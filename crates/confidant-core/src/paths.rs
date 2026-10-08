@@ -554,7 +554,9 @@ mod unix {
         }
 
         pub(super) fn child_mode(&self, name: &OsStr) -> io::Result<u32> {
-            Ok(self.child_stat(name)?.st_mode & 0o7777)
+            // `st_mode` is `u16` on Darwin and `u32` on Linux.
+            #[allow(clippy::unnecessary_cast)]
+            Ok(self.child_stat(name)?.st_mode as u32 & 0o7777)
         }
 
         fn child_stat(&self, name: &OsStr) -> io::Result<libc::stat> {
@@ -575,16 +577,28 @@ mod unix {
             Ok(unsafe { status.assume_init() })
         }
 
+        fn close_raw(fd: libc::c_int) {
+            // SAFETY: `fd` is an owned descriptor this function is discarding.
+            let _ = unsafe { libc::close(fd) };
+        }
+
         pub(super) fn read_children(&self) -> io::Result<ChildListing> {
+            // SAFETY: `self.descriptor` is a valid open directory descriptor.
             let dup = checked(unsafe { libc::dup(self.descriptor.as_raw_fd()) })?;
             // `fdopendir` is specified to reject descriptors with O_NONBLOCK.
-            let prepared = (|| {
-                let flags = checked(unsafe { libc::fcntl(dup, libc::F_GETFL) })?;
-                checked(unsafe { libc::fcntl(dup, libc::F_SETFL, flags & !libc::O_NONBLOCK) })?;
-                Ok::<(), io::Error>(())
-            })();
-            if let Err(err) = prepared {
-                let _ = unsafe { libc::close(dup) };
+            // SAFETY: `dup` is a fresh descriptor we still own.
+            let flags = match checked(unsafe { libc::fcntl(dup, libc::F_GETFL, 0) }) {
+                Ok(flags) => flags,
+                Err(err) => {
+                    Self::close_raw(dup);
+                    return Err(err);
+                }
+            };
+            // SAFETY: `dup` is still owned; the third argument is the new flags.
+            if let Err(err) =
+                checked(unsafe { libc::fcntl(dup, libc::F_SETFL, flags & !libc::O_NONBLOCK) })
+            {
+                Self::close_raw(dup);
                 return Err(err);
             }
             // SAFETY: `dup` is a fresh directory descriptor; `fdopendir` takes
@@ -592,42 +606,20 @@ mod unix {
             let dirp = unsafe { libc::fdopendir(dup) };
             if dirp.is_null() {
                 let err = io::Error::last_os_error();
-                let _ = unsafe { libc::close(dup) };
+                Self::close_raw(dup);
                 return Err(err);
             }
             let mut out = Vec::new();
             loop {
-                // SAFETY: writing 0 to errno is the documented way to distinguish
-                // end-of-stream from a `readdir` failure.
-                unsafe {
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    {
-                        *libc::__errno_location() = 0;
-                    }
-                    #[cfg(any(
-                        target_os = "macos",
-                        target_os = "ios",
-                        target_os = "freebsd",
-                        target_os = "openbsd",
-                        target_os = "netbsd",
-                        target_os = "dragonfly"
-                    ))]
-                    {
-                        *libc::__error() = 0;
-                    }
-                }
                 // SAFETY: `dirp` came from `fdopendir` and is not closed yet.
                 let ent = unsafe { libc::readdir(dirp) };
                 if ent.is_null() {
-                    let err = io::Error::last_os_error();
-                    if err.raw_os_error().is_some_and(|e| e != 0) {
-                        out.push(Err(("<readdir>".to_owned(), err)));
-                    }
                     break;
                 }
                 // SAFETY: `readdir` returned a live dirent whose `d_name` is
                 // NUL-terminated for the lifetime of this iteration.
-                let c_name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+                let c_name =
+                    unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*ent).d_name).cast()) };
                 let os_name = OsStr::from_bytes(c_name.to_bytes()).to_os_string();
                 if os_name == "." || os_name == ".." {
                     continue;
@@ -638,15 +630,21 @@ mod unix {
                 }
             }
             // SAFETY: `dirp` is the pointer from `fdopendir`; this closes `dup`.
-            unsafe { libc::closedir(dirp) };
+            let _ = unsafe { libc::closedir(dirp) };
             Ok(out)
         }
 
         pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
-            Ok(match self.child_stat(name)?.st_mode & libc::S_IFMT {
-                libc::S_IFDIR => EntryKind::Directory,
-                libc::S_IFREG => EntryKind::File,
-                libc::S_IFLNK => EntryKind::Symlink,
+            // `st_mode` / `S_IF*` widths differ between Darwin (`u16`) and Linux (`u32`).
+            #[allow(clippy::unnecessary_cast)]
+            let mode = self.child_stat(name)?.st_mode as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let ifmt = libc::S_IFMT as u32;
+            #[allow(clippy::unnecessary_cast)]
+            Ok(match mode & ifmt {
+                x if x == libc::S_IFDIR as u32 => EntryKind::Directory,
+                x if x == libc::S_IFREG as u32 => EntryKind::File,
+                x if x == libc::S_IFLNK as u32 => EntryKind::Symlink,
                 _ => EntryKind::Other,
             })
         }
