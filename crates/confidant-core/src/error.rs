@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(DomainError::ledger_unreadable(2).message(), "2 items");
         assert!(DomainError::ledger_unreadable(2).file().is_none());
         assert_eq!(
-            DomainError::ledger_unreadable(2).fix().as_deref(),
+            DomainError::ledger_unreadable(2).fix(),
             Some(
                 "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it"
             )

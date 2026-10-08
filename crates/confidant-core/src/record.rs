@@ -666,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             super::parse_ref_id("p-01M3TC5H00MPJG000000000000 # comment"),
-            super::FrontmatterRef::Id(id)
+            super::FrontmatterRef::Id(id.clone())
         );
         assert_eq!(
             super::parse_ref_id("Jane Doe"),

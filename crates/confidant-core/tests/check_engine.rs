@@ -2054,7 +2054,7 @@ fn find_refuses_when_ledger_file_unreadable() {
     assert_eq!(err.message(), "1 items");
     assert!(err.file().is_none(), "{err:?}");
     assert_eq!(
-        err.fix().as_deref(),
+        err.fix(),
         Some(
             "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it"
         )
