@@ -65,6 +65,8 @@ pub struct Record {
     pub body: String,
     /// Original file text, used so search line numbers match the file.
     pub source: String,
+    /// 1-based line after the closing `---` fence (BOM-stripped layout).
+    pub body_start_line: u32,
 }
 
 impl Record {
@@ -120,8 +122,20 @@ const SPEC_KEYS: &[&str] = &[
     "id", "type", "name", "date", "person", "org", "deal", "session", "no-ai",
 ];
 
-fn is_spec_key(key: &str) -> bool {
+pub(crate) fn is_spec_key(key: &str) -> bool {
     SPEC_KEYS.contains(&key)
+}
+
+/// Spec key on a raw front-matter line, if any. Comments and unknown keys
+/// return `None` so callers can name the line without echoing it.
+pub(crate) fn frontmatter_line_spec_key(raw: &str) -> Option<String> {
+    let line = raw.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, _) = line.split_once(':')?;
+    let key = unquote(key.trim());
+    is_spec_key(&key).then_some(key)
 }
 
 fn is_noai_typo(key: &str) -> bool {
@@ -143,7 +157,7 @@ fn normalize_noai(key: &str) -> String {
     folded.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
-type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32>);
+type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32>, u32);
 
 /// Split a Markdown file into front matter scalars and body.
 /// Key line numbers are 1-based in the original file (the opening `---` is line 1).
@@ -220,7 +234,29 @@ pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterErr
         fields,
         body.trim_start_matches(['\n', '\r']).to_owned(),
         key_lines,
+        body_start_line(fm),
     ))
+}
+
+/// 1-based line of the first source line after the closing `---` fence.
+/// Strips a leading BOM so fence detection matches [`split_frontmatter`].
+pub fn source_body_start_line(text: &str) -> Option<u32> {
+    let text = text.trim_start_matches('\u{feff}');
+    let rest = text.strip_prefix("---")?;
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))?;
+    let (fm, _) = split_close(rest)?;
+    Some(body_start_line(fm))
+}
+
+fn body_start_line(fm: &str) -> u32 {
+    let fm_lines = if fm.is_empty() {
+        0
+    } else {
+        fm.lines().count() as u32
+    };
+    1 + fm_lines + 1 + 1
 }
 
 fn split_close(rest: &str) -> Option<(&str, &str)> {
@@ -266,7 +302,7 @@ fn unescape(s: &str) -> String {
 }
 
 pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> {
-    let (fields, body, key_lines) = split_frontmatter(text)?;
+    let (fields, body, key_lines, body_start_line) = split_frontmatter(text)?;
     let line_of = |key: &str| key_lines.get(key).copied();
     let id_raw = fields.get("id").ok_or_else(|| {
         FrontmatterError::new(
@@ -340,6 +376,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         fields,
         body,
         source: text.to_owned(),
+        body_start_line,
     })
 }
 
@@ -507,5 +544,21 @@ mod tests {
         let src = "---\r\nid: p-01M3TC5H00MPJG000000000000\r\ntype: person\r\nname: Ada\r\n---\r\n\r\nBody.\r\n";
         let rec = parse_record(src, "x.md").unwrap();
         assert_eq!(rec.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn bom_shares_frontmatter_offsets() {
+        let inner = "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n---\n\nBody.\n";
+        let with_bom = format!("\u{feff}{inner}");
+        let rec = parse_record(&with_bom, "x.md").unwrap();
+        assert_eq!(rec.body_start_line, 5);
+        assert_eq!(super::source_body_start_line(&with_bom), Some(5));
+        assert_eq!(super::source_body_start_line(inner), Some(5));
+        assert_eq!(
+            super::frontmatter_line_spec_key("person: p-01M3TC5H00MPJG000000000000"),
+            Some("person".into())
+        );
+        assert!(super::frontmatter_line_spec_key("# see p-01M3TC5H00MPJG000000000000").is_none());
+        assert!(super::frontmatter_line_spec_key("see: p-01M3TC5H00MPJG000000000000").is_none());
     }
 }

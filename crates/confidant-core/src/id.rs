@@ -288,7 +288,7 @@ fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
         let run_len = after[run_start..]
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(after.len() - run_start);
-        if run_len == 0 {
+        if !(20..=32).contains(&run_len) {
             continue;
         }
         let total = plen + run_start + run_len;
@@ -422,6 +422,24 @@ mod tests {
         assert_eq!(en_dash, vec![IdToken::Malformed]);
         assert!(scan_id_tokens("merged-deal-token").is_empty());
         assert!(scan_id_tokens("zxqv-unique-token-ada-0").is_empty());
+        for prose in [
+            "I-95",
+            "D-Day",
+            "P-value",
+            "O-1",
+            "I-9",
+            "I-140",
+            "N-400",
+            "Lin I-Chen",
+            "I\u{2014}I",
+        ] {
+            assert!(
+                scan_id_tokens(prose).is_empty(),
+                "{prose:?} should not be an ID token"
+            );
+        }
+        let short_real = scan_id_tokens("p-01M3TC5H00MPJG00000000000");
+        assert_eq!(short_real, vec![IdToken::Malformed]);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::check::{parse_merge, sort_findings, Finding, FindingCode, MergeParse, Severity};
 use crate::id::{person_id_from_path, scan_id_tokens, scan_ids, IdToken, Prefix, RecordId};
-use crate::vault::{SourcedEntry, Vault};
+use crate::vault::Vault;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SearchHit {
@@ -25,8 +25,10 @@ pub struct SearchResult {
 
 struct RecordFacts {
     fm_ids: Vec<RecordId>,
-    malformed: bool,
+    fm_malformed: bool,
     path_person: Option<RecordId>,
+    /// Tokenized once from BOM-stripped source; 1-based line numbers.
+    line_tokens: Vec<(u32, Vec<IdToken>)>,
 }
 
 /// Indexes built once per search so the allowlist is a worklist, not nested scans.
@@ -36,7 +38,8 @@ struct Allowlist<'a> {
     facts: HashMap<RecordId, RecordFacts>,
     by_path: HashMap<&'a str, &'a RecordId>,
     ledger_at: HashMap<(&'a str, u32), usize>,
-    entries_at: HashMap<(&'a str, u32), usize>,
+    ledger_tokens: Vec<Vec<IdToken>>,
+    note_session_lines: HashMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
 }
 
@@ -58,7 +61,7 @@ pub fn search(vault: &Vault, query: &str) -> SearchResult {
         if !allow.cleared.contains(&rec.id) {
             continue;
         }
-        scan_record(rec, &needle, &allow.cleared, &mut hits);
+        scan_record(rec, &needle, &allow, &mut hits);
     }
     for (idx, line) in vault.ledger_lines.iter().enumerate() {
         if !allow.ledger_ok.get(idx).copied().unwrap_or(false) {
@@ -88,13 +91,30 @@ impl<'a> Allowlist<'a> {
         for (idx, line) in vault.ledger_lines.iter().enumerate() {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
-        let mut entries_at = HashMap::with_capacity(vault.entries.len());
-        for (idx, sourced) in vault.entries.iter().enumerate() {
-            entries_at.insert((sourced.file.as_str(), sourced.line), idx);
-        }
         let mut facts = HashMap::with_capacity(vault.records.len());
         for rec in vault.records.values() {
             facts.insert(rec.id.clone(), record_facts(rec));
+        }
+        let ledger_tokens: Vec<Vec<IdToken>> = vault
+            .ledger_lines
+            .iter()
+            .map(|line| scan_id_tokens(&line.text))
+            .collect();
+        let mut note_session_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
+        for sourced in &vault.entries {
+            if sourced.entry.verb != "session" {
+                continue;
+            }
+            let Some(raw) = sourced.entry.pair("note") else {
+                continue;
+            };
+            let Ok(nid) = RecordId::parse(raw) else {
+                continue;
+            };
+            let Some(&idx) = ledger_at.get(&(sourced.file.as_str(), sourced.line)) else {
+                continue;
+            };
+            note_session_lines.entry(nid).or_default().push(idx);
         }
         let mut allow = Self {
             vault,
@@ -102,21 +122,17 @@ impl<'a> Allowlist<'a> {
             facts,
             by_path,
             ledger_at,
-            entries_at,
+            ledger_tokens,
+            note_session_lines,
             ledger_ok: Vec::new(),
         };
         allow.cleared = compute_cleared(&allow);
-        allow.ledger_ok = vault
-            .ledger_lines
+        allow.ledger_ok = allow
+            .ledger_tokens
             .iter()
-            .map(|line| ids_allowed(&line.text, &allow.cleared))
+            .map(|toks| tokens_allowed(toks, &allow.cleared))
             .collect();
         allow
-    }
-
-    fn entry_at(&self, file: &str, line: u32) -> Option<&'a SourcedEntry> {
-        let idx = *self.entries_at.get(&(file, line))?;
-        self.vault.entries.get(idx)
     }
 }
 
@@ -183,7 +199,7 @@ fn still_cleared(
     if tainted.contains(id) {
         return false;
     }
-    if facts.malformed {
+    if facts.fm_malformed {
         return false;
     }
     if facts.fm_ids.iter().any(|fid| !cleared.contains(fid)) {
@@ -199,6 +215,14 @@ fn still_cleared(
             return false;
         }
     }
+    if let Some(idxs) = allow.note_session_lines.get(id) {
+        if idxs
+            .iter()
+            .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared))
+        {
+            return false;
+        }
+    }
     true
 }
 
@@ -207,7 +231,7 @@ fn drop_from_cleared(
     cleared: &mut HashSet<RecordId>,
     components: &MergeComponents,
     person_pkgs: &HashMap<RecordId, Vec<RecordId>>,
-    dependents: &HashMap<RecordId, Vec<RecordId>>,
+    dependents: &HashMap<RecordId, HashSet<RecordId>>,
     stack: &mut Vec<RecordId>,
     queued: &mut HashSet<RecordId>,
 ) {
@@ -364,13 +388,10 @@ fn pkg_openers(
 fn reverse_deps(
     allow: &Allowlist<'_>,
     pkg_openers: &HashMap<RecordId, Vec<RecordId>>,
-) -> HashMap<RecordId, Vec<RecordId>> {
-    let mut dependents: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+) -> HashMap<RecordId, HashSet<RecordId>> {
+    let mut dependents: HashMap<RecordId, HashSet<RecordId>> = HashMap::new();
     let mut link = |from: RecordId, to: RecordId| {
-        let deps = dependents.entry(from).or_default();
-        if !deps.contains(&to) {
-            deps.push(to);
-        }
+        dependents.entry(from).or_default().insert(to);
     };
     for rec in allow.vault.records.values() {
         if let Some(facts) = allow.facts.get(&rec.id) {
@@ -387,14 +408,10 @@ fn reverse_deps(
             link(person.clone(), pkg.clone());
         }
     }
-    for line in &allow.vault.ledger_lines {
-        let notes = session_notes_on_line(allow, line.file.as_str(), line.line, &line.text);
-        if notes.is_empty() {
-            continue;
-        }
-        for tok in scan_id_tokens(&line.text) {
-            if let IdToken::Valid(id) = tok {
-                for note in &notes {
+    for (note, idxs) in &allow.note_session_lines {
+        for &idx in idxs {
+            for tok in &allow.ledger_tokens[idx] {
+                if let IdToken::Valid(id) = tok {
                     link(id.clone(), note.clone());
                 }
             }
@@ -403,68 +420,38 @@ fn reverse_deps(
     dependents
 }
 
-fn session_notes_on_line(
-    allow: &Allowlist<'_>,
-    file: &str,
-    line: u32,
-    text: &str,
-) -> Vec<RecordId> {
-    if let Some(sourced) = allow.entry_at(file, line) {
-        if sourced.entry.verb == "session" {
-            if let Some(raw) = sourced.entry.pair("note") {
-                if let Ok(nid) = RecordId::parse(raw) {
-                    return vec![nid];
+fn record_facts(rec: &crate::record::Record) -> RecordFacts {
+    let text = rec.source.trim_start_matches('\u{feff}');
+    let mut fm_ids = Vec::new();
+    let mut fm_malformed = false;
+    let mut line_tokens = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx as u32 + 1;
+        let toks = scan_id_tokens(line);
+        if line_no < rec.body_start_line {
+            for tok in &toks {
+                match tok {
+                    IdToken::Malformed => fm_malformed = true,
+                    IdToken::Valid(id) => fm_ids.push(id.clone()),
                 }
             }
         }
-        return Vec::new();
-    }
-    scan_ids(text)
-        .into_iter()
-        .filter(|id| id.prefix() == Prefix::Note)
-        .collect()
-}
-
-fn record_facts(rec: &crate::record::Record) -> RecordFacts {
-    let mut fm_ids = Vec::new();
-    let mut malformed = false;
-    for value in rec.fields.values() {
-        for tok in scan_id_tokens(value) {
-            match tok {
-                IdToken::Malformed => malformed = true,
-                IdToken::Valid(id) => fm_ids.push(id),
-            }
-        }
-    }
-    if !malformed && line_has_id_shape(&rec.body) {
-        for line in rec.body.lines() {
-            if scan_id_tokens(line)
-                .iter()
-                .any(|tok| matches!(tok, IdToken::Malformed))
-            {
-                malformed = true;
-                break;
-            }
-        }
+        line_tokens.push((line_no, toks));
     }
     RecordFacts {
         fm_ids,
-        malformed,
+        fm_malformed,
         path_person: person_id_from_path(&rec.path),
+        line_tokens,
     }
 }
 
-fn line_has_id_shape(text: &str) -> bool {
-    text.as_bytes().contains(&b'-')
-        || (text.as_bytes().iter().any(|b| *b >= 0x80) && text.chars().any(crate::id::is_id_dash))
-}
-
-fn ids_allowed(text: &str, cleared: &HashSet<RecordId>) -> bool {
-    for tok in scan_id_tokens(text) {
+fn tokens_allowed(toks: &[IdToken], cleared: &HashSet<RecordId>) -> bool {
+    for tok in toks {
         match tok {
             IdToken::Malformed => return false,
             IdToken::Valid(id) => {
-                if !cleared.contains(&id) {
+                if !cleared.contains(id) {
                     return false;
                 }
             }
@@ -520,13 +507,15 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
 fn scan_record(
     rec: &crate::record::Record,
     needle: &str,
-    cleared: &HashSet<RecordId>,
+    allow: &Allowlist<'_>,
     hits: &mut Vec<SearchHit>,
 ) {
-    let mut seen_fm_open = false;
-    let mut in_body = false;
-    for (idx, line) in rec.source.lines().enumerate() {
-        if in_body && line_has_id_shape(line) && !ids_allowed(line, cleared) {
+    let Some(facts) = allow.facts.get(&rec.id) else {
+        return;
+    };
+    let text = rec.source.trim_start_matches('\u{feff}');
+    for ((line_no, toks), line) in facts.line_tokens.iter().zip(text.lines()) {
+        if !tokens_allowed(toks, &allow.cleared) {
             continue;
         }
         let folded = case_fold(line);
@@ -534,16 +523,9 @@ fn scan_record(
             hits.push(SearchHit {
                 id: Some(rec.id.to_string()),
                 path: rec.path.clone(),
-                line: idx as u32 + 1,
+                line: *line_no,
                 excerpt: excerpt(line.trim(), 200),
             });
-        }
-        if !in_body && line.trim_end_matches('\r') == "---" {
-            if seen_fm_open {
-                in_body = true;
-            } else {
-                seen_fm_open = true;
-            }
         }
     }
 }

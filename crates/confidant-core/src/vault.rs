@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
-use crate::id::{Prefix, RecordId};
+use crate::id::{scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
-use crate::record::{has_conflict_markers, parse_record, Record, RecordKind};
+use crate::record::{
+    frontmatter_line_spec_key, has_conflict_markers, parse_record, Record, RecordKind,
+};
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes"];
 
@@ -539,6 +541,7 @@ fn load_markdown(
         }
         Ok(mut rec) => {
             rec.path = file.clone();
+            flag_malformed_frontmatter(&rec, findings);
             if let Some(pid) = path_id {
                 if rec.id != *pid {
                     findings.push(
@@ -598,6 +601,33 @@ fn load_markdown(
                 records.insert(rec.id.clone(), rec);
             }
         }
+    }
+}
+
+fn flag_malformed_frontmatter(rec: &Record, findings: &mut Vec<Finding>) {
+    let text = rec.source.trim_start_matches('\u{feff}');
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx as u32 + 1;
+        if line_no >= rec.body_start_line {
+            break;
+        }
+        if !scan_id_tokens(line)
+            .iter()
+            .any(|tok| matches!(tok, IdToken::Malformed))
+        {
+            continue;
+        }
+        let message = match frontmatter_line_spec_key(line) {
+            Some(key) => format!("front matter key '{key}' is not a record ID (line {line_no})"),
+            None => format!("front matter line {line_no} is not a record ID"),
+        };
+        findings.push(
+            Finding::new(FindingCode::InvalidId, Severity::Error, message)
+                .at_file(&rec.path)
+                .at_line(line_no)
+                .for_id(&rec.id)
+                .with_fix("Use a prefixed 26-character Crockford ULID"),
+        );
     }
 }
 

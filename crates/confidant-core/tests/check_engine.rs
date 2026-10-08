@@ -17,6 +17,7 @@ const ORG: &str = "o-01M3TC5H00MPJG001K6C000003";
 const DEAL: &str = "d-01M3TC5H00MPJG00248G000004";
 const DEAL2: &str = "d-01M3TC5H00MPJG005VQC00000B";
 const NOTE2: &str = "n-01M3TC5H00MPJG00600000000D";
+const NOTE3: &str = "n-01M3TC5H00MPJG00800000000F";
 const IXN: &str = "i-01M3TC5H00MPJG0048H0000008";
 const SHADOW: &str = "p-01M3TC5H00MPJG001K6C00000A";
 const GHOST: &str = "p-01M3TC5H00MPJG000H2400000Z";
@@ -1508,4 +1509,257 @@ fn find_excludes_record_with_malformed_id_typo() {
     );
     let dumped = serde_json::to_string(&result).unwrap();
     assert!(!dumped.contains("01M3TC5H00MPJG00000000000I"), "{dumped}");
+}
+
+const TYPO_25: &str = "p-01M3TC5H00MPJG00000000000";
+
+#[test]
+fn find_drops_bom_record_body_line_with_excluded_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    let body = format!(
+        "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-bom-token\nsee excluded {ADA} dropped-bom-line-token\nstill-bom-token\n"
+    );
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("\u{feff}{body}"),
+    );
+    let dropped = search_q(dir.path(), "dropped-bom-line-token");
+    let visible = search_q(dir.path(), "visible-bom-token");
+    let still = search_q(dir.path(), "still-bom-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-bom-line-token"),
+        "{dropped:?}"
+    );
+    assert!(token_in_hits(&visible, "visible-bom-token"), "{visible:?}");
+    assert!(token_in_hits(&still, "still-bom-token"), "{still:?}");
+}
+
+#[test]
+fn find_excludes_frontmatter_comment_with_hidden_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n# hidden {ADA}\n---\n\nfm-comment-hidden-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "fm-comment-hidden-token");
+    assert!(
+        !token_in_hits(&result, "fm-comment-hidden-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_excludes_frontmatter_key_that_is_a_hidden_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n{ADA}: true\n---\n\nfm-key-hidden-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "fm-key-hidden-token");
+    assert!(!token_in_hits(&result, "fm-key-hidden-token"), "{result:?}");
+}
+
+#[test]
+fn find_excludes_top_level_note_linked_only_by_hidden_session() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\nhidden-session-note-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
+    let result = search_q(dir.path(), "hidden-session-note-token");
+    assert!(
+        !token_in_hits(&result, "hidden-session-note-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_excludes_note_linked_by_cleared_and_hidden_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    person(dir.path(), BEA, "Bea");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE3}/note.md"),
+        &format!("---\nid: {NOTE3}\ntype: note\n---\n\nmixed-session-note-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 session {ADA} 60m paid note:{NOTE3}\n\
+             2026-10-02 session {BEA} 60m paid note:{NOTE3}\n"
+        ),
+    );
+    let result = search_q(dir.path(), "mixed-session-note-token");
+    assert!(
+        !token_in_hits(&result, "mixed-session-note-token"),
+        "{result:?}"
+    );
+}
+
+fn find_keeps_false_positive_id_shape(phrase: &str, token: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\n{phrase} {token}\n"),
+    );
+    let result = search_q(dir.path(), token);
+    assert!(token_in_hits(&result, token), "{phrase} {result:?}");
+}
+
+#[test]
+fn find_keeps_i95_false_positive() {
+    find_keeps_false_positive_id_shape("I-95", "i95-false-positive-token");
+}
+
+#[test]
+fn find_keeps_d_day_false_positive() {
+    find_keeps_false_positive_id_shape("D-Day", "dday-false-positive-token");
+}
+
+#[test]
+fn find_keeps_p_value_false_positive() {
+    find_keeps_false_positive_id_shape("P-value", "pvalue-false-positive-token");
+}
+
+#[test]
+fn find_keeps_o1_false_positive() {
+    find_keeps_false_positive_id_shape("O-1", "o1-false-positive-token");
+}
+
+#[test]
+fn find_keeps_i9_false_positive() {
+    find_keeps_false_positive_id_shape("I-9", "i9-false-positive-token");
+}
+
+#[test]
+fn find_keeps_i140_false_positive() {
+    find_keeps_false_positive_id_shape("I-140", "i140-false-positive-token");
+}
+
+#[test]
+fn find_keeps_n400_false_positive() {
+    find_keeps_false_positive_id_shape("N-400", "n400-false-positive-token");
+}
+
+#[test]
+fn find_keeps_lin_i_chen_false_positive() {
+    find_keeps_false_positive_id_shape("Lin I-Chen", "lin-ichen-false-positive-token");
+}
+
+#[test]
+fn find_keeps_em_dash_i_false_positive() {
+    find_keeps_false_positive_id_shape("I\u{2014}I", "emdash-i-false-positive-token");
+}
+
+#[test]
+fn find_drops_only_body_line_with_25_char_id_typo() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-25-token\nsee {TYPO_25} dropped-25-token\nstill-25-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-25-token");
+    let visible = search_q(dir.path(), "visible-25-token");
+    let still = search_q(dir.path(), "still-25-token");
+    assert!(!token_in_hits(&dropped, "dropped-25-token"), "{dropped:?}");
+    assert!(token_in_hits(&visible, "visible-25-token"), "{visible:?}");
+    assert!(token_in_hits(&still, "still-25-token"), "{still:?}");
+}
+
+#[test]
+fn find_and_check_frontmatter_25_char_id_typo() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada\nsee: {TYPO_25}\n---\n\nfm-25-typo-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "fm-25-typo-token");
+    assert!(!token_in_hits(&result, "fm-25-typo-token"), "{result:?}");
+    let dumped = serde_json::to_string(&result.findings).unwrap();
+    assert!(!dumped.contains(TYPO_25), "{dumped}");
+    assert!(!dumped.contains(&format!("people/{ADA}")), "{dumped}");
+    assert!(
+        result
+            .findings
+            .iter()
+            .any(|f| f.code == FindingCode::InvalidId && f.file.is_none() && f.id.is_none()),
+        "{:?}",
+        result.findings
+    );
+
+    let json = report_json(dir.path(), None);
+    let invalid: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_INVALID_ID")
+        .collect();
+    assert_eq!(invalid.len(), 1, "{json}");
+    assert_eq!(invalid[0]["line"], 4);
+    let msg = invalid[0]["message"].as_str().unwrap();
+    assert!(msg.contains("line 4"), "{msg}");
+    assert!(!msg.contains(TYPO_25), "{msg}");
+    assert!(!msg.contains("see"), "{msg}");
+}
+
+#[test]
+fn check_frontmatter_person_25_char_id_typo_names_key() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {TYPO_25}\ndate: 2026-10-01\n---\n\nnote-25-typo-token\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let invalid: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_INVALID_ID")
+        .collect();
+    assert_eq!(invalid.len(), 1, "{json}");
+    let msg = invalid[0]["message"].as_str().unwrap();
+    assert!(msg.contains("person"), "{msg}");
+    assert!(msg.contains("line 4"), "{msg}");
+    assert!(!msg.contains(TYPO_25), "{msg}");
+    let result = search_q(dir.path(), "note-25-typo-token");
+    assert!(!token_in_hits(&result, "note-25-typo-token"), "{result:?}");
 }

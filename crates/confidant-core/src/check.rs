@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use crate::config::{parse_iso_date, VaultConfig, SPEC_VERSION};
 use crate::error::DomainError;
-use crate::id::{Prefix, RecordId};
+use crate::id::{scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_decimal_hundredths, parse_duration_minutes, Arg, LedgerEntry};
 use crate::packs::coaching::{self, CoachingState};
 use crate::vault::Vault;
@@ -868,16 +868,24 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
         for key in REF_KEYS {
             let Some(raw) = rec.field(key) else { continue };
             match RecordId::parse(raw) {
-                Err(_) => findings.push(
-                    Finding::new(
-                        FindingCode::InvalidId,
-                        Severity::Error,
-                        format!("front matter key '{key}' is not a record ID"),
-                    )
-                    .at_file(&rec.path)
-                    .for_id(&rec.id)
-                    .with_fix("Use a prefixed 26-character Crockford ULID"),
-                ),
+                Err(_) => {
+                    if scan_id_tokens(raw)
+                        .iter()
+                        .any(|tok| matches!(tok, IdToken::Malformed))
+                    {
+                        continue;
+                    }
+                    findings.push(
+                        Finding::new(
+                            FindingCode::InvalidId,
+                            Severity::Error,
+                            format!("front matter key '{key}' is not a record ID"),
+                        )
+                        .at_file(&rec.path)
+                        .for_id(&rec.id)
+                        .with_fix("Use a prefixed 26-character Crockford ULID"),
+                    );
+                }
                 Ok(id) if !known_ids.contains(&id) => findings.push(
                     Finding::new(
                         FindingCode::DanglingRef,
