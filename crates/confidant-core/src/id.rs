@@ -268,9 +268,24 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
     let text = stripped.as_ref();
-    if !may_contain_id_token(text) {
-        return Vec::new();
+    if has_id_dash(text) {
+        return scan_prefixed_and_bare(text);
     }
+    if text.len() >= ULID_LEN {
+        return scan_bare_ulids(text);
+    }
+    Vec::new()
+}
+
+fn has_id_dash(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.contains(&b'-') {
+        return true;
+    }
+    bytes.iter().any(|b| *b >= 0x80) && text.chars().any(is_id_dash)
+}
+
+fn scan_prefixed_and_bare(text: &str) -> Vec<IdToken> {
     let mut out = Vec::new();
     let mut remaining = text;
     let mut prev: Option<char> = None;
@@ -288,12 +303,18 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
                 continue;
             }
         }
-        if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
-            out.push(tok);
-            remaining = &remaining[len..];
-            prev2 = prev;
-            prev = Some('0');
-            continue;
+        if remaining
+            .as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b, b'0'..=b'7'))
+        {
+            if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
+                out.push(tok);
+                remaining = &remaining[len..];
+                prev2 = prev;
+                prev = Some('0');
+                continue;
+            }
         }
         let ch = remaining.chars().next().unwrap();
         let n = ch.len_utf8();
@@ -408,15 +429,22 @@ fn starts_id_prefix(s: &str) -> bool {
     )
 }
 
-fn may_contain_id_token(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.contains(&b'-') {
-        return true;
+fn scan_bare_ulids(text: &str) -> Vec<IdToken> {
+    let mut out = Vec::new();
+    let mut remaining = text;
+    let mut prev: Option<char> = None;
+    while !remaining.is_empty() {
+        if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
+            out.push(tok);
+            remaining = &remaining[len..];
+            prev = Some('0');
+            continue;
+        }
+        let ch = remaining.chars().next().unwrap();
+        prev = Some(ch);
+        remaining = &remaining[ch.len_utf8()..];
     }
-    if text.len() >= ULID_LEN {
-        return true;
-    }
-    bytes.iter().any(|b| *b >= 0x80) && text.chars().any(is_id_dash)
+    out
 }
 
 /// Valid IDs only; malformed lookalikes and bare ULIDs are skipped.
