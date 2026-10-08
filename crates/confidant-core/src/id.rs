@@ -220,7 +220,8 @@ pub enum IdToken {
 
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
 /// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
-/// inside junk such as `[[p-…]]`. A run that is not a Crockford ULID is
+/// inside junk such as `[[p-…]]` and with an alphanumeric glued in front
+/// (`xp-<ULID>`). A run that is not a Crockford ULID is
 /// [`IdToken::Malformed`].
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     if !text.as_bytes().contains(&b'-')
@@ -230,18 +231,15 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     }
     let mut out = Vec::new();
     let mut remaining = text;
-    let mut prev_alnum = false;
     while !remaining.is_empty() {
-        if !prev_alnum && starts_id_prefix(remaining) {
+        if starts_id_prefix(remaining) {
             if let Some((tok, len)) = match_id_token_at(remaining) {
                 out.push(tok);
                 remaining = &remaining[len..];
-                prev_alnum = true;
                 continue;
             }
         }
         let ch = remaining.chars().next().unwrap();
-        prev_alnum = ch.is_ascii_alphanumeric();
         remaining = &remaining[ch.len_utf8()..];
     }
     out
@@ -288,11 +286,17 @@ fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
         let run_len = after[run_start..]
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(after.len() - run_start);
-        if !(20..=32).contains(&run_len) {
-            continue;
-        }
         let total = plen + run_start + run_len;
         let run = &after[run_start..run_start + run_len];
+        if run_len > 32 {
+            if dash == '-' && canonicalize_ulid(&run[..26]).is_some() {
+                return Some((IdToken::Malformed, total));
+            }
+            continue;
+        }
+        if run_len < 20 {
+            continue;
+        }
         if dash == '-' {
             if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
                 return Some((IdToken::Valid(id), total));
@@ -440,6 +444,15 @@ mod tests {
         }
         let short_real = scan_id_tokens("p-01M3TC5H00MPJG00000000000");
         assert_eq!(short_real, vec![IdToken::Malformed]);
+        let id = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(
+            scan_id_tokens("xp-01M3TC5H00MPJG000000000000"),
+            vec![IdToken::Valid(id)]
+        );
+        assert_eq!(
+            scan_id_tokens("p-01M3TC5H00MPJG000000000000abcdefg"),
+            vec![IdToken::Malformed]
+        );
     }
 
     #[test]

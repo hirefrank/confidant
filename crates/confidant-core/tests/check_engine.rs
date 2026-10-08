@@ -1594,6 +1594,69 @@ fn find_excludes_top_level_note_linked_only_by_hidden_session() {
     );
 }
 
+fn find_excludes_note_named_on_ledger_with_hidden_person(line: &str, token: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\n{token}\n"),
+    );
+    write(dir.path(), "ledger/2026/10.cfd", &format!("{line}\n"));
+    let result = search_q(dir.path(), token);
+    assert!(!token_in_hits(&result, token), "{line} {result:?}");
+}
+
+#[test]
+fn find_excludes_note_named_uppercase_on_unparsed_ledger_line() {
+    find_excludes_note_named_on_ledger_with_hidden_person(
+        &format!("not-an-entry {ADA} {}", NOTE.to_ascii_uppercase()),
+        "uppercase-note-link-token",
+    );
+}
+
+#[test]
+fn find_excludes_note_named_in_wikilink_on_ledger_line() {
+    find_excludes_note_named_on_ledger_with_hidden_person(
+        &format!("not-an-entry {ADA} [[{NOTE}]]"),
+        "wikilink-note-link-token",
+    );
+}
+
+#[test]
+fn find_excludes_note_named_quoted_on_ledger_line() {
+    find_excludes_note_named_on_ledger_with_hidden_person(
+        &format!("not-an-entry {ADA} \"{NOTE}\""),
+        "quoted-note-link-token",
+    );
+}
+
+#[test]
+fn find_excludes_note_named_on_unparsable_ledger_line() {
+    find_excludes_note_named_on_ledger_with_hidden_person(
+        &format!("not-an-entry {ADA} {NOTE}"),
+        "unparsable-note-link-token",
+    );
+}
+
+#[test]
+fn find_keeps_top_level_note_with_no_ledger_mention() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\ncontrol-unlinked-note-token\n"),
+    );
+    let result = search_q(dir.path(), "control-unlinked-note-token");
+    assert!(
+        token_in_hits(&result, "control-unlinked-note-token"),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn find_excludes_note_linked_by_cleared_and_hidden_sessions() {
     let dir = tempfile::tempdir().unwrap();
@@ -1762,4 +1825,55 @@ fn check_frontmatter_person_25_char_id_typo_names_key() {
     assert!(!msg.contains(TYPO_25), "{msg}");
     let result = search_q(dir.path(), "note-25-typo-token");
     assert!(!token_in_hits(&result, "note-25-typo-token"), "{result:?}");
+}
+
+#[test]
+fn find_drops_body_line_with_overlong_ulid_run() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-overlong-token\nsee {ADA}abcdefg dropped-overlong-token\nstill-overlong-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-overlong-token");
+    let visible = search_q(dir.path(), "visible-overlong-token");
+    let still = search_q(dir.path(), "still-overlong-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-overlong-token"),
+        "{dropped:?}"
+    );
+    assert!(
+        token_in_hits(&visible, "visible-overlong-token"),
+        "{visible:?}"
+    );
+    assert!(token_in_hits(&still, "still-overlong-token"), "{still:?}");
+}
+
+#[test]
+fn find_drops_body_line_with_glued_prefix_excluded_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-glued-token\nsee x{ADA} dropped-glued-token\nstill-glued-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-glued-token");
+    let visible = search_q(dir.path(), "visible-glued-token");
+    let still = search_q(dir.path(), "still-glued-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-glued-token"),
+        "{dropped:?}"
+    );
+    assert!(
+        token_in_hits(&visible, "visible-glued-token"),
+        "{visible:?}"
+    );
+    assert!(token_in_hits(&still, "still-glued-token"), "{still:?}");
 }

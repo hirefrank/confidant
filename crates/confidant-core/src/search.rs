@@ -39,7 +39,7 @@ struct Allowlist<'a> {
     by_path: HashMap<&'a str, &'a RecordId>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
-    note_session_lines: HashMap<RecordId, Vec<usize>>,
+    note_ledger_lines: HashMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
 }
 
@@ -100,21 +100,20 @@ impl<'a> Allowlist<'a> {
             .iter()
             .map(|line| scan_id_tokens(&line.text))
             .collect();
-        let mut note_session_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
-        for sourced in &vault.entries {
-            if sourced.entry.verb != "session" {
-                continue;
+        let mut note_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
+        for (idx, toks) in ledger_tokens.iter().enumerate() {
+            for tok in toks {
+                let IdToken::Valid(id) = tok else {
+                    continue;
+                };
+                if id.prefix() != Prefix::Note {
+                    continue;
+                }
+                let lines = note_ledger_lines.entry(id.clone()).or_default();
+                if lines.last() != Some(&idx) {
+                    lines.push(idx);
+                }
             }
-            let Some(raw) = sourced.entry.pair("note") else {
-                continue;
-            };
-            let Ok(nid) = RecordId::parse(raw) else {
-                continue;
-            };
-            let Some(&idx) = ledger_at.get(&(sourced.file.as_str(), sourced.line)) else {
-                continue;
-            };
-            note_session_lines.entry(nid).or_default().push(idx);
         }
         let mut allow = Self {
             vault,
@@ -123,7 +122,7 @@ impl<'a> Allowlist<'a> {
             by_path,
             ledger_at,
             ledger_tokens,
-            note_session_lines,
+            note_ledger_lines,
             ledger_ok: Vec::new(),
         };
         allow.cleared = compute_cleared(&allow);
@@ -215,7 +214,7 @@ fn still_cleared(
             return false;
         }
     }
-    if let Some(idxs) = allow.note_session_lines.get(id) {
+    if let Some(idxs) = allow.note_ledger_lines.get(id) {
         if idxs
             .iter()
             .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared))
@@ -408,7 +407,7 @@ fn reverse_deps(
             link(person.clone(), pkg.clone());
         }
     }
-    for (note, idxs) in &allow.note_session_lines {
+    for (note, idxs) in &allow.note_ledger_lines {
         for &idx in idxs {
             for tok in &allow.ledger_tokens[idx] {
                 if let IdToken::Valid(id) = tok {

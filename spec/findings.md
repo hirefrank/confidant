@@ -13,7 +13,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is not compiled into this CLI. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, alphanumeric run 20–32 characters that fails ULID validation). Check reports the line number and, when the key is a known spec key, the key name; it never echoes the token. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). Check reports the line number and, when the key is a known spec key, the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
@@ -46,7 +46,8 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
-cleared records and ledger lines are searchable. A finding is kept
+cleared records and ledger lines are searchable. A note is cleared only when any ledger line that names it is
+allowed. A finding is kept
 verbatim only when it has no file and no ID, or when it resolves to a
 cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,

@@ -163,23 +163,21 @@ type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32
 /// Key line numbers are 1-based in the original file (the opening `---` is line 1).
 pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterError> {
     let text = text.trim_start_matches('\u{feff}');
-    let rest = text.strip_prefix("---").ok_or_else(|| {
-        FrontmatterError::new(
-            "record does not start with YAML front matter (line 1)",
-            "Start the file with --- then id and type, then a closing ---",
-        )
-        .at_line(1)
-    })?;
-    let rest = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))
-        .ok_or_else(|| {
+    let rest = strip_open_fence(text).ok_or_else(|| {
+        if text.strip_prefix("---").is_some() {
             FrontmatterError::new(
                 "front matter opener --- must be followed by a newline (line 1)",
                 "Put id: and type: on the lines after the opening ---",
             )
             .at_line(1)
-        })?;
+        } else {
+            FrontmatterError::new(
+                "record does not start with YAML front matter (line 1)",
+                "Start the file with --- then id and type, then a closing ---",
+            )
+            .at_line(1)
+        }
+    })?;
     let (fm, body) = split_close(rest).ok_or_else(|| {
         FrontmatterError::new(
             "front matter is not closed with ---",
@@ -238,18 +236,6 @@ pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterErr
     ))
 }
 
-/// 1-based line of the first source line after the closing `---` fence.
-/// Strips a leading BOM so fence detection matches [`split_frontmatter`].
-pub fn source_body_start_line(text: &str) -> Option<u32> {
-    let text = text.trim_start_matches('\u{feff}');
-    let rest = text.strip_prefix("---")?;
-    let rest = rest
-        .strip_prefix('\n')
-        .or_else(|| rest.strip_prefix("\r\n"))?;
-    let (fm, _) = split_close(rest)?;
-    Some(body_start_line(fm))
-}
-
 fn body_start_line(fm: &str) -> u32 {
     let fm_lines = if fm.is_empty() {
         0
@@ -259,16 +245,37 @@ fn body_start_line(fm: &str) -> u32 {
     1 + fm_lines + 1 + 1
 }
 
+fn strip_open_fence(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("---")?;
+    let nl = rest.find('\n')?;
+    let mut head = &rest[..nl];
+    if let Some(stripped) = head.strip_suffix('\r') {
+        head = stripped;
+    }
+    if !is_fence_padding(head) {
+        return None;
+    }
+    Some(&rest[nl + 1..])
+}
+
 fn split_close(rest: &str) -> Option<(&str, &str)> {
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed == "---" {
+        if is_yaml_fence_line(trimmed) {
             return Some((&rest[..offset], &rest[offset + line.len()..]));
         }
         offset += line.len();
     }
     None
+}
+
+fn is_yaml_fence_line(line: &str) -> bool {
+    line.strip_prefix("---").is_some_and(is_fence_padding)
+}
+
+fn is_fence_padding(s: &str) -> bool {
+    s.bytes().all(|b| b == b' ' || b == b'\t')
 }
 
 fn unquote(s: &str) -> String {
@@ -547,13 +554,41 @@ mod tests {
     }
 
     #[test]
+    fn fences_allow_trailing_ascii_spaces_and_tabs() {
+        let src =
+            "---   \nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: Ada\n---\t \n\nBody.\n";
+        let rec = parse_record(src, "x.md").unwrap();
+        assert_eq!(rec.name.as_deref(), Some("Ada"));
+        assert_eq!(rec.body.trim(), "Body.");
+        assert_eq!(rec.body_start_line, 6);
+    }
+
+    #[test]
+    fn fences_allow_trailing_ascii_spaces_and_tabs_crlf() {
+        let src = "---  \t\r\nid: p-01M3TC5H00MPJG000000000000\r\ntype: person\r\nname: Ada\r\n---\t\r\n\r\nBody.\r\n";
+        let rec = parse_record(src, "x.md").unwrap();
+        assert_eq!(rec.name.as_deref(), Some("Ada"));
+        assert_eq!(rec.body.trim(), "Body.");
+        assert_eq!(rec.body_start_line, 6);
+    }
+
+    #[test]
+    fn four_dashes_is_not_a_fence() {
+        assert!(parse_record(
+            "----\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n---\n",
+            "x.md"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn bom_shares_frontmatter_offsets() {
         let inner = "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n---\n\nBody.\n";
         let with_bom = format!("\u{feff}{inner}");
         let rec = parse_record(&with_bom, "x.md").unwrap();
         assert_eq!(rec.body_start_line, 5);
-        assert_eq!(super::source_body_start_line(&with_bom), Some(5));
-        assert_eq!(super::source_body_start_line(inner), Some(5));
+        let rec_plain = parse_record(inner, "x.md").unwrap();
+        assert_eq!(rec_plain.body_start_line, 5);
         assert_eq!(
             super::frontmatter_line_spec_key("person: p-01M3TC5H00MPJG000000000000"),
             Some("person".into())
