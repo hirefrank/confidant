@@ -417,6 +417,18 @@ fn verify_inbox_signatures(repo: &Path, trusted: &[String]) -> anyhow::Result<()
     if trusted.is_empty() {
         return Ok(());
     }
+    // Merge commits are not expanded by `git log -- <file>` (merge diffs are
+    // suppressed by default), so a merge that rewrites an item would escape
+    // the per-file provenance walk below: the log would show only the
+    // original (signed) add while the tip holds tampered bytes. The inbox is
+    // append-only and linear by design, so any merge on the branch is a
+    // policy violation. Fail closed.
+    let merges = git_line(repo, &["rev-list", "--merges", "--count", INBOX_BRANCH])?;
+    if merges != "0" {
+        return Err(anyhow::Error::new(DomainError::inbox_untrusted(
+            "inbox branch contains merge commits; the inbox is append-only and linear",
+        )));
+    }
     for name in list_items(repo)? {
         let file = format!("{name}.age");
         let log = git_line(

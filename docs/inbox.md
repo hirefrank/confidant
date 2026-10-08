@@ -123,7 +123,8 @@ dropping a malicious item would pass as soon as a trusted signer commits on
 top of it. The check traces the provenance of each item file at the tip —
 every commit that added, modified, or renamed it, back to its most recent
 add — so a forged clear-looking commit cannot truncate the verification
-window either. The `[trust]` table lives in the user config — outside the
+window either. Merge commits are refused outright: the inbox is append-only
+and linear, and merge diffs would escape the per-file walk. The `[trust]` table lives in the user config — outside the
 vault, never inside it. With no signers configured the run **refuses**
 unless `--allow-unsigned` is passed; warn-and-proceed is fail-open and is
 gone.
@@ -144,7 +145,9 @@ The run, in order:
 4. Trust: with no `[trust]` signers configured the run refuses
    (`E_INBOX_UNTRUSTED`) unless `--allow-unsigned` is passed. Otherwise every
    commit that adds or changes an item must carry a valid signature from a
-   trusted signer (`E_INBOX_UNTRUSTED`).
+   trusted signer (`E_INBOX_UNTRUSTED`). The inbox branch is append-only and
+   linear: any merge commit on it is refused (`E_INBOX_UNTRUSTED`), because
+   merge diffs are invisible to the per-file provenance walk.
 5. Decrypt and parse every item (`E_INBOX_CRYPTO`, `E_INBOX_ITEM`).
 6. Plan the merge. Ledger lines are appended to `ledger/YYYY/MM.cfd` by entry
    date. Intake is limited on purpose:

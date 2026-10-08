@@ -393,3 +393,143 @@ fn forged_clear_commit_does_not_shield_unsigned_item() {
         .expect_err("expected E_INBOX_UNTRUSTED despite forged clear");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
 }
+
+#[test]
+fn merge_commit_on_inbox_refuses() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAB.age", LEDGER_ITEM)]);
+    // Attacker merges a side branch that rewrites the item. Merge diffs are
+    // invisible to `git log -- <file>`, so without the merge check the
+    // provenance walk would see only the original (unsigned, pre-merge) add.
+    git(r.root(), &["checkout", "-q", "inbox"]);
+    git(r.root(), &["checkout", "-qb", "side"]);
+    std::fs::write(r.root().join("01JAAB.age"), RECORD_ITEM).unwrap();
+    git(r.root(), &["add", "."]);
+    git(r.root(), &["commit", "-q", "-m", "tamper item"]);
+    git(r.root(), &["checkout", "-q", "inbox"]);
+    git(
+        r.root(),
+        &["merge", "-q", "--no-ff", "side", "-m", "merge side"],
+    );
+    git(r.root(), &["checkout", "-q", "main"]);
+    assert_eq!(
+        git_out(r.root(), &["rev-list", "--merges", "--count", "inbox"]),
+        "1"
+    );
+    let err = run_with(&r, vec!["DEADBEEF".to_string()], false, None)
+        .expect_err("expected E_INBOX_UNTRUSTED on merge commit");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("merge"), "unexpected message: {msg}");
+}
+
+/// Configure SSH commit signing on the test repo with a throwaway key.
+/// Returns the key fingerprint (the `SHA256:…` id operators are told to
+/// read via `git log --format=%GK`) plus the TempDir that owns the key
+/// files (must stay alive while signing). Returns None when ssh-keygen is
+/// unavailable — the caller skips the test.
+fn ssh_signing(r: &Repo) -> Option<(TempDir, String)> {
+    let keydir = TempDir::new().ok()?;
+    let key = keydir.path().join("key");
+    let gen = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-C", "inbox-e2e"])
+        .arg("-f")
+        .arg(&key)
+        .output()
+        .ok()?;
+    if !gen.status.success() {
+        return None;
+    }
+    let pubkey = std::fs::read_to_string(key.with_extension("pub")).ok()?;
+    // git verifies SSH signatures against allowedSignersFile, matched on the
+    // committer principal (the harness commits as test@example.com).
+    let allowed = keydir.path().join("allowed_signers");
+    std::fs::write(
+        &allowed,
+        format!("test@example.com namespaces=\"git\" {pubkey}"),
+    )
+    .ok()?;
+    let key_s = key.to_str()?.to_string();
+    let allowed_s = allowed.to_str()?.to_string();
+    for (k, v) in [
+        ("gpg.format", "ssh"),
+        ("user.signingkey", key_s.as_str()),
+        ("gpg.ssh.allowedSignersFile", allowed_s.as_str()),
+    ] {
+        git(r.root(), &["config", k, v]);
+    }
+    // The fingerprint is what `ssh-keygen -lf` (and `git log --format=%GK`)
+    // report: `256 SHA256:… inbox-e2e (ED25519)`.
+    let lf = Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(key.with_extension("pub"))
+        .output()
+        .ok()?;
+    let fingerprint = String::from_utf8_lossy(&lf.stdout)
+        .split_whitespace()
+        .nth(1)?
+        .to_string();
+    Some((keydir, fingerprint))
+}
+
+#[test]
+fn signed_tip_with_unsigned_add_refuses() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAB.age", LEDGER_ITEM)]);
+    let Some((_keep, fingerprint)) = ssh_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    // Sign only the tip: a second item added by a trusted signer. The old
+    // tip-only check would pass this; per-file provenance must still fail on
+    // the unsigned add of 01JAAB.age.
+    git(r.root(), &["checkout", "-q", "inbox"]);
+    std::fs::write(r.root().join("01JAAC.age"), RECORD_ITEM).unwrap();
+    git(r.root(), &["add", "."]);
+    git(r.root(), &["commit", "-q", "-S", "-m", "drop another item"]);
+    git(r.root(), &["checkout", "-q", "main"]);
+    // The documented operator workflow: the id git reports (%GK) is the id
+    // that goes in [trust] signers. Assert the formats agree.
+    let reported = git_out(r.root(), &["log", "-1", "--format=%GK", "inbox"]);
+    assert_eq!(
+        reported, fingerprint,
+        "%GK must match the documented signer id"
+    );
+    assert!(
+        reported.starts_with("SHA256:"),
+        "unexpected %GK: {reported}"
+    );
+
+    let err = run_with(&r, vec![fingerprint], false, None)
+        .expect_err("expected E_INBOX_UNTRUSTED: item add is unsigned");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("is not signed by a trusted signer"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[test]
+fn all_signed_proceeds() {
+    let r = Repo::new();
+    // Both items: the ledger line references the note, so the merged vault
+    // passes check (as in merge_commit_and_clear).
+    r.with_inbox(&[("01JAAB.age", LEDGER_ITEM), ("01JAAC.age", RECORD_ITEM)]);
+    let Some((_keep, fingerprint)) = ssh_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    // Sign the items' add commit itself (amend), so every commit in each
+    // item's provenance carries a trusted signature.
+    git(r.root(), &["checkout", "-q", "inbox"]);
+    git(r.root(), &["commit", "-q", "-S", "--amend", "--no-edit"]);
+    git(r.root(), &["checkout", "-q", "main"]);
+    let reported = git_out(r.root(), &["log", "-1", "--format=%GK", "inbox"]);
+    assert_eq!(reported, fingerprint);
+
+    let report =
+        run_with(&r, vec![fingerprint], false, None).expect("all-signed run should proceed");
+    assert_eq!(report.merged, 2);
+    assert_eq!(report.cleared, 2);
+}
