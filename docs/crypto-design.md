@@ -11,7 +11,7 @@ trust Confidant with client data (public launch).
 and how keys are created, shared, rotated, revoked, shredded, and recovered.
 Out of scope: QMD search (issue #8), write commands and the agent contract
 (issue #10), release (ADR-14). The inbox keypair design (issue #36) is in
-scope as §8a.
+scope as this doc's §8a.
 
 **Sources:** `docs/architecture.md` §§7 (ADRs 1–15), 8, 8a, 9, 9b (binding),
 `docs/research/cr-spike.md` (ADR-13), `spec/0.1.md`, the `confidant-crypt`
@@ -331,14 +331,18 @@ expires = "2026-11-08"
 - **Crypto-shred** (`confidant keys shred p-<ULID>`): shredding is key
   destruction, not just deletion. (1) Delete every wrapped copy of that
   client's data keys (all epochs) from the working tree and the local key
-  cache, and commit the deletion. (2) Rotate **every** recipient keypair
-  that ever held a wrapping of the shredded key — device keys, agent keys,
-  the recovery identity, **and the inbox key** (§8a: cleared items stay in
-  the inbox branch history encrypted to the old inbox key, and opaque item
-  names can't tie them to the shredded client): generate new keypairs,
-  re-wrap all remaining client keys (and the vault lookup key) to the new
-  recipients, and re-sign the manifests. (3) Destroy the old private keys
-  (remove from OS keychains / secret stores / paper). Git history still contains the
+  cache, and commit the deletion. (2) Rotate every recipient keypair that
+  ever held a wrapping of the shredded key — device keys, agent keys, and
+  the recovery identity: generate new keypairs, re-wrap all remaining
+  client keys (and the vault lookup key) to the new recipients, and
+  re-sign the manifests. (2b) Start an inbox key rotation (§8a):
+  `confidant inbox rotate` on the inbox device. The inbox key never holds
+  a client-key wrapping and is never a re-wrap target — it rotates because
+  cleared items stay in the inbox branch history encrypted to the old
+  inbox key, and opaque item names can't tie them to the shredded client.
+  (3) Destroy the old private keys (remove from OS keychains / secret
+  stores / paper) — except the old inbox key, which is destroyed by
+  `inbox rotate --finish`, not at this moment. Git history still contains the
   old wrappings, but no surviving private key can unwrap them — which is
   how ADR-4's "unreadable everywhere, including git history and backups"
   is delivered without a history rewrite. This is deliberately heavyweight;
@@ -374,8 +378,12 @@ vault-wide keypair:
    key was also rotated — the heavyweight §8 shred path. The inbox key
    only stays cheap to destroy if it never enters git. A lost device costs
    at most the un-imported batch: outside tools keep the source until the
-   operator confirms a verified import, so the operator rotates, re-pins,
-   and the tools drop those items again from source.
+   operator confirms a verified import. When the old key is unavailable
+   (lost, compromised, or revoked inbox device), `inbox rotate` generates
+   the new keypair on the new inbox device, skips the drain and `--finish`
+   (there is no old private key to drain with), and old-key items fail
+   closed with `E_INBOX_CRYPTO`; the operator re-pins the tools and the
+   tools drop those items again from source.
 3. **Rotation: not after every import.** Rotating per import would force a
    manual re-pin of every outside tool after every run, and any tool that
    drops an item before re-pinning encrypts to a destroyed key — the form
@@ -395,11 +403,15 @@ vault-wide keypair:
    branch history, encrypted to whatever inbox key was current, and item
    names are opaque — we can't tell which past items belonged to the
    shredded client. So **every `keys shred` also rotates the inbox key and
-   destroys the old one** (added to §8 step 2 above). A shred isn't
+   destroys the old one** (added to §8 step 2b above). A shred isn't
    complete until `inbox rotate --finish` has run; `keys shred` says so
    plainly and lists it among its leftover limits until then. Once the old
    inbox key is destroyed, the old form answers in history are unreadable
-   without rewriting history — the same argument as #15.
+   without rewriting history — the same argument as #15. A `keys shred`
+   run on a device that doesn't hold the inbox key records the pending
+   inbox rotation, tells the operator to run `confidant inbox rotate` on
+   the inbox device, and stays incomplete until `inbox rotate --finish`
+   has run there.
 5. **Revocation.** The inbox key lives on one device, so revoking that
    device means a mandatory inbox rotation. Revoking other devices doesn't
    touch it.
@@ -428,7 +440,8 @@ vault-wide keypair:
 - `confidant recover`: enter the phrase → derive the recovery identity →
   unwrap all client data keys → wrap them to a fresh device key → rotate to
   a fresh recovery identity and revoke the old one. Works from a clean
-  clone with nothing but the phrase.
+  clone with nothing but the phrase. It does not restore the inbox key:
+  run `inbox rotate` on the new device and re-pin (§8a).
 
 ## 10. Alias HMAC
 
@@ -541,11 +554,13 @@ in the repo, tests, or CI.
     (old-then-new); after `inbox rotate --finish`, the old private key is
     gone from the keychain and an item sent to the old key fails closed
     with `E_INBOX_CRYPTO`.
-18. **Shred triggers inbox rotation:** after `keys shred`, the inbox key
-    has been rotated and the old private key destroyed; the shredded
-    client's old form answers in inbox history are unreadable, and
-    `keys shred` lists the pending `inbox rotate --finish` among its
-    leftover limits until it runs.
+18. **Shred triggers inbox rotation (drain-then-destroy):** right after
+    `keys shred`, the new inbox keypair is active (pins updated), the old
+    private key is still present in the keychain, and the output lists the
+    pending `inbox rotate --finish` among its leftover limits. After
+    `inbox rotate --finish`, the old key is gone from the keychain, the
+    shredded client's old form answers in inbox history are unreadable,
+    and an item sent to the old key fails closed with `E_INBOX_CRYPTO`.
 
 ## 13. What changes in the spec
 
@@ -712,3 +727,19 @@ identity); §9's HKDF `info` strings now match §15 Q6 and the implementation
 states the two revocation facts separately per the #21 wording nit
 (still-authorized parties keep reading all retained epochs; the revoked
 party can still decrypt what it copied before revocation).
+
+## 21. Inbox-key precision round (2026-10-08)
+
+Per Silas's second "change" review of PR #60: §8 step 2 splits the inbox
+key out as its own sub-step (2b) — it never holds a client-key wrapping
+and is never a re-wrap target — and step 3 notes the old inbox key is
+destroyed by `inbox rotate --finish`, not with the other old keys; test
+18 asserts both states (after `keys shred`: new keypair active, old key
+still present, pending `--finish` listed; after `--finish`: old key gone,
+old-key items fail `E_INBOX_CRYPTO`); §8a specifies the lost-key path
+(old key unavailable → new keypair generated on the new inbox device,
+drain and `--finish` skipped) and the non-inbox-device shred case
+(records the pending rotation, tells the operator to run it on the inbox
+device, stays incomplete until then); §9 notes `confidant recover` does
+not restore the inbox key (run `inbox rotate` on the new device and
+re-pin); the Scope line says "this doc's §8a".
