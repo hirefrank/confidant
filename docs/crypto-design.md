@@ -63,6 +63,19 @@ recovery identity (ADR-15) ................ 24-word phrase ->
   recovery can authorize the new device's recipient manifest)
 ```
 
+**Record-type-to-key mapping.** Person (`p-`), note (`n-`), and interaction
+(`i-`) records — and deal (`d-`) records whose `person` field is set —
+encrypt under that person’s data key (`p-…/eN`, §5), the same way notes
+and interactions work. If a deal’s `person` changes, the writer re-encrypts
+it under the new person’s current epoch in the same signed commit, so
+shredding a client (§8) destroys their deals too. Org (`o-`) records and
+deals with no `person` use one fixed vault-level client key,
+`client_id = "vault:shared"`, kept under `keys/shared/`: it runs the same
+machinery as `vault:lookup` — a manifest v2 with `seq`, commitments,
+rotation, revocation, and recovery wrapping — and never routes through the
+operator’s own person record, keeping agent scopes clean. An agent gets
+`vault:shared` only when its scope names it.
+
 No passwords, no KDF-over-passphrase for content keys: device keys live in
 the OS keychain (or the agent host's secret store) on trusted devices with
 encrypted disks, matching the existing "plaintext only on trusted devices"
