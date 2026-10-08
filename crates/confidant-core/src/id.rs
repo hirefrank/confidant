@@ -241,9 +241,11 @@ impl IdToken {
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
 /// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
 /// inside junk such as `[[p-…]]`. Format characters (ZWSP, soft hyphen,
-/// word joiner, …) are stripped first. After an ASCII alphanumeric, only a
-/// Valid token (`-` plus an exact ULID) matches; malformed lookalikes and
-/// the over-32 tail rule apply only at a word boundary.
+/// word joiner, …) are stripped first. A prefix is glued (only a Valid
+/// token: `-` plus an exact ULID) after an ASCII alphanumeric or `_`, when
+/// the `-` before it follows an alphanumeric, `_`, or `-` in the same run,
+/// or when it sits inside a `scheme://` token. Malformed lookalikes and the
+/// over-32 tail rule apply only at a word boundary.
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
@@ -256,21 +258,48 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mut out = Vec::new();
     let mut remaining = text;
     let mut prev: Option<char> = None;
+    let mut prev2: Option<char> = None;
+    let mut offset = 0usize;
     while !remaining.is_empty() {
-        let glued = prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let glued = prefix_is_glued(text, offset, prev, prev2);
         if starts_id_prefix(remaining) {
             if let Some((tok, len)) = match_id_token_at(remaining, glued) {
                 out.push(tok);
                 remaining = &remaining[len..];
+                offset += len;
+                prev2 = prev;
                 prev = Some('0');
                 continue;
             }
         }
         let ch = remaining.chars().next().unwrap();
+        let n = ch.len_utf8();
+        prev2 = prev;
         prev = Some(ch);
-        remaining = &remaining[ch.len_utf8()..];
+        remaining = &remaining[n..];
+        offset += n;
     }
     out
+}
+
+fn prefix_is_glued(text: &str, offset: usize, prev: Option<char>, prev2: Option<char>) -> bool {
+    if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return true;
+    }
+    if prev == Some('-') && prev2.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return true;
+    }
+    in_scheme_token(text, offset)
+}
+
+fn in_scheme_token(text: &str, offset: usize) -> bool {
+    let before = &text[..offset];
+    let start = match before.rfind(|c: char| c.is_whitespace()) {
+        Some(i) => i + text[i..].chars().next().unwrap().len_utf8(),
+        None => 0,
+    };
+    text[start..offset].contains("://")
 }
 
 /// U+00AD after an ID prefix is a dash, not a format character to strip.
@@ -388,7 +417,7 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         let total = plen + run_start + run_len;
         let run = &after[run_start..run_start + run_len];
         if glued {
-            // After an alphanumeric or `_`, only '-' plus an exact ULID is an ID.
+            // Glued prefixes: only '-' plus an exact ULID is an ID.
             if dash != '-' || run_len != ULID_LEN {
                 continue;
             }
@@ -630,6 +659,24 @@ mod tests {
         assert!(scan_id_tokens(&format!("My-Page-p-{hex32}")).is_empty());
         assert!(scan_id_tokens("_p-1BxiMVs0XRA5nFMdKvBdBZjgmUU").is_empty());
         assert!(scan_id_tokens("-n-1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms").is_empty());
+        assert!(scan_id_tokens(
+            "docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit"
+        )
+        .is_empty());
+        assert!(
+            scan_id_tokens("drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view")
+                .is_empty()
+        );
+        assert!(scan_id_tokens(
+            "https://docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit"
+        )
+        .is_empty());
+        assert!(scan_id_tokens("https://example.com/n-GYboXeYBl8cpDlwjVptoB").is_empty());
+        let hidden = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(
+            scan_id_tokens("https://drive.google.com/file/d/p-01M3TC5H00MPJG000000000000/view"),
+            vec![IdToken::Valid(hidden)]
+        );
     }
 
     #[test]

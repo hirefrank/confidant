@@ -120,6 +120,13 @@ as_of = "2026-10-08"
     assert_eq!(v["error"]["code"], "E_LEDGER_UNREADABLE");
     assert_eq!(v["error"]["message"], "1 items");
     assert!(v["error"].get("file").is_none(), "{v}");
+    assert!(
+        v["error"]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("run `confidant check` to locate it"),
+        "{v}"
+    );
     assert!(v.get("matches").is_none(), "{v}");
 }
 

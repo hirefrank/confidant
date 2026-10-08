@@ -2053,6 +2053,12 @@ fn find_refuses_when_ledger_file_unreadable() {
     assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
     assert_eq!(err.message(), "1 items");
     assert!(err.file().is_none(), "{err:?}");
+    assert_eq!(
+        err.fix().as_deref(),
+        Some(
+            "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it"
+        )
+    );
     let json = report_json(dir.path(), None);
     assert!(codes(&json).contains(&"E_UNREADABLE".into()), "{json}");
     let dumped = json.to_string();
@@ -2413,4 +2419,187 @@ fn find_keeps_wikilink_alias_and_tilde_person() {
     );
     let json = report_json(dir.path(), None);
     assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+}
+
+#[test]
+fn wikilink_and_comment_person_count_for_ownership_and_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: \"[[{ADA}|Ada]]\"\ndate: 2026-10-01\n---\n\nsession note\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE2}.md"),
+        &format!(
+            "---\nid: {NOTE2}\ntype: note\nperson: \"{ADA} # comment\"\ndate: 2026-10-02\n---\n\ncoverage note\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 session {ADA} 60m paid note:{NOTE}\n2026-10-02 session {ADA} 60m paid\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(!c.contains(&"E_UNKNOWN_RECORD".into()), "{json}");
+    assert!(!c.contains(&"E_SESSION_WITHOUT_NOTES".into()), "{json}");
+    assert!(!c.contains(&"E_ID_PATH_MISMATCH".into()), "{json}");
+}
+
+#[test]
+fn bare_pipe_person_is_invalid_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nperson: {ADA}|Ada\n---\n\nbare-pipe-note-token\n"),
+    );
+    let result = search_q(dir.path(), "bare-pipe-note-token");
+    assert!(
+        !token_in_hits(&result, "bare-pipe-note-token"),
+        "{result:?}"
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+}
+
+#[test]
+fn yaml_null_person_is_not_a_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nperson: null\n---\n\nnull-person-token\n"),
+    );
+    let result = search_q(dir.path(), "null-person-token");
+    assert!(token_in_hits(&result, "null-person-token"), "{result:?}");
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(!codes(&json).contains(&"E_DANGLING_REF".into()), "{json}");
+}
+
+#[test]
+fn find_keeps_docs_and_drive_url_lookalikes() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nsee https://docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit docs-url-token\nsee drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view drive-url-token\n"
+        ),
+    );
+    let a = search_q(dir.path(), "docs-url-token");
+    let b = search_q(dir.path(), "drive-url-token");
+    assert!(token_in_hits(&a, "docs-url-token"), "{a:?}");
+    assert!(token_in_hits(&b, "drive-url-token"), "{b:?}");
+}
+
+#[test]
+fn find_drops_line_when_hidden_person_id_is_inside_url() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-drive-hidden-token\nsee https://drive.google.com/file/d/{ADA}/view dropped-drive-hidden-token\nstill-drive-hidden-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-drive-hidden-token");
+    let visible = search_q(dir.path(), "visible-drive-hidden-token");
+    let still = search_q(dir.path(), "still-drive-hidden-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-drive-hidden-token"),
+        "{dropped:?}"
+    );
+    assert!(
+        token_in_hits(&visible, "visible-drive-hidden-token"),
+        "{visible:?}"
+    );
+    assert!(
+        token_in_hits(&still, "still-drive-hidden-token"),
+        "{still:?}"
+    );
+}
+
+#[test]
+fn find_excludes_bulleted_merge_into_no_ai() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nbulleted-merge-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("- 2026-10-01 merge {BEA} into {ADA}\n"),
+    );
+    let result = search_q(dir.path(), "bulleted-merge-token");
+    assert!(
+        !token_in_hits(&result, "bulleted-merge-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_keeps_person_when_misfiled_note_has_path_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nada-profile-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nada-ok-note-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE2}.md"),
+        &format!(
+            "---\nid: {NOTE2}\ntype: note\nperson: {BEA}\ndate: 2026-10-02\n---\n\nmisfiled-note-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nbea-profile-token\n"),
+    );
+    let profile = search_q(dir.path(), "ada-profile-token");
+    let ok_note = search_q(dir.path(), "ada-ok-note-token");
+    let misfiled = search_q(dir.path(), "misfiled-note-token");
+    let bea = search_q(dir.path(), "bea-profile-token");
+    assert!(token_in_hits(&profile, "ada-profile-token"), "{profile:?}");
+    assert!(token_in_hits(&ok_note, "ada-ok-note-token"), "{ok_note:?}");
+    assert!(
+        !token_in_hits(&misfiled, "misfiled-note-token"),
+        "{misfiled:?}"
+    );
+    assert!(token_in_hits(&bea, "bea-profile-token"), "{bea:?}");
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_ID_PATH_MISMATCH".into()),
+        "{json}"
+    );
 }

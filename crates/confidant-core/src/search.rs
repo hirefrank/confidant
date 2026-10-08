@@ -198,9 +198,6 @@ fn still_cleared(
     pkg_openers: &HashMap<RecordId, Vec<RecordId>>,
 ) -> bool {
     if id.prefix() == Prefix::Package {
-        if allow.vault.ledger_unread {
-            return false;
-        }
         return pkg_openers
             .get(id)
             .is_some_and(|openers| pkg_is_clear(openers, cleared));
@@ -233,19 +230,6 @@ fn still_cleared(
             .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared))
         {
             return false;
-        }
-    }
-    if allow.vault.ledger_unread {
-        if id.prefix() == Prefix::Note {
-            match &facts.path_person {
-                Some(person) if cleared.contains(person) => {}
-                _ => return false,
-            }
-        }
-        if let Some(members) = components.members_of(id) {
-            if members.len() > 1 {
-                return false;
-            }
         }
     }
     true
@@ -293,11 +277,13 @@ fn tainted_ids(vault: &Vault) -> HashSet<RecordId> {
         }
         if let Some(id) = &finding.id {
             if let Ok(rid) = RecordId::parse(id) {
-                tainted.insert(rid);
+                tainted.insert(rid.clone());
+                if rid.prefix() == Prefix::Person {
+                    if let Some(file) = &finding.file {
+                        tainted.extend(scan_ids(file));
+                    }
+                }
             }
-        }
-        if let Some(file) = &finding.file {
-            tainted.extend(scan_ids(file));
         }
     }
     tainted

@@ -74,12 +74,14 @@ pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
 /// Case-folded verb on a ledger line. On any non-comment line, the verb is
 /// the first or second whitespace token with a trailing `:` stripped, whether
 /// or not a date parses (`2026-10-3 merge`, `merge:`, a merge with no date).
+/// A leading Markdown bullet (`*`, `-`, or `+` plus whitespace) is skipped.
 pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
     let stripped = strip_cf(text);
     let trimmed = stripped.trim();
     if trimmed.starts_with('#') || trimmed.starts_with(';') {
         return None;
     }
+    let trimmed = skip_markdown_bullet(trimmed);
     let mut toks = trimmed.split_whitespace();
     let first = toks.next()?;
     let second = toks.next();
@@ -93,6 +95,21 @@ pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
         return Some(second);
     }
     None
+}
+
+fn skip_markdown_bullet(s: &str) -> &str {
+    let Some(first) = s.as_bytes().first() else {
+        return s;
+    };
+    if !matches!(first, b'*' | b'-' | b'+') {
+        return s;
+    }
+    let rest = &s[1..];
+    if rest.starts_with(' ') || rest.starts_with('\t') {
+        rest.trim_start_matches([' ', '\t'])
+    } else {
+        s
+    }
 }
 
 impl LedgerEntry {
@@ -475,6 +492,27 @@ mod tests {
             .any(|a| matches!(a, Arg::Token(s) if s == "duplicate account")));
         let again = parse_line(&format_entry(&parsed)).unwrap().unwrap();
         assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn ledger_line_verb_skips_markdown_bullets() {
+        let merge =
+            "2026-10-01 merge p-01M3TC5H00MPJG000000000000 into p-01M3TC5H00MPJG000H24000001";
+        let open = "2026-10-01 open p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 6 sessions";
+        assert_eq!(
+            super::ledger_line_verb(&format!("- {merge}")),
+            Some("merge".into())
+        );
+        assert_eq!(
+            super::ledger_line_verb(&format!("* {open}")),
+            Some("open".into())
+        );
+        assert_eq!(
+            super::ledger_line_verb(&format!("+\t{merge}")),
+            Some("merge".into())
+        );
+        assert_eq!(super::ledger_line_verb("-nomerge"), None);
+        assert_eq!(super::ledger_line_verb(merge), Some("merge".into()));
     }
 
     #[test]

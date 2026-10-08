@@ -41,9 +41,8 @@ pub struct Vault {
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
     pub load_findings: Vec<Finding>,
-    /// True when any ledger path could not be read. `find` then refuses.
-    pub ledger_unread: bool,
     /// Number of unreadable ledger paths (code+count only; never a path).
+    /// `find` refuses when this is greater than zero.
     pub ledger_unread_count: u32,
 }
 
@@ -100,7 +99,6 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         entries,
         ledger_lines,
         load_findings: findings,
-        ledger_unread: ledger_unread_count > 0,
         ledger_unread_count,
     })
 }

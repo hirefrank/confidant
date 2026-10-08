@@ -128,7 +128,9 @@ impl DomainError {
 
     pub fn ledger_unreadable(count: u32) -> Self {
         Self::new(ErrorKind::LedgerUnreadable, format!("{count} items"))
-            .with_fix("Fix permissions or replace the unreadable ledger file, then re-run find")
+            .with_fix(
+                "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it",
+            )
     }
 
     pub fn with_file(mut self, file: impl Into<String>) -> Self {
@@ -276,6 +278,12 @@ mod tests {
         );
         assert_eq!(DomainError::ledger_unreadable(2).message(), "2 items");
         assert!(DomainError::ledger_unreadable(2).file().is_none());
+        assert_eq!(
+            DomainError::ledger_unreadable(2).fix().as_deref(),
+            Some(
+                "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it"
+            )
+        );
         assert_eq!(DomainError::vault_not_found().code(), "E_VAULT_NOT_FOUND");
         assert_eq!(DomainError::vault_not_found().exit_code(), 1);
         assert_eq!(

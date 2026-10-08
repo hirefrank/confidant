@@ -13,9 +13,9 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is not compiled into this CLI. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). Check reports the line number and, when the key is a known spec key, the key name; it never echoes the token. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key, the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
-| `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID. |
+| `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
 | `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, `note:` is not a note, or a `merge` folds one record type into another. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
@@ -47,14 +47,17 @@ demote, or turn a rule `off` where the table says "configurable".
 
 `confidant find` uses the same codes and the section 12 allowlist: only
 cleared records and ledger lines are searchable. A note is cleared only
-when every ledger line that names it is allowed. A finding is kept
+when every ledger line that names it is allowed. A leading Markdown
+bullet (`*`, `-`, or `+` plus whitespace) is skipped before detecting a
+`merge` or `open` verb. A finding is kept
 verbatim only when it has no file and no ID, or when it resolves to a
 cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,
 key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
 is code and count only. Name-only mentions with no ID are not detected
 in body prose and comments; a `person` / `org` / `deal` value that is
-not a record ID is `E_INVALID_ID` and uncleared. Ledger parse errors
+not a record ID (including a bare `p-A|Name` pipe alias) is `E_INVALID_ID`
+and uncleared. Empty, `~`, and YAML `null` are not references. Ledger parse errors
 give the line number and code without echoing tokens. If any ledger file
 cannot be read, `find` does not scan: command error `E_LEDGER_UNREADABLE`
 (code and count only). `check` still reports `E_UNREADABLE`.

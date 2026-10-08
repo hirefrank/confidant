@@ -75,7 +75,10 @@ impl Record {
     }
 
     pub fn person(&self) -> Option<RecordId> {
-        self.field("person").and_then(|s| RecordId::parse(s).ok())
+        match parse_ref_id(self.field("person")?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
     }
 
     pub fn no_ai(&self) -> bool {
@@ -131,39 +134,50 @@ pub(crate) fn is_spec_key(key: &str) -> bool {
 /// Result of parsing a `person` / `org` / `deal` front-matter value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FrontmatterRef {
-    /// Missing, empty, or YAML `~`.
+    /// Missing, empty, YAML `~`, or YAML `null`.
     Absent,
     Id(RecordId),
     Invalid,
 }
 
 /// Parse a `person` / `org` / `deal` front-matter value as a record ID after
-/// stripping format characters, surrounding quotes, a trailing ` # comment`,
-/// and `[[id|Alias]]`. Empty and `~` are [`FrontmatterRef::Absent`].
+/// stripping format characters, surrounding quotes, a trailing comment
+/// introduced by a space or tab then `#`, and `[[id|Alias]]` only inside
+/// `[[…]]`. Empty, `~`, and YAML `null` are [`FrontmatterRef::Absent`].
 pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
     let stripped = strip_cf(raw);
     let unquoted = unquote(stripped.trim());
     let mut trimmed = unquoted.trim();
-    if let Some(idx) = trimmed.find(" #") {
+    if let Some(idx) = ref_comment_start(trimmed) {
         trimmed = trimmed[..idx].trim();
     }
-    if trimmed.is_empty() || trimmed == "~" {
+    if trimmed.is_empty() || is_yaml_null(trimmed) {
         return FrontmatterRef::Absent;
     }
-    let inner = trimmed
+    let id_part = if let Some(inner) = trimmed
         .strip_prefix("[[")
         .and_then(|s| s.strip_suffix("]]"))
-        .unwrap_or(trimmed)
-        .trim();
-    let id_part = inner
-        .split_once('|')
-        .map(|(id, _)| id)
-        .unwrap_or(inner)
-        .trim();
+    {
+        inner
+            .split_once('|')
+            .map(|(id, _)| id)
+            .unwrap_or(inner)
+            .trim()
+    } else {
+        trimmed
+    };
     match RecordId::parse(id_part) {
         Ok(id) => FrontmatterRef::Id(id),
         Err(_) => FrontmatterRef::Invalid,
     }
+}
+
+fn ref_comment_start(s: &str) -> Option<usize> {
+    s.find(" #").into_iter().chain(s.find("\t#")).min()
+}
+
+fn is_yaml_null(s: &str) -> bool {
+    matches!(s, "~" | "null" | "Null" | "NULL")
 }
 
 pub(crate) fn frontmatter_line_spec_key(raw: &str) -> Option<String> {
@@ -668,5 +682,49 @@ mod tests {
             super::parse_ref_id("~ # comment"),
             super::FrontmatterRef::Absent
         );
+        assert_eq!(super::parse_ref_id("null"), super::FrontmatterRef::Absent);
+        assert_eq!(super::parse_ref_id("Null"), super::FrontmatterRef::Absent);
+        assert_eq!(super::parse_ref_id("NULL"), super::FrontmatterRef::Absent);
+        assert_eq!(
+            super::parse_ref_id("null # comment"),
+            super::FrontmatterRef::Absent
+        );
+        assert_eq!(
+            super::parse_ref_id("p-01M3TC5H00MPJG000000000000\t# comment"),
+            super::FrontmatterRef::Id(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("p-01M3TC5H00MPJG000000000000|Ada"),
+            super::FrontmatterRef::Invalid
+        );
+    }
+
+    #[test]
+    fn person_parses_wikilink_alias_and_comment() {
+        let id = crate::id::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        for person in [
+            "[[p-01M3TC5H00MPJG000000000000]]",
+            "[[p-01M3TC5H00MPJG000000000000|Ada]]",
+            "p-01M3TC5H00MPJG000000000000 # comment",
+            "p-01M3TC5H00MPJG000000000000\t# comment",
+        ] {
+            let src = format!(
+                "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: \"{person}\"\n---\n"
+            );
+            let rec = parse_record(&src, "x.md").unwrap();
+            assert_eq!(rec.person().as_ref(), Some(&id), "{person}");
+        }
+        let bare_pipe = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: p-01M3TC5H00MPJG000000000000|Ada\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(bare_pipe.person(), None);
+        let yaml_null = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: null\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(yaml_null.person(), None);
     }
 }
