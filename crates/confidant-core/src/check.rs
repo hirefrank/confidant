@@ -254,10 +254,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
             Finding::new(
                 FindingCode::SpecUnsupported,
                 Severity::Error,
-                format!(
-                    "vault spec '{}' is not supported (this CLI implements {SPEC_VERSION})",
-                    vault.config.spec
-                ),
+                format!("vault spec is not supported (this CLI implements {SPEC_VERSION})"),
             )
             .at_file("confidant.toml")
             .with_fix("Use spec = \"0.1\" or upgrade the CLI"),
@@ -270,7 +267,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
                 Finding::new(
                     FindingCode::PackUnknown,
                     Severity::Error,
-                    format!("unknown pack '{pack}'"),
+                    "unknown pack".to_owned(),
                 )
                 .at_file("confidant.toml")
                 .with_fix("Remove the pack or use a CLI that implements it"),
@@ -406,7 +403,7 @@ fn check_verbs_and_refs(
                 Finding::new(
                     FindingCode::UnknownVerb,
                     Severity::Error,
-                    format!("unknown verb '{}'", e.verb),
+                    "unknown verb".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
@@ -425,7 +422,7 @@ fn check_verbs_and_refs(
                     Finding::new(
                         FindingCode::WrongIdType,
                         Severity::Error,
-                        format!("{} requires a {} id, got '{}'", e.verb, want.as_str(), e.id),
+                        format!("requires a {} id", want.as_str()),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
@@ -440,7 +437,7 @@ fn check_verbs_and_refs(
                 Finding::new(
                     FindingCode::UnknownRecord,
                     Severity::Error,
-                    format!("ledger id '{}' has no record file", e.id),
+                    "ledger id has no record file".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
@@ -716,7 +713,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                 Finding::new(
                     FindingCode::Parse,
                     Severity::Error,
-                    format!("balance '{metric}' is missing a number"),
+                    "balance line is missing a number".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
@@ -731,7 +728,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                         Finding::new(
                             FindingCode::UnknownMetric,
                             Severity::Error,
-                            format!("metric '{metric}' requires packs = [\"coaching@0.1\"]"),
+                            "metric requires packs = [\"coaching@0.1\"]".to_owned(),
                         )
                         .at_file(&sourced.file)
                         .at_line(sourced.line)
@@ -741,12 +738,12 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                     continue;
                 }
             }
-            other => {
+            _ => {
                 findings.push(
                     Finding::new(
                         FindingCode::UnknownMetric,
                         Severity::Error,
-                        format!("unknown metric '{other}'"),
+                        "unknown metric".to_owned(),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
@@ -765,7 +762,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                         Finding::new(
                             FindingCode::Parse,
                             Severity::Error,
-                            format!("'{number}' is not an integer"),
+                            "expected integer".to_owned(),
                         )
                         .at_file(&sourced.file)
                         .at_line(sourced.line)
@@ -796,7 +793,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                     Finding::new(
                         FindingCode::Parse,
                         Severity::Error,
-                        format!("'{number}' is not a decimal number"),
+                        "expected decimal".to_owned(),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
@@ -811,7 +808,8 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                         FindingCode::BalanceMismatch,
                         Severity::Error,
                         format!(
-                            "icf_hours asserted {number}, computed {}",
+                            "icf_hours asserted {}, computed {}",
+                            format_hundredths(asserted),
                             format_hundredths(computed)
                         ),
                     )
@@ -907,12 +905,12 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
         let Some(src) = sourced.entry.pair("src") else {
             continue;
         };
-        if let Some((file, line)) = seen.get(src) {
+        if seen.contains_key(src) {
             findings.push(
                 Finding::new(
                     FindingCode::DuplicateSrc,
                     Severity::Error,
-                    format!("src:{src} already appears at {file}:{line}"),
+                    "src: already appears on another line".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)

@@ -211,17 +211,23 @@ pub fn is_ulid(s: &str) -> bool {
     canonicalize_ulid(s).is_some()
 }
 
-/// A token that looks like a record ID: type prefix, dash, alphanumeric run.
+/// A token that looks like a record ID: type prefix, dash, alphanumeric run,
+/// or a bare 26-character Crockford ULID at a word boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IdToken {
     Valid(RecordId),
     /// Prefix + dash + alphanumeric run that fails ULID validation.
     /// `candidate` is a recoverable ID when the lookalike embeds one:
-    /// a Unicode-dash run that canonicalizes, or the first 26 characters
+    /// a Unicode-dash run that canonicalizes, a dash run (`--`, soft
+    /// hyphen then `-`) followed by a ULID, or the first 26 characters
     /// of a longer run.
     Malformed {
         candidate: Option<RecordId>,
     },
+    /// Exact 26-character Crockford ULID at a word boundary. Resolved
+    /// against vault records during allowlist construction; ignored when
+    /// no record uses that ULID. No near-ULID / malformed rule.
+    BareUlid(String),
 }
 
 impl IdToken {
@@ -229,8 +235,16 @@ impl IdToken {
         match self {
             Self::Valid(id) => Some(id),
             Self::Malformed { candidate } => candidate.as_ref(),
+            Self::BareUlid(_) => None,
         }
         .into_iter()
+    }
+
+    pub(crate) fn bare_ulid(&self) -> Option<&str> {
+        match self {
+            Self::BareUlid(ulid) => Some(ulid.as_str()),
+            Self::Valid(_) | Self::Malformed { .. } => None,
+        }
     }
 
     pub(crate) fn is_malformed(&self) -> bool {
@@ -239,22 +253,22 @@ impl IdToken {
 }
 
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
-/// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
-/// inside junk such as `[[p-…]]`. Format characters (ZWSP, soft hyphen,
-/// word joiner, …) are stripped first. A prefix is glued after an ASCII
-/// alphanumeric or `_`, when the `-` before it follows an alphanumeric, `_`,
-/// or `-` in the same run, or when it sits inside a `scheme://` token. Glue
-/// is computed only at a prefix; scheme state is tracked incrementally per
-/// whitespace-delimited token. In a glued context a Valid token is `-` plus
-/// an exact ULID; a longer run whose first 26 characters are a ULID, or a
-/// Unicode dash plus a ULID, is Malformed with that candidate.
+/// Unicode dash plus an alphanumeric run), case-insensitively, and for a bare
+/// 26-character Crockford ULID at a word boundary. Finds IDs inside junk such
+/// as `[[p-…]]`. Format characters (ZWSP, soft hyphen, word joiner, …) are
+/// stripped first. A prefix is glued after an ASCII alphanumeric or `_`, when
+/// the `-` before it follows an alphanumeric, `_`, or `-` in the same run, or
+/// when it sits inside a `scheme://` token. Glue is computed only at a prefix;
+/// scheme state is tracked incrementally per whitespace-delimited token. In a
+/// glued context a Valid token is a single ASCII `-` plus an exact ULID; a
+/// longer run whose first 26 characters are a ULID, a Unicode dash plus a
+/// ULID, or a run of dashes (`--`, soft hyphen then `-`) plus a ULID, is
+/// Malformed with that candidate.
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
     let text = stripped.as_ref();
-    if !text.as_bytes().contains(&b'-')
-        && (!text.as_bytes().iter().any(|b| *b >= 0x80) || !text.chars().any(is_id_dash))
-    {
+    if !may_contain_id_token(text) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -273,6 +287,13 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
                 prev = Some('0');
                 continue;
             }
+        }
+        if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
+            out.push(tok);
+            remaining = &remaining[len..];
+            prev2 = prev;
+            prev = Some('0');
+            continue;
         }
         let ch = remaining.chars().next().unwrap();
         let n = ch.len_utf8();
@@ -387,13 +408,24 @@ fn starts_id_prefix(s: &str) -> bool {
     )
 }
 
-/// Valid IDs only; malformed lookalikes are skipped.
+fn may_contain_id_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.contains(&b'-') {
+        return true;
+    }
+    if text.len() >= ULID_LEN {
+        return true;
+    }
+    bytes.iter().any(|b| *b >= 0x80) && text.chars().any(is_id_dash)
+}
+
+/// Valid IDs only; malformed lookalikes and bare ULIDs are skipped.
 pub fn scan_ids(text: &str) -> Vec<RecordId> {
     scan_id_tokens(text)
         .into_iter()
         .filter_map(|tok| match tok {
             IdToken::Valid(id) => Some(id),
-            IdToken::Malformed { .. } => None,
+            IdToken::Malformed { .. } | IdToken::BareUlid(_) => None,
         })
         .collect()
 }
@@ -411,13 +443,11 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         let Some(after) = s.get(plen..) else {
             continue;
         };
-        let Some(dash) = after.chars().next() else {
-            continue;
-        };
-        if !is_id_dash(dash) {
+        let (dash_bytes, dash_count, single_ascii_dash) = dash_run(after);
+        if dash_count == 0 {
             continue;
         }
-        let run_start = dash.len_utf8();
+        let run_start = dash_bytes;
         let run_len = after[run_start..]
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(after.len() - run_start);
@@ -427,13 +457,13 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
             if is_32_lowercase_hex(run) {
                 continue;
             }
-            if dash == '-' && run_len == ULID_LEN {
+            if single_ascii_dash && run_len == ULID_LEN {
                 if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
                     return Some((IdToken::Valid(id), total));
                 }
             }
             if let Some(candidate) = lookalike_candidate(pref, run) {
-                if run_len > ULID_LEN || dash != '-' {
+                if run_len > ULID_LEN || !single_ascii_dash {
                     return Some((
                         IdToken::Malformed {
                             candidate: Some(candidate),
@@ -461,7 +491,7 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         if run_len < 20 {
             continue;
         }
-        if dash == '-' {
+        if single_ascii_dash {
             if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
                 return Some((IdToken::Valid(id), total));
             }
@@ -470,6 +500,47 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         return Some((IdToken::Malformed { candidate }, total));
     }
     None
+}
+
+/// Consecutive `is_id_dash` characters after a prefix count as one dash.
+/// Only a single ASCII `-` can produce a Valid token.
+fn dash_run(s: &str) -> (usize, usize, bool) {
+    let mut bytes = 0;
+    let mut count = 0;
+    let mut all_ascii_hyphen = true;
+    for c in s.chars() {
+        if !is_id_dash(c) {
+            break;
+        }
+        bytes += c.len_utf8();
+        count += 1;
+        if c != '-' {
+            all_ascii_hyphen = false;
+        }
+    }
+    (bytes, count, count == 1 && all_ascii_hyphen)
+}
+
+fn match_bare_ulid_at(s: &str, prev: Option<char>) -> Option<(IdToken, usize)> {
+    if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < ULID_LEN {
+        return None;
+    }
+    if !matches!(bytes[0], b'0'..=b'7') {
+        return None;
+    }
+    if bytes.len() > ULID_LEN && bytes[ULID_LEN].is_ascii_alphanumeric() {
+        return None;
+    }
+    let head = s.get(..ULID_LEN)?;
+    if !head.is_ascii() {
+        return None;
+    }
+    let ulid = canonicalize_ulid(head)?;
+    Some((IdToken::BareUlid(ulid), ULID_LEN))
 }
 
 fn is_32_lowercase_hex(run: &str) -> bool {
@@ -488,20 +559,30 @@ fn lookalike_candidate(pref: &str, run: &str) -> Option<RecordId> {
     }
 }
 
+/// Unicode Dash_Punctuation (Pd), plus U+00AD, U+2212, U+2043, U+30FC.
 pub(crate) fn is_id_dash(c: char) -> bool {
     matches!(
         c,
-        '-' | '\u{00ad}'
-            | '\u{2010}'
-            | '\u{2011}'
-            | '\u{2012}'
-            | '\u{2013}'
-            | '\u{2014}'
-            | '\u{2015}'
-            | '\u{2212}'
-            | '\u{fe58}'
-            | '\u{fe63}'
-            | '\u{ff0d}'
+        '-' | '\u{00ad}' | '\u{058a}' | '\u{05be}' | '\u{1400}' | '\u{1806}' | '\u{2010}'
+            ..='\u{2015}'
+                | '\u{2043}'
+                | '\u{2212}'
+                | '\u{2e17}'
+                | '\u{2e1a}'
+                | '\u{2e3a}'
+                | '\u{2e3b}'
+                | '\u{2e40}'
+                | '\u{2e5d}'
+                | '\u{301c}'
+                | '\u{3030}'
+                | '\u{30a0}'
+                | '\u{30fc}'
+                | '\u{fe31}'
+                | '\u{fe32}'
+                | '\u{fe58}'
+                | '\u{fe63}'
+                | '\u{ff0d}'
+                | '\u{10ead}'
     )
 }
 
@@ -719,6 +800,67 @@ mod tests {
             scan_id_tokens("Ana-p\u{2013}01M3TC5H00MPJG001248000002"),
             vec![malformed_cam]
         );
+    }
+
+    #[test]
+    fn scan_id_tokens_pd_dashes_and_dash_runs_are_malformed() {
+        use super::{scan_id_tokens, IdToken};
+        let cam = super::RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        let ulid = cam.ulid();
+        let malformed = IdToken::Malformed {
+            candidate: Some(cam.clone()),
+        };
+        for dash in [
+            '\u{058a}', '\u{05be}', '\u{1806}', '\u{2e17}', '\u{2e3a}', '\u{301c}', '\u{fe31}',
+            '\u{2043}', '\u{30fc}',
+        ] {
+            let text = format!("p{dash}{ulid}");
+            assert_eq!(
+                scan_id_tokens(&text),
+                vec![malformed.clone()],
+                "dash U+{:04X}",
+                dash as u32
+            );
+        }
+        assert_eq!(
+            scan_id_tokens(&format!("p--{ulid}")),
+            vec![malformed.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens(&format!("p\u{00ad}-{ulid}")),
+            vec![malformed.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens(&format!("p--{ulid}abc")),
+            vec![malformed.clone()]
+        );
+        assert!(scan_id_tokens("I-95").is_empty());
+        assert!(scan_id_tokens("I--95").is_empty());
+        assert!(scan_id_tokens(
+            "docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit"
+        )
+        .is_empty());
+        assert!(
+            scan_id_tokens("drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view")
+                .is_empty()
+        );
+        assert!(scan_id_tokens(
+            "https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef"
+        )
+        .is_empty());
+        assert_eq!(
+            scan_id_tokens(&format!("see {ulid}")),
+            vec![IdToken::BareUlid(ulid.to_owned())]
+        );
+        assert_eq!(
+            scan_id_tokens(&format!("src:\"zoom/{ulid}.vtt\"")),
+            vec![IdToken::BareUlid(ulid.to_owned())]
+        );
+        assert!(scan_id_tokens(&format!("see {ulid}abc")).is_empty());
+        assert!(scan_id_tokens(&format!("x{ulid}")).is_empty());
+        let hex32 = "0123456789abcdef0123456789abcdef";
+        assert!(scan_id_tokens(hex32).is_empty());
+        assert!(scan_id_tokens(&format!("Phase-I-{hex32}")).is_empty());
     }
 
     #[test]

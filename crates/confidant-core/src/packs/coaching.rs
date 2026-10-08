@@ -347,12 +347,7 @@ fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>>
     let n: i64 = match tokens[2].parse() {
         Ok(n) if n > 0 => n,
         Ok(_) => return None,
-        Err(_) => {
-            return Some(Err(OpenIssue::Malformed(format!(
-                "'{}' is not a positive integer",
-                tokens[2]
-            ))))
-        }
+        Err(_) => return Some(Err(OpenIssue::Malformed("expected integer".to_owned()))),
     };
     Some(Ok((pkg, n)))
 }

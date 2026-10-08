@@ -30,6 +30,7 @@ struct RecordFacts {
     fm_ids: Vec<RecordId>,
     fm_malformed: bool,
     fm_bad_ref: bool,
+    fm_bare_ulids: Vec<String>,
     path_person: Option<RecordId>,
     /// Tokenized once from BOM-stripped source; 1-based line numbers.
     line_tokens: Vec<(u32, Vec<IdToken>)>,
@@ -41,9 +42,10 @@ struct Allowlist<'a> {
     cleared: HashSet<RecordId>,
     facts: HashMap<RecordId, RecordFacts>,
     by_path: HashMap<&'a str, &'a RecordId>,
+    by_ulid: HashMap<String, Vec<RecordId>>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
-    note_ledger_lines: HashMap<RecordId, Vec<usize>>,
+    named_ledger_lines: HashMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
 }
 
@@ -104,19 +106,26 @@ impl<'a> Allowlist<'a> {
         for rec in vault.records.values() {
             facts.insert(rec.id.clone(), record_facts(rec));
         }
+        let mut by_ulid: HashMap<String, Vec<RecordId>> = HashMap::new();
+        for id in vault.records.keys() {
+            by_ulid
+                .entry(id.ulid().to_owned())
+                .or_default()
+                .push(id.clone());
+        }
         let ledger_tokens: Vec<Vec<IdToken>> = vault
             .ledger_lines
             .iter()
             .map(|line| scan_id_tokens(&line.text))
             .collect();
-        let mut note_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
+        let mut named_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
             for tok in toks {
-                for id in tok.record_ids() {
-                    if id.prefix() != Prefix::Note {
+                for id in ids_named_by(tok, &by_ulid) {
+                    if !ledger_named_prefix(id.prefix()) {
                         continue;
                     }
-                    let lines = note_ledger_lines.entry(id.clone()).or_default();
+                    let lines = named_ledger_lines.entry(id.clone()).or_default();
                     if lines.last() != Some(&idx) {
                         lines.push(idx);
                     }
@@ -128,9 +137,10 @@ impl<'a> Allowlist<'a> {
             cleared: HashSet::new(),
             facts,
             by_path,
+            by_ulid,
             ledger_at,
             ledger_tokens,
-            note_ledger_lines,
+            named_ledger_lines,
             ledger_ok: Vec::new(),
         };
         allow.cleared = compute_cleared(&allow);
@@ -139,7 +149,9 @@ impl<'a> Allowlist<'a> {
             .ledger_lines
             .iter()
             .zip(allow.ledger_tokens.iter())
-            .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow.cleared))
+            .map(|(line, toks)| {
+                line.searchable && tokens_allowed(toks, &allow.cleared, &allow.by_ulid)
+            })
             .collect();
         allow
     }
@@ -224,10 +236,18 @@ fn still_cleared(
             return false;
         }
     }
-    if let Some(idxs) = allow.note_ledger_lines.get(id) {
+    if facts.fm_bare_ulids.iter().any(|ulid| {
+        allow
+            .by_ulid
+            .get(ulid)
+            .is_some_and(|ids| ids.iter().any(|fid| !cleared.contains(fid)))
+    }) {
+        return false;
+    }
+    if let Some(idxs) = allow.named_ledger_lines.get(id) {
         if idxs
             .iter()
-            .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared))
+            .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared, &allow.by_ulid))
         {
             return false;
         }
@@ -424,6 +444,13 @@ fn reverse_deps(
             for id in &facts.fm_ids {
                 link(id.clone(), rec.id.clone());
             }
+            for ulid in &facts.fm_bare_ulids {
+                if let Some(ids) = allow.by_ulid.get(ulid) {
+                    for id in ids {
+                        link(id.clone(), rec.id.clone());
+                    }
+                }
+            }
             if let Some(person) = &facts.path_person {
                 link(person.clone(), rec.id.clone());
             }
@@ -434,11 +461,11 @@ fn reverse_deps(
             link(person.clone(), pkg.clone());
         }
     }
-    for (note, idxs) in &allow.note_ledger_lines {
+    for (named, idxs) in &allow.named_ledger_lines {
         for &idx in idxs {
             for tok in &allow.ledger_tokens[idx] {
-                for id in tok.record_ids() {
-                    link(id.clone(), note.clone());
+                for id in ids_named_by(tok, &allow.by_ulid) {
+                    link(id.clone(), named.clone());
                 }
             }
         }
@@ -450,6 +477,7 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
     let mut fm_malformed = false;
+    let mut fm_bare_ulids = Vec::new();
     let mut line_tokens = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx as u32 + 1;
@@ -459,6 +487,7 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
                 match tok {
                     IdToken::Malformed { .. } => fm_malformed = true,
                     IdToken::Valid(id) => fm_ids.push(id.clone()),
+                    IdToken::BareUlid(ulid) => fm_bare_ulids.push(ulid.clone()),
                 }
             }
         }
@@ -472,18 +501,50 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
         fm_ids,
         fm_malformed,
         fm_bad_ref,
+        fm_bare_ulids,
         path_person: person_id_from_path(&rec.path),
         line_tokens,
     }
 }
 
-fn tokens_allowed(toks: &[IdToken], cleared: &HashSet<RecordId>) -> bool {
+fn ledger_named_prefix(prefix: Prefix) -> bool {
+    match prefix {
+        Prefix::Note | Prefix::Interaction | Prefix::Deal => true,
+        Prefix::Person | Prefix::Org | Prefix::Package => false,
+    }
+}
+
+fn ids_named_by<'a>(
+    tok: &'a IdToken,
+    by_ulid: &'a HashMap<String, Vec<RecordId>>,
+) -> Vec<&'a RecordId> {
+    let mut ids: Vec<&RecordId> = tok.record_ids().collect();
+    if let Some(ulid) = tok.bare_ulid() {
+        if let Some(matched) = by_ulid.get(ulid) {
+            ids.extend(matched.iter());
+        }
+    }
+    ids
+}
+
+fn tokens_allowed(
+    toks: &[IdToken],
+    cleared: &HashSet<RecordId>,
+    by_ulid: &HashMap<String, Vec<RecordId>>,
+) -> bool {
     for tok in toks {
         match tok {
             IdToken::Malformed { .. } => return false,
             IdToken::Valid(id) => {
                 if !cleared.contains(id) {
                     return false;
+                }
+            }
+            IdToken::BareUlid(ulid) => {
+                if let Some(ids) = by_ulid.get(ulid) {
+                    if ids.iter().any(|id| !cleared.contains(id)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -546,7 +607,7 @@ fn scan_record(
     };
     let text = rec.source.trim_start_matches('\u{feff}');
     for ((line_no, toks), line) in facts.line_tokens.iter().zip(text.lines()) {
-        if !tokens_allowed(toks, &allow.cleared) {
+        if !tokens_allowed(toks, &allow.cleared, &allow.by_ulid) {
             continue;
         }
         let folded = case_fold(line);

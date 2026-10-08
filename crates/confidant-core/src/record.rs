@@ -142,9 +142,9 @@ pub(crate) enum FrontmatterRef {
 
 /// Parse a `person` / `org` / `deal` front-matter value as a record ID after
 /// stripping format characters, surrounding quotes, a trailing comment
-/// introduced by a space or tab then `#` (including after a closing quote),
-/// and `[[id|Alias]]` only inside `[[…]]`. Empty, `~`, and YAML `null` are
-/// [`FrontmatterRef::Absent`].
+/// introduced by one or more spaces or tabs then `#` (including after a
+/// closing quote), and `[[id|Alias]]` only inside `[[…]]`. Empty, `~`, and
+/// YAML `null` are [`FrontmatterRef::Absent`].
 pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
     let stripped = strip_cf(raw);
     let trimmed = strip_comment_after_quoted(stripped.trim());
@@ -201,7 +201,7 @@ fn strip_comment_after_quoted(s: &str) -> &str {
             }
             if c == '"' {
                 let after = &s[i + c.len_utf8()..];
-                if after.starts_with(" #") || after.starts_with("\t#") {
+                if comment_after_quote(after) {
                     return &s[..i + c.len_utf8()];
                 }
                 return s;
@@ -212,13 +212,19 @@ fn strip_comment_after_quoted(s: &str) -> &str {
     for (i, c) in chars {
         if c == '\'' {
             let after = &s[i + c.len_utf8()..];
-            if after.starts_with(" #") || after.starts_with("\t#") {
+            if comment_after_quote(after) {
                 return &s[..i + c.len_utf8()];
             }
             return s;
         }
     }
     s
+}
+
+/// At least one space or tab, then any amount of spaces/tabs, then `#`.
+fn comment_after_quote(after: &str) -> bool {
+    let trimmed = after.trim_start_matches([' ', '\t']);
+    trimmed.len() < after.len() && trimmed.starts_with('#')
 }
 
 fn is_yaml_null(s: &str) -> bool {
@@ -748,6 +754,14 @@ mod tests {
         );
         assert_eq!(
             super::parse_ref_id("'[[p-01M3TC5H00MPJG000000000000|Ada]]' # c"),
+            super::FrontmatterRef::Id(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("\"p-01M3TC5H00MPJG000000000000\"  # Bea"),
+            super::FrontmatterRef::Id(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("\"p-01M3TC5H00MPJG000000000000\" \t# Bea"),
             super::FrontmatterRef::Id(id)
         );
     }

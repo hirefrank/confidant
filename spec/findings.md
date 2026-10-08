@@ -21,7 +21,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
 | `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
-| `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. |
+| `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. The message does not echo the verb. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines. |
 | `E_LEDGER_PATH` | error | | A file under `ledger/` is not `YYYY/MM.cfd`. |
@@ -43,11 +43,12 @@ demote, or turn a rule `off` where the table says "configurable".
 | `W_SESSION_UNTAGGED` | warning | | A session has none of `paid`, `pps`, or `comp`. The session still consumes a package slot. |
 | `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID has no record. |
-| `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
+| `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
-cleared records and ledger lines are searchable. A note is cleared only
-when every ledger line that names it is allowed. A leading Markdown
+cleared records and ledger lines are searchable. A note, interaction, or
+deal is cleared only when every ledger line that names it is allowed
+(persons are not uncleared by this rule). A leading Markdown
 bullet (`*`, `-`, or `+` plus whitespace) is skipped before detecting a
 `merge` or `open` verb. A finding is kept
 verbatim only when it has no file and no ID, or when it resolves to a

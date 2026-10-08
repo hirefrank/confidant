@@ -2654,6 +2654,7 @@ fn quoted_person_with_trailing_hash_comment_parses() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea");
     write(
         dir.path(),
         &format!("notes/{NOTE}/note.md"),
@@ -2668,10 +2669,276 @@ fn quoted_person_with_trailing_hash_comment_parses() {
             "---\nid: {NOTE2}\ntype: note\nperson: '[[{ADA}|Ada]]' # c\n---\n\nquoted-wikilink-hash-token\n"
         ),
     );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE3}/note.md"),
+        &format!(
+            "---\nid: {NOTE3}\ntype: note\nperson: \"{BEA}\"  # Bea\n---\n\nquoted-spaces-hash-token\n"
+        ),
+    );
+    let note4 = "n-01M3TC5H00MPJG00900000000G";
+    write(
+        dir.path(),
+        &format!("notes/{note4}/note.md"),
+        &format!(
+            "---\nid: {note4}\ntype: note\nperson: \"{BEA}\" \t# Bea\n---\n\nquoted-tab-hash-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {BEA} package {PKG} 6 sessions\n\
+             2026-10-02 session {BEA} 60m paid note:{NOTE3}\n\
+             2026-10-03 session {BEA} 45m paid note:{note4}\n"
+        ),
+    );
     let a = search_q(dir.path(), "quoted-hash-person-token");
     let b = search_q(dir.path(), "quoted-wikilink-hash-token");
+    let c = search_q(dir.path(), "quoted-spaces-hash-token");
+    let d = search_q(dir.path(), "quoted-tab-hash-token");
     assert!(token_in_hits(&a, "quoted-hash-person-token"), "{a:?}");
     assert!(token_in_hits(&b, "quoted-wikilink-hash-token"), "{b:?}");
+    assert!(token_in_hits(&c, "quoted-spaces-hash-token"), "{c:?}");
+    assert!(token_in_hits(&d, "quoted-tab-hash-token"), "{d:?}");
     let json = report_json(dir.path(), None);
     assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(!codes(&json).contains(&"E_UNKNOWN_RECORD".into()), "{json}");
+}
+
+#[test]
+fn find_drops_unicode_dash_runs_and_keeps_drive_i95() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let cam_ulid = &CAM[2..];
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\n\
+visible-dash-run-token\n\
+see p\u{058a}{cam_ulid} dropped-armenian-hyphen-token\n\
+see p\u{05be}{cam_ulid} dropped-maqaf-token\n\
+see p\u{1806}{cam_ulid} dropped-mongolian-hyphen-token\n\
+see p\u{2e17}{cam_ulid} dropped-double-oblique-token\n\
+see p\u{2e3a}{cam_ulid} dropped-two-em-token\n\
+see p\u{301c}{cam_ulid} dropped-wave-dash-token\n\
+see p\u{fe31}{cam_ulid} dropped-vertical-em-token\n\
+see p\u{2043}{cam_ulid} dropped-hyphen-bullet-token\n\
+see p\u{30fc}{cam_ulid} dropped-kana-prolonged-token\n\
+see p--{cam_ulid} dropped-double-hyphen-token\n\
+see p\u{00ad}-{cam_ulid} dropped-soft-hyphen-ascii-token\n\
+see I-95 i95-highway-token\n\
+see https://docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit docs-url-dash-token\n\
+see drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view drive-url-dash-token\n\
+see https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef notion-url-dash-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("; p--{cam_ulid} dropped-ledger-dash-run-token\n"),
+    );
+    for token in [
+        "dropped-armenian-hyphen-token",
+        "dropped-maqaf-token",
+        "dropped-mongolian-hyphen-token",
+        "dropped-double-oblique-token",
+        "dropped-two-em-token",
+        "dropped-wave-dash-token",
+        "dropped-vertical-em-token",
+        "dropped-hyphen-bullet-token",
+        "dropped-kana-prolonged-token",
+        "dropped-double-hyphen-token",
+        "dropped-soft-hyphen-ascii-token",
+        "dropped-ledger-dash-run-token",
+    ] {
+        let result = search_q(dir.path(), token);
+        assert!(!token_in_hits(&result, token), "{token} {result:?}");
+    }
+    for token in [
+        "visible-dash-run-token",
+        "i95-highway-token",
+        "docs-url-dash-token",
+        "drive-url-dash-token",
+        "notion-url-dash-token",
+    ] {
+        let result = search_q(dir.path(), token);
+        assert!(token_in_hits(&result, token), "{token} {result:?}");
+    }
+}
+
+#[test]
+fn find_drops_cam_dash_in_nonref_front_matter_key() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let cam_ulid = &CAM[2..];
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\nsee: p--{cam_ulid}\n---\n\nhidden-fm-dash-run-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "hidden-fm-dash-run-token");
+    assert!(
+        !token_in_hits(&result, "hidden-fm-dash-run-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_unclears_interaction_and_deal_named_on_hidden_ledger_line() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    person(dir.path(), BEA, "Bea");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nbea-named-ledger-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Call\nperson: {BEA}\n---\n\nixn-named-on-cam-line-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("deals/{DEAL}/deal.md"),
+        &format!(
+            "---\nid: {DEAL}\ntype: deal\nname: Deal\nperson: {BEA}\n---\n\ndeal-named-on-cam-line-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-02 session {CAM} 60m paid src:{IXN}\n\
+             2026-10-03 stage {DEAL} proposal ; for {CAM}\n"
+        ),
+    );
+    let ixn = search_q(dir.path(), "ixn-named-on-cam-line-token");
+    let deal = search_q(dir.path(), "deal-named-on-cam-line-token");
+    let bea = search_q(dir.path(), "bea-named-ledger-token");
+    assert!(
+        !token_in_hits(&ixn, "ixn-named-on-cam-line-token"),
+        "{ixn:?}"
+    );
+    assert!(
+        !token_in_hits(&deal, "deal-named-on-cam-line-token"),
+        "{deal:?}"
+    );
+    assert!(token_in_hits(&bea, "bea-named-ledger-token"), "{bea:?}");
+}
+
+#[test]
+fn find_drops_bare_uncleared_ulid_in_body_and_src() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let cam_ulid = &CAM[2..];
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\n\
+visible-bare-ulid-token\n\
+see {cam_ulid} dropped-bare-ulid-token\n\
+still-bare-ulid-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {BEA}\ndate: 2026-10-01\nsee: {cam_ulid}\n---\n\nhidden-fm-bare-ulid-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 session {BEA} 60m paid src:\"zoom/{cam_ulid}.vtt\" dropped-src-bare-ulid-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-bare-ulid-token");
+    let src = search_q(dir.path(), "dropped-src-bare-ulid-token");
+    let fm = search_q(dir.path(), "hidden-fm-bare-ulid-token");
+    let visible = search_q(dir.path(), "visible-bare-ulid-token");
+    let still = search_q(dir.path(), "still-bare-ulid-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-bare-ulid-token"),
+        "{dropped:?}"
+    );
+    assert!(
+        !token_in_hits(&src, "dropped-src-bare-ulid-token"),
+        "{src:?}"
+    );
+    assert!(!token_in_hits(&fm, "hidden-fm-bare-ulid-token"), "{fm:?}");
+    assert!(
+        token_in_hits(&visible, "visible-bare-ulid-token"),
+        "{visible:?}"
+    );
+    assert!(token_in_hits(&still, "still-bare-ulid-token"), "{still:?}");
+}
+
+#[test]
+fn check_messages_do_not_echo_vault_free_text() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        r#"spec = "0.1"
+packs = ["coaching@0.1", "ZXQVLEAKPACK@0.1"]
+vault_id = "test-vault"
+
+[checks]
+as_of = "2026-10-08"
+coaching.require_duration = "error"
+coaching.balance_nonnegative = "error"
+coaching.session_notes = "off"
+coaching.paid_session_gap = "off"
+"#,
+    );
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} ZXQVLEAKN sessions\n\
+             2026-10-01 ZXQVLEAKVERB {ADA}\n\
+             2026-10-02 session {ADA} 60m paid note:{NOTE} src:ZXQVLEAKSRC\n\
+             2026-10-03 session {ADA} 45m paid note:{NOTE} src:ZXQVLEAKSRC\n\
+             2026-10-04 balance {ADA} ZXQVLEAKMETRIC 1\n\
+             2026-10-05 balance {ADA} sessions_remaining ZXQVLEAKINT\n\
+             2026-10-06 balance {ADA} icf_hours ZXQVLEAKDEC\n\
+             2026-10-07 balance {ADA} sessions_remaining\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let dumped = serde_json::to_string(&json).unwrap();
+    for leak in [
+        "ZXQVLEAKPACK",
+        "ZXQVLEAKN",
+        "ZXQVLEAKVERB",
+        "ZXQVLEAKSRC",
+        "ZXQVLEAKMETRIC",
+        "ZXQVLEAKINT",
+        "ZXQVLEAKDEC",
+    ] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    let c = codes(&json);
+    assert!(c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
+    assert!(c.contains(&"E_UNKNOWN_VERB".into()), "{c:?}");
+    assert!(c.contains(&"E_DUPLICATE_SRC".into()), "{c:?}");
+    assert!(c.contains(&"E_UNKNOWN_METRIC".into()), "{c:?}");
+    assert!(c.contains(&"E_PARSE".into()), "{c:?}");
+    assert!(c.contains(&"E_OPEN_MALFORMED".into()), "{c:?}");
 }

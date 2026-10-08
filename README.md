@@ -32,22 +32,29 @@ person. `pkg-` IDs follow their openers. A leading Markdown bullet is skipped
 before detecting `merge` / `open`. Malformed ID-like tokens un-clear the
 record or line. Body lines that mention an uncleared or invalid ID are
 dropped. Ledger lines are searchable only when every ID on the line is
-cleared. Findings are themselves an allowlist: kept verbatim only when
-they have no file and no ID, or resolve to a cleared record or ledger
-line; otherwise a code and a count, never a path or raw text. Name-only
-mentions with no ID are not detected in body prose and comments; a
-`person` / `org` / `deal` value that is not a record ID (`person: "Jane Doe"`,
-bare `p-A|Name`) is `E_INVALID_ID` and uncleared. Empty, `~`, and YAML `null`
+cleared. A note, interaction, or deal is cleared only when every ledger
+line that names it is allowed; this does not apply to persons. Findings
+are themselves an allowlist: kept verbatim only when they have no file
+and no ID, or resolve to a cleared record or ledger line; otherwise a
+code and a count, never a path or raw text. Name-only mentions with no
+ID are not detected in body prose and comments; a `person` / `org` /
+`deal` value that is not a record ID (`person: "Jane Doe"`, bare
+`p-A|Name`) is `E_INVALID_ID` and uncleared. Empty, `~`, and YAML `null`
 are not references. A `|` alias is accepted only inside `[[…]]`. A trailing
-` #` / tab-`#` comment after a closing quote is stripped (`"p-…" # Ada`).
-After an alphanumeric, `_`, or `-` in the same run, and inside a
-`scheme://` token, a prefix is glued: an exact ULID is Valid; a longer run
-whose first 26 characters are a ULID, or a Unicode dash plus a ULID, is
-malformed with that candidate; other glued lookalikes (Drive/Docs, Notion,
-32-hex) are not tokens. If any ledger
-file cannot be read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code
-and count only) and no hits. Remaining limits: glued inexact IDs whose first
-26 characters do not canonicalize, non-Cf invisible characters, capitalised
+comment after a closing quote (one or more spaces or tabs, then `#`) is
+stripped (`"p-…" # Ada`, `"p-…"  # Bea`). After an alphanumeric, `_`, or
+`-` in the same run, and inside a `scheme://` token, a prefix is glued: an
+exact ULID is Valid; a longer run whose first 26 characters are a ULID, a
+Unicode dash plus a ULID, or a dash run (`--`, soft hyphen then `-`) plus
+a ULID, is malformed with that candidate; other glued lookalikes
+(Drive/Docs, Notion, 32-hex) are not tokens. Unicode Pd dashes plus
+U+30FC and U+2043 count as the ID dash. A bare 26-character ULID at a
+word boundary that exactly equals an uncleared record's ULID is treated
+as that record's ID (body, ledger, front matter, `src:` paths and URLs);
+near-ULID bare runs and 32-hex are not. If any ledger file cannot be
+read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code and count
+only) and no hits. Remaining limits: glued inexact IDs whose first 26
+characters do not canonicalize, non-Cf invisible characters, capitalised
 or other keys holding names, and name-only prose. Milestone 3 `context`
 continues to honour `no-ai`.
 
