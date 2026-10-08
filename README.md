@@ -48,15 +48,19 @@ exact ULID is Valid; a longer run whose first 26 characters are a ULID, a
 Unicode dash plus a ULID, or a dash run (`--`, soft hyphen then `-`) plus
 a ULID, is malformed with that candidate; other glued lookalikes
 (Drive/Docs, Notion, 32-hex) are not tokens. Unicode Pd dashes plus
-U+30FC and U+2043 count as the ID dash. A bare 26-character ULID at a
-word boundary that exactly equals an uncleared record's ULID is treated
-as that record's ID (body, ledger, front matter, `src:` paths and URLs);
-near-ULID bare runs and 32-hex are not. If any ledger file cannot be
+U+30FC and U+2043 count as the ID dash. A bare 26-character ULID that
+exactly equals a vault record's ULID is treated as that record's ID,
+including as any 26-character window inside a Crockford run
+(`src:zoom/rec_<ULID>.vtt`, `p_<ULID>`, `p<ULID>`, `<ULID>abc`);
+near-ULID bare runs are not. Merge and open name that ID the same way.
+A path that exists but failed to load still seeds the ULID index and
+stays uncleared. If any ledger file cannot be
 read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code and count
 only) and no hits. Remaining limits: glued inexact IDs whose first 26
 characters do not canonicalize, non-Cf invisible characters, capitalised
-or other keys holding names, and name-only prose. Milestone 3 `context`
-continues to honour `no-ai`.
+or other keys holding names, name-only prose, and that `check`'s
+location field still shows the paths of invalid files. Milestone 3
+`context` continues to honour `no-ai`.
 
 ## Quickstart
 

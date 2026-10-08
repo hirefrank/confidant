@@ -2942,3 +2942,236 @@ coaching.paid_session_gap = "off"
     assert!(c.contains(&"E_PARSE".into()), "{c:?}");
     assert!(c.contains(&"E_OPEN_MALFORMED".into()), "{c:?}");
 }
+
+fn ada_coaching_client(root: &Path) {
+    write(
+        root,
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake coaching client\n"),
+    );
+}
+
+#[test]
+fn find_hides_ada_merged_into_cam_bare_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    ada_coaching_client(dir.path());
+    person_no_ai(dir.path(), CAM, "Cam");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-02 merge {ADA} into {}\n", &CAM[2..]),
+    );
+    let result = search_q(dir.path(), "Fake coaching client");
+    assert!(
+        !token_in_hits(&result, "Fake coaching client"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_hides_bea_merged_from_lowercase_cam_bare_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    ada_coaching_client(dir.path());
+    person_no_ai(dir.path(), CAM, "Cam");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nbea-lowercase-bare-merge-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        "merge 01m3tc5h00mpjg001248000002 into p-01M3TC5H00MPJG000H24000001\n",
+    );
+    let bea = search_q(dir.path(), "bea-lowercase-bare-merge-token");
+    let ada = search_q(dir.path(), "Fake coaching client");
+    assert!(
+        !token_in_hits(&bea, "bea-lowercase-bare-merge-token"),
+        "{bea:?}"
+    );
+    assert!(
+        token_in_hits(&ada, "Fake coaching client"),
+        "Ada is not in this merge group: {ada:?}"
+    );
+}
+
+#[test]
+fn find_hides_ada_merged_from_t_prefixed_cam_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    ada_coaching_client(dir.path());
+    person_no_ai(dir.path(), CAM, "Cam");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("merge t-{} into {ADA}\n", &CAM[2..]),
+    );
+    let result = search_q(dir.path(), "Fake coaching client");
+    assert!(
+        !token_in_hits(&result, "Fake coaching client"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_hides_pkg_opened_by_bare_cam_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), BEA, "Bea");
+    person_no_ai(dir.path(), CAM, "Cam");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {BEA} package {PKG} 4 sessions\n\
+             2026-10-01 open {} package {PKG} 4 sessions\n\
+             2026-10-02 session {BEA} 60m paid src:{PKG} pkg-bare-open-token\n",
+            &CAM[2..]
+        ),
+    );
+    let result = search_q(dir.path(), "pkg-bare-open-token");
+    assert!(!token_in_hits(&result, "pkg-bare-open-token"), "{result:?}");
+}
+
+#[test]
+fn find_drops_bareline_of_unloaded_no_ai_yes_path() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{CAM}/profile.md"),
+        &format!("---\nid: {CAM}\ntype: person\nname: Cam\nno-ai: yes\n---\n\nCam secret\n"),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nBare ref BARELINE {} here\n",
+            &CAM[2..]
+        ),
+    );
+    let bare = search_q(dir.path(), "BARELINE");
+    assert!(!token_in_hits(&bare, "BARELINE"), "{bare:?}");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nprefixed {CAM} PREFIXEDHIDE\n"),
+    );
+    let prefixed = search_q(dir.path(), "PREFIXEDHIDE");
+    assert!(!token_in_hits(&prefixed, "PREFIXEDHIDE"), "{prefixed:?}");
+}
+
+#[test]
+fn find_drops_glued_bare_ulid_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let ulid = &CAM[2..];
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\n\
+visible-window-token\n\
+src:zoom/rec_{ulid}.vtt rec-window-token\n\
+p_{ulid} p-underscore-window-token\n\
+p{ulid} p-glued-window-token\n\
+{ulid}abc suffix-window-token\n\
+still-window-token\n"
+        ),
+    );
+    for token in [
+        "rec-window-token",
+        "p-underscore-window-token",
+        "p-glued-window-token",
+        "suffix-window-token",
+    ] {
+        let result = search_q(dir.path(), token);
+        assert!(!token_in_hits(&result, token), "{token} {result:?}");
+    }
+    let visible = search_q(dir.path(), "visible-window-token");
+    let still = search_q(dir.path(), "still-window-token");
+    assert!(
+        token_in_hits(&visible, "visible-window-token"),
+        "{visible:?}"
+    );
+    assert!(token_in_hits(&still, "still-window-token"), "{still:?}");
+}
+
+#[test]
+fn check_messages_do_not_echo_seeded_filenames() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let leaks = [
+        "ZXQVLEAKTOP.md",
+        "ZXQVLEAKFILE.md",
+        "ZXQVLEAKDIR",
+        "ZXQVLEAKEXTRA.md",
+        "ZXQVLEAKNOTE.txt",
+        "ZXQVLEAKTMP",
+        "ZXQVLEAKYEAR",
+        "ZXQVLEAKLEDGER.txt",
+        "ZXQVLEAKLINK",
+    ];
+    write(dir.path(), "ZXQVLEAKTOP.md", "not a vault file\n");
+    write(
+        dir.path(),
+        "people/ZXQVLEAKFILE.md",
+        "---\nid: x\ntype: person\n---\n",
+    );
+    write(
+        dir.path(),
+        "people/ZXQVLEAKDIR/profile.md",
+        "---\nid: x\ntype: person\n---\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/ZXQVLEAKEXTRA.md"),
+        "extra\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/ZXQVLEAKNOTE.txt"),
+        "note leftover\n",
+    );
+    write(dir.path(), "people/.confidant-tmp-ZXQVLEAKTMP", "tmp\n");
+    write(dir.path(), "ledger/ZXQVLEAKYEAR/01.cfd", "x\n");
+    write(dir.path(), "ledger/2026/ZXQVLEAKLEDGER.txt", "x\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("profile.md", dir.path().join("people/ZXQVLEAKLINK")).unwrap();
+    let json = report_json(dir.path(), None);
+    let messages: Vec<String> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            format!(
+                "{} {}",
+                f["message"].as_str().unwrap_or(""),
+                f["fix"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    let joined = messages.join("\n");
+    for leak in leaks {
+        assert!(
+            !joined.contains(leak),
+            "{leak} leaked in check messages: {joined}"
+        );
+    }
+    let files: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+    assert!(
+        files.iter().any(|f| f.contains("ZXQVLEAKFILE")),
+        "location field should still name the invalid path: {files:?}"
+    );
+}

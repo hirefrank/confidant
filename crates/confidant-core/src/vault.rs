@@ -44,6 +44,9 @@ pub struct Vault {
     /// Number of unreadable ledger paths (code+count only; never a path).
     /// `find` refuses when this is greater than zero.
     pub ledger_unread_count: u32,
+    /// Path-derived record IDs, including files/directories that failed to load.
+    /// Always uncleared when not present in `records`.
+    pub path_ids: HashSet<RecordId>,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -76,12 +79,13 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
 
     let mut findings = config.config_findings();
     let mut records = BTreeMap::new();
+    let mut path_ids = HashSet::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
 
     if config.spec == SPEC_VERSION {
-        scan_collections(root, &mut records, &mut findings);
+        scan_collections(root, &mut records, &mut path_ids, &mut findings);
         scan_ledger(
             root,
             &mut entries,
@@ -100,6 +104,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         ledger_lines,
         load_findings: findings,
         ledger_unread_count,
+        path_ids,
     })
 }
 
@@ -111,30 +116,38 @@ enum Listed {
 fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
     match paths::read_dir(root, rel) {
         Ok(listing) => {
-            for (name, msg) in listing.errors {
+            for (name, _) in listing.errors {
                 let child = if rel.as_os_str().is_empty() {
                     name.clone()
                 } else {
                     paths::display_relative(&rel.join(&name))
                 };
                 findings.push(
-                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
-                        .at_file(child)
-                        .with_fix("Fix permissions or replace the unreadable entry"),
+                    Finding::new(
+                        FindingCode::Unreadable,
+                        Severity::Error,
+                        "path is unreadable".to_owned(),
+                    )
+                    .at_file(child)
+                    .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
             Listed::Ok(listing.entries)
         }
-        Err(err) => {
+        Err(_) => {
             let file = if rel.as_os_str().is_empty() {
                 ".".to_owned()
             } else {
                 paths::display_relative(rel)
             };
             findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                    .at_file(file)
-                    .with_fix("Fix directory permissions or replace the unreadable path"),
+                Finding::new(
+                    FindingCode::Unreadable,
+                    Severity::Error,
+                    "path is unreadable".to_owned(),
+                )
+                .at_file(file)
+                .with_fix("Fix directory permissions or replace the unreadable path"),
             );
             Listed::Failed
         }
@@ -149,7 +162,7 @@ fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
         Finding::new(
             FindingCode::InvalidFilename,
             Severity::Error,
-            format!("leftover temporary file '{name}'"),
+            "leftover temporary file".to_owned(),
         )
         .at_file(paths::display_relative(child))
         .with_fix("Delete .confidant-tmp-* leftovers from a crashed write"),
@@ -164,7 +177,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
             Finding::new(
                 FindingCode::InvalidFilename,
                 Severity::Error,
-                format!("non-UTF-8 name at '{file}'"),
+                "non-UTF-8 filename".to_owned(),
             )
             .at_file(&file)
             .with_fix("Rename the file to a UTF-8 record ID"),
@@ -176,7 +189,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
             Finding::new(
                 FindingCode::Symlink,
                 Severity::Error,
-                format!("symbolic link '{file}'"),
+                "symbolic link".to_owned(),
             )
             .at_file(&file)
             .with_fix("Replace the symlink with a real file or directory"),
@@ -217,7 +230,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                 Finding::new(
                     FindingCode::InvalidFilename,
                     Severity::Error,
-                    format!("unexpected vault entry '{}'", ent.name),
+                    "unexpected vault entry".to_owned(),
                 )
                 .at_file(&ent.name)
                 .with_fix("Use the layout in spec/0.1.md (people/, orgs/, deals/, ledger/, …)"),
@@ -229,6 +242,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
 fn scan_collections(
     root: &Path,
     records: &mut BTreeMap<RecordId, Record>,
+    path_ids: &mut HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     for collection in COLLECTIONS {
@@ -240,11 +254,15 @@ fn scan_collections(
                 continue;
             }
             Ok(listing) => {
-                for (name, msg) in listing.errors {
+                for (name, _) in listing.errors {
                     findings.push(
-                        Finding::new(FindingCode::Unreadable, Severity::Error, msg)
-                            .at_file(paths::display_relative(&rel.join(&name)))
-                            .with_fix("Fix permissions or replace the unreadable entry"),
+                        Finding::new(
+                            FindingCode::Unreadable,
+                            Severity::Error,
+                            "path is unreadable".to_owned(),
+                        )
+                        .at_file(paths::display_relative(&rel.join(&name)))
+                        .with_fix("Fix permissions or replace the unreadable entry"),
                     );
                 }
                 let prefix = Prefix::from_collection(collection).expect("known collection");
@@ -263,16 +281,15 @@ fn scan_collections(
                     match ent.kind {
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(root, &child, stem, prefix, records, findings);
+                                ingest_file(
+                                    root, &child, stem, prefix, records, path_ids, findings,
+                                );
                             } else {
                                 findings.push(
                                     Finding::new(
                                         FindingCode::InvalidFilename,
                                         Severity::Error,
-                                        format!(
-                                            "collection '{collection}' contains a file named '{}' that is not a record ID",
-                                            ent.name
-                                        ),
+                                        "filename is not a valid record ID".to_owned(),
                                     )
                                     .at_file(paths::display_relative(&child))
                                     .with_fix("Rename to <prefix>-<ULID>.md or move it out of the collection"),
@@ -280,16 +297,15 @@ fn scan_collections(
                             }
                         }
                         EntryKind::Directory => {
-                            ingest_dir(root, &child, &ent.name, prefix, records, findings);
+                            ingest_dir(
+                                root, &child, &ent.name, prefix, records, path_ids, findings,
+                            );
                         }
                         EntryKind::Other => findings.push(
                             Finding::new(
                                 FindingCode::InvalidFilename,
                                 Severity::Error,
-                                format!(
-                                    "collection '{collection}' contains a non-file named '{}'",
-                                    ent.name
-                                ),
+                                "record directory contains an unexpected entry".to_owned(),
                             )
                             .at_file(paths::display_relative(&child)),
                         ),
@@ -307,6 +323,7 @@ fn ingest_file(
     stem: &str,
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
+    path_ids: &mut HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let file = paths::display_relative(relative);
@@ -317,7 +334,7 @@ fn ingest_file(
                 Finding::new(
                     FindingCode::InvalidFilename,
                     Severity::Error,
-                    format!("filename '{stem}' cannot be a record ID"),
+                    "filename is not a valid record ID".to_owned(),
                 )
                 .at_file(&file)
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
@@ -325,6 +342,7 @@ fn ingest_file(
             return;
         }
     };
+    path_ids.insert(path_id.clone());
     if path_id.prefix() != expected_prefix {
         findings.push(
             Finding::new(
@@ -348,6 +366,7 @@ fn ingest_dir(
     name: &str,
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
+    path_ids: &mut HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let dir = paths::display_relative(relative);
@@ -358,7 +377,7 @@ fn ingest_dir(
                 Finding::new(
                     FindingCode::InvalidFilename,
                     Severity::Error,
-                    format!("directory '{name}' cannot be a record ID"),
+                    "directory name is not a valid record ID".to_owned(),
                 )
                 .at_file(&dir)
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
@@ -366,6 +385,7 @@ fn ingest_dir(
             return;
         }
     };
+    path_ids.insert(path_id.clone());
     if path_id.prefix() != expected_prefix {
         findings.push(
             Finding::new(
@@ -412,17 +432,14 @@ fn ingest_dir(
             && ent.name == "notes"
             && ent.kind == EntryKind::Directory
         {
-            scan_person_notes(root, relative, &path_id, records, findings);
+            scan_person_notes(root, relative, &path_id, records, path_ids, findings);
             continue;
         }
         findings.push(
             Finding::new(
                 FindingCode::InvalidFilename,
                 Severity::Error,
-                format!(
-                    "record directory '{dir}' contains unexpected '{}'",
-                    ent.name
-                ),
+                "record directory contains an unexpected entry".to_owned(),
             )
             .at_file(paths::display_relative(&child))
             .for_id(&path_id)
@@ -436,7 +453,7 @@ fn ingest_dir(
             Finding::new(
                 FindingCode::Frontmatter,
                 Severity::Error,
-                format!("record directory '{dir}' is missing {main}"),
+                "record directory is missing the main file".to_owned(),
             )
             .at_file(&dir)
             .for_id(&path_id)
@@ -450,6 +467,7 @@ fn scan_person_notes(
     person_dir: &Path,
     person_id: &RecordId,
     records: &mut BTreeMap<RecordId, Record>,
+    path_ids: &mut HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let notes_rel = person_dir.join("notes");
@@ -459,11 +477,15 @@ fn scan_person_notes(
             let _ = list_dir(root, &notes_rel, findings);
         }
         Ok(listing) => {
-            for (name, msg) in listing.errors {
+            for (name, _) in listing.errors {
                 findings.push(
-                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
-                        .at_file(paths::display_relative(&notes_rel.join(&name)))
-                        .with_fix("Fix permissions or replace the unreadable entry"),
+                    Finding::new(
+                        FindingCode::Unreadable,
+                        Severity::Error,
+                        "path is unreadable".to_owned(),
+                    )
+                    .at_file(paths::display_relative(&notes_rel.join(&name)))
+                    .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
             for ent in listing.entries {
@@ -483,17 +505,22 @@ fn scan_person_notes(
                         Finding::new(
                             FindingCode::InvalidFilename,
                             Severity::Error,
-                            format!(
-                                "notes directory contains '{}' which is not n-<ULID>.md",
-                                ent.name
-                            ),
+                            "filename is not a valid record ID".to_owned(),
                         )
                         .at_file(paths::display_relative(&child)),
                     );
                     continue;
                 }
                 let stem = ent.name.trim_end_matches(".md");
-                ingest_file(root, &child, stem, Prefix::Note, records, findings);
+                ingest_file(
+                    root,
+                    &child,
+                    stem,
+                    Prefix::Note,
+                    records,
+                    path_ids,
+                    findings,
+                );
                 if let Ok(id) = RecordId::parse(stem) {
                     if let Some(rec) = records.get(&id) {
                         if rec.person().as_ref().is_some_and(|p| p != person_id) {
@@ -524,11 +551,15 @@ fn load_markdown(
     let file = paths::display_relative(relative);
     let text = match paths::read_to_string(root, relative) {
         Ok(t) => t,
-        Err(err) => {
+        Err(_) => {
             findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                    .at_file(&file)
-                    .with_fix("Replace the file with valid UTF-8 Markdown"),
+                Finding::new(
+                    FindingCode::Unreadable,
+                    Severity::Error,
+                    "path is unreadable".to_owned(),
+                )
+                .at_file(&file)
+                .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
             return;
         }
@@ -538,7 +569,7 @@ fn load_markdown(
             Finding::new(
                 FindingCode::MergeConflict,
                 Severity::Error,
-                format!("'{file}' contains git conflict markers"),
+                "file contains git conflict markers".to_owned(),
             )
             .at_file(&file)
             .with_fix("Resolve the conflict; check keeps both sides visible until you do"),
@@ -593,7 +624,7 @@ fn load_markdown(
                         Finding::new(
                             FindingCode::TypePathMismatch,
                             Severity::Error,
-                            format!("type '{}' does not belong at '{file}'", rec.kind.as_str()),
+                            format!("type '{}' does not belong at this path", rec.kind.as_str()),
                         )
                         .at_file(&file)
                         .for_id(&rec.id),
@@ -692,11 +723,15 @@ fn walk_ledger(
         }
         Ok(listing) => {
             *unread += listing.errors.len() as u32;
-            for (name, msg) in listing.errors {
+            for (name, _) in listing.errors {
                 findings.push(
-                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
-                        .at_file(paths::display_relative(&rel.join(&name)))
-                        .with_fix("Fix permissions or replace the unreadable entry"),
+                    Finding::new(
+                        FindingCode::Unreadable,
+                        Severity::Error,
+                        "path is unreadable".to_owned(),
+                    )
+                    .at_file(paths::display_relative(&rel.join(&name)))
+                    .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
             listing.entries
@@ -732,12 +767,16 @@ fn walk_ledger_resolved(
         return;
     }
     let listing = match std::fs::read_dir(canon) {
-        Err(err) => {
+        Err(_) => {
             *unread += 1;
             findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                    .at_file(paths::display_relative(rel))
-                    .with_fix("Fix permissions or replace the unreadable path"),
+                Finding::new(
+                    FindingCode::Unreadable,
+                    Severity::Error,
+                    "path is unreadable".to_owned(),
+                )
+                .at_file(paths::display_relative(rel))
+                .with_fix("Fix permissions or replace the unreadable path"),
             );
             return;
         }
@@ -839,7 +878,7 @@ fn process_ledger_entry(
                     Finding::new(
                         FindingCode::LedgerPath,
                         Severity::Error,
-                        format!("ledger/{} is not a four-digit year directory", ent.name),
+                        "ledger year directory is not a four-digit year".to_owned(),
                     )
                     .at_file(paths::display_relative(&child))
                     .with_fix("Use ledger/YYYY/MM.cfd"),
@@ -948,7 +987,7 @@ fn load_ledger_file(
             Finding::new(
                 FindingCode::LedgerPath,
                 Severity::Error,
-                format!("'{file}' is not MM.cfd"),
+                "ledger file is not MM.cfd".to_owned(),
             )
             .at_file(&file)
             .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
@@ -964,7 +1003,7 @@ fn load_ledger_file(
                         Finding::new(
                             FindingCode::Unreadable,
                             Severity::Error,
-                            format!("'{file}' is not valid UTF-8"),
+                            "file is not valid UTF-8".to_owned(),
                         )
                         .at_file(&file)
                         .with_fix("Fix permissions or replace the unreadable path"),
@@ -972,24 +1011,32 @@ fn load_ledger_file(
                     return;
                 }
             },
-            Err(err) => {
+            Err(_) => {
                 *unread += 1;
                 findings.push(
-                    Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                        .at_file(&file)
-                        .with_fix("Fix permissions or replace the unreadable path"),
+                    Finding::new(
+                        FindingCode::Unreadable,
+                        Severity::Error,
+                        "path is unreadable".to_owned(),
+                    )
+                    .at_file(&file)
+                    .with_fix("Fix permissions or replace the unreadable path"),
                 );
                 return;
             }
         },
         None => match paths::read_to_string(root, rel) {
             Ok(t) => t,
-            Err(err) => {
+            Err(_) => {
                 *unread += 1;
                 findings.push(
-                    Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                        .at_file(&file)
-                        .with_fix("Fix permissions or replace the unreadable path"),
+                    Finding::new(
+                        FindingCode::Unreadable,
+                        Severity::Error,
+                        "path is unreadable".to_owned(),
+                    )
+                    .at_file(&file)
+                    .with_fix("Fix permissions or replace the unreadable path"),
                 );
                 return;
             }
@@ -1011,7 +1058,7 @@ fn ingest_ledger_text(
             Finding::new(
                 FindingCode::MergeConflict,
                 Severity::Error,
-                format!("'{file}' contains git conflict markers"),
+                "file contains git conflict markers".to_owned(),
             )
             .at_file(file),
         );

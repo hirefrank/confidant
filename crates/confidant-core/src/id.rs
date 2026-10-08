@@ -1,6 +1,7 @@
 //! Collision-free prefixed ULIDs (ADR-3).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
@@ -212,7 +213,7 @@ pub fn is_ulid(s: &str) -> bool {
 }
 
 /// A token that looks like a record ID: type prefix, dash, alphanumeric run,
-/// or a bare 26-character Crockford ULID at a word boundary.
+/// or a bare 26-character Crockford ULID that matches a vault ULID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IdToken {
     Valid(RecordId),
@@ -224,9 +225,9 @@ pub enum IdToken {
     Malformed {
         candidate: Option<RecordId>,
     },
-    /// Exact 26-character Crockford ULID at a word boundary. Resolved
-    /// against vault records during allowlist construction; ignored when
-    /// no record uses that ULID. No near-ULID / malformed rule.
+    /// Exact 26-character Crockford ULID that matches a vault record
+    /// ULID, found as any 26-character window inside a Crockford run.
+    /// No near-ULID / malformed rule; only exact vault matches count.
     BareUlid(String),
 }
 
@@ -253,28 +254,38 @@ impl IdToken {
 }
 
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
-/// Unicode dash plus an alphanumeric run), case-insensitively, and for a bare
-/// 26-character Crockford ULID at a word boundary. Finds IDs inside junk such
-/// as `[[p-…]]`. Format characters (ZWSP, soft hyphen, word joiner, …) are
-/// stripped first. A prefix is glued after an ASCII alphanumeric or `_`, when
-/// the `-` before it follows an alphanumeric, `_`, or `-` in the same run, or
-/// when it sits inside a `scheme://` token. Glue is computed only at a prefix;
-/// scheme state is tracked incrementally per whitespace-delimited token. In a
-/// glued context a Valid token is a single ASCII `-` plus an exact ULID; a
-/// longer run whose first 26 characters are a ULID, a Unicode dash plus a
-/// ULID, or a run of dashes (`--`, soft hyphen then `-`) plus a ULID, is
-/// Malformed with that candidate.
+/// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
+/// inside junk such as `[[p-…]]`. Format characters (ZWSP, soft hyphen, word
+/// joiner, …) are stripped first. A prefix is glued after an ASCII
+/// alphanumeric or `_`, when the `-` before it follows an alphanumeric, `_`,
+/// or `-` in the same run, or when it sits inside a `scheme://` token. Glue is
+/// computed only at a prefix; scheme state is tracked incrementally per
+/// whitespace-delimited token. In a glued context a Valid token is a single
+/// ASCII `-` plus an exact ULID; a longer run whose first 26 characters are a
+/// ULID, a Unicode dash plus a ULID, or a run of dashes (`--`, soft hyphen
+/// then `-`) plus a ULID, is Malformed with that candidate. When `vault_ulids`
+/// is set, every 26-character Crockford window that exactly matches a vault
+/// ULID is also a BareUlid token (no word-boundary rule).
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
+    scan_id_tokens_against(text, None)
+}
+
+pub(crate) fn scan_id_tokens_against(
+    text: &str,
+    vault_ulids: Option<&HashSet<String>>,
+) -> Vec<IdToken> {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
     let text = stripped.as_ref();
-    if has_id_dash(text) {
-        return scan_prefixed_and_bare(text);
+    let mut out = if has_id_dash(text) {
+        scan_prefixed(text)
+    } else {
+        Vec::new()
+    };
+    if let Some(ulids) = vault_ulids {
+        scan_vault_ulid_windows(text, ulids, &mut out);
     }
-    if text.len() >= ULID_LEN {
-        return scan_bare_ulids(text);
-    }
-    Vec::new()
+    out
 }
 
 fn has_id_dash(text: &str) -> bool {
@@ -285,7 +296,7 @@ fn has_id_dash(text: &str) -> bool {
     bytes.iter().any(|b| *b >= 0x80) && text.chars().any(is_id_dash)
 }
 
-fn scan_prefixed_and_bare(text: &str) -> Vec<IdToken> {
+fn scan_prefixed(text: &str) -> Vec<IdToken> {
     let mut out = Vec::new();
     let mut remaining = text;
     let mut prev: Option<char> = None;
@@ -296,19 +307,6 @@ fn scan_prefixed_and_bare(text: &str) -> Vec<IdToken> {
         if starts_id_prefix(remaining) {
             let glued = prefix_is_glued(prev, prev2, run_has_scheme);
             if let Some((tok, len)) = match_id_token_at(remaining, glued) {
-                out.push(tok);
-                remaining = &remaining[len..];
-                prev2 = prev;
-                prev = Some('0');
-                continue;
-            }
-        }
-        if remaining
-            .as_bytes()
-            .first()
-            .is_some_and(|b| matches!(b, b'0'..=b'7'))
-        {
-            if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
                 out.push(tok);
                 remaining = &remaining[len..];
                 prev2 = prev;
@@ -429,22 +427,46 @@ fn starts_id_prefix(s: &str) -> bool {
     )
 }
 
-fn scan_bare_ulids(text: &str) -> Vec<IdToken> {
-    let mut out = Vec::new();
-    let mut remaining = text;
-    let mut prev: Option<char> = None;
-    while !remaining.is_empty() {
-        if let Some((tok, len)) = match_bare_ulid_at(remaining, prev) {
-            out.push(tok);
-            remaining = &remaining[len..];
-            prev = Some('0');
+fn is_crockford_byte(b: u8) -> bool {
+    CROCKFORD.contains(&b.to_ascii_uppercase())
+}
+
+fn scan_vault_ulid_windows(text: &str, vault_ulids: &HashSet<String>, out: &mut Vec<IdToken>) {
+    if vault_ulids.is_empty() {
+        return;
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_crockford_byte(bytes[i]) {
+            i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
             continue;
         }
-        let ch = remaining.chars().next().unwrap();
-        prev = Some(ch);
-        remaining = &remaining[ch.len_utf8()..];
+        let start = i;
+        i += 1;
+        while i < bytes.len() && is_crockford_byte(bytes[i]) {
+            i += 1;
+        }
+        let run = &bytes[start..i];
+        if run.len() < ULID_LEN {
+            continue;
+        }
+        for off in 0..=run.len() - ULID_LEN {
+            let window = &run[off..off + ULID_LEN];
+            let first = window[0].to_ascii_uppercase();
+            if first > b'7' {
+                continue;
+            }
+            let mut buf = [0u8; ULID_LEN];
+            for (j, &b) in window.iter().enumerate() {
+                buf[j] = b.to_ascii_uppercase();
+            }
+            let ulid = std::str::from_utf8(&buf).expect("crockford alphabet is ascii");
+            if vault_ulids.contains(ulid) {
+                out.push(IdToken::BareUlid(ulid.to_owned()));
+            }
+        }
     }
-    out
 }
 
 /// Valid IDs only; malformed lookalikes and bare ULIDs are skipped.
@@ -547,28 +569,6 @@ fn dash_run(s: &str) -> (usize, usize, bool) {
         }
     }
     (bytes, count, count == 1 && all_ascii_hyphen)
-}
-
-fn match_bare_ulid_at(s: &str, prev: Option<char>) -> Option<(IdToken, usize)> {
-    if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    if bytes.len() < ULID_LEN {
-        return None;
-    }
-    if !matches!(bytes[0], b'0'..=b'7') {
-        return None;
-    }
-    if bytes.len() > ULID_LEN && bytes[ULID_LEN].is_ascii_alphanumeric() {
-        return None;
-    }
-    let head = s.get(..ULID_LEN)?;
-    if !head.is_ascii() {
-        return None;
-    }
-    let ulid = canonicalize_ulid(head)?;
-    Some((IdToken::BareUlid(ulid), ULID_LEN))
 }
 
 fn is_32_lowercase_hex(run: &str) -> bool {
@@ -876,26 +876,69 @@ mod tests {
             "https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef"
         )
         .is_empty());
-        assert_eq!(
-            scan_id_tokens(&format!("see {ulid}")),
-            vec![IdToken::BareUlid(ulid.to_owned())]
-        );
-        assert_eq!(
-            scan_id_tokens(&format!("src:\"zoom/{ulid}.vtt\"")),
-            vec![IdToken::BareUlid(ulid.to_owned())]
-        );
-        assert!(scan_id_tokens(&format!("see {ulid}abc")).is_empty());
-        assert!(scan_id_tokens(&format!("x{ulid}")).is_empty());
+        assert!(scan_id_tokens(&format!("see {ulid}")).is_empty());
         let hex32 = "0123456789abcdef0123456789abcdef";
         assert!(scan_id_tokens(hex32).is_empty());
         assert!(scan_id_tokens(&format!("Phase-I-{hex32}")).is_empty());
     }
 
+    fn scan_with_ulids(text: &str, ulids: &[&str]) -> Vec<super::IdToken> {
+        let set: std::collections::HashSet<String> =
+            ulids.iter().map(|u| (*u).to_owned()).collect();
+        super::scan_id_tokens_against(text, Some(&set))
+    }
+
+    #[test]
+    fn scan_id_tokens_bare_ulid_windows_match_vault_ulids() {
+        use super::IdToken;
+        let cam = super::RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        let ulid = cam.ulid();
+        let bare = vec![IdToken::BareUlid(ulid.to_owned())];
+        assert_eq!(
+            scan_with_ulids(&format!("src:zoom/rec_{ulid}.vtt"), &[ulid]),
+            bare
+        );
+        assert_eq!(scan_with_ulids(&format!("p_{ulid}"), &[ulid]), bare);
+        assert_eq!(scan_with_ulids(&format!("p{ulid}"), &[ulid]), bare);
+        assert_eq!(scan_with_ulids(&format!("{ulid}abc"), &[ulid]), bare);
+        assert_eq!(
+            scan_with_ulids(&format!("see {ulid}"), &[ulid]),
+            bare.clone()
+        );
+        assert_eq!(
+            scan_with_ulids(&format!("src:\"zoom/{ulid}.vtt\""), &[ulid]),
+            bare.clone()
+        );
+        assert_eq!(scan_with_ulids(&format!("t-{ulid}"), &[ulid]), bare.clone());
+        assert_eq!(scan_with_ulids("01m3tc5h00mpjg001248000002", &[ulid]), bare);
+        assert!(scan_with_ulids("the quick brown fox jumps", &[ulid]).is_empty());
+        assert!(
+            scan_with_ulids("0123456789abcdef0123456789abcdef0123456789abcdef", &[ulid]).is_empty()
+        );
+        assert!(scan_with_ulids(
+            "docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit",
+            &[ulid]
+        )
+        .is_empty());
+        assert!(scan_with_ulids(
+            "https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef",
+            &[ulid]
+        )
+        .is_empty());
+    }
+
     #[test]
     fn scan_id_tokens_is_linear_on_long_cjk_and_url_lines() {
+        use std::collections::HashSet;
         use std::time::{Duration, Instant};
         let cjk = format!("{}-{}", "漢".repeat(40_000), "字".repeat(40_000));
         let url = format!("https://example.com/{}", "-".repeat(320_000));
+        let ulid = "01M3TC5H00MPJG001248000002";
+        let mut crockford = "A".repeat(1_000_000);
+        crockford.push_str(ulid);
+        crockford.push_str(&"A".repeat(1_000_000));
+        let mut vault = HashSet::new();
+        vault.insert(ulid.to_owned());
         let budget = Duration::from_millis(if cfg!(debug_assertions) { 1000 } else { 250 });
         let t0 = Instant::now();
         let cjk_toks = super::scan_id_tokens(&cjk);
@@ -903,8 +946,17 @@ mod tests {
         let t1 = Instant::now();
         let url_toks = super::scan_id_tokens(&url);
         let url_elapsed = t1.elapsed();
+        let t2 = Instant::now();
+        let crock_toks = super::scan_id_tokens_against(&crockford, Some(&vault));
+        let crock_elapsed = t2.elapsed();
         assert!(cjk_toks.is_empty(), "{cjk_toks:?}");
         assert!(url_toks.is_empty(), "{url_toks:?}");
+        assert!(
+            crock_toks
+                .iter()
+                .any(|t| matches!(t, super::IdToken::BareUlid(u) if u == ulid)),
+            "{crock_toks:?}"
+        );
         assert!(
             cjk_elapsed <= budget,
             "CJK 80k-char line took {cjk_elapsed:?} (budget {budget:?})"
@@ -912,6 +964,10 @@ mod tests {
         assert!(
             url_elapsed <= budget,
             "320k-char URL line took {url_elapsed:?} (budget {budget:?})"
+        );
+        assert!(
+            crock_elapsed <= budget,
+            "2 MB Crockford line took {crock_elapsed:?} (budget {budget:?})"
         );
     }
 

@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
 use crate::error::DomainError;
-use crate::id::{person_id_from_path, scan_id_tokens, scan_ids, IdToken, Prefix, RecordId};
+use crate::id::{person_id_from_path, scan_id_tokens_against, scan_ids, IdToken, Prefix, RecordId};
 use crate::ledger::ledger_line_verb;
 use crate::record::{parse_ref_id, FrontmatterRef};
 use crate::vault::Vault;
@@ -102,10 +102,6 @@ impl<'a> Allowlist<'a> {
         for (idx, line) in vault.ledger_lines.iter().enumerate() {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
-        let mut facts = HashMap::with_capacity(vault.records.len());
-        for rec in vault.records.values() {
-            facts.insert(rec.id.clone(), record_facts(rec));
-        }
         let mut by_ulid: HashMap<String, Vec<RecordId>> = HashMap::new();
         for id in vault.records.keys() {
             by_ulid
@@ -113,10 +109,21 @@ impl<'a> Allowlist<'a> {
                 .or_default()
                 .push(id.clone());
         }
+        for id in &vault.path_ids {
+            let entry = by_ulid.entry(id.ulid().to_owned()).or_default();
+            if !entry.contains(id) {
+                entry.push(id.clone());
+            }
+        }
+        let vault_ulids: HashSet<String> = by_ulid.keys().cloned().collect();
+        let mut facts = HashMap::with_capacity(vault.records.len());
+        for rec in vault.records.values() {
+            facts.insert(rec.id.clone(), record_facts(rec, &vault_ulids));
+        }
         let ledger_tokens: Vec<Vec<IdToken>> = vault
             .ledger_lines
             .iter()
-            .map(|line| scan_id_tokens(&line.text))
+            .map(|line| scan_id_tokens_against(&line.text, Some(&vault_ulids)))
             .collect();
         let mut named_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
@@ -364,7 +371,11 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
         if ledger_line_verb(&line.text).as_deref() != Some("merge") {
             continue;
         }
-        let ids: Vec<RecordId> = toks.iter().flat_map(IdToken::record_ids).cloned().collect();
+        let ids: Vec<RecordId> = toks
+            .iter()
+            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid))
+            .cloned()
+            .collect();
         for id in &ids {
             find(&mut parent, id);
         }
@@ -408,7 +419,10 @@ fn pkg_openers(
         }
         let mut people = Vec::new();
         let mut pkgs = Vec::new();
-        for id in toks.iter().flat_map(IdToken::record_ids) {
+        for id in toks
+            .iter()
+            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid))
+        {
             match id.prefix() {
                 Prefix::Person => people.push(id.clone()),
                 Prefix::Package => pkgs.push(id.clone()),
@@ -473,7 +487,7 @@ fn reverse_deps(
     dependents
 }
 
-fn record_facts(rec: &crate::record::Record) -> RecordFacts {
+fn record_facts(rec: &crate::record::Record, vault_ulids: &HashSet<String>) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
     let mut fm_malformed = false;
@@ -481,7 +495,7 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
     let mut line_tokens = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx as u32 + 1;
-        let toks = scan_id_tokens(line);
+        let toks = scan_id_tokens_against(line, Some(vault_ulids));
         if line_no < rec.body_start_line {
             for tok in &toks {
                 match tok {
