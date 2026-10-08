@@ -77,4 +77,10 @@ Command-level error codes (not check findings):
 | `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
 | `E_LEDGER_UNREADABLE` | 1 | A ledger file could not be read. `find` returns this command error (code and count only, no path) and no hits. `check` still reports finding `E_UNREADABLE`. |
 | `E_IDEMPOTENCY_CONFLICT` | 1 | Reserved for milestone 3 (`--request-id`). |
+| `E_INBOX_DIRTY` | 1 | `confidant inbox` refused: the working tree is not clean. |
+| `E_INBOX_UNTRUSTED` | 1 | `confidant inbox` refused: the `inbox` branch tip is not signed by a key in the user config's `[trust] signers`. |
+| `E_INBOX_ITEM` | 1 | `confidant inbox` refused: an inbox item is not `<name>.age`, is undecryptable, or its decrypted payload is malformed. |
+| `E_INBOX_CONFLICT` | 1 | `confidant inbox` refused: an item targets a record path that already exists with different content. |
+| `E_INBOX_CHECK_FAILED` | 1 | `confidant inbox` refused: the merged vault fails `check` (nothing was committed). |
+| `E_INBOX_CRYPTO` | 1 | `confidant inbox` cannot decrypt: milestone 2 crypto is not implemented yet. |
 | `internal_error` | 1 | Unclassified failure. Never match on its message. |

@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use clap::{CommandFactory, Parser, Subcommand};
 use confidant_core::check::parse_fail_on;
 use confidant_core::config::parse_iso_date;
+use confidant_core::config::UserConfig;
 use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
@@ -92,6 +93,23 @@ enum Command {
         /// Max hits to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Merge the encrypted `inbox` git branch into the current branch.
+    ///
+    /// Outside tools push age-encrypted items to the `inbox` branch; this
+    /// decrypts them, runs `check` on the merged vault, commits the merge,
+    /// and clears the inbox. Requires a clean tree; every commit that adds
+    /// or changes an item must be signed by a `[trust]` signer, and the run
+    /// refuses without signers unless `--allow-unsigned` is passed.
+    /// No webhooks, no CI keys.
+    Inbox {
+        /// Decrypt and plan, but commit nothing and clear nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed without verifying inbox branch signatures. Only for
+        /// setups that have not configured `[trust] signers` yet.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Append to the ledger (one commit per write).
     Log {
@@ -207,7 +225,7 @@ fn main() -> ExitCode {
             // Best-effort resolved vault for the envelope (ADR-11).
             let vault = discover(vault_flag.as_deref())
                 .ok()
-                .map(|p| p.display().to_string());
+                .map(|(p, _)| p.display().to_string());
             let _ = print_error(json, vault.as_deref(), &domain);
             ExitCode::from(domain.exit_code() as u8)
         }
@@ -229,14 +247,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
     let needs_vault = !matches!(cli.command, Command::Schema | Command::Help { .. });
-    let vault_root: Option<PathBuf> = match discover(cli.vault.as_deref()) {
-        Ok(root) => Some(root),
+    let vault_root: Option<PathBuf>;
+    let user_config: Option<UserConfig>;
+    match discover(cli.vault.as_deref()) {
+        Ok((root, user)) => {
+            vault_root = Some(root);
+            user_config = user;
+        }
         Err(err) => {
             if needs_vault {
                 print_error(json, None, &err)?;
                 return Ok(ExitCode::from(err.exit_code() as u8));
             }
-            None
+            vault_root = None;
+            user_config = None;
         }
     };
 
@@ -281,11 +305,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 })?),
             };
             let vault = vault_or!(&root, json);
+            let pinned_inbox_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
             let report = check_vault(
                 &vault,
                 &CheckOptions {
                     as_of,
                     fail_on: Some(fail_on),
+                    pinned_inbox_pubkey,
                 },
             );
             if json {
@@ -357,6 +383,80 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     )?;
                 }
                 writeln!(io::stdout(), "{} matches", hits.len())?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Inbox {
+            dry_run,
+            allow_unsigned,
+        } => {
+            let root = vault_root.unwrap();
+            let trusted_signers = user_config
+                .as_ref()
+                .map(|u| u.trust.signers.clone())
+                .unwrap_or_default();
+            let pinned_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
+            let report = match confidant_core::run_inbox(
+                &root,
+                &confidant_core::InboxOptions {
+                    dry_run: *dry_run,
+                    trusted_signers,
+                    allow_unsigned: *allow_unsigned,
+                    pinned_pubkey,
+                },
+                &confidant_core::stub_decrypt,
+            ) {
+                Ok(report) => report,
+                Err(err) => {
+                    let domain = DomainError::of(&err)
+                        .cloned()
+                        .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+                    print_error(json, Some(&root.display().to_string()), &domain)?;
+                    return Ok(ExitCode::from(domain.exit_code() as u8));
+                }
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                        "vault": root.display().to_string(),
+                        "branch": report.branch,
+                        "dry_run": report.dry_run,
+                        "empty": report.empty,
+                        "merged": report.merged,
+                        "cleared": report.cleared,
+                        "items": report.items.iter().map(|i| serde_json::json!({
+                            "name": i.name,
+                            "kind": i.kind,
+                            "target": i.target,
+                            "action": i.action,
+                        })).collect::<Vec<_>>(),
+                        "warnings": report.warnings,
+                    })
+                );
+            } else {
+                if report.empty {
+                    println!("inbox: nothing to do (no inbox branch)");
+                } else if report.dry_run {
+                    println!(
+                        "inbox: dry run — {} item(s) would merge, {} would be skipped",
+                        report.merged,
+                        report.items.len() - report.merged
+                    );
+                } else {
+                    println!(
+                        "inbox: {} item(s) merged into {}, {} cleared",
+                        report.merged, report.branch, report.cleared
+                    );
+                }
+                for i in &report.items {
+                    println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+                }
+                for w in &report.warnings {
+                    println!("warning: {w}");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -1079,15 +1179,16 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
     Ok(ExitCode::SUCCESS)
 }
 
-fn discover(flag: Option<&std::path::Path>) -> Result<PathBuf, DomainError> {
+fn discover(flag: Option<&std::path::Path>) -> Result<(PathBuf, Option<UserConfig>), DomainError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    let user_config = load_user_config(home.as_deref());
     let discovery = Discovery {
         flag: flag.map(PathBuf::from),
         env: std::env::var("CONFIDANT_VAULT").ok(),
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        user_config: load_user_config(home.as_deref()),
+        user_config: user_config.clone(),
     };
-    resolve(&discovery)
+    resolve(&discovery).map(|root| (root, user_config))
 }
 
 fn print_check_human(report: &confidant_core::CheckReport) -> io::Result<()> {

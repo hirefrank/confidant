@@ -102,6 +102,7 @@ pub enum FindingCode {
     DuplicateSrc,
     SessionUntagged,
     SessionTags,
+    InboxKeyMismatch,
 }
 
 impl FindingCode {
@@ -143,6 +144,7 @@ impl FindingCode {
             Self::DuplicateSrc => "E_DUPLICATE_SRC",
             Self::SessionUntagged => "W_SESSION_UNTAGGED",
             Self::SessionTags => "E_SESSION_TAGS",
+            Self::InboxKeyMismatch => "E_INBOX_KEY_MISMATCH",
         }
     }
 }
@@ -243,6 +245,10 @@ pub struct CheckReport {
 pub struct CheckOptions {
     pub as_of: Option<NaiveDate>,
     pub fail_on: Option<Severity>,
+    /// The operator's out-of-band pin of the vault's inbox public key. When
+    /// set and the vault's `[inbox].pubkey` differs, an error finding is
+    /// reported (possible key substitution; see `docs/inbox.md`).
+    pub pinned_inbox_pubkey: Option<String>,
 }
 
 /// Run every check against `vault`, collecting rather than propagating.
@@ -259,6 +265,38 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
             .at_file("confidant.toml")
             .with_fix("Use spec = \"0.1\" or upgrade the CLI"),
         );
+    }
+
+    // Key-substitution defense: the vault's advertised inbox key must match
+    // the operator's out-of-band pin. Anyone with git write access can change
+    // confidant.toml; only the local pin is trustworthy.
+    if let Some(pinned) = options
+        .pinned_inbox_pubkey
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match vault
+            .config
+            .inbox
+            .pubkey
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(vault_key) if vault_key != pinned => {
+                findings.push(
+                    Finding::new(
+                        FindingCode::InboxKeyMismatch,
+                        Severity::Error,
+                        "vault [inbox].pubkey does not match the pinned key in user config; possible key substitution",
+                    )
+                    .at_file("confidant.toml")
+                    .with_fix("Restore the pinned public key, or update the pin in ~/.config/confidant/config.toml after verifying the key out of band"),
+                );
+            }
+            _ => {}
+        }
     }
 
     for pack in &vault.config.packs {
