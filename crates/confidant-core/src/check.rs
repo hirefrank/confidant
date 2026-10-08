@@ -339,6 +339,11 @@ fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> NaiveDate {
     if let Some(d) = options.as_of {
         return d;
     }
+    resolve_as_of_date(vault)
+}
+
+/// The effective as-of date for coaching folds: config override, else today.
+pub fn resolve_as_of_date(vault: &Vault) -> NaiveDate {
     if let Some(raw) = vault.config.checks.as_of.as_deref() {
         if let Ok(d) = parse_iso_date(raw) {
             return d;
@@ -346,6 +351,21 @@ fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> NaiveDate {
         // Invalid as_of in config is reported as E_CONFIG at load time.
     }
     chrono::Utc::now().date_naive()
+}
+
+/// Best-effort coaching state for read commands (e.g. `context`).
+///
+/// Merge/alias problems are still reported by [`run`]; here they are folded
+/// best-effort and the findings discarded. Returns `None` when the coaching
+/// pack is disabled.
+pub fn coaching_snapshot(vault: &Vault, as_of: NaiveDate) -> Option<CoachingState> {
+    if !vault.config.coaching_enabled() {
+        return None;
+    }
+    let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
+    let mut findings = Vec::new();
+    let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut findings);
+    Some(coaching::fold(vault, merges, as_of, &mut findings))
 }
 
 fn known_verbs(config: &VaultConfig) -> HashSet<&'static str> {
