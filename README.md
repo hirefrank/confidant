@@ -21,10 +21,12 @@ not put real clients in it.
 
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores
-nothing; that depends on the provider's terms. A per-person `no-ai: true`
-flag is a boolean in spec 0.1. `confidant find` omits those people and their
-notes so an agent does not send them to a model. Milestone 3 `context`
-continues to honour the flag.
+nothing; that depends on the provider's terms. `no-ai: true` is a boolean on
+person, note, interaction, and deal records. `confidant find` is
+privacy-first (if unsure, exclude): it omits those records, people whose
+profile will not parse or is missing, every member of a merge group when any
+member is excluded, linked interactions and deals, and ledger lines that
+mention an excluded ID. Milestone 3 `context` continues to honour the flag.
 
 ## Quickstart
 
@@ -74,8 +76,13 @@ on `code`, never on message text.
 
 Gap rules from the architecture (section 9b): a session with no notes, and a
 paid client (`sessions_remaining > 0` or a `pps` session in the lookback)
-with no session inside a configurable window. `no-ai: true` people are
-omitted from `find`.
+with no session inside a configurable window. Never-started packages measure
+that window from the most recent `open`. Session billing tags are `paid`
+(consumes a slot), `pps`, and `comp` (complimentary; never consume). A
+session with none of these still consumes and is `W_SESSION_UNTAGGED`; more
+than one is `E_SESSION_TAGS`. A merge between different record types is
+`E_WRONG_ID_TYPE`. `find` follows the privacy-first rules in spec section 12
+(ledger lines included).
 
 ```sh
 confidant check --json --fail-on warning --as-of 2026-10-08

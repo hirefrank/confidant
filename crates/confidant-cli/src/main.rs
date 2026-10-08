@@ -194,7 +194,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 )?;
                 return Ok(ExitCode::from(1));
             }
-            let hits = search(&vault, &query);
+            let result = search(&vault, &query);
             if json {
                 println!(
                     "{}",
@@ -203,12 +203,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
                         "vault": vault.root.display().to_string(),
                         "query": query,
-                        "matches": hits,
-                        "findings": vault.load_findings,
+                        "matches": result.hits,
+                        "findings": result.findings,
                     })
                 );
             } else {
-                for f in &vault.load_findings {
+                for f in &result.findings {
                     writeln!(
                         io::stdout(),
                         "{:<7}  {}  {}",
@@ -217,7 +217,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         f.message
                     )?;
                 }
-                for hit in &hits {
+                for hit in &result.hits {
                     let id = hit.id.as_deref().unwrap_or("-");
                     writeln!(
                         io::stdout(),
@@ -227,7 +227,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         hit.excerpt
                     )?;
                 }
-                writeln!(io::stdout(), "{} matches", hits.len())?;
+                writeln!(io::stdout(), "{} matches", result.hits.len())?;
             }
             Ok(ExitCode::SUCCESS)
         }

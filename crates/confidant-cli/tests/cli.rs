@@ -138,6 +138,50 @@ fn bad_as_of_is_usage_error() {
 }
 
 #[test]
+fn find_json_findings_omit_raw_profile_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        r#"spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "x"
+[checks]
+as_of = "2026-10-08"
+"#,
+    )
+    .unwrap();
+    let people = dir.path().join("people/p-01M3TC5H00MPJG000000000000");
+    std::fs::create_dir_all(&people).unwrap();
+    std::fs::write(
+        people.join("profile.md"),
+        "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: unique-fm-secret-token\nno-ai: yes\n---\n\nunique-body-secret\n",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["find", "unique-fm-secret-token", "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"], serde_json::json!([]));
+    let dumped = serde_json::to_string(&v["findings"]).unwrap();
+    assert!(!dumped.contains("unique-fm-secret-token"), "{dumped}");
+    assert!(!dumped.contains("unique-body-secret"), "{dumped}");
+    let findings = v["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| {
+            f["code"] == "E_FRONTMATTER"
+                && f["file"] == "people/p-01M3TC5H00MPJG000000000000/profile.md"
+                && f.get("line").is_none()
+                && f.get("id").is_none()
+                && f.get("fix").is_none()
+        }),
+        "{findings:?}"
+    );
+}
+
+#[test]
 fn find_unsupported_spec_is_command_error() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

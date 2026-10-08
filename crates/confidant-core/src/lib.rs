@@ -30,5 +30,5 @@ pub use error::DomainError;
 pub use id::RecordId;
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
-pub use search::{search, SearchHit};
+pub use search::{search, SearchHit, SearchResult};
 pub use vault::{load_vault, Vault};

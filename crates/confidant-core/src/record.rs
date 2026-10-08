@@ -45,6 +45,13 @@ impl RecordKind {
             _ => None,
         }
     }
+
+    pub fn allows_no_ai(self) -> bool {
+        match self {
+            Self::Person | Self::Note | Self::Deal | Self::Interaction => true,
+            Self::Org => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,54 +85,103 @@ impl Record {
 pub struct FrontmatterError {
     pub message: String,
     pub fix: String,
+    pub line: Option<u32>,
 }
 
+impl FrontmatterError {
+    fn new(message: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fix: fix.into(),
+            line: None,
+        }
+    }
+
+    fn at_line(mut self, line: u32) -> Self {
+        self.line = Some(line);
+        self
+    }
+
+    fn key_at(line: u32, key: &str, problem: &str, fix: impl Into<String>) -> Self {
+        Self {
+            message: format!("front matter key '{key}' {problem} (line {line})"),
+            fix: fix.into(),
+            line: Some(line),
+        }
+    }
+}
+
+type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32>);
+
 /// Split a Markdown file into front matter scalars and body.
-pub fn split_frontmatter(
-    text: &str,
-) -> Result<(BTreeMap<String, String>, String), FrontmatterError> {
+/// Key line numbers are 1-based in the original file (the opening `---` is line 1).
+pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterError> {
     let text = text.trim_start_matches('\u{feff}');
-    let rest = text.strip_prefix("---").ok_or(FrontmatterError {
-        message: "record does not start with YAML front matter (---)".to_owned(),
-        fix: "Start the file with --- then id and type, then a closing ---".to_owned(),
+    let rest = text.strip_prefix("---").ok_or_else(|| {
+        FrontmatterError::new(
+            "record does not start with YAML front matter (line 1)",
+            "Start the file with --- then id and type, then a closing ---",
+        )
+        .at_line(1)
     })?;
     let rest = rest
         .strip_prefix('\n')
         .or_else(|| rest.strip_prefix("\r\n"))
-        .ok_or(FrontmatterError {
-            message: "front matter opener --- must be followed by a newline".to_owned(),
-            fix: "Put id: and type: on the lines after the opening ---".to_owned(),
+        .ok_or_else(|| {
+            FrontmatterError::new(
+                "front matter opener --- must be followed by a newline (line 1)",
+                "Put id: and type: on the lines after the opening ---",
+            )
+            .at_line(1)
         })?;
-    let (fm, body) = split_close(rest).ok_or(FrontmatterError {
-        message: "front matter is not closed with ---".to_owned(),
-        fix: "Add a closing --- line after the identity fields".to_owned(),
+    let (fm, body) = split_close(rest).ok_or_else(|| {
+        FrontmatterError::new(
+            "front matter is not closed with ---",
+            "Add a closing --- line after the identity fields",
+        )
     })?;
     let mut fields = BTreeMap::new();
+    let mut key_lines = BTreeMap::new();
+    // Opening `---` consumed line 1.
+    let mut line_no: u32 = 2;
     for raw in fm.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
+            line_no += 1;
             continue;
         }
-        let (key, value) = line.split_once(':').ok_or(FrontmatterError {
-            message: format!("front matter line '{line}' is not key: value"),
-            fix: "Use simple key: value scalars; nested YAML is not part of spec 0.1".to_owned(),
-        })?;
+        let Some((key, value)) = line.split_once(':') else {
+            return Err(FrontmatterError::new(
+                format!("front matter line {line_no} is not key: value"),
+                "Use simple key: value scalars; nested YAML is not part of spec 0.1",
+            )
+            .at_line(line_no));
+        };
         let key = key.trim();
         if key.is_empty() {
-            return Err(FrontmatterError {
-                message: "front matter key is empty".to_owned(),
-                fix: "Each front matter line must be key: value".to_owned(),
-            });
+            return Err(FrontmatterError::new(
+                format!("front matter key is empty (line {line_no})"),
+                "Each front matter line must be key: value",
+            )
+            .at_line(line_no));
         }
         if fields.contains_key(key) {
-            return Err(FrontmatterError {
-                message: format!("front matter key '{key}' is duplicated"),
-                fix: "Keep a single value for each front matter key".to_owned(),
-            });
+            return Err(FrontmatterError::key_at(
+                line_no,
+                key,
+                "is duplicated",
+                "Keep a single value for each front matter key",
+            ));
         }
         fields.insert(key.to_owned(), unquote(value.trim()));
+        key_lines.insert(key.to_owned(), line_no);
+        line_no += 1;
     }
-    Ok((fields, body.trim_start_matches(['\n', '\r']).to_owned()))
+    Ok((
+        fields,
+        body.trim_start_matches(['\n', '\r']).to_owned(),
+        key_lines,
+    ))
 }
 
 fn split_close(rest: &str) -> Option<(&str, &str)> {
@@ -171,38 +227,68 @@ fn unescape(s: &str) -> String {
 }
 
 pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> {
-    let (fields, body) = split_frontmatter(text)?;
-    let id_raw = fields.get("id").ok_or(FrontmatterError {
-        message: "front matter is missing id".to_owned(),
-        fix: "Add id: <prefix>-<ULID>".to_owned(),
+    let (fields, body, key_lines) = split_frontmatter(text)?;
+    let line_of = |key: &str| key_lines.get(key).copied();
+    let id_raw = fields.get("id").ok_or_else(|| {
+        FrontmatterError::new(
+            "front matter is missing key 'id'",
+            "Add id: <prefix>-<ULID>",
+        )
     })?;
-    let type_raw = fields.get("type").ok_or(FrontmatterError {
-        message: "front matter is missing type".to_owned(),
-        fix: "Add type: person | org | deal | interaction | note".to_owned(),
+    let type_raw = fields.get("type").ok_or_else(|| {
+        FrontmatterError::new(
+            "front matter is missing key 'type'",
+            "Add type: person | org | deal | interaction | note",
+        )
     })?;
-    let kind = RecordKind::parse(type_raw).ok_or(FrontmatterError {
-        message: format!("unknown record type '{type_raw}'"),
-        fix: "Use type: person, org, deal, interaction, or note".to_owned(),
+    let kind = RecordKind::parse(type_raw).ok_or_else(|| {
+        let line = line_of("type").unwrap_or(1);
+        FrontmatterError::key_at(
+            line,
+            "type",
+            "has an unknown value",
+            "Use type: person, org, deal, interaction, or note",
+        )
     })?;
-    let id = RecordId::parse(id_raw).map_err(|err| FrontmatterError {
-        message: format!("invalid id '{id_raw}': {err}"),
-        fix: "Use a prefixed 26-character Crockford ULID".to_owned(),
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        let line = line_of("id").unwrap_or(1);
+        FrontmatterError::key_at(
+            line,
+            "id",
+            "is not a record ID",
+            "Use a prefixed 26-character Crockford ULID",
+        )
     })?;
-    if let Some(v) = fields.get("no-ai") {
+    if fields.contains_key("no-ai") {
+        let line = line_of("no-ai").unwrap_or(1);
+        if !kind.allows_no_ai() {
+            return Err(FrontmatterError::key_at(
+                line,
+                "no-ai",
+                "is not allowed on this record type",
+                "Use no-ai only on person, note, interaction, or deal records",
+            ));
+        }
+        let v = fields.get("no-ai").map(String::as_str).unwrap_or("");
         if v != "true" && v != "false" {
-            return Err(FrontmatterError {
-                message: format!("no-ai must be true or false (got '{v}')"),
-                fix: "Use no-ai: true or no-ai: false".to_owned(),
-            });
+            return Err(FrontmatterError::key_at(
+                line,
+                "no-ai",
+                "is not a boolean",
+                "Use no-ai: true or no-ai: false",
+            ));
         }
     }
     for key in ["date", "session"] {
         if let Some(v) = fields.get(key) {
             if parse_strict_date(v).is_none() {
-                return Err(FrontmatterError {
-                    message: format!("front matter {key} '{v}' is not YYYY-MM-DD"),
-                    fix: "Use a zero-padded calendar date such as 2026-10-08".to_owned(),
-                });
+                let line = line_of(key).unwrap_or(1);
+                return Err(FrontmatterError::key_at(
+                    line,
+                    key,
+                    "is not YYYY-MM-DD",
+                    "Use a zero-padded calendar date such as 2026-10-08",
+                ));
             }
         }
     }
@@ -301,17 +387,43 @@ mod tests {
     fn malformed_frontmatter() {
         assert!(parse_record("no front matter", "x.md").is_err());
         assert!(parse_record("---\nid: p-01M3TC5H00MPJG000000000000\n", "x.md").is_err());
-        assert!(parse_record(
+        let unknown_type = parse_record(
             "---\nid: p-01M3TC5H00MPJG000000000000\ntype: widget\n---\n",
-            "x.md"
+            "x.md",
         )
-        .is_err());
+        .unwrap_err();
+        assert!(unknown_type.message.contains("type"));
+        assert!(!unknown_type.message.contains("widget"));
         assert!(parse_record("---\ntype: person\n---\n", "x.md").is_err());
-        assert!(parse_record(
+        let dup = parse_record(
             "---\nid: p-01M3TC5H00MPJG000000000000\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n---\n",
-            "x.md"
+            "x.md",
         )
-        .is_err());
+        .unwrap_err();
+        assert!(dup.message.contains("id"));
+        assert!(dup.message.contains("duplicated"));
+        assert!(!dup.message.contains("01M3TC5H00MPJG000000000000"));
+        let unparsed = parse_record(
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nthis is not key value\n---\n",
+            "x.md",
+        )
+        .unwrap_err();
+        assert!(unparsed.message.contains("line 4"));
+        assert!(!unparsed.message.contains("this is not key value"));
+        let yes = parse_record(
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nno-ai: yes\n---\n",
+            "x.md",
+        )
+        .unwrap_err();
+        assert!(yes.message.contains("no-ai"));
+        assert!(!yes.message.contains("yes"));
+        let org = parse_record(
+            "---\nid: o-01M3TC5H00MPJG001K6C000003\ntype: org\nno-ai: true\n---\n",
+            "x.md",
+        )
+        .unwrap_err();
+        assert!(org.message.contains("no-ai"));
+        assert!(org.message.contains("not allowed"));
     }
 
     #[test]

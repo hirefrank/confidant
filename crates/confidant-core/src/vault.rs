@@ -1,6 +1,6 @@
 //! Load a vault from disk: config, records, ledger.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
@@ -36,6 +36,10 @@ pub struct Vault {
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
     pub load_findings: Vec<Finding>,
+    /// Person IDs observed under `people/`, whether or not the profile parsed.
+    pub person_ids: HashSet<RecordId>,
+    /// Main profile path for each person ID, when the file (or its directory) was seen.
+    pub person_files: HashMap<RecordId, String>,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -70,9 +74,17 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut records = BTreeMap::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
+    let mut person_ids = HashSet::new();
+    let mut person_files = HashMap::new();
 
     if config.spec == SPEC_VERSION {
-        scan_collections(root, &mut records, &mut findings);
+        scan_collections(
+            root,
+            &mut records,
+            &mut findings,
+            &mut person_ids,
+            &mut person_files,
+        );
         scan_ledger(root, &mut entries, &mut ledger_lines, &mut findings);
         scan_unexpected_top_level(root, &mut findings);
     }
@@ -84,6 +96,8 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         entries,
         ledger_lines,
         load_findings: findings,
+        person_ids,
+        person_files,
     })
 }
 
@@ -210,10 +224,13 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_collections(
     root: &Path,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
+    person_ids: &mut HashSet<RecordId>,
+    person_files: &mut HashMap<RecordId, String>,
 ) {
     for collection in COLLECTIONS {
         let rel = Path::new(collection);
@@ -247,7 +264,16 @@ fn scan_collections(
                     match ent.kind {
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(root, &child, stem, prefix, records, findings);
+                                ingest_file(
+                                    root,
+                                    &child,
+                                    stem,
+                                    prefix,
+                                    records,
+                                    findings,
+                                    person_ids,
+                                    person_files,
+                                );
                             } else {
                                 findings.push(
                                     Finding::new(
@@ -264,7 +290,16 @@ fn scan_collections(
                             }
                         }
                         EntryKind::Directory => {
-                            ingest_dir(root, &child, &ent.name, prefix, records, findings);
+                            ingest_dir(
+                                root,
+                                &child,
+                                &ent.name,
+                                prefix,
+                                records,
+                                findings,
+                                person_ids,
+                                person_files,
+                            );
                         }
                         EntryKind::Other => findings.push(
                             Finding::new(
@@ -285,6 +320,7 @@ fn scan_collections(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_file(
     root: &Path,
     relative: &Path,
@@ -292,6 +328,8 @@ fn ingest_file(
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
+    person_ids: &mut HashSet<RecordId>,
+    person_files: &mut HashMap<RecordId, String>,
 ) {
     let file = paths::display_relative(relative);
     let path_id = match RecordId::parse(stem) {
@@ -323,9 +361,14 @@ fn ingest_file(
             .for_id(&path_id),
         );
     }
+    if expected_prefix == Prefix::Person {
+        person_ids.insert(path_id.clone());
+        person_files.insert(path_id.clone(), file.clone());
+    }
     load_markdown(root, relative, Some(&path_id), records, findings);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_dir(
     root: &Path,
     relative: &Path,
@@ -333,6 +376,8 @@ fn ingest_dir(
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
+    person_ids: &mut HashSet<RecordId>,
+    person_files: &mut HashMap<RecordId, String>,
 ) {
     let dir = paths::display_relative(relative);
     let path_id = match RecordId::parse(name) {
@@ -367,6 +412,12 @@ fn ingest_dir(
     let main = expected_prefix
         .main_filename()
         .expect("collection records have a main file");
+    if expected_prefix == Prefix::Person {
+        person_ids.insert(path_id.clone());
+        person_files
+            .entry(path_id.clone())
+            .or_insert_with(|| paths::display_relative(&relative.join(main)));
+    }
     let mut saw_main = false;
     let entries = match list_dir(root, relative, findings) {
         Listed::Failed => return,
@@ -389,6 +440,9 @@ fn ingest_dir(
         }
         if ent.name == main && ent.kind == EntryKind::File {
             saw_main = true;
+            if expected_prefix == Prefix::Person {
+                person_files.insert(path_id.clone(), paths::display_relative(&child));
+            }
             load_markdown(root, &child, Some(&path_id), records, findings);
             continue;
         }
@@ -396,7 +450,15 @@ fn ingest_dir(
             && ent.name == "notes"
             && ent.kind == EntryKind::Directory
         {
-            scan_person_notes(root, relative, &path_id, records, findings);
+            scan_person_notes(
+                root,
+                relative,
+                &path_id,
+                records,
+                findings,
+                person_ids,
+                person_files,
+            );
             continue;
         }
         findings.push(
@@ -429,12 +491,15 @@ fn ingest_dir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_person_notes(
     root: &Path,
     person_dir: &Path,
     person_id: &RecordId,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
+    person_ids: &mut HashSet<RecordId>,
+    person_files: &mut HashMap<RecordId, String>,
 ) {
     let notes_rel = person_dir.join("notes");
     match paths::read_dir(root, &notes_rel) {
@@ -477,7 +542,16 @@ fn scan_person_notes(
                     continue;
                 }
                 let stem = ent.name.trim_end_matches(".md");
-                ingest_file(root, &child, stem, Prefix::Note, records, findings);
+                ingest_file(
+                    root,
+                    &child,
+                    stem,
+                    Prefix::Note,
+                    records,
+                    findings,
+                    person_ids,
+                    person_files,
+                );
                 if let Ok(id) = RecordId::parse(stem) {
                     if let Some(rec) = records.get(&id) {
                         if rec.person().as_ref().is_some_and(|p| p != person_id) {
@@ -532,11 +606,14 @@ fn load_markdown(
         );
     }
     match parse_record(&text, &file) {
-        Err(err) => findings.push(
-            Finding::new(FindingCode::Frontmatter, Severity::Error, err.message)
-                .at_file(&file)
-                .with_fix(err.fix),
-        ),
+        Err(err) => {
+            let mut finding =
+                Finding::new(FindingCode::Frontmatter, Severity::Error, err.message).at_file(&file);
+            if let Some(line) = err.line {
+                finding = finding.at_line(line);
+            }
+            findings.push(finding.with_fix(err.fix));
+        }
         Ok(mut rec) => {
             rec.path = file.clone();
             if let Some(pid) = path_id {

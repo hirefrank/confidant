@@ -1,5 +1,6 @@
 //! Coaching schema pack 0.1: sessions, packages, ICF hours, gap rules.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
@@ -64,6 +65,10 @@ impl PersonCoaching {
             .max()
     }
 
+    fn last_open_on(&self, on: NaiveDate) -> Option<NaiveDate> {
+        self.opens.iter().map(|o| o.date).filter(|d| *d <= on).max()
+    }
+
     fn pps_in_lookback(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
         self.sessions
             .iter()
@@ -77,11 +82,14 @@ impl PersonCoaching {
     }
 }
 
+type MembersByRoot = HashMap<NaiveDate, HashMap<RecordId, Vec<RecordId>>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct CoachingState {
     pub parent: MergeMap,
     people: HashMap<RecordId, PersonCoaching>,
     pub packages: HashSet<RecordId>,
+    members_by_root: RefCell<MembersByRoot>,
 }
 
 impl CoachingState {
@@ -89,17 +97,41 @@ impl CoachingState {
         canonical_on(id, &self.parent, on)
     }
 
+    fn members_on(&self, on: NaiveDate) -> HashMap<RecordId, Vec<RecordId>> {
+        if let Some(existing) = self.members_by_root.borrow().get(&on) {
+            return existing.clone();
+        }
+        let mut map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+        for pid in self.people.keys() {
+            let root = canonical_on(pid, &self.parent, on);
+            map.entry(root).or_default().push(pid.clone());
+        }
+        for members in map.values_mut() {
+            members.sort();
+        }
+        self.members_by_root.borrow_mut().insert(on, map.clone());
+        map
+    }
+
+    fn group_people<'a>(
+        &'a self,
+        groups: &'a HashMap<RecordId, Vec<RecordId>>,
+        id: &RecordId,
+        on: NaiveDate,
+    ) -> impl Iterator<Item = &'a PersonCoaching> {
+        let root = canonical_on(id, &self.parent, on);
+        let members = groups.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+        members.iter().filter_map(|pid| self.people.get(pid))
+    }
+
     pub fn sessions_remaining(&self, id: &RecordId) -> i64 {
         self.sessions_remaining_on(id, NaiveDate::MAX)
     }
 
     pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let root = self.canonical_on(id, on);
+        let groups = self.members_on(on);
         let mut total: i64 = 0;
-        for (pid, person) in &self.people {
-            if self.canonical_on(pid, on) != root {
-                continue;
-            }
+        for person in self.group_people(&groups, id, on) {
             let Some(n) = person.remaining_on(on) else {
                 continue;
             };
@@ -116,12 +148,9 @@ impl CoachingState {
     }
 
     pub fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let root = self.canonical_on(id, on);
+        let groups = self.members_on(on);
         let mut minutes: u32 = 0;
-        for (pid, person) in &self.people {
-            if self.canonical_on(pid, on) != root {
-                continue;
-            }
+        for person in self.group_people(&groups, id, on) {
             minutes = minutes.saturating_add(person.minutes_on(on));
         }
         minutes_to_hundredths(minutes)
@@ -133,10 +162,11 @@ impl CoachingState {
         as_of: NaiveDate,
         window: chrono::Duration,
     ) -> bool {
-        let root = self.canonical_on(id, as_of);
-        self.people.iter().any(|(pid, person)| {
-            self.canonical_on(pid, as_of) == root && person.pps_in_lookback(as_of, window)
-        })
+        let groups = self.members_on(as_of);
+        let found = self
+            .group_people(&groups, id, as_of)
+            .any(|person| person.pps_in_lookback(as_of, window));
+        found
     }
 
     fn group_any_session_in_window(
@@ -145,19 +175,29 @@ impl CoachingState {
         as_of: NaiveDate,
         window: chrono::Duration,
     ) -> bool {
-        let root = self.canonical_on(id, as_of);
-        self.people.iter().any(|(pid, person)| {
-            self.canonical_on(pid, as_of) == root && person.any_session_in_window(as_of, window)
-        })
+        let groups = self.members_on(as_of);
+        let found = self
+            .group_people(&groups, id, as_of)
+            .any(|person| person.any_session_in_window(as_of, window));
+        found
     }
 
     fn group_last_session_on(&self, id: &RecordId, as_of: NaiveDate) -> Option<NaiveDate> {
-        let root = self.canonical_on(id, as_of);
-        self.people
-            .iter()
-            .filter(|(pid, _)| self.canonical_on(pid, as_of) == root)
-            .filter_map(|(_, person)| person.last_session_on(as_of))
-            .max()
+        let groups = self.members_on(as_of);
+        let last = self
+            .group_people(&groups, id, as_of)
+            .filter_map(|person| person.last_session_on(as_of))
+            .max();
+        last
+    }
+
+    fn group_last_open_on(&self, id: &RecordId, as_of: NaiveDate) -> Option<NaiveDate> {
+        let groups = self.members_on(as_of);
+        let last = self
+            .group_people(&groups, id, as_of)
+            .filter_map(|person| person.last_open_on(as_of))
+            .max();
+        last
     }
 }
 
@@ -171,6 +211,7 @@ pub fn fold(
         parent,
         people: HashMap::new(),
         packages: HashSet::new(),
+        members_by_root: RefCell::new(HashMap::new()),
     };
 
     let mut events: Vec<_> = vault
@@ -206,13 +247,9 @@ pub fn fold(
         .checks
         .severity("coaching.balance_nonnegative", Severity::Error);
     if let Some(sev) = nonnegative {
-        let keys: Vec<_> = state.people.keys().cloned().collect();
-        let mut roots: Vec<_> = keys
-            .iter()
-            .map(|id| state.canonical_on(id, as_of))
-            .collect();
+        let groups = state.members_on(as_of);
+        let mut roots: Vec<_> = groups.keys().cloned().collect();
         roots.sort();
-        roots.dedup();
         for id in roots {
             let remaining = state.sessions_remaining_on(&id, as_of);
             if remaining < 0 {
@@ -379,10 +416,42 @@ fn apply_session(
             .with_fix("Add a duration such as 60m or 1h30m"),
         );
     }
+    let paid = entry.has_token("paid");
     let pps = entry.has_token("pps");
-    // A plain session (including `paid`) always consumes a package slot.
-    // `pps` (pay-per-session) never does.
-    let consumes = !pps;
+    let comp = entry.has_token("comp");
+    let tag_count = [paid, pps, comp].into_iter().filter(|tag| *tag).count();
+    if tag_count > 1 {
+        findings.push(
+            Finding::new(
+                FindingCode::SessionTags,
+                Severity::Error,
+                format!(
+                    "session for {} has more than one of paid, pps, comp",
+                    entry.id
+                ),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(&entry.id)
+            .with_fix("Keep exactly one billing tag: paid, pps, or comp"),
+        );
+    }
+    if tag_count == 0 {
+        findings.push(
+            Finding::new(
+                FindingCode::SessionUntagged,
+                Severity::Warning,
+                format!("session for {} has no paid, pps, or comp tag", entry.id),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(&entry.id)
+            .with_fix("Tag the session paid, pps (pay-per-session), or comp (complimentary)"),
+        );
+    }
+    // `paid` consumes. `pps` and `comp` never do. Untagged still consumes so
+    // balances cannot silently drop a session.
+    let consumes = paid || tag_count == 0;
     let person = person_mut(state, &entry.id);
     if let Some(mins) = duration {
         let current = person.minutes_on(NaiveDate::MAX);
@@ -604,13 +673,9 @@ fn paid_session_gap(
     let lookback_i = i64::try_from(lookback).unwrap_or(i64::MAX);
     let window = chrono::Duration::days(days_i);
     let lookback_window = chrono::Duration::days(lookback_i);
-    let keys: Vec<_> = state.people.keys().cloned().collect();
-    let mut ids: Vec<_> = keys
-        .iter()
-        .map(|id| state.canonical_on(id, as_of))
-        .collect();
+    let groups = state.members_on(as_of);
+    let mut ids: Vec<_> = groups.keys().cloned().collect();
     ids.sort();
-    ids.dedup();
     for id in ids {
         let remaining = state.sessions_remaining_on(&id, as_of);
         let pps_client = state.group_pps_in_lookback(&id, as_of, lookback_window);
@@ -621,6 +686,13 @@ fn paid_session_gap(
             continue;
         }
         let last = state.group_last_session_on(&id, as_of);
+        if last.is_none() {
+            if let Some(opened) = state.group_last_open_on(&id, as_of) {
+                if as_of.signed_duration_since(opened) <= window {
+                    continue;
+                }
+            }
+        }
         let start = as_of - window;
         let message = match (last, remaining > 0) {
             (None, _) => format!("paid client {id} has no session logged"),

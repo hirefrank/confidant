@@ -1,7 +1,11 @@
 //! Plaintext scan of records and ledger lines (milestone 1 stopgap).
 
+use std::collections::{HashMap, HashSet};
+
 use serde::Serialize;
 
+use crate::check::{parse_merge, Finding, FindingCode, MergeParse, Severity};
+use crate::id::RecordId;
 use crate::record::RecordKind;
 use crate::vault::Vault;
 
@@ -14,18 +18,29 @@ pub struct SearchHit {
     pub excerpt: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    pub findings: Vec<Finding>,
+}
+
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
 /// Line numbers are 1-based positions in the original file.
-/// People with `no-ai: true` and their notes are excluded.
-pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
+/// Excludes no-ai people, uncertain profiles, merge groups, linked records,
+/// and ledger lines that mention an excluded ID.
+pub fn search(vault: &Vault, query: &str) -> SearchResult {
     let needle = case_fold(query);
+    let exclusion = ExclusionSet::build(vault);
+    let findings = findings_for_find(vault, &exclusion);
     if needle.is_empty() {
-        return Vec::new();
+        return SearchResult {
+            hits: Vec::new(),
+            findings,
+        };
     }
-    let excluded = excluded_people(vault);
     let mut hits = Vec::new();
     for rec in vault.records.values() {
-        if excluded_record(rec, &excluded) {
+        if exclusion.ids.contains(&rec.id) {
             continue;
         }
         scan_text(
@@ -37,7 +52,7 @@ pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
         );
     }
     for line in &vault.ledger_lines {
-        if ledger_line_excluded(line, &excluded) {
+        if ledger_line_excluded(&line.text, &exclusion.folded_ids) {
             continue;
         }
         if contains_ignore_case(&line.text, &needle) {
@@ -50,56 +65,171 @@ pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
         }
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    hits
+    SearchResult { hits, findings }
 }
 
-fn excluded_people(vault: &Vault) -> std::collections::HashSet<crate::id::RecordId> {
-    vault
-        .records
-        .values()
-        .filter(|r| r.kind == RecordKind::Person && r.no_ai())
-        .map(|r| r.id.clone())
-        .collect()
+struct ExclusionSet {
+    ids: HashSet<RecordId>,
+    folded_ids: Vec<String>,
+    unparsed_profiles: Vec<(RecordId, String)>,
 }
 
-fn excluded_record(
-    rec: &crate::record::Record,
-    excluded: &std::collections::HashSet<crate::id::RecordId>,
-) -> bool {
-    if rec.kind == RecordKind::Person && excluded.contains(&rec.id) {
-        return true;
-    }
-    if rec.kind == RecordKind::Note {
-        if let Some(person) = rec.person() {
-            if excluded.contains(&person) {
-                return true;
+impl ExclusionSet {
+    fn build(vault: &Vault) -> Self {
+        let mut seeds = HashSet::new();
+        let mut unparsed_profiles = Vec::new();
+        for id in &vault.person_ids {
+            match vault.records.get(id) {
+                Some(rec) if rec.kind == RecordKind::Person && rec.no_ai() => {
+                    seeds.insert(id.clone());
+                }
+                Some(rec) if rec.kind == RecordKind::Person => {}
+                _ => {
+                    seeds.insert(id.clone());
+                    let path = vault
+                        .person_files
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("people/{id}/profile.md"));
+                    unparsed_profiles.push((id.clone(), path));
+                }
             }
         }
-        if let Some(person) = person_from_path(&rec.path) {
-            if excluded.contains(&person) {
-                return true;
+        let links = merge_links(vault);
+        let mut ids = expand_merge_groups(seeds, &links);
+        for rec in vault.records.values() {
+            if rec.no_ai() {
+                ids.insert(rec.id.clone());
+            }
+            if let Some(person) = rec.person() {
+                if ids.contains(&person) {
+                    ids.insert(rec.id.clone());
+                }
+            }
+            if rec.kind == RecordKind::Note {
+                if let Some(person) = person_from_path(&rec.path) {
+                    if ids.contains(&person) {
+                        ids.insert(rec.id.clone());
+                    }
+                }
             }
         }
+        let mut folded_ids: Vec<String> = ids.iter().map(|id| case_fold(&id.to_string())).collect();
+        folded_ids.sort();
+        folded_ids.dedup();
+        Self {
+            ids,
+            folded_ids,
+            unparsed_profiles,
+        }
     }
-    false
 }
 
-fn person_from_path(path: &str) -> Option<crate::id::RecordId> {
+fn merge_links(vault: &Vault) -> Vec<(RecordId, RecordId)> {
+    let mut links = Vec::new();
+    for sourced in &vault.entries {
+        if sourced.entry.verb != "merge" {
+            continue;
+        }
+        if let MergeParse::Ok { from, to } = parse_merge(&sourced.entry) {
+            links.push((from, to));
+        }
+    }
+    links
+}
+
+fn expand_merge_groups(
+    seeds: HashSet<RecordId>,
+    links: &[(RecordId, RecordId)],
+) -> HashSet<RecordId> {
+    let mut adj: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+    for (a, b) in links {
+        adj.entry(a.clone()).or_default().push(b.clone());
+        adj.entry(b.clone()).or_default().push(a.clone());
+    }
+    let mut out = HashSet::new();
+    let mut stack: Vec<RecordId> = seeds.into_iter().collect();
+    while let Some(id) = stack.pop() {
+        if !out.insert(id.clone()) {
+            continue;
+        }
+        if let Some(neighbours) = adj.get(&id) {
+            stack.extend(neighbours.iter().cloned());
+        }
+    }
+    out
+}
+
+fn findings_for_find(vault: &Vault, exclusion: &ExclusionSet) -> Vec<Finding> {
+    let unparsed: HashSet<&str> = exclusion
+        .unparsed_profiles
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .collect();
+    let mut out = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for finding in &vault.load_findings {
+        if finding
+            .file
+            .as_deref()
+            .is_some_and(|file| unparsed.contains(file) || is_person_profile_path(file))
+            && (finding.code == FindingCode::Frontmatter || finding.code == FindingCode::Unreadable)
+        {
+            if let Some(file) = &finding.file {
+                if seen_paths.insert(file.clone()) {
+                    out.push(profile_find_finding(file));
+                }
+            }
+            continue;
+        }
+        out.push(finding.clone());
+    }
+    for (_, path) in &exclusion.unparsed_profiles {
+        if seen_paths.insert(path.clone()) {
+            out.push(profile_find_finding(path));
+        }
+    }
+    out
+}
+
+fn profile_find_finding(path: &str) -> Finding {
+    Finding::new(
+        FindingCode::Frontmatter,
+        Severity::Error,
+        "person profile excluded from find",
+    )
+    .at_file(path)
+}
+
+fn is_person_profile_path(file: &str) -> bool {
+    let mut parts = file.split('/');
+    if parts.next() != Some("people") {
+        return false;
+    }
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    match parts.next() {
+        Some("profile.md") => parts.next().is_none(),
+        None => second.ends_with(".md"),
+        _ => false,
+    }
+}
+
+fn person_from_path(path: &str) -> Option<RecordId> {
     let mut parts = path.split('/');
     if parts.next()? != "people" {
         return None;
     }
-    crate::id::RecordId::parse(parts.next()?).ok()
+    RecordId::parse(parts.next()?).ok()
 }
 
-fn ledger_line_excluded(
-    line: &crate::vault::LedgerLine,
-    excluded: &std::collections::HashSet<crate::id::RecordId>,
-) -> bool {
-    line.id
-        .as_deref()
-        .and_then(|raw| crate::id::RecordId::parse(raw).ok())
-        .is_some_and(|id| excluded.contains(&id))
+fn ledger_line_excluded(text: &str, folded_ids: &[String]) -> bool {
+    if folded_ids.is_empty() {
+        return false;
+    }
+    let folded = case_fold(text);
+    folded_ids.iter().any(|id| folded.contains(id))
 }
 
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {

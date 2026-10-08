@@ -185,8 +185,8 @@ mod tests {
         let (unique, common) = generate_realistic_vault(dir.path(), 3, 2).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
-        assert_eq!(search(&vault, &unique).len(), 1);
-        assert!(search(&vault, &common).len() >= 3);
+        assert_eq!(search(&vault, &unique).hits.len(), 1);
+        assert!(search(&vault, &common).hits.len() >= 3);
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());
         assert!(
             report.findings.is_empty(),

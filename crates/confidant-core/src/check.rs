@@ -99,6 +99,8 @@ pub enum FindingCode {
     MergeFork,
     DanglingRef,
     DuplicateSrc,
+    SessionUntagged,
+    SessionTags,
 }
 
 impl FindingCode {
@@ -138,6 +140,8 @@ impl FindingCode {
             Self::MergeFork => "E_MERGE_FORK",
             Self::DanglingRef => "E_DANGLING_REF",
             Self::DuplicateSrc => "E_DUPLICATE_SRC",
+            Self::SessionUntagged => "W_SESSION_UNTAGGED",
+            Self::SessionTags => "E_SESSION_TAGS",
         }
     }
 }
@@ -484,6 +488,23 @@ fn check_aliases_and_merges(
                 .with_fix("Use a prefixed 26-character Crockford ULID"),
             ),
             MergeParse::Ok { from, to } => {
+                if from.prefix() != to.prefix() {
+                    findings.push(
+                        Finding::new(
+                            FindingCode::WrongIdType,
+                            Severity::Error,
+                            format!(
+                                "merge requires the same record type, got {} into {}",
+                                from, to
+                            ),
+                        )
+                        .at_file(&sourced.file)
+                        .at_line(sourced.line)
+                        .for_id(&from)
+                        .with_fix("Merge two records of the same type"),
+                    );
+                    continue;
+                }
                 if from == to {
                     findings.push(
                         Finding::new(
@@ -949,5 +970,7 @@ mod tests {
         assert_eq!(FindingCode::WrongIdType.as_str(), "E_WRONG_ID_TYPE");
         assert_eq!(FindingCode::Config.as_str(), "E_CONFIG");
         assert_eq!(FindingCode::InvalidId.as_str(), "E_INVALID_ID");
+        assert_eq!(FindingCode::SessionUntagged.as_str(), "W_SESSION_UNTAGGED");
+        assert_eq!(FindingCode::SessionTags.as_str(), "E_SESSION_TAGS");
     }
 }

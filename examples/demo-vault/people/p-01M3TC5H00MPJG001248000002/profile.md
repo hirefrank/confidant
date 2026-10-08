@@ -5,6 +5,6 @@ name: Cam Sample
 no-ai: true
 ---
 
-Fake client with the no-ai flag set. `confidant find` omits this person and
-their notes. Milestone 3 `context` continues to honour the flag. Not a real
-person.
+Fake client with the no-ai flag set. `confidant find` omits this person,
+their notes, linked records, and ledger lines that mention this ID.
+Milestone 3 `context` continues to honour the flag. Not a real person.
