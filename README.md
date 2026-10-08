@@ -136,6 +136,10 @@ after v0, on trusted devices with encrypted disks, index never in git.
 
 ## License
 
-Apache-2.0. Some files are adapted from [cr](https://github.com/AnandChowdhary/cr)
+Copyright 2026 Frank Harris.
+
+Licensed under the Apache License, Version 2.0 (`license = "Apache-2.0"` in
+[`Cargo.toml`](Cargo.toml)). See [`LICENSE`](LICENSE) for the full text.
+Some files are adapted from [cr](https://github.com/AnandChowdhary/cr)
 (MIT); see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) and
 [`docs/borrowing.md`](docs/borrowing.md).
