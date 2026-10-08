@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Encryption for Confidant vaults (stub until milestone 2)."
+# publish=false until the §9b item 5 gate clears: outside design review +
+# code audit before inviting anyone else to trust Confidant. Publishing
+# can't be undone, only yanked.
 publish = false
 
 [dependencies]

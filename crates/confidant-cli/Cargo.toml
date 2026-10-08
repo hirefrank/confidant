@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 description = "CLI for the Confidant plain-text CRM."
 publish = false
@@ -12,6 +13,11 @@ publish = false
 [[bin]]
 name = "confidant"
 path = "src/main.rs"
+
+[package.metadata.dist]
+# The binary ships via GitHub Releases (cargo-dist); it is not published to
+# crates.io as a package (publish = false stays).
+dist = true
 
 [dependencies]
 anyhow.workspace = true
