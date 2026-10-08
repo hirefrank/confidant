@@ -1,0 +1,12 @@
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "01M3TC5H00MPJG005VQC00000B"
+
+[checks]
+as_of = "2026-10-08"
+coaching.require_duration = "error"
+coaching.balance_nonnegative = "error"
+coaching.session_notes = "warning"
+coaching.paid_session_gap = "warning"
+coaching.paid_session_gap_days = 45
+coaching.pps_lookback_days = 180

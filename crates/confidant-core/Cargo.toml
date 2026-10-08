@@ -1,0 +1,25 @@
+[package]
+name = "confidant-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Parse, model, derived values, and check engine for Confidant vaults."
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+chrono.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
