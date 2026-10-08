@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Parse, model, derived values, and check engine for Confidant vaults."
-publish = false
 
 [dependencies]
 anyhow.workspace = true
