@@ -190,7 +190,7 @@ Encryption is optional for generic open-source users and the default for notes a
 
 **Alternatives considered.** Claiming remote wipe or DRM-style control: not possible with files on a device the user doesn't control.
 
-**Consequences.** Honest expectations. Rotation re-encrypts affected files, which creates large commits.
+**Consequences.** Honest expectations. Rotation issues a new epoch key; old-epoch ciphertext stays readable by still-authorized parties (the AAD binds the key epoch, ADR-4), so rotation is cheap and creates small commits.
 
 ### ADR-6. Files are the only source of truth; indexes and caches are throwaway.
 
