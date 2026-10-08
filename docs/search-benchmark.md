@@ -50,10 +50,11 @@ Session-note and paid-gap checks are `off` in the generated config so
 
 ## Results
 
-Measured 2026-10-08 on the milestone 1 cloud-agent VM after Review #13
-(bare-ULID Crockford windows vs a vault HashSet, merge/open `ids_named_by`,
-failed-to-load path IDs). `find` hit counts match `grep -ri` exactly
-(1 unique, 2,400 common) on both the English and `--cjk` vaults.
+Measured 2026-10-08 on the milestone 1 cloud-agent VM after Review #14
+(bare-ULID index seeded from every prefixed vault name and rejected
+path, `E_LEDGER_DATE` without a path in the message). `find` hit counts
+match `grep -ri` exactly (1 unique, 2,400 common) on both the English
+and `--cjk` vaults.
 
 Hardware: Intel Xeon (4 logical CPUs), Linux 6.12, `confidant` release
 build (`rustc 1.99.0`). Hyperfine 2.0.0, **3 warmup runs, 10 timed runs**.
@@ -63,17 +64,17 @@ English filler:
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| `find zxqvUniqueTokenAda0` (one profile) | 1 | **166.7 ms** | 27.6 ms | 148.3 ms | 222.4 ms |
-| `find coaching-practice` (every record) | 2,400 | **150.7 ms** | 14.8 ms | 142.6 ms | 192.1 ms |
-| `check` | 0 findings | **82.1 ms** | 1.9 ms | 80.0 ms | 85.5 ms |
+| `find zxqvUniqueTokenAda0` (one profile) | 1 | **203.7 ms** | 5.3 ms | 197.5 ms | 215.1 ms |
+| `find coaching-practice` (every record) | 2,400 | **213.7 ms** | 24.3 ms | 195.7 ms | 280.5 ms |
+| `check` | 0 findings | **84.3 ms** | 1.9 ms | 82.0 ms | 88.4 ms |
 
 `--cjk` (no-space CJK note bodies):
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| `find zxqvUniqueTokenAda0` | 1 | **228.3 ms** | 5.6 ms | 221.8 ms | 240.6 ms |
-| `find coaching-practice` | 2,400 | **226.4 ms** | 4.5 ms | 220.1 ms | 233.3 ms |
-| `check` | 0 findings | **90.0 ms** | 7.2 ms | 83.8 ms | 104.9 ms |
+| `find zxqvUniqueTokenAda0` | 1 | **259.4 ms** | 8.4 ms | 249.8 ms | 275.7 ms |
+| `find coaching-practice` | 2,400 | **274.4 ms** | 25.9 ms | 254.5 ms | 342.6 ms |
+| `check` | 0 findings | **89.0 ms** | 1.4 ms | 87.4 ms | 92.0 ms |
 
 Peak RSS was about 33–46 MiB (check ~33–35 MiB, find ~45–46 MiB).
 An 80k-character CJK line, a 320k-character URL line, and a 2 MB
@@ -84,15 +85,16 @@ in release (guarded by `scan_id_tokens_is_linear_on_long_cjk_and_url_lines`).
 
 A sequential plaintext scan of a few hundred clients, with realistic
 note sizes (KB transcripts), dozens of sessions per client, and
-multi-year ledgers, stays around **151 ms** for `find` (cleared
+multi-year ledgers, stays around **214 ms** for `find` (cleared
 allowlist plus scan, including every 26-character Crockford window
-against vault ULIDs) and **82 ms** for `check` — still inside interactive
-range. The same layout with no-space CJK note bodies is about **226 ms**
-for `find` (previously 5.6 s when glue scanned back to the last space at
-every character). The earlier ~70 ms `find` figure was the same 400×5
-layout before the fixed-point allowlist; Review #11 was ~117 ms English /
-~180 ms CJK; Review #12 was ~145 ms English / ~200 ms CJK at word
-boundary before the window scan.
+against every ULID the vault names) and **84 ms** for `check` — still
+inside interactive range. The same layout with no-space CJK note bodies
+is about **274 ms** for `find` (previously 5.6 s when glue scanned back
+to the last space at every character). The earlier ~70 ms `find` figure
+was the same 400×5 layout before the fixed-point allowlist; Review #11
+was ~117 ms English / ~180 ms CJK; Review #12 was ~145 ms English /
+~200 ms CJK at word boundary; Review #13 was ~151 ms English / ~226 ms
+CJK before seeding the ULID index from every prefixed name.
 
 QMD (local BM25 + vectors, index never in git) is still the plan after
 v0. Milestone 2 record-bound AEAD is **not** in this measurement; do not
