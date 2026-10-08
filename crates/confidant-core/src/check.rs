@@ -94,6 +94,11 @@ pub enum FindingCode {
     NegativeBalance,
     SessionWithoutNotes,
     PaidSessionGap,
+    WrongIdType,
+    DuplicateUlid,
+    MergeFork,
+    DanglingRef,
+    DuplicateSrc,
 }
 
 impl FindingCode {
@@ -128,6 +133,11 @@ impl FindingCode {
             Self::NegativeBalance => "E_NEGATIVE_BALANCE",
             Self::SessionWithoutNotes => "E_SESSION_WITHOUT_NOTES",
             Self::PaidSessionGap => "E_PAID_SESSION_GAP",
+            Self::WrongIdType => "E_WRONG_ID_TYPE",
+            Self::DuplicateUlid => "E_DUPLICATE_ULID",
+            Self::MergeFork => "E_MERGE_FORK",
+            Self::DanglingRef => "E_DANGLING_REF",
+            Self::DuplicateSrc => "E_DUPLICATE_SRC",
         }
     }
 }
@@ -207,9 +217,13 @@ impl CheckSummary {
     }
 }
 
+/// JSON report schema version. Independent of the vault spec version.
+pub const JSON_SCHEMA_VERSION: &str = "1";
+
 /// The complete result of one `check` run.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CheckReport {
+    pub schema_version: String,
     pub ok: bool,
     pub vault: String,
     pub spec: String,
@@ -259,12 +273,21 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         }
     }
 
+    let spec_ok = vault.config.spec == SPEC_VERSION;
+    if !spec_ok {
+        sort_findings(&mut findings);
+        return finish_report(vault, options, findings);
+    }
+
     let known_verbs = known_verbs(&vault.config);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
     check_aliases_and_merges(vault, &known_ids, &mut findings);
     check_verbs_and_refs(vault, &known_verbs, &known_ids, &mut findings);
+    check_duplicate_ulids(vault, &mut findings);
+    check_dangling_refs(vault, &known_ids, &mut findings);
+    check_duplicate_src(vault, &mut findings);
 
     let coaching = if vault.config.coaching_enabled() {
         Some(coaching::fold(vault, &mut findings))
@@ -280,7 +303,10 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     }
 
     sort_findings(&mut findings);
+    finish_report(vault, options, findings)
+}
 
+fn finish_report(vault: &Vault, options: &CheckOptions, findings: Vec<Finding>) -> CheckReport {
     let errors = findings
         .iter()
         .filter(|f| f.severity == Severity::Error)
@@ -297,6 +323,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     };
     let fail_on = options.fail_on.unwrap_or(Severity::Error);
     CheckReport {
+        schema_version: JSON_SCHEMA_VERSION.to_owned(),
         ok: !summary.fails(fail_on),
         vault: vault.root.display().to_string(),
         spec: vault.config.spec.clone(),
@@ -381,6 +408,27 @@ fn check_verbs_and_refs(
                 .with_fix("Use a core verb or enable the pack that defines it"),
             );
         }
+        let expected = match e.verb.as_str() {
+            "stage" => Some(Prefix::Deal),
+            "open" | "session" => Some(Prefix::Person),
+            _ => None,
+        };
+        if let Some(want) = expected {
+            if e.id.prefix() != want {
+                findings.push(
+                    Finding::new(
+                        FindingCode::WrongIdType,
+                        Severity::Error,
+                        format!("{} requires a {} id, got '{}'", e.verb, want.as_str(), e.id),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&e.id)
+                    .with_fix(format!("Use a {}-<ULID> id", want.as_str())),
+                );
+                continue;
+            }
+        }
         if e.id.prefix() != Prefix::Package && !known_ids.contains(&e.id) {
             findings.push(
                 Finding::new(
@@ -392,19 +440,6 @@ fn check_verbs_and_refs(
                 .at_line(sourced.line)
                 .for_id(&e.id)
                 .with_fix("Create the record or fix the id"),
-            );
-        }
-        if e.verb == "stage" && e.id.prefix() != Prefix::Deal {
-            findings.push(
-                Finding::new(
-                    FindingCode::UnknownRecord,
-                    Severity::Error,
-                    format!("stage requires a deal id, got '{}'", e.id),
-                )
-                .at_file(&sourced.file)
-                .at_line(sourced.line)
-                .for_id(&e.id)
-                .with_fix("Use a d-<ULID> deal id"),
             );
         }
     }
@@ -462,7 +497,25 @@ fn check_aliases_and_merges(
                         );
                     }
                 }
-                parent.insert(from, to);
+                if let Some(existing) = parent.get(&from) {
+                    if existing != &to {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::MergeFork,
+                                Severity::Error,
+                                format!(
+                                    "merge of {from} names two destinations ({existing} and {to})"
+                                ),
+                            )
+                            .at_file(&sourced.file)
+                            .at_line(sourced.line)
+                            .for_id(&from)
+                            .with_fix("Keep a single merge FROM into TO"),
+                        );
+                    }
+                } else {
+                    parent.insert(from, to);
+                }
             }
         }
     }
@@ -530,33 +583,30 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> Option<(RecordId, RecordId)> {
     Some((entry.id.clone(), to))
 }
 
+const ALIAS_HMAC_MIN_HEX: usize = 32;
+
 fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
-    let kind = entry
-        .args
-        .iter()
-        .find_map(Arg::as_token)
-        .ok_or_else(|| "alias line is missing a kind (email, phone, or handle)".to_owned())?;
+    if entry.args.len() != 2 {
+        return Err("alias line must be exactly KIND hmac:HEX".to_owned());
+    }
+    let kind = entry.args[0]
+        .as_token()
+        .ok_or_else(|| "alias kind must be a token (email, phone, or handle)".to_owned())?;
     if !matches!(kind, "email" | "phone" | "handle") {
         return Err(format!(
             "alias kind '{kind}' is not email, phone, or handle"
         ));
     }
-    let hmac = if let Some(value) = entry.pair("hmac") {
-        format!("hmac:{value}")
-    } else {
-        entry
-            .args
-            .iter()
-            .find_map(|a| match a {
-                Arg::Token(s) if s.starts_with("hmac:") => Some(s.clone()),
-                Arg::Pair { key, value } if key == "hmac" => Some(format!("hmac:{value}")),
-                _ => None,
-            })
-            .ok_or_else(|| "alias value is not hmac:<hex>".to_owned())?
+    let hmac = match &entry.args[1] {
+        Arg::Token(s) if s.starts_with("hmac:") => s.clone(),
+        Arg::Pair { key, value } if key == "hmac" => format!("hmac:{value}"),
+        _ => return Err("alias value is not hmac:<hex>".to_owned()),
     };
     let hex = hmac.strip_prefix("hmac:").unwrap_or("");
-    if hex.len() < 8 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("alias HMAC must be hmac: plus at least 8 hex characters".to_owned());
+    if hex.len() < ALIAS_HMAC_MIN_HEX || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "alias HMAC must be hmac: plus at least {ALIAS_HMAC_MIN_HEX} hex characters"
+        ));
     }
     Ok((kind.to_owned(), hex.to_ascii_lowercase()))
 }
@@ -669,7 +719,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                     continue;
                 }
             };
-            let computed = state.sessions_remaining(&person);
+            let computed = state.sessions_remaining_on(&person, e.date);
             if asserted != computed {
                 findings.push(
                     Finding::new(
@@ -699,7 +749,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                 );
                 continue;
             };
-            let computed = state.icf_hours_hundredths(&person);
+            let computed = state.icf_hours_hundredths_on(&person, e.date);
             if asserted != computed {
                 findings.push(
                     Finding::new(
@@ -724,8 +774,94 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
 
 fn format_hundredths(n: i64) -> String {
     let sign = if n < 0 { "-" } else { "" };
-    let n = n.abs();
+    let Some(n) = n.checked_abs() else {
+        return n.to_string();
+    };
     format!("{sign}{}.{:02}", n / 100, n % 100)
+}
+
+fn check_duplicate_ulids(vault: &Vault, findings: &mut Vec<Finding>) {
+    let mut by_ulid: HashMap<&str, Vec<&RecordId>> = HashMap::new();
+    for id in vault.records.keys() {
+        by_ulid.entry(id.ulid()).or_default().push(id);
+    }
+    for (ulid, ids) in by_ulid {
+        if ids.len() < 2 {
+            continue;
+        }
+        let mut ids = ids;
+        ids.sort();
+        findings.push(
+            Finding::new(
+                FindingCode::DuplicateUlid,
+                Severity::Error,
+                format!(
+                    "ULID {ulid} is used under more than one prefix ({})",
+                    ids.iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .for_id(ids[0]),
+        );
+    }
+}
+
+fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut Vec<Finding>) {
+    const REF_KEYS: &[&str] = &["person", "org", "deal"];
+    for rec in vault.records.values() {
+        for key in REF_KEYS {
+            let Some(raw) = rec.field(key) else { continue };
+            match RecordId::parse(raw) {
+                Err(_) => findings.push(
+                    Finding::new(
+                        FindingCode::InvalidId,
+                        Severity::Error,
+                        format!("front matter {key} '{raw}' is not a record ID"),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Use a prefixed 26-character Crockford ULID"),
+                ),
+                Ok(id) if !known_ids.contains(&id) => findings.push(
+                    Finding::new(
+                        FindingCode::DanglingRef,
+                        Severity::Error,
+                        format!("front matter {key} '{id}' has no record file"),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Create the record or fix the reference"),
+                ),
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
+    let mut seen: BTreeMap<String, (String, u32)> = BTreeMap::new();
+    for sourced in &vault.entries {
+        let Some(src) = sourced.entry.pair("src") else {
+            continue;
+        };
+        if let Some((file, line)) = seen.get(src) {
+            findings.push(
+                Finding::new(
+                    FindingCode::DuplicateSrc,
+                    Severity::Error,
+                    format!("src:{src} already appears at {file}:{line}"),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&sourced.entry.id)
+                .with_fix("Keep one src: provenance per import"),
+            );
+        } else {
+            seen.insert(src.to_owned(), (sourced.file.clone(), sourced.line));
+        }
+    }
 }
 
 fn sort_findings(findings: &mut [Finding]) {
@@ -775,5 +911,8 @@ mod tests {
             "E_SESSION_WITHOUT_NOTES"
         );
         assert_eq!(FindingCode::PaidSessionGap.as_str(), "E_PAID_SESSION_GAP");
+        assert_eq!(FindingCode::WrongIdType.as_str(), "E_WRONG_ID_TYPE");
+        assert_eq!(FindingCode::Config.as_str(), "E_CONFIG");
+        assert_eq!(FindingCode::InvalidId.as_str(), "E_INVALID_ID");
     }
 }

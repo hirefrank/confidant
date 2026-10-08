@@ -10,9 +10,10 @@ Rust 1.85 or newer (`rust-toolchain.toml` pins 1.99.0). From the repo root:
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo run -p confidant-cli -- check --json --no-input --vault examples/demo-vault
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+cargo +1.85 check --workspace --locked
+cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
 ```
 
 Supply-chain checks (also in CI):

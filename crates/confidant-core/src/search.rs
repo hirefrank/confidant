@@ -13,9 +13,10 @@ pub struct SearchHit {
     pub excerpt: String,
 }
 
-/// Case-insensitive substring scan. Hits are ordered by path, then line.
+/// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
+/// Line numbers are 1-based positions in the original file.
 pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
-    let needle = query.to_ascii_lowercase();
+    let needle = query.to_lowercase();
     if needle.is_empty() {
         return Vec::new();
     }
@@ -24,14 +25,14 @@ pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
         scan_text(
             &rec.path,
             Some(rec.id.to_string()),
-            &display_text(rec),
+            &rec.source,
             &needle,
             &mut hits,
         );
     }
     for sourced in &vault.entries {
         let line_text = crate::ledger::format_entry(&sourced.entry);
-        if line_text.to_ascii_lowercase().contains(&needle) {
+        if contains_ignore_case(&line_text, &needle) {
             hits.push(SearchHit {
                 id: Some(sourced.entry.id.to_string()),
                 path: sourced.file.clone(),
@@ -44,21 +45,13 @@ pub fn search(vault: &Vault, query: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn display_text(rec: &crate::record::Record) -> String {
-    let mut out = String::new();
-    for (k, v) in &rec.fields {
-        out.push_str(k);
-        out.push_str(": ");
-        out.push_str(v);
-        out.push('\n');
-    }
-    out.push_str(&rec.body);
-    out
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    haystack.to_lowercase().contains(needle_lower)
 }
 
 fn scan_text(path: &str, id: Option<String>, text: &str, needle: &str, hits: &mut Vec<SearchHit>) {
     for (idx, line) in text.lines().enumerate() {
-        if line.to_ascii_lowercase().contains(needle) {
+        if contains_ignore_case(line, needle) {
             hits.push(SearchHit {
                 id: id.clone(),
                 path: path.to_owned(),
@@ -79,11 +72,19 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::excerpt;
+    use super::{contains_ignore_case, excerpt};
 
     #[test]
     fn excerpt_truncates() {
         let s = excerpt("abcdefghijklmnopqrstuvwxyz", 5);
         assert_eq!(s, "abcde…");
+    }
+
+    #[test]
+    fn unicode_case_insensitive() {
+        assert!(contains_ignore_case("İstanbul Café", "café"));
+        assert!(
+            contains_ignore_case("Straße", "STRASSE") || contains_ignore_case("Straße", "straße")
+        );
     }
 }

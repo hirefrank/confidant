@@ -97,16 +97,18 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    let json = cli.json;
     let _no_input = cli.no_input;
     match cli.command {
         Command::BenchGen { dir, people, notes } => {
             let (unique, common) =
                 confidant_core::bench::generate_realistic_vault(&dir, people, notes)?;
-            if cli.json {
+            if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "ok": true,
+                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
                         "vault": dir.canonicalize().unwrap_or(dir).display().to_string(),
                         "people": people,
                         "notes_per_person": notes,
@@ -124,8 +126,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Check { fail_on, as_of } => {
             let fail_on = parse_fail_on(&fail_on)?;
             let as_of = as_of.as_deref().map(parse_iso_date).transpose()?;
-            let root = discover(cli.vault.as_deref())?;
-            let vault = load_vault(&root)?;
+            let root = match discover(cli.vault.as_deref()) {
+                Ok(root) => root,
+                Err(err) => {
+                    print_error(json, None, &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
+                }
+            };
+            let vault = match load_vault(&root) {
+                Ok(v) => v,
+                Err(err) => {
+                    print_error(json, Some(&root.display().to_string()), &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
+                }
+            };
             let report = check_vault(
                 &vault,
                 &CheckOptions {
@@ -133,7 +147,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     fail_on: Some(fail_on),
                 },
             );
-            if cli.json {
+            if json {
                 serde_json::to_writer(io::stdout(), &report)?;
                 println!();
             } else {
@@ -151,14 +165,27 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     "find requires a non-empty query",
                 )));
             }
-            let root = discover(cli.vault.as_deref())?;
-            let vault = load_vault(&root)?;
+            let root = match discover(cli.vault.as_deref()) {
+                Ok(root) => root,
+                Err(err) => {
+                    print_error(json, None, &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
+                }
+            };
+            let vault = match load_vault(&root) {
+                Ok(v) => v,
+                Err(err) => {
+                    print_error(json, Some(&root.display().to_string()), &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
+                }
+            };
             let hits = search(&vault, &query);
-            if cli.json {
+            if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "ok": true,
+                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
                         "vault": vault.root.display().to_string(),
                         "query": query,
                         "matches": hits,
@@ -232,10 +259,11 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
     if json {
         let body = serde_json::json!({
             "ok": false,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
             "vault": vault,
             "error": err.to_json(),
         });
-        writeln!(io::stderr(), "{body}")?;
+        writeln!(io::stdout(), "{body}")?;
     } else {
         writeln!(io::stderr(), "error: {} ({})", err.message(), err.code())?;
         if let Some(fix) = err.fix() {

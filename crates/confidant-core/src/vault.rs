@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
-use crate::config::{parse_iso_date, VaultConfig};
+use crate::config::{VaultConfig, SPEC_VERSION};
 use crate::id::{Prefix, RecordId};
-use crate::ledger::{parse_ledger, LedgerEntry};
+use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
 use crate::record::{has_conflict_markers, parse_record, Record, RecordKind};
 
@@ -53,19 +53,18 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
                 .with_file("confidant.toml"),
         ));
     }
-    let config = VaultConfig::parse(&cfg_text)
+    let mut config = VaultConfig::parse(&cfg_text)
         .map_err(|err| anyhow::Error::new(err.with_file("confidant.toml")))?;
-    if let Some(as_of) = config.checks.as_of.as_deref() {
-        parse_iso_date(as_of).map_err(|err| anyhow::Error::new(err.with_file("confidant.toml")))?;
-    }
 
-    let mut findings = Vec::new();
+    let mut findings = config.config_findings();
     let mut records = BTreeMap::new();
     let mut entries = Vec::new();
 
-    scan_collections(root, &mut records, &mut findings)?;
-    scan_ledger(root, &mut entries, &mut findings)?;
-    scan_unexpected_top_level(root, &mut findings)?;
+    if config.spec == SPEC_VERSION {
+        scan_collections(root, &mut records, &mut findings);
+        scan_ledger(root, &mut entries, &mut findings);
+        scan_unexpected_top_level(root, &mut findings);
+    }
 
     Ok(Vault {
         root: root.to_path_buf(),
@@ -76,7 +75,53 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     })
 }
 
-fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) -> anyhow::Result<()> {
+fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Vec<paths::DirectoryEntry> {
+    match paths::read_dir(root, rel) {
+        Ok(entries) => entries,
+        Err(err) => {
+            let file = if rel.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                paths::display_relative(rel)
+            };
+            findings.push(
+                Finding::new(FindingCode::Unreadable, Severity::Error, err.to_string())
+                    .at_file(file)
+                    .with_fix("Fix directory permissions or replace the unreadable path"),
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
+    let file = paths::display_relative(child);
+    if !ent.utf8 {
+        findings.push(
+            Finding::new(
+                FindingCode::InvalidFilename,
+                Severity::Error,
+                format!("non-UTF-8 name at '{file}'"),
+            )
+            .at_file(&file)
+            .with_fix("Rename the file to a UTF-8 record ID"),
+        );
+        return;
+    }
+    if ent.kind == EntryKind::Symlink {
+        findings.push(
+            Finding::new(
+                FindingCode::Symlink,
+                Severity::Error,
+                format!("symbolic link '{file}'"),
+            )
+            .at_file(&file)
+            .with_fix("Replace the symlink with a real file or directory"),
+        );
+    }
+}
+
+fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
     let allowed = [
         "confidant.toml",
         "people",
@@ -89,20 +134,13 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) -> anyhow
         "README.md",
         "LICENSE",
     ];
-    for ent in paths::read_dir(root, Path::new(""))? {
-        if paths::is_skipped_name(&ent.name) {
+    for ent in list_dir(root, Path::new(""), findings) {
+        let child = Path::new(&ent.name);
+        if !ent.utf8 || ent.kind == EntryKind::Symlink {
+            flag_entry(&ent, child, findings);
             continue;
         }
-        if ent.kind == EntryKind::Symlink {
-            findings.push(
-                Finding::new(
-                    FindingCode::Symlink,
-                    Severity::Error,
-                    format!("symbolic link '{}' in vault root", ent.name),
-                )
-                .at_file(&ent.name)
-                .with_fix("Replace the symlink with a real file or directory"),
-            );
+        if paths::skip_walk_entry(&ent.name, ent.kind) {
             continue;
         }
         if !allowed.contains(&ent.name.as_str()) {
@@ -117,38 +155,36 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) -> anyhow
             );
         }
     }
-    Ok(())
 }
 
 fn scan_collections(
     root: &Path,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+) {
     for collection in COLLECTIONS {
         let rel = Path::new(collection);
         match paths::read_dir(root, rel) {
             Err(err) if crate::error::is_missing(&err) => continue,
-            Err(err) => return Err(err),
+            Err(_) => {
+                let _ = list_dir(root, rel, findings);
+                continue;
+            }
             Ok(entries) => {
                 let prefix = Prefix::from_collection(collection).expect("known collection");
                 for ent in entries {
-                    if paths::is_skipped_name(&ent.name) {
+                    let child = rel.join(&ent.name);
+                    if !ent.utf8 || ent.kind == EntryKind::Symlink {
+                        flag_entry(&ent, &child, findings);
                         continue;
                     }
-                    let child = rel.join(&ent.name);
+                    if paths::skip_walk_entry(&ent.name, ent.kind) {
+                        continue;
+                    }
                     match ent.kind {
-                        EntryKind::Symlink => findings.push(
-                            Finding::new(
-                                FindingCode::Symlink,
-                                Severity::Error,
-                                format!("symbolic link '{}'", paths::display_relative(&child)),
-                            )
-                            .at_file(paths::display_relative(&child)),
-                        ),
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(root, &child, stem, prefix, records, findings)?;
+                                ingest_file(root, &child, stem, prefix, records, findings);
                             } else {
                                 findings.push(
                                     Finding::new(
@@ -165,7 +201,7 @@ fn scan_collections(
                             }
                         }
                         EntryKind::Directory => {
-                            ingest_dir(root, &child, &ent.name, prefix, records, findings)?;
+                            ingest_dir(root, &child, &ent.name, prefix, records, findings);
                         }
                         EntryKind::Other => findings.push(
                             Finding::new(
@@ -178,12 +214,12 @@ fn scan_collections(
                             )
                             .at_file(paths::display_relative(&child)),
                         ),
+                        EntryKind::Symlink => {}
                     }
                 }
             }
         }
     }
-    Ok(())
 }
 
 fn ingest_file(
@@ -193,7 +229,7 @@ fn ingest_file(
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+) {
     let file = paths::display_relative(relative);
     let path_id = match RecordId::parse(stem) {
         Ok(id) => id,
@@ -207,7 +243,7 @@ fn ingest_file(
                 .at_file(&file)
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
             );
-            return Ok(());
+            return;
         }
     };
     if path_id.prefix() != expected_prefix {
@@ -224,7 +260,7 @@ fn ingest_file(
             .for_id(&path_id),
         );
     }
-    load_markdown(root, relative, Some(&path_id), records, findings)
+    load_markdown(root, relative, Some(&path_id), records, findings);
 }
 
 fn ingest_dir(
@@ -234,7 +270,7 @@ fn ingest_dir(
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+) {
     let dir = paths::display_relative(relative);
     let path_id = match RecordId::parse(name) {
         Ok(id) => id,
@@ -248,7 +284,7 @@ fn ingest_dir(
                 .at_file(&dir)
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
-            return Ok(());
+            return;
         }
     };
     if path_id.prefix() != expected_prefix {
@@ -268,10 +304,49 @@ fn ingest_dir(
     let main = expected_prefix
         .main_filename()
         .expect("collection records have a main file");
-    let main_rel = relative.join(main);
-    match paths::resolve(root, &main_rel, true) {
-        Ok(_) => load_markdown(root, &main_rel, Some(&path_id), records, findings)?,
-        Err(_) => findings.push(
+    let mut saw_main = false;
+    for ent in list_dir(root, relative, findings) {
+        let child = relative.join(&ent.name);
+        if !ent.utf8 || ent.kind == EntryKind::Symlink {
+            flag_entry(&ent, &child, findings);
+            if ent.name == main {
+                saw_main = true;
+            }
+            continue;
+        }
+        if paths::skip_walk_entry(&ent.name, ent.kind) {
+            continue;
+        }
+        if ent.name == main && ent.kind == EntryKind::File {
+            saw_main = true;
+            load_markdown(root, &child, Some(&path_id), records, findings);
+            continue;
+        }
+        if expected_prefix == Prefix::Person
+            && ent.name == "notes"
+            && ent.kind == EntryKind::Directory
+        {
+            scan_person_notes(root, relative, &path_id, records, findings);
+            continue;
+        }
+        findings.push(
+            Finding::new(
+                FindingCode::InvalidFilename,
+                Severity::Error,
+                format!(
+                    "record directory '{dir}' contains unexpected '{}'",
+                    ent.name
+                ),
+            )
+            .at_file(paths::display_relative(&child))
+            .for_id(&path_id)
+            .with_fix(format!(
+                "Keep only {main} (and notes/ for people) in the record directory"
+            )),
+        );
+    }
+    if !saw_main {
+        findings.push(
             Finding::new(
                 FindingCode::Frontmatter,
                 Severity::Error,
@@ -280,12 +355,8 @@ fn ingest_dir(
             .at_file(&dir)
             .for_id(&path_id)
             .with_fix(format!("Add {main} with id/type front matter")),
-        ),
+        );
     }
-    if expected_prefix == Prefix::Person {
-        scan_person_notes(root, relative, &path_id, records, findings)?;
-    }
-    Ok(())
 }
 
 fn scan_person_notes(
@@ -294,26 +365,21 @@ fn scan_person_notes(
     person_id: &RecordId,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+) {
     let notes_rel = person_dir.join("notes");
     match paths::read_dir(root, &notes_rel) {
-        Err(err) if crate::error::is_missing(&err) => Ok(()),
-        Err(err) => Err(err),
+        Err(err) if crate::error::is_missing(&err) => {}
+        Err(_) => {
+            let _ = list_dir(root, &notes_rel, findings);
+        }
         Ok(entries) => {
             for ent in entries {
-                if paths::is_skipped_name(&ent.name) {
+                let child = notes_rel.join(&ent.name);
+                if !ent.utf8 || ent.kind == EntryKind::Symlink {
+                    flag_entry(&ent, &child, findings);
                     continue;
                 }
-                let child = notes_rel.join(&ent.name);
-                if ent.kind == EntryKind::Symlink {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::Symlink,
-                            Severity::Error,
-                            format!("symbolic link '{}'", paths::display_relative(&child)),
-                        )
-                        .at_file(paths::display_relative(&child)),
-                    );
+                if paths::skip_walk_entry(&ent.name, ent.kind) {
                     continue;
                 }
                 if ent.kind != EntryKind::File || !ent.name.ends_with(".md") {
@@ -331,7 +397,7 @@ fn scan_person_notes(
                     continue;
                 }
                 let stem = ent.name.trim_end_matches(".md");
-                ingest_file(root, &child, stem, Prefix::Note, records, findings)?;
+                ingest_file(root, &child, stem, Prefix::Note, records, findings);
                 if let Ok(id) = RecordId::parse(stem) {
                     if let Some(rec) = records.get(&id) {
                         if rec.person().as_ref().is_some_and(|p| p != person_id) {
@@ -351,7 +417,6 @@ fn scan_person_notes(
                     }
                 }
             }
-            Ok(())
         }
     }
 }
@@ -362,7 +427,7 @@ fn load_markdown(
     path_id: Option<&RecordId>,
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+) {
     let file = paths::display_relative(relative);
     let text = match paths::read_to_string(root, relative) {
         Ok(t) => t,
@@ -373,7 +438,7 @@ fn load_markdown(
                     .at_file(&file)
                     .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
-            return Ok(());
+            return;
         }
     };
     if has_conflict_markers(&text) {
@@ -461,33 +526,23 @@ fn load_markdown(
             }
         }
     }
-    Ok(())
 }
 
-fn scan_ledger(
-    root: &Path,
-    entries: &mut Vec<SourcedEntry>,
-    findings: &mut Vec<Finding>,
-) -> anyhow::Result<()> {
+fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<Finding>) {
     let ledger_rel = Path::new("ledger");
     match paths::read_dir(root, ledger_rel) {
-        Err(err) if crate::error::is_missing(&err) => return Ok(()),
-        Err(err) => return Err(err),
+        Err(err) if crate::error::is_missing(&err) => {}
+        Err(_) => {
+            let _ = list_dir(root, ledger_rel, findings);
+        }
         Ok(years) => {
             for year_ent in years {
-                if paths::is_skipped_name(&year_ent.name) {
+                let year_rel = ledger_rel.join(&year_ent.name);
+                if !year_ent.utf8 || year_ent.kind == EntryKind::Symlink {
+                    flag_entry(&year_ent, &year_rel, findings);
                     continue;
                 }
-                let year_rel = ledger_rel.join(&year_ent.name);
-                if year_ent.kind == EntryKind::Symlink {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::Symlink,
-                            Severity::Error,
-                            format!("symbolic link '{}'", paths::display_relative(&year_rel)),
-                        )
-                        .at_file(paths::display_relative(&year_rel)),
-                    );
+                if paths::skip_walk_entry(&year_ent.name, year_ent.kind) {
                     continue;
                 }
                 if year_ent.kind != EntryKind::Directory || !is_yyyy(&year_ent.name) {
@@ -505,21 +560,14 @@ fn scan_ledger(
                     );
                     continue;
                 }
-                for month_ent in paths::read_dir(root, &year_rel)? {
-                    if paths::is_skipped_name(&month_ent.name) {
-                        continue;
-                    }
+                for month_ent in list_dir(root, &year_rel, findings) {
                     let file_rel = year_rel.join(&month_ent.name);
                     let file = paths::display_relative(&file_rel);
-                    if month_ent.kind == EntryKind::Symlink {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::Symlink,
-                                Severity::Error,
-                                format!("symbolic link '{file}'"),
-                            )
-                            .at_file(&file),
-                        );
+                    if !month_ent.utf8 || month_ent.kind == EntryKind::Symlink {
+                        flag_entry(&month_ent, &file_rel, findings);
+                        continue;
+                    }
+                    if paths::skip_walk_entry(&month_ent.name, month_ent.kind) {
                         continue;
                     }
                     if month_ent.kind != EntryKind::File || !is_month_cfd(&month_ent.name) {
@@ -560,8 +608,12 @@ fn scan_ledger(
                     }
                     let (parsed, errors) = parse_ledger(&text);
                     for err in errors {
+                        let code = match err.kind {
+                            ParseErrorKind::InvalidId => FindingCode::InvalidId,
+                            ParseErrorKind::Grammar => FindingCode::Parse,
+                        };
                         findings.push(
-                            Finding::new(FindingCode::Parse, Severity::Error, err.message)
+                            Finding::new(code, Severity::Error, err.message)
                                 .at_file(&file)
                                 .at_line(err.line)
                                 .with_fix(err.fix),
@@ -578,7 +630,6 @@ fn scan_ledger(
             }
         }
     }
-    Ok(())
 }
 
 fn is_yyyy(s: &str) -> bool {

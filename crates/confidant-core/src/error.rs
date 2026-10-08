@@ -29,6 +29,8 @@ pub enum ErrorKind {
     Conflict,
     /// The request is well formed but not valid for this vault.
     Invalid,
+    /// `confidant.toml` cannot be interpreted (command-level E_CONFIG).
+    Config,
     /// Flags or arguments cannot be interpreted. Exit 2.
     Usage,
     /// An idempotency key was reused with different content.
@@ -46,6 +48,7 @@ impl ErrorKind {
             Self::AlreadyExists => "E_ALREADY_EXISTS",
             Self::Conflict => "E_CONFLICT",
             Self::Invalid => "E_INVALID",
+            Self::Config => "E_CONFIG",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
             Self::Internal => "internal_error",
@@ -81,6 +84,14 @@ impl DomainError {
 
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Invalid, message)
+    }
+
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Config, message)
+    }
+
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::AlreadyExists, message)
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
@@ -245,6 +256,8 @@ mod tests {
             DomainError::of(&invalid("bad field")).map(DomainError::code),
             Some("E_INVALID")
         );
+        assert_eq!(DomainError::config("bad toml").code(), "E_CONFIG");
+        assert_eq!(DomainError::conflict("busy").code(), "E_CONFLICT");
     }
 
     #[test]

@@ -180,12 +180,22 @@ impl Display for IdError {
 impl std::error::Error for IdError {}
 
 pub fn canonicalize_ulid(s: &str) -> Option<String> {
-    if s.len() != ULID_LEN {
+    if s.chars().count() != ULID_LEN {
         return None;
     }
     let mut out = String::with_capacity(ULID_LEN);
-    for ch in s.chars() {
+    for (i, ch) in s.chars().enumerate() {
+        // Reject non-ASCII before the alphabet lookup. `to_ascii_uppercase`
+        // leaves non-ASCII unchanged, and `up as u8` would truncate it.
+        if !ch.is_ascii() {
+            return None;
+        }
         let up = ch.to_ascii_uppercase();
+        // A ULID timestamp is 48 bits in 10 Crockford characters; the first
+        // character only has 3 bits of payload, so it must be 0–7.
+        if i == 0 && up > '7' {
+            return None;
+        }
         // Crockford maps I/L → 1, O → 0 when decoding; we reject them so
         // check can flag non-conforming IDs instead of silently repairing.
         if !CROCKFORD.contains(&(up as u8)) {
@@ -250,5 +260,20 @@ mod tests {
         let id = RecordId::parse("pkg-01M3TC5H00MPJG004SK4000009").unwrap();
         assert_eq!(id.prefix(), Prefix::Package);
         assert!(id.prefix().collection().is_none());
+    }
+
+    #[test]
+    fn rejects_non_ascii_before_alphabet_lookup() {
+        let mut raw: Vec<char> = "01M3TC5H00MPJG000000000000".chars().collect();
+        raw[4] = 'é';
+        let s: String = raw.into_iter().collect();
+        assert!(RecordId::parse(&format!("p-{s}")).is_err());
+    }
+
+    #[test]
+    fn rejects_first_char_above_seven() {
+        assert!(RecordId::parse("p-81M3TC5H00MPJG000000000000").is_err());
+        assert!(RecordId::parse("p-01M3TC5H00MPJG000000000000").is_ok());
+        assert!(RecordId::parse("p-71M3TC5H00MPJG000000000000").is_ok());
     }
 }

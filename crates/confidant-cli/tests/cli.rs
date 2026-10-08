@@ -23,6 +23,7 @@ fn check_demo_json_ok() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
+    assert_eq!(v["schema_version"], "1");
     assert_eq!(v["spec"], "0.1");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     assert_eq!(v["findings"], serde_json::json!([]));
@@ -63,8 +64,9 @@ fn missing_vault_json_error() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], false);
+    assert_eq!(v["schema_version"], "1");
     assert_eq!(v["error"]["code"], "E_VAULT_NOT_FOUND");
 }
 

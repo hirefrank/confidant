@@ -301,9 +301,9 @@ fn alias_plaintext_and_collision() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 alias {ADA} email not-an-hmac\n\
-             2026-10-02 alias {ADA} email hmac:abcdef12\n\
-             2026-10-02 alias {bea} email hmac:abcdef12\n"
+            "             2026-10-01 alias {ADA} email not-an-hmac\n\
+             2026-10-02 alias {ADA} email hmac:abcdef12abcdef12abcdef12abcdef12\n\
+             2026-10-02 alias {bea} email hmac:abcdef12abcdef12abcdef12abcdef12\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -319,6 +319,7 @@ fn json_shape_has_stable_keys() {
     person(dir.path(), ADA, "Ada Example");
     let json = report_json(dir.path(), None);
     assert_eq!(json["spec"], "0.1");
+    assert_eq!(json["schema_version"], "1");
     assert_eq!(json["ok"], true);
     assert_eq!(json["summary"]["errors"], 0);
     assert_eq!(json["findings"], json!([]));
@@ -327,4 +328,182 @@ fn json_shape_has_stable_keys() {
 #[test]
 fn finding_code_enum_round_trips_in_json() {
     assert_eq!(FindingCode::BalanceMismatch.as_str(), "E_BALANCE_MISMATCH");
+}
+
+#[test]
+fn balance_as_of_date_ignores_later_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
+             2026-10-08 balance {ADA} sessions_remaining 5\n\
+             2026-10-08 balance {ADA} icf_hours 1.00\n\
+             2026-10-15 session {ADA} 60m paid note:{NOTE}\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_BALANCE_MISMATCH".into()),
+        "{json}"
+    );
+}
+
+#[test]
+fn pay_per_session_does_not_consume_package() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_NEGATIVE_BALANCE".into()),
+        "{json}"
+    );
+}
+
+#[test]
+fn unsupported_spec_stops_after_spec_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"9.9\"\npacks = [\"nope@1\"]\nvault_id = \"x\"\n",
+    );
+    person(dir.path(), ADA, "Ada");
+    write(dir.path(), "ledger/2026/10.cfd", "this is not an entry\n");
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"E_SPEC_UNSUPPORTED".into()), "{c:?}");
+    assert!(c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
+    assert!(!c.contains(&"E_PARSE".into()), "{c:?}");
+}
+
+#[test]
+fn wrong_id_type_and_invalid_note_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 stage {ADA} proposal\n\
+             2026-10-01 session {ADA} 60m paid note:not-an-id\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"E_WRONG_ID_TYPE".into()), "{c:?}");
+    assert!(c.contains(&"E_INVALID_ID".into()), "{c:?}");
+}
+
+#[test]
+fn merge_cycle_self_unresolved_and_balances() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let bea = "p-01M3TC5H00MPJG000H24000001";
+    person(dir.path(), bea, "Bea");
+    let ghost = "p-01M3TC5H00MPJG000H2400000Z";
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {bea} package {PKG} 2 sessions\n\
+             2026-10-01 session {bea} 60m paid note:{NOTE}\n\
+             2026-10-02 merge {ADA} into {ADA}\n\
+             2026-10-03 merge {ghost} into {ADA}\n\
+             2026-10-04 merge {ADA} into {bea}\n\
+             2026-10-05 merge {bea} into {ADA}\n\
+             2026-10-08 balance {bea} sessions_remaining 1\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"E_SELF_MERGE".into()), "{c:?}");
+    assert!(c.contains(&"E_UNRESOLVED_MERGE".into()), "{c:?}");
+    assert!(c.contains(&"E_MERGE_CYCLE".into()), "{c:?}");
+}
+
+#[test]
+fn merge_fork_duplicate_ulid_and_src() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let bea = "p-01M3TC5H00MPJG000H24000001";
+    person(dir.path(), bea, "Bea");
+    let org = "o-01M3TC5H00MPJG000000000000";
+    write(
+        dir.path(),
+        &format!("orgs/{org}/org.md"),
+        &format!("---\nid: {org}\ntype: org\nname: Dup\n---\n"),
+    );
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 merge {bea} into {ADA}\n\
+             2026-10-02 merge {bea} into p-01M3TC5H00MPJG001248000002\n\
+             2026-10-08 session {ADA} 45m paid note:{NOTE} src:transcript/t-1\n\
+             2026-10-08 session {ADA} 45m paid note:{NOTE} src:transcript/t-1\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"E_DUPLICATE_ULID".into()), "{c:?}");
+    assert!(c.contains(&"E_MERGE_FORK".into()), "{c:?}");
+    assert!(c.contains(&"E_DUPLICATE_SRC".into()), "{c:?}");
+}
+
+#[test]
+fn config_errors_are_e_config() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        r#"spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "x"
+[checks]
+coaching.session_notes = "warn"
+coaching.paid_session_gap_days = -3
+typo_key = 1
+"#,
+    );
+    person(dir.path(), ADA, "Ada");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).contains(&"E_CONFIG".into()), "{json}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_at_every_level_are_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    std::os::unix::fs::symlink("/tmp", dir.path().join("people").join("linkdir")).unwrap();
+    std::os::unix::fs::symlink(
+        "profile.md",
+        dir.path().join("people").join(ADA).join(".hidden-link"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("x", dir.path().join(".dotlink")).unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    std::os::unix::fs::symlink("10.cfd", dir.path().join("ledger/2026/link.cfd")).unwrap();
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.iter().filter(|x| *x == "E_SYMLINK").count() >= 3, "{c:?}");
 }

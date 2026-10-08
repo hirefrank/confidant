@@ -66,23 +66,34 @@ impl LedgerEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub line: u32,
+    pub kind: ParseErrorKind,
     pub message: String,
     pub fix: String,
 }
 
+/// Why a ledger line failed to parse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParseErrorKind {
+    Grammar,
+    InvalidId,
+}
+
 /// Parse a whole ledger file. Blank lines and comment-only lines are skipped.
 /// Each bad line is a [`ParseError`]; parsing continues (collect-don't-throw).
+/// A leading UTF-8 BOM is stripped and does not affect line numbers.
 pub fn parse_ledger(text: &str) -> (Vec<(u32, LedgerEntry)>, Vec<ParseError>) {
+    let text = text.trim_start_matches('\u{feff}');
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
         let line = idx as u32 + 1;
-        match parse_line(raw) {
+        match parse_line_inner(raw) {
             Ok(None) => {}
             Ok(Some(entry)) => entries.push((line, entry)),
-            Err(message) => errors.push(ParseError {
+            Err(err) => errors.push(ParseError {
                 line,
-                message,
+                kind: err.kind,
+                message: err.message,
                 fix: "Fix the line so it matches DATE VERB ID ARGS…  ; comment".to_owned(),
             }),
         }
@@ -90,22 +101,48 @@ pub fn parse_ledger(text: &str) -> (Vec<(u32, LedgerEntry)>, Vec<ParseError>) {
     (entries, errors)
 }
 
+struct LineError {
+    kind: ParseErrorKind,
+    message: String,
+}
+
+impl LineError {
+    fn grammar(message: impl Into<String>) -> Self {
+        Self {
+            kind: ParseErrorKind::Grammar,
+            message: message.into(),
+        }
+    }
+
+    fn invalid_id(message: impl Into<String>) -> Self {
+        Self {
+            kind: ParseErrorKind::InvalidId,
+            message: message.into(),
+        }
+    }
+}
+
 pub fn parse_line(raw: &str) -> Result<Option<LedgerEntry>, String> {
-    let trimmed = raw.trim();
+    parse_line_inner(raw).map_err(|err| err.message)
+}
+
+fn parse_line_inner(raw: &str) -> Result<Option<LedgerEntry>, LineError> {
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
     if trimmed.is_empty() || trimmed.starts_with(';') {
         return Ok(None);
     }
     let mut lexer = Lexer::new(trimmed);
-    let date = lexer.date()?;
-    let verb = lexer.ident("verb")?;
-    let id_raw = lexer.ident("id")?;
-    let id = RecordId::parse(&id_raw).map_err(|err| format!("invalid id '{id_raw}': {err}"))?;
+    let date = lexer.date().map_err(LineError::grammar)?;
+    let verb = lexer.ident("verb").map_err(LineError::grammar)?;
+    let id_raw = lexer.ident("id").map_err(LineError::grammar)?;
+    let id = RecordId::parse(&id_raw)
+        .map_err(|err| LineError::invalid_id(format!("invalid id '{id_raw}': {err}")))?;
     let mut args = Vec::new();
     while !lexer.done() {
         if lexer.peek_comment() {
             break;
         }
-        args.push(lexer.arg()?);
+        args.push(lexer.arg().map_err(LineError::grammar)?);
     }
     let comment = lexer.comment();
     Ok(Some(LedgerEntry {
@@ -162,10 +199,37 @@ impl<'a> Lexer<'a> {
     }
 
     fn date(&mut self) -> Result<NaiveDate, String> {
-        self.bump_ws();
-        let tok = self.take_while(|c| c.is_ascii_digit() || c == '-')?;
-        NaiveDate::parse_from_str(&tok, "%Y-%m-%d")
-            .map_err(|_| format!("'{tok}' is not a calendar date YYYY-MM-DD"))
+        if self.i >= self.s.len() {
+            return Err("missing date".to_owned());
+        }
+        let rest = &self.s[self.i..];
+        let tok: String = rest.chars().take(10).collect();
+        if tok.chars().count() != 10 {
+            return Err("missing date YYYY-MM-DD".to_owned());
+        }
+        let bytes = tok.as_bytes();
+        let zero_padded = bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes.iter().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 {
+                    *b == b'-'
+                } else {
+                    b.is_ascii_digit()
+                }
+            });
+        if !zero_padded {
+            return Err(format!(
+                "'{tok}' is not a zero-padded calendar date YYYY-MM-DD"
+            ));
+        }
+        let date = NaiveDate::parse_from_str(&tok, "%Y-%m-%d")
+            .map_err(|_| format!("'{tok}' is not a calendar date YYYY-MM-DD"))?;
+        self.i += 10;
+        match self.s[self.i..].chars().next() {
+            Some(c) if c == ' ' || c == '\t' => Ok(date),
+            _ => Err("date must be followed by whitespace".to_owned()),
+        }
     }
 
     fn ident(&mut self, what: &str) -> Result<String, String> {
@@ -185,42 +249,54 @@ impl<'a> Lexer<'a> {
             let s = self.quoted()?;
             return Ok(Arg::Token(s));
         }
-        let raw = self.take_while(|c| !c.is_whitespace() && c != ';')?;
-        if let Some((key, value)) = split_pair(&raw) {
-            Ok(Arg::Pair {
-                key: key.to_owned(),
-                value: value.to_owned(),
-            })
-        } else {
-            Ok(Arg::Token(raw))
+        let start = self.i;
+        while let Some(c) = self.s[self.i..].chars().next() {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                self.i += c.len_utf8();
+            } else {
+                break;
+            }
         }
+        if self.i > start && self.s[self.i..].starts_with(':') {
+            let key = self.s[start..self.i].to_owned();
+            if key.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+                self.i += 1;
+                if self.s[self.i..].starts_with('"') {
+                    let value = self.quoted()?;
+                    return Ok(Arg::Pair { key, value });
+                }
+                let value = self.take_while(|c| !c.is_whitespace() && c != ';')?;
+                return Ok(Arg::Pair { key, value });
+            }
+        }
+        self.i = start;
+        let raw = self.take_while(|c| !c.is_whitespace() && c != ';')?;
+        Ok(Arg::Token(raw))
     }
 
     fn quoted(&mut self) -> Result<String, String> {
         debug_assert!(self.s[self.i..].starts_with('"'));
         self.i += 1;
         let mut out = String::new();
-        let bytes = self.s.as_bytes();
-        while self.i < bytes.len() {
-            let c = bytes[self.i];
-            self.i += 1;
+        let rest = &self.s[self.i..];
+        let mut chars = rest.char_indices();
+        while let Some((off, c)) = chars.next() {
             match c {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    if self.i >= bytes.len() {
-                        return Err("unterminated escape in quoted string".to_owned());
-                    }
-                    let n = bytes[self.i];
-                    self.i += 1;
-                    match n {
-                        b'"' | b'\\' => out.push(n as char),
+                '"' => {
+                    self.i += off + c.len_utf8();
+                    return Ok(out);
+                }
+                '\\' => match chars.next() {
+                    None => return Err("unterminated escape in quoted string".to_owned()),
+                    Some((_, n)) => match n {
+                        '"' | '\\' => out.push(n),
                         _ => {
                             out.push('\\');
-                            out.push(n as char);
+                            out.push(n);
                         }
-                    }
-                }
-                _ => out.push(c as char),
+                    },
+                },
+                _ => out.push(c),
             }
         }
         Err("unterminated quoted string".to_owned())
@@ -256,23 +332,6 @@ impl<'a> Lexer<'a> {
         }
         Ok(self.s[start..self.i].to_owned())
     }
-}
-
-fn split_pair(raw: &str) -> Option<(&str, &str)> {
-    let (key, value) = raw.split_once(':')?;
-    if key.is_empty() || value.is_empty() {
-        return None;
-    }
-    if !key.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
-        return None;
-    }
-    if !key
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-    {
-        return None;
-    }
-    Some((key, value))
 }
 
 fn needs_quotes(s: &str) -> bool {
@@ -335,7 +394,10 @@ pub fn parse_decimal_hundredths(s: &str) -> Option<i64> {
         if frac.len() == 1 {
             frac_n *= 10;
         }
-        let mag = whole_n.abs().checked_mul(100)?.checked_add(frac_n)?;
+        let mag = whole_n
+            .checked_abs()?
+            .checked_mul(100)?
+            .checked_add(frac_n)?;
         if negative {
             Some(-mag)
         } else {
@@ -426,5 +488,50 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(e.pair("note").unwrap(), "n-01M3TC5H00MPJG002NAM000005");
+    }
+
+    #[test]
+    fn quoted_pair_values_round_trip() {
+        let line = r#"2026-10-08 session p-01M3TC5H00MPJG000000000000 45m src:"transcript/t:foo; bar \"baz\"""#;
+        let parsed = parse_line(line).unwrap().unwrap();
+        assert_eq!(
+            parsed.pair("src").unwrap(),
+            r#"transcript/t:foo; bar "baz""#
+        );
+        let again = parse_line(&format_entry(&parsed)).unwrap().unwrap();
+        assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn quoted_unicode_round_trips() {
+        let line = r#"2026-10-08 session p-01M3TC5H00MPJG000000000000 45m reason "café 日本語""#;
+        let parsed = parse_line(line).unwrap().unwrap();
+        assert!(parsed
+            .args
+            .iter()
+            .any(|a| matches!(a, Arg::Token(s) if s == "café 日本語")));
+        let rendered = format_entry(&parsed);
+        assert!(rendered.contains("café"));
+        assert!(rendered.contains("日本語"));
+        let again = parse_line(&rendered).unwrap().unwrap();
+        assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn date_must_be_zero_padded_and_followed_by_whitespace() {
+        assert!(parse_line("2026-10-1 session p-01M3TC5H00MPJG000000000000 60m").is_err());
+        assert!(parse_line("2026-1-01 session p-01M3TC5H00MPJG000000000000 60m").is_err());
+        assert!(parse_line("2026-10-01session p-01M3TC5H00MPJG000000000000 60m").is_err());
+        assert!(parse_line("2026-10-01\tsession p-01M3TC5H00MPJG000000000000 60m").is_ok());
+    }
+
+    #[test]
+    fn strips_bom_and_accepts_crlf() {
+        let text =
+            "\u{feff}2026-10-01 stage d-01M3TC5H00MPJG00248G000004 proposal\r\n; comment\r\n";
+        let (entries, errors) = parse_ledger(text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 1);
     }
 }

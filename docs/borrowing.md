@@ -10,13 +10,16 @@ Adapted source (MIT header on each file, full text in
 
 - Domain errors and JSON error envelopes
 - Check report types (`Severity`, stable codes, `--fail-on`)
-- Symlink-refusing path walk and atomic replace
+- Symlink-refusing path walk and atomic replace. Unix (including macOS)
+  uses cr's `openat` / `O_NOFOLLOW` walk; the portable `symlink_metadata`
+  fallback is compiled only for non-Unix targets.
 
 Re-implemented patterns, credited here rather than copied:
 
 - Collect findings; never abort the rest of a damaged vault
 - Crash-safe publish via rename
 - Classify by typed error, never by message text
+- CLI `print_error` JSON/human envelopes (`--json` errors on stdout)
 
 Not taken: cr's audit hash chain, YAML-front-matter-as-truth `Database`,
 field-level encryption, sync adapters, server, or UI.

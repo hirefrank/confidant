@@ -5,20 +5,26 @@ use std::path::Path;
 use anyhow::Result;
 use chrono::NaiveDate;
 
+use crate::error::DomainError;
 use crate::id::{ulid_from_parts, Prefix, RecordId};
 use crate::paths;
 
 const TIME_MS: u64 = 1_790_812_800_000; // 2026-10-01 UTC
+const SESSIONS_PER_PERSON: usize = 24;
+const NOTE_BODY_KB: usize = 3;
 
 /// Write a vault of `people` clients, each with `notes_per_person` notes.
 /// All names and emails are synthetic. Returns the unique token planted in
 /// person 0's profile (for a one-hit search) and a common token planted in
 /// every profile.
+///
+/// Refuses to run on a non-empty directory or an existing vault.
 pub fn generate_realistic_vault(
     root: &Path,
     people: usize,
     notes_per_person: usize,
 ) -> Result<(String, String)> {
+    refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
     let unique = "zxqv-unique-token-ada-0";
     let common = "coaching-practice";
@@ -32,15 +38,17 @@ vault_id = "{vault_id}"
 as_of = "2026-10-08"
 coaching.require_duration = "error"
 coaching.balance_nonnegative = "error"
-coaching.session_notes = "warning"
-coaching.paid_session_gap = "warning"
+coaching.session_notes = "off"
+coaching.paid_session_gap = "off"
 coaching.paid_session_gap_days = 45
 "#
     );
     paths::write_replace(root, Path::new("confidant.toml"), cfg.as_bytes())?;
 
-    let mut ledger = String::from("; generated fake ledger — not real clients\n");
+    let mut ledgers: std::collections::BTreeMap<(i32, u32), String> =
+        std::collections::BTreeMap::new();
     let pkg = RecordId::new(Prefix::Package, ulid_from_parts(TIME_MS, 99))?.to_string();
+    let filler = "transcript line about goals, blockers, and next actions. ".repeat(40);
 
     for i in 0..people {
         let pid = RecordId::new(Prefix::Person, ulid_from_parts(TIME_MS, 1_000 + i as u128))?;
@@ -59,31 +67,103 @@ coaching.paid_session_gap_days = 45
             profile.as_bytes(),
         )?;
 
-        let note_date = NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid date");
         for n in 0..notes_per_person {
             let nid = RecordId::new(
                 Prefix::Note,
-                ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 64 + n as u128),
+                ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 256 + n as u128),
             )?;
+            let note_date =
+                NaiveDate::from_ymd_opt(2024 + (n / 12) as i32, (n % 12) as u32 + 1, 15)
+                    .unwrap_or(NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid"));
+            let mut note_body =
+                format!("Session note {n} for generated person {i}. Themes: {common}.\n{filler}\n");
+            while note_body.len() < NOTE_BODY_KB * 1024 {
+                note_body.push_str(&filler);
+            }
             let note = format!(
-                "---\nid: {nid}\ntype: note\nperson: {pid}\ndate: {note_date}\n---\n\nSession note {n} for generated person {i}. Themes: {common}.\n"
+                "---\nid: {nid}\ntype: note\nperson: {pid}\ndate: {note_date}\n---\n\n{note_body}"
             );
             let path = Path::new(&dir).join("notes").join(format!("{nid}.md"));
             paths::write_replace(root, &path, note.as_bytes())?;
         }
 
-        ledger.push_str(&format!(
-            "2026-10-01 open {pid} package {pkg} 6 sessions\n2026-10-01 session {pid} 60m paid note:{nid_placeholder}\n",
-            nid_placeholder = RecordId::new(
+        push_ledger(
+            &mut ledgers,
+            2024,
+            1,
+            &format!("2024-01-15 open {pid} package {pkg} 36 sessions\n"),
+        );
+        for s in 0..SESSIONS_PER_PERSON {
+            let month_offset = (s as u32) % 12;
+            let year = 2024 + (s as i32 / 12);
+            let month = month_offset + 1;
+            let day = 8;
+            let nid = RecordId::new(
                 Prefix::Note,
-                ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 64),
-            )?,
-        ));
-        ledger.push_str(&format!("2026-10-01 balance {pid} sessions_remaining 5\n"));
+                ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 256),
+            )?;
+            push_ledger(
+                &mut ledgers,
+                year,
+                month,
+                &format!("{year}-{month:02}-{day:02} session {pid} 60m paid note:{nid}\n"),
+            );
+        }
+        push_ledger(
+            &mut ledgers,
+            2026,
+            10,
+            &format!(
+                "2026-10-01 balance {pid} sessions_remaining {}\n",
+                36 - SESSIONS_PER_PERSON
+            ),
+        );
     }
 
-    paths::write_replace(root, Path::new("ledger/2026/10.cfd"), ledger.as_bytes())?;
+    for ((year, month), body) in ledgers {
+        let mut text = String::from("; generated fake ledger — not real clients\n");
+        text.push_str(&body);
+        paths::write_replace(
+            root,
+            Path::new(&format!("ledger/{year}/{month:02}.cfd")),
+            text.as_bytes(),
+        )?;
+    }
     Ok((unique.to_owned(), common.to_owned()))
+}
+
+fn push_ledger(
+    ledgers: &mut std::collections::BTreeMap<(i32, u32), String>,
+    year: i32,
+    month: u32,
+    line: &str,
+) {
+    ledgers.entry((year, month)).or_default().push_str(line);
+}
+
+fn refuse_existing(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    if root.join("confidant.toml").is_file() {
+        return Err(anyhow::Error::new(DomainError::already_exists(format!(
+            "refusing to overwrite existing vault at {}",
+            root.display()
+        ))));
+    }
+    if root.is_file() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "'{}' exists and is not a directory",
+            root.display()
+        ))));
+    }
+    if std::fs::read_dir(root)?.next().is_some() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "refusing to generate a vault in a non-empty directory ({})",
+            root.display()
+        ))));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -100,5 +180,6 @@ mod tests {
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
         assert_eq!(search(&vault, &unique).len(), 1);
         assert!(search(&vault, &common).len() >= 3);
+        assert!(generate_realistic_vault(dir.path(), 1, 1).is_err());
     }
 }
