@@ -88,6 +88,9 @@ pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
     let mut enc = None;
     let mut key_id = None;
     let mut nonce = None;
+    // A repeated header key is ambiguous (first-value vs last-value readers
+    // disagree); reject it rather than silently taking the last one.
+    let mut seen = std::collections::HashSet::new();
     for line in &mut lines {
         if line == "---" {
             break;
@@ -95,7 +98,11 @@ pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
         let (k, v) = line
             .split_once(':')
             .ok_or_else(|| Error::Envelope(format!("bad header line: {line}")))?;
-        match k.trim() {
+        let key = k.trim();
+        if !seen.insert(key) {
+            return Err(Error::Envelope(format!("duplicate header field: {key}")));
+        }
+        match key {
             "id" => id = Some(v.trim().to_string()),
             "type" => record_type = Some(v.trim().to_string()),
             "no-ai" => no_ai = Some(parse_bool(v)?),
@@ -161,14 +168,19 @@ pub fn serialize(env: &Envelope) -> Vec<u8> {
 }
 
 /// Check header consistency against the AAD-bound values (design §5):
-/// `id` equals the record ULID, `key_id`'s epoch equals the AAD epoch,
-/// and `type` maps to exactly one `purpose`. Any inconsistency fails closed.
-pub fn check_header(env: &Envelope, ulid: &str, purpose: &str, epoch: u64) -> Result<(), Error> {
-    // id must equal the record ULID bound in the AAD. The id is `p-<ULID>`;
-    // accept either the full id or the bare ULID as the bound value.
-    let id_ulid = env.id.strip_prefix("p-").unwrap_or(&env.id);
-    let bound_ulid = ulid.strip_prefix("p-").unwrap_or(ulid);
-    if id_ulid != bound_ulid {
+/// `id` equals the record ULID, `key_id`'s client equals the ctx client id
+/// (compared exactly — no prefix stripping), `key_id`'s epoch equals the
+/// AAD epoch, and `type` maps to exactly one `purpose`. Any inconsistency
+/// fails closed.
+pub fn check_header(
+    env: &Envelope,
+    ulid: &str,
+    client_id: &str,
+    purpose: &str,
+    epoch: u64,
+) -> Result<(), Error> {
+    // id must equal the record ULID bound in the AAD, compared exactly.
+    if env.id != ulid {
         return Err(Error::Header(format!(
             "header id {} does not match AAD ULID {ulid}",
             env.id
@@ -181,10 +193,9 @@ pub fn check_header(env: &Envelope, ulid: &str, purpose: &str, epoch: u64) -> Re
         )));
     }
     let (key_client, _) = parse_key_id(&env.key_id)?;
-    let key_client_ulid = key_client.strip_prefix("p-").unwrap_or(&key_client);
-    if key_client_ulid != bound_ulid {
+    if key_client != client_id {
         return Err(Error::Header(format!(
-            "key_id client {} does not match record {ulid}",
+            "key_id client {} does not match ctx client {client_id}",
             env.key_id
         )));
     }
@@ -231,9 +242,21 @@ mod tests {
     #[test]
     fn header_checks() {
         let env = sample();
-        assert!(check_header(&env, "p-01ABC", "profile", 3).is_ok());
-        assert!(check_header(&env, "p-OTHER", "profile", 3).is_err());
-        assert!(check_header(&env, "p-01ABC", "profile", 4).is_err());
-        assert!(check_header(&env, "p-01ABC", "note", 3).is_err());
+        assert!(check_header(&env, "p-01ABC", "p-01ABC", "profile", 3).is_ok());
+        assert!(check_header(&env, "p-OTHER", "p-OTHER", "profile", 3).is_err());
+        assert!(check_header(&env, "p-01ABC", "p-01ABC", "profile", 4).is_err());
+        assert!(check_header(&env, "p-01ABC", "p-01ABC", "note", 3).is_err());
+        // key_id client must match ctx client exactly.
+        assert!(check_header(&env, "p-01ABC", "p-OTHER", "profile", 3).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_header_field() {
+        // no-ai: false then no-ai: true — last-one-wins is ambiguous, reject.
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nno-ai: true\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("duplicate header field") => {}
+            other => panic!("expected duplicate-header Envelope error, got: {other:?}"),
+        }
     }
 }

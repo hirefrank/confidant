@@ -98,6 +98,10 @@ pub fn decrypt_file(ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
 pub struct RecordCtx {
     pub vault_id: String,
     pub ulid: String,
+    /// The client whose data key encrypts this record (e.g. `p-…` for a
+    /// person's notes/interactions, per spec §1). Bound in the AAD and the
+    /// `key_id` header.
+    pub client_id: String,
     pub path: String,
     /// AAD purpose: `profile`, `note`, `interaction`, `org`, `deal`.
     pub purpose: String,
@@ -124,10 +128,11 @@ pub fn encrypt_record(
             )))
         }
     }
-    let key_id = format!("{}/e{}", ctx.ulid, ctx.epoch);
+    let key_id = format!("{}/e{}", ctx.client_id, ctx.epoch);
     let aad = aead::build_aad(
         &ctx.vault_id,
         &ctx.ulid,
+        &ctx.client_id,
         &ctx.path,
         &ctx.purpose,
         ctx.epoch,
@@ -164,7 +169,7 @@ pub fn decrypt_record(
     for_agent: bool,
 ) -> Result<Vec<u8>, Error> {
     let env = envelope::parse(envelope_bytes)?;
-    envelope::check_header(&env, &ctx.ulid, &ctx.purpose, ctx.epoch)?;
+    envelope::check_header(&env, &ctx.ulid, &ctx.client_id, &ctx.purpose, ctx.epoch)?;
     if for_agent && env.no_ai {
         return Err(Error::Header(
             "no-ai: refusing to decrypt for agent output".to_string(),
@@ -173,6 +178,7 @@ pub fn decrypt_record(
     let aad = aead::build_aad(
         &ctx.vault_id,
         &ctx.ulid,
+        &ctx.client_id,
         &ctx.path,
         &ctx.purpose,
         ctx.epoch,
@@ -200,6 +206,7 @@ mod tests {
         let ctx = RecordCtx {
             vault_id: "v1".to_string(),
             ulid: "p-01ABC".to_string(),
+            client_id: "p-01ABC".to_string(),
             path: "people/p-01ABC.cfd".to_string(),
             purpose: "profile".to_string(),
             epoch: 3,
@@ -215,6 +222,7 @@ mod tests {
         let ctx = RecordCtx {
             vault_id: "v1".to_string(),
             ulid: "p-01ABC".to_string(),
+            client_id: "p-01ABC".to_string(),
             path: "people/p-01ABC.cfd".to_string(),
             purpose: "profile".to_string(),
             epoch: 3,

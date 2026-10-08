@@ -48,6 +48,8 @@ impl GitSignerChecker {
 impl SignerChecker for GitSignerChecker {
     fn commit_signature(&self, commit: &str) -> Result<Option<(char, String)>, Error> {
         let out = Command::new("git")
+            // Never leak the device key into git/gpg/hooks via the environment.
+            .env_remove("CONFIDANT_DEVICE_KEY")
             .args([
                 "-C",
                 &self.vault.to_string_lossy(),

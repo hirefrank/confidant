@@ -1,3 +1,9 @@
+// Portions adapted from cr (https://github.com/AnandChowdhary/cr) at f29f8d4,
+// MIT License, Copyright (c) 2026 Anand Chowdhary.
+//
+// XChaCha20-Poly1305 AEAD with length-prefixed associated data, re-keyed to
+// per-client data keys and Confidant's AAD fields (ADR-13).
+
 //! XChaCha20-Poly1305 content encryption with length-prefixed associated data.
 //!
 //! Adapted from cr's `src/encryption.rs` per ADR-13: re-keyed to per-client
@@ -36,6 +42,7 @@ fn push_component(buf: &mut Vec<u8>, data: &[u8]) {
 pub fn build_aad(
     vault_id: &str,
     ulid: &str,
+    client_id: &str,
     path: &str,
     purpose: &str,
     epoch: u64,
@@ -49,6 +56,7 @@ pub fn build_aad(
     push_component(&mut aad, DOMAIN);
     push_component(&mut aad, vault_id.as_bytes());
     push_component(&mut aad, ulid.as_bytes());
+    push_component(&mut aad, client_id.as_bytes());
     push_component(&mut aad, path.as_bytes());
     push_component(&mut aad, purpose.as_bytes());
     push_component(&mut aad, epoch.to_string().as_bytes());
@@ -66,7 +74,7 @@ pub fn build_aad(
 /// 16-byte Poly1305 tag). A fresh nonce is drawn per call.
 pub fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(key.into());
     let ct = cipher
         .encrypt(
@@ -113,6 +121,7 @@ mod tests {
         build_aad(
             "vault1",
             "01ABC",
+            "p-01ABC",
             "people/p-01ABC.cfd",
             "profile",
             3,

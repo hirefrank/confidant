@@ -117,10 +117,11 @@ impl Fixture {
         self.anchor.recovery_age.clone()
     }
 
-    fn ctx(&self, ulid: &str, purpose: &str, epoch: u64) -> RecordCtx {
+    fn ctx(&self, ulid: &str, client_id: &str, purpose: &str, epoch: u64) -> RecordCtx {
         RecordCtx {
             vault_id: "vault-01".to_string(),
             ulid: ulid.to_string(),
+            client_id: client_id.to_string(),
             path: format!("people/{ulid}.cfd"),
             purpose: purpose.to_string(),
             epoch,
@@ -136,7 +137,7 @@ impl Fixture {
 fn test1_aad_binding() {
     let f = Fixture::new();
     let key = DataKey::generate();
-    let ctx = f.ctx("p-01ABC", "profile", 3);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 3);
     let bytes = encrypt_record(&ctx, &key, "person", false, b"secret").unwrap();
 
     // Baseline decrypts.
@@ -208,7 +209,7 @@ fn test3_wrong_key_tampered() {
     let f = Fixture::new();
     let key = DataKey::generate();
     let wrong = DataKey::generate();
-    let ctx = f.ctx("p-01ABC", "profile", 1);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
     let bytes = encrypt_record(&ctx, &key, "person", false, b"top secret").unwrap();
 
     // Wrong key -> auth failure, no plaintext.
@@ -275,7 +276,7 @@ fn test4_age_wrap_round_trip() {
     ));
 
     // Full record encrypt/decrypt with the unwrapped key.
-    let ctx = f.ctx("p-01ABC", "profile", 1);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
     let bytes = encrypt_record(&ctx, &back, "person", false, b"profile body").unwrap();
     let pt = decrypt_record(&ctx, &back, &bytes, false).unwrap();
     assert_eq!(pt, b"profile body");
@@ -496,8 +497,8 @@ fn test8_shredding() {
     assert_ne!(key_b.as_bytes(), key_b_e1.as_bytes());
 
     // Encrypt a record for each client.
-    let ctx_a = f.ctx("p-AAAA", "profile", 1);
-    let ctx_b = f.ctx("p-BBBB", "profile", 2);
+    let ctx_a = f.ctx("p-AAAA", "p-AAAA", "profile", 1);
+    let ctx_b = f.ctx("p-BBBB", "p-BBBB", "profile", 2);
     let env_a = encrypt_record(&ctx_a, &key_a, "person", false, b"A secret").unwrap();
     let env_b = encrypt_record(&ctx_b, &key_b, "person", false, b"B secret").unwrap();
     assert!(decrypt_record(&ctx_a, &key_a, &env_a, false).is_ok());
@@ -750,7 +751,7 @@ fn test9_recovery_drill() {
     assert_eq!(back.as_bytes(), key.as_bytes());
 
     // Encrypt/decrypt works with the recovered key.
-    let ctx = f.ctx("p-01ABC", "profile", 1);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
     let bytes = encrypt_record(&ctx, &back, "person", false, b"after recovery").unwrap();
     assert_eq!(
         decrypt_record(&ctx, &back, &bytes, false).unwrap(),
@@ -816,14 +817,14 @@ fn test9b_recovery_key_signs_manifest() {
 fn test10_envelope_without_keys() {
     let f = Fixture::new();
     let key = DataKey::generate();
-    let ctx = f.ctx("p-01ABC", "profile", 1);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
     let bytes = encrypt_record(&ctx, &key, "person", true, b"secret").unwrap();
 
     // Structural validation needs no keys: parse + header checks only.
     let env = envelope::parse(&bytes).unwrap();
     assert_eq!(env.id, "p-01ABC");
     assert!(env.no_ai);
-    assert!(envelope::check_header(&env, "p-01ABC", "profile", 1).is_ok());
+    assert!(envelope::check_header(&env, "p-01ABC", "p-01ABC", "profile", 1).is_ok());
     assert_eq!(purpose_for_type("person"), Some("profile"));
     assert_eq!(purpose_for_type("bogus"), None);
 
@@ -842,7 +843,7 @@ fn test11_reencrypt_produces_new_ciphertext() {
     // write path does for unchanged files (no diff churn).
     let f = Fixture::new();
     let key = DataKey::generate();
-    let ctx = f.ctx("p-01ABC", "profile", 1);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
     let a = encrypt_record(&ctx, &key, "person", false, b"same").unwrap();
     let b = encrypt_record(&ctx, &key, "person", false, b"same").unwrap();
     assert_ne!(a, b, "fresh nonce per write");
@@ -881,7 +882,7 @@ fn test13_never_log_phrase() {
 fn test14_header_flip() {
     let f = Fixture::new();
     let key = DataKey::generate();
-    let ctx = f.ctx("p-01ABC", "profile", 3);
+    let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 3);
     let bytes = encrypt_record(&ctx, &key, "person", true, b"secret").unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
 
@@ -1237,4 +1238,256 @@ fn legacy_file_api_round_trip() {
     std::env::remove_var("CONFIDANT_DEVICE_KEY");
     // Without a key -> fail closed.
     assert!(confidant_crypt::decrypt_file(&ct).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Key commitment regression tests (must-fix 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_commitment_planted_device_wrapping_refused() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Attacker with push access plants a wrapping of an attacker-known key.
+    let attacker_key = [0xAAu8; 32];
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.device_recipient).unwrap();
+    let keys_dir = f._tmp.path().join("keys");
+    std::fs::write(
+        keys_dir.join("p-01ABC").join("wrapped").join("laptop.age"),
+        planted,
+    )
+    .unwrap();
+
+    // Unwrap must fail closed: commitment mismatch, no key returned.
+    match f
+        .keys
+        .unwrap_data_key("p-01ABC", "laptop", 1, &f.device_id, &f.anchor)
+    {
+        Err(Error::Manifest(_)) => {}
+        Err(e) => panic!("expected Manifest error, got: {e:?}"),
+        Ok(_) => panic!("planted device wrapping must be refused"),
+    }
+}
+
+#[test]
+fn test_commitment_planted_recovery_wrapping_refused() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Plant a recovery wrapping of an attacker-known key.
+    let attacker_key = [0xBBu8; 32];
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.recovery_recipient()).unwrap();
+    let keys_dir = f._tmp.path().join("keys");
+    std::fs::write(
+        keys_dir
+            .join("p-01ABC")
+            .join("wrapped")
+            .join("recovery.age"),
+        planted,
+    )
+    .unwrap();
+
+    match f.keys.unwrap_data_key(
+        "p-01ABC",
+        "recovery",
+        1,
+        &f.recovery.age_identity().to_age_identity().unwrap(),
+        &f.anchor,
+    ) {
+        Err(Error::Manifest(_)) => {}
+        Err(e) => panic!("expected Manifest error, got: {e:?}"),
+        Ok(_) => panic!("planted recovery wrapping must be refused"),
+    }
+}
+
+#[test]
+fn test_commitment_planted_lookup_age_refused() {
+    let mut f = Fixture::new();
+    // Fixture::new already ran init_lookup_key for the device recipient.
+
+    // Plant a lookup.age wrapping of an attacker-known key.
+    let attacker_key = [0xCCu8; 32];
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.device_recipient).unwrap();
+    let keys_dir = f._tmp.path().join("keys");
+    std::fs::write(keys_dir.join("vault").join("lookup.age"), planted).unwrap();
+
+    match f.keys.read_lookup_key(&f.device_id, &f.anchor) {
+        Err(Error::Manifest(_)) => {}
+        Err(e) => panic!("expected Manifest error, got: {e:?}"),
+        Ok(_) => panic!("planted lookup.age must be refused"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key id charset regression tests (must-fix 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_revoke_recovery_reserved() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // "recovery" is reserved: revoke must reject it before touching anything.
+    let err = f
+        .keys
+        .revoke("p-01ABC", &["recovery"], &f.operator_sk, &f.anchor)
+        .expect_err("revoke([\"recovery\"]) must be rejected");
+    assert!(
+        matches!(err, Error::Manifest(_)),
+        "expected Manifest error, got: {err:?}"
+    );
+    // The recovery wrapping must still be there.
+    let keys_dir = f._tmp.path().join("keys");
+    assert!(keys_dir
+        .join("p-01ABC")
+        .join("wrapped")
+        .join("recovery.age")
+        .exists());
+}
+
+#[test]
+fn test_recipient_named_recovery_rejected() {
+    // A recipient literally named "recovery" would collide with recovery.age.
+    let mut map = RecipientMap::new();
+    map.insert(
+        "recovery".to_string(),
+        RecipientEntry {
+            age_pubkey: "age1fake".to_string(),
+            label: "recovery".to_string(),
+            scope_ref: String::new(),
+        },
+    );
+    let err = confidant_crypt::manifest::to_toml(1, &map, &[])
+        .expect_err("recipient named \"recovery\" must be rejected");
+    assert!(
+        matches!(err, Error::Manifest(_)),
+        "expected Manifest error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_key_id_charset_rejects_dots_and_slashes() {
+    for bad in ["agent.eu", "../", "UPPER", "with space", ""] {
+        let mut map = RecipientMap::new();
+        map.insert(
+            bad.to_string(),
+            RecipientEntry {
+                age_pubkey: "age1fake".to_string(),
+                label: bad.to_string(),
+                scope_ref: String::new(),
+            },
+        );
+        let err = confidant_crypt::manifest::to_toml(1, &map, &[])
+            .expect_err(&format!("key id {bad:?} must be rejected"));
+        assert!(
+            matches!(err, Error::Manifest(_)),
+            "expected Manifest error for {bad:?}, got: {err:?}"
+        );
+    }
+    // Sanity: a valid id still works.
+    let mut map = RecipientMap::new();
+    map.insert(
+        "laptop-2".to_string(),
+        RecipientEntry {
+            age_pubkey: "age1fake".to_string(),
+            label: "laptop-2".to_string(),
+            scope_ref: String::new(),
+        },
+    );
+    assert!(confidant_crypt::manifest::to_toml(1, &map, &[]).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// RecordCtx client_id regression tests (must-fix 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_note_round_trip_under_person_key() {
+    // n-… records encrypt under the person's key (p-…/eN), per spec §1.
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    let key = f
+        .keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    let ctx = f.ctx("n-01NOTE", "p-01ABC", "note", 1);
+    let bytes = encrypt_record(&ctx, &key, "note", false, b"note body").unwrap();
+
+    // The key_id header names the person's key, not the note's id.
+    let env = envelope::parse(&bytes).unwrap();
+    assert_eq!(env.key_id, "p-01ABC/e1");
+
+    // Round-trip with the person's key.
+    let back = decrypt_record(&ctx, &key, &bytes, false).unwrap();
+    assert_eq!(back, b"note body");
+}
+
+#[test]
+fn test_note_under_a_key_fails_as_b() {
+    // A note encrypted under client A's key must not decrypt as client B,
+    // even with B's key (AAD binds the client id).
+    let mut f = Fixture::new();
+    let recipients_a = f.recipients(&[("laptop", &f.device_recipient)]);
+    let key_a = f
+        .keys
+        .init_client(
+            "p-AAAA",
+            &recipients_a,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    let recipients_b = f.recipients(&[("laptop", &f.device_recipient)]);
+    let key_b = f
+        .keys
+        .init_client(
+            "p-BBBB",
+            &recipients_b,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    let ctx_a = f.ctx("n-01NOTE", "p-AAAA", "note", 1);
+    let bytes = encrypt_record(&ctx_a, &key_a, "note", false, b"note body").unwrap();
+
+    // As client B: header check fails (key_id client != ctx client).
+    let ctx_b = f.ctx("n-01NOTE", "p-BBBB", "note", 1);
+    let err = decrypt_record(&ctx_b, &key_b, &bytes, false)
+        .expect_err("note under A's key must fail as B");
+    assert!(
+        matches!(err, Error::Header(_)),
+        "expected Header error, got: {err:?}"
+    );
 }

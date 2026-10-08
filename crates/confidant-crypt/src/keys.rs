@@ -14,7 +14,7 @@ pub struct DataKey([u8; 32]);
 impl DataKey {
     pub fn generate() -> Self {
         let mut b = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rngs::OsRng.fill_bytes(&mut b);
         DataKey(b)
     }
 
@@ -42,7 +42,7 @@ pub struct DeviceKeypair {
 impl DeviceKeypair {
     pub fn generate() -> Self {
         let mut b = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rngs::OsRng.fill_bytes(&mut b);
         // Clamp like X25519 requires.
         b[0] &= 248;
         b[31] &= 127;
@@ -68,7 +68,7 @@ pub struct LookupKey([u8; 32]);
 impl LookupKey {
     pub fn generate() -> Self {
         let mut b = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut b);
+        rand::rngs::OsRng.fill_bytes(&mut b);
         LookupKey(b)
     }
 

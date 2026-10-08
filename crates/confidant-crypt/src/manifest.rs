@@ -18,15 +18,24 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::error::Error;
 
 /// Domain separator for manifest signatures.
 const MANIFEST_DOMAIN: &[u8] = b"confidant-manifest-v2";
 
+/// Domain separator for the key-commitment HMAC (design §4).
+const COMMIT_DOMAIN: &[u8] = b"confidant-key-commit-v1";
+
 /// Fixed client id for the vault-level lookup-key manifest (`keys/vault/`).
 pub const VAULT_CLIENT_ID: &str = "vault:lookup";
+
+/// Key id reserved for the recovery wrapping (`recovery.age`); it is never
+/// a manifest recipient entry.
+pub const RECOVERY_KEY_ID: &str = "recovery";
 
 /// One recipient entry in the manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,34 +52,150 @@ pub struct RecipientEntry {
 /// The parsed recipient list: key id -> entry.
 pub type RecipientMap = BTreeMap<String, RecipientEntry>;
 
-/// The manifest document: sequence number plus recipient list.
+/// Validate a recipient key id.
+///
+/// Key ids end up in file names (`<key-id>.age`), so they are restricted
+/// to `[a-z0-9-]` — no `.` (which would confuse the `.e<epoch>` retained-
+/// epoch suffix), no `/` or `..` (path traversal). `recovery` is reserved
+/// for the recovery wrapping and is never a manifest entry: accepting it
+/// would let `revoke(&["recovery"])` silently delete every recovery
+/// wrapping, or a recipient named `recovery` overwrite `recovery.age`.
+pub fn validate_key_id(key_id: &str) -> Result<(), Error> {
+    if key_id.is_empty() {
+        return Err(Error::Manifest("empty key id".to_string()));
+    }
+    if key_id == RECOVERY_KEY_ID {
+        return Err(Error::Manifest(format!(
+            "key id {key_id:?} is reserved for the recovery wrapping"
+        )));
+    }
+    if !key_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(Error::Manifest(format!(
+            "key id {key_id:?} must match [a-z0-9-]+"
+        )));
+    }
+    Ok(())
+}
+
+/// Key commitment: binds a data key to its (vault, client, epoch) so a
+/// planted `.age` wrapping can't substitute an attacker-known key.
+///
+/// `HMAC-SHA256(data_key, "confidant-key-commit-v1" ‖ len(vault_id) ‖
+/// vault_id ‖ len(client_id) ‖ client_id ‖ le64(epoch))`. The manifest
+/// carries one commitment per retained epoch; after every unwrap the
+/// caller recomputes it and compares in constant time.
+pub fn key_commitment(
+    data_key: &[u8; 32],
+    vault_id: &str,
+    client_id: &str,
+    epoch: u64,
+) -> [u8; 32] {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(data_key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(COMMIT_DOMAIN);
+    mac.update(&(vault_id.len() as u64).to_le_bytes());
+    mac.update(vault_id.as_bytes());
+    mac.update(&(client_id.len() as u64).to_le_bytes());
+    mac.update(client_id.as_bytes());
+    mac.update(&epoch.to_le_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+/// Constant-time equality for commitment comparison.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Hex-encode bytes (avoids a `hex` dependency).
+pub fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Hex-decode (for commitment comparison).
+pub fn decode_hex(s: &str) -> Result<Vec<u8>, Error> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err(Error::Manifest("odd-length hex commitment".to_string()));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| Error::Manifest("invalid hex commitment".to_string()))
+        })
+        .collect()
+}
+
+/// One key commitment entry in the manifest: epoch → hex HMAC.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitmentEntry {
+    pub epoch: u64,
+    /// Hex-encoded `key_commitment` output.
+    pub commitment: String,
+}
+
+/// The manifest document: sequence number, recipient list, and one key
+/// commitment per retained epoch.
 #[derive(Serialize)]
 struct Doc<'a> {
     seq: u64,
     recipients: &'a RecipientMap,
+    commitments: &'a [CommitmentEntry],
 }
 
 #[derive(Deserialize)]
 struct OwnedDoc {
     seq: u64,
     recipients: RecipientMap,
+    #[serde(default)]
+    commitments: Vec<CommitmentEntry>,
 }
 
-/// Serialize a recipient map to canonical TOML with the given sequence number.
-pub fn to_toml(seq: u64, map: &RecipientMap) -> Result<Vec<u8>, Error> {
+/// Serialize a recipient map to canonical TOML with the given sequence
+/// number and key commitments. Key ids are validated here (write path).
+pub fn to_toml(
+    seq: u64,
+    map: &RecipientMap,
+    commitments: &[CommitmentEntry],
+) -> Result<Vec<u8>, Error> {
+    for key_id in map.keys() {
+        validate_key_id(key_id)?;
+    }
     let s = toml::to_string(&Doc {
         seq,
         recipients: map,
+        commitments,
     })?;
     Ok(s.into_bytes())
 }
 
-/// Parse a recipient map and its sequence number from TOML.
-pub fn from_toml(bytes: &[u8]) -> Result<(u64, RecipientMap), Error> {
+/// Parse a recipient map, its sequence number, and its key commitments
+/// from TOML. Key ids are validated here too (read path): a manifest from
+/// git history with a bad key id is refused rather than trusted.
+pub fn from_toml(bytes: &[u8]) -> Result<(u64, RecipientMap, Vec<CommitmentEntry>), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::Manifest("recipients.toml is not UTF-8".to_string()))?;
     let doc: OwnedDoc = toml::from_str(text)?;
-    Ok((doc.seq, doc.recipients))
+    for key_id in doc.recipients.keys() {
+        validate_key_id(key_id)?;
+    }
+    Ok((doc.seq, doc.recipients, doc.commitments))
 }
 
 fn le64_len(s: &str, out: &mut Vec<u8>) {
@@ -132,7 +257,7 @@ pub fn verify(
     if sig_bytes.len() != 64 {
         return Err(Error::Manifest("signature must be 64 bytes".to_string()));
     }
-    let (seq, _) = from_toml(toml_bytes)?;
+    let (seq, _, _) = from_toml(toml_bytes)?;
     if seq < min_seq {
         return Err(Error::Manifest(format!(
             "manifest seq {seq} is below the high-water mark {min_seq}; refusing stale manifest"
@@ -239,7 +364,7 @@ mod tests {
     #[test]
     fn sign_verify_round_trip() {
         let sk = SigningKey::generate(&mut OsRng);
-        let toml = to_toml(1, &sample()).unwrap();
+        let toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01ABC", 3, 1, &toml);
         let back = verify(
             &sk.verifying_key(),
@@ -257,7 +382,7 @@ mod tests {
     #[test]
     fn tampered_list_fails() {
         let sk = SigningKey::generate(&mut OsRng);
-        let mut toml = to_toml(1, &sample()).unwrap();
+        let mut toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01ABC", 3, 1, &toml);
         toml.extend_from_slice(b"# evil");
         assert!(verify(
@@ -276,7 +401,7 @@ mod tests {
     fn wrong_signer_fails() {
         let sk = SigningKey::generate(&mut OsRng);
         let other = SigningKey::generate(&mut OsRng);
-        let toml = to_toml(1, &sample()).unwrap();
+        let toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01ABC", 3, 1, &toml);
         assert!(verify(
             &other.verifying_key(),
@@ -293,7 +418,7 @@ mod tests {
     #[test]
     fn wrong_epoch_fails() {
         let sk = SigningKey::generate(&mut OsRng);
-        let toml = to_toml(1, &sample()).unwrap();
+        let toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01ABC", 3, 1, &toml);
         assert!(verify(
             &sk.verifying_key(),
@@ -313,7 +438,7 @@ mod tests {
         // client B's directory (same epoch) — otherwise the next rotate for
         // B wraps B's key to A's recipients.
         let sk = SigningKey::generate(&mut OsRng);
-        let toml = to_toml(1, &sample()).unwrap();
+        let toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01AAA", 3, 1, &toml);
         let err = verify(
             &sk.verifying_key(),
@@ -345,7 +470,7 @@ mod tests {
         // A restored pre-revocation manifest: valid signature, same epoch,
         // but seq below the high-water mark.
         let sk = SigningKey::generate(&mut OsRng);
-        let toml = to_toml(1, &sample()).unwrap();
+        let toml = to_toml(1, &sample(), &[]).unwrap();
         let sig = sign(&sk, "vault-01", "p-01ABC", 3, 1, &toml);
         let err = verify(
             &sk.verifying_key(),

@@ -145,6 +145,26 @@ place.
   files are kept (renamed `wrapped/<key-id>.e<epoch>.age`) so history stays
   readable; see §8.
 
+**Key commitment.** The signed manifest also carries a key commitment for
+every retained epoch, so a planted wrapping cannot pass verification:
+
+```
+HMAC-SHA256(data_key,
+            "confidant-key-commit-v1" ‖ len(vault_id) ‖ vault_id
+            ‖ len(client_id) ‖ client_id ‖ le64(epoch))
+```
+
+(lengths are 8-byte little-endian; `‖` is concatenation). Stored in
+`recipients.toml` as `[[commitments]]` entries `{epoch, commitment}`
+(hex). The lookup key gets the same commitment in the `vault:lookup`
+manifest. After **every** unwrap (device, agent, recovery, lookup), the
+CLI recomputes the commitment and compares it in constant time; a
+mismatch — or a missing commitment — is a hard error and no key is
+returned. This closes the hole where anyone with push access could plant
+`wrapped/laptop.age = age(attacker_key → laptop pubkey)`: the manifest
+signature would still verify, but the commitment would not match.
+Manifest format v2 (adds `vault_id` binding and `[[commitments]]`).
+
 ## 5. Content encryption
 
 Algorithm: **XChaCha20-Poly1305** (192-bit random nonce per write;
@@ -480,11 +500,21 @@ in the repo, tests, or CI.
 
 ## 13. What changes in the spec
 
-None in this PR — docs only. This design fills in the `keys/` reservation
-from spec §1 and the `vault_id` encryption binding from spec §2; any
-resulting spec edits (envelope format, `no-ai` outer header, new finding
-codes for crypto failures) land in the milestone 2 implementation PR after
-this review.
+This is the milestone 2 implementation PR. Format changes from spec 0.1:
+
+- **Manifest v2**: `recipients.toml` gains `vault_id` (binds the manifest
+  to the vault) and `[[commitments]]` (key commitments for every retained
+  epoch, §4). Readers must reject manifests without commitments (fail
+  closed).
+- **Key id charset**: `[a-z0-9-]`, `recovery` reserved (§4).
+- **Envelope**: `key_id` is `<client_id>/e<epoch>` where `client_id` is the
+  record owner's key holder (for `n-`/`i-` records, the person's `p-…` id,
+  §2); the AAD binds both record ULID and client id; duplicate header keys
+  are rejected (§5).
+- **AAD**: adds a `client_id` component after `ulid` (§5).
+
+These are documented here; the normative spec 0.1 edits land in a
+follow-up after crypto review.
 
 ## 14. Decisions I made
 
