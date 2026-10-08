@@ -39,6 +39,20 @@ pub enum ErrorKind {
     Usage,
     /// An idempotency key was reused with different content.
     IdempotencyConflict,
+    /// `confidant inbox` refused: the working tree is not clean.
+    InboxDirty,
+    /// `confidant inbox` refused: the inbox branch tip is not signed by a
+    /// trusted signer.
+    InboxUntrusted,
+    /// `confidant inbox` refused: an inbox item is malformed or undecryptable.
+    InboxItem,
+    /// `confidant inbox` refused: an item targets a path that already exists
+    /// with different content.
+    InboxConflict,
+    /// `confidant inbox` refused: the merged content fails `check`.
+    InboxCheckFailed,
+    /// `confidant inbox` cannot decrypt: milestone 2 crypto is a stub.
+    InboxCrypto,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -57,6 +71,12 @@ impl ErrorKind {
             Self::LedgerUnreadable => "E_LEDGER_UNREADABLE",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
+            Self::InboxDirty => "E_INBOX_DIRTY",
+            Self::InboxUntrusted => "E_INBOX_UNTRUSTED",
+            Self::InboxItem => "E_INBOX_ITEM",
+            Self::InboxConflict => "E_INBOX_CONFLICT",
+            Self::InboxCheckFailed => "E_INBOX_CHECK_FAILED",
+            Self::InboxCrypto => "E_INBOX_CRYPTO",
             Self::Internal => "internal_error",
         }
     }
@@ -131,6 +151,46 @@ impl DomainError {
             .with_fix(
                 "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it",
             )
+    }
+
+    pub fn inbox_dirty() -> Self {
+        Self::new(
+            ErrorKind::InboxDirty,
+            "working tree is not clean; `confidant inbox` refuses to merge",
+        )
+        .with_fix("Commit or stash your changes, then run `confidant inbox` again")
+    }
+
+    pub fn inbox_untrusted(detail: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InboxUntrusted, detail.into()).with_fix(
+            "Push the inbox branch from a device whose signing key is in [trust] signers, or add the signer",
+        )
+    }
+
+    pub fn inbox_item(detail: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InboxItem, detail.into()).with_fix(
+            "Fix or remove the item on the inbox branch, then run `confidant inbox` again",
+        )
+    }
+
+    pub fn inbox_conflict(path: impl Into<String>) -> Self {
+        Self::new(
+            ErrorKind::InboxConflict,
+            format!("inbox item targets '{}' which already exists with different content", path.into()),
+        )
+        .with_fix("Resolve the conflict manually (merge the two versions), then run `confidant inbox` again")
+    }
+
+    pub fn inbox_check_failed(summary: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InboxCheckFailed, summary.into()).with_fix(
+            "Fix the inbox items so `confidant check` passes, then run `confidant inbox` again",
+        )
+    }
+
+    pub fn inbox_crypto(detail: impl Into<String>) -> Self {
+        Self::new(ErrorKind::InboxCrypto, detail.into()).with_fix(
+            "Inbox decryption needs the milestone 2 crypto implementation; until then the inbox cannot be merged",
+        )
     }
 
     pub fn with_file(mut self, file: impl Into<String>) -> Self {
@@ -296,6 +356,18 @@ mod tests {
         );
         assert_eq!(DomainError::config("bad toml").code(), "E_CONFIG");
         assert_eq!(DomainError::conflict("busy").code(), "E_CONFLICT");
+        assert_eq!(DomainError::inbox_dirty().code(), "E_INBOX_DIRTY");
+        assert_eq!(
+            DomainError::inbox_untrusted("x").code(),
+            "E_INBOX_UNTRUSTED"
+        );
+        assert_eq!(DomainError::inbox_item("x").code(), "E_INBOX_ITEM");
+        assert_eq!(DomainError::inbox_conflict("p").code(), "E_INBOX_CONFLICT");
+        assert_eq!(
+            DomainError::inbox_check_failed("x").code(),
+            "E_INBOX_CHECK_FAILED"
+        );
+        assert_eq!(DomainError::inbox_crypto("x").code(), "E_INBOX_CRYPTO");
         assert_eq!(
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"

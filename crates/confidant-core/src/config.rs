@@ -36,6 +36,19 @@ pub struct VaultConfig {
     pub vault_id: String,
     #[serde(default)]
     pub checks: ChecksConfig,
+    /// Optional `[inbox]` table. Unknown tables are ignored by readers that
+    /// do not know them, so this is backward compatible (no spec bump).
+    #[serde(default)]
+    pub inbox: InboxConfig,
+}
+
+/// Optional `[inbox]` table: the vault's public inbox key (age X25519,
+/// `age1...`). Outside tools encrypt intake items to this key and push them
+/// to the `inbox` branch. The private half never lives in the vault.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct InboxConfig {
+    #[serde(default)]
+    pub pubkey: Option<String>,
 }
 
 /// `[checks]` table. Unknown keys are `E_CONFIG` findings.
@@ -278,6 +291,39 @@ pub struct UserConfig {
     pub default_vault: Option<String>,
     #[serde(default)]
     pub vaults: BTreeMap<String, String>,
+    /// Optional `[trust]` table: signing key IDs (as shown by
+    /// `git log --format=%GK`) whose commits the operator trusts.
+    /// `confidant inbox` requires every inbox-branch commit that adds or
+    /// changes an item to be signed by one of these keys (ADR-10), and
+    /// refuses the run entirely when this list is empty unless
+    /// `--allow-unsigned` is passed. Lives outside the vault, never inside it.
+    #[serde(default)]
+    pub trust: TrustConfig,
+    /// Optional `[inbox]` table in the user config: the operator's out-of-band
+    /// pin of the vault's inbox public key. `confidant inbox` (and `check`)
+    /// error when the vault's `[inbox].pubkey` differs from this pin — the
+    /// vault copy is informational only and anyone with git write access can
+    /// change it. Set once from the `age-keygen` output; lives outside the
+    /// vault, never inside it.
+    #[serde(default)]
+    pub inbox: InboxUserConfig,
+}
+
+/// Optional `[trust]` table in the user config.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TrustConfig {
+    #[serde(default)]
+    pub signers: Vec<String>,
+}
+
+/// Optional `[inbox]` table in the user config: the operator's out-of-band
+/// pin of the vault's inbox public key (age `age1...`). Compared against the
+/// vault's `confidant.toml [inbox].pubkey` by `confidant inbox` and `check`;
+/// a mismatch is a hard error (possible key substitution).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct InboxUserConfig {
+    #[serde(default)]
+    pub pubkey: Option<String>,
 }
 
 impl UserConfig {
