@@ -379,7 +379,7 @@ fn check_inbox_pubkey(
     let Some(pinned) = pinned.map(str::trim).filter(|s| !s.is_empty()) else {
         warnings.push(
             "no [inbox].pubkey pinned in ~/.config/confidant/config.toml; \
-             inbox key substitution cannot be detected — pin the key once from age-keygen output"
+             inbox key substitution cannot be detected — pin the key once from the vault's inbox public key"
                 .to_string(),
         );
         return Ok(());

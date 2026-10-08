@@ -24,14 +24,17 @@ Two explicit non-goals:
 ## Keypair
 
 The vault has one age X25519 keypair for intake (milestone 2 terminology: the
-inbox key; the private half is wrapped to devices like the alias lookup key).
+inbox key). The private half is **never** in git, and it isn't wrapped to the
+recovery identity either — that's what keeps it cheap to destroy on rotation
+and shred.
 
-1. Generate it on the operator's machine (requires
-   [age](https://age-encryption.org)):
-   ```sh
-   age-keygen -o ~/.config/confidant/inbox.key
-   chmod 600 ~/.config/confidant/inbox.key
-   ```
+1. Generate it on the operator's machine — with milestone 2. M2 generates the
+   keypair and stores the private half in the **OS keychain** on the one
+   device that runs `confidant inbox`. It is never a file under `~/.config`,
+   because Time Machine backs that up and "destroy the old key" would then be
+   false. `confidant inbox rotate` rotates it (see the inbox-key section of
+   `docs/crypto-design.md`). Until milestone 2 lands there is nothing to
+   generate, because decryption is a stub.
 2. Publish the public half in the vault's `confidant.toml`:
    ```toml
    [inbox]
