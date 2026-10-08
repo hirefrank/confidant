@@ -423,7 +423,7 @@ Frank sends each client a form before and after every session. The answers shoul
 2. **The model provider sees plaintext.** Agents send what they read to a hosted model provider. The README and privacy model say so plainly and don't claim the provider stores nothing. A per-client `no-ai` flag keeps that client's notes and PII out of `confidant context` and `--json` output used by agents, so the operator can keep sensitive clients away from models entirely.
 3. **Capture going stale.** Confidant only knows what agents write into it. A `confidant check` rule flags gaps, such as a session with no notes, or a paid client with no session within a set window. The agent sends the operator a weekly summary of these gaps.
 4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred clients (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks (FileVault on the laptop, and the agent's computer), and its index stays out of git and is never synced anywhere.
-5. **Crypto review.** Someone independent reviews the crypto design before any milestone 2 code is written: a security-focused agent plus one outside human reviewer. A full code audit happens before the README invites anyone else to trust Confidant with client data. Personal use before then is fine.
+5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with client data.
 
 ## Appendix A. Moving off Lightfield (Frank's context)
 
