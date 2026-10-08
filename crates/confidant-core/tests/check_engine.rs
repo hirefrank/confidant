@@ -1729,9 +1729,9 @@ fn find_and_check_frontmatter_25_char_id_typo() {
         .filter(|f| f["code"] == "E_INVALID_ID")
         .collect();
     assert_eq!(invalid.len(), 1, "{json}");
-    assert_eq!(invalid[0]["line"], 4);
+    assert_eq!(invalid[0]["line"], 5);
     let msg = invalid[0]["message"].as_str().unwrap();
-    assert!(msg.contains("line 4"), "{msg}");
+    assert!(msg.contains("line 5"), "{msg}");
     assert!(!msg.contains(TYPO_25), "{msg}");
     assert!(!msg.contains("see"), "{msg}");
 }
