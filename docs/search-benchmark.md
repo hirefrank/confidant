@@ -19,7 +19,16 @@ hyperfine --warmup 3 --runs 10 \
   "./target/release/confidant find zxqvUniqueTokenAda0 --vault $tmp --json --no-input" \
   "./target/release/confidant find coaching-practice --vault $tmp --json --no-input" \
   "./target/release/confidant check --vault $tmp --json --no-input"
+cjk=$(mktemp -d)
+./target/release/confidant bench-gen "$cjk" --people 400 --notes 5 --cjk
+hyperfine --warmup 3 --runs 10 \
+  "./target/release/confidant find zxqvUniqueTokenAda0 --vault $cjk --json --no-input" \
+  "./target/release/confidant find coaching-practice --vault $cjk --json --no-input"
 ```
+
+`--cjk` fills note bodies with no-space CJK prose (an embedded dash, no
+ASCII spaces) so the scanner is timed on long runs that are not English
+word boundaries. Hit counts must still match `grep -ri`.
 
 ## Vault
 

@@ -241,11 +241,13 @@ impl IdToken {
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
 /// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
 /// inside junk such as `[[p-…]]`. Format characters (ZWSP, soft hyphen,
-/// word joiner, …) are stripped first. A prefix is glued (only a Valid
-/// token: `-` plus an exact ULID) after an ASCII alphanumeric or `_`, when
-/// the `-` before it follows an alphanumeric, `_`, or `-` in the same run,
-/// or when it sits inside a `scheme://` token. Malformed lookalikes and the
-/// over-32 tail rule apply only at a word boundary.
+/// word joiner, …) are stripped first. A prefix is glued after an ASCII
+/// alphanumeric or `_`, when the `-` before it follows an alphanumeric, `_`,
+/// or `-` in the same run, or when it sits inside a `scheme://` token. Glue
+/// is computed only at a prefix; scheme state is tracked incrementally per
+/// whitespace-delimited token. In a glued context a Valid token is `-` plus
+/// an exact ULID; a longer run whose first 26 characters are a ULID, or a
+/// Unicode dash plus a ULID, is Malformed with that candidate.
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
@@ -259,14 +261,14 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     let mut remaining = text;
     let mut prev: Option<char> = None;
     let mut prev2: Option<char> = None;
-    let mut offset = 0usize;
+    let mut run_has_scheme = false;
+    let mut scheme_progress = 0u8;
     while !remaining.is_empty() {
-        let glued = prefix_is_glued(text, offset, prev, prev2);
         if starts_id_prefix(remaining) {
+            let glued = prefix_is_glued(prev, prev2, run_has_scheme);
             if let Some((tok, len)) = match_id_token_at(remaining, glued) {
                 out.push(tok);
                 remaining = &remaining[len..];
-                offset += len;
                 prev2 = prev;
                 prev = Some('0');
                 continue;
@@ -274,15 +276,29 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
         }
         let ch = remaining.chars().next().unwrap();
         let n = ch.len_utf8();
+        if ch.is_whitespace() {
+            run_has_scheme = false;
+            scheme_progress = 0;
+        } else if !run_has_scheme {
+            scheme_progress = match (scheme_progress, ch) {
+                (0, ':') => 1,
+                (1, '/') => 2,
+                (2, '/') => {
+                    run_has_scheme = true;
+                    0
+                }
+                (_, ':') => 1,
+                _ => 0,
+            };
+        }
         prev2 = prev;
         prev = Some(ch);
         remaining = &remaining[n..];
-        offset += n;
     }
     out
 }
 
-fn prefix_is_glued(text: &str, offset: usize, prev: Option<char>, prev2: Option<char>) -> bool {
+fn prefix_is_glued(prev: Option<char>, prev2: Option<char>, run_has_scheme: bool) -> bool {
     if prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
         return true;
     }
@@ -290,16 +306,7 @@ fn prefix_is_glued(text: &str, offset: usize, prev: Option<char>, prev2: Option<
     {
         return true;
     }
-    in_scheme_token(text, offset)
-}
-
-fn in_scheme_token(text: &str, offset: usize) -> bool {
-    let before = &text[..offset];
-    let start = match before.rfind(|c: char| c.is_whitespace()) {
-        Some(i) => i + text[i..].chars().next().unwrap().len_utf8(),
-        None => 0,
-    };
-    text[start..offset].contains("://")
+    run_has_scheme
 }
 
 /// U+00AD after an ID prefix is a dash, not a format character to strip.
@@ -417,12 +424,23 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         let total = plen + run_start + run_len;
         let run = &after[run_start..run_start + run_len];
         if glued {
-            // Glued prefixes: only '-' plus an exact ULID is an ID.
-            if dash != '-' || run_len != ULID_LEN {
+            if is_32_lowercase_hex(run) {
                 continue;
             }
-            if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
-                return Some((IdToken::Valid(id), total));
+            if dash == '-' && run_len == ULID_LEN {
+                if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
+                    return Some((IdToken::Valid(id), total));
+                }
+            }
+            if let Some(candidate) = lookalike_candidate(pref, run) {
+                if run_len > ULID_LEN || dash != '-' {
+                    return Some((
+                        IdToken::Malformed {
+                            candidate: Some(candidate),
+                        },
+                        total,
+                    ));
+                }
             }
             continue;
         }
@@ -676,6 +694,54 @@ mod tests {
         assert_eq!(
             scan_id_tokens("https://drive.google.com/file/d/p-01M3TC5H00MPJG000000000000/view"),
             vec![IdToken::Valid(hidden)]
+        );
+        let cam = super::RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        let malformed_cam = IdToken::Malformed {
+            candidate: Some(cam.clone()),
+        };
+        assert_eq!(
+            scan_id_tokens("https://example.com/x/p-01M3TC5H00MPJG001248000002abc"),
+            vec![malformed_cam.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens("https://example.com/p-01M3TC5H00MPJG001248000002abcdefghijk"),
+            vec![malformed_cam.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens("Ana-p-01M3TC5H00MPJG001248000002s"),
+            vec![malformed_cam.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens("Ana-p-01M3TC5H00MPJG001248000002abcdefghij"),
+            vec![malformed_cam.clone()]
+        );
+        assert_eq!(
+            scan_id_tokens("Ana-p\u{2013}01M3TC5H00MPJG001248000002"),
+            vec![malformed_cam]
+        );
+    }
+
+    #[test]
+    fn scan_id_tokens_is_linear_on_long_cjk_and_url_lines() {
+        use std::time::{Duration, Instant};
+        let cjk = format!("{}-{}", "漢".repeat(40_000), "字".repeat(40_000));
+        let url = format!("https://example.com/{}", "-".repeat(320_000));
+        let budget = Duration::from_millis(if cfg!(debug_assertions) { 1000 } else { 250 });
+        let t0 = Instant::now();
+        let cjk_toks = super::scan_id_tokens(&cjk);
+        let cjk_elapsed = t0.elapsed();
+        let t1 = Instant::now();
+        let url_toks = super::scan_id_tokens(&url);
+        let url_elapsed = t1.elapsed();
+        assert!(cjk_toks.is_empty(), "{cjk_toks:?}");
+        assert!(url_toks.is_empty(), "{url_toks:?}");
+        assert!(
+            cjk_elapsed <= budget,
+            "CJK 80k-char line took {cjk_elapsed:?} (budget {budget:?})"
+        );
+        assert!(
+            url_elapsed <= budget,
+            "320k-char URL line took {url_elapsed:?} (budget {budget:?})"
         );
     }
 

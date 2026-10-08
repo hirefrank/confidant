@@ -142,11 +142,13 @@ pub(crate) enum FrontmatterRef {
 
 /// Parse a `person` / `org` / `deal` front-matter value as a record ID after
 /// stripping format characters, surrounding quotes, a trailing comment
-/// introduced by a space or tab then `#`, and `[[id|Alias]]` only inside
-/// `[[…]]`. Empty, `~`, and YAML `null` are [`FrontmatterRef::Absent`].
+/// introduced by a space or tab then `#` (including after a closing quote),
+/// and `[[id|Alias]]` only inside `[[…]]`. Empty, `~`, and YAML `null` are
+/// [`FrontmatterRef::Absent`].
 pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
     let stripped = strip_cf(raw);
-    let unquoted = unquote(stripped.trim());
+    let trimmed = strip_comment_after_quoted(stripped.trim());
+    let unquoted = unquote(trimmed.trim());
     let mut trimmed = unquoted.trim();
     if let Some(idx) = ref_comment_start(trimmed) {
         trimmed = trimmed[..idx].trim();
@@ -174,6 +176,49 @@ pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
 
 fn ref_comment_start(s: &str) -> Option<usize> {
     s.find(" #").into_iter().chain(s.find("\t#")).min()
+}
+
+/// `"id" # comment` / `'[[id|Alias]]' # c` — drop the comment before unquoting.
+fn strip_comment_after_quoted(s: &str) -> &str {
+    let Some(q) = s.chars().next() else {
+        return s;
+    };
+    if q != '"' && q != '\'' {
+        return s;
+    }
+    let mut chars = s.char_indices();
+    chars.next();
+    if q == '"' {
+        let mut escaped = false;
+        for (i, c) in chars {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' {
+                escaped = true;
+                continue;
+            }
+            if c == '"' {
+                let after = &s[i + c.len_utf8()..];
+                if after.starts_with(" #") || after.starts_with("\t#") {
+                    return &s[..i + c.len_utf8()];
+                }
+                return s;
+            }
+        }
+        return s;
+    }
+    for (i, c) in chars {
+        if c == '\'' {
+            let after = &s[i + c.len_utf8()..];
+            if after.starts_with(" #") || after.starts_with("\t#") {
+                return &s[..i + c.len_utf8()];
+            }
+            return s;
+        }
+    }
+    s
 }
 
 fn is_yaml_null(s: &str) -> bool {
@@ -697,6 +742,14 @@ mod tests {
             super::parse_ref_id("p-01M3TC5H00MPJG000000000000|Ada"),
             super::FrontmatterRef::Invalid
         );
+        assert_eq!(
+            super::parse_ref_id("\"p-01M3TC5H00MPJG000000000000\" # Ada"),
+            super::FrontmatterRef::Id(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("'[[p-01M3TC5H00MPJG000000000000|Ada]]' # c"),
+            super::FrontmatterRef::Id(id)
+        );
     }
 
     #[test]
@@ -726,5 +779,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(yaml_null.person(), None);
+        let quoted_hash = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: \"p-01M3TC5H00MPJG000000000000\" # Ada\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(quoted_hash.person().as_ref(), Some(&id));
+        let quoted_wikilink = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: '[[p-01M3TC5H00MPJG000000000000|Ada]]' # c\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(quoted_wikilink.person().as_ref(), Some(&id));
     }
 }

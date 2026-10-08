@@ -38,11 +38,18 @@ line; otherwise a code and a count, never a path or raw text. Name-only
 mentions with no ID are not detected in body prose and comments; a
 `person` / `org` / `deal` value that is not a record ID (`person: "Jane Doe"`,
 bare `p-A|Name`) is `E_INVALID_ID` and uncleared. Empty, `~`, and YAML `null`
-are not references. A `|` alias is accepted only inside `[[…]]`. If any ledger
+are not references. A `|` alias is accepted only inside `[[…]]`. A trailing
+` #` / tab-`#` comment after a closing quote is stripped (`"p-…" # Ada`).
+After an alphanumeric, `_`, or `-` in the same run, and inside a
+`scheme://` token, a prefix is glued: an exact ULID is Valid; a longer run
+whose first 26 characters are a ULID, or a Unicode dash plus a ULID, is
+malformed with that candidate; other glued lookalikes (Drive/Docs, Notion,
+32-hex) are not tokens. If any ledger
 file cannot be read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code
-and count only) and no hits. Remaining limits: glued text with an inexact
-ID, non-Cf invisible characters, capitalised or other keys holding names,
-and name-only prose. Milestone 3 `context` continues to honour `no-ai`.
+and count only) and no hits. Remaining limits: glued inexact IDs whose first
+26 characters do not canonicalize, non-Cf invisible characters, capitalised
+or other keys holding names, and name-only prose. Milestone 3 `context`
+continues to honour `no-ai`.
 
 ## Quickstart
 

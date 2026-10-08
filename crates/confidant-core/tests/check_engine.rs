@@ -2603,3 +2603,75 @@ fn find_keeps_person_when_misfiled_note_has_path_mismatch() {
         "{json}"
     );
 }
+
+#[test]
+fn find_drops_glued_cam_id_tails_and_keeps_drive_urls() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let cam_ulid = &CAM[2..];
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\n\
+visible-cam-glue-token\n\
+see https://example.com/x/{CAM}abc dropped-cam-url-short-token\n\
+see https://example.com/{CAM}abcdefghijk dropped-cam-url-long-token\n\
+see Ana-{CAM}s dropped-cam-ana-s-token\n\
+see Ana-{CAM}abcdefghij dropped-cam-ana-long-token\n\
+see Ana-p\u{2013}{cam_ulid} dropped-cam-en-dash-token\n\
+still-cam-glue-token\n\
+see https://docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit docs-url-token\n\
+see drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view drive-url-token\n"
+        ),
+    );
+    for token in [
+        "dropped-cam-url-short-token",
+        "dropped-cam-url-long-token",
+        "dropped-cam-ana-s-token",
+        "dropped-cam-ana-long-token",
+        "dropped-cam-en-dash-token",
+    ] {
+        let result = search_q(dir.path(), token);
+        assert!(!token_in_hits(&result, token), "{token} {result:?}");
+    }
+    let visible = search_q(dir.path(), "visible-cam-glue-token");
+    let still = search_q(dir.path(), "still-cam-glue-token");
+    let docs = search_q(dir.path(), "docs-url-token");
+    let drive = search_q(dir.path(), "drive-url-token");
+    assert!(
+        token_in_hits(&visible, "visible-cam-glue-token"),
+        "{visible:?}"
+    );
+    assert!(token_in_hits(&still, "still-cam-glue-token"), "{still:?}");
+    assert!(token_in_hits(&docs, "docs-url-token"), "{docs:?}");
+    assert!(token_in_hits(&drive, "drive-url-token"), "{drive:?}");
+}
+
+#[test]
+fn quoted_person_with_trailing_hash_comment_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: \"{ADA}\" # Ada\n---\n\nquoted-hash-person-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE2}/note.md"),
+        &format!(
+            "---\nid: {NOTE2}\ntype: note\nperson: '[[{ADA}|Ada]]' # c\n---\n\nquoted-wikilink-hash-token\n"
+        ),
+    );
+    let a = search_q(dir.path(), "quoted-hash-person-token");
+    let b = search_q(dir.path(), "quoted-wikilink-hash-token");
+    assert!(token_in_hits(&a, "quoted-hash-person-token"), "{a:?}");
+    assert!(token_in_hits(&b, "quoted-wikilink-hash-token"), "{b:?}");
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+}

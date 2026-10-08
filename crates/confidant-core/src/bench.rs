@@ -16,13 +16,15 @@ const NOTE_BODY_KB: usize = 3;
 /// Write a vault of `people` clients, each with `notes_per_person` notes.
 /// All names and emails are synthetic. Returns the unique token planted in
 /// person 0's profile (for a one-hit search) and a common token planted in
-/// every profile.
+/// every profile. When `cjk` is true, note bodies use a no-space CJK
+/// paragraph (with an embedded dash) instead of English filler.
 ///
 /// Refuses to run on a non-empty directory or an existing vault.
 pub fn generate_realistic_vault(
     root: &Path,
     people: usize,
     notes_per_person: usize,
+    cjk: bool,
 ) -> Result<(String, String)> {
     refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
@@ -49,7 +51,11 @@ coaching.pps_lookback_days = 180
     let mut ledgers: std::collections::BTreeMap<(i32, u32), String> =
         std::collections::BTreeMap::new();
     let pkg = RecordId::new(Prefix::Package, ulid_from_parts(TIME_MS, 99))?.to_string();
-    let filler = "transcript line about goals, blockers, and next actions. ".repeat(40);
+    let filler = if cjk {
+        "会话记录关于目标阻碍与下一步行动计划-主题讨论。".repeat(20)
+    } else {
+        "transcript line about goals, blockers, and next actions. ".repeat(40)
+    };
 
     for i in 0..people {
         let pid = RecordId::new(Prefix::Person, ulid_from_parts(TIME_MS, 1_000 + i as u128))?;
@@ -182,7 +188,7 @@ mod tests {
     #[test]
     fn generated_vault_is_searchable() {
         let dir = tempfile::tempdir().unwrap();
-        let (unique, common) = generate_realistic_vault(dir.path(), 3, 2).unwrap();
+        let (unique, common) = generate_realistic_vault(dir.path(), 3, 2, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
         assert_eq!(search(&vault, &unique).expect("search").hits.len(), 1);
@@ -193,14 +199,14 @@ mod tests {
             "generated vault should check clean: {:?}",
             report.findings
         );
-        assert!(generate_realistic_vault(dir.path(), 1, 1).is_err());
+        assert!(generate_realistic_vault(dir.path(), 1, 1, false).is_err());
     }
 
     #[test]
     fn bench_gen_vault_stays_within_search_timings() {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
-        let (unique, common) = generate_realistic_vault(dir.path(), 400, 5).unwrap();
+        let (unique, common) = generate_realistic_vault(dir.path(), 400, 5, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert!(
             vault.records.len() >= 2_400,

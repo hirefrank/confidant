@@ -64,6 +64,9 @@ enum Command {
         people: usize,
         #[arg(long, default_value_t = 5)]
         notes: usize,
+        /// Fill note bodies with no-space CJK prose (quadratic-scan guard).
+        #[arg(long)]
+        cjk: bool,
     },
 }
 
@@ -100,9 +103,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let json = cli.json;
     let _no_input = cli.no_input;
     match cli.command {
-        Command::BenchGen { dir, people, notes } => {
+        Command::BenchGen {
+            dir,
+            people,
+            notes,
+            cjk,
+        } => {
             let (unique, common) =
-                confidant_core::bench::generate_realistic_vault(&dir, people, notes)?;
+                confidant_core::bench::generate_realistic_vault(&dir, people, notes, cjk)?;
             if json {
                 println!(
                     "{}",
