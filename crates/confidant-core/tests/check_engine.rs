@@ -81,6 +81,7 @@ fn report_json(root: &Path, as_of: Option<&str>) -> Value {
         &CheckOptions {
             as_of,
             fail_on: Some(Severity::Warning),
+            pinned_inbox_pubkey: None,
         },
     );
     let mut v = serde_json::to_value(&report).unwrap();

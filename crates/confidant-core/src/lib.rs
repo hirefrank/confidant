@@ -15,6 +15,7 @@ pub mod context;
 pub mod discover;
 pub mod error;
 pub mod id;
+pub mod inbox;
 pub mod ledger;
 pub mod paths;
 pub mod record;
@@ -29,10 +30,13 @@ pub use check::{
     run as check_vault, CheckOptions, CheckReport, Finding, FindingCode, Severity,
     JSON_SCHEMA_VERSION,
 };
-pub use config::{VaultConfig, SPEC_VERSION};
+pub use config::{InboxConfig, TrustConfig, VaultConfig, SPEC_VERSION};
 pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
+pub use inbox::{
+    run_inbox, stub_decrypt, DecryptFn, InboxOptions, InboxReport, ItemOutcome, INBOX_BRANCH,
+};
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
 pub use search::{allowlist_is_fixed_point, cleared_record_ids, search, SearchHit, SearchResult};
