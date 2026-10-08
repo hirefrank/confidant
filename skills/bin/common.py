@@ -9,6 +9,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -112,6 +114,58 @@ def month_file(vault: str, date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Secure scratch (plaintext PII lives here until --cleanup deletes it)
+# ---------------------------------------------------------------------------
+
+def _secure_makedirs(path: str) -> None:
+    """makedirs with mode 0700 (umask-proof: chmod after, like #24)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def write_file_600(path: str, text: str) -> None:
+    """Write text to path with mode 0600 (plaintext PII scratch)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+
+
+def _ensure_proposals_gitignored(vault: str) -> None:
+    """Refuse unless <vault>/.confidant/proposals/ is git-ignored.
+
+    Same pattern as #24's corpus check: the proposal set is plaintext
+    PII (names, emails, notes, transcripts), and one `git add -A` in a
+    vault that doesn't ignore it would commit the whole thing. Skips
+    with a note when the vault isn't a git repo or git is absent (no
+    commit vector then).
+    """
+    git = shutil.which("git")
+    if git is None:
+        print("note: git not found; skipping gitignore check "
+              "(nothing to commit the proposals with)", file=sys.stderr)
+        return
+    rp = subprocess.run([git, "-C", vault, "rev-parse", "--git-dir"],
+                        capture_output=True, text=True)
+    if rp.returncode != 0:
+        print("note: vault is not a git repo; skipping gitignore check",
+              file=sys.stderr)
+        return
+    probe = os.path.join(".confidant", "proposals", ".probe")
+    r = subprocess.run([git, "-C", vault, "check-ignore", "-q", probe],
+                       capture_output=True)
+    if r.returncode != 0:
+        sys.exit(
+            "error: refusing to write proposal: .confidant/proposals/ is not "
+            "git-ignored in this vault\n"
+            "The proposal set is plaintext PII (names, emails, notes, "
+            "transcripts); one `git add -A` would commit it.\n"
+            f"Fix: (cd {vault} && echo '.confidant/' >> .gitignore)\n"
+            "then re-run.")
+    print("gitignore: .confidant/proposals/ is ignored — ok")
+
+
+# ---------------------------------------------------------------------------
 # Proposal manifests
 # ---------------------------------------------------------------------------
 
@@ -130,15 +184,34 @@ def proposal_paths(vault: str, skill: str) -> tuple[str, str]:
     """Default (manifest_path, lines_path) for a proposal.
 
     Both live under <vault>/.confidant/proposals/ (gitignored scratch —
-    the manifest is plaintext PII, deleted after the apply). The lines
-    file holds the proposed ledger lines, one per line, for
-    `confidant import --file`.
+    the manifest is plaintext PII, deleted after the apply). Refuses
+    unless that dir is git-ignored (same check-ignore pattern as #24);
+    creates it 0700. The lines file holds the proposed ledger lines, one
+    per line, for `confidant import --file`.
     """
+    _ensure_proposals_gitignored(vault)
     d = os.path.join(vault, ".confidant", "proposals")
-    os.makedirs(d, exist_ok=True)
+    _secure_makedirs(d)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     base = os.path.join(d, f"{skill}-{ts}")
     return base + ".json", base + ".cfd"
+
+
+def proposal_notes_dir(manifest_path: str) -> str:
+    """Directory for per-note body files, next to the manifest.
+
+    `<manifest-stem>/notes/` — never /tmp (note bodies are plaintext
+    PII). Created 0700; the proposer writes each body 0600 and records
+    the path in the manifest, and --cleanup removes the whole proposal
+    set (manifest, lines file, note bodies).
+    """
+    stem = (manifest_path[:-5] if manifest_path.endswith(".json")
+            else manifest_path)
+    d = os.path.join(stem, "notes")
+    _secure_makedirs(d)
+    # makedirs modes only the leaf; the stem parent needs 0700 too.
+    os.chmod(stem, 0o700)
+    return d
 
 
 def write_lines_file(path: str, by_file: dict[str, list[str]]) -> None:
@@ -151,9 +224,7 @@ def write_lines_file(path: str, by_file: dict[str, list[str]]) -> None:
     lines: list[str] = []
     for key in sorted(by_file):
         lines.extend(by_file[key])
-    with open(path, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
+    write_file_600(path, "".join(line + "\n" for line in lines))
 
 
 _ENC_RE = re.compile(r"^enc:\s*\S", re.MULTILINE)
@@ -185,11 +256,10 @@ def vault_looks_encrypted(vault: str) -> bool:
 
 
 def write_manifest(path: str | None, manifest: dict) -> None:
-    """Write the proposal manifest as JSON (stdout when path is None)."""
+    """Write the proposal manifest as JSON (0600; stdout when path is None)."""
     text = json.dumps(manifest, indent=2, sort_keys=True)
     if path:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+        write_file_600(path, text + "\n")
     else:
         print(text)
 

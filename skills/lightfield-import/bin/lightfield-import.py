@@ -35,6 +35,8 @@ Usage:
   lightfield-import.py --vault VAULT --record-applied --manifest proposal.json
   lightfield-import.py --cleanup --export export.json --manifest proposal.json \
       --i-verified-the-import
+  # ^ deletes the export AND the whole proposal set (manifest, lines file,
+  #   staged note bodies) — all plaintext PII.
 """
 from __future__ import annotations
 
@@ -42,6 +44,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
@@ -74,6 +77,12 @@ def parse_args(argv=None):
 def map_path(vault: str) -> str:
     """Local dedup map: opaque lf-id -> vault-id pairs only, no PII."""
     return os.path.join(vault, ".confidant", "lightfield-import-map.json")
+
+
+def _manifest_stem(manifest_path: str) -> str:
+    """Manifest path minus a trailing .json (proposal-set derivation)."""
+    return (manifest_path[:-5] if manifest_path.endswith(".json")
+            else manifest_path)
 
 
 def load_map(vault: str) -> dict[str, str]:
@@ -153,19 +162,50 @@ def main(argv=None) -> int:
         os.remove(args.export)
         print(f"deleted {args.export}")
         if args.manifest:
-            if os.path.isfile(args.manifest):
+            if not os.path.isfile(args.manifest):
+                print(f"warning: manifest not found: {args.manifest!r}",
+                      file=sys.stderr)
+            else:
+                # Delete the whole proposal set: manifest, lines file, and
+                # note bodies. The set is defined by the manifest path the
+                # user passed (same derivation the proposer used), so a
+                # custom --out is cleaned up too. Symlinks are never
+                # followed — a symlinked notes dir is left with a warning.
+                stem = _manifest_stem(args.manifest)
+                for t in (stem + ".cfd", os.path.join(stem, "notes")):
+                    if os.path.islink(t):
+                        print(f"warning: not deleting {t!r}: is a symlink",
+                              file=sys.stderr)
+                        continue
+                    if os.path.isdir(t):
+                        shutil.rmtree(t)
+                        print(f"deleted {t}")
+                        # drop the now-empty proposal stem dir too
+                        try:
+                            os.rmdir(os.path.dirname(t))
+                        except OSError:
+                            pass
+                    elif os.path.isfile(t):
+                        os.remove(t)
+                        print(f"deleted {t}")
                 print(f"deleting proposal manifest {args.manifest!r} (plaintext PII).")
                 os.remove(args.manifest)
                 print(f"deleted {args.manifest}")
-            else:
-                print(f"warning: manifest not found: {args.manifest!r}",
-                      file=sys.stderr)
         return 0
 
     if not args.export:
         print("error: --export is required (or use --cleanup)", file=sys.stderr)
         return 2
     vault = common.require_vault(args)
+
+    # Proposal-set paths up front: the notes loop stages bodies next to the
+    # manifest, and proposal_paths() refuses unless the scratch dir is
+    # git-ignored (before any PII touches disk).
+    if args.out:
+        manifest_path = args.out
+        lines_path = _manifest_stem(args.out) + ".cfd"
+    else:
+        manifest_path, lines_path = common.proposal_paths(vault, "lightfield-import")
 
     try:
         with open(args.export, encoding="utf-8") as f:
@@ -287,6 +327,13 @@ def main(argv=None) -> int:
         add_line(date, f"{date} stage {deal_id} {stage} src:lightfield/{did}")
 
     # --- notes -> note records ----------------------------------------------
+    # Note bodies are plaintext PII: the proposer stages each body next to
+    # the manifest (<stem>/notes/<note_id>.md, 0600) and records the path
+    # in the manifest — the agent must never stage them in /tmp. Each note
+    # also gets its own idempotency ULID for `note add --request-id`, so a
+    # retried apply doesn't duplicate notes (reusing one id across different
+    # writes would trip E_IDEMPOTENCY_CONFLICT).
+    notes_dir: str | None = None
     for n in export.get("notes", []) or []:
         nid = n.get("id", "")
         if not nid:
@@ -308,8 +355,17 @@ def main(argv=None) -> int:
             path = f"notes/{note_id}.md"
             warnings.append(f"note {nid}: no person link; top-level note {note_id}")
         text = (n.get("text") or "").strip()
+        if notes_dir is None:
+            notes_dir = common.proposal_notes_dir(manifest_path)
+        body_file = os.path.join(notes_dir, note_id + ".md")
+        common.write_file_600(body_file, text + "\n")
         records.append({"path": path,
-                        "content": "---\n" + "\n".join(front) + f"\n---\n\n{text}\n"})
+                        "content": "---\n" + "\n".join(front) + f"\n---\n\n{text}\n",
+                        "note_id": note_id,
+                        "person": pid or None,
+                        "date": date,
+                        "body_file": body_file,
+                        "request_id": common.new_ulid()})
         import_map_additions[f"note:{nid}"] = note_id
 
     # --- transcripts -> interactions + session lines ------------------------
@@ -365,11 +421,6 @@ def main(argv=None) -> int:
             "`confidant record add --file`, which does not exist yet.")
 
     rid = common.new_request_id()
-    if args.out:
-        manifest_path = args.out
-        lines_path = (args.out[:-5] if args.out.endswith(".json") else args.out) + ".cfd"
-    else:
-        manifest_path, lines_path = common.proposal_paths(vault, "lightfield-import")
     common.write_lines_file(lines_path, by_file)
     manifest = {
         "skill": "lightfield-import",
@@ -377,6 +428,7 @@ def main(argv=None) -> int:
         "request_id": rid,
         "ledger": by_file,
         "lines_file": lines_path,
+        "notes_dir": notes_dir,
         "records": records,
         "records_blocked": encrypted,
         "alias_candidates": alias_candidates,
@@ -393,6 +445,8 @@ def main(argv=None) -> int:
         print(f"  warning: {w}")
     print(f"  manifest: {manifest_path}")
     print(f"  lines file (for `confidant import --file`): {lines_path}")
+    if notes_dir:
+        print(f"  note bodies (0600, for `note add --body-file`): {notes_dir}/")
     common.write_manifest(manifest_path, manifest)
     return 0
 

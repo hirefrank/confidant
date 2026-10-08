@@ -15,7 +15,8 @@ The Lightfield export is **plaintext PII**.
 - Keep it on a trusted device. Never commit it. Never copy it into the
   vault or the repo.
 - After the import is applied **and** `confidant check` passes, delete the
-  export **and** the proposal manifest (both are plaintext PII):
+  export **and the whole proposal set** (manifest, lines file, staged note
+  bodies — all plaintext PII):
   ```sh
   python3 skills/lightfield-import/bin/lightfield-import.py \
       --cleanup --export /path/to/export.json --manifest <manifest path> \
@@ -45,7 +46,8 @@ rows are warned and skipped):
    ```
    The manifest and the flat ledger-lines file land in
    `<vault>/.confidant/proposals/` (gitignored scratch — the paths are
-   printed).
+   printed), plus a `notes/` dir next to the manifest holding the staged
+   note bodies (0600, for `note add --body-file`).
 2. Review the summary and warnings carefully:
    - **Person matching** is best-effort (exact display-name match links
      to an existing person; otherwise a new person record is proposed).
@@ -73,12 +75,20 @@ rows are warned and skipped):
    The request id is a fresh ULID generated once per proposal and stored
    in the manifest — reuse the manifest's value on retry, never
    regenerate it for the same proposal.
-5. Notes, one `note add` per note record in the manifest (write each body
-   from the manifest's `records[]` to a temp file first):
+5. Notes, one `note add` per note record in the manifest. The proposer
+   stages each body next to the manifest (`<stem>/notes/<note_id>.md`,
+   mode 0600 — never `/tmp`, which is world-readable) and records the
+   path as the note record's `body_file`. Each note also carries its own
+   `request_id`: a fresh ULID per note, stored in the manifest — reuse
+   the manifest's value on retry, never regenerate it, and never reuse
+   one id across different writes (that would trip
+   `E_IDEMPOTENCY_CONFLICT`):
    ```sh
    confidant note add --person <person_id> --date <date> \
-       --body-file /tmp/note-<id>.md --json --no-input
+       --body-file <body_file from the note record> \
+       --request-id <note's request_id from the manifest> --json --no-input
    ```
+   (Omit `--person` when the note record's `person` is null.)
 6. Person/deal/interaction records: **pre-M2 only**, hand-create the
    files from the manifest's `records[]`, then run
    `confidant check --json` to validate before committing (one commit).
@@ -92,8 +102,9 @@ rows are warned and skipped):
    python3 skills/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
        --record-applied --manifest <manifest path>
    ```
-8. After `check` passes on the applied import, delete the export **and**
-   the manifest (both are plaintext PII):
+8. After `check` passes on the applied import, delete the export **and
+   the whole proposal set** (manifest, lines file, staged note bodies —
+   all plaintext PII):
    ```sh
    python3 skills/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
        --cleanup --export /path/to/export.json --manifest <manifest path> \

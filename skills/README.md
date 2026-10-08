@@ -12,7 +12,9 @@ Every skill follows the same shape:
    source data and the vault, computes the delta, and prints a
    human-readable summary plus a machine-readable **proposal manifest**
    (JSON) under `<vault>/.confidant/proposals/` (gitignored scratch —
-   the manifest is plaintext PII). Next to the manifest the script writes
+   the manifest is plaintext PII). The script refuses unless that dir is
+   git-ignored (same `check-ignore` refusal as the QMD skill), creates it
+   `0700`, and writes the manifest and lines file `0600`. Next to the manifest the script writes
    a flat **lines file** (`.cfd`) with the proposed ledger lines, one per
    line. Scripts never write to the vault. The manifest carries a
    `request_id` — a fresh ULID generated once per proposal; retries reuse
@@ -26,8 +28,11 @@ Every skill follows the same shape:
      to its month file itself.) One commit per write; `check` runs
      before every commit and a failing check blocks the write (ADR-7).
    - Notes: one `confidant note add --person <id> --date <date>
-     --body-file <body>` per note record (bodies come from the
-     manifest's `records[]`).
+     --body-file <body> --request-id <note_request_id>` per note record.
+     Bodies are pre-staged by the proposer next to the manifest
+     (`body_file` in the manifest, mode 0600 — never `/tmp`), and each
+     note carries its own `request_id` ULID in the manifest so a retried
+     apply doesn't duplicate notes.
    - Person/deal/interaction records: **pre-M2 only** — hand-create the
      files from the manifest's `records[]`, then `confidant check
      --json` before committing. **Post-M2** (the manifest's
@@ -35,10 +40,11 @@ Every skill follows the same shape:
      `confidant record add --file`, which does not exist yet. Hand-
      writing into an encrypted vault would commit plaintext PII to git.
      The scripts detect this via an `enc:` envelope scan of the vault.
-4. **Clean up.** Delete the proposal manifest after a successful apply —
-   it is plaintext PII. (Lightfield: `--cleanup` takes `--manifest` and
-   deletes the export and the manifest together; also run
-   `--record-applied --manifest` so reruns skip what's applied.)
+4. **Clean up.** Delete the whole proposal set (manifest, lines file,
+   staged note bodies) after a successful apply — all plaintext PII.
+   (Lightfield: `--cleanup` takes `--manifest` and deletes the export
+   and the whole proposal set together; also run `--record-applied
+   --manifest` so reruns skip what's applied.)
 
 ## Skills
 
@@ -74,7 +80,10 @@ reuse the manifest's value on retry.
   pull-only.
 - Proposal manifests are **plaintext PII** (names, emails, phones, notes,
   transcripts). They live under `<vault>/.confidant/proposals/`
-  (gitignored, never committed) and are deleted after the apply.
+  (gitignored, never committed) and are deleted after the apply. The
+  scripts refuse to write a proposal unless that dir is git-ignored in
+  the vault, create it `0700`, and write the manifest, lines file, and
+  staged note bodies `0600`.
 - The Lightfield export is **plaintext PII**: it is never committed, never
   copied into the vault, and the import script deletes it after a verified
   import.
