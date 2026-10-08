@@ -9,3 +9,4 @@ coaching.balance_nonnegative = "error"
 coaching.session_notes = "warning"
 coaching.paid_session_gap = "warning"
 coaching.paid_session_gap_days = 45
+coaching.pps_lookback_days = 180

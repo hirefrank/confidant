@@ -13,14 +13,14 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is not compiled into this CLI. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger, `note:`, or a front-matter reference). |
-| `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, or a non-UTF-8 name. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, or a front-matter reference). |
+| `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
 | `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type (or `note:` is not a note). |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
-| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed. |
+| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean, and note `date` / `session` that is not YYYY-MM-DD). |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines. |
@@ -36,10 +36,10 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_SYMLINK` | error | | A symbolic link exists in the vault. |
 | `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. |
 | `E_MISSING_DURATION` | error | `coaching.require_duration` | A `session` has no parseable duration. |
-| `E_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, or `N` overflows. |
+| `E_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, `N` is over 100000, or the running open total overflows. |
 | `E_NEGATIVE_BALANCE` | error | `coaching.balance_nonnegative` | Computed `sessions_remaining` is negative. |
-| `E_SESSION_WITHOUT_NOTES` | warning | `coaching.session_notes` | A session has no linked or same-day note (section 9b). |
-| `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client has no session in the window. |
+| `E_SESSION_WITHOUT_NOTES` | warning | `coaching.session_notes` | A session has no linked or same-day note (coverage only; `note:` integrity is always on). |
+| `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID has no record. |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
 
@@ -54,5 +54,6 @@ Command-level error codes (not check findings):
 | `E_INVALID` | 1 | The request is well formed but not valid for this vault. |
 | `E_CONFLICT` | 1 | The request conflicts with stored vault state (including a refused symlink on a write path). |
 | `E_CONFIG` | 1 | `confidant.toml` cannot be parsed as TOML or is missing `spec` / `vault_id`. Semantic `[checks]` problems are the finding of the same code. |
+| `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
 | `E_IDEMPOTENCY_CONFLICT` | 1 | Reserved for milestone 3 (`--request-id`). |
 | `internal_error` | 1 | Unclassified failure. Never match on its message. |

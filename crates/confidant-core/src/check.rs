@@ -283,14 +283,15 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
-    check_aliases_and_merges(vault, &known_ids, &mut findings);
+    let as_of = resolve_as_of(vault, options);
+    let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut findings);
     check_verbs_and_refs(vault, &known_verbs, &known_ids, &mut findings);
     check_duplicate_ulids(vault, &mut findings);
     check_dangling_refs(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
 
     let coaching = if vault.config.coaching_enabled() {
-        Some(coaching::fold(vault, &mut findings))
+        Some(coaching::fold(vault, merges, as_of, &mut findings))
     } else {
         None
     };
@@ -298,7 +299,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     check_balances(vault, coaching.as_ref(), &mut findings);
 
     if let Some(state) = coaching.as_ref() {
-        let as_of = resolve_as_of(vault, options);
+        coaching::session_note_integrity(vault, state, &mut findings);
         coaching::gap_rules(vault, state, as_of, &mut findings);
     }
 
@@ -445,19 +446,22 @@ fn check_verbs_and_refs(
     }
 }
 
+pub(crate) type MergeMap = HashMap<RecordId, (RecordId, NaiveDate)>;
+
 fn check_aliases_and_merges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
+    as_of: NaiveDate,
     findings: &mut Vec<Finding>,
-) {
-    let mut parent: HashMap<RecordId, RecordId> = HashMap::new();
+) -> MergeMap {
+    let mut parent: MergeMap = HashMap::new();
     for sourced in &vault.entries {
         if sourced.entry.verb != "merge" {
             continue;
         }
         let e = &sourced.entry;
         match parse_merge(e) {
-            None => findings.push(
+            MergeParse::Malformed => findings.push(
                 Finding::new(
                     FindingCode::Parse,
                     Severity::Error,
@@ -468,7 +472,18 @@ fn check_aliases_and_merges(
                 .for_id(&e.id)
                 .with_fix("Write: merge <from-id> into <to-id>"),
             ),
-            Some((from, to)) => {
+            MergeParse::InvalidTo { raw } => findings.push(
+                Finding::new(
+                    FindingCode::InvalidId,
+                    Severity::Error,
+                    format!("merge destination '{raw}' is not a record ID"),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&e.id)
+                .with_fix("Use a prefixed 26-character Crockford ULID"),
+            ),
+            MergeParse::Ok { from, to } => {
                 if from == to {
                     findings.push(
                         Finding::new(
@@ -497,7 +512,7 @@ fn check_aliases_and_merges(
                         );
                     }
                 }
-                if let Some(existing) = parent.get(&from) {
+                if let Some((existing, _)) = parent.get(&from) {
                     if existing != &to {
                         findings.push(
                             Finding::new(
@@ -514,7 +529,8 @@ fn check_aliases_and_merges(
                         );
                     }
                 } else {
-                    parent.insert(from, to);
+                    // First wins on fork.
+                    parent.insert(from, (to, e.date));
                 }
             }
         }
@@ -546,18 +562,15 @@ fn check_aliases_and_merges(
                     .with_fix("Store HMAC(vault lookup key, normalized value) as hmac:<hex>"),
             ),
             Ok((kind, hmac)) => {
-                let canon = canonical(&e.id, &parent);
-                let key = (kind, hmac);
+                let canon = canonical_on(&e.id, &parent, as_of);
+                let key = (kind.clone(), hmac);
                 if let Some(existing) = seen_alias.get(&key) {
                     if existing != &canon {
                         findings.push(
                             Finding::new(
                                 FindingCode::AliasCollision,
                                 Severity::Warning,
-                                format!(
-                                    "alias {} hmac is shared by {} and {}",
-                                    key.0, existing, canon
-                                ),
+                                format!("alias {kind} hmac is shared by {existing} and {canon}"),
                             )
                             .at_file(&sourced.file)
                             .at_line(sourced.line)
@@ -571,16 +584,34 @@ fn check_aliases_and_merges(
             }
         }
     }
+    parent
 }
 
-pub(crate) fn parse_merge(entry: &LedgerEntry) -> Option<(RecordId, RecordId)> {
+pub(crate) enum MergeParse {
+    Ok { from: RecordId, to: RecordId },
+    InvalidTo { raw: String },
+    Malformed,
+}
+
+pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
     // FROM is entry.id; then token "into" then TO token.
     let mut toks = entry.args.iter().filter_map(Arg::as_token);
-    if toks.next()? != "into" {
-        return None;
+    match toks.next() {
+        Some("into") => {}
+        _ => return MergeParse::Malformed,
     }
-    let to = RecordId::parse(toks.next()?).ok()?;
-    Some((entry.id.clone(), to))
+    let Some(raw) = toks.next() else {
+        return MergeParse::Malformed;
+    };
+    match RecordId::parse(raw) {
+        Ok(to) => MergeParse::Ok {
+            from: entry.id.clone(),
+            to,
+        },
+        Err(_) => MergeParse::InvalidTo {
+            raw: raw.to_owned(),
+        },
+    }
 }
 
 const ALIAS_HMAC_MIN_HEX: usize = 32;
@@ -593,9 +624,7 @@ fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
         .as_token()
         .ok_or_else(|| "alias kind must be a token (email, phone, or handle)".to_owned())?;
     if !matches!(kind, "email" | "phone" | "handle") {
-        return Err(format!(
-            "alias kind '{kind}' is not email, phone, or handle"
-        ));
+        return Err("alias kind must be email, phone, or handle".to_owned());
     }
     let hmac = match &entry.args[1] {
         Arg::Token(s) if s.starts_with("hmac:") => s.clone(),
@@ -611,10 +640,16 @@ fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
     Ok((kind.to_owned(), hex.to_ascii_lowercase()))
 }
 
-pub(crate) fn canonical(id: &RecordId, parent: &HashMap<RecordId, RecordId>) -> RecordId {
+pub(crate) fn canonical_on(id: &RecordId, parent: &MergeMap, on: NaiveDate) -> RecordId {
     let mut seen = HashSet::new();
     let mut cur = id.clone();
-    while let Some(next) = parent.get(&cur) {
+    while let Some((next, date)) = parent.get(&cur) {
+        if *date > on {
+            break;
+        }
+        if next.prefix() != cur.prefix() {
+            break;
+        }
         if !seen.insert(cur.clone()) {
             return id.clone();
         }
@@ -623,11 +658,11 @@ pub(crate) fn canonical(id: &RecordId, parent: &HashMap<RecordId, RecordId>) -> 
     cur
 }
 
-fn detect_cycle(parent: &HashMap<RecordId, RecordId>) -> Option<RecordId> {
+fn detect_cycle(parent: &MergeMap) -> Option<RecordId> {
     for start in parent.keys() {
         let mut seen = HashSet::new();
         let mut cur = start.clone();
-        while let Some(next) = parent.get(&cur) {
+        while let Some((next, _)) = parent.get(&cur) {
             if !seen.insert(cur.clone()) {
                 return Some(start.clone());
             }
@@ -701,7 +736,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
             }
         }
         let Some(state) = coaching else { continue };
-        let person = state.canonical(&e.id);
+        let person = state.canonical_on(&e.id, e.date);
         if metric == "sessions_remaining" {
             let asserted: i64 = match number.parse() {
                 Ok(n) => n,

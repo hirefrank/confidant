@@ -5,5 +5,6 @@ name: Cam Sample
 no-ai: true
 ---
 
-Fake client with the no-ai flag set. Milestone 3 will keep this person out of
-agent context bundles. Not a real person.
+Fake client with the no-ai flag set. `confidant find` omits this person and
+their notes. Milestone 3 `context` continues to honour the flag. Not a real
+person.

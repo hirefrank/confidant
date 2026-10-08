@@ -22,8 +22,9 @@ not put real clients in it.
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores
 nothing; that depends on the provider's terms. A per-person `no-ai: true`
-flag is parsed in spec 0.1 and will keep that person out of agent context
-in milestone 3.
+flag is a boolean in spec 0.1. `confidant find` omits those people and their
+notes so an agent does not send them to a model. Milestone 3 `context`
+continues to honour the flag.
 
 ## Quickstart
 
@@ -72,7 +73,9 @@ are part of the spec ([`spec/findings.md`](spec/findings.md)). Callers branch
 on `code`, never on message text.
 
 Gap rules from the architecture (section 9b): a session with no notes, and a
-paid client with no session inside a configurable window.
+paid client (`sessions_remaining > 0` or a `pps` session in the lookback)
+with no session inside a configurable window. `no-ai: true` people are
+omitted from `find`.
 
 ```sh
 confidant check --json --fail-on warning --as-of 2026-10-08

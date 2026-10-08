@@ -31,6 +31,8 @@ pub enum ErrorKind {
     Invalid,
     /// `confidant.toml` cannot be interpreted (command-level E_CONFIG).
     Config,
+    /// Vault `spec` is not implemented by this CLI.
+    SpecUnsupported,
     /// Flags or arguments cannot be interpreted. Exit 2.
     Usage,
     /// An idempotency key was reused with different content.
@@ -49,6 +51,7 @@ impl ErrorKind {
             Self::Conflict => "E_CONFLICT",
             Self::Invalid => "E_INVALID",
             Self::Config => "E_CONFIG",
+            Self::SpecUnsupported => "E_SPEC_UNSUPPORTED",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
             Self::Internal => "internal_error",
@@ -88,6 +91,15 @@ impl DomainError {
 
     pub fn config(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Config, message)
+    }
+
+    pub fn spec_unsupported(spec: impl Display) -> Self {
+        Self::new(
+            ErrorKind::SpecUnsupported,
+            format!("vault spec '{spec}' is not supported (this CLI implements 0.1)"),
+        )
+        .with_fix("Use spec = \"0.1\" or upgrade the CLI")
+        .with_file("confidant.toml")
     }
 
     pub fn already_exists(message: impl Into<String>) -> Self {
@@ -246,6 +258,10 @@ mod tests {
             ErrorKind::IdempotencyConflict.code(),
             "E_IDEMPOTENCY_CONFLICT"
         );
+        assert_eq!(
+            DomainError::spec_unsupported("9.9").code(),
+            "E_SPEC_UNSUPPORTED"
+        );
         assert_eq!(DomainError::vault_not_found().code(), "E_VAULT_NOT_FOUND");
         assert_eq!(DomainError::vault_not_found().exit_code(), 1);
         assert_eq!(
@@ -258,6 +274,10 @@ mod tests {
         );
         assert_eq!(DomainError::config("bad toml").code(), "E_CONFIG");
         assert_eq!(DomainError::conflict("busy").code(), "E_CONFLICT");
+        assert_eq!(
+            DomainError::spec_unsupported("9.9").code(),
+            "E_SPEC_UNSUPPORTED"
+        );
     }
 
     #[test]

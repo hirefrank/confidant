@@ -195,7 +195,9 @@ fn create_directory_all(root: &Path, relative: &Path) -> Result<Directory> {
             Ok(child) => child,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match directory.create_child_directory(name) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        let _ = directory.sync();
+                    }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => {
                         return Err(io_failure(
@@ -270,9 +272,18 @@ pub fn read_to_string(root: &Path, relative: &Path) -> Result<String> {
     })
 }
 
+/// Result of listing a directory without following it.
+pub struct DirListing {
+    pub entries: Vec<DirectoryEntry>,
+    /// Per-entry failures (`name`, `{:#}` cause). The directory itself listed.
+    pub errors: Vec<(String, String)>,
+}
+
 /// List a directory beneath `root` without following the directory itself or
-/// classifying children by following them.
-pub fn read_dir(root: &Path, relative: &Path) -> Result<Vec<DirectoryEntry>> {
+/// classifying children by following them. Uses the checked directory fd
+/// (`fdopendir` on Unix). Per-entry errors are returned in [`DirListing::errors`]
+/// rather than aborting the listing.
+pub fn read_dir(root: &Path, relative: &Path) -> Result<DirListing> {
     let directory = if relative.as_os_str().is_empty() {
         Directory::open_root(root).map_err(|error| {
             io_failure(error, "vault root", "could not open the vault root".into())
@@ -280,23 +291,31 @@ pub fn read_dir(root: &Path, relative: &Path) -> Result<Vec<DirectoryEntry>> {
     } else {
         open_directory(root, relative)?
     };
+    let children = directory.read_children().map_err(|error| {
+        io_failure(
+            error,
+            &display_relative(relative),
+            format!("could not list {}", relative.display()),
+        )
+    })?;
     let mut entries = Vec::new();
-    for ent in std::fs::read_dir(directory.resolved())
-        .with_context(|| format!("could not list {}", relative.display()))?
-    {
-        let ent = ent?;
-        let os_name = ent.file_name();
-        let (name, utf8) = match os_name.to_str() {
-            Some(s) => (s.to_owned(), true),
-            None => (os_name.to_string_lossy().into_owned(), false),
-        };
-        let kind = directory
-            .child_kind(&os_name)
-            .with_context(|| format!("could not stat {name}"))?;
-        entries.push(DirectoryEntry { name, utf8, kind });
+    let mut errors = Vec::new();
+    for child in children {
+        match child {
+            Ok((os_name, kind)) => {
+                let (name, utf8) = match os_name.to_str() {
+                    Some(s) => (s.to_owned(), true),
+                    None => (os_name.to_string_lossy().into_owned(), false),
+                };
+                entries.push(DirectoryEntry { name, utf8, kind });
+            }
+            Err((name, error)) => {
+                errors.push((name, format!("{error:#}")));
+            }
+        }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(entries)
+    Ok(DirListing { entries, errors })
 }
 
 fn temporary_name() -> OsString {
@@ -323,13 +342,14 @@ pub fn write_replace(root: &Path, relative: &Path, contents: &[u8]) -> Result<()
     } else {
         create_directory_all(root, parent)?
     };
-    match directory.child_kind(name) {
+    let existing_mode = match directory.child_kind(name) {
         Ok(EntryKind::Symlink) => return Err(refuse_symlink(&display_name(name))),
         Ok(EntryKind::Directory) | Ok(EntryKind::Other) => {
             return Err(refuse_not_regular(&relative.display().to_string()));
         }
-        Ok(EntryKind::File) | Err(_) => {}
-    }
+        Ok(EntryKind::File) => directory.child_mode(name).ok(),
+        Err(_) => None,
+    };
 
     let mut last_error = None;
     for _ in 0..16 {
@@ -348,6 +368,17 @@ pub fn write_replace(root: &Path, relative: &Path, contents: &[u8]) -> Result<()
                 ));
             }
         };
+        if let Some(mode) = existing_mode {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = mode;
+            }
+        }
         let staged = file
             .write_all(contents)
             .and_then(|_| file.sync_all())
@@ -396,8 +427,16 @@ pub fn display_relative(relative: &Path) -> String {
 
 /// Names that collection walks skip when the entry is not a symbolic link.
 /// Dot-named symbolic links are never skipped (they are `E_SYMLINK`).
+/// Leftover `.confidant-tmp-*` files are not skipped (they are flagged).
 pub fn is_skipped_name(name: &str) -> bool {
+    if is_leftover_temp(name) {
+        return false;
+    }
     name.starts_with('.') || name.eq_ignore_ascii_case("README.md")
+}
+
+pub fn is_leftover_temp(name: &str) -> bool {
+    name.starts_with(TEMPORARY_PREFIX)
 }
 
 pub fn skip_walk_entry(name: &str, kind: EntryKind) -> bool {
@@ -414,7 +453,7 @@ struct Directory {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod unix {
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -425,6 +464,7 @@ mod unix {
 
     const SAFE_FLAGS: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     const PRIVATE_MODE: libc::mode_t = 0o600;
+    type ChildListing = Vec<Result<(OsString, EntryKind), (String, io::Error)>>;
 
     fn terminated(name: &OsStr) -> io::Result<CString> {
         CString::new(name.as_bytes()).map_err(|_| {
@@ -513,7 +553,11 @@ mod unix {
             .map(File::from)
         }
 
-        pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
+        pub(super) fn child_mode(&self, name: &OsStr) -> io::Result<u32> {
+            Ok(self.child_stat(name)?.st_mode & 0o7777)
+        }
+
+        fn child_stat(&self, name: &OsStr) -> io::Result<libc::stat> {
             let terminated = terminated(name)?;
             let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: `terminated` outlives the call, `self.descriptor` is a
@@ -528,8 +572,78 @@ mod unix {
                 )
             })?;
             // SAFETY: `fstatat` succeeded, so `status` is initialized.
-            let status = unsafe { status.assume_init() };
-            Ok(match status.st_mode & libc::S_IFMT {
+            Ok(unsafe { status.assume_init() })
+        }
+
+        pub(super) fn read_children(&self) -> io::Result<ChildListing> {
+            let dup = checked(unsafe { libc::dup(self.descriptor.as_raw_fd()) })?;
+            // `fdopendir` is specified to reject descriptors with O_NONBLOCK.
+            let prepared = (|| {
+                let flags = checked(unsafe { libc::fcntl(dup, libc::F_GETFL) })?;
+                checked(unsafe { libc::fcntl(dup, libc::F_SETFL, flags & !libc::O_NONBLOCK) })?;
+                Ok::<(), io::Error>(())
+            })();
+            if let Err(err) = prepared {
+                let _ = unsafe { libc::close(dup) };
+                return Err(err);
+            }
+            // SAFETY: `dup` is a fresh directory descriptor; `fdopendir` takes
+            // ownership and `closedir` releases it.
+            let dirp = unsafe { libc::fdopendir(dup) };
+            if dirp.is_null() {
+                let err = io::Error::last_os_error();
+                let _ = unsafe { libc::close(dup) };
+                return Err(err);
+            }
+            let mut out = Vec::new();
+            loop {
+                // SAFETY: writing 0 to errno is the documented way to distinguish
+                // end-of-stream from a `readdir` failure.
+                unsafe {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    {
+                        *libc::__errno_location() = 0;
+                    }
+                    #[cfg(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "netbsd",
+                        target_os = "dragonfly"
+                    ))]
+                    {
+                        *libc::__error() = 0;
+                    }
+                }
+                // SAFETY: `dirp` came from `fdopendir` and is not closed yet.
+                let ent = unsafe { libc::readdir(dirp) };
+                if ent.is_null() {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error().is_some_and(|e| e != 0) {
+                        out.push(Err(("<readdir>".to_owned(), err)));
+                    }
+                    break;
+                }
+                // SAFETY: `readdir` returned a live dirent whose `d_name` is
+                // NUL-terminated for the lifetime of this iteration.
+                let c_name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+                let os_name = OsStr::from_bytes(c_name.to_bytes()).to_os_string();
+                if os_name == "." || os_name == ".." {
+                    continue;
+                }
+                match self.child_kind(&os_name) {
+                    Ok(kind) => out.push(Ok((os_name, kind))),
+                    Err(error) => out.push(Err((os_name.to_string_lossy().into_owned(), error))),
+                }
+            }
+            // SAFETY: `dirp` is the pointer from `fdopendir`; this closes `dup`.
+            unsafe { libc::closedir(dirp) };
+            Ok(out)
+        }
+
+        pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
+            Ok(match self.child_stat(name)?.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => EntryKind::Directory,
                 libc::S_IFREG => EntryKind::File,
                 libc::S_IFLNK => EntryKind::Symlink,
@@ -587,6 +701,8 @@ mod portable {
 
     use super::{Directory, EntryKind};
 
+    type ChildListing = Vec<Result<(std::ffi::OsString, EntryKind), (String, io::Error)>>;
+
     fn kind_of(path: &Path) -> io::Result<EntryKind> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(EntryKind::from_metadata(&metadata))
@@ -638,6 +754,39 @@ mod portable {
 
         pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
             kind_of(&self.path.join(name))
+        }
+
+        pub(super) fn child_mode(&self, name: &OsStr) -> io::Result<u32> {
+            let metadata = std::fs::symlink_metadata(self.path.join(name))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                Ok(metadata.permissions().mode() & 0o7777)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = metadata;
+                Ok(0o600)
+            }
+        }
+
+        pub(super) fn read_children(&self) -> io::Result<ChildListing> {
+            let mut out = Vec::new();
+            for ent in std::fs::read_dir(&self.path)? {
+                match ent {
+                    Err(error) => out.push(Err(("<entry>".to_owned(), error))),
+                    Ok(ent) => {
+                        let os_name = ent.file_name();
+                        match self.child_kind(&os_name) {
+                            Ok(kind) => out.push(Ok((os_name, kind))),
+                            Err(error) => {
+                                out.push(Err((os_name.to_string_lossy().into_owned(), error)))
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(out)
         }
 
         pub(super) fn rename_child(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
@@ -693,6 +842,25 @@ mod tests {
         assert_eq!(leftovers.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_replace_keeps_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let rel = Path::new("kept.txt");
+        write_replace(dir.path(), rel, b"first").unwrap();
+        fs::set_permissions(dir.path().join(rel), fs::Permissions::from_mode(0o640)).unwrap();
+        write_replace(dir.path(), rel, b"second").unwrap();
+        let mode = fs::metadata(dir.path().join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(read_to_string(dir.path(), rel).unwrap(), "second");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn refuses_symlink_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -707,13 +875,15 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "secret");
     }
 
+    #[cfg(unix)]
     #[test]
     fn lists_without_following() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("ok.txt"), "x").unwrap();
         std::os::unix::fs::symlink("ok.txt", dir.path().join("s")).unwrap();
-        let entries = read_dir(dir.path(), Path::new("")).unwrap();
-        let kinds: Vec<_> = entries
+        let listing = read_dir(dir.path(), Path::new("")).unwrap();
+        let kinds: Vec<_> = listing
+            .entries
             .iter()
             .map(|e| (e.name.as_str(), e.kind, e.utf8))
             .collect();

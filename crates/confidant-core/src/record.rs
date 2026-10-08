@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::id::{Prefix, RecordId};
+use crate::ledger::parse_strict_date;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordKind {
@@ -66,6 +67,10 @@ impl Record {
 
     pub fn person(&self) -> Option<RecordId> {
         self.field("person").and_then(|s| RecordId::parse(s).ok())
+    }
+
+    pub fn no_ai(&self) -> bool {
+        self.field("no-ai") == Some("true")
     }
 }
 
@@ -183,6 +188,24 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         message: format!("invalid id '{id_raw}': {err}"),
         fix: "Use a prefixed 26-character Crockford ULID".to_owned(),
     })?;
+    if let Some(v) = fields.get("no-ai") {
+        if v != "true" && v != "false" {
+            return Err(FrontmatterError {
+                message: format!("no-ai must be true or false (got '{v}')"),
+                fix: "Use no-ai: true or no-ai: false".to_owned(),
+            });
+        }
+    }
+    for key in ["date", "session"] {
+        if let Some(v) = fields.get(key) {
+            if parse_strict_date(v).is_none() {
+                return Err(FrontmatterError {
+                    message: format!("front matter {key} '{v}' is not YYYY-MM-DD"),
+                    fix: "Use a zero-padded calendar date such as 2026-10-08".to_owned(),
+                });
+            }
+        }
+    }
     let name = fields.get("name").cloned().filter(|s| !s.is_empty());
     Ok(Record {
         id,

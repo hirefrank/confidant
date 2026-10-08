@@ -41,6 +41,7 @@ coaching.balance_nonnegative = "error"
 coaching.session_notes = "off"
 coaching.paid_session_gap = "off"
 coaching.paid_session_gap_days = 45
+coaching.pps_lookback_days = 180
 "#
     );
     paths::write_replace(root, Path::new("confidant.toml"), cfg.as_bytes())?;
@@ -87,12 +88,15 @@ coaching.paid_session_gap_days = 45
             paths::write_replace(root, &path, note.as_bytes())?;
         }
 
-        push_ledger(
-            &mut ledgers,
-            2024,
-            1,
-            &format!("2024-01-01 open {pid} package {pkg} 36 sessions\n"),
-        );
+        let pps_client = i % 10 == 1;
+        if !pps_client {
+            push_ledger(
+                &mut ledgers,
+                2024,
+                1,
+                &format!("2024-01-01 open {pid} package {pkg} 36 sessions\n"),
+            );
+        }
         for s in 0..SESSIONS_PER_PERSON {
             let month_offset = (s as u32) % 12;
             let year = 2024 + (s as i32 / 12);
@@ -102,22 +106,25 @@ coaching.paid_session_gap_days = 45
                 Prefix::Note,
                 ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 256),
             )?;
+            let tag = if pps_client { "pps" } else { "paid" };
             push_ledger(
                 &mut ledgers,
                 year,
                 month,
-                &format!("{year}-{month:02}-{day:02} session {pid} 60m paid note:{nid}\n"),
+                &format!("{year}-{month:02}-{day:02} session {pid} 60m {tag} note:{nid}\n"),
             );
         }
-        push_ledger(
-            &mut ledgers,
-            2026,
-            10,
-            &format!(
-                "2026-10-01 balance {pid} sessions_remaining {}\n",
-                36 - SESSIONS_PER_PERSON
-            ),
-        );
+        if !pps_client {
+            push_ledger(
+                &mut ledgers,
+                2026,
+                10,
+                &format!(
+                    "2026-10-01 balance {pid} sessions_remaining {}\n",
+                    36 - SESSIONS_PER_PERSON
+                ),
+            );
+        }
     }
 
     for ((year, month), body) in ledgers {

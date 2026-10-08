@@ -68,7 +68,7 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let json_hint = std::env::args().any(|a| a == "--json");
+    let json_hint = std::env::args_os().any(|a| a == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -86,7 +86,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => code,
         Err(error) => {
-            let json = std::env::args().any(|a| a == "--json");
+            let json = std::env::args_os().any(|a| a == "--json");
             let domain = DomainError::of(&error)
                 .cloned()
                 .unwrap_or_else(|| DomainError::internal(format!("{error:#}")));
@@ -125,7 +125,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Check { fail_on, as_of } => {
             let fail_on = parse_fail_on(&fail_on)?;
-            let as_of = as_of.as_deref().map(parse_iso_date).transpose()?;
+            let as_of = match as_of.as_deref() {
+                None => None,
+                Some(s) => Some(parse_iso_date(s).map_err(|_| {
+                    DomainError::usage(format!(
+                        "--as-of '{s}' is not a zero-padded calendar date YYYY-MM-DD"
+                    ))
+                })?),
+            };
             let root = match discover(cli.vault.as_deref()) {
                 Ok(root) => root,
                 Err(err) => {
@@ -179,6 +186,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::from(err.exit_code() as u8));
                 }
             };
+            if vault.config.spec != confidant_core::SPEC_VERSION {
+                print_error(
+                    json,
+                    Some(&vault.root.display().to_string()),
+                    &DomainError::spec_unsupported(&vault.config.spec),
+                )?;
+                return Ok(ExitCode::from(1));
+            }
             let hits = search(&vault, &query);
             if json {
                 println!(
@@ -189,9 +204,19 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         "vault": vault.root.display().to_string(),
                         "query": query,
                         "matches": hits,
+                        "findings": vault.load_findings,
                     })
                 );
             } else {
+                for f in &vault.load_findings {
+                    writeln!(
+                        io::stdout(),
+                        "{:<7}  {}  {}",
+                        f.severity.label(),
+                        f.code.as_str(),
+                        f.message
+                    )?;
+                }
                 for hit in &hits {
                     let id = hit.id.as_deref().unwrap_or("-");
                     writeln!(

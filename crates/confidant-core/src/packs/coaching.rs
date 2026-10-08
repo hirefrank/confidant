@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 
-use crate::check::{canonical, duration_of, parse_merge, Finding, FindingCode, Severity};
+use crate::check::{canonical_on, duration_of, Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
-use crate::ledger::{minutes_to_hundredths, Arg, LedgerEntry};
+use crate::ledger::{minutes_to_hundredths, parse_strict_date, Arg, LedgerEntry};
 use crate::record::RecordKind;
 use crate::vault::Vault;
+
+const MAX_OPEN_N: i64 = 100_000;
 
 #[derive(Clone, Debug)]
 struct OpenEvent {
@@ -20,7 +22,7 @@ struct OpenEvent {
 struct SessionEvent {
     date: NaiveDate,
     minutes: Option<u32>,
-    paid: bool,
+    pps: bool,
     consumes: bool,
 }
 
@@ -31,19 +33,19 @@ pub struct PersonCoaching {
 }
 
 impl PersonCoaching {
-    fn remaining_on(&self, on: NaiveDate) -> i64 {
-        let opened: i64 = self
-            .opens
-            .iter()
-            .filter(|o| o.date <= on)
-            .map(|o| o.n)
-            .sum();
-        let used = self
-            .sessions
-            .iter()
-            .filter(|s| s.date <= on && s.consumes)
-            .count() as i64;
-        opened - used
+    fn remaining_on(&self, on: NaiveDate) -> Option<i64> {
+        let mut opened: i64 = 0;
+        for o in self.opens.iter().filter(|o| o.date <= on) {
+            opened = opened.checked_add(o.n)?;
+        }
+        let used = i64::try_from(
+            self.sessions
+                .iter()
+                .filter(|s| s.date <= on && s.consumes)
+                .count(),
+        )
+        .ok()?;
+        opened.checked_sub(used)
     }
 
     fn minutes_on(&self, on: NaiveDate) -> u32 {
@@ -62,10 +64,10 @@ impl PersonCoaching {
             .max()
     }
 
-    fn paid_session_in_window(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
+    fn pps_in_lookback(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
         self.sessions
             .iter()
-            .any(|s| s.paid && s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
+            .any(|s| s.pps && s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
     }
 
     fn any_session_in_window(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
@@ -77,14 +79,14 @@ impl PersonCoaching {
 
 #[derive(Clone, Debug, Default)]
 pub struct CoachingState {
-    pub parent: HashMap<RecordId, RecordId>,
+    pub parent: MergeMap,
     people: HashMap<RecordId, PersonCoaching>,
     pub packages: HashSet<RecordId>,
 }
 
 impl CoachingState {
-    pub fn canonical(&self, id: &RecordId) -> RecordId {
-        canonical(id, &self.parent)
+    pub fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
+        canonical_on(id, &self.parent, on)
     }
 
     pub fn sessions_remaining(&self, id: &RecordId) -> i64 {
@@ -92,11 +94,21 @@ impl CoachingState {
     }
 
     pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let id = self.canonical(id);
-        self.people
-            .get(&id)
-            .map(|p| p.remaining_on(on))
-            .unwrap_or(0)
+        let root = self.canonical_on(id, on);
+        let mut total: i64 = 0;
+        for (pid, person) in &self.people {
+            if self.canonical_on(pid, on) != root {
+                continue;
+            }
+            let Some(n) = person.remaining_on(on) else {
+                continue;
+            };
+            match total.checked_add(n) {
+                Some(sum) => total = sum,
+                None => return total,
+            }
+        }
+        total
     }
 
     pub fn icf_hours_hundredths(&self, id: &RecordId) -> i64 {
@@ -104,23 +116,62 @@ impl CoachingState {
     }
 
     pub fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let id = self.canonical(id);
+        let root = self.canonical_on(id, on);
+        let mut minutes: u32 = 0;
+        for (pid, person) in &self.people {
+            if self.canonical_on(pid, on) != root {
+                continue;
+            }
+            minutes = minutes.saturating_add(person.minutes_on(on));
+        }
+        minutes_to_hundredths(minutes)
+    }
+
+    fn group_pps_in_lookback(
+        &self,
+        id: &RecordId,
+        as_of: NaiveDate,
+        window: chrono::Duration,
+    ) -> bool {
+        let root = self.canonical_on(id, as_of);
+        self.people.iter().any(|(pid, person)| {
+            self.canonical_on(pid, as_of) == root && person.pps_in_lookback(as_of, window)
+        })
+    }
+
+    fn group_any_session_in_window(
+        &self,
+        id: &RecordId,
+        as_of: NaiveDate,
+        window: chrono::Duration,
+    ) -> bool {
+        let root = self.canonical_on(id, as_of);
+        self.people.iter().any(|(pid, person)| {
+            self.canonical_on(pid, as_of) == root && person.any_session_in_window(as_of, window)
+        })
+    }
+
+    fn group_last_session_on(&self, id: &RecordId, as_of: NaiveDate) -> Option<NaiveDate> {
+        let root = self.canonical_on(id, as_of);
         self.people
-            .get(&id)
-            .map(|p| minutes_to_hundredths(p.minutes_on(on)))
-            .unwrap_or(0)
+            .iter()
+            .filter(|(pid, _)| self.canonical_on(pid, as_of) == root)
+            .filter_map(|(_, person)| person.last_session_on(as_of))
+            .max()
     }
 }
 
-pub fn fold(vault: &Vault, findings: &mut Vec<Finding>) -> CoachingState {
-    let mut state = CoachingState::default();
-    for sourced in &vault.entries {
-        if sourced.entry.verb == "merge" {
-            if let Some((from, to)) = parse_merge(&sourced.entry) {
-                state.parent.insert(from, to);
-            }
-        }
-    }
+pub fn fold(
+    vault: &Vault,
+    parent: MergeMap,
+    as_of: NaiveDate,
+    findings: &mut Vec<Finding>,
+) -> CoachingState {
+    let mut state = CoachingState {
+        parent,
+        people: HashMap::new(),
+        packages: HashSet::new(),
+    };
 
     let mut events: Vec<_> = vault
         .entries
@@ -138,6 +189,9 @@ pub fn fold(vault: &Vault, findings: &mut Vec<Finding>) -> CoachingState {
 
     for sourced in events {
         let e = &sourced.entry;
+        if e.id.prefix() != Prefix::Person {
+            continue;
+        }
         match e.verb.as_str() {
             "open" => apply_open(&mut state, sourced.file.as_str(), sourced.line, e, findings),
             "session" => {
@@ -152,10 +206,15 @@ pub fn fold(vault: &Vault, findings: &mut Vec<Finding>) -> CoachingState {
         .checks
         .severity("coaching.balance_nonnegative", Severity::Error);
     if let Some(sev) = nonnegative {
-        let mut ids: Vec<_> = state.people.keys().cloned().collect();
-        ids.sort();
-        for id in ids {
-            let remaining = state.sessions_remaining(&id);
+        let keys: Vec<_> = state.people.keys().cloned().collect();
+        let mut roots: Vec<_> = keys
+            .iter()
+            .map(|id| state.canonical_on(id, as_of))
+            .collect();
+        roots.sort();
+        roots.dedup();
+        for id in roots {
+            let remaining = state.sessions_remaining_on(&id, as_of);
             if remaining < 0 {
                 findings.push(
                     Finding::new(
@@ -173,8 +232,7 @@ pub fn fold(vault: &Vault, findings: &mut Vec<Finding>) -> CoachingState {
 }
 
 fn person_mut<'a>(state: &'a mut CoachingState, id: &RecordId) -> &'a mut PersonCoaching {
-    let canon = state.canonical(id);
-    state.people.entry(canon).or_default()
+    state.people.entry(id.clone()).or_default()
 }
 
 fn apply_open(
@@ -196,7 +254,18 @@ fn apply_open(
             .for_id(&entry.id)
             .with_fix("Example: 2026-10-01 open p-… package pkg-… 6 sessions"),
         ),
-        Some(Err(msg)) => findings.push(
+        Some(Err(OpenIssue::InvalidId(raw))) => findings.push(
+            Finding::new(
+                FindingCode::InvalidId,
+                Severity::Error,
+                format!("package id '{raw}' is not a record ID"),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(&entry.id)
+            .with_fix("Use a pkg-<ULID> package id"),
+        ),
+        Some(Err(OpenIssue::Malformed(msg))) => findings.push(
             Finding::new(FindingCode::OpenMalformed, Severity::Error, msg)
                 .at_file(file)
                 .at_line(line)
@@ -206,7 +275,7 @@ fn apply_open(
             if pkg.prefix() != Prefix::Package {
                 findings.push(
                     Finding::new(
-                        FindingCode::OpenMalformed,
+                        FindingCode::WrongIdType,
                         Severity::Error,
                         format!("package id '{pkg}' must use the pkg- prefix"),
                     )
@@ -215,16 +284,56 @@ fn apply_open(
                     .for_id(&entry.id),
                 );
             }
+            if n > MAX_OPEN_N {
+                findings.push(
+                    Finding::new(
+                        FindingCode::OpenMalformed,
+                        Severity::Error,
+                        format!("open N {n} exceeds the cap of {MAX_OPEN_N}"),
+                    )
+                    .at_file(file)
+                    .at_line(line)
+                    .for_id(&entry.id)
+                    .with_fix(format!("Use a package size between 1 and {MAX_OPEN_N}")),
+                );
+                return;
+            }
+            {
+                let person = person_mut(state, &entry.id);
+                let opened: Option<i64> = person
+                    .opens
+                    .iter()
+                    .try_fold(0i64, |acc, o| acc.checked_add(o.n));
+                if opened.and_then(|acc| acc.checked_add(n)).is_none() {
+                    findings.push(
+                        Finding::new(
+                            FindingCode::OpenMalformed,
+                            Severity::Error,
+                            format!("open total for {} overflows", entry.id),
+                        )
+                        .at_file(file)
+                        .at_line(line)
+                        .for_id(&entry.id),
+                    );
+                    return;
+                }
+                person.opens.push(OpenEvent {
+                    date: entry.date,
+                    n,
+                });
+            }
             state.packages.insert(pkg);
-            person_mut(state, &entry.id).opens.push(OpenEvent {
-                date: entry.date,
-                n,
-            });
         }
     }
 }
 
-fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), String>> {
+#[derive(Debug)]
+enum OpenIssue {
+    InvalidId(String),
+    Malformed(String),
+}
+
+fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>> {
     let tokens: Vec<&str> = entry.args.iter().filter_map(Arg::as_token).collect();
     if tokens.len() < 4 {
         return None;
@@ -234,17 +343,17 @@ fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), String>> {
     }
     let pkg = match RecordId::parse(tokens[1]) {
         Ok(id) => id,
-        Err(_) => {
-            return Some(Err(format!(
-                "package id '{}' is not a record ID",
-                tokens[1]
-            )))
-        }
+        Err(_) => return Some(Err(OpenIssue::InvalidId(tokens[1].to_owned()))),
     };
     let n: i64 = match tokens[2].parse() {
         Ok(n) if n > 0 => n,
         Ok(_) => return None,
-        Err(_) => return Some(Err(format!("'{}' is not a positive integer", tokens[2]))),
+        Err(_) => {
+            return Some(Err(OpenIssue::Malformed(format!(
+                "'{}' is not a positive integer",
+                tokens[2]
+            ))))
+        }
     };
     Some(Ok((pkg, n)))
 }
@@ -270,43 +379,14 @@ fn apply_session(
             .with_fix("Add a duration such as 60m or 1h30m"),
         );
     }
-    let paid = entry.has_token("paid");
-    let remaining_now = {
-        let person = person_mut(state, &entry.id);
-        person.remaining_on(entry.date)
-    };
-    // A `paid` session with no remaining package does not consume a package
-    // slot and must not raise E_NEGATIVE_BALANCE (pay-per-session).
-    let consumes = remaining_now > 0 || !paid;
+    let pps = entry.has_token("pps");
+    // A plain session (including `paid`) always consumes a package slot.
+    // `pps` (pay-per-session) never does.
+    let consumes = !pps;
     let person = person_mut(state, &entry.id);
-    if consumes {
-        // Overflow of the used-count is reported as E_PARSE rather than wrapping.
-        if person
-            .sessions
-            .iter()
-            .filter(|s| s.consumes)
-            .count()
-            .checked_add(1)
-            .is_none()
-        {
-            findings.push(
-                Finding::new(
-                    FindingCode::Parse,
-                    Severity::Error,
-                    format!("session count for {} overflows", entry.id),
-                )
-                .at_file(file)
-                .at_line(line)
-                .for_id(&entry.id),
-            );
-        }
-    }
     if let Some(mins) = duration {
-        if person
-            .minutes_on(NaiveDate::MAX)
-            .checked_add(mins)
-            .is_none()
-        {
+        let current = person.minutes_on(NaiveDate::MAX);
+        if current.checked_add(mins).is_none() {
             findings.push(
                 Finding::new(
                     FindingCode::Parse,
@@ -322,7 +402,7 @@ fn apply_session(
     person.sessions.push(SessionEvent {
         date: entry.date,
         minutes: duration,
-        paid,
+        pps,
         consumes,
     });
 }
@@ -360,7 +440,78 @@ pub fn gap_rules(
         .severity("coaching.paid_session_gap", Severity::Warning)
     {
         let days = vault.config.checks.paid_session_gap_days();
-        paid_session_gap(state, as_of, days, sev, findings);
+        let lookback = vault.config.checks.pps_lookback_days();
+        paid_session_gap(state, as_of, days, lookback, sev, findings);
+    }
+}
+
+/// `note:` ID/type/existence/ownership. Always on; ignores `session_notes` and `as_of`.
+pub fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &mut Vec<Finding>) {
+    for sourced in &vault.entries {
+        if sourced.entry.verb != "session" {
+            continue;
+        }
+        let e = &sourced.entry;
+        let person = state.canonical_on(&e.id, NaiveDate::MAX);
+        let Some(note_id) = e.pair("note") else {
+            continue;
+        };
+        match RecordId::parse(note_id) {
+            Err(_) => findings.push(
+                Finding::new(
+                    FindingCode::InvalidId,
+                    Severity::Error,
+                    format!("session note '{note_id}' is not a record ID"),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&person)
+                .with_fix("Point note: at an existing n-<ULID> note"),
+            ),
+            Ok(nid) if nid.prefix() != Prefix::Note => findings.push(
+                Finding::new(
+                    FindingCode::WrongIdType,
+                    Severity::Error,
+                    format!("session note '{nid}' is not a note id"),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&person)
+                .with_fix("Use note:n-<ULID>"),
+            ),
+            Ok(nid) => match vault.records.get(&nid) {
+                None => findings.push(
+                    Finding::new(
+                        FindingCode::UnknownRecord,
+                        Severity::Error,
+                        format!("session note '{nid}' does not exist"),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&person)
+                    .with_fix("Point note: at an existing n-<ULID> note"),
+                ),
+                Some(rec) => {
+                    let note_person = rec
+                        .person()
+                        .or_else(|| person_from_path(&rec.path))
+                        .map(|p| state.canonical_on(&p, NaiveDate::MAX));
+                    if note_person.as_ref() != Some(&person) {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::UnknownRecord,
+                                Severity::Error,
+                                format!("session note '{nid}' does not belong to {person}"),
+                            )
+                            .at_file(&sourced.file)
+                            .at_line(sourced.line)
+                            .for_id(&person)
+                            .with_fix("Point note: at a note for this person"),
+                        );
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -371,7 +522,7 @@ fn session_without_notes(
     severity: Severity,
     findings: &mut Vec<Finding>,
 ) {
-    let notes_by_person_date = note_coverage(vault, state);
+    let notes_by_person_date = note_coverage(vault, state, as_of);
     for sourced in &vault.entries {
         if sourced.entry.verb != "session" {
             continue;
@@ -380,74 +531,9 @@ fn session_without_notes(
         if e.date > as_of {
             continue;
         }
-        let person = state.canonical(&e.id);
-        if let Some(note_id) = e.pair("note") {
-            match RecordId::parse(note_id) {
-                Err(_) => {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::InvalidId,
-                            Severity::Error,
-                            format!("session note '{note_id}' is not a record ID"),
-                        )
-                        .at_file(&sourced.file)
-                        .at_line(sourced.line)
-                        .for_id(&person)
-                        .with_fix("Point note: at an existing n-<ULID> note"),
-                    );
-                    continue;
-                }
-                Ok(nid) if nid.prefix() != Prefix::Note => {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::WrongIdType,
-                            Severity::Error,
-                            format!("session note '{nid}' is not a note id"),
-                        )
-                        .at_file(&sourced.file)
-                        .at_line(sourced.line)
-                        .for_id(&person)
-                        .with_fix("Use note:n-<ULID>"),
-                    );
-                    continue;
-                }
-                Ok(nid) => match vault.records.get(&nid) {
-                    None => {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::UnknownRecord,
-                                Severity::Error,
-                                format!("session note '{nid}' does not exist"),
-                            )
-                            .at_file(&sourced.file)
-                            .at_line(sourced.line)
-                            .for_id(&person)
-                            .with_fix("Point note: at an existing n-<ULID> note"),
-                        );
-                        continue;
-                    }
-                    Some(rec) => {
-                        let note_person = rec
-                            .person()
-                            .or_else(|| person_from_path(&rec.path))
-                            .map(|p| state.canonical(&p));
-                        if note_person.as_ref() != Some(&person) {
-                            findings.push(
-                                Finding::new(
-                                    FindingCode::UnknownRecord,
-                                    Severity::Error,
-                                    format!("session note '{nid}' does not belong to {person}"),
-                                )
-                                .at_file(&sourced.file)
-                                .at_line(sourced.line)
-                                .for_id(&person)
-                                .with_fix("Point note: at a note for this person"),
-                            );
-                        }
-                        continue;
-                    }
-                },
-            }
+        let person = state.canonical_on(&e.id, as_of);
+        if e.pair("note").is_some() {
+            continue;
         }
         let covered = notes_by_person_date
             .get(&person)
@@ -469,7 +555,11 @@ fn session_without_notes(
     }
 }
 
-fn note_coverage(vault: &Vault, state: &CoachingState) -> HashMap<RecordId, HashSet<NaiveDate>> {
+fn note_coverage(
+    vault: &Vault,
+    state: &CoachingState,
+    as_of: NaiveDate,
+) -> HashMap<RecordId, HashSet<NaiveDate>> {
     let mut map: HashMap<RecordId, HashSet<NaiveDate>> = HashMap::new();
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Note {
@@ -478,12 +568,12 @@ fn note_coverage(vault: &Vault, state: &CoachingState) -> HashMap<RecordId, Hash
         let Some(person) = rec.person().or_else(|| person_from_path(&rec.path)) else {
             continue;
         };
-        let person = state.canonical(&person);
+        let person = state.canonical_on(&person, as_of);
         let mut dates = HashSet::new();
-        if let Some(d) = rec.field("date").and_then(parse_date) {
+        if let Some(d) = rec.field("date").and_then(parse_strict_date) {
             dates.insert(d);
         }
-        if let Some(d) = rec.field("session").and_then(parse_date) {
+        if let Some(d) = rec.field("session").and_then(parse_strict_date) {
             dates.insert(d);
         }
         if dates.is_empty() {
@@ -502,43 +592,44 @@ fn person_from_path(path: &str) -> Option<RecordId> {
     RecordId::parse(parts.next()?).ok()
 }
 
-fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-}
-
 fn paid_session_gap(
     state: &CoachingState,
     as_of: NaiveDate,
     days: u64,
+    lookback: u64,
     severity: Severity,
     findings: &mut Vec<Finding>,
 ) {
     let days_i = i64::try_from(days).unwrap_or(i64::MAX);
+    let lookback_i = i64::try_from(lookback).unwrap_or(i64::MAX);
     let window = chrono::Duration::days(days_i);
-    let mut ids: Vec<_> = state.people.keys().cloned().collect();
+    let lookback_window = chrono::Duration::days(lookback_i);
+    let keys: Vec<_> = state.people.keys().cloned().collect();
+    let mut ids: Vec<_> = keys
+        .iter()
+        .map(|id| state.canonical_on(id, as_of))
+        .collect();
     ids.sort();
+    ids.dedup();
     for id in ids {
         let remaining = state.sessions_remaining_on(&id, as_of);
-        let person = state.people.get(&id);
-        let paid_in_window = person.is_some_and(|p| p.paid_session_in_window(as_of, window));
-        // Paid client: remaining package sessions, or a pay-per-session
-        // client with a `paid` session inside the window.
-        if remaining <= 0 && !paid_in_window {
+        let pps_client = state.group_pps_in_lookback(&id, as_of, lookback_window);
+        if remaining <= 0 && !pps_client {
             continue;
         }
-        let in_window = person.is_some_and(|p| p.any_session_in_window(as_of, window));
-        if in_window {
+        if state.group_any_session_in_window(&id, as_of, window) {
             continue;
         }
-        let last = person.and_then(|p| p.last_session_on(as_of));
-        let message = match last {
-            None => format!(
-                "paid client {id} has remaining sessions but no session has been logged"
+        let last = state.group_last_session_on(&id, as_of);
+        let start = as_of - window;
+        let message = match (last, remaining > 0) {
+            (None, _) => format!("paid client {id} has no session logged"),
+            (Some(d), true) => format!(
+                "paid client {id} has remaining sessions and no session on or after {start} (last was {d})"
             ),
-            Some(d) => format!(
-                "paid client {id} has remaining sessions and no session on or after {} (last was {d})",
-                as_of - window
-            ),
+            (Some(d), false) => {
+                format!("paid client {id} has no session on or after {start} (last was {d})")
+            }
         };
         findings.push(
             Finding::new(FindingCode::PaidSessionGap, severity, message)

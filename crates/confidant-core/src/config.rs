@@ -2,17 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use serde::Deserialize;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::error::DomainError;
+use crate::ledger::parse_strict_date;
 
 pub const SPEC_VERSION: &str = "0.1";
 pub const COACHING_PACK: &str = "coaching@0.1";
 pub const MAX_GAP_DAYS: u64 = 3650;
 pub const DEFAULT_GAP_DAYS: u64 = 45;
+pub const DEFAULT_PPS_LOOKBACK_DAYS: u64 = 180;
 
 const KNOWN_SEVERITY_KEYS: &[&str] = &[
     "coaching.require_duration",
@@ -20,7 +21,10 @@ const KNOWN_SEVERITY_KEYS: &[&str] = &[
     "coaching.session_notes",
     "coaching.paid_session_gap",
 ];
-const KNOWN_INT_KEYS: &[&str] = &["coaching.paid_session_gap_days"];
+const KNOWN_INT_KEYS: &[&str] = &[
+    "coaching.paid_session_gap_days",
+    "coaching.pps_lookback_days",
+];
 const KNOWN_TOP_LEVEL: &[&str] = &["as_of"];
 
 /// A vault's `confidant.toml`.
@@ -42,6 +46,8 @@ pub struct ChecksConfig {
     pub rules: BTreeMap<String, toml::Value>,
     #[serde(skip)]
     pub gap_days: u64,
+    #[serde(skip)]
+    pub pps_lookback_days: u64,
 }
 
 impl ChecksConfig {
@@ -72,6 +78,10 @@ impl ChecksConfig {
     pub fn paid_session_gap_days(&self) -> u64 {
         self.gap_days
     }
+
+    pub fn pps_lookback_days(&self) -> u64 {
+        self.pps_lookback_days
+    }
 }
 
 fn parse_severity_token(s: &str) -> Result<Option<Severity>, ()> {
@@ -97,6 +107,7 @@ impl VaultConfig {
             return Err(DomainError::config("confidant.toml is missing spec"));
         }
         cfg.checks.gap_days = DEFAULT_GAP_DAYS;
+        cfg.checks.pps_lookback_days = DEFAULT_PPS_LOOKBACK_DAYS;
         Ok(cfg)
     }
 
@@ -160,8 +171,11 @@ impl VaultConfig {
                 continue;
             }
             if KNOWN_INT_KEYS.contains(&key.as_str()) {
-                match self.checks.lookup(key) {
-                    Some(toml::Value::Integer(n)) if *n < 0 => {
+                let default = int_key_default(key);
+                let value = self.checks.lookup(key).cloned();
+                let dest = int_key_dest(&mut self.checks, key);
+                match value {
+                    Some(toml::Value::Integer(n)) if n < 0 => {
                         findings.push(
                             Finding::new(
                                 FindingCode::Config,
@@ -170,10 +184,10 @@ impl VaultConfig {
                             )
                             .at_file("confidant.toml"),
                         );
-                        self.checks.gap_days = DEFAULT_GAP_DAYS;
+                        *dest = default;
                     }
                     Some(toml::Value::Integer(n)) => {
-                        let n = *n as u64;
+                        let n = n as u64;
                         if n > MAX_GAP_DAYS {
                             findings.push(
                                 Finding::new(
@@ -186,9 +200,9 @@ impl VaultConfig {
                                 .at_file("confidant.toml")
                                 .with_fix(format!("Use a value between 0 and {MAX_GAP_DAYS}")),
                             );
-                            self.checks.gap_days = MAX_GAP_DAYS;
+                            *dest = MAX_GAP_DAYS;
                         } else {
-                            self.checks.gap_days = n;
+                            *dest = n;
                         }
                     }
                     Some(_) => {
@@ -200,7 +214,7 @@ impl VaultConfig {
                             )
                             .at_file("confidant.toml"),
                         );
-                        self.checks.gap_days = DEFAULT_GAP_DAYS;
+                        *dest = default;
                     }
                     None => {}
                 }
@@ -220,6 +234,22 @@ impl VaultConfig {
             );
         }
         findings
+    }
+}
+
+fn int_key_default(key: &str) -> u64 {
+    if key == "coaching.pps_lookback_days" {
+        DEFAULT_PPS_LOOKBACK_DAYS
+    } else {
+        DEFAULT_GAP_DAYS
+    }
+}
+
+fn int_key_dest<'a>(checks: &'a mut ChecksConfig, key: &str) -> &'a mut u64 {
+    if key == "coaching.pps_lookback_days" {
+        &mut checks.pps_lookback_days
+    } else {
+        &mut checks.gap_days
     }
 }
 
@@ -277,8 +307,8 @@ fn expand_tilde(raw: &String) -> PathBuf {
 }
 
 pub fn parse_iso_date(s: &str) -> Result<chrono::NaiveDate, DomainError> {
-    chrono::NaiveDate::from_str(s)
-        .map_err(|_| DomainError::invalid(format!("date '{s}' is not YYYY-MM-DD")))
+    parse_strict_date(s)
+        .ok_or_else(|| DomainError::invalid(format!("date '{s}' is not YYYY-MM-DD")))
 }
 
 #[cfg(test)]
@@ -310,6 +340,10 @@ coaching.paid_session_gap_days = 45
             Some(Severity::Error)
         );
         assert_eq!(cfg.checks.paid_session_gap_days(), 45);
+        assert_eq!(
+            cfg.checks.pps_lookback_days(),
+            super::DEFAULT_PPS_LOOKBACK_DAYS
+        );
         assert_eq!(
             cfg.checks
                 .severity("coaching.session_notes", Severity::Warning),

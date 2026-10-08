@@ -50,6 +50,27 @@ pub struct LedgerEntry {
     pub comment: Option<String>,
 }
 
+/// Strict `YYYY-MM-DD`: zero-padded, exactly 10 characters, a real calendar date.
+pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
+    if s.len() != 10 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if !bytes.iter().enumerate().all(|(i, b)| {
+        if i == 4 || i == 7 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    }) {
+        return None;
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
 impl LedgerEntry {
     pub fn pair(&self, key: &str) -> Option<&str> {
         self.args.iter().find_map(|a| match a {
@@ -207,24 +228,8 @@ impl<'a> Lexer<'a> {
         if tok.chars().count() != 10 {
             return Err("missing date YYYY-MM-DD".to_owned());
         }
-        let bytes = tok.as_bytes();
-        let zero_padded = bytes.len() == 10
-            && bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes.iter().enumerate().all(|(i, b)| {
-                if i == 4 || i == 7 {
-                    *b == b'-'
-                } else {
-                    b.is_ascii_digit()
-                }
-            });
-        if !zero_padded {
-            return Err(format!(
-                "'{tok}' is not a zero-padded calendar date YYYY-MM-DD"
-            ));
-        }
-        let date = NaiveDate::parse_from_str(&tok, "%Y-%m-%d")
-            .map_err(|_| format!("'{tok}' is not a calendar date YYYY-MM-DD"))?;
+        let date = parse_strict_date(&tok)
+            .ok_or_else(|| format!("'{tok}' is not a zero-padded calendar date YYYY-MM-DD"))?;
         self.i += 10;
         match self.s[self.i..].chars().next() {
             Some(c) if c == ' ' || c == '\t' => Ok(date),

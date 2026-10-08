@@ -19,12 +19,22 @@ pub struct SourcedEntry {
     pub entry: LedgerEntry,
 }
 
+/// Original ledger file line, including unparsable ones, for search.
+#[derive(Clone, Debug)]
+pub struct LedgerLine {
+    pub file: String,
+    pub line: u32,
+    pub text: String,
+    pub id: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Vault {
     pub root: PathBuf,
     pub config: VaultConfig,
     pub records: BTreeMap<RecordId, Record>,
     pub entries: Vec<SourcedEntry>,
+    pub ledger_lines: Vec<LedgerLine>,
     pub load_findings: Vec<Finding>,
 }
 
@@ -59,10 +69,11 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut findings = config.config_findings();
     let mut records = BTreeMap::new();
     let mut entries = Vec::new();
+    let mut ledger_lines = Vec::new();
 
     if config.spec == SPEC_VERSION {
         scan_collections(root, &mut records, &mut findings);
-        scan_ledger(root, &mut entries, &mut findings);
+        scan_ledger(root, &mut entries, &mut ledger_lines, &mut findings);
         scan_unexpected_top_level(root, &mut findings);
     }
 
@@ -71,13 +82,33 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         config,
         records,
         entries,
+        ledger_lines,
         load_findings: findings,
     })
 }
 
-fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Vec<paths::DirectoryEntry> {
+enum Listed {
+    Ok(Vec<paths::DirectoryEntry>),
+    Failed,
+}
+
+fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
     match paths::read_dir(root, rel) {
-        Ok(entries) => entries,
+        Ok(listing) => {
+            for (name, msg) in listing.errors {
+                let child = if rel.as_os_str().is_empty() {
+                    name.clone()
+                } else {
+                    paths::display_relative(&rel.join(&name))
+                };
+                findings.push(
+                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
+                        .at_file(child)
+                        .with_fix("Fix permissions or replace the unreadable entry"),
+                );
+            }
+            Listed::Ok(listing.entries)
+        }
         Err(err) => {
             let file = if rel.as_os_str().is_empty() {
                 ".".to_owned()
@@ -85,13 +116,29 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Vec<paths::
                 paths::display_relative(rel)
             };
             findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, err.to_string())
+                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
                     .at_file(file)
                     .with_fix("Fix directory permissions or replace the unreadable path"),
             );
-            Vec::new()
+            Listed::Failed
         }
     }
+}
+
+fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
+    if !paths::is_leftover_temp(name) {
+        return false;
+    }
+    findings.push(
+        Finding::new(
+            FindingCode::InvalidFilename,
+            Severity::Error,
+            format!("leftover temporary file '{name}'"),
+        )
+        .at_file(paths::display_relative(child))
+        .with_fix("Delete .confidant-tmp-* leftovers from a crashed write"),
+    );
+    true
 }
 
 fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
@@ -134,8 +181,14 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
         "README.md",
         "LICENSE",
     ];
-    for ent in list_dir(root, Path::new(""), findings) {
+    let Listed::Ok(entries) = list_dir(root, Path::new(""), findings) else {
+        return;
+    };
+    for ent in entries {
         let child = Path::new(&ent.name);
+        if leftover_tmp(&ent.name, child, findings) {
+            continue;
+        }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
             flag_entry(&ent, child, findings);
             continue;
@@ -170,10 +223,20 @@ fn scan_collections(
                 let _ = list_dir(root, rel, findings);
                 continue;
             }
-            Ok(entries) => {
+            Ok(listing) => {
+                for (name, msg) in listing.errors {
+                    findings.push(
+                        Finding::new(FindingCode::Unreadable, Severity::Error, msg)
+                            .at_file(paths::display_relative(&rel.join(&name)))
+                            .with_fix("Fix permissions or replace the unreadable entry"),
+                    );
+                }
                 let prefix = Prefix::from_collection(collection).expect("known collection");
-                for ent in entries {
+                for ent in listing.entries {
                     let child = rel.join(&ent.name);
+                    if leftover_tmp(&ent.name, &child, findings) {
+                        continue;
+                    }
                     if !ent.utf8 || ent.kind == EntryKind::Symlink {
                         flag_entry(&ent, &child, findings);
                         continue;
@@ -305,8 +368,15 @@ fn ingest_dir(
         .main_filename()
         .expect("collection records have a main file");
     let mut saw_main = false;
-    for ent in list_dir(root, relative, findings) {
+    let entries = match list_dir(root, relative, findings) {
+        Listed::Failed => return,
+        Listed::Ok(entries) => entries,
+    };
+    for ent in entries {
         let child = relative.join(&ent.name);
+        if leftover_tmp(&ent.name, &child, findings) {
+            continue;
+        }
         if !ent.utf8 || ent.kind == EntryKind::Symlink {
             flag_entry(&ent, &child, findings);
             if ent.name == main {
@@ -372,9 +442,19 @@ fn scan_person_notes(
         Err(_) => {
             let _ = list_dir(root, &notes_rel, findings);
         }
-        Ok(entries) => {
-            for ent in entries {
+        Ok(listing) => {
+            for (name, msg) in listing.errors {
+                findings.push(
+                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
+                        .at_file(paths::display_relative(&notes_rel.join(&name)))
+                        .with_fix("Fix permissions or replace the unreadable entry"),
+                );
+            }
+            for ent in listing.entries {
                 let child = notes_rel.join(&ent.name);
+                if leftover_tmp(&ent.name, &child, findings) {
+                    continue;
+                }
                 if !ent.utf8 || ent.kind == EntryKind::Symlink {
                     flag_entry(&ent, &child, findings);
                     continue;
@@ -432,9 +512,8 @@ fn load_markdown(
     let text = match paths::read_to_string(root, relative) {
         Ok(t) => t,
         Err(err) => {
-            let msg = err.to_string();
             findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, msg)
+                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
                     .at_file(&file)
                     .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
@@ -528,16 +607,31 @@ fn load_markdown(
     }
 }
 
-fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<Finding>) {
+fn scan_ledger(
+    root: &Path,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+) {
     let ledger_rel = Path::new("ledger");
     match paths::read_dir(root, ledger_rel) {
         Err(err) if crate::error::is_missing(&err) => {}
         Err(_) => {
             let _ = list_dir(root, ledger_rel, findings);
         }
-        Ok(years) => {
-            for year_ent in years {
+        Ok(listing) => {
+            for (name, msg) in listing.errors {
+                findings.push(
+                    Finding::new(FindingCode::Unreadable, Severity::Error, msg)
+                        .at_file(paths::display_relative(&ledger_rel.join(&name)))
+                        .with_fix("Fix permissions or replace the unreadable entry"),
+                );
+            }
+            for year_ent in listing.entries {
                 let year_rel = ledger_rel.join(&year_ent.name);
+                if leftover_tmp(&year_ent.name, &year_rel, findings) {
+                    continue;
+                }
                 if !year_ent.utf8 || year_ent.kind == EntryKind::Symlink {
                     flag_entry(&year_ent, &year_rel, findings);
                     continue;
@@ -560,9 +654,16 @@ fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<
                     );
                     continue;
                 }
-                for month_ent in list_dir(root, &year_rel, findings) {
+                let months = match list_dir(root, &year_rel, findings) {
+                    Listed::Failed => continue,
+                    Listed::Ok(m) => m,
+                };
+                for month_ent in months {
                     let file_rel = year_rel.join(&month_ent.name);
                     let file = paths::display_relative(&file_rel);
+                    if leftover_tmp(&month_ent.name, &file_rel, findings) {
+                        continue;
+                    }
                     if !month_ent.utf8 || month_ent.kind == EntryKind::Symlink {
                         flag_entry(&month_ent, &file_rel, findings);
                         continue;
@@ -589,7 +690,7 @@ fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<
                                 Finding::new(
                                     FindingCode::Unreadable,
                                     Severity::Error,
-                                    err.to_string(),
+                                    format!("{err:#}"),
                                 )
                                 .at_file(&file),
                             );
@@ -606,7 +707,8 @@ fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<
                             .at_file(&file),
                         );
                     }
-                    let (parsed, errors) = parse_ledger(&text);
+                    let text = text.trim_start_matches('\u{feff}');
+                    let (parsed, errors) = parse_ledger(text);
                     for err in errors {
                         let code = match err.kind {
                             ParseErrorKind::InvalidId => FindingCode::InvalidId,
@@ -619,12 +721,29 @@ fn scan_ledger(root: &Path, entries: &mut Vec<SourcedEntry>, findings: &mut Vec<
                                 .with_fix(err.fix),
                         );
                     }
+                    let mut by_line: BTreeMap<u32, LedgerEntry> = BTreeMap::new();
                     for (line, entry) in parsed {
-                        entries.push(SourcedEntry {
+                        by_line.insert(line, entry);
+                    }
+                    for (idx, raw) in text.lines().enumerate() {
+                        let line = idx as u32 + 1;
+                        if raw.trim().is_empty() {
+                            continue;
+                        }
+                        let entry = by_line.remove(&line);
+                        ledger_lines.push(LedgerLine {
                             file: file.clone(),
                             line,
-                            entry,
+                            text: raw.to_owned(),
+                            id: entry.as_ref().map(|e| e.id.to_string()),
                         });
+                        if let Some(entry) = entry {
+                            entries.push(SourcedEntry {
+                                file: file.clone(),
+                                line,
+                                entry,
+                            });
+                        }
                     }
                 }
             }

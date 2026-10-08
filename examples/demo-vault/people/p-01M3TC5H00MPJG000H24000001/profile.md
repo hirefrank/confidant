@@ -4,4 +4,4 @@ type: person
 name: Bea Demo
 ---
 
-Fake client used to show a second package and org link. Not a real person.
+Fake pay-per-session client (`pps` on the session line). Not a real person.
