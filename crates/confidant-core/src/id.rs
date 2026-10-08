@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize};
 /// Crockford base32 alphabet used by ULIDs (no I, L, O, U).
 pub const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+const fn crockford_lookup() -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < CROCKFORD.len() {
+        let c = CROCKFORD[i];
+        table[c as usize] = true;
+        if c.is_ascii_uppercase() {
+            table[(c | 32) as usize] = true;
+        }
+        i += 1;
+    }
+    table
+}
+
+const CROCKFORD_BYTE: [bool; 256] = crockford_lookup();
+
 const ULID_LEN: usize = 26;
 
 /// Type prefix on a record ID.
@@ -428,7 +444,7 @@ fn starts_id_prefix(s: &str) -> bool {
 }
 
 fn is_crockford_byte(b: u8) -> bool {
-    CROCKFORD.contains(&b.to_ascii_uppercase())
+    CROCKFORD_BYTE[b as usize]
 }
 
 fn scan_vault_ulid_windows(text: &str, vault_ulids: &HashSet<String>, out: &mut Vec<IdToken>) {
