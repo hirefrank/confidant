@@ -20,8 +20,9 @@ truth for the search allowlist.
   Time Machine). Treat them as sensitive, exactly like `.confidant/`.
 - **`qmd-index` enforces three guardrails before building** (the corpus is a
   plaintext mirror of the vault, including `no-ai` records):
-  1. it refuses unless `.confidant/qmd-corpus/` is git-ignored in the vault's
-     repo (fix: `echo '.confidant/' >> .gitignore` in the vault);
+  1. it refuses unless `.confidant/qmd-corpus/` AND `.confidant/qmd/` (the
+     QMD store — its index.sqlite holds plaintext FTS chunks) are git-ignored
+     in the vault's repo (fix: `echo '.confidant/' >> .gitignore` in the vault);
   2. it refuses unless the disk is encrypted — auto-detected (FileVault on
      macOS, dm-crypt ancestor in `lsblk` on Linux) or asserted with
      `--i-confirm-encrypted-disk`;
@@ -101,8 +102,9 @@ it on stderr.
 - `bin/qmd-index.py [--vault PATH] [--embed] [--i-confirm-encrypted-disk]` — builds
   `<vault>/.confidant/qmd-corpus/` from decrypted vault content and registers
   it as the `confidant` QMD collection (always a full rebuild: wipes the old
-  corpus and re-adds the collection). Refuses unless the corpus is git-ignored
-  and the disk is encrypted (see guardrails above). Puts QMD's own store under
+  corpus and re-adds the collection). Refuses unless the corpus and the QMD
+  store are git-ignored and the disk is encrypted (see guardrails above).
+  Puts QMD's own store under
   `<vault>/.confidant/qmd/`. Skips `enc:`-enveloped files with a
   warning. Mirrors each `ledger/*.cfd` as a sibling `.cfd.md` so QMD's
   `**/*.md` collection pattern covers ledger facts too (hits map back to the

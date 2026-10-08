@@ -15,8 +15,10 @@ Usage: qmd-index.py [--vault PATH] [--embed]
 
 Guardrails (the corpus is a plaintext mirror of the vault, INCLUDING
 no-ai records — these are enforced in code, not just docs):
-- REFUSES to build unless `.confidant/qmd-corpus/` is git-ignored in the
-  vault's repo (one `git add -A` must never commit the corpus).
+- REFUSES to build unless `.confidant/qmd-corpus/` AND `.confidant/qmd/`
+  (the QMD store, whose index.sqlite holds plaintext FTS chunks) are
+  git-ignored in the vault's repo (one `git add -A` must never commit
+  the corpus or the index).
 - REFUSES to build unless the disk is encrypted (auto-detected: FileVault
   on macOS, dm-crypt ancestor in lsblk on Linux) or the operator passes
   --i-confirm-encrypted-disk.
@@ -83,10 +85,11 @@ def is_decodable_text(path):
 
 
 def ensure_corpus_gitignored(vault):
-    """Refuse unless the corpus path is git-ignored in the vault's repo.
+    """Refuse unless the corpus AND the QMD store are git-ignored.
 
     The corpus is a plaintext mirror of the vault (including no-ai
-    records); a single `git add -A` in a vault that doesn't ignore it
+    records), and the QMD store's index.sqlite holds the plaintext FTS
+    chunks; a single `git add -A` in a vault that doesn't ignore them
     would commit the whole thing.
     """
     git = shutil.which("git")
@@ -100,19 +103,24 @@ def ensure_corpus_gitignored(vault):
         print("note: vault is not a git repo; skipping gitignore check",
               file=sys.stderr)
         return
-    probe = os.path.join(CORPUS_REL, ".probe")
-    ci = subprocess.run([git, "-C", vault, "check-ignore", "-q", probe],
-                        capture_output=True)
-    if ci.returncode != 0:
+    # check-ignore -q exits 0 if ANY path is ignored, so probe each path
+    # separately; the probe files need not exist on disk.
+    probes = {os.path.join(CORPUS_REL, ".probe"): ".confidant/qmd-corpus/",
+              os.path.join(STORE_REL, ".probe"): ".confidant/qmd/"}
+    unignored = [label for probe, label in probes.items()
+                 if subprocess.run([git, "-C", vault, "check-ignore", "-q",
+                                    probe], capture_output=True).returncode != 0]
+    if unignored:
         sys.exit(
-            "error: refusing to build: .confidant/qmd-corpus/ is not "
-            "git-ignored in this vault.\n"
+            "error: refusing to build: not git-ignored in this vault: "
+            f"{', '.join(unignored)}\n"
             "The corpus is a plaintext mirror of the vault (including no-ai "
-            "records); one `git add -A` would commit it.\n"
+            "records), and the QMD store's index.sqlite holds the plaintext "
+            "FTS chunks; one `git add -A` would commit them.\n"
             "Fix: add `.confidant/` to the vault's .gitignore, e.g.:\n"
             f"  (cd {vault} && echo '.confidant/' >> .gitignore)\n"
             "then re-run qmd-index.")
-    print("gitignore: corpus path is ignored — ok")
+    print("gitignore: corpus and QMD store paths are ignored — ok")
 
 
 def encrypted_disk_detected(vault):
