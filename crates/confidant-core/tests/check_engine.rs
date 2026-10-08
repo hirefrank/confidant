@@ -595,7 +595,9 @@ fn no_ai_people_are_excluded_from_search() {
         &format!("---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nsecret-token in a note\n"),
     );
     let vault = load_vault(dir.path()).unwrap();
-    let hits = confidant_core::search(&vault, "secret-token").hits;
+    let hits = confidant_core::search(&vault, "secret-token")
+        .expect("search")
+        .hits;
     assert!(hits.is_empty(), "{hits:?}");
 }
 
@@ -610,7 +612,9 @@ fn unparsable_ledger_lines_are_searchable() {
         "this-unique-garbage-token is not an entry\n",
     );
     let vault = load_vault(dir.path()).unwrap();
-    let hits = confidant_core::search(&vault, "this-unique-garbage-token").hits;
+    let hits = confidant_core::search(&vault, "this-unique-garbage-token")
+        .expect("search")
+        .hits;
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].line, 1);
 }
@@ -752,7 +756,7 @@ fn symlinks_at_every_level_are_findings() {
 }
 
 fn search_q(root: &Path, q: &str) -> confidant_core::SearchResult {
-    confidant_core::search(&load_vault(root).unwrap(), q)
+    confidant_core::search(&load_vault(root).unwrap(), q).expect("search")
 }
 
 fn person_no_ai(root: &Path, id: &str, name: &str) {
@@ -2030,7 +2034,7 @@ fn find_excludes_note_named_in_nested_ledger_cfd() {
 }
 
 #[test]
-fn find_fails_closed_when_ledger_file_unreadable() {
+fn find_refuses_when_ledger_file_unreadable() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -2039,27 +2043,20 @@ fn find_fails_closed_when_ledger_file_unreadable() {
         &format!("notes/{NOTE}/note.md"),
         &format!("---\nid: {NOTE}\ntype: note\n---\n\nunread-toplevel-note-token\n"),
     );
-    write(
-        dir.path(),
-        &format!("people/{ADA}/notes/{NOTE2}.md"),
-        &format!(
-            "---\nid: {NOTE2}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nunread-under-ada-token\n"
-        ),
-    );
     std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
     std::fs::write(dir.path().join("ledger/2026/08.cfd"), [0xff, 0xfe, 0xfd]).unwrap();
-    let hidden = search_q(dir.path(), "unread-toplevel-note-token");
-    let under = search_q(dir.path(), "unread-under-ada-token");
-    let ada = search_q(dir.path(), "Ada Example");
-    assert!(
-        !token_in_hits(&hidden, "unread-toplevel-note-token"),
-        "{hidden:?}"
-    );
-    assert!(token_in_hits(&under, "unread-under-ada-token"), "{under:?}");
-    assert!(token_in_hits(&ada, "Ada Example"), "{ada:?}");
-    let dumped = serde_json::to_string(&hidden.findings).unwrap();
-    assert!(dumped.contains("E_UNREADABLE"), "{dumped}");
-    assert!(!dumped.contains("08.cfd"), "{dumped}");
+    let err = confidant_core::search(
+        &load_vault(dir.path()).unwrap(),
+        "unread-toplevel-note-token",
+    )
+    .expect_err("find refuses");
+    assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
+    assert_eq!(err.message(), "1 items");
+    assert!(err.file().is_none(), "{err:?}");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).contains(&"E_UNREADABLE".into()), "{json}");
+    let dumped = json.to_string();
+    assert!(dumped.contains("08.cfd"), "{dumped}");
 }
 
 #[test]
@@ -2131,4 +2128,289 @@ fn find_excludes_person_jane_doe_frontmatter() {
         messages.iter().all(|m| !m.contains("Jane Doe")),
         "{messages:?}"
     );
+}
+
+fn hidden_note_named_in(root: &Path, ledger_rel: &str) {
+    person_no_ai(root, ADA, "Ada");
+    write(
+        root,
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\nhidden-extra-ledger-note-token\n"),
+    );
+    write(
+        root,
+        ledger_rel,
+        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
+}
+
+#[test]
+fn find_keeps_uppercase_cfd_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/09.CFD",
+        &format!("2026-09-01 session {ADA} 60m paid note:{NOTE}  ; uppercase-cfd-token\n"),
+    );
+    let result = search_q(dir.path(), "uppercase-cfd-token");
+    assert!(token_in_hits(&result, "uppercase-cfd-token"), "{result:?}");
+}
+
+#[test]
+fn find_excludes_note_named_in_orig_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    hidden_note_named_in(dir.path(), "ledger/2026/10.cfd.orig");
+    let result = search_q(dir.path(), "hidden-extra-ledger-note-token");
+    assert!(
+        !token_in_hits(&result, "hidden-extra-ledger-note-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_excludes_note_named_in_tilde_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    hidden_note_named_in(dir.path(), "ledger/2026/10.cfd~");
+    let result = search_q(dir.path(), "hidden-extra-ledger-note-token");
+    assert!(
+        !token_in_hits(&result, "hidden-extra-ledger-note-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_excludes_note_named_in_bak_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    hidden_note_named_in(dir.path(), "ledger/2026/10.cfd.bak");
+    let result = search_q(dir.path(), "hidden-extra-ledger-note-token");
+    assert!(
+        !token_in_hits(&result, "hidden-extra-ledger-note-token"),
+        "{result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_excludes_note_named_in_in_vault_symlink_file() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\nsymlink-file-note-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/payload.cfd",
+        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
+    std::os::unix::fs::symlink("payload.cfd", dir.path().join("ledger/2026/10.cfd.bak")).unwrap();
+    let result = search_q(dir.path(), "symlink-file-note-token");
+    assert!(
+        !token_in_hits(&result, "symlink-file-note-token"),
+        "{result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_refuses_outside_vault_symlink_file() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    let outside = dir.path().parent().unwrap().join("outside.cfd");
+    std::fs::write(&outside, "2026-10-01 merge p-x into p-y\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.path().join("ledger/2026/10.cfd.bak")).unwrap();
+    let err = confidant_core::search(&load_vault(dir.path()).unwrap(), "Ada Example")
+        .expect_err("outside symlink unread");
+    assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
+}
+
+#[cfg(unix)]
+#[test]
+fn find_excludes_note_named_in_in_vault_symlink_year_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\nsymlink-year-note-token\n"),
+    );
+    write(
+        dir.path(),
+        "alt/2026/10.cfd",
+        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
+    std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
+    std::os::unix::fs::symlink("../alt/2026", dir.path().join("ledger/2026")).unwrap();
+    let result = search_q(dir.path(), "symlink-year-note-token");
+    assert!(
+        !token_in_hits(&result, "symlink-year-note-token"),
+        "{result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_refuses_outside_vault_symlink_year_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let outside = dir.path().parent().unwrap().join("outside-year");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("10.cfd"), "x\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.path().join("ledger/2026")).unwrap();
+    let err = confidant_core::search(&load_vault(dir.path()).unwrap(), "Ada Example")
+        .expect_err("outside year unread");
+    assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
+}
+
+fn merge_hides_bea(root: &Path, line: &str) {
+    vault_toml(root, DEFAULT_CHECKS);
+    person_no_ai(root, ADA, "Ada");
+    write(
+        root,
+        &format!("people/{BEA}/profile.md"),
+        &format!("---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nundated-merge-token\n"),
+    );
+    write(root, "ledger/2026/10.cfd", line);
+}
+
+#[test]
+fn find_joins_merge_with_short_date() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_hides_bea(dir.path(), &format!("2026-10-3 merge {BEA} into {ADA}\n"));
+    let result = search_q(dir.path(), "undated-merge-token");
+    assert!(!token_in_hits(&result, "undated-merge-token"), "{result:?}");
+}
+
+#[test]
+fn find_joins_merge_with_slash_date() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_hides_bea(dir.path(), &format!("2026/10/03 merge {BEA} into {ADA}\n"));
+    let result = search_q(dir.path(), "undated-merge-token");
+    assert!(!token_in_hits(&result, "undated-merge-token"), "{result:?}");
+}
+
+#[test]
+fn find_joins_merge_with_no_date() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_hides_bea(dir.path(), &format!("merge {BEA} into {ADA}\n"));
+    let result = search_q(dir.path(), "undated-merge-token");
+    assert!(!token_in_hits(&result, "undated-merge-token"), "{result:?}");
+}
+
+#[test]
+fn find_joins_merge_with_trailing_colon() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_hides_bea(dir.path(), &format!("merge: {BEA} into {ADA}\n"));
+    let result = search_q(dir.path(), "undated-merge-token");
+    assert!(!token_in_hits(&result, "undated-merge-token"), "{result:?}");
+}
+
+#[test]
+fn find_excludes_soft_hyphen_note_on_hidden_line() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\n---\n\nsoft-hyphen-note-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 session {ADA} 60m paid note:n\u{00ad}{}\n",
+            &NOTE[2..]
+        ),
+    );
+    let result = search_q(dir.path(), "soft-hyphen-note-token");
+    assert!(
+        !token_in_hits(&result, "soft-hyphen-note-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_keeps_phase_i_32hex_and_page_p_32hex() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    let hex32 = "0123456789abcdef0123456789abcdef";
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nPhase-I-{hex32} phase-i-token\nMy-Page-p-{hex32} page-p-token\n"
+        ),
+    );
+    let a = search_q(dir.path(), "phase-i-token");
+    let b = search_q(dir.path(), "page-p-token");
+    assert!(token_in_hits(&a, "phase-i-token"), "{a:?}");
+    assert!(token_in_hits(&b, "page-p-token"), "{b:?}");
+}
+
+#[test]
+fn find_keeps_underscore_p_and_dash_n_drive_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nsee _p-1BxiMVs0XRA5nFMdKvBdBZjgmUU underscore-drive-token\nsee -n-1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms dash-n-drive-token\n"
+        ),
+    );
+    let a = search_q(dir.path(), "underscore-drive-token");
+    let b = search_q(dir.path(), "dash-n-drive-token");
+    assert!(token_in_hits(&a, "underscore-drive-token"), "{a:?}");
+    assert!(token_in_hits(&b, "dash-n-drive-token"), "{b:?}");
+}
+
+#[test]
+fn find_keeps_wikilink_alias_and_tilde_person() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: \"[[{ADA}|Ada]]\"\n---\n\nwikilink-alias-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE2}/note.md"),
+        &format!("---\nid: {NOTE2}\ntype: note\nperson: ~\n---\n\ntilde-person-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE3}/note.md"),
+        &format!(
+            "---\nid: {NOTE3}\ntype: note\nperson: \"{ADA} # comment\"\n---\n\ncomment-person-token\n"
+        ),
+    );
+    let alias = search_q(dir.path(), "wikilink-alias-token");
+    let tilde = search_q(dir.path(), "tilde-person-token");
+    let comment = search_q(dir.path(), "comment-person-token");
+    assert!(token_in_hits(&alias, "wikilink-alias-token"), "{alias:?}");
+    assert!(token_in_hits(&tilde, "tilde-person-token"), "{tilde:?}");
+    assert!(
+        token_in_hits(&comment, "comment-person-token"),
+        "{comment:?}"
+    );
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
 }

@@ -95,6 +95,35 @@ as_of = "2026-10-08"
 }
 
 #[test]
+fn find_unreadable_ledger_is_command_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        r#"spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "x"
+[checks]
+as_of = "2026-10-08"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    std::fs::write(dir.path().join("ledger/2026/08.cfd"), [0xff, 0xfe, 0xfd]).unwrap();
+    let out = Command::new(bin())
+        .args(["find", "anything", "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_LEDGER_UNREADABLE");
+    assert_eq!(v["error"]["message"], "1 items");
+    assert!(v["error"].get("file").is_none(), "{v}");
+    assert!(v.get("matches").is_none(), "{v}");
+}
+
+#[test]
 fn missing_vault_json_error() {
     let out = Command::new(bin())
         .args([

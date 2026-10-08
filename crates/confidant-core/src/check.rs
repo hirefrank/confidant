@@ -24,7 +24,7 @@ use crate::error::DomainError;
 use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_decimal_hundredths, parse_duration_minutes, Arg, LedgerEntry};
 use crate::packs::coaching::{self, CoachingState};
-use crate::record::parse_ref_id;
+use crate::record::{parse_ref_id, FrontmatterRef};
 use crate::vault::Vault;
 
 /// How serious a finding is.
@@ -869,7 +869,8 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
         for key in REF_KEYS {
             let Some(raw) = rec.field(key) else { continue };
             match parse_ref_id(raw) {
-                None => {
+                FrontmatterRef::Absent => {}
+                FrontmatterRef::Invalid => {
                     if scan_id_tokens(raw).iter().any(|tok| tok.is_malformed()) {
                         continue;
                     }
@@ -884,7 +885,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                         .with_fix("Use a prefixed 26-character Crockford ULID"),
                     );
                 }
-                Some(id) if !known_ids.contains(&id) => findings.push(
+                FrontmatterRef::Id(id) if !known_ids.contains(&id) => findings.push(
                     Finding::new(
                         FindingCode::DanglingRef,
                         Severity::Error,
@@ -894,7 +895,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     .for_id(&rec.id)
                     .with_fix("Create the record or fix the reference"),
                 ),
-                Some(_) => {}
+                FrontmatterRef::Id(_) => {}
             }
         }
     }

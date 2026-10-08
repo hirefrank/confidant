@@ -128,18 +128,42 @@ pub(crate) fn is_spec_key(key: &str) -> bool {
 
 /// Spec key on a raw front-matter line, if any. Comments and unknown keys
 /// return `None` so callers can name the line without echoing it.
+/// Result of parsing a `person` / `org` / `deal` front-matter value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrontmatterRef {
+    /// Missing, empty, or YAML `~`.
+    Absent,
+    Id(RecordId),
+    Invalid,
+}
+
 /// Parse a `person` / `org` / `deal` front-matter value as a record ID after
-/// stripping format characters, surrounding quotes, and `[[ ]]`.
-pub(crate) fn parse_ref_id(raw: &str) -> Option<RecordId> {
+/// stripping format characters, surrounding quotes, a trailing ` # comment`,
+/// and `[[id|Alias]]`. Empty and `~` are [`FrontmatterRef::Absent`].
+pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
     let stripped = strip_cf(raw);
     let unquoted = unquote(stripped.trim());
-    let trimmed = unquoted.trim();
+    let mut trimmed = unquoted.trim();
+    if let Some(idx) = trimmed.find(" #") {
+        trimmed = trimmed[..idx].trim();
+    }
+    if trimmed.is_empty() || trimmed == "~" {
+        return FrontmatterRef::Absent;
+    }
     let inner = trimmed
         .strip_prefix("[[")
         .and_then(|s| s.strip_suffix("]]"))
         .unwrap_or(trimmed)
         .trim();
-    RecordId::parse(inner).ok()
+    let id_part = inner
+        .split_once('|')
+        .map(|(id, _)| id)
+        .unwrap_or(inner)
+        .trim();
+    match RecordId::parse(id_part) {
+        Ok(id) => FrontmatterRef::Id(id),
+        Err(_) => FrontmatterRef::Invalid,
+    }
 }
 
 pub(crate) fn frontmatter_line_spec_key(raw: &str) -> Option<String> {
@@ -616,13 +640,33 @@ mod tests {
         let id = crate::id::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
         assert_eq!(
             super::parse_ref_id("[[p-01M3TC5H00MPJG000000000000]]"),
-            Some(id.clone())
+            super::FrontmatterRef::Id(id.clone())
         );
         assert_eq!(
             super::parse_ref_id("\"p-\u{200b}01M3TC5H00MPJG000000000000\""),
-            Some(id)
+            super::FrontmatterRef::Id(id.clone())
         );
-        assert!(super::parse_ref_id("Jane Doe").is_none());
-        assert!(super::parse_ref_id("\"Jane Doe\"").is_none());
+        assert_eq!(
+            super::parse_ref_id("[[p-01M3TC5H00MPJG000000000000|Ada]]"),
+            super::FrontmatterRef::Id(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("p-01M3TC5H00MPJG000000000000 # comment"),
+            super::FrontmatterRef::Id(id)
+        );
+        assert_eq!(
+            super::parse_ref_id("Jane Doe"),
+            super::FrontmatterRef::Invalid
+        );
+        assert_eq!(
+            super::parse_ref_id("\"Jane Doe\""),
+            super::FrontmatterRef::Invalid
+        );
+        assert_eq!(super::parse_ref_id("~"), super::FrontmatterRef::Absent);
+        assert_eq!(super::parse_ref_id(""), super::FrontmatterRef::Absent);
+        assert_eq!(
+            super::parse_ref_id("~ # comment"),
+            super::FrontmatterRef::Absent
+        );
     }
 }

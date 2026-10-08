@@ -245,7 +245,8 @@ impl IdToken {
 /// Valid token (`-` plus an exact ULID) matches; malformed lookalikes and
 /// the over-32 tail rule apply only at a word boundary.
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
-    let stripped = strip_cf(text);
+    let mapped = map_soft_hyphen_after_prefix(text);
+    let stripped = strip_cf(&mapped);
     let text = stripped.as_ref();
     if !text.as_bytes().contains(&b'-')
         && (!text.as_bytes().iter().any(|b| *b >= 0x80) || !text.chars().any(is_id_dash))
@@ -254,21 +255,57 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     }
     let mut out = Vec::new();
     let mut remaining = text;
-    let mut prev_alnum = false;
+    let mut prev: Option<char> = None;
     while !remaining.is_empty() {
+        let glued = prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
         if starts_id_prefix(remaining) {
-            if let Some((tok, len)) = match_id_token_at(remaining, prev_alnum) {
+            if let Some((tok, len)) = match_id_token_at(remaining, glued) {
                 out.push(tok);
                 remaining = &remaining[len..];
-                prev_alnum = true;
+                prev = Some('0');
                 continue;
             }
         }
         let ch = remaining.chars().next().unwrap();
-        prev_alnum = ch.is_ascii_alphanumeric();
+        prev = Some(ch);
         remaining = &remaining[ch.len_utf8()..];
     }
     out
+}
+
+/// U+00AD after an ID prefix is a dash, not a format character to strip.
+fn map_soft_hyphen_after_prefix(s: &str) -> Cow<'_, str> {
+    if !s.contains('\u{00ad}') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(plen) = prefix_len_before_soft_hyphen(rest) {
+            out.push_str(&rest[..plen]);
+            out.push('-');
+            rest = &rest[plen + '\u{00ad}'.len_utf8()..];
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    Cow::Owned(out)
+}
+
+fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
+    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
+    for pref in PREFIXES {
+        let plen = pref.len();
+        let Some(head) = s.get(..plen) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(pref) && s[plen..].starts_with('\u{00ad}') {
+            return Some(plen);
+        }
+    }
+    None
 }
 
 /// Unicode General Category Cf (Format): ZWSP, soft hyphen, word joiner, BOM,
@@ -351,13 +388,16 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         let total = plen + run_start + run_len;
         let run = &after[run_start..run_start + run_len];
         if glued {
-            // After an alphanumeric, only '-' plus an exact ULID is an ID.
+            // After an alphanumeric or `_`, only '-' plus an exact ULID is an ID.
             if dash != '-' || run_len != ULID_LEN {
                 continue;
             }
             if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
                 return Some((IdToken::Valid(id), total));
             }
+            continue;
+        }
+        if is_32_lowercase_hex(run) {
             continue;
         }
         if run_len > 32 {
@@ -383,6 +423,10 @@ fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
         return Some((IdToken::Malformed { candidate }, total));
     }
     None
+}
+
+fn is_32_lowercase_hex(run: &str) -> bool {
+    run.len() == 32 && run.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn lookalike_candidate(pref: &str, run: &str) -> Option<RecordId> {
@@ -576,6 +620,16 @@ mod tests {
                 super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap()
             )]
         );
+        let note_soft = super::RecordId::parse("n-01M3TC5H00MPJG002NAM000005").unwrap();
+        assert_eq!(
+            scan_id_tokens("note:n\u{00ad}01M3TC5H00MPJG002NAM000005"),
+            vec![IdToken::Valid(note_soft)]
+        );
+        let hex32 = "0123456789abcdef0123456789abcdef";
+        assert!(scan_id_tokens(&format!("Phase-I-{hex32}")).is_empty());
+        assert!(scan_id_tokens(&format!("My-Page-p-{hex32}")).is_empty());
+        assert!(scan_id_tokens("_p-1BxiMVs0XRA5nFMdKvBdBZjgmUU").is_empty());
+        assert!(scan_id_tokens("-n-1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms").is_empty());
     }
 
     #[test]

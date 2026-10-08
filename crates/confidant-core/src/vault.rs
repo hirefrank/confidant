@@ -1,6 +1,6 @@
 //! Load a vault from disk: config, records, ledger.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
@@ -41,8 +41,10 @@ pub struct Vault {
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
     pub load_findings: Vec<Finding>,
-    /// True when any ledger path could not be read. Search then fails closed.
+    /// True when any ledger path could not be read. `find` then refuses.
     pub ledger_unread: bool,
+    /// Number of unreadable ledger paths (code+count only; never a path).
+    pub ledger_unread_count: u32,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -77,7 +79,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut records = BTreeMap::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
-    let mut ledger_unread = false;
+    let mut ledger_unread_count = 0u32;
 
     if config.spec == SPEC_VERSION {
         scan_collections(root, &mut records, &mut findings);
@@ -86,7 +88,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             &mut entries,
             &mut ledger_lines,
             &mut findings,
-            &mut ledger_unread,
+            &mut ledger_unread_count,
         );
         scan_unexpected_top_level(root, &mut findings);
     }
@@ -98,7 +100,8 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         entries,
         ledger_lines,
         load_findings: findings,
-        ledger_unread,
+        ledger_unread: ledger_unread_count > 0,
+        ledger_unread_count,
     })
 }
 
@@ -646,37 +649,51 @@ fn scan_ledger(
     entries: &mut Vec<SourcedEntry>,
     ledger_lines: &mut Vec<LedgerLine>,
     findings: &mut Vec<Finding>,
-    unread: &mut bool,
+    unread: &mut u32,
 ) {
     let ledger_rel = Path::new("ledger");
+    let mut visited = HashSet::new();
     match paths::read_dir(root, ledger_rel) {
         Err(err) if crate::error::is_missing(&err) => {}
         Err(_) => {
             let _ = list_dir(root, ledger_rel, findings);
-            *unread = true;
+            *unread += 1;
         }
-        Ok(_) => walk_ledger(root, ledger_rel, entries, ledger_lines, findings, unread),
+        Ok(_) => walk_ledger(
+            root,
+            ledger_rel,
+            entries,
+            ledger_lines,
+            findings,
+            unread,
+            &mut visited,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_ledger(
     root: &Path,
     rel: &Path,
     entries: &mut Vec<SourcedEntry>,
     ledger_lines: &mut Vec<LedgerLine>,
     findings: &mut Vec<Finding>,
-    unread: &mut bool,
+    unread: &mut u32,
+    visited: &mut HashSet<PathBuf>,
 ) {
+    if let Some(canon) = canonicalize_under_root(root, rel) {
+        if !visited.insert(canon) {
+            return;
+        }
+    }
     let listing = match paths::read_dir(root, rel) {
         Err(_) => {
             let _ = list_dir(root, rel, findings);
-            *unread = true;
+            *unread += 1;
             return;
         }
         Ok(listing) => {
-            if !listing.errors.is_empty() {
-                *unread = true;
-            }
+            *unread += listing.errors.len() as u32;
             for (name, msg) in listing.errors {
                 findings.push(
                     Finding::new(FindingCode::Unreadable, Severity::Error, msg)
@@ -688,58 +705,243 @@ fn walk_ledger(
         }
     };
     for ent in listing {
-        let child = rel.join(&ent.name);
-        if leftover_tmp(&ent.name, &child, findings) {
-            continue;
+        process_ledger_entry(
+            root,
+            rel,
+            &ent,
+            None,
+            entries,
+            ledger_lines,
+            findings,
+            unread,
+            visited,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_ledger_resolved(
+    root: &Path,
+    rel: &Path,
+    canon: &Path,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+    unread: &mut u32,
+    visited: &mut HashSet<PathBuf>,
+) {
+    if !visited.insert(canon.to_path_buf()) {
+        return;
+    }
+    let listing = match std::fs::read_dir(canon) {
+        Err(err) => {
+            *unread += 1;
+            findings.push(
+                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
+                    .at_file(paths::display_relative(rel))
+                    .with_fix("Fix permissions or replace the unreadable path"),
+            );
+            return;
         }
-        if !ent.utf8 || ent.kind == EntryKind::Symlink {
-            flag_entry(&ent, &child, findings);
+        Ok(rd) => rd,
+    };
+    for ent in listing {
+        let Ok(ent) = ent else {
+            *unread += 1;
             continue;
-        }
-        if paths::skip_walk_entry(&ent.name, ent.kind) {
-            continue;
-        }
-        match ent.kind {
-            EntryKind::Directory => {
-                if rel == Path::new("ledger") && !is_yyyy(&ent.name) {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::LedgerPath,
-                            Severity::Error,
-                            format!("ledger/{} is not a four-digit year directory", ent.name),
-                        )
-                        .at_file(paths::display_relative(&child))
-                        .with_fix("Use ledger/YYYY/MM.cfd"),
-                    );
-                }
-                walk_ledger(root, &child, entries, ledger_lines, findings, unread);
+        };
+        let name_os = ent.file_name();
+        let utf8 = name_os.to_str().is_some();
+        let name = name_os.to_string_lossy().into_owned();
+        let kind = match ent.file_type() {
+            Ok(ft) if ft.is_symlink() => EntryKind::Symlink,
+            Ok(ft) if ft.is_dir() => EntryKind::Directory,
+            Ok(ft) if ft.is_file() => EntryKind::File,
+            Ok(_) => EntryKind::Other,
+            Err(_) => {
+                *unread += 1;
+                continue;
             }
-            EntryKind::File if ent.name.ends_with(".cfd") => {
-                load_cfd_file(root, &child, entries, ledger_lines, findings, unread);
+        };
+        let fake = paths::DirectoryEntry { name, utf8, kind };
+        process_ledger_entry(
+            root,
+            rel,
+            &fake,
+            Some(canon),
+            entries,
+            ledger_lines,
+            findings,
+            unread,
+            visited,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_ledger_entry(
+    root: &Path,
+    parent: &Path,
+    ent: &paths::DirectoryEntry,
+    parent_canon: Option<&Path>,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+    unread: &mut u32,
+    visited: &mut HashSet<PathBuf>,
+) {
+    let child = parent.join(&ent.name);
+    if leftover_tmp(&ent.name, &child, findings) {
+        return;
+    }
+    if !ent.utf8 {
+        flag_entry(ent, &child, findings);
+        *unread += 1;
+        return;
+    }
+    if ent.name.starts_with('.') {
+        return;
+    }
+    if ent.kind == EntryKind::Symlink {
+        flag_entry(ent, &child, findings);
+        match resolve_in_vault(root, &child) {
+            Some(InVault::File(canon)) => {
+                load_ledger_file(
+                    root,
+                    &child,
+                    Some(&canon),
+                    entries,
+                    ledger_lines,
+                    findings,
+                    unread,
+                );
             }
-            EntryKind::File => {
+            Some(InVault::Directory(canon)) => {
+                walk_ledger_resolved(
+                    root,
+                    &child,
+                    &canon,
+                    entries,
+                    ledger_lines,
+                    findings,
+                    unread,
+                    visited,
+                );
+            }
+            None => {
+                *unread += 1;
+            }
+        }
+        return;
+    }
+    match ent.kind {
+        EntryKind::Directory => {
+            if parent == Path::new("ledger") && !is_yyyy(&ent.name) {
                 findings.push(
                     Finding::new(
                         FindingCode::LedgerPath,
                         Severity::Error,
-                        format!("'{}' is not MM.cfd", paths::display_relative(&child)),
+                        format!("ledger/{} is not a four-digit year directory", ent.name),
                     )
                     .at_file(paths::display_relative(&child))
-                    .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
+                    .with_fix("Use ledger/YYYY/MM.cfd"),
                 );
             }
-            _ => {}
+            if let Some(base) = parent_canon {
+                walk_ledger_resolved(
+                    root,
+                    &child,
+                    &base.join(&ent.name),
+                    entries,
+                    ledger_lines,
+                    findings,
+                    unread,
+                    visited,
+                );
+            } else {
+                walk_ledger(
+                    root,
+                    &child,
+                    entries,
+                    ledger_lines,
+                    findings,
+                    unread,
+                    visited,
+                );
+            }
         }
+        EntryKind::File => {
+            let from = parent_canon.map(|base| base.join(&ent.name));
+            load_ledger_file(
+                root,
+                &child,
+                from.as_deref(),
+                entries,
+                ledger_lines,
+                findings,
+                unread,
+            );
+        }
+        EntryKind::Other => {
+            *unread += 1;
+        }
+        EntryKind::Symlink => {}
     }
 }
 
-fn load_cfd_file(
+enum InVault {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+fn canonicalize_under_root(root: &Path, rel: &Path) -> Option<PathBuf> {
+    let path = if rel.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    path.canonicalize()
+        .ok()
+        .filter(|canon| is_under(root, canon))
+}
+
+fn is_under(root: &Path, path: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    path == root || path.starts_with(&root)
+}
+
+fn resolve_in_vault(root: &Path, rel: &Path) -> Option<InVault> {
+    let link_path = root.join(rel);
+    let target = std::fs::read_link(&link_path).ok()?;
+    let joined = if target.is_absolute() {
+        target
+    } else {
+        link_path.parent().unwrap_or(root).join(target)
+    };
+    let canon = joined.canonicalize().ok()?;
+    if !is_under(root, &canon) {
+        return None;
+    }
+    if canon.is_dir() {
+        Some(InVault::Directory(canon))
+    } else if canon.is_file() {
+        Some(InVault::File(canon))
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_ledger_file(
     root: &Path,
     rel: &Path,
+    read_from: Option<&Path>,
     entries: &mut Vec<SourcedEntry>,
     ledger_lines: &mut Vec<LedgerLine>,
     findings: &mut Vec<Finding>,
-    unread: &mut bool,
+    unread: &mut u32,
 ) {
     let file = paths::display_relative(rel);
     let searchable = is_canonical_ledger_cfd(rel);
@@ -754,26 +956,66 @@ fn load_cfd_file(
             .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
         );
     }
-    let text = match paths::read_to_string(root, rel) {
-        Ok(t) => t,
-        Err(err) => {
-            *unread = true;
-            findings.push(
-                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
-                    .at_file(&file)
-                    .with_fix("Fix permissions or replace the unreadable path"),
-            );
-            return;
-        }
+    let text = match read_from {
+        Some(canon) => match std::fs::read(canon) {
+            Ok(buf) => match String::from_utf8(buf) {
+                Ok(t) => t,
+                Err(_) => {
+                    *unread += 1;
+                    findings.push(
+                        Finding::new(
+                            FindingCode::Unreadable,
+                            Severity::Error,
+                            format!("'{file}' is not valid UTF-8"),
+                        )
+                        .at_file(&file)
+                        .with_fix("Fix permissions or replace the unreadable path"),
+                    );
+                    return;
+                }
+            },
+            Err(err) => {
+                *unread += 1;
+                findings.push(
+                    Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
+                        .at_file(&file)
+                        .with_fix("Fix permissions or replace the unreadable path"),
+                );
+                return;
+            }
+        },
+        None => match paths::read_to_string(root, rel) {
+            Ok(t) => t,
+            Err(err) => {
+                *unread += 1;
+                findings.push(
+                    Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
+                        .at_file(&file)
+                        .with_fix("Fix permissions or replace the unreadable path"),
+                );
+                return;
+            }
+        },
     };
-    if has_conflict_markers(&text) {
+    ingest_ledger_text(&text, &file, searchable, entries, ledger_lines, findings);
+}
+
+fn ingest_ledger_text(
+    text: &str,
+    file: &str,
+    searchable: bool,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+) {
+    if has_conflict_markers(text) {
         findings.push(
             Finding::new(
                 FindingCode::MergeConflict,
                 Severity::Error,
                 format!("'{file}' contains git conflict markers"),
             )
-            .at_file(&file),
+            .at_file(file),
         );
     }
     let text = text.trim_start_matches('\u{feff}');
@@ -787,7 +1029,7 @@ fn load_cfd_file(
             };
             findings.push(
                 Finding::new(code, Severity::Error, err.message)
-                    .at_file(&file)
+                    .at_file(file)
                     .at_line(err.line)
                     .with_fix(err.fix),
             );
@@ -803,7 +1045,7 @@ fn load_cfd_file(
         }
         let entry = by_line.remove(&line);
         ledger_lines.push(LedgerLine {
-            file: file.clone(),
+            file: file.to_owned(),
             line,
             text: raw.to_owned(),
             id: entry.as_ref().map(|e| e.id.to_string()),
@@ -812,7 +1054,7 @@ fn load_cfd_file(
         if searchable {
             if let Some(entry) = entry {
                 entries.push(SourcedEntry {
-                    file: file.clone(),
+                    file: file.to_owned(),
                     line,
                     entry,
                 });
@@ -834,6 +1076,7 @@ fn is_yyyy(s: &str) -> bool {
 }
 
 fn is_month_cfd(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
     let Some(mm) = s.strip_suffix(".cfd") else {
         return false;
     };
@@ -850,6 +1093,7 @@ mod tests {
     #[test]
     fn month_names() {
         assert!(is_month_cfd("10.cfd"));
+        assert!(is_month_cfd("10.CFD"));
         assert!(!is_month_cfd("1.cfd"));
         assert!(!is_month_cfd("13.cfd"));
         assert!(!is_month_cfd("10.md"));

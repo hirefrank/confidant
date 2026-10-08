@@ -33,6 +33,8 @@ pub enum ErrorKind {
     Config,
     /// Vault `spec` is not implemented by this CLI.
     SpecUnsupported,
+    /// `find` refuses because a ledger file could not be read.
+    LedgerUnreadable,
     /// Flags or arguments cannot be interpreted. Exit 2.
     Usage,
     /// An idempotency key was reused with different content.
@@ -52,6 +54,7 @@ impl ErrorKind {
             Self::Invalid => "E_INVALID",
             Self::Config => "E_CONFIG",
             Self::SpecUnsupported => "E_SPEC_UNSUPPORTED",
+            Self::LedgerUnreadable => "E_LEDGER_UNREADABLE",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
             Self::Internal => "internal_error",
@@ -121,6 +124,11 @@ impl DomainError {
     pub fn vault_not_found() -> Self {
         Self::new(ErrorKind::VaultNotFound, "no vault found")
             .with_fix("Pass --vault, set CONFIDANT_VAULT, or run from a vault directory")
+    }
+
+    pub fn ledger_unreadable(count: u32) -> Self {
+        Self::new(ErrorKind::LedgerUnreadable, format!("{count} items"))
+            .with_fix("Fix permissions or replace the unreadable ledger file, then re-run find")
     }
 
     pub fn with_file(mut self, file: impl Into<String>) -> Self {
@@ -262,6 +270,12 @@ mod tests {
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"
         );
+        assert_eq!(
+            DomainError::ledger_unreadable(2).code(),
+            "E_LEDGER_UNREADABLE"
+        );
+        assert_eq!(DomainError::ledger_unreadable(2).message(), "2 items");
+        assert!(DomainError::ledger_unreadable(2).file().is_none());
         assert_eq!(DomainError::vault_not_found().code(), "E_VAULT_NOT_FOUND");
         assert_eq!(DomainError::vault_not_found().exit_code(), 1);
         assert_eq!(

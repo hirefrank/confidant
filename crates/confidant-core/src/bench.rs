@@ -185,8 +185,8 @@ mod tests {
         let (unique, common) = generate_realistic_vault(dir.path(), 3, 2).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
-        assert_eq!(search(&vault, &unique).hits.len(), 1);
-        assert!(search(&vault, &common).hits.len() >= 3);
+        assert_eq!(search(&vault, &unique).expect("search").hits.len(), 1);
+        assert!(search(&vault, &common).expect("search").hits.len() >= 3);
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());
         assert!(
             report.findings.is_empty(),
@@ -213,10 +213,10 @@ mod tests {
             Duration::from_millis(200)
         };
         let t0 = Instant::now();
-        let one = search(&vault, &unique);
+        let one = search(&vault, &unique).expect("search");
         let find_unique = t0.elapsed();
         let t1 = Instant::now();
-        let many = search(&vault, &common);
+        let many = search(&vault, &common).expect("search");
         let find_common = t1.elapsed();
         let t2 = Instant::now();
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());

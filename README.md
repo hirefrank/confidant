@@ -34,8 +34,11 @@ they have no file and no ID, or resolve to a cleared record or ledger
 line; otherwise a code and a count, never a path or raw text. Name-only
 mentions with no ID are not detected in body prose and comments; a
 `person` / `org` / `deal` value that is not a record ID (`person: "Jane Doe"`)
-is `E_INVALID_ID` and uncleared. Milestone 3 `context` continues to honour
-`no-ai`.
+is `E_INVALID_ID` and uncleared. If any ledger file cannot be read, `find`
+exits non-zero with `E_LEDGER_UNREADABLE` (code and count only) and no
+hits. Remaining limits: glued text with an inexact ID, non-Cf invisible
+characters, capitalised or other keys holding names, and name-only prose.
+Milestone 3 `context` continues to honour `no-ai`.
 
 ## Quickstart
 

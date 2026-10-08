@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
+use crate::error::DomainError;
 use crate::id::{person_id_from_path, scan_id_tokens, scan_ids, IdToken, Prefix, RecordId};
 use crate::ledger::ledger_line_verb;
-use crate::record::parse_ref_id;
+use crate::record::{parse_ref_id, FrontmatterRef};
 use crate::vault::Vault;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -49,15 +50,20 @@ struct Allowlist<'a> {
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
 /// Line numbers are 1-based positions in the original file.
 /// Returns content only from the cleared allowlist (spec section 12).
-pub fn search(vault: &Vault, query: &str) -> SearchResult {
+/// If any ledger file was unreadable, returns [`DomainError`] `E_LEDGER_UNREADABLE`
+/// and no hits.
+pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
+    if vault.ledger_unread_count > 0 {
+        return Err(DomainError::ledger_unreadable(vault.ledger_unread_count));
+    }
     let needle = case_fold(query);
     let allow = Allowlist::build(vault);
     let findings = findings_for_find(&allow);
     if needle.is_empty() {
-        return SearchResult {
+        return Ok(SearchResult {
             hits: Vec::new(),
             findings,
-        };
+        });
     }
     let mut hits = Vec::new();
     for rec in vault.records.values() {
@@ -81,7 +87,7 @@ pub fn search(vault: &Vault, query: &str) -> SearchResult {
         }
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    SearchResult { hits, findings }
+    Ok(SearchResult { hits, findings })
 }
 
 impl<'a> Allowlist<'a> {
@@ -474,7 +480,7 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
     }
     let fm_bad_ref = ["person", "org", "deal"].iter().any(|key| {
         rec.field(key)
-            .is_some_and(|raw| parse_ref_id(raw).is_none())
+            .is_some_and(|raw| matches!(parse_ref_id(raw), FrontmatterRef::Invalid))
     });
     RecordFacts {
         fm_ids,

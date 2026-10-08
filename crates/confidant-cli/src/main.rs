@@ -194,7 +194,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 )?;
                 return Ok(ExitCode::from(1));
             }
-            let result = search(&vault, &query);
+            let result = match search(&vault, &query) {
+                Ok(result) => result,
+                Err(err) => {
+                    print_error(json, Some(&vault.root.display().to_string()), &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
+                }
+            };
             if json {
                 println!(
                     "{}",

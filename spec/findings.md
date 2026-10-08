@@ -55,7 +55,9 @@ key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
 is code and count only. Name-only mentions with no ID are not detected
 in body prose and comments; a `person` / `org` / `deal` value that is
 not a record ID is `E_INVALID_ID` and uncleared. Ledger parse errors
-give the line number and code without echoing tokens.
+give the line number and code without echoing tokens. If any ledger file
+cannot be read, `find` does not scan: command error `E_LEDGER_UNREADABLE`
+(code and count only). `check` still reports `E_UNREADABLE`.
 
 Command-level error codes (not check findings):
 
@@ -69,5 +71,6 @@ Command-level error codes (not check findings):
 | `E_CONFLICT` | 1 | The request conflicts with stored vault state (including a refused symlink on a write path). |
 | `E_CONFIG` | 1 | `confidant.toml` cannot be parsed as TOML or is missing `spec` / `vault_id`. Semantic `[checks]` problems are the finding of the same code. |
 | `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
+| `E_LEDGER_UNREADABLE` | 1 | A ledger file could not be read. `find` returns this command error (code and count only, no path) and no hits. `check` still reports finding `E_UNREADABLE`. |
 | `E_IDEMPOTENCY_CONFLICT` | 1 | Reserved for milestone 3 (`--request-id`). |
 | `internal_error` | 1 | Unclassified failure. Never match on its message. |
