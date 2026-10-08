@@ -365,10 +365,7 @@ fn check_ledger_paths(vault: &Vault, findings: &mut Vec<Finding>) {
                     Finding::new(
                         FindingCode::LedgerDate,
                         Severity::Error,
-                        format!(
-                            "entry date {} does not belong in {}",
-                            entry.entry.date, entry.file
-                        ),
+                        "entry date does not belong in this monthly file".to_owned(),
                     )
                     .at_file(&entry.file)
                     .at_line(entry.line)

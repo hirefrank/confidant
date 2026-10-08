@@ -21,6 +21,7 @@ const NOTE3: &str = "n-01M3TC5H00MPJG00800000000F";
 const IXN: &str = "i-01M3TC5H00MPJG0048H0000008";
 const SHADOW: &str = "p-01M3TC5H00MPJG001K6C00000A";
 const GHOST: &str = "p-01M3TC5H00MPJG000H2400000Z";
+const CAM_NOTE: &str = "n-01M3TC5H000068T0000000000C";
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -3117,6 +3118,8 @@ fn check_messages_do_not_echo_seeded_filenames() {
         "ZXQVLEAKYEAR",
         "ZXQVLEAKLEDGER.txt",
         "ZXQVLEAKLINK",
+        "10.cfd",
+        "ledger/2026/10.cfd",
     ];
     write(dir.path(), "ZXQVLEAKTOP.md", "not a vault file\n");
     write(
@@ -3142,6 +3145,11 @@ fn check_messages_do_not_echo_seeded_filenames() {
     write(dir.path(), "people/.confidant-tmp-ZXQVLEAKTMP", "tmp\n");
     write(dir.path(), "ledger/ZXQVLEAKYEAR/01.cfd", "x\n");
     write(dir.path(), "ledger/2026/ZXQVLEAKLEDGER.txt", "x\n");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-09-01 session {ADA} 60m paid note:{NOTE}\n"),
+    );
     #[cfg(unix)]
     std::os::unix::fs::symlink("profile.md", dir.path().join("people/ZXQVLEAKLINK")).unwrap();
     let json = report_json(dir.path(), None);
@@ -3174,4 +3182,219 @@ fn check_messages_do_not_echo_seeded_filenames() {
         files.iter().any(|f| f.contains("ZXQVLEAKFILE")),
         "location field should still name the invalid path: {files:?}"
     );
+    assert!(codes(&json).contains(&"E_LEDGER_DATE".into()), "{json}");
+    let date_msgs: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_LEDGER_DATE")
+        .map(|f| f["message"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        date_msgs
+            .iter()
+            .all(|m| *m == "entry date does not belong in this monthly file"),
+        "{date_msgs:?}"
+    );
+    assert!(
+        files.contains(&"ledger/2026/10.cfd"),
+        "E_LEDGER_DATE keeps the path in file: {files:?}"
+    );
+}
+
+fn ulid_of(id: &str) -> &str {
+    id.rsplit_once('-').unwrap().1
+}
+
+fn id_spellings(id: &str) -> Vec<(&'static str, String)> {
+    let ulid = ulid_of(id);
+    vec![
+        ("prefixed", id.to_owned()),
+        ("bare", ulid.to_owned()),
+        ("lower", ulid.to_ascii_lowercase()),
+        ("tprefix", format!("t-{ulid}")),
+        ("recvtt", format!("src:zoom/rec_{ulid}.vtt")),
+        ("punder", format!("p_{ulid}")),
+        ("pglued", format!("p{ulid}")),
+        ("suffix", format!("{ulid}abc")),
+    ]
+}
+
+fn src_spellings(id: &str) -> Vec<(&'static str, String)> {
+    let ulid = ulid_of(id);
+    vec![
+        ("prefixed", id.to_owned()),
+        ("bare", ulid.to_owned()),
+        ("lower", ulid.to_ascii_lowercase()),
+        ("recvtt", format!("zoom/rec_{ulid}.vtt")),
+        ("tprefix", format!("t-{ulid}")),
+        ("punder", format!("p_{ulid}")),
+        ("pglued", format!("p{ulid}")),
+        ("suffix", format!("{ulid}abc")),
+    ]
+}
+
+fn write_ada_mentions(root: &Path, id: &str, marker_prefix: &str) -> Vec<String> {
+    let mut body = format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\n");
+    let mut markers = Vec::new();
+    for (label, spelling) in id_spellings(id) {
+        let marker = format!("{marker_prefix}{label}");
+        body.push_str(&format!("{marker} {spelling}\n"));
+        markers.push(marker);
+    }
+    write(root, &format!("people/{ADA}/profile.md"), &body);
+    markers
+}
+
+fn assert_markers_hidden(root: &Path, markers: &[String]) {
+    for marker in markers {
+        let result = search_q(root, marker);
+        assert!(
+            !token_in_hits(&result, marker),
+            "{marker} leaked {result:?}"
+        );
+    }
+}
+
+#[test]
+fn find_hides_bare_ulid_of_note_renamed_to_uppercase_md() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    note(dir.path(), CAM_NOTE, CAM, "2026-10-07");
+    let notes = dir.path().join(format!("people/{CAM}/notes"));
+    fs::rename(
+        notes.join(format!("{CAM_NOTE}.md")),
+        notes.join(format!("{CAM_NOTE}.MD")),
+    )
+    .unwrap();
+    let markers = write_ada_mentions(dir.path(), CAM_NOTE, "ZNOTE");
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[test]
+fn find_hides_bare_ulid_of_flat_uppercase_md_no_ai_person() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{CAM}.MD"),
+        &format!("---\nid: {CAM}\ntype: person\nname: Cam\nno-ai: true\n---\n\nCam secret\n"),
+    );
+    let markers = write_ada_mentions(dir.path(), CAM, "ZFLAT");
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[cfg(unix)]
+#[test]
+fn find_hides_bare_ulid_of_person_dir_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), CAM, "Cam");
+    let people = dir.path().join("people");
+    let real = people.join(format!("{CAM}-real"));
+    fs::rename(people.join(CAM), &real).unwrap();
+    std::os::unix::fs::symlink(&real, people.join(CAM)).unwrap();
+    let markers = write_ada_mentions(dir.path(), CAM, "ZLINK");
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[cfg(unix)]
+#[test]
+fn find_hides_bare_ulid_of_fifo_named_as_record_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    let fifo = dir.path().join("people").join(CAM);
+    fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    let markers = write_ada_mentions(dir.path(), CAM, "ZFIFO");
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[cfg(unix)]
+#[test]
+fn find_hides_bare_ulid_of_non_file_note_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), CAM, "Cam");
+    let notes = dir.path().join(format!("people/{CAM}/notes"));
+    fs::create_dir_all(&notes).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(notes.join(CAM_NOTE))
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    let markers = write_ada_mentions(dir.path(), CAM_NOTE, "ZNFIFO");
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[test]
+fn find_hides_session_line_naming_no_ai_package_by_bare_ulid() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    person_no_ai(dir.path(), CAM, "Cam");
+    let mut ledger = format!("2026-10-01 open {CAM} package {PKG2} 4 sessions\n");
+    let mut markers = Vec::new();
+    for (label, spelling) in src_spellings(PKG2) {
+        let marker = format!("KLINE{label}");
+        ledger.push_str(&format!(
+            "2026-10-12 session {ADA} 60m paid {marker} src:{spelling}\n"
+        ));
+        markers.push(marker);
+    }
+    write(dir.path(), "ledger/2026/10.cfd", &ledger);
+    assert_markers_hidden(dir.path(), &markers);
+}
+
+#[test]
+fn find_hides_note_named_on_session_with_bare_package_src() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    person_no_ai(dir.path(), CAM, "Cam");
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nNA1TOKEN in ada note\n"
+        ),
+    );
+    let mut ledger = format!("2026-10-01 open {CAM} package {PKG2} 4 sessions\n");
+    for (label, spelling) in src_spellings(PKG2) {
+        ledger.push_str(&format!(
+            "2026-10-12 session {ADA} 60m paid note:{NOTE} src:{spelling} {label}\n"
+        ));
+    }
+    write(dir.path(), "ledger/2026/10.cfd", &ledger);
+    let result = search_q(dir.path(), "NA1TOKEN");
+    assert!(!token_in_hits(&result, "NA1TOKEN"), "{result:?}");
+}
+
+#[test]
+fn find_bare_package_ulid_matches_prefixed_when_package_is_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+    let mut markers = Vec::new();
+    for (label, spelling) in src_spellings(PKG) {
+        let marker = format!("KCLEAR{label}");
+        ledger.push_str(&format!(
+            "2026-10-12 session {ADA} 60m paid {marker} src:{spelling}\n"
+        ));
+        markers.push(marker);
+    }
+    write(dir.path(), "ledger/2026/10.cfd", &ledger);
+    for marker in &markers {
+        let result = search_q(dir.path(), marker);
+        assert!(
+            token_in_hits(&result, marker),
+            "{marker} should stay searchable when the package is cleared: {result:?}"
+        );
+    }
 }

@@ -6,7 +6,10 @@ use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
 use crate::error::DomainError;
-use crate::id::{person_id_from_path, scan_id_tokens_against, scan_ids, IdToken, Prefix, RecordId};
+use crate::id::{
+    person_id_from_path, scan_id_tokens, scan_id_tokens_against, scan_ids, IdToken, Prefix,
+    RecordId,
+};
 use crate::ledger::ledger_line_verb;
 use crate::record::{parse_ref_id, FrontmatterRef};
 use crate::vault::Vault;
@@ -104,16 +107,16 @@ impl<'a> Allowlist<'a> {
         }
         let mut by_ulid: HashMap<String, Vec<RecordId>> = HashMap::new();
         for id in vault.records.keys() {
-            by_ulid
-                .entry(id.ulid().to_owned())
-                .or_default()
-                .push(id.clone());
+            insert_by_ulid(&mut by_ulid, id.clone());
         }
         for id in &vault.path_ids {
-            let entry = by_ulid.entry(id.ulid().to_owned()).or_default();
-            if !entry.contains(id) {
-                entry.push(id.clone());
-            }
+            insert_by_ulid(&mut by_ulid, id.clone());
+        }
+        for rec in vault.records.values() {
+            seed_prefixed_tokens(rec.source.trim_start_matches('\u{feff}'), &mut by_ulid);
+        }
+        for line in &vault.ledger_lines {
+            seed_prefixed_tokens(&line.text, &mut by_ulid);
         }
         let vault_ulids: HashSet<String> = by_ulid.keys().cloned().collect();
         let mut facts = HashMap::with_capacity(vault.records.len());
@@ -525,6 +528,21 @@ fn ledger_named_prefix(prefix: Prefix) -> bool {
     match prefix {
         Prefix::Note | Prefix::Interaction | Prefix::Deal => true,
         Prefix::Person | Prefix::Org | Prefix::Package => false,
+    }
+}
+
+fn insert_by_ulid(by_ulid: &mut HashMap<String, Vec<RecordId>>, id: RecordId) {
+    let entry = by_ulid.entry(id.ulid().to_owned()).or_default();
+    if !entry.contains(&id) {
+        entry.push(id);
+    }
+}
+
+fn seed_prefixed_tokens(text: &str, by_ulid: &mut HashMap<String, Vec<RecordId>>) {
+    for tok in scan_id_tokens(text) {
+        for id in tok.record_ids() {
+            insert_by_ulid(by_ulid, id.clone());
+        }
     }
 }
 

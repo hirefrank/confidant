@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
-use crate::id::{scan_id_tokens, IdToken, Prefix, RecordId};
+use crate::id::{record_id_from_entry_name, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
 use crate::record::{
@@ -154,6 +154,12 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
     }
 }
 
+fn seed_entry_id(name: &str, path_ids: &mut HashSet<RecordId>) {
+    if let Some(id) = record_id_from_entry_name(name) {
+        path_ids.insert(id);
+    }
+}
+
 fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
     if !paths::is_leftover_temp(name) {
         return false;
@@ -255,6 +261,7 @@ fn scan_collections(
             }
             Ok(listing) => {
                 for (name, _) in listing.errors {
+                    seed_entry_id(&name, path_ids);
                     findings.push(
                         Finding::new(
                             FindingCode::Unreadable,
@@ -268,6 +275,9 @@ fn scan_collections(
                 let prefix = Prefix::from_collection(collection).expect("known collection");
                 for ent in listing.entries {
                     let child = rel.join(&ent.name);
+                    if ent.utf8 {
+                        seed_entry_id(&ent.name, path_ids);
+                    }
                     if leftover_tmp(&ent.name, &child, findings) {
                         continue;
                     }
@@ -410,6 +420,9 @@ fn ingest_dir(
     };
     for ent in entries {
         let child = relative.join(&ent.name);
+        if ent.utf8 {
+            seed_entry_id(&ent.name, path_ids);
+        }
         if leftover_tmp(&ent.name, &child, findings) {
             continue;
         }
@@ -478,6 +491,7 @@ fn scan_person_notes(
         }
         Ok(listing) => {
             for (name, _) in listing.errors {
+                seed_entry_id(&name, path_ids);
                 findings.push(
                     Finding::new(
                         FindingCode::Unreadable,
@@ -490,6 +504,9 @@ fn scan_person_notes(
             }
             for ent in listing.entries {
                 let child = notes_rel.join(&ent.name);
+                if ent.utf8 {
+                    seed_entry_id(&ent.name, path_ids);
+                }
                 if leftover_tmp(&ent.name, &child, findings) {
                     continue;
                 }

@@ -49,12 +49,14 @@ Unicode dash plus a ULID, or a dash run (`--`, soft hyphen then `-`) plus
 a ULID, is malformed with that candidate; other glued lookalikes
 (Drive/Docs, Notion, 32-hex) are not tokens. Unicode Pd dashes plus
 U+30FC and U+2043 count as the ID dash. A bare 26-character ULID that
-exactly equals a vault record's ULID is treated as that record's ID,
-including as any 26-character window inside a Crockford run
-(`src:zoom/rec_<ULID>.vtt`, `p_<ULID>`, `p<ULID>`, `<ULID>abc`);
-near-ULID bare runs are not. Merge and open name that ID the same way.
-A path that exists but failed to load still seeds the ULID index and
-stays uncleared. If any ledger file cannot be
+exactly equals any ULID the vault names (loaded records, packages,
+dangling prefixed IDs, and path/file/directory entries that parse as a
+record ID, including `.MD`, symlinks, fifos, and other rejected entries)
+is treated as that ID, including as any 26-character window inside a
+Crockford run (`src:zoom/rec_<ULID>.vtt`, `p_<ULID>`, `p<ULID>`,
+`<ULID>abc`); near-ULID bare runs are not. Each mapped ID stays
+uncleared unless it is a cleared record or a cleared package. Merge and
+open name that ID the same way. If any ledger file cannot be
 read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code and count
 only) and no hits. Remaining limits: glued inexact IDs whose first 26
 characters do not canonicalize, non-Cf invisible characters, capitalised

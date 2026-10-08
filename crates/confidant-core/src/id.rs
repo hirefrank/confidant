@@ -241,9 +241,10 @@ pub enum IdToken {
     Malformed {
         candidate: Option<RecordId>,
     },
-    /// Exact 26-character Crockford ULID that matches a vault record
-    /// ULID, found as any 26-character window inside a Crockford run.
-    /// No near-ULID / malformed rule; only exact vault matches count.
+    /// Exact 26-character Crockford ULID that matches a ULID the vault
+    /// names (loaded records, packages, dangling prefixed IDs, path
+    /// entries), found as any 26-character window inside a Crockford
+    /// run. No near-ULID / malformed rule; only exact vault matches count.
     BareUlid(String),
 }
 
@@ -280,8 +281,8 @@ impl IdToken {
 /// ASCII `-` plus an exact ULID; a longer run whose first 26 characters are a
 /// ULID, a Unicode dash plus a ULID, or a run of dashes (`--`, soft hyphen
 /// then `-`) plus a ULID, is Malformed with that candidate. When `vault_ulids`
-/// is set, every 26-character Crockford window that exactly matches a vault
-/// ULID is also a BareUlid token (no word-boundary rule).
+/// is set, every 26-character Crockford window that exactly matches a ULID
+/// the vault names is also a BareUlid token (no word-boundary rule).
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     scan_id_tokens_against(text, None)
 }
@@ -628,6 +629,19 @@ pub(crate) fn is_id_dash(c: char) -> bool {
                 | '\u{ff0d}'
                 | '\u{10ead}'
     )
+}
+
+/// Parse a directory or file name as a record ID. Any single extension is
+/// stripped case-insensitively (`p-<ULID>.MD`, `n-<ULID>.txt`).
+pub(crate) fn record_id_from_entry_name(name: &str) -> Option<RecordId> {
+    if let Ok(id) = RecordId::parse(name) {
+        return Some(id);
+    }
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    RecordId::parse(stem).ok()
 }
 
 /// Person ID for a vault-relative path under `people/<id>/` or `people/<id>.md`.
@@ -999,5 +1013,30 @@ mod tests {
             Some(id)
         );
         assert!(super::person_id_from_path("notes/n-01M3TC5H00MPJG002NAM000005/note.md").is_none());
+    }
+
+    #[test]
+    fn record_id_from_entry_name_strips_any_extension() {
+        let cam = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        let note = RecordId::parse("n-01M3TC5H000068T0000000000C").unwrap();
+        assert_eq!(
+            super::record_id_from_entry_name(&cam.to_string()),
+            Some(cam.clone())
+        );
+        assert_eq!(
+            super::record_id_from_entry_name(&format!("{cam}.MD")),
+            Some(cam.clone())
+        );
+        assert_eq!(
+            super::record_id_from_entry_name(&format!("{cam}.md")),
+            Some(cam)
+        );
+        assert_eq!(
+            super::record_id_from_entry_name(&format!("{note}.txt")),
+            Some(note)
+        );
+        assert!(super::record_id_from_entry_name("profile.md").is_none());
+        assert!(super::record_id_from_entry_name(".MD").is_none());
+        assert!(super::record_id_from_entry_name("not-an-id.md").is_none());
     }
 }
