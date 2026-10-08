@@ -53,6 +53,10 @@ vault alias-lookup key .................... 256-bit random, one per vault
   HMAC key for alias lines; wrapped with age to devices like a data key
   (§10); stored under keys/
 
+inbox key ............................. one vault-wide X25519 keypair; the
+  private half lives in the OS keychain on the inbox device only, never
+  in git, and is not wrapped to devices or to the recovery identity (§8a)
+
 recovery identity (ADR-15) ................ 24-word phrase ->
   X25519 age recipient (unwraps every client data key) AND
   Ed25519 signing key (in the trust-anchor set, so a bare-phrase
@@ -344,9 +348,10 @@ expires = "2026-11-08"
   it was written down, exactly like `init`. `keys shred` also states its
   leftover limits plainly in its output: decrypted copies already on
   devices, `.confidant/` caches and search indexes on every device, old
-  keys lingering in OS keychains or OS backups, and copies outside
-  Confidant entirely (e.g. Drive transcripts). Shredding cannot reach any
-  of these.
+  keys lingering in OS keychains or OS backups, copies outside
+  Confidant entirely (e.g. Drive transcripts), and — until
+  `confidant inbox rotate --finish` has run — the old inbox key.
+  Shredding cannot reach any of these.
 
 ## 8a. Inbox key (issue #36)
 
@@ -411,10 +416,10 @@ vault-wide keypair:
 - The phrase derives two keys via HKDF-SHA256 from the raw BIP39 entropy
   (256 bits, **no passphrase** — the entropy goes straight into HKDF).
   Domain separation, with fixed salt `confidant1/recovery`:
-  - `X25519_sk = HKDF-SHA256(entropy, salt, info="confidant1/recovery/age-x25519")`
+  - `X25519_sk = HKDF-SHA256(entropy, salt, info="confidant/recovery/x25519/v1")`
     (age recipient; every client data key is wrapped to it:
     `wrapped/recovery.age`)
-  - `Ed25519_seed = HKDF-SHA256(entropy, salt, info="confidant1/recovery/ed25519-sign")`
+  - `Ed25519_seed = HKDF-SHA256(entropy, salt, info="confidant/recovery/ed25519/v1")`
     (trust-anchor signing key, so a bare-phrase recovery can authorize the
     new device's recipient manifest)
 - `confidant doctor` warns when any client key isn't wrapped to the
@@ -490,9 +495,10 @@ in the repo, tests, or CI.
 7. **Revocation:** after revoke (+ optional rotate), the revoked key
    cannot unwrap new epochs, and the revoked party's old-epoch wrappings
    are gone from the working tree — re-wrap covers all retained epochs
-   (§6). Old-epoch ciphertext the revoked party already copied remains
-   readable by still-authorized parties (documents future-writes-only,
-   ADR-5).
+   (§6). Still-authorized parties keep reading all retained epochs
+   through the re-wrapped keys. The revoked party can still decrypt
+   whatever ciphertext plus old wrappings it copied before revocation
+   (documents future-writes-only, ADR-5).
 8. **Shredding:** after `keys shred` plus rotation, the old private keys
    are destroyed: the shredded client's historical wrappings (all epochs)
    cannot be opened by any former recipient, while other clients' records
@@ -693,3 +699,16 @@ tree, and names who can still read old-epoch ciphertext
 the removed §15 Q8; the six §15 questions moved under Resolved with
 Silas's one-line calls and issue links, so the implementation builds from
 this doc alone.
+
+## 20. Inbox-key review round (2026-10-08)
+
+Per Silas's "change" review of PR #60 (#56): `keys shred`'s leftover-limits
+list now names the pending `inbox rotate --finish` — until it runs, the old
+inbox key still exists on the inbox device (§8); §2's key hierarchy gains
+the vault-wide inbox keypair (private half in the OS keychain on the inbox
+device only, never in git, not wrapped to devices or the recovery
+identity); §9's HKDF `info` strings now match §15 Q6 and the implementation
+(`confidant/recovery/x25519/v1`, `confidant/recovery/ed25519/v1`); test 7
+states the two revocation facts separately per the #21 wording nit
+(still-authorized parties keep reading all retained epochs; the revoked
+party can still decrypt what it copied before revocation).
