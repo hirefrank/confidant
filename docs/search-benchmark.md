@@ -41,10 +41,10 @@ Session-note and paid-gap checks are `off` in the generated config so
 
 ## Results
 
-Measured 2026-10-08 on the milestone 1 cloud-agent VM after the section 12
-allowlist (shared front-matter offsets, raw FM comment/key scan, session
-`note:` reverse map, 20–32 character malformed IDs, one tokenize per line,
-`HashSet` reverse deps).
+Measured 2026-10-08 on the milestone 1 cloud-agent VM after Review #8
+(word-boundary malformed IDs, Cf stripping, candidate lookalikes, all
+`ledger/**/*.cfd` link scan). `find` hit counts match `grep -ri` exactly
+(1 unique, 2,400 common).
 
 Hardware: Intel Xeon (4 logical CPUs), Linux 6.12, `confidant` release
 build (`rustc 1.99.0`). Hyperfine 2.0.0, **3 warmup runs, 10 timed runs**.
@@ -52,9 +52,9 @@ Spread is mean ± one standard deviation; min and max are the observed range.
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| `find zxqvUniqueTokenAda0` (one profile) | 1 | **103.5 ms** | 2.7 ms | 99.1 ms | 107.5 ms |
-| `find coaching-practice` (every record) | 2,400 | **109.4 ms** | 4.3 ms | 104.8 ms | 119.0 ms |
-| `check` | 0 findings | **81.3 ms** | 12.9 ms | 74.3 ms | 114.7 ms |
+| `find zxqvUniqueTokenAda0` (one profile) | 1 | **127.7 ms** | 9.4 ms | 120.6 ms | 152.9 ms |
+| `find coaching-practice` (every record) | 2,400 | **129.4 ms** | 5.6 ms | 123.6 ms | 142.5 ms |
+| `check` | 0 findings | **95.7 ms** | 16.1 ms | 80.9 ms | 119.0 ms |
 
 Peak RSS was about 34–43 MiB (check ~34 MiB, find ~43 MiB).
 
@@ -62,8 +62,8 @@ Peak RSS was about 34–43 MiB (check ~34 MiB, find ~43 MiB).
 
 A sequential plaintext scan of a few hundred clients, with realistic
 note sizes (KB transcripts), dozens of sessions per client, and
-multi-year ledgers, stays around **100–110 ms** for `find` (cleared
-allowlist plus scan) and **80 ms** for `check` — still inside interactive
+multi-year ledgers, stays around **125–130 ms** for `find` (cleared
+allowlist plus scan) and **95 ms** for `check` — still inside interactive
 range. The earlier ~70 ms `find` figure was the same 400×5 layout before
 the fixed-point allowlist.
 
