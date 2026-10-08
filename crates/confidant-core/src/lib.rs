@@ -5,18 +5,23 @@
 // Unsafe is denied crate-wide. The Unix `openat` / `O_NOFOLLOW` walk in
 // `paths` is the only exception, matching cr (ADR-13).
 #![deny(unsafe_code)]
+// Large hand-authored `json!` schema literals need a deeper macro expansion.
+#![recursion_limit = "256"]
 
 pub mod bench;
 pub mod check;
 pub mod config;
+pub mod context;
 pub mod discover;
 pub mod error;
 pub mod id;
 pub mod ledger;
 pub mod paths;
 pub mod record;
+pub mod schema;
 pub mod search;
 pub mod vault;
+pub mod write;
 
 pub mod packs;
 
