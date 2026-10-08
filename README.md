@@ -32,8 +32,10 @@ dropped. Ledger lines are searchable only when every ID on the line is
 cleared. Findings are themselves an allowlist: kept verbatim only when
 they have no file and no ID, or resolve to a cleared record or ledger
 line; otherwise a code and a count, never a path or raw text. Name-only
-mentions with no ID (prose, comments, `person: "Jane Doe"`) are not
-detected. Milestone 3 `context` continues to honour `no-ai`.
+mentions with no ID are not detected in body prose and comments; a
+`person` / `org` / `deal` value that is not a record ID (`person: "Jane Doe"`)
+is `E_INVALID_ID` and uncleared. Milestone 3 `context` continues to honour
+`no-ai`.
 
 ## Quickstart
 

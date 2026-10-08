@@ -21,9 +21,10 @@ use serde::Serialize;
 
 use crate::config::{parse_iso_date, VaultConfig, SPEC_VERSION};
 use crate::error::DomainError;
-use crate::id::{scan_id_tokens, IdToken, Prefix, RecordId};
+use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_decimal_hundredths, parse_duration_minutes, Arg, LedgerEntry};
 use crate::packs::coaching::{self, CoachingState};
+use crate::record::parse_ref_id;
 use crate::vault::Vault;
 
 /// How serious a finding is.
@@ -867,12 +868,9 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
     for rec in vault.records.values() {
         for key in REF_KEYS {
             let Some(raw) = rec.field(key) else { continue };
-            match RecordId::parse(raw) {
-                Err(_) => {
-                    if scan_id_tokens(raw)
-                        .iter()
-                        .any(|tok| matches!(tok, IdToken::Malformed))
-                    {
+            match parse_ref_id(raw) {
+                None => {
+                    if scan_id_tokens(raw).iter().any(|tok| tok.is_malformed()) {
                         continue;
                     }
                     findings.push(
@@ -886,7 +884,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                         .with_fix("Use a prefixed 26-character Crockford ULID"),
                     );
                 }
-                Ok(id) if !known_ids.contains(&id) => findings.push(
+                Some(id) if !known_ids.contains(&id) => findings.push(
                     Finding::new(
                         FindingCode::DanglingRef,
                         Severity::Error,
@@ -896,7 +894,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     .for_id(&rec.id)
                     .with_fix("Create the record or fix the reference"),
                 ),
-                Ok(_) => {}
+                Some(_) => {}
             }
         }
     }

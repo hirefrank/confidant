@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::id::{Prefix, RecordId};
+use crate::id::{strip_cf, Prefix, RecordId};
 use crate::ledger::parse_strict_date;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +128,20 @@ pub(crate) fn is_spec_key(key: &str) -> bool {
 
 /// Spec key on a raw front-matter line, if any. Comments and unknown keys
 /// return `None` so callers can name the line without echoing it.
+/// Parse a `person` / `org` / `deal` front-matter value as a record ID after
+/// stripping format characters, surrounding quotes, and `[[ ]]`.
+pub(crate) fn parse_ref_id(raw: &str) -> Option<RecordId> {
+    let stripped = strip_cf(raw);
+    let unquoted = unquote(stripped.trim());
+    let trimmed = unquoted.trim();
+    let inner = trimmed
+        .strip_prefix("[[")
+        .and_then(|s| s.strip_suffix("]]"))
+        .unwrap_or(trimmed)
+        .trim();
+    RecordId::parse(inner).ok()
+}
+
 pub(crate) fn frontmatter_line_spec_key(raw: &str) -> Option<String> {
     let line = raw.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -595,5 +609,20 @@ mod tests {
         );
         assert!(super::frontmatter_line_spec_key("# see p-01M3TC5H00MPJG000000000000").is_none());
         assert!(super::frontmatter_line_spec_key("see: p-01M3TC5H00MPJG000000000000").is_none());
+    }
+
+    #[test]
+    fn parse_ref_id_strips_quotes_wikilinks_and_cf() {
+        let id = crate::id::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(
+            super::parse_ref_id("[[p-01M3TC5H00MPJG000000000000]]"),
+            Some(id.clone())
+        );
+        assert_eq!(
+            super::parse_ref_id("\"p-\u{200b}01M3TC5H00MPJG000000000000\""),
+            Some(id)
+        );
+        assert!(super::parse_ref_id("Jane Doe").is_none());
+        assert!(super::parse_ref_id("\"Jane Doe\"").is_none());
     }
 }

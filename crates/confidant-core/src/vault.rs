@@ -28,6 +28,9 @@ pub struct LedgerLine {
     pub line: u32,
     pub text: String,
     pub id: Option<String>,
+    /// Canonical `ledger/YYYY/MM.cfd` lines are searchable. Other `*.cfd`
+    /// files are read only for link tokens (notes, merges, package openers).
+    pub searchable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +41,8 @@ pub struct Vault {
     pub entries: Vec<SourcedEntry>,
     pub ledger_lines: Vec<LedgerLine>,
     pub load_findings: Vec<Finding>,
+    /// True when any ledger path could not be read. Search then fails closed.
+    pub ledger_unread: bool,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -72,10 +77,17 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut records = BTreeMap::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
+    let mut ledger_unread = false;
 
     if config.spec == SPEC_VERSION {
         scan_collections(root, &mut records, &mut findings);
-        scan_ledger(root, &mut entries, &mut ledger_lines, &mut findings);
+        scan_ledger(
+            root,
+            &mut entries,
+            &mut ledger_lines,
+            &mut findings,
+            &mut ledger_unread,
+        );
         scan_unexpected_top_level(root, &mut findings);
     }
 
@@ -86,6 +98,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         entries,
         ledger_lines,
         load_findings: findings,
+        ledger_unread,
     })
 }
 
@@ -611,10 +624,7 @@ fn flag_malformed_frontmatter(rec: &Record, findings: &mut Vec<Finding>) {
         if line_no >= rec.body_start_line {
             break;
         }
-        if !scan_id_tokens(line)
-            .iter()
-            .any(|tok| matches!(tok, IdToken::Malformed))
-        {
+        if !scan_id_tokens(line).iter().any(IdToken::is_malformed) {
             continue;
         }
         let message = match frontmatter_line_spec_key(line) {
@@ -636,143 +646,187 @@ fn scan_ledger(
     entries: &mut Vec<SourcedEntry>,
     ledger_lines: &mut Vec<LedgerLine>,
     findings: &mut Vec<Finding>,
+    unread: &mut bool,
 ) {
     let ledger_rel = Path::new("ledger");
     match paths::read_dir(root, ledger_rel) {
         Err(err) if crate::error::is_missing(&err) => {}
         Err(_) => {
             let _ = list_dir(root, ledger_rel, findings);
+            *unread = true;
+        }
+        Ok(_) => walk_ledger(root, ledger_rel, entries, ledger_lines, findings, unread),
+    }
+}
+
+fn walk_ledger(
+    root: &Path,
+    rel: &Path,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+    unread: &mut bool,
+) {
+    let listing = match paths::read_dir(root, rel) {
+        Err(_) => {
+            let _ = list_dir(root, rel, findings);
+            *unread = true;
+            return;
         }
         Ok(listing) => {
+            if !listing.errors.is_empty() {
+                *unread = true;
+            }
             for (name, msg) in listing.errors {
                 findings.push(
                     Finding::new(FindingCode::Unreadable, Severity::Error, msg)
-                        .at_file(paths::display_relative(&ledger_rel.join(&name)))
+                        .at_file(paths::display_relative(&rel.join(&name)))
                         .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
-            for year_ent in listing.entries {
-                let year_rel = ledger_rel.join(&year_ent.name);
-                if leftover_tmp(&year_ent.name, &year_rel, findings) {
-                    continue;
-                }
-                if !year_ent.utf8 || year_ent.kind == EntryKind::Symlink {
-                    flag_entry(&year_ent, &year_rel, findings);
-                    continue;
-                }
-                if paths::skip_walk_entry(&year_ent.name, year_ent.kind) {
-                    continue;
-                }
-                if year_ent.kind != EntryKind::Directory || !is_yyyy(&year_ent.name) {
+            listing.entries
+        }
+    };
+    for ent in listing {
+        let child = rel.join(&ent.name);
+        if leftover_tmp(&ent.name, &child, findings) {
+            continue;
+        }
+        if !ent.utf8 || ent.kind == EntryKind::Symlink {
+            flag_entry(&ent, &child, findings);
+            continue;
+        }
+        if paths::skip_walk_entry(&ent.name, ent.kind) {
+            continue;
+        }
+        match ent.kind {
+            EntryKind::Directory => {
+                if rel == Path::new("ledger") && !is_yyyy(&ent.name) {
                     findings.push(
                         Finding::new(
                             FindingCode::LedgerPath,
                             Severity::Error,
-                            format!(
-                                "ledger/{} is not a four-digit year directory",
-                                year_ent.name
-                            ),
+                            format!("ledger/{} is not a four-digit year directory", ent.name),
                         )
-                        .at_file(paths::display_relative(&year_rel))
+                        .at_file(paths::display_relative(&child))
                         .with_fix("Use ledger/YYYY/MM.cfd"),
                     );
-                    continue;
                 }
-                let months = match list_dir(root, &year_rel, findings) {
-                    Listed::Failed => continue,
-                    Listed::Ok(m) => m,
-                };
-                for month_ent in months {
-                    let file_rel = year_rel.join(&month_ent.name);
-                    let file = paths::display_relative(&file_rel);
-                    if leftover_tmp(&month_ent.name, &file_rel, findings) {
-                        continue;
-                    }
-                    if !month_ent.utf8 || month_ent.kind == EntryKind::Symlink {
-                        flag_entry(&month_ent, &file_rel, findings);
-                        continue;
-                    }
-                    if paths::skip_walk_entry(&month_ent.name, month_ent.kind) {
-                        continue;
-                    }
-                    if month_ent.kind != EntryKind::File || !is_month_cfd(&month_ent.name) {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::LedgerPath,
-                                Severity::Error,
-                                format!("'{file}' is not MM.cfd"),
-                            )
-                            .at_file(&file)
-                            .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
-                        );
-                        continue;
-                    }
-                    let text = match paths::read_to_string(root, &file_rel) {
-                        Ok(t) => t,
-                        Err(err) => {
-                            findings.push(
-                                Finding::new(
-                                    FindingCode::Unreadable,
-                                    Severity::Error,
-                                    format!("{err:#}"),
-                                )
-                                .at_file(&file),
-                            );
-                            continue;
-                        }
-                    };
-                    if has_conflict_markers(&text) {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::MergeConflict,
-                                Severity::Error,
-                                format!("'{file}' contains git conflict markers"),
-                            )
-                            .at_file(&file),
-                        );
-                    }
-                    let text = text.trim_start_matches('\u{feff}');
-                    let (parsed, errors) = parse_ledger(text);
-                    for err in errors {
-                        let code = match err.kind {
-                            ParseErrorKind::InvalidId => FindingCode::InvalidId,
-                            ParseErrorKind::Grammar => FindingCode::Parse,
-                        };
-                        findings.push(
-                            Finding::new(code, Severity::Error, err.message)
-                                .at_file(&file)
-                                .at_line(err.line)
-                                .with_fix(err.fix),
-                        );
-                    }
-                    let mut by_line: BTreeMap<u32, LedgerEntry> = BTreeMap::new();
-                    for (line, entry) in parsed {
-                        by_line.insert(line, entry);
-                    }
-                    for (idx, raw) in text.lines().enumerate() {
-                        let line = idx as u32 + 1;
-                        if raw.trim().is_empty() {
-                            continue;
-                        }
-                        let entry = by_line.remove(&line);
-                        ledger_lines.push(LedgerLine {
-                            file: file.clone(),
-                            line,
-                            text: raw.to_owned(),
-                            id: entry.as_ref().map(|e| e.id.to_string()),
-                        });
-                        if let Some(entry) = entry {
-                            entries.push(SourcedEntry {
-                                file: file.clone(),
-                                line,
-                                entry,
-                            });
-                        }
-                    }
-                }
+                walk_ledger(root, &child, entries, ledger_lines, findings, unread);
+            }
+            EntryKind::File if ent.name.ends_with(".cfd") => {
+                load_cfd_file(root, &child, entries, ledger_lines, findings, unread);
+            }
+            EntryKind::File => {
+                findings.push(
+                    Finding::new(
+                        FindingCode::LedgerPath,
+                        Severity::Error,
+                        format!("'{}' is not MM.cfd", paths::display_relative(&child)),
+                    )
+                    .at_file(paths::display_relative(&child))
+                    .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn load_cfd_file(
+    root: &Path,
+    rel: &Path,
+    entries: &mut Vec<SourcedEntry>,
+    ledger_lines: &mut Vec<LedgerLine>,
+    findings: &mut Vec<Finding>,
+    unread: &mut bool,
+) {
+    let file = paths::display_relative(rel);
+    let searchable = is_canonical_ledger_cfd(rel);
+    if !searchable {
+        findings.push(
+            Finding::new(
+                FindingCode::LedgerPath,
+                Severity::Error,
+                format!("'{file}' is not MM.cfd"),
+            )
+            .at_file(&file)
+            .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
+        );
+    }
+    let text = match paths::read_to_string(root, rel) {
+        Ok(t) => t,
+        Err(err) => {
+            *unread = true;
+            findings.push(
+                Finding::new(FindingCode::Unreadable, Severity::Error, format!("{err:#}"))
+                    .at_file(&file)
+                    .with_fix("Fix permissions or replace the unreadable path"),
+            );
+            return;
+        }
+    };
+    if has_conflict_markers(&text) {
+        findings.push(
+            Finding::new(
+                FindingCode::MergeConflict,
+                Severity::Error,
+                format!("'{file}' contains git conflict markers"),
+            )
+            .at_file(&file),
+        );
+    }
+    let text = text.trim_start_matches('\u{feff}');
+    let mut by_line: BTreeMap<u32, LedgerEntry> = BTreeMap::new();
+    if searchable {
+        let (parsed, errors) = parse_ledger(text);
+        for err in errors {
+            let code = match err.kind {
+                ParseErrorKind::InvalidId => FindingCode::InvalidId,
+                ParseErrorKind::Grammar => FindingCode::Parse,
+            };
+            findings.push(
+                Finding::new(code, Severity::Error, err.message)
+                    .at_file(&file)
+                    .at_line(err.line)
+                    .with_fix(err.fix),
+            );
+        }
+        for (line, entry) in parsed {
+            by_line.insert(line, entry);
+        }
+    }
+    for (idx, raw) in text.lines().enumerate() {
+        let line = idx as u32 + 1;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let entry = by_line.remove(&line);
+        ledger_lines.push(LedgerLine {
+            file: file.clone(),
+            line,
+            text: raw.to_owned(),
+            id: entry.as_ref().map(|e| e.id.to_string()),
+            searchable,
+        });
+        if searchable {
+            if let Some(entry) = entry {
+                entries.push(SourcedEntry {
+                    file: file.clone(),
+                    line,
+                    entry,
+                });
             }
         }
     }
+}
+
+fn is_canonical_ledger_cfd(rel: &Path) -> bool {
+    let mut parts = rel.iter().filter_map(|s| s.to_str());
+    parts.next() == Some("ledger")
+        && parts.next().is_some_and(is_yyyy)
+        && parts.next().is_some_and(is_month_cfd)
+        && parts.next().is_none()
 }
 
 fn is_yyyy(s: &str) -> bool {

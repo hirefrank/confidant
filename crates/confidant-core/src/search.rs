@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use crate::check::{parse_merge, sort_findings, Finding, FindingCode, MergeParse, Severity};
+use crate::check::{sort_findings, Finding, FindingCode, Severity};
 use crate::id::{person_id_from_path, scan_id_tokens, scan_ids, IdToken, Prefix, RecordId};
+use crate::ledger::ledger_line_verb;
+use crate::record::parse_ref_id;
 use crate::vault::Vault;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -26,6 +28,7 @@ pub struct SearchResult {
 struct RecordFacts {
     fm_ids: Vec<RecordId>,
     fm_malformed: bool,
+    fm_bad_ref: bool,
     path_person: Option<RecordId>,
     /// Tokenized once from BOM-stripped source; 1-based line numbers.
     line_tokens: Vec<(u32, Vec<IdToken>)>,
@@ -103,15 +106,14 @@ impl<'a> Allowlist<'a> {
         let mut note_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
             for tok in toks {
-                let IdToken::Valid(id) = tok else {
-                    continue;
-                };
-                if id.prefix() != Prefix::Note {
-                    continue;
-                }
-                let lines = note_ledger_lines.entry(id.clone()).or_default();
-                if lines.last() != Some(&idx) {
-                    lines.push(idx);
+                for id in tok.record_ids() {
+                    if id.prefix() != Prefix::Note {
+                        continue;
+                    }
+                    let lines = note_ledger_lines.entry(id.clone()).or_default();
+                    if lines.last() != Some(&idx) {
+                        lines.push(idx);
+                    }
                 }
             }
         }
@@ -127,9 +129,11 @@ impl<'a> Allowlist<'a> {
         };
         allow.cleared = compute_cleared(&allow);
         allow.ledger_ok = allow
-            .ledger_tokens
+            .vault
+            .ledger_lines
             .iter()
-            .map(|toks| tokens_allowed(toks, &allow.cleared))
+            .zip(allow.ledger_tokens.iter())
+            .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow.cleared))
             .collect();
         allow
     }
@@ -138,8 +142,8 @@ impl<'a> Allowlist<'a> {
 fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
     let vault = allow.vault;
     let tainted = tainted_ids(vault);
-    let components = merge_components(vault);
-    let (pkg_openers, person_pkgs) = pkg_openers(vault);
+    let components = merge_components(allow);
+    let (pkg_openers, person_pkgs) = pkg_openers(allow);
     let dependents = reverse_deps(allow, &pkg_openers);
 
     let mut cleared: HashSet<RecordId> = vault
@@ -188,6 +192,9 @@ fn still_cleared(
     pkg_openers: &HashMap<RecordId, Vec<RecordId>>,
 ) -> bool {
     if id.prefix() == Prefix::Package {
+        if allow.vault.ledger_unread {
+            return false;
+        }
         return pkg_openers
             .get(id)
             .is_some_and(|openers| pkg_is_clear(openers, cleared));
@@ -198,7 +205,7 @@ fn still_cleared(
     if tainted.contains(id) {
         return false;
     }
-    if facts.fm_malformed {
+    if facts.fm_malformed || facts.fm_bad_ref {
         return false;
     }
     if facts.fm_ids.iter().any(|fid| !cleared.contains(fid)) {
@@ -220,6 +227,19 @@ fn still_cleared(
             .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared))
         {
             return false;
+        }
+    }
+    if allow.vault.ledger_unread {
+        if id.prefix() == Prefix::Note {
+            match &facts.path_person {
+                Some(person) if cleared.contains(person) => {}
+                _ => return false,
+            }
+        }
+        if let Some(members) = components.members_of(id) {
+            if members.len() > 1 {
+                return false;
+            }
         }
     }
     true
@@ -289,7 +309,7 @@ impl MergeComponents {
     }
 }
 
-fn merge_components(vault: &Vault) -> MergeComponents {
+fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
     let mut parent: HashMap<RecordId, RecordId> = HashMap::new();
     let find = |parent: &mut HashMap<RecordId, RecordId>, id: &RecordId| -> RecordId {
         if !parent.contains_key(id) {
@@ -320,15 +340,24 @@ fn merge_components(vault: &Vault) -> MergeComponents {
         }
     };
 
-    for rec in vault.records.values() {
+    for rec in allow.vault.records.values() {
         find(&mut parent, &rec.id);
     }
-    for sourced in &vault.entries {
-        if sourced.entry.verb != "merge" {
+    for (line, toks) in allow
+        .vault
+        .ledger_lines
+        .iter()
+        .zip(allow.ledger_tokens.iter())
+    {
+        if ledger_line_verb(&line.text).as_deref() != Some("merge") {
             continue;
         }
-        if let MergeParse::Ok { from, to } = parse_merge(&sourced.entry) {
-            union(&mut parent, &from, &to);
+        let ids: Vec<RecordId> = toks.iter().flat_map(IdToken::record_ids).cloned().collect();
+        for id in &ids {
+            find(&mut parent, id);
+        }
+        for pair in ids.windows(2) {
+            union(&mut parent, &pair[0], &pair[1]);
         }
     }
 
@@ -349,35 +378,41 @@ fn merge_components(vault: &Vault) -> MergeComponents {
 }
 
 fn pkg_openers(
-    vault: &Vault,
+    allow: &Allowlist<'_>,
 ) -> (
     HashMap<RecordId, Vec<RecordId>>,
     HashMap<RecordId, Vec<RecordId>>,
 ) {
     let mut pkg_openers: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
     let mut person_pkgs: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-    for sourced in &vault.entries {
-        if sourced.entry.verb != "open" || sourced.entry.id.prefix() != Prefix::Person {
+    for (line, toks) in allow
+        .vault
+        .ledger_lines
+        .iter()
+        .zip(allow.ledger_tokens.iter())
+    {
+        if ledger_line_verb(&line.text).as_deref() != Some("open") {
             continue;
         }
-        let person = sourced.entry.id.clone();
-        for arg in &sourced.entry.args {
-            let Some(token) = arg.as_token() else {
-                continue;
-            };
-            let Ok(pkg) = RecordId::parse(token) else {
-                continue;
-            };
-            if pkg.prefix() != Prefix::Package {
-                continue;
+        let mut people = Vec::new();
+        let mut pkgs = Vec::new();
+        for id in toks.iter().flat_map(IdToken::record_ids) {
+            match id.prefix() {
+                Prefix::Person => people.push(id.clone()),
+                Prefix::Package => pkgs.push(id.clone()),
+                Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note => {}
             }
-            let openers = pkg_openers.entry(pkg.clone()).or_default();
-            if !openers.contains(&person) {
-                openers.push(person.clone());
-            }
-            let pkgs = person_pkgs.entry(person.clone()).or_default();
-            if !pkgs.contains(&pkg) {
-                pkgs.push(pkg);
+        }
+        for pkg in &pkgs {
+            for person in &people {
+                let openers = pkg_openers.entry(pkg.clone()).or_default();
+                if !openers.contains(person) {
+                    openers.push(person.clone());
+                }
+                let person_pkgs_for = person_pkgs.entry(person.clone()).or_default();
+                if !person_pkgs_for.contains(pkg) {
+                    person_pkgs_for.push(pkg.clone());
+                }
             }
         }
     }
@@ -410,7 +445,7 @@ fn reverse_deps(
     for (note, idxs) in &allow.note_ledger_lines {
         for &idx in idxs {
             for tok in &allow.ledger_tokens[idx] {
-                if let IdToken::Valid(id) = tok {
+                for id in tok.record_ids() {
                     link(id.clone(), note.clone());
                 }
             }
@@ -430,16 +465,21 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
         if line_no < rec.body_start_line {
             for tok in &toks {
                 match tok {
-                    IdToken::Malformed => fm_malformed = true,
+                    IdToken::Malformed { .. } => fm_malformed = true,
                     IdToken::Valid(id) => fm_ids.push(id.clone()),
                 }
             }
         }
         line_tokens.push((line_no, toks));
     }
+    let fm_bad_ref = ["person", "org", "deal"].iter().any(|key| {
+        rec.field(key)
+            .is_some_and(|raw| parse_ref_id(raw).is_none())
+    });
     RecordFacts {
         fm_ids,
         fm_malformed,
+        fm_bad_ref,
         path_person: person_id_from_path(&rec.path),
         line_tokens,
     }
@@ -448,7 +488,7 @@ fn record_facts(rec: &crate::record::Record) -> RecordFacts {
 fn tokens_allowed(toks: &[IdToken], cleared: &HashSet<RecordId>) -> bool {
     for tok in toks {
         match tok {
-            IdToken::Malformed => return false,
+            IdToken::Malformed { .. } => return false,
             IdToken::Valid(id) => {
                 if !cleared.contains(id) {
                     return false;

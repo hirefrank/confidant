@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 
-use crate::id::RecordId;
+use crate::id::{strip_cf, RecordId};
 
 /// One argument after the record ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +69,20 @@ pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
         return None;
     }
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+/// Case-folded verb after the date on a ledger line, if the line looks like
+/// `DATE VERB …`. Used so search can join merge/open IDs on unparsable lines.
+pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
+    let stripped = strip_cf(text);
+    let trimmed = stripped.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return None;
+    }
+    let (date, rest) = trimmed.split_once(char::is_whitespace)?;
+    parse_strict_date(date)?;
+    let verb = rest.trim_start().split(char::is_whitespace).next()?;
+    Some(verb.to_ascii_lowercase())
 }
 
 impl LedgerEntry {

@@ -46,14 +46,16 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
-cleared records and ledger lines are searchable. A note is cleared only when any ledger line that names it is
-allowed. A finding is kept
+cleared records and ledger lines are searchable. A note is cleared only
+when every ledger line that names it is allowed. A finding is kept
 verbatim only when it has no file and no ID, or when it resolves to a
 cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,
 key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
-is code and count only. Name-only mentions with no ID are not detected.
-Ledger parse errors give the line number and code without echoing tokens.
+is code and count only. Name-only mentions with no ID are not detected
+in body prose and comments; a `person` / `org` / `deal` value that is
+not a record ID is `E_INVALID_ID` and uncleared. Ledger parse errors
+give the line number and code without echoing tokens.
 
 Command-level error codes (not check findings):
 

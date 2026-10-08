@@ -1,5 +1,6 @@
 //! Collision-free prefixed ULIDs (ADR-3).
 
+use std::borrow::Cow;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
@@ -215,15 +216,37 @@ pub fn is_ulid(s: &str) -> bool {
 pub enum IdToken {
     Valid(RecordId),
     /// Prefix + dash + alphanumeric run that fails ULID validation.
-    Malformed,
+    /// `candidate` is a recoverable ID when the lookalike embeds one:
+    /// a Unicode-dash run that canonicalizes, or the first 26 characters
+    /// of a longer run.
+    Malformed {
+        candidate: Option<RecordId>,
+    },
+}
+
+impl IdToken {
+    pub(crate) fn record_ids(&self) -> impl Iterator<Item = &RecordId> {
+        match self {
+            Self::Valid(id) => Some(id),
+            Self::Malformed { candidate } => candidate.as_ref(),
+        }
+        .into_iter()
+    }
+
+    pub(crate) fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed { .. })
+    }
 }
 
 /// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
 /// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
-/// inside junk such as `[[p-…]]` and with an alphanumeric glued in front
-/// (`xp-<ULID>`). A run that is not a Crockford ULID is
-/// [`IdToken::Malformed`].
+/// inside junk such as `[[p-…]]`. Format characters (ZWSP, soft hyphen,
+/// word joiner, …) are stripped first. After an ASCII alphanumeric, only a
+/// Valid token (`-` plus an exact ULID) matches; malformed lookalikes and
+/// the over-32 tail rule apply only at a word boundary.
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
+    let stripped = strip_cf(text);
+    let text = stripped.as_ref();
     if !text.as_bytes().contains(&b'-')
         && (!text.as_bytes().iter().any(|b| *b >= 0x80) || !text.chars().any(is_id_dash))
     {
@@ -231,18 +254,57 @@ pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     }
     let mut out = Vec::new();
     let mut remaining = text;
+    let mut prev_alnum = false;
     while !remaining.is_empty() {
         if starts_id_prefix(remaining) {
-            if let Some((tok, len)) = match_id_token_at(remaining) {
+            if let Some((tok, len)) = match_id_token_at(remaining, prev_alnum) {
                 out.push(tok);
                 remaining = &remaining[len..];
+                prev_alnum = true;
                 continue;
             }
         }
         let ch = remaining.chars().next().unwrap();
+        prev_alnum = ch.is_ascii_alphanumeric();
         remaining = &remaining[ch.len_utf8()..];
     }
     out
+}
+
+/// Unicode General Category Cf (Format): ZWSP, soft hyphen, word joiner, BOM,
+/// bidi marks, tags.
+pub(crate) fn is_cf(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+pub(crate) fn strip_cf(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() || !s.chars().any(is_cf) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(s.chars().filter(|c| !is_cf(*c)).collect())
 }
 
 fn starts_id_prefix(s: &str) -> bool {
@@ -258,12 +320,12 @@ pub fn scan_ids(text: &str) -> Vec<RecordId> {
         .into_iter()
         .filter_map(|tok| match tok {
             IdToken::Valid(id) => Some(id),
-            IdToken::Malformed => None,
+            IdToken::Malformed { .. } => None,
         })
         .collect()
 }
 
-fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
+fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
     const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
     for pref in PREFIXES {
         let plen = pref.len();
@@ -288,9 +350,24 @@ fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
             .unwrap_or(after.len() - run_start);
         let total = plen + run_start + run_len;
         let run = &after[run_start..run_start + run_len];
+        if glued {
+            // After an alphanumeric, only '-' plus an exact ULID is an ID.
+            if dash != '-' || run_len != ULID_LEN {
+                continue;
+            }
+            if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
+                return Some((IdToken::Valid(id), total));
+            }
+            continue;
+        }
         if run_len > 32 {
-            if dash == '-' && canonicalize_ulid(&run[..26]).is_some() {
-                return Some((IdToken::Malformed, total));
+            if let Some(candidate) = lookalike_candidate(pref, run) {
+                return Some((
+                    IdToken::Malformed {
+                        candidate: Some(candidate),
+                    },
+                    total,
+                ));
             }
             continue;
         }
@@ -302,9 +379,22 @@ fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
                 return Some((IdToken::Valid(id), total));
             }
         }
-        return Some((IdToken::Malformed, total));
+        let candidate = lookalike_candidate(pref, run);
+        return Some((IdToken::Malformed { candidate }, total));
     }
     None
+}
+
+fn lookalike_candidate(pref: &str, run: &str) -> Option<RecordId> {
+    let prefix = Prefix::parse(pref)?;
+    if let Ok(id) = RecordId::new(prefix, run.to_owned()) {
+        return Some(id);
+    }
+    if run.len() > ULID_LEN {
+        RecordId::new(prefix, run[..ULID_LEN].to_owned()).ok()
+    } else {
+        None
+    }
 }
 
 pub(crate) fn is_id_dash(c: char) -> bool {
@@ -418,12 +508,19 @@ mod tests {
     #[test]
     fn scan_id_tokens_flags_malformed_ulid_and_unicode_dash() {
         use super::{scan_id_tokens, IdToken};
+        let id = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let none = IdToken::Malformed { candidate: None };
         let bad_letter = scan_id_tokens("see p-01M3TC5H00MPJG00000000000I");
-        assert_eq!(bad_letter, vec![IdToken::Malformed]);
+        assert_eq!(bad_letter, vec![none.clone()]);
         let short = scan_id_tokens("p-01M3TC5H00MPJG00000000000");
-        assert_eq!(short, vec![IdToken::Malformed]);
+        assert_eq!(short, vec![none.clone()]);
         let en_dash = scan_id_tokens("p\u{2013}01M3TC5H00MPJG000000000000");
-        assert_eq!(en_dash, vec![IdToken::Malformed]);
+        assert_eq!(
+            en_dash,
+            vec![IdToken::Malformed {
+                candidate: Some(id.clone())
+            }]
+        );
         assert!(scan_id_tokens("merged-deal-token").is_empty());
         assert!(scan_id_tokens("zxqv-unique-token-ada-0").is_empty());
         for prose in [
@@ -443,15 +540,41 @@ mod tests {
             );
         }
         let short_real = scan_id_tokens("p-01M3TC5H00MPJG00000000000");
-        assert_eq!(short_real, vec![IdToken::Malformed]);
-        let id = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(short_real, vec![none.clone()]);
         assert_eq!(
             scan_id_tokens("xp-01M3TC5H00MPJG000000000000"),
-            vec![IdToken::Valid(id)]
+            vec![IdToken::Valid(id.clone())]
         );
         assert_eq!(
             scan_id_tokens("p-01M3TC5H00MPJG000000000000abcdefg"),
-            vec![IdToken::Malformed]
+            vec![IdToken::Malformed {
+                candidate: Some(id)
+            }]
+        );
+        assert!(scan_id_tokens(
+            "https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef"
+        )
+        .is_empty());
+        assert!(scan_id_tokens("Kickoff-session-abcdefghijklmnopqrstuvwx").is_empty());
+        let note = super::RecordId::parse("n-01M3TC5H00MPJG002NAM000005").unwrap();
+        assert_eq!(
+            scan_id_tokens("note:n\u{2010}01M3TC5H00MPJG002NAM000005"),
+            vec![IdToken::Malformed {
+                candidate: Some(note.clone())
+            }]
+        );
+        assert_eq!(
+            scan_id_tokens("note:n-01M3TC5H00MPJG002NAM000005v2"),
+            vec![IdToken::Malformed {
+                candidate: Some(note)
+            }]
+        );
+        let zwsp = scan_id_tokens("p-\u{200b}01M3TC5H00MPJG000000000000");
+        assert_eq!(
+            zwsp,
+            vec![IdToken::Valid(
+                super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap()
+            )]
         );
     }
 
