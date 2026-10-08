@@ -13,7 +13,13 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0173: proc-macro-error2 (via i18n-embed-fl <- age) is
+    # unmaintained. It is a compile-time proc-macro used only for age's
+    # localized error messages; it has no effect on runtime crypto.
+    # No safe upgrade exists (age 0.11 pins it); re-evaluate on age 0.12.
+    "RUSTSEC-2026-0173",
+]
 
 [licenses]
 version = 2
@@ -30,6 +36,7 @@ allow = [
     "Zlib",
     "CDLA-Permissive-2.0",
     "OpenSSL",
+    "CC0-1.0", # age, bip39 (public-domain dedication; compatible with Apache-2.0)
 ]
 
 [bans]

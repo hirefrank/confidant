@@ -6,10 +6,29 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Encryption for Confidant vaults (stub until milestone 2)."
+description = "Encryption for Confidant vaults (milestone 2: age + XChaCha20-Poly1305 per docs/crypto-design.md)."
 # publish=false until the §9b item 5 gate clears: outside design review +
 # code audit before inviting anyone else to trust Confidant. Publishing
 # can't be undone, only yanked.
 publish = false
 
 [dependencies]
+age.workspace = true
+base64.workspace = true
+bech32.workspace = true
+bip39.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

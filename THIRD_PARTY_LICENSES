@@ -26,6 +26,11 @@ Adapted files:
   O_NOFOLLOW walk from cr. The portable symlink_metadata fallback is compiled
   only for non-Unix targets.
 
+- crates/confidant-crypt/src/aead.rs
+  XChaCha20-Poly1305 AEAD with length-prefixed associated data. Confidant
+  re-keys to per-client data keys and binds vault_id, record ULID, client
+  id, path, purpose, epoch, and the outer header in the AAD (ADR-13).
+
 Re-implemented patterns (no cr source copied; credited per ADR-13):
 
 - Collect findings instead of aborting on the first damaged file.

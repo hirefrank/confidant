@@ -750,8 +750,8 @@ fn doctor_reports_expected_checks() {
         .iter()
         .find(|c| c["id"] == "crypto")
         .unwrap();
-    // confidant-crypt is a stub in this milestone: we know encryption is
-    // absent, so doctor warns plainly instead of reporting "unknown".
+    // The crypto crate is present but the CLI write path is not wired yet:
+    // doctor warns plainly instead of reporting "ok" or "unknown".
     assert_eq!(crypto["status"], "warning");
     assert!(crypto["message"]
         .as_str()

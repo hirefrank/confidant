@@ -24,5 +24,7 @@ Re-implemented patterns, credited here rather than copied:
 Not taken: cr's audit hash chain, YAML-front-matter-as-truth `Database`,
 field-level encryption, sync adapters, server, or UI.
 
-Milestone 1 does not adapt cr's record-bound AEAD. That waits for the
-milestone 2 crypto design review (architecture section 9b).
+Milestone 2 adapts cr's record-bound AEAD (`crates/confidant-crypt/src/aead.rs`,
+MIT header on the file, entry in `THIRD_PARTY_LICENSES`): the XChaCha20-Poly1305
+construction with length-prefixed AAD, re-keyed to per-client data keys and
+Confidant's AAD fields per the crypto design §5.

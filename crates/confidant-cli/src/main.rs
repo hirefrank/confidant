@@ -1060,13 +1060,23 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
     }
 
     // PR B owns crypto (ADR-13). `is_available()` tells us whether this build
-    // can encrypt at all — when it can't, say plainly that content is
-    // unencrypted rather than reporting "unknown".
-    if confidant_crypt::is_available() {
+    // can encrypt at all; `writes_encrypted()` tells us whether the CLI write
+    // path actually does. Until the wiring lands, the write path stores
+    // plaintext, so report a warning — an `ok` here would tell the operator
+    // their notes are encrypted when they aren't.
+    if confidant_crypt::writes_encrypted() {
         checks.push(DoctorCheck {
             id: "crypto",
             status: "ok",
             message: "encryption available; key health not assessed in this milestone".to_owned(),
+        });
+    } else if confidant_crypt::is_available() {
+        checks.push(DoctorCheck {
+            id: "crypto",
+            status: "warning",
+            message:
+                "crypto library present, CLI not wired yet, vault content is stored as plaintext"
+                    .to_owned(),
         });
     } else {
         checks.push(DoctorCheck {
