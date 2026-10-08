@@ -435,8 +435,11 @@ in the repo, tests, or CI.
 6. **Scope enforcement:** expired scope, out-of-scope client or type, or
    write-with-read-only capability → refused before any crypto.
 7. **Revocation:** after revoke (+ optional rotate), the revoked key
-   cannot unwrap new epochs; old-epoch ciphertext remains readable
-   (documents future-writes-only, ADR-5).
+   cannot unwrap new epochs, and the revoked party's old-epoch wrappings
+   are gone from the working tree — re-wrap covers all retained epochs
+   (§6). Old-epoch ciphertext the revoked party already copied remains
+   readable by still-authorized parties (documents future-writes-only,
+   ADR-5).
 8. **Shredding:** after `keys shred` plus rotation, the old private keys
    are destroyed: the shredded client's historical wrappings (all epochs)
    cannot be opened by any former recipient, while other clients' records
@@ -493,8 +496,9 @@ Where the sources were silent, I picked the simpler option:
 2. **One data key per client (person)**, not per record and not per vault —
    matches per-client shredding (ADR-4).
 3. **Epoch-tagged keys; no re-encryption on rotation** — old epochs stay
-   readable by still-authorized parties (flagged against ADR-5's wording
-   in §15 Q8).
+   readable by still-authorized parties (Silas's call: agree, epoch
+   model; the stale ADR-5 consequences sentence is fixed separately —
+   see #20 and #22).
 4. **`no-ai` stays plaintext** in the outer envelope so `find`/`context`
    fail closed without keys (§9b item 2).
 5. **Trust anchor outside the vault** (`~/.config/confidant/` `[trust]`,
@@ -510,30 +514,53 @@ Where the sources were silent, I picked the simpler option:
 
 ## 15. Questions for the reviewer
 
+All six had Silas's call (2026-10-08); resolved below with one-line
+answers and issue links, so the milestone 2 implementation builds from
+this doc alone.
+
 1. **Envelope format:** outer front matter (`id`/`type`/`no-ai`/`enc`/
-   `key_id`/`nonce`) + base64 body (§5), or separate `.enc` sidecar files?
-   I chose inline — one file per record, no path-sync bugs.
-2. **`no-ai` in plaintext:** accept the "opted out of AI" metadata leak so
-   `find` fails closed without keys, or move it inside the ciphertext and
-   treat keyless records as uncleared? (Note: the header is now
-   authenticated via the AAD — flipping it fails decryption.)
-3. **Recovery phrase encoding:** BIP39-style 24-word list vs the age
-   identity's bech32 string? Former is transcription-friendly; latter has
-   no wordlist dependency.
-4. **Agent key distribution:** out of scope for M2, or should the design
-   include the operator→agent handoff?
-5. **Trust anchor location:** `~/.config/confidant/` `[trust]` (flag/env
-   override allowed) — OK?
-6. **Recovery dual-key derivation** (§9): one phrase → X25519 + Ed25519 via
-   HKDF-SHA256 with the stated domain separation. Acceptable, or should
-   recovery be unwrap-only with a separate operator signing key required
-   to add the device?
+   `key_id`/`nonce`) + base64 body. **Silas's call: agree — inline, one
+   file per record** (#13). The outer header is bound into the
+   length-prefixed AAD; header `id` must equal the AAD ULID, `key_id`'s
+   epoch must equal the AAD epoch, and `type` must map to exactly one
+   `purpose`. Flipping any header field (especially `no-ai: true` →
+   `false`) makes decrypt fail (tests 1, 14).
+2. **`no-ai` in plaintext:** **Silas's call: agree — keep the plaintext
+   outer header, now authenticated** (#14). The boolean leak is
+   acceptable: it reveals which opaque IDs opted out of AI, never who
+   they are. `no-ai` is per client: every record carries the person
+   record's value, `check` flags mismatches, any `true` wins, and a
+   `true` header means `find`/`context` skip the record without
+   decrypting (test 14).
+3. **Recovery phrase encoding:** **Silas's call: agree — 24-word list**
+   (#16). 256-bit entropy with the BIP39 English wordlist and checksum,
+   fed straight into HKDF (no passphrase, no BIP39 PBKDF2 seed step);
+   `recover` validates the checksum with "typo in word N"-style errors;
+   the phrase is never logged or written to disk (test 13).
+4. **Agent key distribution:** **Silas's call: agree — out of scope for
+   milestone 2, with one rule written down now** (#17). No agent private
+   key ever moves: an agent generates its X25519 keypair on its host and
+   hands over only the public key; the operator verifies the fingerprint
+   out of band, then signs the scope doc and manifest change like a
+   device add (§7).
+5. **Trust anchor location:** **Silas's call: agree —
+   `~/.config/confidant/` `[trust]` with flag/env override** (#18).
+   Nothing inside the vault can point at or override the anchor;
+   restrictive permissions (0700/0600) with warnings; the anchor set is
+   the operator Ed25519 key plus the recovery Ed25519 key pinned at
+   `init`; a missing anchor is a hard error (§4).
+6. **Recovery dual-key derivation:** **Silas's call: agree — one phrase,
+   two domain-separated keys** (#19). HKDF-SHA256 over the phrase
+   entropy with a fixed salt and versioned `info` strings
+   (`confidant/recovery/x25519/v1`, `confidant/recovery/ed25519/v1`);
+   in-vault copies of the recovery public halves are informational only
+   and never trusted (test 16).
 
 Resolved in the 2026-10-08 review round (Silas): shredding is key
 destruction — delete wrappings, rotate every recipient that ever held one
-(recovery included), destroy old private keys (§8); rotation keeps the
-epoch model, and the ADR-5 consequences sentence is fixed in a separate
-docs change, not here.
+(recovery included), destroy old private keys (#15, §8); rotation keeps
+the epoch model, and the ADR-5 consequences erratum is a separate docs
+change, not here (#20, #22).
 
 ## 16. Changes from the pre-architecture draft (2026-10-08)
 
@@ -593,3 +620,13 @@ recipient set (§6, §8); the stale ADR-5 caveat in §8 is dropped. Also in
 this revision: `docs/architecture.md` is brought into this PR with §9b
 item 5 updated per Frank's 2026-10-08 change, and the Status line no
 longer requires an outside human reviewer before milestone 2 code.
+
+## 19. Non-blocking cleanups from the sign-off (2026-10-08)
+
+Per Silas's sign-off comment on #21 (fold into this PR): test 7 now also
+asserts the revoked party's old-epoch wrappings are gone from the working
+tree, and names who can still read old-epoch ciphertext
+(still-authorized parties); §14 item 3 points at #20 and #22 instead of
+the removed §15 Q8; the six §15 questions moved under Resolved with
+Silas's one-line calls and issue links, so the implementation builds from
+this doc alone.
