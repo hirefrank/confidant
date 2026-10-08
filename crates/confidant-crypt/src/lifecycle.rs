@@ -43,21 +43,37 @@ use crate::age_wrap::{unwrap_with_identity, wrap_to_recipient};
 use crate::anchor::Anchor;
 use crate::error::Error;
 use crate::keys::{DataKey, LookupKey};
-use crate::manifest::{self, RecipientMap};
+use crate::manifest::{self, RecipientMap, SeqTracker, VAULT_CLIENT_ID};
 use crate::recovery::Recovery;
 
 /// Key id used for the recovery wrapping.
 const RECOVERY_KEY_ID: &str = "recovery";
 
+/// A client's verified epoch keys, ready for re-wrapping (shred's verify-first pass).
+type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>);
+
 /// Manages the `keys/` tree of one vault.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct KeyStore {
     keys_dir: PathBuf,
+    vault_id: String,
+    seq: Option<SeqTracker>,
 }
 
 impl KeyStore {
-    pub fn new(keys_dir: PathBuf) -> Self {
-        KeyStore { keys_dir }
+    pub fn new(keys_dir: PathBuf, vault_id: &str) -> Self {
+        KeyStore {
+            keys_dir,
+            vault_id: vault_id.to_string(),
+            seq: None,
+        }
+    }
+
+    /// Attach the off-vault seq high-water tracker (next to `trust.toml`).
+    /// Without it, manifest seq replay checks are skipped — tests only.
+    pub fn with_seq_tracker(mut self, tracker: SeqTracker) -> Self {
+        self.seq = Some(tracker);
+        self
     }
 
     fn client_dir(&self, client_id: &str) -> PathBuf {
@@ -90,24 +106,55 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Current manifest seq for a client (0 if no manifest yet).
+    fn current_seq(&self, client_id: &str) -> u64 {
+        let (toml_path, _) = self.manifest_paths(client_id);
+        std::fs::read(&toml_path)
+            .ok()
+            .and_then(|b| manifest::from_toml(&b).ok())
+            .map(|(seq, _)| seq)
+            .unwrap_or(0)
+    }
+
+    fn high_water(&self, client_id: &str) -> u64 {
+        self.seq
+            .as_ref()
+            .map(|t| t.high_water(&self.vault_id, client_id))
+            .unwrap_or(0)
+    }
+
+    fn advance_seq(&mut self, client_id: &str, seq: u64) -> Result<(), Error> {
+        if let Some(t) = self.seq.as_mut() {
+            t.advance(&self.vault_id, client_id, seq)?;
+        }
+        Ok(())
+    }
+
     fn write_manifest(
-        &self,
+        &mut self,
         client_id: &str,
         epoch: u64,
         recipients: &RecipientMap,
-        operator_sk: &SigningKey,
+        signing_sk: &SigningKey,
     ) -> Result<(), Error> {
-        let toml = manifest::to_toml(recipients)?;
-        let sig = manifest::sign(operator_sk, epoch, &toml);
+        let seq = self.current_seq(client_id).max(self.high_water(client_id)) + 1;
+        let toml = manifest::to_toml(seq, recipients)?;
+        let sig = manifest::sign(signing_sk, &self.vault_id, client_id, epoch, seq, &toml);
         let (toml_path, sig_path) = self.manifest_paths(client_id);
         std::fs::write(toml_path, toml)?;
         std::fs::write(sig_path, sig)?;
+        self.advance_seq(client_id, seq)?;
         Ok(())
     }
 
     /// Read and verify the manifest against the trust anchor.
+    ///
+    /// Accepts a signature from the operator key **or** the recovery Ed25519
+    /// key (both are trust-anchor members, design §4) — so a recovery from
+    /// the phrase alone can authorize the new device's manifest. Refuses a
+    /// seq below the off-vault high-water mark.
     pub fn verified_recipients(
-        &self,
+        &mut self,
         client_id: &str,
         anchor: &Anchor,
     ) -> Result<(u64, RecipientMap), Error> {
@@ -117,14 +164,38 @@ impl KeyStore {
             .map_err(|_| Error::Manifest(format!("missing manifest for {client_id}")))?;
         let sig = std::fs::read(&sig_path)
             .map_err(|_| Error::Manifest(format!("missing manifest signature for {client_id}")))?;
-        let map = manifest::verify(&anchor.operator, epoch, &toml, &sig)?;
+        let min_seq = self.high_water(client_id);
+        // Try the operator key first, then the recovery key.
+        let map = manifest::verify(
+            &anchor.operator,
+            &self.vault_id,
+            client_id,
+            epoch,
+            &toml,
+            &sig,
+            min_seq,
+        )
+        .or_else(|_| {
+            manifest::verify(
+                &anchor.recovery,
+                &self.vault_id,
+                client_id,
+                epoch,
+                &toml,
+                &sig,
+                min_seq,
+            )
+        })?;
+        // Advance the high-water mark past what we just verified.
+        let seq = manifest::from_toml(&toml)?.0;
+        self.advance_seq(client_id, seq)?;
         Ok((epoch, map))
     }
 
     /// Initialize a client's key directory: epoch 1, wrap the new data key
     /// to every recipient + recovery, sign the manifest.
     pub fn init_client(
-        &self,
+        &mut self,
         client_id: &str,
         recipients: &RecipientMap,
         recovery_recipient: &str,
@@ -190,7 +261,7 @@ impl KeyStore {
 
     /// Initialize the vault alias-lookup key, wrapped to all recipients.
     pub fn init_lookup_key(
-        &self,
+        &mut self,
         recipients: &[String],
         operator_sk: &SigningKey,
     ) -> Result<LookupKey, Error> {
@@ -219,7 +290,8 @@ impl KeyStore {
             w.finish().map_err(|e| Error::Age(format!("finish: {e}")))?;
         }
         std::fs::write(vdir.join("lookup.age"), out)?;
-        // Vault-level manifest for the lookup key.
+        // Vault-level manifest for the lookup key (seq starts at 1; the
+        // vault-level manifest uses the fixed VAULT_CLIENT_ID binding).
         let mut map = RecipientMap::new();
         for (i, r) in recipients.iter().enumerate() {
             map.insert(
@@ -231,17 +303,18 @@ impl KeyStore {
                 },
             );
         }
-        let toml = manifest::to_toml(&map)?;
-        let sig = manifest::sign(operator_sk, 1, &toml);
+        let toml = manifest::to_toml(1, &map)?;
+        let sig = manifest::sign(operator_sk, &self.vault_id, VAULT_CLIENT_ID, 1, 1, &toml);
         std::fs::write(vdir.join("recipients.toml"), toml)?;
         std::fs::write(vdir.join("recipients.sig"), sig)?;
+        self.advance_seq(VAULT_CLIENT_ID, 1)?;
         Ok(key)
     }
 
     /// Unwrap a data key: verify the manifest against the anchor, then
     /// unwrap `<key-id>.age` (current epoch) or `<key-id>.e<epoch>.age`.
     pub fn unwrap_data_key(
-        &self,
+        &mut self,
         client_id: &str,
         key_id: &str,
         epoch: u64,
@@ -277,7 +350,7 @@ impl KeyStore {
     /// current recipients + recovery, re-sign. Old wrappings are renamed to
     /// `.e<epoch>.age` so history stays readable. No re-encryption.
     pub fn rotate(
-        &self,
+        &mut self,
         client_id: &str,
         recovery_recipient: &str,
         operator_sk: &SigningKey,
@@ -307,7 +380,7 @@ impl KeyStore {
     /// keeps whatever ciphertext it already copied (ADR-5, future writes
     /// only) — `revoke` does not pretend otherwise.
     pub fn revoke(
-        &self,
+        &mut self,
         client_id: &str,
         revoked_key_ids: &[&str],
         operator_sk: &SigningKey,
@@ -332,6 +405,57 @@ impl KeyStore {
         Ok(())
     }
 
+    /// All historical versions of a client's recipient manifest, oldest
+    /// first, from git history. Used by `shred` to build the complete
+    /// destroy list: a recipient revoked earlier still has old wrappings in
+    /// history that open the shredded client's historical data keys.
+    fn historical_recipients(&self, client_id: &str) -> Result<Vec<RecipientMap>, Error> {
+        // keys_dir is <vault>/keys; the repo root is its parent.
+        let repo = self
+            .keys_dir
+            .parent()
+            .ok_or_else(|| Error::Manifest("keys dir has no parent; not a vault".to_string()))?;
+        let rel = format!("keys/{client_id}/recipients.toml");
+        let out = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "log",
+                "--format=%H",
+                "--end-of-options",
+                "--",
+                &rel,
+            ])
+            .output()
+            .map_err(Error::Io)?;
+        if !out.status.success() {
+            // Not a git repo or no history: fall back to the current manifest.
+            return Ok(Vec::new());
+        }
+        let mut maps = Vec::new();
+        for sha in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+            if sha.is_empty() {
+                continue;
+            }
+            let show = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &repo.to_string_lossy(),
+                    "show",
+                    &format!("{sha}:{rel}"),
+                ])
+                .output()
+                .map_err(Error::Io)?;
+            if !show.status.success() {
+                continue;
+            }
+            if let Ok((_, map)) = manifest::from_toml(&show.stdout) {
+                maps.push(map);
+            }
+        }
+        Ok(maps)
+    }
+
     /// Crypto-shred a client: key destruction, not deletion.
     ///
     /// 1. Delete the client's entire `keys/<client>/` tree (every wrapped
@@ -350,7 +474,7 @@ impl KeyStore {
     /// `identity` must unwrap the current keys (an old device or recovery
     /// identity) so remaining keys can be re-wrapped.
     pub fn shred(
-        &self,
+        &mut self,
         shredded_client: &str,
         all_clients: &[&str],
         new_recipients: &RecipientMap,
@@ -358,28 +482,28 @@ impl KeyStore {
         anchor: &Anchor,
         identity: &dyn age::Identity,
     ) -> Result<ShredOutcome, Error> {
-        // Collect old key ids for the destruction list before deleting.
-        let (_, old_recipients) = self.verified_recipients(shredded_client, anchor)?;
-        let destroy_key_ids: Vec<String> = old_recipients.keys().cloned().collect();
-
-        // 1. Delete the shredded client's key tree.
-        let cdir = self.client_dir(shredded_client);
-        if cdir.exists() {
-            std::fs::remove_dir_all(&cdir)?;
+        // Build the destroy list from EVERY historical version of the
+        // manifest: a recipient revoked earlier still has old wrappings in
+        // git history that open the shredded client's historical data keys
+        // (design §8: "every recipient that ever held a wrapping").
+        let mut destroy_ids = std::collections::BTreeSet::new();
+        for map in self.historical_recipients(shredded_client)? {
+            destroy_ids.extend(map.keys().cloned());
         }
+        let (_, current_recipients) = self.verified_recipients(shredded_client, anchor)?;
+        destroy_ids.extend(current_recipients.keys().cloned());
+        let destroy_key_ids: Vec<String> = destroy_ids.into_iter().collect();
 
-        // 2. Fresh recovery identity (each shred means a new phrase).
-        let new_recovery = Recovery::generate();
-        let new_recovery_recipient = new_recovery.age_identity().to_recipient_string();
-
-        // 3. Re-wrap every remaining client + lookup key to the new set,
-        // preserving all retained epochs so history stays readable.
+        // Verify EVERYTHING before changing any files. On failure here,
+        // nothing has changed and the old keys still work.
+        //
+        // 1. The identity must open every remaining client's every epoch.
+        let mut to_rewrap: Vec<VerifiedEpochKeys> = Vec::new();
         for client in all_clients {
             if *client == shredded_client {
                 continue;
             }
             let (epoch, old_map) = self.verified_recipients(client, anchor)?;
-            // Unwrap every retained epoch's key with the old identity.
             let mut epoch_keys = Vec::new();
             for e in 1..=epoch {
                 let mut key_opt = None;
@@ -399,25 +523,60 @@ impl KeyStore {
                 }
                 epoch_keys.push((e, key_opt.ok_or(last_err)?));
             }
-            // Clear old wrappings (all epochs) and re-wrap each epoch's key
-            // to the new recipient set.
+            to_rewrap.push((client, epoch, epoch_keys));
+        }
+        // 2. No new recipient pubkey may match any current or historical
+        // recipient (including recovery): reusing a pubkey would keep the
+        // old private key able to unwrap.
+        let mut old_pubkeys = std::collections::BTreeSet::new();
+        for client in all_clients {
+            for map in self.historical_recipients(client)? {
+                old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
+            }
+            let (_, map) = self.verified_recipients(client, anchor)?;
+            old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
+        }
+        old_pubkeys.insert(anchor.recovery_age.clone());
+        for (id, entry) in new_recipients {
+            if old_pubkeys.contains(&entry.age_pubkey) {
+                return Err(Error::Manifest(format!(
+                    "new recipient {id} reuses a pubkey that already appears in history; \
+                     generate fresh keypairs"
+                )));
+            }
+        }
+        // 3. The lookup key must unwrap with the identity.
+        let lookup_raw = self.read_lookup_raw(identity)?;
+
+        // All checks passed: now mutate.
+        let new_recovery = Recovery::generate();
+        let new_recovery_recipient = new_recovery.age_identity().to_recipient_string();
+
+        // 1. Delete the shredded client's key tree.
+        let cdir = self.client_dir(shredded_client);
+        if cdir.exists() {
+            std::fs::remove_dir_all(&cdir)?;
+        }
+
+        // 2. Re-wrap every remaining client to the new set.
+        for (client, epoch, epoch_keys) in &to_rewrap {
             for entry in std::fs::read_dir(self.wrapped_dir(client))? {
                 std::fs::remove_file(entry?.path())?;
             }
-            for (e, key) in &epoch_keys {
+            for (e, key) in epoch_keys {
                 self.wrap_epoch(
                     client,
                     *e,
-                    epoch,
+                    *epoch,
                     key,
                     new_recipients,
                     &new_recovery_recipient,
                 )?;
             }
-            self.write_manifest(client, epoch, new_recipients, operator_sk)?;
+            self.write_manifest(client, *epoch, new_recipients, operator_sk)?;
         }
-        // Lookup key: unwrap with old identity, re-wrap to new recipients.
-        self.rewrap_lookup_key(new_recipients, operator_sk, identity, anchor)?;
+        // Lookup key: re-wrap the verified bytes to new recipients.
+        self.write_lookup_raw(&lookup_raw, new_recipients, operator_sk)?;
 
         Ok(ShredOutcome {
             new_recovery,
@@ -426,15 +585,74 @@ impl KeyStore {
         })
     }
 
+    /// Read the raw lookup key bytes (for shred's verify-first pass).
+    fn read_lookup_raw(&self, identity: &dyn age::Identity) -> Result<Vec<u8>, Error> {
+        let vdir = self.keys_dir.join("vault");
+        let wrapped = std::fs::read(vdir.join("lookup.age"))
+            .map_err(|_| Error::NoKey("no vault lookup.age".to_string()))?;
+        unwrap_with_identity(&wrapped, identity)
+    }
+
+    /// Write raw lookup key bytes re-wrapped to new recipients (for shred).
+    fn write_lookup_raw(
+        &mut self,
+        raw: &[u8],
+        new_recipients: &RecipientMap,
+        operator_sk: &SigningKey,
+    ) -> Result<(), Error> {
+        let vdir = self.keys_dir.join("vault");
+        let recips: Vec<Box<dyn age::Recipient>> = new_recipients
+            .values()
+            .map(|e| {
+                e.age_pubkey
+                    .parse::<age::x25519::Recipient>()
+                    .map(|rec| Box::new(rec) as Box<dyn age::Recipient>)
+                    .map_err(|er| Error::Age(format!("bad recipient: {er}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let encryptor = age::Encryptor::with_recipients(recips.iter().map(|r| r.as_ref()))
+            .map_err(|e| Error::Age(format!("encryptor: {e}")))?;
+        let mut out = Vec::new();
+        {
+            use std::io::Write;
+            let mut w = encryptor
+                .wrap_output(&mut out)
+                .map_err(|e| Error::Age(format!("wrap: {e}")))?;
+            w.write_all(raw)
+                .map_err(|e| Error::Age(format!("write: {e}")))?;
+            w.finish().map_err(|e| Error::Age(format!("finish: {e}")))?;
+        }
+        std::fs::write(vdir.join("lookup.age"), out)?;
+        let seq = std::fs::read(vdir.join("recipients.toml"))
+            .ok()
+            .and_then(|b| manifest::from_toml(&b).ok())
+            .map(|(s, _)| s)
+            .unwrap_or(0)
+            .max(
+                self.seq
+                    .as_ref()
+                    .map(|t| t.high_water(&self.vault_id, VAULT_CLIENT_ID))
+                    .unwrap_or(0),
+            )
+            + 1;
+        let toml = manifest::to_toml(seq, new_recipients)?;
+        let sig = manifest::sign(operator_sk, &self.vault_id, VAULT_CLIENT_ID, 1, seq, &toml);
+        std::fs::write(vdir.join("recipients.toml"), toml)?;
+        std::fs::write(vdir.join("recipients.sig"), sig)?;
+        self.advance_seq(VAULT_CLIENT_ID, seq)?;
+        Ok(())
+    }
+
     /// Rotate the recovery identity: re-wrap every client's `recovery.age`
     /// (all retained epochs) to a fresh recovery recipient.
     ///
     /// Used by `recover` ("rotate to a fresh recovery identity and revoke
     /// the old one") and after `shred`. Returns the new [`Recovery`]; the
     /// caller pins its public halves in the trust anchor and confirms the
-    /// phrase was written down. The old phrase stops working.
+    /// phrase was written down. Destroy every copy of the old recovery
+    /// phrase (paper, 1Password); until you do, it still opens history.
     pub fn rotate_recovery(
-        &self,
+        &mut self,
         clients: &[&str],
         operator_sk: &SigningKey,
         anchor: &Anchor,
@@ -467,50 +685,6 @@ impl KeyStore {
             self.write_manifest(client, epoch, &recipients, operator_sk)?;
         }
         Ok(new_recovery)
-    }
-
-    fn rewrap_lookup_key(
-        &self,
-        new_recipients: &RecipientMap,
-        operator_sk: &SigningKey,
-        identity: &dyn age::Identity,
-        anchor: &Anchor,
-    ) -> Result<(), Error> {
-        let vdir = self.keys_dir.join("vault");
-        let wrapped = std::fs::read(vdir.join("lookup.age"))
-            .map_err(|_| Error::NoKey("no vault lookup.age".to_string()))?;
-        let raw = unwrap_with_identity(&wrapped, identity)?;
-        // Re-wrap to the new recipient set (one age file, all recipients).
-        let recips: Vec<Box<dyn age::Recipient>> = new_recipients
-            .values()
-            .map(|e| {
-                e.age_pubkey
-                    .parse::<age::x25519::Recipient>()
-                    .map(|rec| Box::new(rec) as Box<dyn age::Recipient>)
-                    .map_err(|er| Error::Age(format!("bad recipient: {er}")))
-            })
-            .collect::<Result<_, _>>()?;
-        let encryptor = age::Encryptor::with_recipients(recips.iter().map(|r| r.as_ref()))
-            .map_err(|e| Error::Age(format!("encryptor: {e}")))?;
-        let mut out = Vec::new();
-        {
-            use std::io::Write;
-            let mut w = encryptor
-                .wrap_output(&mut out)
-                .map_err(|e| Error::Age(format!("wrap: {e}")))?;
-            w.write_all(&raw)
-                .map_err(|e| Error::Age(format!("write: {e}")))?;
-            w.finish().map_err(|e| Error::Age(format!("finish: {e}")))?;
-        }
-        std::fs::write(vdir.join("lookup.age"), out)?;
-        let toml = manifest::to_toml(new_recipients)?;
-        let sig = manifest::sign(operator_sk, 1, &toml);
-        std::fs::write(vdir.join("recipients.toml"), toml)?;
-        std::fs::write(vdir.join("recipients.sig"), sig)?;
-        // Also rotate the recovery wrap for remaining clients is handled by
-        // the caller via wrap_current with new_recovery_recipient.
-        let _ = anchor;
-        Ok(())
     }
 }
 
@@ -559,7 +733,8 @@ fn leftover_warnings() -> Vec<String> {
             .to_string(),
         "Old private keys may linger in OS keychains or OS backups — destroy them now.".to_string(),
         "Copies outside Confidant entirely (e.g. Drive transcripts) are not affected.".to_string(),
-        "This shred issued a new recovery phrase: the old phrase no longer works.".to_string(),
+        "This shred issued a new recovery phrase. Destroy every copy of the old recovery phrase (paper, 1Password); until you do, it still opens history.".to_string(),
+        "Inbox rotation is pending: run `confidant inbox rotate --finish` to destroy the old inbox key; until then old form answers in history remain readable.".to_string(),
     ]
 }
 

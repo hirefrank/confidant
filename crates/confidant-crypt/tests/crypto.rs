@@ -80,7 +80,10 @@ impl Fixture {
         let (anchor, warnings) = anchor::load(&config_dir, &vault_dir).unwrap();
         assert!(warnings.is_empty());
 
-        let keys = KeyStore::new(keys_dir);
+        let seq_tracker =
+            confidant_crypt::manifest::SeqTracker::load(&config_dir.join("manifest-seq.toml"))
+                .unwrap();
+        let mut keys = KeyStore::new(keys_dir, "vault-01").with_seq_tracker(seq_tracker);
         keys.init_lookup_key(std::slice::from_ref(&device_recipient), &operator_sk)
             .unwrap();
 
@@ -231,7 +234,7 @@ fn test3_wrong_key_tampered() {
 
 #[test]
 fn test4_age_wrap_round_trip() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
@@ -284,7 +287,7 @@ fn test4_age_wrap_round_trip() {
 
 #[test]
 fn test5_manifest_verification() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
         .init_client(
@@ -392,7 +395,7 @@ fn test6_scope_enforcement() {
 
 #[test]
 fn test7_revocation() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let dev2 = DeviceKeypair::generate();
     let dev2_recipient = dev2.recipient();
     let dev2_id = age::x25519::Identity::from_str(&{
@@ -464,7 +467,7 @@ fn test7_revocation() {
 
 #[test]
 fn test8_shredding() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key_a = f
         .keys
@@ -600,12 +603,131 @@ fn test8_shredding() {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation replay: restored pre-revocation manifest refused via seq
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_revoke_replay_refused() {
+    // Revoke re-signs at the SAME epoch. A restored pre-revocation manifest
+    // (valid signature, same epoch) must still be refused via the seq
+    // high-water mark.
+    let mut f = Fixture::new();
+    let dev2 = DeviceKeypair::generate();
+    let recipients = f.recipients(&[
+        ("laptop", &f.device_recipient),
+        ("phone", &dev2.recipient()),
+    ]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Save the pre-revocation manifest (has both recipients).
+    let keys_dir = f._tmp.path().join("keys");
+    let toml_path = keys_dir.join("p-01ABC").join("recipients.toml");
+    let sig_path = keys_dir.join("p-01ABC").join("recipients.sig");
+    let saved_toml = std::fs::read(&toml_path).unwrap();
+    let saved_sig = std::fs::read(&sig_path).unwrap();
+
+    // Revoke the phone: manifest re-signed at same epoch, seq bumped.
+    f.keys
+        .revoke("p-01ABC", &["phone"], &f.operator_sk, &f.anchor)
+        .unwrap();
+    // Sanity: phone is gone from the current manifest.
+    let (_, map) = f.keys.verified_recipients("p-01ABC", &f.anchor).unwrap();
+    assert!(!map.contains_key("phone"));
+
+    // Restore the pre-revocation manifest (valid sig, same epoch, stale seq).
+    std::fs::write(&toml_path, &saved_toml).unwrap();
+    std::fs::write(&sig_path, &saved_sig).unwrap();
+    let err = f
+        .keys
+        .verified_recipients("p-01ABC", &f.anchor)
+        .unwrap_err();
+    assert!(format!("{err}").contains("high-water mark"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Shredding: destroy list covers historical recipients
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shred_destroy_list_covers_history() {
+    // A recipient revoked BEFORE the shred still has old wrappings in git
+    // history. The destroy list must include it.
+    let mut f = Fixture::new();
+    let dev2 = DeviceKeypair::generate();
+    let recipients = f.recipients(&[
+        ("laptop", &f.device_recipient),
+        ("phone", &dev2.recipient()),
+    ]);
+    f.keys
+        .init_client(
+            "p-AAAA",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    f.keys
+        .init_client(
+            "p-BBBB",
+            &f.recipients(&[("laptop", &f.device_recipient)]),
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Revoke phone from A (its old wrappings stay in history).
+    // Init a git repo FIRST so history captures the pre-revoke manifest.
+    let keys_dir = f._tmp.path().join("keys");
+    let vault_dir = keys_dir.parent().unwrap();
+    git(vault_dir, &["init", "-q"]);
+    git(vault_dir, &["config", "user.email", "t@t"]);
+    git(vault_dir, &["config", "user.name", "t"]);
+    git(vault_dir, &["add", "keys"]);
+    git(vault_dir, &["commit", "-qm", "init keys"]);
+    f.keys
+        .revoke("p-AAAA", &["phone"], &f.operator_sk, &f.anchor)
+        .unwrap();
+    git(vault_dir, &["add", "keys"]);
+    git(vault_dir, &["commit", "-qm", "revoke phone"]);
+
+    // Shred A.
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    let outcome = f
+        .keys
+        .shred(
+            "p-AAAA",
+            &["p-AAAA", "p-BBBB"],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap();
+    // phone was revoked before the shred but must still be named: its old
+    // wrappings in history open A's historical data keys.
+    assert!(
+        outcome.destroy_key_ids.contains(&"phone".to_string()),
+        "destroy list must include historically-present phone: {:?}",
+        outcome.destroy_key_ids
+    );
+    assert!(outcome.destroy_key_ids.contains(&"laptop".to_string()));
+}
+
+// ---------------------------------------------------------------------------
 // Test 9: recovery drill
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test9_recovery_drill() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
@@ -653,6 +775,37 @@ fn test9_recovery_drill() {
         .unwrap_data_key("p-01ABC", "recovery", 1, &new_id, &f.anchor)
         .unwrap();
     assert_eq!(back2.as_bytes(), key.as_bytes());
+}
+
+#[test]
+fn test9b_recovery_key_signs_manifest() {
+    // The recovery Ed25519 key (pinned in the anchor) alone can authorize
+    // a manifest change — no operator key needed. This is what lets a
+    // bare-phrase recovery authorize the new device's manifest (design §4).
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Rotate, signing the new manifest with ONLY the recovery key.
+    let rec_sk = f.recovery.signing_key().clone();
+    let rotated = f
+        .keys
+        .rotate("p-01ABC", &f.recovery_recipient(), &rec_sk, &f.anchor)
+        .unwrap();
+    // Unwrap via the recovery identity (still valid — no rotate_recovery ran).
+    let rec_id = f.recovery.age_identity().to_age_identity().unwrap();
+    let back = f
+        .keys
+        .unwrap_data_key("p-01ABC", "recovery", 2, &rec_id, &f.anchor)
+        .unwrap();
+    assert_eq!(back.as_bytes(), rotated.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -762,11 +915,11 @@ fn test14_header_flip() {
 // ---------------------------------------------------------------------------
 
 struct FakeChecker {
-    signers: std::collections::HashMap<String, Option<String>>,
+    signers: std::collections::HashMap<String, Option<(char, String)>>,
 }
 
 impl SignerChecker for FakeChecker {
-    fn commit_signer(&self, commit: &str) -> Result<Option<String>, Error> {
+    fn commit_signature(&self, commit: &str) -> Result<Option<(char, String)>, Error> {
         Ok(self.signers.get(commit).cloned().flatten())
     }
 }
@@ -778,8 +931,8 @@ fn test15_rollback_replay_unsigned_refused() {
     // commit is honored.
     let checker = FakeChecker {
         signers: std::collections::HashMap::from([
-            ("tip-signed".to_string(), Some("KEY1".to_string())),
-            ("v2-signed".to_string(), Some("KEY1".to_string())),
+            ("tip-signed".to_string(), Some(('G', "KEY1".to_string()))),
+            ("v2-signed".to_string(), Some(('G', "KEY1".to_string()))),
             ("rollback-unsigned".to_string(), None),
         ]),
     };
@@ -858,13 +1011,150 @@ fn test15_rollback_replay_real_git() {
     assert!(format!("{err}").contains("not signed by a trusted key"));
 }
 
+#[test]
+fn test15_merge_rollback_unsigned_side_refused() {
+    // A SIGNED merge of an UNSIGNED rollback: the introducing walk must be
+    // built with -m so the merge is included, and the unsigned side-branch
+    // commit in the list is refused even though the merge itself is signed.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    git(repo, &["init", "-q"]);
+    git(repo, &["config", "user.email", "test@example.com"]);
+    git(repo, &["config", "user.name", "t"]);
+    git(repo, &["config", "commit.gpgsign", "false"]);
+
+    // main: v1 -> v2 (v2 has no-ai: true).
+    std::fs::write(repo.join("rec.cfd"), "v1 no-ai false").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "v1"]);
+    std::fs::write(repo.join("rec.cfd"), "v2 no-ai true").unwrap();
+    git(repo, &["commit", "-qam", "v2"]);
+
+    // Side branch: unsigned rollback to v1 content.
+    git(repo, &["checkout", "-qb", "side"]);
+    git(repo, &["checkout", "-q", "HEAD~1", "--", "rec.cfd"]);
+    git(repo, &["commit", "-qam", "unsigned rollback"]);
+    let side = git_rev(repo, "HEAD");
+
+    // SSH signing for the merge commit (throwaway key).
+    let keydir = tempfile::tempdir().unwrap();
+    let key = keydir.path().join("key");
+    let gen = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-C", "test"])
+        .arg("-f")
+        .arg(&key)
+        .output()
+        .unwrap();
+    if !gen.status.success() {
+        eprintln!("skipping: ssh-keygen unavailable");
+        return;
+    }
+    let pubkey = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let allowed = keydir.path().join("allowed_signers");
+    std::fs::write(
+        &allowed,
+        format!("test@example.com namespaces=\"git\" {pubkey}"),
+    )
+    .unwrap();
+    let fp_out = std::process::Command::new("ssh-keygen")
+        .args(["-lf"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    let fp = String::from_utf8(fp_out.stdout).unwrap();
+    let fingerprint = fp.split_whitespace().nth(1).unwrap().to_string();
+
+    git(repo, &["checkout", "-q", "-"]);
+    git(repo, &["config", "gpg.format", "ssh"]);
+    git(repo, &["config", "user.signingkey", key.to_str().unwrap()]);
+    git(
+        repo,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed.to_str().unwrap(),
+        ],
+    );
+    git(
+        repo,
+        &[
+            "merge",
+            "--no-ff",
+            "-S",
+            "-m",
+            "signed merge of rollback",
+            "side",
+        ],
+    );
+    let merge_commit = git_rev(repo, "HEAD");
+
+    // Without -m the merge commit's diff is suppressed: it does NOT appear
+    // as touching the path (the hole).
+    let plain = git_log_path(repo, false);
+    assert!(
+        !plain.contains(&merge_commit),
+        "plain git log should miss the merge (documenting the hole)"
+    );
+    // With -m the merge IS included.
+    let with_m = git_log_path(repo, true);
+    assert!(
+        with_m.contains(&merge_commit),
+        "git log -m must include the merge commit"
+    );
+    assert!(with_m.contains(&side), "side commit must be listed");
+
+    // The merge is signed by a trusted key, but the unsigned side commit in
+    // the introducing list is refused.
+    use confidant_crypt::history::GitSignerChecker;
+    let checker = GitSignerChecker::new(repo);
+    let err = verify_history(
+        &checker,
+        &[fingerprint],
+        &merge_commit,
+        &[merge_commit.clone(), side],
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("untrusted/unsigned"), "{err}");
+}
+
+fn git_rev(repo: &Path, rev: &str) -> String {
+    String::from_utf8(
+        std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "rev-parse", rev])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+fn git_log_path(repo: &Path, with_m: bool) -> String {
+    let mut args = vec!["log", "--format=%H"];
+    if with_m {
+        args.push("-m");
+    }
+    args.extend(["--end-of-options", "--", "rec.cfd"]);
+    String::from_utf8(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(&args)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Test 16: recovery public key pinning
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test16_recovery_pubkey_pinning() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
 
     // Attacker swaps the recovery public halves in a *vault config copy*.
     let evil_recovery = Recovery::generate();

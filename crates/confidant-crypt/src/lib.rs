@@ -37,11 +37,24 @@ pub fn is_available() -> bool {
     true
 }
 
+/// True when the CLI write path actually encrypts vault content.
+///
+/// This is separate from [`is_available`]: the crate can encrypt, but until
+/// the CLI wiring lands (`note add`, `log session --note`, etc. still write
+/// plaintext), `doctor` must not report the crypto check as `ok`. Key the
+/// doctor check off this, not off `is_available`.
+pub fn writes_encrypted() -> bool {
+    false
+}
+
 /// Resolve the device age identity.
 ///
-/// Order: `CONFIDANT_DEVICE_KEY` env var (Bech32 `AGE-SECRET-KEY-1…`), then
-/// `~/.config/confidant/device.key` (same format, 0600). Absent → fail
-/// closed with [`Error::NoKey`].
+/// From the `CONFIDANT_DEVICE_KEY` env var (Bech32 `AGE-SECRET-KEY-1…`).
+/// There is no file fallback: §2 says device keys live in the OS keychain,
+/// and #36 rejected key files under `~/.config` (Time Machine backs them
+/// up, so "destroy the old key" would be false). OS-keychain storage lands
+/// with the CLI wiring; until then the env var covers tests and agent
+/// hosts. Absent → fail closed with [`Error::NoKey`].
 fn device_identity() -> Result<age::x25519::Identity, Error> {
     use std::str::FromStr;
     if let Ok(s) = std::env::var("CONFIDANT_DEVICE_KEY") {
@@ -51,21 +64,10 @@ fn device_identity() -> Result<age::x25519::Identity, Error> {
                 .map_err(|e| Error::Age(format!("bad CONFIDANT_DEVICE_KEY: {e}")));
         }
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        Error::NoKey(
-            "no device key: set CONFIDANT_DEVICE_KEY or create ~/.config/confidant/device.key"
-                .to_string(),
-        )
-    })?;
-    let path = std::path::Path::new(&home).join(".config/confidant/device.key");
-    let s = std::fs::read_to_string(&path).map_err(|_| {
-        Error::NoKey(format!(
-            "no device key: set CONFIDANT_DEVICE_KEY or create {}",
-            path.display()
-        ))
-    })?;
-    age::x25519::Identity::from_str(s.trim())
-        .map_err(|e| Error::Age(format!("bad device.key: {e}")))
+    Err(Error::NoKey(
+        "no device key: set CONFIDANT_DEVICE_KEY (OS-keychain storage lands with the CLI wiring)"
+            .to_string(),
+    ))
 }
 
 /// Encrypt a file to this device's age key.

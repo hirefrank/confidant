@@ -23,12 +23,16 @@ use crate::error::Error;
 /// Production uses [`GitSignerChecker`] (shells out to git); tests inject a
 /// fake.
 pub trait SignerChecker {
-    /// Return the signer's key id for `commit` (e.g. `%GK`), or `None` if
-    /// the commit is unsigned.
-    fn commit_signer(&self, commit: &str) -> Result<Option<String>, Error>;
+    /// Return the signature validity and signer key id for `commit`, or
+    /// `None` if the commit is unsigned.
+    ///
+    /// Validity is git's `%G?` status: only `G` (good signature) is
+    /// accepted — `%GK` alone is not enough, since git prints a key id even
+    /// for bad or uncheckable signatures.
+    fn commit_signature(&self, commit: &str) -> Result<Option<(char, String)>, Error>;
 }
 
-/// `git log --format=%GK` based checker.
+/// `git log --format=%G? --format=%GK` based checker.
 pub struct GitSignerChecker {
     vault: std::path::PathBuf,
 }
@@ -42,14 +46,15 @@ impl GitSignerChecker {
 }
 
 impl SignerChecker for GitSignerChecker {
-    fn commit_signer(&self, commit: &str) -> Result<Option<String>, Error> {
+    fn commit_signature(&self, commit: &str) -> Result<Option<(char, String)>, Error> {
         let out = Command::new("git")
             .args([
                 "-C",
                 &self.vault.to_string_lossy(),
                 "log",
                 "-1",
-                "--format=%GK",
+                "--format=%G?%x00%GK",
+                "--end-of-options",
                 commit,
             ])
             .output()
@@ -57,43 +62,56 @@ impl SignerChecker for GitSignerChecker {
         if !out.status.success() {
             return Err(Error::Manifest(format!("git log failed for {commit}")));
         }
-        let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(if key.is_empty() { None } else { Some(key) })
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.split('\0');
+        let validity = parts.next().unwrap_or("").trim();
+        let key = parts.next().unwrap_or("").trim().to_string();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let v = validity.chars().next().unwrap_or(' ');
+        Ok(Some((v, key)))
     }
 }
 
 /// Verify that history is trusted for agent output.
 ///
-/// - `tip`: the current HEAD commit. Must be signed by a trusted key.
+/// - `tip`: the current HEAD commit. Must carry a *good* signature (`%G?`
+///   == `G`) from a trusted key.
 /// - `introducing_commits`: for each file being emitted, the commits that
-///   introduced its current content (e.g. from `git log --format=%H --
-///   <path>`). Every one must be signed by a trusted key.
+///   introduced its current content. Build this list with
+///   `git log -m --format=%H --end-of-options -- <path>`: `-m`
+///   (`--diff-merges=separate`) expands merge diffs so a merge commit that
+///   rewrote the file is included — without it, content changed inside a
+///   merge escapes the walk (the same hole as the inbox's merge-commit
+///   bypass). Every listed commit must carry a good signature from a
+///   trusted key.
 ///
-/// An unsigned commit — including an unsigned rollback — is a hard error:
-/// the caller withholds the record from agent output.
+/// Anything else — unsigned, bad signature, untrusted signer — is a hard
+/// error: the caller withholds the record from agent output.
 pub fn verify_history(
     checker: &dyn SignerChecker,
     trusted_signers: &[String],
     tip: &str,
     introducing_commits: &[String],
 ) -> Result<(), Error> {
-    let trusted = |key: &Option<String>| -> bool {
-        match key {
-            Some(k) => trusted_signers.iter().any(|t| t == k),
-            None => false,
+    let trusted = |sig: &Option<(char, String)>| -> bool {
+        match sig {
+            Some(('G', k)) => trusted_signers.iter().any(|t| t == k),
+            _ => false,
         }
     };
-    let tip_signer = checker.commit_signer(tip)?;
-    if !trusted(&tip_signer) {
+    let tip_sig = checker.commit_signature(tip)?;
+    if !trusted(&tip_sig) {
         return Err(Error::Manifest(format!(
-            "tip commit {tip} is not signed by a trusted key; refusing agent output"
+            "tip commit {tip} is not signed by a trusted key with a good signature; refusing agent output"
         )));
     }
     for commit in introducing_commits {
-        let signer = checker.commit_signer(commit)?;
-        if !trusted(&signer) {
+        let sig = checker.commit_signature(commit)?;
+        if !trusted(&sig) {
             return Err(Error::Manifest(format!(
-                "content introduced by untrusted/unsigned commit {commit}; refusing agent output"
+                "content introduced by untrusted/unsigned/bad-signature commit {commit}; refusing agent output"
             )));
         }
     }
@@ -106,11 +124,11 @@ mod tests {
     use std::collections::HashMap;
 
     struct FakeChecker {
-        signers: HashMap<String, Option<String>>,
+        signers: HashMap<String, Option<(char, String)>>,
     }
 
     impl SignerChecker for FakeChecker {
-        fn commit_signer(&self, commit: &str) -> Result<Option<String>, Error> {
+        fn commit_signature(&self, commit: &str) -> Result<Option<(char, String)>, Error> {
             Ok(self.signers.get(commit).cloned().flatten())
         }
     }
@@ -118,10 +136,11 @@ mod tests {
     fn checker() -> FakeChecker {
         FakeChecker {
             signers: HashMap::from([
-                ("tip".to_string(), Some("KEY1".to_string())),
-                ("c1".to_string(), Some("KEY1".to_string())),
-                ("c2".to_string(), Some("KEY2".to_string())),
+                ("tip".to_string(), Some(('G', "KEY1".to_string()))),
+                ("c1".to_string(), Some(('G', "KEY1".to_string()))),
+                ("c2".to_string(), Some(('G', "KEY2".to_string()))),
                 ("unsigned".to_string(), None),
+                ("bad-sig".to_string(), Some(('B', "KEY1".to_string()))),
             ]),
         }
     }
@@ -139,6 +158,15 @@ mod tests {
         let trusted = vec!["KEY1".to_string()];
         let err = verify_history(&c, &trusted, "tip", &["unsigned".to_string()]).unwrap_err();
         assert!(format!("{err}").contains("untrusted/unsigned"));
+    }
+
+    #[test]
+    fn bad_signature_refused_even_from_trusted_key() {
+        // %GK prints a key id even for a BAD signature — %G? must be G.
+        let c = checker();
+        let trusted = vec!["KEY1".to_string()];
+        let err = verify_history(&c, &trusted, "tip", &["bad-sig".to_string()]).unwrap_err();
+        assert!(format!("{err}").contains("bad-signature"));
     }
 
     #[test]

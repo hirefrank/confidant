@@ -94,6 +94,18 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
     }
 
     let trust_path = config_dir.join(TRUST_FILE);
+    // Canonicalize the file too (not just the dir): a trust.toml symlink
+    // pointing into the vault must not pass the inside-the-vault check.
+    let trust_canon = trust_path
+        .canonicalize()
+        .unwrap_or_else(|_| trust_path.clone());
+    if trust_canon.starts_with(&vault_canon) {
+        return Err(Error::Anchor(format!(
+            "trust anchor path {} is inside the vault {}; refusing",
+            trust_canon.display(),
+            vault_canon.display()
+        )));
+    }
     let text = std::fs::read_to_string(&trust_path).map_err(|_| {
         Error::Anchor(format!(
             "missing trust anchor at {}: run `confidant init` on a trusted device",

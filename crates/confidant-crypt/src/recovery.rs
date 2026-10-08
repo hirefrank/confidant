@@ -76,7 +76,8 @@ impl Recovery {
     }
 
     /// Recover from a written-down phrase. Validates the checksum and
-    /// reports "typo in word N"-style errors.
+    /// reports "typo in word N"-style errors (position only — never echo
+    /// the mistyped word, per test 13).
     pub fn from_phrase(phrase: &str) -> Result<Self, Error> {
         let words: Vec<&str> = phrase.split_whitespace().collect();
         if words.len() != 24 {
@@ -87,14 +88,20 @@ impl Recovery {
         }
         let list = Language::English.word_list();
         for (i, w) in words.iter().enumerate() {
-            if !list.contains(w) {
+            let lower = w.to_lowercase();
+            if !list.iter().any(|valid| *valid == lower) {
                 return Err(Error::Recovery(format!(
-                    "typo in word {}: {w} is not in the BIP39 English wordlist",
+                    "typo in word {}: not in the BIP39 English wordlist",
                     i + 1
                 )));
             }
         }
-        let m = Mnemonic::parse_in(Language::English, phrase)
+        let normalized = words
+            .iter()
+            .map(|w| w.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let m = Mnemonic::parse_in(Language::English, &normalized)
             .map_err(|e| Error::Recovery(format!("checksum invalid: {e}")))?;
         Ok(Self::from_mnemonic(&m))
     }
@@ -128,11 +135,13 @@ impl Recovery {
     }
 
     fn from_mnemonic(m: &Mnemonic) -> Self {
-        let entropy = m.to_entropy();
+        let mut entropy = m.to_entropy();
         assert_eq!(entropy.len(), 32, "24 words must give 256-bit entropy");
         let x25519_sk = hkdf_32(&entropy, INFO_X25519);
-        let ed_seed = hkdf_32(&entropy, INFO_ED25519);
+        let mut ed_seed = hkdf_32(&entropy, INFO_ED25519);
+        entropy.zeroize();
         let ed25519_sk = SigningKey::from_bytes(&ed_seed);
+        ed_seed.zeroize();
         let phrase_words: Vec<String> = m
             .to_string()
             .split_whitespace()
