@@ -20,7 +20,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, `note:` is not a note, or a `merge` folds one record type into another. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
-| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it, a key that normalises to `noai` other than exact `no-ai`, and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
+| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines. |
@@ -46,10 +46,12 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
-cleared records and ledger lines are searchable. A finding about anything
-uncleared gives only its code and the count of affected items — never a
-path, file name, ID, key, or line text. Ledger parse errors give the line
-number and code without echoing tokens.
+cleared records and ledger lines are searchable. A finding is kept
+verbatim only when it has no file and no ID, or when it resolves to a
+cleared record or a cleared ledger line. Everything else is reduced to
+its code and the count of affected items — never a path, file name, ID,
+key, or line text. Name-only mentions with no ID are not detected.
+Ledger parse errors give the line number and code without echoing tokens.
 
 Command-level error codes (not check findings):
 

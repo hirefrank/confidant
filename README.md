@@ -26,9 +26,14 @@ content only from a cleared allowlist (spec section 12): a record is
 searchable only when it parsed cleanly, has no `no-ai` flag, has no
 duplicate or path-id mismatch, every ID in its front matter is cleared,
 its whole merge group is cleared, and any `people/<id>/` parent is cleared.
-Ledger lines are searchable only when every ID on the line is cleared.
-Findings about uncleared items give a code and a count, never a path or
-raw text. Milestone 3 `context` continues to honour `no-ai`.
+`pkg-` IDs follow their openers. Malformed ID-like tokens un-clear the
+record or line. Body lines that mention an uncleared or invalid ID are
+dropped. Ledger lines are searchable only when every ID on the line is
+cleared. Findings are themselves an allowlist: kept verbatim only when
+they have no file and no ID, or resolve to a cleared record or ledger
+line; otherwise a code and a count, never a path or raw text. Name-only
+mentions with no ID (prose, comments, `person: "Jane Doe"`) are not
+detected. Milestone 3 `context` continues to honour `no-ai`.
 
 ## Quickstart
 

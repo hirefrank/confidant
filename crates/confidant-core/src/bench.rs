@@ -26,7 +26,7 @@ pub fn generate_realistic_vault(
 ) -> Result<(String, String)> {
     refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
-    let unique = "zxqv-unique-token-ada-0";
+    let unique = "zxqvUniqueTokenAda0";
     let common = "coaching-practice";
     let vault_id = ulid_from_parts(TIME_MS, 1);
     let cfg = format!(
@@ -194,5 +194,48 @@ mod tests {
             report.findings
         );
         assert!(generate_realistic_vault(dir.path(), 1, 1).is_err());
+    }
+
+    #[test]
+    fn bench_gen_vault_stays_within_search_timings() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (unique, common) = generate_realistic_vault(dir.path(), 400, 5).unwrap();
+        let vault = load_vault(dir.path()).unwrap();
+        assert!(
+            vault.records.len() >= 2_400,
+            "expected ~2500 files, got {} records",
+            vault.records.len()
+        );
+        let budget = if cfg!(debug_assertions) {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_millis(200)
+        };
+        let t0 = Instant::now();
+        let one = search(&vault, &unique);
+        let find_unique = t0.elapsed();
+        let t1 = Instant::now();
+        let many = search(&vault, &common);
+        let find_common = t1.elapsed();
+        let t2 = Instant::now();
+        let report = crate::check_vault(&vault, &crate::CheckOptions::default());
+        let check = t2.elapsed();
+        assert_eq!(one.hits.len(), 1, "{:?}", one.hits);
+        assert!(many.hits.len() >= 400, "{}", many.hits.len());
+        assert!(
+            report.findings.is_empty(),
+            "generated vault should check clean: {:?}",
+            report.findings
+        );
+        assert!(
+            find_unique <= budget,
+            "find unique {find_unique:?} exceeded {budget:?}"
+        );
+        assert!(
+            find_common <= budget,
+            "find common {find_common:?} exceeded {budget:?}"
+        );
+        assert!(check <= budget, "check {check:?} exceeded {budget:?}");
     }
 }

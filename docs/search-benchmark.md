@@ -16,7 +16,7 @@ cargo build --release --locked -p confidant-cli
 tmp=$(mktemp -d)
 ./target/release/confidant bench-gen "$tmp" --people 400 --notes 5
 hyperfine --warmup 3 --runs 10 \
-  "./target/release/confidant find zxqv-unique-token-ada-0 --vault $tmp --json --no-input" \
+  "./target/release/confidant find zxqvUniqueTokenAda0 --vault $tmp --json --no-input" \
   "./target/release/confidant find coaching-practice --vault $tmp --json --no-input" \
   "./target/release/confidant check --vault $tmp --json --no-input"
 ```
@@ -41,7 +41,9 @@ Session-note and paid-gap checks are `off` in the generated config so
 
 ## Results
 
-Measured 2026-10-08 on the milestone 1 cloud-agent VM.
+Measured 2026-10-08 on the milestone 1 cloud-agent VM after the section 12
+allowlist (cleared set, malformed ID tokens, `pkg-` openers, body-line
+filter, finding redaction).
 
 Hardware: Intel Xeon (4 logical CPUs), Linux 6.12, `confidant` release
 build (`rustc 1.99.0`). Hyperfine 2.0.0, **3 warmup runs, 10 timed runs**.
@@ -49,20 +51,21 @@ Spread is mean ± one standard deviation; min and max are the observed range.
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| `find zxqv-unique-token-ada-0` (one profile) | 1 | **68.4 ms** | 3.1 ms | 65.9 ms | 75.9 ms |
-| `find coaching-practice` (every record) | 2,400 | **72.4 ms** | 1.9 ms | 70.2 ms | 76.1 ms |
-| `check` | 0 findings | **65.8 ms** | 1.0 ms | 63.5 ms | 67.0 ms |
+| `find zxqvUniqueTokenAda0` (one profile) | 1 | **100.0 ms** | 2.4 ms | 96.5 ms | 102.9 ms |
+| `find coaching-practice` (every record) | 2,400 | **103.5 ms** | 2.7 ms | 99.5 ms | 107.4 ms |
+| `check` | 0 findings | **70.6 ms** | 1.7 ms | 68.0 ms | 73.4 ms |
 
-Peak RSS was about 31–34 MiB.
+Peak RSS was about 34–38 MiB.
 
 ## Section 9b item 4
 
 A sequential plaintext scan of a few hundred clients, with realistic
 note sizes (KB transcripts), dozens of sessions per client, and
-multi-year ledgers, stays around **70 ms** — well inside interactive
-range. The earlier ~38 ms figure was the same 400×5 layout with tiny
-notes and far fewer ledger lines.
+multi-year ledgers, stays around **100 ms** for `find` (cleared allowlist
+plus scan) and **70 ms** for `check` — still inside interactive range.
+The earlier ~70 ms `find` figure was the same 400×5 layout before the
+fixed-point allowlist.
 
 QMD (local BM25 + vectors, index never in git) is still the plan after
 v0. Milestone 2 record-bound AEAD is **not** in this measurement; do not
-treat 70 ms as a decrypt-inclusive budget.
+treat 100 ms as a decrypt-inclusive budget.

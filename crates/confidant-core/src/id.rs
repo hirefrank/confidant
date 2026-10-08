@@ -210,52 +210,129 @@ pub fn is_ulid(s: &str) -> bool {
     canonicalize_ulid(s).is_some()
 }
 
-/// Scan `text` for ID-shaped tokens (`p-`/`o-`/`d-`/`i-`/`n-`/`pkg-` plus ULID),
-/// case-insensitively. Finds IDs inside junk such as `[[p-…]]`.
-pub fn scan_ids(text: &str) -> Vec<RecordId> {
+/// A token that looks like a record ID: type prefix, dash, alphanumeric run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdToken {
+    Valid(RecordId),
+    /// Prefix + dash + alphanumeric run that fails ULID validation.
+    Malformed,
+}
+
+/// Scan `text` for ID-shaped tokens (`p`/`o`/`d`/`i`/`n`/`pkg` plus an ASCII or
+/// Unicode dash plus an alphanumeric run), case-insensitively. Finds IDs
+/// inside junk such as `[[p-…]]`. A run that is not a Crockford ULID is
+/// [`IdToken::Malformed`].
+pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
+    if !text.as_bytes().contains(&b'-')
+        && (!text.as_bytes().iter().any(|b| *b >= 0x80) || !text.chars().any(is_id_dash))
+    {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut remaining = text;
+    let mut prev_alnum = false;
     while !remaining.is_empty() {
-        if let Some((id, len)) = match_id_at(remaining) {
-            out.push(id);
-            remaining = &remaining[len..];
-        } else {
-            let ch = remaining.chars().next().unwrap();
-            remaining = &remaining[ch.len_utf8()..];
+        if !prev_alnum && starts_id_prefix(remaining) {
+            if let Some((tok, len)) = match_id_token_at(remaining) {
+                out.push(tok);
+                remaining = &remaining[len..];
+                prev_alnum = true;
+                continue;
+            }
         }
+        let ch = remaining.chars().next().unwrap();
+        prev_alnum = ch.is_ascii_alphanumeric();
+        remaining = &remaining[ch.len_utf8()..];
     }
     out
 }
 
-fn match_id_at(s: &str) -> Option<(RecordId, usize)> {
+fn starts_id_prefix(s: &str) -> bool {
+    matches!(
+        s.as_bytes().first(),
+        Some(b'p' | b'P' | b'o' | b'O' | b'd' | b'D' | b'i' | b'I' | b'n' | b'N')
+    )
+}
+
+/// Valid IDs only; malformed lookalikes are skipped.
+pub fn scan_ids(text: &str) -> Vec<RecordId> {
+    scan_id_tokens(text)
+        .into_iter()
+        .filter_map(|tok| match tok {
+            IdToken::Valid(id) => Some(id),
+            IdToken::Malformed => None,
+        })
+        .collect()
+}
+
+fn match_id_token_at(s: &str) -> Option<(IdToken, usize)> {
     const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
     for pref in PREFIXES {
         let plen = pref.len();
-        if s.len() < plen + 1 + ULID_LEN {
+        let Some(head) = s.get(..plen) else {
             continue;
-        }
-        let head = s.get(..plen)?;
+        };
         if !head.eq_ignore_ascii_case(pref) {
             continue;
         }
-        if s.as_bytes().get(plen) != Some(&b'-') {
+        let Some(after) = s.get(plen..) else {
+            continue;
+        };
+        let Some(dash) = after.chars().next() else {
+            continue;
+        };
+        if !is_id_dash(dash) {
             continue;
         }
-        let ulid = s.get(plen + 1..plen + 1 + ULID_LEN)?;
-        if ulid.len() != ULID_LEN || !ulid.is_ascii() {
+        let run_start = dash.len_utf8();
+        let run_len = after[run_start..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after.len() - run_start);
+        if run_len == 0 {
             continue;
         }
-        let raw = format!("{pref}-{ulid}");
-        if let Ok(id) = RecordId::parse(&raw) {
-            return Some((id, plen + 1 + ULID_LEN));
+        let total = plen + run_start + run_len;
+        let run = &after[run_start..run_start + run_len];
+        if dash == '-' {
+            if let Ok(id) = RecordId::parse(&format!("{pref}-{run}")) {
+                return Some((IdToken::Valid(id), total));
+            }
         }
+        return Some((IdToken::Malformed, total));
     }
     None
 }
 
-/// Package IDs are ledger-only in 0.1 and do not participate in the find allowlist.
-pub fn is_vault_record_prefix(prefix: Prefix) -> bool {
-    prefix != Prefix::Package
+pub(crate) fn is_id_dash(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '\u{00ad}'
+            | '\u{2010}'
+            | '\u{2011}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2015}'
+            | '\u{2212}'
+            | '\u{fe58}'
+            | '\u{fe63}'
+            | '\u{ff0d}'
+    )
+}
+
+/// Person ID for a vault-relative path under `people/<id>/` or `people/<id>.md`.
+pub fn person_id_from_path(path: &str) -> Option<RecordId> {
+    let mut parts = path.split('/');
+    if parts.next()? != "people" {
+        return None;
+    }
+    let second = parts.next()?;
+    let stem = second.strip_suffix(".md").unwrap_or(second);
+    let id = RecordId::parse(stem).ok()?;
+    if id.prefix() != Prefix::Person {
+        return None;
+    }
+    Some(id)
 }
 
 /// Encode `value` as `len` Crockford characters (big-endian).
@@ -332,5 +409,32 @@ mod tests {
         assert_eq!(found, vec![id.clone()]);
         let mixed = super::scan_ids("P-01m3tc5h00mpjg000000000000");
         assert_eq!(mixed, vec![id]);
+    }
+
+    #[test]
+    fn scan_id_tokens_flags_malformed_ulid_and_unicode_dash() {
+        use super::{scan_id_tokens, IdToken};
+        let bad_letter = scan_id_tokens("see p-01M3TC5H00MPJG00000000000I");
+        assert_eq!(bad_letter, vec![IdToken::Malformed]);
+        let short = scan_id_tokens("p-01M3TC5H00MPJG00000000000");
+        assert_eq!(short, vec![IdToken::Malformed]);
+        let en_dash = scan_id_tokens("p\u{2013}01M3TC5H00MPJG000000000000");
+        assert_eq!(en_dash, vec![IdToken::Malformed]);
+        assert!(scan_id_tokens("merged-deal-token").is_empty());
+        assert!(scan_id_tokens("zxqv-unique-token-ada-0").is_empty());
+    }
+
+    #[test]
+    fn person_id_from_people_path() {
+        let id = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        assert_eq!(
+            super::person_id_from_path("people/p-01M3TC5H00MPJG000000000000/profile.md"),
+            Some(id.clone())
+        );
+        assert_eq!(
+            super::person_id_from_path("people/p-01M3TC5H00MPJG000000000000.md"),
+            Some(id)
+        );
+        assert!(super::person_id_from_path("notes/n-01M3TC5H00MPJG002NAM000005/note.md").is_none());
     }
 }

@@ -132,38 +132,15 @@ fn is_noai_typo(key: &str) -> bool {
 }
 
 fn normalize_noai(key: &str) -> String {
-    let mut out = String::new();
+    let mut folded = String::new();
     for c in key.chars() {
-        if is_stripped_noai_char(c) {
-            continue;
-        }
         match c {
-            'ß' | 'ẞ' => out.push_str("ss"),
-            'İ' => out.push('i'),
-            _ => out.extend(c.to_lowercase()),
+            'ß' | 'ẞ' => folded.push_str("ss"),
+            'İ' => folded.push('i'),
+            _ => folded.extend(c.to_lowercase()),
         }
     }
-    out
-}
-
-fn is_stripped_noai_char(c: char) -> bool {
-    matches!(
-        c,
-        '-' | '_'
-            | ' '
-            | '\t'
-            | '\u{00ad}'
-            | '\u{2010}'
-            | '\u{2011}'
-            | '\u{2012}'
-            | '\u{2013}'
-            | '\u{2014}'
-            | '\u{2015}'
-            | '\u{2212}'
-            | '\u{fe58}'
-            | '\u{fe63}'
-            | '\u{ff0d}'
-    )
+    folded.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32>);
@@ -212,7 +189,7 @@ pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterErr
             )
             .at_line(line_no));
         };
-        let key = key.trim();
+        let key = unquote(key.trim());
         if key.is_empty() {
             return Err(FrontmatterError::new(
                 format!("front matter key is empty (line {line_no})"),
@@ -220,23 +197,23 @@ pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterErr
             )
             .at_line(line_no));
         }
-        if is_noai_typo(key) {
+        if is_noai_typo(&key) {
             return Err(FrontmatterError::new(
                 format!("front matter line {line_no} has a no-ai key typo"),
                 "Use the exact key no-ai: true or no-ai: false",
             )
             .at_line(line_no));
         }
-        if fields.contains_key(key) {
+        if fields.contains_key(&key) {
             return Err(FrontmatterError::key_at(
                 line_no,
-                key,
+                &key,
                 "is duplicated",
                 "Keep a single value for each front matter key",
             ));
         }
-        fields.insert(key.to_owned(), unquote(value.trim()));
-        key_lines.insert(key.to_owned(), line_no);
+        fields.insert(key.clone(), unquote(value.trim()));
+        key_lines.insert(key, line_no);
         line_no += 1;
     }
     Ok((
@@ -486,13 +463,23 @@ mod tests {
         .unwrap_err();
         assert!(org.message.contains("no-ai"));
         assert!(org.message.contains("not allowed"));
-        for key in ["No-AI", "no_ai", "noai", "no\u{2013}ai"] {
+        for key in ["No-AI", "no_ai", "noai", "no\u{2013}ai", "no.ai"] {
             let src =
                 format!("---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n{key}: true\n---\n");
             let err = parse_record(&src, "x.md").unwrap_err();
             assert!(err.message.contains("line 4"), "{key}: {}", err.message);
             assert!(!err.message.contains(key), "{key}: {}", err.message);
             assert!(!err.message.contains("true"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn quoted_no_ai_key_is_the_real_flag() {
+        for key in ["\"no-ai\"", "'no-ai'"] {
+            let src =
+                format!("---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n{key}: true\n---\n");
+            let rec = parse_record(&src, "x.md").unwrap();
+            assert!(rec.no_ai(), "{key}");
         }
     }
 

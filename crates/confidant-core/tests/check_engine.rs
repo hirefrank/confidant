@@ -11,6 +11,7 @@ const ADA: &str = "p-01M3TC5H00MPJG000000000000";
 const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
 const CAM: &str = "p-01M3TC5H00MPJG001248000002";
 const PKG: &str = "pkg-01M3TC5H00MPJG004SK4000009";
+const PKG2: &str = "pkg-01M3TC5H00MPJG007ZZ000000E";
 const NOTE: &str = "n-01M3TC5H00MPJG002NAM000005";
 const ORG: &str = "o-01M3TC5H00MPJG001K6C000003";
 const DEAL: &str = "d-01M3TC5H00MPJG00248G000004";
@@ -1360,4 +1361,151 @@ fn returning_client_new_package_resets_gap_clock() {
         !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
         "{json}"
     );
+}
+
+#[test]
+fn find_json_omits_unparsable_note_outside_people() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        "this is not front matter\nunparsable-outside-people-token\n",
+    );
+    let result = search_q(dir.path(), "unparsable-outside-people-token");
+    assert!(
+        !token_in_hits(&result, "unparsable-outside-people-token"),
+        "{result:?}"
+    );
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(!dumped.contains(NOTE), "{dumped}");
+    assert!(!dumped.contains(&format!("notes/{NOTE}")), "{dumped}");
+    assert!(!dumped.contains("note.md"), "{dumped}");
+}
+
+#[test]
+fn find_json_omits_non_record_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "zz-hidden-nonrecord-filename.txt",
+        "hidden-nonrecord-token\n",
+    );
+    let result = search_q(dir.path(), "hidden-nonrecord-token");
+    assert!(
+        !token_in_hits(&result, "hidden-nonrecord-token"),
+        "{result:?}"
+    );
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(
+        !dumped.contains("zz-hidden-nonrecord-filename.txt"),
+        "{dumped}"
+    );
+}
+
+#[test]
+fn find_excludes_quoted_double_no_ai_key() {
+    find_excludes_noai_key_typo("\"no-ai\"", "quoted-double-no-ai-token");
+}
+
+#[test]
+fn find_excludes_quoted_single_no_ai_key() {
+    find_excludes_noai_key_typo("'no-ai'", "quoted-single-no-ai-token");
+}
+
+#[test]
+fn find_excludes_nbsp_no_ai_key() {
+    find_excludes_noai_key_typo("no\u{00a0}ai", "nbsp-no-ai-token");
+}
+
+#[test]
+fn find_excludes_zero_width_no_ai_key() {
+    find_excludes_noai_key_typo("no\u{200b}ai", "zwsp-no-ai-token");
+}
+
+#[test]
+fn find_excludes_dotted_no_ai_key() {
+    find_excludes_noai_key_typo("no.ai", "dotted-no-ai-token");
+}
+
+#[test]
+fn find_drops_body_line_with_excluded_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\n---\n\nvisible-bea-token\nsee excluded {ADA} dropped-body-line-token\nstill-visible-token\n"
+        ),
+    );
+    let dropped = search_q(dir.path(), "dropped-body-line-token");
+    let visible = search_q(dir.path(), "visible-bea-token");
+    let still = search_q(dir.path(), "still-visible-token");
+    assert!(
+        !token_in_hits(&dropped, "dropped-body-line-token"),
+        "{dropped:?}"
+    );
+    assert!(token_in_hits(&visible, "visible-bea-token"), "{visible:?}");
+    assert!(token_in_hits(&still, "still-visible-token"), "{still:?}");
+}
+
+#[test]
+fn find_excludes_line_naming_only_excluded_person_pkg() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    person(dir.path(), BEA, "Bea");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             not-an-entry pkg-only-token {PKG}\n"
+        ),
+    );
+    let result = search_q(dir.path(), "pkg-only-token");
+    assert!(!token_in_hits(&result, "pkg-only-token"), "{result:?}");
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(!dumped.contains(PKG), "{dumped}");
+}
+
+#[test]
+fn find_excludes_unopened_pkg() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("not-an-entry unopened-pkg-token {PKG2}\n"),
+    );
+    let result = search_q(dir.path(), "unopened-pkg-token");
+    assert!(!token_in_hits(&result, "unopened-pkg-token"), "{result:?}");
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(!dumped.contains(PKG2), "{dumped}");
+}
+
+#[test]
+fn find_excludes_record_with_malformed_id_typo() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada\nsee: p-01M3TC5H00MPJG00000000000I\n---\n\nmalformed-id-typo-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "malformed-id-typo-token");
+    assert!(
+        !token_in_hits(&result, "malformed-id-typo-token"),
+        "{result:?}"
+    );
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(!dumped.contains("01M3TC5H00MPJG00000000000I"), "{dumped}");
 }
