@@ -1,7 +1,7 @@
 //! Collision-free prefixed ULIDs (ADR-3).
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
@@ -258,13 +258,6 @@ impl IdToken {
         .into_iter()
     }
 
-    pub(crate) fn bare_ulid(&self) -> Option<&str> {
-        match self {
-            Self::BareUlid(ulid) => Some(ulid.as_str()),
-            Self::Valid(_) | Self::Malformed { .. } => None,
-        }
-    }
-
     pub(crate) fn is_malformed(&self) -> bool {
         matches!(self, Self::Malformed { .. })
     }
@@ -282,27 +275,62 @@ impl IdToken {
 /// ULID, a Unicode dash plus a ULID, or a run of dashes (`--`, soft hyphen
 /// then `-`) plus a ULID, is Malformed with that candidate. When `vault_ulids`
 /// is set, every 26-character Crockford window that exactly matches a ULID
-/// the vault names is also a BareUlid token (no word-boundary rule).
+/// the vault names is also a BareUlid token (no word-boundary rule), except
+/// windows already covered by a prefixed token on that line (a record's
+/// `id:` line is not a bare window).
 pub fn scan_id_tokens(text: &str) -> Vec<IdToken> {
     scan_id_tokens_against(text, None)
+}
+
+/// Prefixed tokens from one line, plus byte ranges of those tokens in the
+/// stripped text so a later window scan can skip ULIDs already named.
+pub(crate) struct PrefixedScan {
+    pub tokens: Vec<IdToken>,
+    covered: Vec<(usize, usize)>,
 }
 
 pub(crate) fn scan_id_tokens_against(
     text: &str,
     vault_ulids: Option<&HashSet<String>>,
 ) -> Vec<IdToken> {
+    let mut scan = scan_prefixed_line(text);
+    if let Some(ulids) = vault_ulids {
+        add_bare_ulid_windows(text, ulids, &mut scan);
+    }
+    scan.tokens
+}
+
+/// Tokenize the prefixed form of a line once (no bare-ULID windows).
+pub(crate) fn scan_prefixed_line(text: &str) -> PrefixedScan {
     let mapped = map_soft_hyphen_after_prefix(text);
     let stripped = strip_cf(&mapped);
-    let text = stripped.as_ref();
-    let mut out = if has_id_dash(text) {
-        scan_prefixed(text)
-    } else {
-        Vec::new()
-    };
-    if let Some(ulids) = vault_ulids {
-        scan_vault_ulid_windows(text, ulids, &mut out);
-    }
-    out
+    scan_prefixed(stripped.as_ref())
+}
+
+/// Append BareUlid tokens for vault ULIDs whose 26-character windows are not
+/// already covered by a prefixed token on this line.
+pub(crate) fn add_bare_ulid_windows(
+    text: &str,
+    vault_ulids: &HashSet<String>,
+    scan: &mut PrefixedScan,
+) {
+    let mapped = map_soft_hyphen_after_prefix(text);
+    let stripped = strip_cf(&mapped);
+    scan_vault_ulid_windows(
+        stripped.as_ref(),
+        vault_ulids,
+        &scan.covered,
+        &mut scan.tokens,
+    );
+}
+
+/// Crockford ULID windows in `text` that sit outside any prefixed token.
+/// Used to seed the allowlist from file and directory names.
+pub(crate) fn collect_uncovered_ulid_windows(text: &str, out: &mut BTreeSet<String>) {
+    let mapped = map_soft_hyphen_after_prefix(text);
+    let stripped = strip_cf(&mapped);
+    let scan = scan_prefixed(stripped.as_ref());
+    collect_ulid_windows(stripped.as_ref(), &scan.covered, out);
 }
 
 fn has_id_dash(text: &str) -> bool {
@@ -313,9 +341,17 @@ fn has_id_dash(text: &str) -> bool {
     bytes.iter().any(|b| *b >= 0x80) && text.chars().any(is_id_dash)
 }
 
-fn scan_prefixed(text: &str) -> Vec<IdToken> {
-    let mut out = Vec::new();
+fn scan_prefixed(text: &str) -> PrefixedScan {
+    if !has_id_dash(text) {
+        return PrefixedScan {
+            tokens: Vec::new(),
+            covered: Vec::new(),
+        };
+    }
+    let mut tokens = Vec::new();
+    let mut covered = Vec::new();
     let mut remaining = text;
+    let mut offset = 0;
     let mut prev: Option<char> = None;
     let mut prev2: Option<char> = None;
     let mut run_has_scheme = false;
@@ -324,8 +360,10 @@ fn scan_prefixed(text: &str) -> Vec<IdToken> {
         if starts_id_prefix(remaining) {
             let glued = prefix_is_glued(prev, prev2, run_has_scheme);
             if let Some((tok, len)) = match_id_token_at(remaining, glued) {
-                out.push(tok);
+                tokens.push(tok);
+                covered.push((offset, offset + len));
                 remaining = &remaining[len..];
+                offset += len;
                 prev2 = prev;
                 prev = Some('0');
                 continue;
@@ -351,8 +389,9 @@ fn scan_prefixed(text: &str) -> Vec<IdToken> {
         prev2 = prev;
         prev = Some(ch);
         remaining = &remaining[n..];
+        offset += n;
     }
-    out
+    PrefixedScan { tokens, covered }
 }
 
 fn prefix_is_glued(prev: Option<char>, prev2: Option<char>, run_has_scheme: bool) -> bool {
@@ -448,10 +487,16 @@ fn is_crockford_byte(b: u8) -> bool {
     CROCKFORD_BYTE[b as usize]
 }
 
-fn scan_vault_ulid_windows(text: &str, vault_ulids: &HashSet<String>, out: &mut Vec<IdToken>) {
-    if vault_ulids.is_empty() {
-        return;
-    }
+fn window_covered(start: usize, covered: &[(usize, usize)]) -> bool {
+    let end = start + ULID_LEN;
+    covered.iter().any(|&(lo, hi)| start < hi && end > lo)
+}
+
+fn each_crockford_window(
+    text: &str,
+    covered: &[(usize, usize)],
+    mut on_ulid: impl FnMut(usize, &str),
+) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -469,6 +514,10 @@ fn scan_vault_ulid_windows(text: &str, vault_ulids: &HashSet<String>, out: &mut 
             continue;
         }
         for off in 0..=run.len() - ULID_LEN {
+            let abs = start + off;
+            if window_covered(abs, covered) {
+                continue;
+            }
             let window = &run[off..off + ULID_LEN];
             let first = window[0].to_ascii_uppercase();
             if first > b'7' {
@@ -479,11 +528,33 @@ fn scan_vault_ulid_windows(text: &str, vault_ulids: &HashSet<String>, out: &mut 
                 buf[j] = b.to_ascii_uppercase();
             }
             let ulid = std::str::from_utf8(&buf).expect("crockford alphabet is ascii");
-            if vault_ulids.contains(ulid) {
-                out.push(IdToken::BareUlid(ulid.to_owned()));
-            }
+            on_ulid(abs, ulid);
         }
     }
+}
+
+fn scan_vault_ulid_windows(
+    text: &str,
+    vault_ulids: &HashSet<String>,
+    covered: &[(usize, usize)],
+    out: &mut Vec<IdToken>,
+) {
+    if vault_ulids.is_empty() {
+        return;
+    }
+    each_crockford_window(text, covered, |_abs, ulid| {
+        if vault_ulids.contains(ulid) {
+            out.push(IdToken::BareUlid(ulid.to_owned()));
+        }
+    });
+}
+
+fn collect_ulid_windows(text: &str, covered: &[(usize, usize)], out: &mut BTreeSet<String>) {
+    each_crockford_window(text, covered, |_abs, ulid| {
+        if canonicalize_ulid(ulid).is_some() {
+            out.insert(ulid.to_owned());
+        }
+    });
 }
 
 /// Valid IDs only; malformed lookalikes and bare ULIDs are skipped.
@@ -955,6 +1026,30 @@ mod tests {
             &[ulid]
         )
         .is_empty());
+    }
+
+    #[test]
+    fn scan_id_tokens_skips_bare_windows_inside_prefixed_tokens() {
+        use super::IdToken;
+        let person = super::RecordId::parse("p-01M3TC5H00MPJG000H24000001").unwrap();
+        let ulid = person.ulid().to_owned();
+        let note = super::RecordId::parse(&format!("n-{ulid}")).unwrap();
+        assert_eq!(
+            scan_with_ulids(&format!("id: {person}"), &[&ulid]),
+            vec![IdToken::Valid(person.clone())]
+        );
+        assert_eq!(
+            scan_with_ulids(&format!("Mentioned {note} once by mistake."), &[&ulid]),
+            vec![IdToken::Valid(note)]
+        );
+        assert_eq!(
+            scan_with_ulids(&format!("see {ulid}"), &[&ulid]),
+            vec![IdToken::BareUlid(ulid.clone())]
+        );
+        assert_eq!(
+            scan_with_ulids(&format!("id: {person} then {ulid}"), &[&ulid]),
+            vec![IdToken::Valid(person), IdToken::BareUlid(ulid)]
+        );
     }
 
     #[test]

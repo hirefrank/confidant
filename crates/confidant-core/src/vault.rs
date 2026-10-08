@@ -1,11 +1,14 @@
 //! Load a vault from disk: config, records, ledger.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
-use crate::id::{record_id_from_entry_name, scan_id_tokens, IdToken, Prefix, RecordId};
+use crate::id::{
+    collect_uncovered_ulid_windows, record_id_from_entry_name, scan_id_tokens, IdToken, Prefix,
+    RecordId,
+};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
 use crate::record::{
@@ -46,7 +49,10 @@ pub struct Vault {
     pub ledger_unread_count: u32,
     /// Path-derived record IDs, including files/directories that failed to load.
     /// Always uncleared when not present in `records`.
-    pub path_ids: HashSet<RecordId>,
+    pub path_ids: BTreeSet<RecordId>,
+    /// Crockford ULIDs taken from visited file/directory names whose windows
+    /// are not already a loaded record's own exact name.
+    pub path_ulids: BTreeSet<String>,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
@@ -79,7 +85,8 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
 
     let mut findings = config.config_findings();
     let mut records = BTreeMap::new();
-    let mut path_ids = HashSet::new();
+    let mut path_ids = BTreeSet::new();
+    let mut path_ulids = BTreeSet::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
@@ -94,6 +101,9 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             &mut ledger_unread_count,
         );
         scan_unexpected_top_level(root, &mut findings);
+        let mut names = Vec::new();
+        walk_seed_names(root, Path::new(""), &mut path_ids, &mut names);
+        seed_path_ulids(&names, &records, &mut path_ulids);
     }
 
     Ok(Vault {
@@ -105,6 +115,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         load_findings: findings,
         ledger_unread_count,
         path_ids,
+        path_ulids,
     })
 }
 
@@ -154,9 +165,73 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
     }
 }
 
-fn seed_entry_id(name: &str, path_ids: &mut HashSet<RecordId>) {
+fn seed_entry_id(name: &str, path_ids: &mut BTreeSet<RecordId>) {
     if let Some(id) = record_id_from_entry_name(name) {
         path_ids.insert(id);
+    }
+}
+
+fn seed_name_tokens(name: &str, path_ids: &mut BTreeSet<RecordId>, names: &mut Vec<String>) {
+    names.push(name.to_owned());
+    for tok in scan_id_tokens(name) {
+        for id in tok.record_ids() {
+            path_ids.insert(id.clone());
+        }
+    }
+}
+
+fn name_matches_loaded_record_exactly(name: &str, records: &BTreeMap<RecordId, Record>) -> bool {
+    let mut candidate = name;
+    loop {
+        if let Ok(id) = RecordId::parse(candidate) {
+            return records.contains_key(&id);
+        }
+        match candidate.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => candidate = stem,
+            _ => break,
+        }
+    }
+    false
+}
+
+fn seed_path_ulids(
+    names: &[String],
+    records: &BTreeMap<RecordId, Record>,
+    path_ulids: &mut BTreeSet<String>,
+) {
+    for name in names {
+        if name_matches_loaded_record_exactly(name, records) {
+            continue;
+        }
+        collect_uncovered_ulid_windows(name, path_ulids);
+    }
+}
+
+fn walk_seed_names(
+    root: &Path,
+    rel: &Path,
+    path_ids: &mut BTreeSet<RecordId>,
+    names: &mut Vec<String>,
+) {
+    let Ok(listing) = paths::read_dir(root, rel) else {
+        return;
+    };
+    for (name, _) in listing.errors {
+        seed_name_tokens(&name, path_ids, names);
+    }
+    for ent in listing.entries {
+        if ent.utf8 {
+            seed_name_tokens(&ent.name, path_ids, names);
+        }
+        if !ent.utf8 || ent.kind == EntryKind::Symlink {
+            continue;
+        }
+        if paths::skip_walk_entry(&ent.name, ent.kind) {
+            continue;
+        }
+        if ent.kind == EntryKind::Directory {
+            walk_seed_names(root, &rel.join(&ent.name), path_ids, names);
+        }
     }
 }
 
@@ -248,7 +323,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
 fn scan_collections(
     root: &Path,
     records: &mut BTreeMap<RecordId, Record>,
-    path_ids: &mut HashSet<RecordId>,
+    path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     for collection in COLLECTIONS {
@@ -333,7 +408,7 @@ fn ingest_file(
     stem: &str,
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
-    path_ids: &mut HashSet<RecordId>,
+    path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let file = paths::display_relative(relative);
@@ -376,7 +451,7 @@ fn ingest_dir(
     name: &str,
     expected_prefix: Prefix,
     records: &mut BTreeMap<RecordId, Record>,
-    path_ids: &mut HashSet<RecordId>,
+    path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let dir = paths::display_relative(relative);
@@ -480,7 +555,7 @@ fn scan_person_notes(
     person_dir: &Path,
     person_id: &RecordId,
     records: &mut BTreeMap<RecordId, Record>,
-    path_ids: &mut HashSet<RecordId>,
+    path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     let notes_rel = person_dir.join("notes");

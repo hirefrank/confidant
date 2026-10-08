@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use confidant_core::check::{CheckOptions, FindingCode, Severity};
 use confidant_core::{check_vault, load_vault};
@@ -3397,4 +3398,321 @@ fn find_bare_package_ulid_matches_prefixed_when_package_is_cleared() {
             "{marker} should stay searchable when the package is cleared: {result:?}"
         );
     }
+}
+
+fn copy_dir(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for ent in fs::read_dir(src).unwrap() {
+        let ent = ent.unwrap();
+        let to = dst.join(ent.file_name());
+        if ent.file_type().unwrap().is_dir() {
+            copy_dir(&ent.path(), &to);
+        } else {
+            fs::copy(ent.path(), to).unwrap();
+        }
+    }
+}
+
+fn demo_vault() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
+}
+
+fn copy_demo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&demo_vault(), dir.path());
+    dir
+}
+
+fn append_ledger(root: &Path, extra: &str) {
+    let path = root.join("ledger/2026/10.cfd");
+    let mut text = fs::read_to_string(&path).unwrap();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(extra);
+    fs::write(path, text).unwrap();
+}
+
+fn hit_fingerprint(result: &confidant_core::SearchResult) -> Vec<(String, u32, String, String)> {
+    result
+        .hits
+        .iter()
+        .map(|h| {
+            (
+                h.path.clone(),
+                h.line,
+                h.excerpt.clone(),
+                h.id.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn write_merge_pkg_leak_lines(root: &Path, pkg_spelling: &str) {
+    append_ledger(
+        root,
+        &format!(
+            "2026-10-09 merge {BEA} into {pkg_spelling}\n\
+             2026-10-09 merge {ADA} into {CAM}\n"
+        ),
+    );
+}
+
+#[test]
+fn find_hides_bea_merged_into_package_when_opener_merges_into_no_ai() {
+    for (label, pkg_spelling) in [
+        ("prefixed", PKG.to_owned()),
+        ("bare", ulid_of(PKG).to_owned()),
+    ] {
+        let dir = copy_demo();
+        write_merge_pkg_leak_lines(dir.path(), &pkg_spelling);
+        let vault = load_vault(dir.path()).unwrap();
+        assert!(
+            confidant_core::allowlist_is_fixed_point(&vault),
+            "{label} allowlist is not a fixed point"
+        );
+        let cleared: Vec<String> = confidant_core::cleared_record_ids(&vault)
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert!(
+            !cleared.iter().any(|id| id == BEA),
+            "{label}: Bea stayed cleared: {cleared:?}"
+        );
+        for q in ["Bea Demo", "pay-per-session", "Bea"] {
+            let result = search_q(dir.path(), q);
+            assert!(
+                !token_in_hits(&result, "Bea"),
+                "{label} query {q:?} leaked Bea: {result:?}"
+            );
+        }
+        let mut first = None;
+        for _ in 0..16 {
+            let result = search_q(dir.path(), "Demo");
+            let fp = hit_fingerprint(&result);
+            assert!(
+                fp.iter()
+                    .all(|(_, _, excerpt, id)| { !excerpt.contains("Bea") && id.as_str() != BEA }),
+                "{label} Demo search leaked Bea: {fp:?}"
+            );
+            match &first {
+                None => first = Some(fp),
+                Some(prev) => assert_eq!(prev, &fp, "{label} find was not deterministic"),
+            }
+        }
+    }
+}
+
+#[test]
+fn find_is_deterministic_on_shuffled_ledger_insertion() {
+    let mut lines = [
+        format!("2026-10-01 open {ADA} package {PKG} 6 sessions"),
+        format!("2026-10-01 open {CAM} package {PKG2} 4 sessions"),
+        format!("2026-10-09 merge {BEA} into {PKG}"),
+        format!("2026-10-09 merge {ADA} into {CAM}"),
+        format!("2026-10-05 session {BEA} 60m pps bea-shuffle-token"),
+        format!("2026-10-08 session {ADA} 45m paid ada-shuffle-token"),
+    ];
+    let mut expected: Option<Vec<String>> = None;
+    for seed in 1u64..=16 {
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for i in (1..lines.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let j = (x as usize) % (i + 1);
+            lines.swap(i, j);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        vault_toml(dir.path(), DEFAULT_CHECKS);
+        person(dir.path(), ADA, "Ada Example");
+        person(dir.path(), BEA, "Bea");
+        person_no_ai(dir.path(), CAM, "Cam");
+        write(
+            dir.path(),
+            "ledger/2026/10.cfd",
+            &format!("{}\n", lines.join("\n")),
+        );
+        let vault = load_vault(dir.path()).unwrap();
+        assert!(
+            confidant_core::allowlist_is_fixed_point(&vault),
+            "shuffled seed {seed} is not a fixed point"
+        );
+        let mut found = Vec::new();
+        for (q, token) in [
+            ("ada-shuffle-token", "ada-shuffle-token"),
+            ("bea-shuffle-token", "bea-shuffle-token"),
+            ("Ada Example", "Ada Example"),
+            ("Bea", "Bea"),
+        ] {
+            if token_in_hits(&search_q(dir.path(), q), token) {
+                found.push(token.to_owned());
+            }
+        }
+        found.sort();
+        assert!(
+            found.is_empty(),
+            "seed {seed} leaked searchable tokens: {found:?}"
+        );
+        match &expected {
+            None => expected = Some(found),
+            Some(prev) => assert_eq!(prev, &found, "seed {seed} disagreed"),
+        }
+    }
+}
+
+#[test]
+fn find_keeps_bea_when_ada_mentions_dangling_note_with_bea_ulid() {
+    let dir = copy_demo();
+    let profile = dir.path().join(format!("people/{ADA}/profile.md"));
+    let mut text = fs::read_to_string(&profile).unwrap();
+    text.push_str(&format!(
+        "\nMentioned n-{} once by mistake.\n",
+        ulid_of(BEA)
+    ));
+    fs::write(&profile, text).unwrap();
+    let baseline = search_q(&demo_vault(), "Bea");
+    let after = search_q(dir.path(), "Bea");
+    assert!(
+        token_in_hits(&baseline, "Bea Demo"),
+        "demo vault should mention Bea: {baseline:?}"
+    );
+    assert_eq!(
+        baseline.hits.len(),
+        after.hits.len(),
+        "dangling n-Bea ULID hid Bea: baseline {} after {} {after:?}",
+        baseline.hits.len(),
+        after.hits.len()
+    );
+    assert_eq!(
+        hit_fingerprint(&baseline),
+        hit_fingerprint(&after),
+        "dangling n-Bea ULID changed Bea's hits"
+    );
+    assert!(confidant_core::allowlist_is_fixed_point(
+        &load_vault(dir.path()).unwrap()
+    ));
+}
+
+#[test]
+fn find_keeps_ada_when_interaction_mentions_dangling_note_with_ada_ulid() {
+    let dir = copy_demo();
+    let ixn = dir
+        .path()
+        .join(format!("interactions/{IXN}/interaction.md"));
+    let mut text = fs::read_to_string(&ixn).unwrap();
+    text.push_str(&format!("\nn-{}\n", ulid_of(ADA)));
+    fs::write(&ixn, text).unwrap();
+    let ada = search_q(dir.path(), "Ada Example");
+    assert!(
+        token_in_hits(&ada, "Ada Example"),
+        "dangling n-Ada ULID hid Ada: {ada:?}"
+    );
+    assert!(confidant_core::allowlist_is_fixed_point(
+        &load_vault(dir.path()).unwrap()
+    ));
+}
+
+#[test]
+fn find_open_line_with_thousands_of_ids_is_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let mut line = String::from("2026-10-01 open");
+    for i in 0..2000u128 {
+        let pid = confidant_core::id::RecordId::new(
+            confidant_core::id::Prefix::Person,
+            confidant_core::id::ulid_from_parts(1_790_812_800_000, 10_000 + i),
+        )
+        .unwrap();
+        line.push(' ');
+        line.push_str(&pid.to_string());
+    }
+    line.push_str(" package");
+    for i in 0..2000u128 {
+        let pkg = confidant_core::id::RecordId::new(
+            confidant_core::id::Prefix::Package,
+            confidant_core::id::ulid_from_parts(1_790_812_800_000, 80_000 + i),
+        )
+        .unwrap();
+        line.push(' ');
+        line.push_str(&pkg.to_string());
+    }
+    line.push_str(" 1 sessions\n");
+    write(dir.path(), "ledger/2026/10.cfd", &line);
+    let vault = load_vault(dir.path()).unwrap();
+    let t0 = Instant::now();
+    let _ = confidant_core::search(&vault, "Ada Example").unwrap();
+    let elapsed = t0.elapsed();
+    let budget = if cfg!(debug_assertions) {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_millis(500)
+    };
+    assert!(
+        elapsed < budget,
+        "open 2000×2000 took {elapsed:?} (budget {budget:?})"
+    );
+}
+
+fn junk_name_hides_cam_note(root: &Path, rel: &str) {
+    vault_toml(root, DEFAULT_CHECKS);
+    person_no_ai(root, CAM, "Cam");
+    write(root, rel, "leftover copy\n");
+    person(root, ADA, "Ada Example");
+    let markers = write_ada_mentions(root, CAM_NOTE, "ZJUNK");
+    assert_markers_hidden(root, &markers);
+    let ada = search_q(root, "Ada Example");
+    assert!(
+        token_in_hits(&ada, "Ada Example"),
+        "junk name {rel} hid Ada's own profile: {ada:?}"
+    );
+}
+
+#[test]
+fn find_hides_bare_ulid_of_note_named_md_bak() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/{CAM_NOTE}.md.bak"));
+}
+
+#[test]
+fn find_hides_bare_ulid_of_note_named_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/{CAM_NOTE} (copy).md"));
+}
+
+#[test]
+fn find_hides_bare_ulid_of_uppercase_prefix_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/N-{}.md", ulid_of(CAM_NOTE)));
+}
+
+#[test]
+fn find_hides_bare_ulid_of_bare_ulid_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/{}.md", ulid_of(CAM_NOTE)));
+}
+
+#[test]
+fn find_hides_bare_ulid_of_dotfile_swp_name() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/.{CAM_NOTE}.md.swp"));
+}
+
+#[test]
+fn find_hides_bare_ulid_of_note_nested_under_sub() {
+    let dir = tempfile::tempdir().unwrap();
+    junk_name_hides_cam_note(dir.path(), &format!("notes/sub/{CAM_NOTE}.md"));
+}
+
+#[test]
+fn find_keeps_ada_when_only_her_own_filenames_contain_her_id() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let ada = search_q(dir.path(), "Ada Example");
+    assert!(token_in_hits(&ada, "Ada Example"), "{ada:?}");
+    assert!(confidant_core::allowlist_is_fixed_point(
+        &load_vault(dir.path()).unwrap()
+    ));
 }

@@ -50,13 +50,18 @@ a ULID, is malformed with that candidate; other glued lookalikes
 (Drive/Docs, Notion, 32-hex) are not tokens. Unicode Pd dashes plus
 U+30FC and U+2043 count as the ID dash. A bare 26-character ULID that
 exactly equals any ULID the vault names (loaded records, packages,
-dangling prefixed IDs, and path/file/directory entries that parse as a
-record ID, including `.MD`, symlinks, fifos, and other rejected entries)
-is treated as that ID, including as any 26-character window inside a
-Crockford run (`src:zoom/rec_<ULID>.vtt`, `p_<ULID>`, `p<ULID>`,
-`<ULID>abc`); near-ULID bare runs are not. Each mapped ID stays
+dangling prefixed IDs, and IDs found in visited file/directory names,
+including nested dirs, `(copy)` / `.bak` / uppercase prefixes / bare
+`<ULID>.md` / `.n-<ULID>.md.swp`) is treated as that ID as any
+26-character window inside a Crockford run (`src:zoom/rec_<ULID>.vtt`,
+`p_<ULID>`, `p<ULID>`, `<ULID>abc`), except windows already covered by a
+prefixed token (a record's `id:` line is not a bare window). ULIDs named
+only by a dangling or malformed prefixed token match genuinely bare
+windows only; loaded records and path IDs still apply inside prefixed
+tokens. Near-ULID bare runs are not IDs. Each mapped ID stays
 uncleared unless it is a cleared record or a cleared package. Merge and
-open name that ID the same way. If any ledger file cannot be
+open name that ID the same way. Dropping a record walks merge peers and
+package openers to a fixed point. If any ledger file cannot be
 read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code and count
 only) and no hits. Remaining limits: glued inexact IDs whose first 26
 characters do not canonicalize, non-Cf invisible characters, capitalised

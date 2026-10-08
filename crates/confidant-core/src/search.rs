@@ -1,14 +1,14 @@
 //! Plaintext scan of records and ledger lines (milestone 1 stopgap).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
 use crate::error::DomainError;
 use crate::id::{
-    person_id_from_path, scan_id_tokens, scan_id_tokens_against, scan_ids, IdToken, Prefix,
-    RecordId,
+    add_bare_ulid_windows, person_id_from_path, scan_ids, scan_prefixed_line, IdToken, Prefix,
+    PrefixedScan, RecordId,
 };
 use crate::ledger::ledger_line_verb;
 use crate::record::{parse_ref_id, FrontmatterRef};
@@ -35,6 +35,7 @@ struct RecordFacts {
     fm_bad_ref: bool,
     fm_bare_ulids: Vec<String>,
     path_person: Option<RecordId>,
+    body_start_line: u32,
     /// Tokenized once from BOM-stripped source; 1-based line numbers.
     line_tokens: Vec<(u32, Vec<IdToken>)>,
 }
@@ -42,13 +43,14 @@ struct RecordFacts {
 /// Indexes built once per search so the allowlist is a worklist, not nested scans.
 struct Allowlist<'a> {
     vault: &'a Vault,
-    cleared: HashSet<RecordId>,
-    facts: HashMap<RecordId, RecordFacts>,
-    by_path: HashMap<&'a str, &'a RecordId>,
-    by_ulid: HashMap<String, Vec<RecordId>>,
+    cleared: BTreeSet<RecordId>,
+    facts: BTreeMap<RecordId, RecordFacts>,
+    by_path: BTreeMap<&'a str, &'a RecordId>,
+    by_ulid: BTreeMap<String, Vec<RecordId>>,
+    strong_by_ulid: BTreeMap<String, Vec<RecordId>>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
-    named_ledger_lines: HashMap<RecordId, Vec<usize>>,
+    named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
 }
 
@@ -95,9 +97,33 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
     Ok(SearchResult { hits, findings })
 }
 
+/// Record IDs in the section 12 cleared set. Used by tests to assert a fixed point.
+pub fn cleared_record_ids(vault: &Vault) -> BTreeSet<RecordId> {
+    Allowlist::build(vault).cleared
+}
+
+/// True when every cleared id still satisfies every allowlist rule (merge
+/// peers, package openers, front matter, path parent, named ledger lines).
+pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
+    let allow = Allowlist::build(vault);
+    let tainted = tainted_ids(vault);
+    let components = merge_components(&allow);
+    let open_lines = pkg_open_lines(&allow);
+    allow.cleared.iter().all(|id| {
+        still_cleared(
+            &allow,
+            id,
+            &allow.cleared,
+            &tainted,
+            &components,
+            &open_lines,
+        )
+    })
+}
+
 impl<'a> Allowlist<'a> {
     fn build(vault: &'a Vault) -> Self {
-        let mut by_path = HashMap::with_capacity(vault.records.len());
+        let mut by_path = BTreeMap::new();
         for rec in vault.records.values() {
             by_path.insert(rec.path.as_str(), &rec.id);
         }
@@ -105,33 +131,67 @@ impl<'a> Allowlist<'a> {
         for (idx, line) in vault.ledger_lines.iter().enumerate() {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
-        let mut by_ulid: HashMap<String, Vec<RecordId>> = HashMap::new();
+
+        let mut strong_by_ulid = BTreeMap::new();
         for id in vault.records.keys() {
-            insert_by_ulid(&mut by_ulid, id.clone());
+            insert_by_ulid(&mut strong_by_ulid, id.clone());
         }
         for id in &vault.path_ids {
-            insert_by_ulid(&mut by_ulid, id.clone());
+            insert_by_ulid(&mut strong_by_ulid, id.clone());
         }
+        let mut by_ulid = strong_by_ulid.clone();
+
+        let mut record_prefixed: BTreeMap<RecordId, Vec<(u32, PrefixedScan)>> = BTreeMap::new();
         for rec in vault.records.values() {
-            seed_prefixed_tokens(rec.source.trim_start_matches('\u{feff}'), &mut by_ulid);
+            let text = rec.source.trim_start_matches('\u{feff}');
+            let mut lines = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                let scan = scan_prefixed_line(line);
+                for tok in &scan.tokens {
+                    for id in tok.record_ids() {
+                        insert_by_ulid(&mut by_ulid, id.clone());
+                    }
+                }
+                lines.push((idx as u32 + 1, scan));
+            }
+            record_prefixed.insert(rec.id.clone(), lines);
         }
+        let mut ledger_prefixed = Vec::with_capacity(vault.ledger_lines.len());
         for line in &vault.ledger_lines {
-            seed_prefixed_tokens(&line.text, &mut by_ulid);
+            let scan = scan_prefixed_line(&line.text);
+            for tok in &scan.tokens {
+                for id in tok.record_ids() {
+                    insert_by_ulid(&mut by_ulid, id.clone());
+                }
+            }
+            ledger_prefixed.push(scan);
         }
-        let vault_ulids: HashSet<String> = by_ulid.keys().cloned().collect();
-        let mut facts = HashMap::with_capacity(vault.records.len());
+        sort_by_ulid(&mut by_ulid);
+        sort_by_ulid(&mut strong_by_ulid);
+
+        let mut vault_ulids: HashSet<String> = by_ulid.keys().cloned().collect();
+        vault_ulids.extend(vault.path_ulids.iter().cloned());
+
+        let mut facts = BTreeMap::new();
         for rec in vault.records.values() {
-            facts.insert(rec.id.clone(), record_facts(rec, &vault_ulids));
+            let lines = record_prefixed
+                .remove(&rec.id)
+                .expect("prefixed scan for every record");
+            facts.insert(rec.id.clone(), record_facts(rec, lines, &vault_ulids));
         }
         let ledger_tokens: Vec<Vec<IdToken>> = vault
             .ledger_lines
             .iter()
-            .map(|line| scan_id_tokens_against(&line.text, Some(&vault_ulids)))
+            .zip(ledger_prefixed)
+            .map(|(line, mut scan)| {
+                add_bare_ulid_windows(&line.text, &vault_ulids, &mut scan);
+                scan.tokens
+            })
             .collect();
-        let mut named_ledger_lines: HashMap<RecordId, Vec<usize>> = HashMap::new();
+        let mut named_ledger_lines: BTreeMap<RecordId, Vec<usize>> = BTreeMap::new();
         for (idx, toks) in ledger_tokens.iter().enumerate() {
             for tok in toks {
-                for id in ids_named_by(tok, &by_ulid) {
+                for id in ids_named_by(tok, &by_ulid, &strong_by_ulid) {
                     if !ledger_named_prefix(id.prefix()) {
                         continue;
                     }
@@ -144,10 +204,11 @@ impl<'a> Allowlist<'a> {
         }
         let mut allow = Self {
             vault,
-            cleared: HashSet::new(),
+            cleared: BTreeSet::new(),
             facts,
             by_path,
             by_ulid,
+            strong_by_ulid,
             ledger_at,
             ledger_tokens,
             named_ledger_lines,
@@ -159,22 +220,20 @@ impl<'a> Allowlist<'a> {
             .ledger_lines
             .iter()
             .zip(allow.ledger_tokens.iter())
-            .map(|(line, toks)| {
-                line.searchable && tokens_allowed(toks, &allow.cleared, &allow.by_ulid)
-            })
+            .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow))
             .collect();
         allow
     }
 }
 
-fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
+fn compute_cleared(allow: &Allowlist<'_>) -> BTreeSet<RecordId> {
     let vault = allow.vault;
     let tainted = tainted_ids(vault);
     let components = merge_components(allow);
-    let (pkg_openers, person_pkgs) = pkg_openers(allow);
-    let dependents = reverse_deps(allow, &pkg_openers);
+    let open_lines = pkg_open_lines(allow);
+    let dependents = reverse_deps(allow, &components);
 
-    let mut cleared: HashSet<RecordId> = vault
+    let mut cleared: BTreeSet<RecordId> = vault
         .records
         .values()
         .filter(|rec| !rec.no_ai() && !tainted.contains(&rec.id))
@@ -182,27 +241,31 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
         .map(|rec| rec.id.clone())
         .collect();
 
-    for (pkg, openers) in &pkg_openers {
-        if pkg_is_clear(openers, &cleared) {
+    let pkgs: BTreeSet<RecordId> = open_lines
+        .iter()
+        .flat_map(|line| line.pkgs.iter().cloned())
+        .collect();
+    for pkg in &pkgs {
+        if pkg_is_clear(pkg, &open_lines, &cleared) {
             cleared.insert(pkg.clone());
         }
     }
 
     let mut stack: Vec<RecordId> = cleared.iter().cloned().collect();
-    let mut queued: HashSet<RecordId> = cleared.iter().cloned().collect();
+    let mut queued: BTreeSet<RecordId> = cleared.iter().cloned().collect();
     while let Some(id) = stack.pop() {
         queued.remove(&id);
         if !cleared.contains(&id) {
             continue;
         }
-        if still_cleared(allow, &id, &cleared, &tainted, &components, &pkg_openers) {
+        if still_cleared(allow, &id, &cleared, &tainted, &components, &open_lines) {
             continue;
         }
         drop_from_cleared(
             &id,
             &mut cleared,
             &components,
-            &person_pkgs,
+            &open_lines,
             &dependents,
             &mut stack,
             &mut queued,
@@ -214,15 +277,18 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
 fn still_cleared(
     allow: &Allowlist<'_>,
     id: &RecordId,
-    cleared: &HashSet<RecordId>,
-    tainted: &HashSet<RecordId>,
+    cleared: &BTreeSet<RecordId>,
+    tainted: &BTreeSet<RecordId>,
     components: &MergeComponents,
-    pkg_openers: &HashMap<RecordId, Vec<RecordId>>,
+    open_lines: &[OpenLine],
 ) -> bool {
     if id.prefix() == Prefix::Package {
-        return pkg_openers
-            .get(id)
-            .is_some_and(|openers| pkg_is_clear(openers, cleared));
+        if let Some(members) = components.members_of(id) {
+            if members.iter().any(|m| !cleared.contains(m)) {
+                return false;
+            }
+        }
+        return pkg_is_clear(id, open_lines, cleared);
     }
     let Some(facts) = allow.facts.get(id) else {
         return false;
@@ -233,7 +299,9 @@ fn still_cleared(
     if facts.fm_malformed || facts.fm_bad_ref {
         return false;
     }
-    if facts.fm_ids.iter().any(|fid| !cleared.contains(fid)) {
+    if facts.line_tokens.iter().any(|(line_no, toks)| {
+        *line_no < facts.body_start_line && !tokens_allowed_with(toks, cleared, allow)
+    }) {
         return false;
     }
     if let Some(person) = &facts.path_person {
@@ -246,18 +314,10 @@ fn still_cleared(
             return false;
         }
     }
-    if facts.fm_bare_ulids.iter().any(|ulid| {
-        allow
-            .by_ulid
-            .get(ulid)
-            .is_some_and(|ids| ids.iter().any(|fid| !cleared.contains(fid)))
-    }) {
-        return false;
-    }
     if let Some(idxs) = allow.named_ledger_lines.get(id) {
         if idxs
             .iter()
-            .any(|&idx| !tokens_allowed(&allow.ledger_tokens[idx], cleared, &allow.by_ulid))
+            .any(|&idx| !tokens_allowed_with(&allow.ledger_tokens[idx], cleared, allow))
         {
             return false;
         }
@@ -267,24 +327,28 @@ fn still_cleared(
 
 fn drop_from_cleared(
     id: &RecordId,
-    cleared: &mut HashSet<RecordId>,
+    cleared: &mut BTreeSet<RecordId>,
     components: &MergeComponents,
-    person_pkgs: &HashMap<RecordId, Vec<RecordId>>,
-    dependents: &HashMap<RecordId, HashSet<RecordId>>,
+    open_lines: &[OpenLine],
+    dependents: &BTreeMap<RecordId, BTreeSet<RecordId>>,
     stack: &mut Vec<RecordId>,
-    queued: &mut HashSet<RecordId>,
+    queued: &mut BTreeSet<RecordId>,
 ) {
-    let mut dropping = vec![id.clone()];
-    if let Some(members) = components.members_of(id) {
-        dropping.extend(members.iter().cloned());
-    }
-    if let Some(pkgs) = person_pkgs.get(id) {
-        dropping.extend(pkgs.iter().cloned());
-    }
-    for dropped in dropping {
+    let mut work = vec![id.clone()];
+    while let Some(dropped) = work.pop() {
         if !cleared.remove(&dropped) {
             continue;
         }
+        if let Some(members) = components.members_of(&dropped) {
+            work.extend(members.iter().cloned());
+        }
+        let mut opened = BTreeSet::new();
+        for line in open_lines {
+            if line.people.contains(&dropped) {
+                opened.extend(line.pkgs.iter().cloned());
+            }
+        }
+        work.extend(opened);
         if let Some(deps) = dependents.get(&dropped) {
             for dep in deps {
                 if cleared.contains(dep) && queued.insert(dep.clone()) {
@@ -295,12 +359,22 @@ fn drop_from_cleared(
     }
 }
 
-fn pkg_is_clear(openers: &[RecordId], cleared: &HashSet<RecordId>) -> bool {
-    !openers.is_empty() && openers.iter().all(|person| cleared.contains(person))
+fn pkg_is_clear(pkg: &RecordId, open_lines: &[OpenLine], cleared: &BTreeSet<RecordId>) -> bool {
+    let mut mentioned = false;
+    for line in open_lines {
+        if !line.pkgs.contains(pkg) {
+            continue;
+        }
+        mentioned = true;
+        if line.people.is_empty() || line.people.iter().any(|person| !cleared.contains(person)) {
+            return false;
+        }
+    }
+    mentioned
 }
 
-fn tainted_ids(vault: &Vault) -> HashSet<RecordId> {
-    let mut tainted = HashSet::new();
+fn tainted_ids(vault: &Vault) -> BTreeSet<RecordId> {
+    let mut tainted = BTreeSet::new();
     for finding in &vault.load_findings {
         if finding.code != FindingCode::DuplicateId && finding.code != FindingCode::IdPathMismatch {
             continue;
@@ -320,7 +394,7 @@ fn tainted_ids(vault: &Vault) -> HashSet<RecordId> {
 }
 
 struct MergeComponents {
-    of: HashMap<RecordId, usize>,
+    of: BTreeMap<RecordId, usize>,
     members: Vec<Vec<RecordId>>,
 }
 
@@ -332,8 +406,8 @@ impl MergeComponents {
 }
 
 fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
-    let mut parent: HashMap<RecordId, RecordId> = HashMap::new();
-    let find = |parent: &mut HashMap<RecordId, RecordId>, id: &RecordId| -> RecordId {
+    let mut parent: BTreeMap<RecordId, RecordId> = BTreeMap::new();
+    let find = |parent: &mut BTreeMap<RecordId, RecordId>, id: &RecordId| -> RecordId {
         if !parent.contains_key(id) {
             parent.insert(id.clone(), id.clone());
             return id.clone();
@@ -354,7 +428,7 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
         }
         root
     };
-    let union = |parent: &mut HashMap<RecordId, RecordId>, a: &RecordId, b: &RecordId| {
+    let union = |parent: &mut BTreeMap<RecordId, RecordId>, a: &RecordId, b: &RecordId| {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -376,7 +450,7 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
         }
         let ids: Vec<RecordId> = toks
             .iter()
-            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid))
+            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid, &allow.strong_by_ulid))
             .cloned()
             .collect();
         for id in &ids {
@@ -388,9 +462,9 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
     }
 
     let ids: Vec<RecordId> = parent.keys().cloned().collect();
-    let mut root_index: HashMap<RecordId, usize> = HashMap::new();
+    let mut root_index: BTreeMap<RecordId, usize> = BTreeMap::new();
     let mut members: Vec<Vec<RecordId>> = Vec::new();
-    let mut of = HashMap::new();
+    let mut of = BTreeMap::new();
     for id in ids {
         let root = find(&mut parent, &id);
         let idx = *root_index.entry(root.clone()).or_insert_with(|| {
@@ -400,17 +474,19 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
         members[idx].push(id.clone());
         of.insert(id, idx);
     }
+    for group in &mut members {
+        group.sort();
+    }
     MergeComponents { of, members }
 }
 
-fn pkg_openers(
-    allow: &Allowlist<'_>,
-) -> (
-    HashMap<RecordId, Vec<RecordId>>,
-    HashMap<RecordId, Vec<RecordId>>,
-) {
-    let mut pkg_openers: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-    let mut person_pkgs: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+struct OpenLine {
+    people: HashSet<RecordId>,
+    pkgs: HashSet<RecordId>,
+}
+
+fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
+    let mut lines = Vec::new();
     for (line, toks) in allow
         .vault
         .ledger_lines
@@ -420,39 +496,34 @@ fn pkg_openers(
         if ledger_line_verb(&line.text).as_deref() != Some("open") {
             continue;
         }
-        let mut people = Vec::new();
-        let mut pkgs = Vec::new();
+        let mut people = HashSet::new();
+        let mut pkgs = HashSet::new();
         for id in toks
             .iter()
-            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid))
+            .flat_map(|tok| ids_named_by(tok, &allow.by_ulid, &allow.strong_by_ulid))
         {
             match id.prefix() {
-                Prefix::Person => people.push(id.clone()),
-                Prefix::Package => pkgs.push(id.clone()),
+                Prefix::Person => {
+                    people.insert(id.clone());
+                }
+                Prefix::Package => {
+                    pkgs.insert(id.clone());
+                }
                 Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note => {}
             }
         }
-        for pkg in &pkgs {
-            for person in &people {
-                let openers = pkg_openers.entry(pkg.clone()).or_default();
-                if !openers.contains(person) {
-                    openers.push(person.clone());
-                }
-                let person_pkgs_for = person_pkgs.entry(person.clone()).or_default();
-                if !person_pkgs_for.contains(pkg) {
-                    person_pkgs_for.push(pkg.clone());
-                }
-            }
+        if !people.is_empty() || !pkgs.is_empty() {
+            lines.push(OpenLine { people, pkgs });
         }
     }
-    (pkg_openers, person_pkgs)
+    lines
 }
 
 fn reverse_deps(
     allow: &Allowlist<'_>,
-    pkg_openers: &HashMap<RecordId, Vec<RecordId>>,
-) -> HashMap<RecordId, HashSet<RecordId>> {
-    let mut dependents: HashMap<RecordId, HashSet<RecordId>> = HashMap::new();
+    components: &MergeComponents,
+) -> BTreeMap<RecordId, BTreeSet<RecordId>> {
+    let mut dependents: BTreeMap<RecordId, BTreeSet<RecordId>> = BTreeMap::new();
     let mut link = |from: RecordId, to: RecordId| {
         dependents.entry(from).or_default().insert(to);
     };
@@ -460,6 +531,11 @@ fn reverse_deps(
         if let Some(facts) = allow.facts.get(&rec.id) {
             for id in &facts.fm_ids {
                 link(id.clone(), rec.id.clone());
+                if let Some(strong) = allow.strong_by_ulid.get(id.ulid()) {
+                    for sid in strong {
+                        link(sid.clone(), rec.id.clone());
+                    }
+                }
             }
             for ulid in &facts.fm_bare_ulids {
                 if let Some(ids) = allow.by_ulid.get(ulid) {
@@ -473,15 +549,19 @@ fn reverse_deps(
             }
         }
     }
-    for (pkg, openers) in pkg_openers {
-        for person in openers {
-            link(person.clone(), pkg.clone());
+    for group in &components.members {
+        for a in group {
+            for b in group {
+                if a != b {
+                    link(a.clone(), b.clone());
+                }
+            }
         }
     }
     for (named, idxs) in &allow.named_ledger_lines {
         for &idx in idxs {
             for tok in &allow.ledger_tokens[idx] {
-                for id in ids_named_by(tok, &allow.by_ulid) {
+                for id in ids_named_by(tok, &allow.by_ulid, &allow.strong_by_ulid) {
                     link(id.clone(), named.clone());
                 }
             }
@@ -490,17 +570,20 @@ fn reverse_deps(
     dependents
 }
 
-fn record_facts(rec: &crate::record::Record, vault_ulids: &HashSet<String>) -> RecordFacts {
+fn record_facts(
+    rec: &crate::record::Record,
+    mut lines: Vec<(u32, PrefixedScan)>,
+    vault_ulids: &HashSet<String>,
+) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
     let mut fm_malformed = false;
     let mut fm_bare_ulids = Vec::new();
-    let mut line_tokens = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        let line_no = idx as u32 + 1;
-        let toks = scan_id_tokens_against(line, Some(vault_ulids));
+    let mut line_tokens = Vec::with_capacity(lines.len());
+    for ((line_no, mut scan), line) in lines.drain(..).zip(text.lines()) {
+        add_bare_ulid_windows(line, vault_ulids, &mut scan);
         if line_no < rec.body_start_line {
-            for tok in &toks {
+            for tok in &scan.tokens {
                 match tok {
                     IdToken::Malformed { .. } => fm_malformed = true,
                     IdToken::Valid(id) => fm_ids.push(id.clone()),
@@ -508,7 +591,7 @@ fn record_facts(rec: &crate::record::Record, vault_ulids: &HashSet<String>) -> R
                 }
             }
         }
-        line_tokens.push((line_no, toks));
+        line_tokens.push((line_no, scan.tokens));
     }
     let fm_bad_ref = ["person", "org", "deal"].iter().any(|key| {
         rec.field(key)
@@ -520,6 +603,7 @@ fn record_facts(rec: &crate::record::Record, vault_ulids: &HashSet<String>) -> R
         fm_bad_ref,
         fm_bare_ulids,
         path_person: person_id_from_path(&rec.path),
+        body_start_line: rec.body_start_line,
         line_tokens,
     }
 }
@@ -531,38 +615,55 @@ fn ledger_named_prefix(prefix: Prefix) -> bool {
     }
 }
 
-fn insert_by_ulid(by_ulid: &mut HashMap<String, Vec<RecordId>>, id: RecordId) {
+fn insert_by_ulid(by_ulid: &mut BTreeMap<String, Vec<RecordId>>, id: RecordId) {
     let entry = by_ulid.entry(id.ulid().to_owned()).or_default();
     if !entry.contains(&id) {
         entry.push(id);
     }
 }
 
-fn seed_prefixed_tokens(text: &str, by_ulid: &mut HashMap<String, Vec<RecordId>>) {
-    for tok in scan_id_tokens(text) {
-        for id in tok.record_ids() {
-            insert_by_ulid(by_ulid, id.clone());
-        }
+fn sort_by_ulid(by_ulid: &mut BTreeMap<String, Vec<RecordId>>) {
+    for ids in by_ulid.values_mut() {
+        ids.sort();
     }
 }
 
 fn ids_named_by<'a>(
     tok: &'a IdToken,
-    by_ulid: &'a HashMap<String, Vec<RecordId>>,
+    by_ulid: &'a BTreeMap<String, Vec<RecordId>>,
+    strong_by_ulid: &'a BTreeMap<String, Vec<RecordId>>,
 ) -> Vec<&'a RecordId> {
-    let mut ids: Vec<&RecordId> = tok.record_ids().collect();
-    if let Some(ulid) = tok.bare_ulid() {
-        if let Some(matched) = by_ulid.get(ulid) {
-            ids.extend(matched.iter());
+    match tok {
+        IdToken::Valid(id)
+        | IdToken::Malformed {
+            candidate: Some(id),
+        } => {
+            let mut ids = vec![id];
+            if let Some(strong) = strong_by_ulid.get(id.ulid()) {
+                for sid in strong {
+                    if sid != id && !ids.contains(&sid) {
+                        ids.push(sid);
+                    }
+                }
+            }
+            ids
         }
+        IdToken::Malformed { candidate: None } => Vec::new(),
+        IdToken::BareUlid(ulid) => by_ulid
+            .get(ulid)
+            .map(|ids| ids.iter().collect())
+            .unwrap_or_default(),
     }
-    ids
 }
 
-fn tokens_allowed(
+fn tokens_allowed(toks: &[IdToken], allow: &Allowlist<'_>) -> bool {
+    tokens_allowed_with(toks, &allow.cleared, allow)
+}
+
+fn tokens_allowed_with(
     toks: &[IdToken],
-    cleared: &HashSet<RecordId>,
-    by_ulid: &HashMap<String, Vec<RecordId>>,
+    cleared: &BTreeSet<RecordId>,
+    allow: &Allowlist<'_>,
 ) -> bool {
     for tok in toks {
         match tok {
@@ -571,9 +672,17 @@ fn tokens_allowed(
                 if !cleared.contains(id) {
                     return false;
                 }
+                if let Some(ids) = allow.strong_by_ulid.get(id.ulid()) {
+                    if ids.iter().any(|sid| !cleared.contains(sid)) {
+                        return false;
+                    }
+                }
             }
             IdToken::BareUlid(ulid) => {
-                if let Some(ids) = by_ulid.get(ulid) {
+                if allow.vault.path_ulids.contains(ulid) {
+                    return false;
+                }
+                if let Some(ids) = allow.by_ulid.get(ulid) {
                     if ids.iter().any(|id| !cleared.contains(id)) {
                         return false;
                     }
@@ -639,7 +748,7 @@ fn scan_record(
     };
     let text = rec.source.trim_start_matches('\u{feff}');
     for ((line_no, toks), line) in facts.line_tokens.iter().zip(text.lines()) {
-        if !tokens_allowed(toks, &allow.cleared, &allow.by_ulid) {
+        if !tokens_allowed(toks, allow) {
             continue;
         }
         let folded = case_fold(line);
@@ -680,7 +789,7 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, excerpt};
+    use super::{case_fold, excerpt, still_cleared, Allowlist};
 
     #[test]
     fn excerpt_truncates() {
@@ -694,5 +803,73 @@ mod tests {
         assert!(case_fold("Straße").contains(&case_fold("STRASSE")));
         assert!(case_fold("STRASSE").contains(&case_fold("straße")));
         assert_eq!(case_fold("ß"), "ss");
+    }
+
+    fn assert_fixed_point(vault: &crate::vault::Vault) {
+        let allow = Allowlist::build(vault);
+        let tainted = super::tainted_ids(vault);
+        let components = super::merge_components(&allow);
+        let open_lines = super::pkg_open_lines(&allow);
+        for id in &allow.cleared {
+            assert!(
+                still_cleared(
+                    &allow,
+                    id,
+                    &allow.cleared,
+                    &tainted,
+                    &components,
+                    &open_lines
+                ),
+                "{id} is cleared but still_cleared is false"
+            );
+        }
+        for rec in vault.records.values() {
+            if !allow.cleared.contains(&rec.id) {
+                continue;
+            }
+            let Some(facts) = allow.facts.get(&rec.id) else {
+                continue;
+            };
+            for fid in &facts.fm_ids {
+                if vault.records.contains_key(fid) || fid.prefix() == super::Prefix::Package {
+                    assert!(
+                        allow.cleared.contains(fid),
+                        "{} front matter names uncleared {fid}",
+                        rec.id
+                    );
+                }
+            }
+            if let Some(members) = components.members_of(&rec.id) {
+                for m in members {
+                    if vault.records.contains_key(m) || m.prefix() == super::Prefix::Package {
+                        assert!(
+                            allow.cleared.contains(m),
+                            "{} merge peer {m} is uncleared",
+                            rec.id
+                        );
+                    }
+                }
+            }
+        }
+        for line in &open_lines {
+            for pkg in &line.pkgs {
+                if allow.cleared.contains(pkg) {
+                    for person in &line.people {
+                        assert!(
+                            allow.cleared.contains(person),
+                            "cleared {pkg} opened by uncleared {person}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn demo_vault_allowlist_is_a_fixed_point() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+        let vault = crate::vault::load_vault(&root).unwrap();
+        assert_fixed_point(&vault);
     }
 }
