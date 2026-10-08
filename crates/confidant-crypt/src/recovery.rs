@@ -59,8 +59,11 @@ impl ZeroizeOnDrop for Recovery {}
 
 impl std::fmt::Debug for Recovery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Label "words", not "phrase_words": "phrase" is itself a BIP39
+        // word, so a label containing it false-positives any token scan
+        // of the Debug output against the phrase (CI run 37812600604).
         f.debug_struct("Recovery")
-            .field("phrase_words", &"<redacted>")
+            .field("words", &"<redacted>")
             .field("x25519_sk", &"<redacted>")
             .field("ed25519_sk", &"<redacted>")
             .finish()
@@ -200,17 +203,71 @@ mod tests {
     #[test]
     fn debug_redacts_phrase() {
         let r = Recovery::generate();
-        let dbg = format!("{r:?}");
-        // Whole-token check: a short word like "act" is a substring of
-        // "<redacted>", so compare tokens, not substrings.
-        let tokens: Vec<&str> = dbg
-            .split(|c: char| !c.is_alphabetic())
-            .filter(|t| !t.is_empty())
-            .collect();
-        for w in r.phrase().split_whitespace() {
-            assert!(!tokens.contains(&w), "phrase word leaked in Debug: {w}");
+        // Exact match, not a token scan: redaction is total, so the Debug
+        // output is byte-identical to the redacted form whatever the
+        // random phrase is. Deterministic by construction.
+        assert_eq!(
+            format!("{r:?}"),
+            r#"Recovery { words: "<redacted>", x25519_sk: "<redacted>", ed25519_sk: "<redacted>" }"#
+        );
+    }
+
+    #[test]
+    fn debug_redacts_when_phrase_contains_label_word() {
+        // Regression test for the old flake: "phrase" is itself a BIP39
+        // word, and the old "phrase_words" Debug label false-positived a
+        // token scan whenever a random phrase contained it (~1 in 86,
+        // CI run 37812600604). Build a valid 24-word phrase containing
+        // "phrase" deterministically — every 23-word prefix has valid
+        // checksum completions — and assert redaction still holds.
+        let list = Language::English.word_list();
+        let mut prefix: Vec<&str> = vec!["phrase"];
+        prefix.extend(std::iter::repeat_n("abandon", 22));
+        let phrase = list
+            .iter()
+            .find_map(|last| {
+                let candidate = prefix
+                    .iter()
+                    .chain(std::iter::once(last))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Mnemonic::parse_in(Language::English, &candidate)
+                    .ok()
+                    .map(|_| candidate)
+            })
+            .expect("every 23-word prefix has valid 24th-word completions");
+        assert!(phrase.split_whitespace().any(|w| w == "phrase"));
+        let r = Recovery::from_phrase(&phrase).unwrap();
+        assert_eq!(
+            format!("{r:?}"),
+            r#"Recovery { words: "<redacted>", x25519_sk: "<redacted>", ed25519_sk: "<redacted>" }"#
+        );
+    }
+
+    #[test]
+    fn debug_labels_contain_no_bip39_words() {
+        // Guards the labels themselves: if a Debug label ever becomes a
+        // BIP39 word again, any token-based redaction check would
+        // false-positive on random phrases containing that word.
+        let dbg = format!("{:?}", Recovery::generate());
+        let list = Language::English.word_list();
+        let body = dbg
+            .strip_prefix("Recovery { ")
+            .and_then(|s| s.strip_suffix(" }"))
+            .expect("Debug keeps debug_struct shape");
+        for field in body.split(", ") {
+            let (label, _) = field.split_once(": ").expect("label: value shape");
+            for token in label
+                .split(|c: char| !c.is_alphabetic())
+                .filter(|t| !t.is_empty())
+            {
+                assert!(
+                    !list.contains(&token),
+                    "Debug label is a BIP39 word: {token}"
+                );
+            }
         }
-        assert!(dbg.contains("<redacted>"));
     }
 
     #[test]
