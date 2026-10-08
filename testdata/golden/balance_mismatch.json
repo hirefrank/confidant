@@ -1,0 +1,21 @@
+{
+  "findings": [
+    {
+      "code": "E_BALANCE_MISMATCH",
+      "file": "ledger/2026/10.cfd",
+      "fix": "Check for a missing 'open' entry or a duplicated 'session' entry for p-01M3TC5H00MPJG000000000000",
+      "id": "p-01M3TC5H00MPJG000000000000",
+      "line": 3,
+      "message": "sessions_remaining asserted 4, computed 5",
+      "severity": "error"
+    }
+  ],
+  "ok": false,
+  "spec": "0.1",
+  "summary": {
+    "errors": 1,
+    "ledger_entries": 3,
+    "records": 2,
+    "warnings": 0
+  }
+}

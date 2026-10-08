@@ -1,0 +1,61 @@
+Third-party licenses
+====================
+
+This project is licensed under Apache-2.0 (see LICENSE). Some source files are
+adapted from cr (https://github.com/AnandChowdhary/cr) at commit
+f29f8d434c8a854b5b3e2ce41921667dede1aa7e (v0.2.75), which is MIT-licensed.
+Each adapted file carries an attribution header. The original MIT license text
+follows.
+
+Adapted files:
+
+- crates/confidant-core/src/error.rs
+  DomainError taxonomy, typed downcast via DomainError::of, stable codes,
+  internal_error for unclassified failures, and usage-error exit 2. Confidant
+  adds file/line/fix fields and E_* codes (ADR-7, ADR-13).
+
+- crates/confidant-core/src/check.rs
+  Severity (two levels), Finding with a stable code(), CheckSummary::fails,
+  CheckReport deterministic order, and parse_fail_on / --fail-on. The scanner
+  itself is original.
+
+- crates/confidant-core/src/paths.rs
+  Refuse symbolic links, classify directory entries without following them,
+  and write atomically via a temporary file plus rename. The Unix openat /
+  O_NOFOLLOW walk is replaced with a portable symlink_metadata walk so the
+  same crate builds on Linux and macOS.
+
+Re-implemented patterns (no cr source copied; credited per ADR-13):
+
+- Collect findings instead of aborting on the first damaged file.
+- Crash-safe write: publish via rename so a crash cannot leave a half-written
+  record as the canonical file.
+- Classify errors by typed downcast, never by message text.
+
+The following cr pieces are deliberately not used: the linear audit chain,
+database.rs, schema-driven field encryption, sync.rs, and anything server or
+UI related. Encryption code is out of scope for milestone 1 (section 9b).
+
+---------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Anand Chowdhary
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

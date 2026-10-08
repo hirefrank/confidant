@@ -1,0 +1,21 @@
+{
+  "findings": [
+    {
+      "code": "E_SESSION_WITHOUT_NOTES",
+      "file": "ledger/2026/10.cfd",
+      "fix": "Add a note for that person and date, or note:n-<ULID> on the session line",
+      "id": "p-01M3TC5H00MPJG000000000000",
+      "line": 2,
+      "message": "session on 2026-10-01 for p-01M3TC5H00MPJG000000000000 has no notes",
+      "severity": "warning"
+    }
+  ],
+  "ok": false,
+  "spec": "0.1",
+  "summary": {
+    "errors": 0,
+    "ledger_entries": 2,
+    "records": 1,
+    "warnings": 1
+  }
+}

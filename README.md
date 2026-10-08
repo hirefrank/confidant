@@ -1,1 +1,91 @@
-# confidant
+# Confidant
+
+A plain-text, git-native CRM for **one operator** and their AI agents. Records
+live in a git repo (the **vault**). The Rust CLI `confidant` reads and checks
+them. There is no server.
+
+Milestone 1 is the format spec, parser, generic records, derived values,
+balance assertions, `confidant check`, the coaching schema pack, and a fake
+demo vault. Encryption ships in milestone 2, after an independent crypto
+design review. Do not put real client data in a vault until then.
+
+The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
+`CONFIDANT_VAULT` (or pass `--vault`) so they never write the wrong tree.
+
+## Privacy (read this)
+
+Plaintext belongs only on trusted devices (your laptop, or an agent computer
+acting for you). A git remote must not hold client notes once encryption
+exists; until milestone 2, treat the remote as if it were plaintext and do
+not put real clients in it.
+
+When an agent reads notes, that content is sent to a hosted model provider.
+This is explicit and accepted. Confidant does not claim the provider stores
+nothing; that depends on the provider's terms. A per-person `no-ai: true`
+flag is parsed in spec 0.1 and will keep that person out of agent context
+in milestone 3.
+
+## Quickstart
+
+```sh
+git clone https://github.com/hirefrank/confidant
+cd confidant
+cargo build -p confidant-cli
+export CONFIDANT_VAULT="$PWD/examples/demo-vault"
+./target/debug/confidant check
+./target/debug/confidant check --json --no-input
+./target/debug/confidant find "Ada Example" --json
+```
+
+The demo vault is **fake data only**.
+
+`--json` is on every command. `--no-input` never prompts (milestone 1 has
+nothing to prompt for). Discovery order is `--vault`, then `CONFIDANT_VAULT`,
+then a walk up from the current directory looking for `confidant.toml`, then
+`default_vault` in `~/.config/confidant/config.toml`.
+
+## Layout
+
+See [`spec/0.1.md`](spec/0.1.md). Short version:
+
+```
+vault/
+├── confidant.toml
+├── ledger/2026/10.cfd      # dated facts, one file per month
+├── people/p-<ULID>/profile.md
+├── people/p-<ULID>/notes/n-<ULID>.md
+├── orgs/o-<ULID>/org.md
+├── deals/d-<ULID>/deal.md
+└── .confidant/             # local cache, gitignored
+```
+
+Structured facts are ledger lines (`DATE VERB ID ARGS…`). Prose is Markdown.
+`balance` lines are assertions `check` verifies against computed values.
+
+Coaching (sessions, packages, ICF hours, gap rules) is a **schema pack**,
+not core: [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+
+## `confidant check`
+
+Read-only. Collects every finding; it does not repair. Stable finding codes
+are part of the spec ([`spec/findings.md`](spec/findings.md)). Callers branch
+on `code`, never on message text.
+
+Gap rules from the architecture (section 9b): a session with no notes, and a
+paid client with no session inside a configurable window.
+
+```sh
+confidant check --json --fail-on warning --as-of 2026-10-08
+```
+
+## Search
+
+Milestone 1 scans plaintext. That is enough for a few hundred clients; numbers
+are in [`docs/search-benchmark.md`](docs/search-benchmark.md). QMD search comes
+after v0, on trusted devices with encrypted disks, index never in git.
+
+## License
+
+Apache-2.0. Some files are adapted from [cr](https://github.com/AnandChowdhary/cr)
+(MIT); see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) and
+[`docs/borrowing.md`](docs/borrowing.md).
