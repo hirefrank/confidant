@@ -74,12 +74,6 @@ impl PersonCoaching {
             .iter()
             .any(|s| s.pps && s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
     }
-
-    fn any_session_in_window(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
-    }
 }
 
 type MembersByRoot = HashMap<NaiveDate, HashMap<RecordId, Vec<RecordId>>>;
@@ -97,9 +91,9 @@ impl CoachingState {
         canonical_on(id, &self.parent, on)
     }
 
-    fn members_on(&self, on: NaiveDate) -> HashMap<RecordId, Vec<RecordId>> {
-        if let Some(existing) = self.members_by_root.borrow().get(&on) {
-            return existing.clone();
+    fn ensure_members(&self, on: NaiveDate) {
+        if self.members_by_root.borrow().contains_key(&on) {
+            return;
         }
         let mut map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
         for pid in self.people.keys() {
@@ -109,8 +103,7 @@ impl CoachingState {
         for members in map.values_mut() {
             members.sort();
         }
-        self.members_by_root.borrow_mut().insert(on, map.clone());
-        map
+        self.members_by_root.borrow_mut().insert(on, map);
     }
 
     fn group_people<'a>(
@@ -124,14 +117,14 @@ impl CoachingState {
         members.iter().filter_map(|pid| self.people.get(pid))
     }
 
-    pub fn sessions_remaining(&self, id: &RecordId) -> i64 {
-        self.sessions_remaining_on(id, NaiveDate::MAX)
-    }
-
-    pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let groups = self.members_on(on);
+    fn remaining_with(
+        &self,
+        groups: &HashMap<RecordId, Vec<RecordId>>,
+        id: &RecordId,
+        on: NaiveDate,
+    ) -> i64 {
         let mut total: i64 = 0;
-        for person in self.group_people(&groups, id, on) {
+        for person in self.group_people(groups, id, on) {
             let Some(n) = person.remaining_on(on) else {
                 continue;
             };
@@ -143,61 +136,28 @@ impl CoachingState {
         total
     }
 
+    pub fn sessions_remaining(&self, id: &RecordId) -> i64 {
+        self.sessions_remaining_on(id, NaiveDate::MAX)
+    }
+
+    pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
+        self.ensure_members(on);
+        let groups = self.members_by_root.borrow();
+        self.remaining_with(groups.get(&on).expect("members cached"), id, on)
+    }
+
     pub fn icf_hours_hundredths(&self, id: &RecordId) -> i64 {
         self.icf_hours_hundredths_on(id, NaiveDate::MAX)
     }
 
     pub fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        let groups = self.members_on(on);
+        self.ensure_members(on);
+        let groups = self.members_by_root.borrow();
         let mut minutes: u32 = 0;
-        for person in self.group_people(&groups, id, on) {
+        for person in self.group_people(groups.get(&on).expect("members cached"), id, on) {
             minutes = minutes.saturating_add(person.minutes_on(on));
         }
         minutes_to_hundredths(minutes)
-    }
-
-    fn group_pps_in_lookback(
-        &self,
-        id: &RecordId,
-        as_of: NaiveDate,
-        window: chrono::Duration,
-    ) -> bool {
-        let groups = self.members_on(as_of);
-        let found = self
-            .group_people(&groups, id, as_of)
-            .any(|person| person.pps_in_lookback(as_of, window));
-        found
-    }
-
-    fn group_any_session_in_window(
-        &self,
-        id: &RecordId,
-        as_of: NaiveDate,
-        window: chrono::Duration,
-    ) -> bool {
-        let groups = self.members_on(as_of);
-        let found = self
-            .group_people(&groups, id, as_of)
-            .any(|person| person.any_session_in_window(as_of, window));
-        found
-    }
-
-    fn group_last_session_on(&self, id: &RecordId, as_of: NaiveDate) -> Option<NaiveDate> {
-        let groups = self.members_on(as_of);
-        let last = self
-            .group_people(&groups, id, as_of)
-            .filter_map(|person| person.last_session_on(as_of))
-            .max();
-        last
-    }
-
-    fn group_last_open_on(&self, id: &RecordId, as_of: NaiveDate) -> Option<NaiveDate> {
-        let groups = self.members_on(as_of);
-        let last = self
-            .group_people(&groups, id, as_of)
-            .filter_map(|person| person.last_open_on(as_of))
-            .max();
-        last
     }
 }
 
@@ -247,11 +207,13 @@ pub fn fold(
         .checks
         .severity("coaching.balance_nonnegative", Severity::Error);
     if let Some(sev) = nonnegative {
-        let groups = state.members_on(as_of);
+        state.ensure_members(as_of);
+        let groups = state.members_by_root.borrow();
+        let groups = groups.get(&as_of).expect("members cached");
         let mut roots: Vec<_> = groups.keys().cloned().collect();
         roots.sort();
         for id in roots {
-            let remaining = state.sessions_remaining_on(&id, as_of);
+            let remaining = state.remaining_with(groups, &id, as_of);
             if remaining < 0 {
                 findings.push(
                     Finding::new(
@@ -291,11 +253,11 @@ fn apply_open(
             .for_id(&entry.id)
             .with_fix("Example: 2026-10-01 open p-… package pkg-… 6 sessions"),
         ),
-        Some(Err(OpenIssue::InvalidId(raw))) => findings.push(
+        Some(Err(OpenIssue::InvalidId(_raw))) => findings.push(
             Finding::new(
                 FindingCode::InvalidId,
                 Severity::Error,
-                format!("package id '{raw}' is not a record ID"),
+                "package id is not a record ID".to_owned(),
             )
             .at_file(file)
             .at_line(line)
@@ -530,7 +492,7 @@ pub fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &m
                 Finding::new(
                     FindingCode::InvalidId,
                     Severity::Error,
-                    format!("session note '{note_id}' is not a record ID"),
+                    "session note is not a record ID".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
@@ -673,26 +635,39 @@ fn paid_session_gap(
     let lookback_i = i64::try_from(lookback).unwrap_or(i64::MAX);
     let window = chrono::Duration::days(days_i);
     let lookback_window = chrono::Duration::days(lookback_i);
-    let groups = state.members_on(as_of);
+    state.ensure_members(as_of);
+    let groups = state.members_by_root.borrow();
+    let groups = groups.get(&as_of).expect("members cached");
     let mut ids: Vec<_> = groups.keys().cloned().collect();
     ids.sort();
     for id in ids {
-        let remaining = state.sessions_remaining_on(&id, as_of);
-        let pps_client = state.group_pps_in_lookback(&id, as_of, lookback_window);
+        let remaining = state.remaining_with(groups, &id, as_of);
+        let pps_client = state
+            .group_people(groups, &id, as_of)
+            .any(|person| person.pps_in_lookback(as_of, lookback_window));
         if remaining <= 0 && !pps_client {
             continue;
         }
-        if state.group_any_session_in_window(&id, as_of, window) {
-            continue;
-        }
-        let last = state.group_last_session_on(&id, as_of);
-        if last.is_none() {
-            if let Some(opened) = state.group_last_open_on(&id, as_of) {
-                if as_of.signed_duration_since(opened) <= window {
-                    continue;
-                }
+        let last_session = state
+            .group_people(groups, &id, as_of)
+            .filter_map(|person| person.last_session_on(as_of))
+            .max();
+        let last_open = state
+            .group_people(groups, &id, as_of)
+            .filter_map(|person| person.last_open_on(as_of))
+            .max();
+        let clock = match (last_session, last_open) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(activity) = clock {
+            if as_of.signed_duration_since(activity) <= window {
+                continue;
             }
         }
+        let last = last_session;
         let start = as_of - window;
         let message = match (last, remaining > 0) {
             (None, _) => format!("paid client {id} has no session logged"),

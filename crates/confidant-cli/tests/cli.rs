@@ -172,10 +172,11 @@ as_of = "2026-10-08"
     assert!(
         findings.iter().any(|f| {
             f["code"] == "E_FRONTMATTER"
-                && f["file"] == "people/p-01M3TC5H00MPJG000000000000/profile.md"
+                && f.get("file").is_none()
                 && f.get("line").is_none()
                 && f.get("id").is_none()
                 && f.get("fix").is_none()
+                && f["message"].as_str().unwrap().contains("items")
         }),
         "{findings:?}"
     );

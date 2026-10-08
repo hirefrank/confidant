@@ -1,12 +1,11 @@
 //! Plaintext scan of records and ledger lines (milestone 1 stopgap).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
-use crate::check::{parse_merge, Finding, FindingCode, MergeParse, Severity};
-use crate::id::RecordId;
-use crate::record::RecordKind;
+use crate::check::{parse_merge, sort_findings, Finding, FindingCode, MergeParse, Severity};
+use crate::id::{is_vault_record_prefix, scan_ids, RecordId};
 use crate::vault::Vault;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -26,12 +25,11 @@ pub struct SearchResult {
 
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
 /// Line numbers are 1-based positions in the original file.
-/// Excludes no-ai people, uncertain profiles, merge groups, linked records,
-/// and ledger lines that mention an excluded ID.
+/// Returns content only from the cleared allowlist (spec section 12).
 pub fn search(vault: &Vault, query: &str) -> SearchResult {
     let needle = case_fold(query);
-    let exclusion = ExclusionSet::build(vault);
-    let findings = findings_for_find(vault, &exclusion);
+    let cleared = compute_cleared(vault);
+    let findings = findings_for_find(vault, &cleared);
     if needle.is_empty() {
         return SearchResult {
             hits: Vec::new(),
@@ -40,7 +38,7 @@ pub fn search(vault: &Vault, query: &str) -> SearchResult {
     }
     let mut hits = Vec::new();
     for rec in vault.records.values() {
-        if exclusion.ids.contains(&rec.id) {
+        if !cleared.contains(&rec.id) {
             continue;
         }
         scan_text(
@@ -52,10 +50,11 @@ pub fn search(vault: &Vault, query: &str) -> SearchResult {
         );
     }
     for line in &vault.ledger_lines {
-        if ledger_line_excluded(&line.text, &exclusion.folded_ids) {
+        if !line_cleared(&line.text, &cleared) {
             continue;
         }
-        if contains_ignore_case(&line.text, &needle) {
+        let folded = case_fold(&line.text);
+        if folded.contains(&needle) {
             hits.push(SearchHit {
                 id: line.id.clone(),
                 path: line.file.clone(),
@@ -68,172 +67,209 @@ pub fn search(vault: &Vault, query: &str) -> SearchResult {
     SearchResult { hits, findings }
 }
 
-struct ExclusionSet {
-    ids: HashSet<RecordId>,
-    folded_ids: Vec<String>,
-    unparsed_profiles: Vec<(RecordId, String)>,
+fn compute_cleared(vault: &Vault) -> HashSet<RecordId> {
+    let tainted = tainted_ids(vault);
+    let adj = merge_adj(vault);
+    let mut cleared: HashSet<RecordId> = vault
+        .records
+        .values()
+        .filter(|rec| !rec.no_ai() && !tainted.contains(&rec.id))
+        .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
+        .map(|rec| rec.id.clone())
+        .collect();
+
+    loop {
+        let mut next = HashSet::new();
+        for id in &cleared {
+            let Some(rec) = vault.records.get(id) else {
+                continue;
+            };
+            if !fm_ids_cleared(rec, &cleared) {
+                continue;
+            }
+            if !component_cleared(id, &adj, &cleared) {
+                continue;
+            }
+            if let Some(person) = person_from_people_path(&rec.path) {
+                if !cleared.contains(&person) {
+                    continue;
+                }
+            }
+            next.insert(id.clone());
+        }
+        for note in session_notes_on_uncleared_lines(vault, &cleared) {
+            next.remove(&note);
+        }
+        if next == cleared {
+            break;
+        }
+        cleared = next;
+    }
+    cleared
 }
 
-impl ExclusionSet {
-    fn build(vault: &Vault) -> Self {
-        let mut seeds = HashSet::new();
-        let mut unparsed_profiles = Vec::new();
-        for id in &vault.person_ids {
-            match vault.records.get(id) {
-                Some(rec) if rec.kind == RecordKind::Person && rec.no_ai() => {
-                    seeds.insert(id.clone());
-                }
-                Some(rec) if rec.kind == RecordKind::Person => {}
-                _ => {
-                    seeds.insert(id.clone());
-                    let path = vault
-                        .person_files
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("people/{id}/profile.md"));
-                    unparsed_profiles.push((id.clone(), path));
-                }
+fn tainted_ids(vault: &Vault) -> HashSet<RecordId> {
+    let mut tainted = HashSet::new();
+    for finding in &vault.load_findings {
+        if finding.code != FindingCode::DuplicateId && finding.code != FindingCode::IdPathMismatch {
+            continue;
+        }
+        if let Some(id) = &finding.id {
+            if let Ok(rid) = RecordId::parse(id) {
+                tainted.insert(rid);
             }
         }
-        let links = merge_links(vault);
-        let mut ids = expand_merge_groups(seeds, &links);
-        for rec in vault.records.values() {
-            if rec.no_ai() {
-                ids.insert(rec.id.clone());
-            }
-            if let Some(person) = rec.person() {
-                if ids.contains(&person) {
-                    ids.insert(rec.id.clone());
-                }
-            }
-            if rec.kind == RecordKind::Note {
-                if let Some(person) = person_from_path(&rec.path) {
-                    if ids.contains(&person) {
-                        ids.insert(rec.id.clone());
-                    }
-                }
-            }
-        }
-        let mut folded_ids: Vec<String> = ids.iter().map(|id| case_fold(&id.to_string())).collect();
-        folded_ids.sort();
-        folded_ids.dedup();
-        Self {
-            ids,
-            folded_ids,
-            unparsed_profiles,
+        if let Some(file) = &finding.file {
+            tainted.extend(scan_ids(file));
         }
     }
+    tainted
 }
 
-fn merge_links(vault: &Vault) -> Vec<(RecordId, RecordId)> {
-    let mut links = Vec::new();
+fn merge_adj(vault: &Vault) -> HashMap<RecordId, Vec<RecordId>> {
+    let mut adj: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
     for sourced in &vault.entries {
         if sourced.entry.verb != "merge" {
             continue;
         }
         if let MergeParse::Ok { from, to } = parse_merge(&sourced.entry) {
-            links.push((from, to));
+            adj.entry(from.clone()).or_default().push(to.clone());
+            adj.entry(to).or_default().push(from);
         }
     }
-    links
+    adj
 }
 
-fn expand_merge_groups(
-    seeds: HashSet<RecordId>,
-    links: &[(RecordId, RecordId)],
-) -> HashSet<RecordId> {
-    let mut adj: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-    for (a, b) in links {
-        adj.entry(a.clone()).or_default().push(b.clone());
-        adj.entry(b.clone()).or_default().push(a.clone());
-    }
-    let mut out = HashSet::new();
-    let mut stack: Vec<RecordId> = seeds.into_iter().collect();
-    while let Some(id) = stack.pop() {
-        if !out.insert(id.clone()) {
+fn component_cleared(
+    id: &RecordId,
+    adj: &HashMap<RecordId, Vec<RecordId>>,
+    cleared: &HashSet<RecordId>,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut stack = vec![id.clone()];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
             continue;
         }
-        if let Some(neighbours) = adj.get(&id) {
+        if !cleared.contains(&cur) {
+            return false;
+        }
+        if let Some(neighbours) = adj.get(&cur) {
             stack.extend(neighbours.iter().cloned());
         }
     }
-    out
+    true
 }
 
-fn findings_for_find(vault: &Vault, exclusion: &ExclusionSet) -> Vec<Finding> {
-    let unparsed: HashSet<&str> = exclusion
-        .unparsed_profiles
+fn fm_ids_cleared(rec: &crate::record::Record, cleared: &HashSet<RecordId>) -> bool {
+    rec.fields.values().all(|value| ids_cleared(value, cleared))
+}
+
+fn ids_cleared(text: &str, cleared: &HashSet<RecordId>) -> bool {
+    scan_ids(text)
         .iter()
-        .map(|(_, path)| path.as_str())
-        .collect();
-    let mut out = Vec::new();
-    let mut seen_paths = HashSet::new();
-    for finding in &vault.load_findings {
-        if finding
-            .file
-            .as_deref()
-            .is_some_and(|file| unparsed.contains(file) || is_person_profile_path(file))
-            && (finding.code == FindingCode::Frontmatter || finding.code == FindingCode::Unreadable)
+        .all(|id| !is_vault_record_prefix(id.prefix()) || cleared.contains(id))
+}
+
+fn line_cleared(text: &str, cleared: &HashSet<RecordId>) -> bool {
+    ids_cleared(text, cleared)
+}
+
+fn session_notes_on_uncleared_lines(
+    vault: &Vault,
+    cleared: &HashSet<RecordId>,
+) -> HashSet<RecordId> {
+    let mut notes = HashSet::new();
+    for line in &vault.ledger_lines {
+        if line_cleared(&line.text, cleared) {
+            continue;
+        }
+        if let Some(sourced) = vault
+            .entries
+            .iter()
+            .find(|s| s.file == line.file && s.line == line.line)
         {
-            if let Some(file) = &finding.file {
-                if seen_paths.insert(file.clone()) {
-                    out.push(profile_find_finding(file));
+            if sourced.entry.verb == "session" {
+                if let Some(raw) = sourced.entry.pair("note") {
+                    if let Ok(nid) = RecordId::parse(raw) {
+                        notes.insert(nid);
+                    }
                 }
             }
             continue;
         }
-        out.push(finding.clone());
+        notes.extend(
+            scan_ids(&line.text)
+                .into_iter()
+                .filter(|id| id.prefix() == crate::id::Prefix::Note),
+        );
     }
-    for (_, path) in &exclusion.unparsed_profiles {
-        if seen_paths.insert(path.clone()) {
-            out.push(profile_find_finding(path));
+    notes
+}
+
+fn findings_for_find(vault: &Vault, cleared: &HashSet<RecordId>) -> Vec<Finding> {
+    let mut kept = Vec::new();
+    let mut redacted: BTreeMap<FindingCode, (Severity, usize)> = BTreeMap::new();
+    for finding in &vault.load_findings {
+        if finding_is_uncleared(finding, vault, cleared) {
+            let entry = redacted
+                .entry(finding.code)
+                .or_insert((finding.severity, 0));
+            entry.0 = entry.0.max(finding.severity);
+            entry.1 += 1;
+        } else {
+            kept.push(finding.clone());
         }
     }
-    out
-}
-
-fn profile_find_finding(path: &str) -> Finding {
-    Finding::new(
-        FindingCode::Frontmatter,
-        Severity::Error,
-        "person profile excluded from find",
-    )
-    .at_file(path)
-}
-
-fn is_person_profile_path(file: &str) -> bool {
-    let mut parts = file.split('/');
-    if parts.next() != Some("people") {
-        return false;
+    for (code, (severity, count)) in redacted {
+        kept.push(Finding::new(code, severity, format!("{count} items")));
     }
-    let Some(second) = parts.next() else {
-        return false;
-    };
-    match parts.next() {
-        Some("profile.md") => parts.next().is_none(),
-        None => second.ends_with(".md"),
-        _ => false,
-    }
+    sort_findings(&mut kept);
+    kept
 }
 
-fn person_from_path(path: &str) -> Option<RecordId> {
+fn finding_is_uncleared(finding: &Finding, vault: &Vault, cleared: &HashSet<RecordId>) -> bool {
+    if let Some(id) = &finding.id {
+        if let Ok(rid) = RecordId::parse(id) {
+            if is_vault_record_prefix(rid.prefix()) && !cleared.contains(&rid) {
+                return true;
+            }
+        }
+    }
+    if let Some(file) = &finding.file {
+        if let Some(person) = person_from_people_path(file) {
+            if !cleared.contains(&person) {
+                return true;
+            }
+        }
+        if let Some(rec) = vault.records.values().find(|r| r.path == *file) {
+            if !cleared.contains(&rec.id) {
+                return true;
+            }
+        }
+        if let Some(line) = finding.line {
+            if let Some(ll) = vault
+                .ledger_lines
+                .iter()
+                .find(|l| l.file == *file && l.line == line)
+            {
+                if !line_cleared(&ll.text, cleared) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn person_from_people_path(path: &str) -> Option<RecordId> {
     let mut parts = path.split('/');
     if parts.next()? != "people" {
         return None;
     }
-    RecordId::parse(parts.next()?).ok()
-}
-
-fn ledger_line_excluded(text: &str, folded_ids: &[String]) -> bool {
-    if folded_ids.is_empty() {
-        return false;
-    }
-    let folded = case_fold(text);
-    folded_ids.iter().any(|id| folded.contains(id))
-}
-
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    case_fold(haystack).contains(&case_fold(needle))
+    let second = parts.next()?;
+    let stem = second.strip_suffix(".md").unwrap_or(second);
+    RecordId::parse(stem).ok()
 }
 
 /// Practical Unicode caseless matching: lowercasing plus ß/ẞ → ss and İ → i.
@@ -251,7 +287,8 @@ fn case_fold(s: &str) -> String {
 
 fn scan_text(path: &str, id: Option<String>, text: &str, needle: &str, hits: &mut Vec<SearchHit>) {
     for (idx, line) in text.lines().enumerate() {
-        if contains_ignore_case(line, needle) {
+        let folded = case_fold(line);
+        if folded.contains(needle) {
             hits.push(SearchHit {
                 id: id.clone(),
                 path: path.to_owned(),
@@ -272,7 +309,7 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, contains_ignore_case, excerpt};
+    use super::{case_fold, excerpt};
 
     #[test]
     fn excerpt_truncates() {
@@ -282,9 +319,9 @@ mod tests {
 
     #[test]
     fn unicode_case_folding() {
-        assert!(contains_ignore_case("İstanbul Café", "café"));
-        assert!(contains_ignore_case("Straße", "STRASSE"));
-        assert!(contains_ignore_case("STRASSE", "straße"));
+        assert!(case_fold("İstanbul Café").contains(&case_fold("café")));
+        assert!(case_fold("Straße").contains(&case_fold("STRASSE")));
+        assert!(case_fold("STRASSE").contains(&case_fold("straße")));
         assert_eq!(case_fold("ß"), "ss");
     }
 }

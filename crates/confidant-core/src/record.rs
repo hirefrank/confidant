@@ -103,12 +103,67 @@ impl FrontmatterError {
     }
 
     fn key_at(line: u32, key: &str, problem: &str, fix: impl Into<String>) -> Self {
+        let message = if is_spec_key(key) {
+            format!("front matter key '{key}' {problem} (line {line})")
+        } else {
+            format!("front matter line {line} {problem}")
+        };
         Self {
-            message: format!("front matter key '{key}' {problem} (line {line})"),
+            message,
             fix: fix.into(),
             line: Some(line),
         }
     }
+}
+
+const SPEC_KEYS: &[&str] = &[
+    "id", "type", "name", "date", "person", "org", "deal", "session", "no-ai",
+];
+
+fn is_spec_key(key: &str) -> bool {
+    SPEC_KEYS.contains(&key)
+}
+
+fn is_noai_typo(key: &str) -> bool {
+    if key == "no-ai" {
+        return false;
+    }
+    normalize_noai(key) == "noai"
+}
+
+fn normalize_noai(key: &str) -> String {
+    let mut out = String::new();
+    for c in key.chars() {
+        if is_stripped_noai_char(c) {
+            continue;
+        }
+        match c {
+            'ß' | 'ẞ' => out.push_str("ss"),
+            'İ' => out.push('i'),
+            _ => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+fn is_stripped_noai_char(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '_'
+            | ' '
+            | '\t'
+            | '\u{00ad}'
+            | '\u{2010}'
+            | '\u{2011}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2015}'
+            | '\u{2212}'
+            | '\u{fe58}'
+            | '\u{fe63}'
+            | '\u{ff0d}'
+    )
 }
 
 type FrontmatterFields = (BTreeMap<String, String>, String, BTreeMap<String, u32>);
@@ -162,6 +217,13 @@ pub fn split_frontmatter(text: &str) -> Result<FrontmatterFields, FrontmatterErr
             return Err(FrontmatterError::new(
                 format!("front matter key is empty (line {line_no})"),
                 "Each front matter line must be key: value",
+            )
+            .at_line(line_no));
+        }
+        if is_noai_typo(key) {
+            return Err(FrontmatterError::new(
+                format!("front matter line {line_no} has a no-ai key typo"),
+                "Use the exact key no-ai: true or no-ai: false",
             )
             .at_line(line_no));
         }
@@ -424,6 +486,14 @@ mod tests {
         .unwrap_err();
         assert!(org.message.contains("no-ai"));
         assert!(org.message.contains("not allowed"));
+        for key in ["No-AI", "no_ai", "noai", "no\u{2013}ai"] {
+            let src =
+                format!("---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n{key}: true\n---\n");
+            let err = parse_record(&src, "x.md").unwrap_err();
+            assert!(err.message.contains("line 4"), "{key}: {}", err.message);
+            assert!(!err.message.contains(key), "{key}: {}", err.message);
+            assert!(!err.message.contains("true"), "{}", err.message);
+        }
     }
 
     #[test]

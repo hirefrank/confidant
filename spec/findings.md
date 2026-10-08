@@ -20,7 +20,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, `note:` is not a note, or a `merge` folds one record type into another. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
-| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it, and note `date` / `session` that is not YYYY-MM-DD). Messages give a line number and the key name only; they never echo raw front-matter text. |
+| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it, a key that normalises to `noai` other than exact `no-ai`, and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines. |
@@ -39,18 +39,17 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, `N` is over 100000, or the running open total overflows. |
 | `E_NEGATIVE_BALANCE` | error | `coaching.balance_nonnegative` | Computed `sessions_remaining` is negative. |
 | `E_SESSION_WITHOUT_NOTES` | warning | `coaching.session_notes` | A session has no linked or same-day note (coverage only; `note:` integrity is always on). |
-| `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. Never-started packages measure that window from the most recent `open`. |
+| `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. The gap clock runs from `max(last session, latest open)`. |
 | `W_SESSION_UNTAGGED` | warning | | A session has none of `paid`, `pps`, or `comp`. The session still consumes a package slot. |
 | `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID has no record. |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. |
 
-`confidant find` uses the same codes. If unsure, exclude: `no-ai: true`
-people, profiles that fail to parse or are missing, whole merge groups,
-linked interactions and deals, records that themselves have `no-ai: true`,
-and ledger lines that mention an excluded ID. For a person profile that
-will not parse, `find --json` findings include the path and code only —
-never raw front-matter text.
+`confidant find` uses the same codes and the section 12 allowlist: only
+cleared records and ledger lines are searchable. A finding about anything
+uncleared gives only its code and the count of affected items — never a
+path, file name, ID, key, or line text. Ledger parse errors give the line
+number and code without echoing tokens.
 
 Command-level error codes (not check findings):
 

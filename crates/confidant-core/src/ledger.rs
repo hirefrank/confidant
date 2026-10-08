@@ -157,7 +157,7 @@ fn parse_line_inner(raw: &str) -> Result<Option<LedgerEntry>, LineError> {
     let verb = lexer.ident("verb").map_err(LineError::grammar)?;
     let id_raw = lexer.ident("id").map_err(LineError::grammar)?;
     let id = RecordId::parse(&id_raw)
-        .map_err(|err| LineError::invalid_id(format!("invalid id '{id_raw}': {err}")))?;
+        .map_err(|_| LineError::invalid_id("ledger line has an invalid id".to_owned()))?;
     let mut args = Vec::new();
     while !lexer.done() {
         if lexer.peek_comment() {
@@ -229,7 +229,7 @@ impl<'a> Lexer<'a> {
             return Err("missing date YYYY-MM-DD".to_owned());
         }
         let date = parse_strict_date(&tok)
-            .ok_or_else(|| format!("'{tok}' is not a zero-padded calendar date YYYY-MM-DD"))?;
+            .ok_or_else(|| "ledger line date is not YYYY-MM-DD".to_owned())?;
         self.i += 10;
         match self.s[self.i..].chars().next() {
             Some(c) if c == ' ' || c == '\t' => Ok(date),

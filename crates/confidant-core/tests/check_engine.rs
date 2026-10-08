@@ -14,7 +14,11 @@ const PKG: &str = "pkg-01M3TC5H00MPJG004SK4000009";
 const NOTE: &str = "n-01M3TC5H00MPJG002NAM000005";
 const ORG: &str = "o-01M3TC5H00MPJG001K6C000003";
 const DEAL: &str = "d-01M3TC5H00MPJG00248G000004";
+const DEAL2: &str = "d-01M3TC5H00MPJG005VQC00000B";
+const NOTE2: &str = "n-01M3TC5H00MPJG00600000000D";
 const IXN: &str = "i-01M3TC5H00MPJG0048H0000008";
+const SHADOW: &str = "p-01M3TC5H00MPJG001K6C00000A";
+const GHOST: &str = "p-01M3TC5H00MPJG000H2400000Z";
 
 fn write(root: &Path, rel: &str, body: &str) {
     let path = root.join(rel);
@@ -1074,19 +1078,286 @@ fn find_json_findings_omit_raw_profile_text() {
     assert!(!dumped.contains("unique-fm-secret-token"), "{dumped}");
     assert!(!dumped.contains("unique-body-secret"), "{dumped}");
     assert!(!dumped.contains("yes"), "{dumped}");
+    assert!(!dumped.contains(&format!("people/{ADA}")), "{dumped}");
     assert!(
         result
             .findings
             .iter()
             .any(|f| f.code == FindingCode::Frontmatter
-                && f.file.as_deref() == Some(&format!("people/{ADA}/profile.md"))),
+                && f.file.is_none()
+                && f.line.is_none()
+                && f.id.is_none()
+                && f.fix.is_none()
+                && f.message.contains("items")),
         "{result:?}"
     );
-    for f in &result.findings {
-        if f.code == FindingCode::Frontmatter {
-            assert!(f.line.is_none(), "{f:?}");
-            assert!(f.id.is_none(), "{f:?}");
-            assert!(f.fix.is_none(), "{f:?}");
-        }
-    }
+}
+
+#[test]
+fn find_excludes_merged_no_ai_deal() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("deals/{DEAL}/deal.md"),
+        &format!(
+            "---\nid: {DEAL}\ntype: deal\nname: Secret Deal\nno-ai: true\n---\n\nmerged-deal-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("deals/{DEAL2}/deal.md"),
+        &format!(
+            "---\nid: {DEAL2}\ntype: deal\nname: Other Deal\n---\n\nmerged-deal-partner-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {DEAL} into {DEAL2}\n"),
+    );
+    let a = search_q(dir.path(), "merged-deal-token");
+    let b = search_q(dir.path(), "merged-deal-partner-token");
+    assert!(!token_in_hits(&a, "merged-deal-token"), "{a:?}");
+    assert!(!token_in_hits(&b, "merged-deal-partner-token"), "{b:?}");
+}
+
+#[test]
+fn find_excludes_merged_no_ai_note() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nno-ai: true\n---\n\nmerged-note-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE2}/note.md"),
+        &format!("---\nid: {NOTE2}\ntype: note\n---\n\nmerged-note-partner-token\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {NOTE} into {NOTE2}\n"),
+    );
+    let a = search_q(dir.path(), "merged-note-token");
+    let b = search_q(dir.path(), "merged-note-partner-token");
+    assert!(!token_in_hits(&a, "merged-note-token"), "{a:?}");
+    assert!(!token_in_hits(&b, "merged-note-partner-token"), "{b:?}");
+}
+
+#[test]
+fn find_excludes_flat_file_plus_directory_no_ai_shadow() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Flat Ada\nno-ai: true\n---\n\nflat-person-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Dir Ada\n---\n\ndir-person-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nunder-dup-token\n"
+        ),
+    );
+    let flat = search_q(dir.path(), "flat-person-token");
+    let dir_tok = search_q(dir.path(), "dir-person-token");
+    let under = search_q(dir.path(), "under-dup-token");
+    assert!(!token_in_hits(&flat, "flat-person-token"), "{flat:?}");
+    assert!(!token_in_hits(&dir_tok, "dir-person-token"), "{dir_tok:?}");
+    assert!(!token_in_hits(&under, "under-dup-token"), "{under:?}");
+}
+
+#[test]
+fn find_excludes_mismatched_id_shadowing_real_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nreal-ada-token\n"),
+    );
+    write(
+        dir.path(),
+        &format!("people/{SHADOW}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Shadow\n---\n\nshadow-id-token\n"),
+    );
+    let real = search_q(dir.path(), "real-ada-token");
+    let shadow = search_q(dir.path(), "shadow-id-token");
+    assert!(!token_in_hits(&real, "real-ada-token"), "{real:?}");
+    assert!(!token_in_hits(&shadow, "shadow-id-token"), "{shadow:?}");
+}
+
+fn find_excludes_noai_key_typo(key: &str, token: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada\n{key}: true\n---\n\n{token}\n"),
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\n{token} in a note\n"
+        ),
+    );
+    let result = search_q(dir.path(), token);
+    assert!(!token_in_hits(&result, token), "{key} {result:?}");
+}
+
+#[test]
+fn find_excludes_no_ai_pascal_key_typo() {
+    find_excludes_noai_key_typo("No-AI", "no-ai-pascal-token");
+}
+
+#[test]
+fn find_excludes_no_ai_underscore_key_typo() {
+    find_excludes_noai_key_typo("no_ai", "no-ai-underscore-token");
+}
+
+#[test]
+fn find_excludes_noai_compact_key_typo() {
+    find_excludes_noai_key_typo("noai", "noai-compact-token");
+}
+
+#[test]
+fn find_excludes_no_ai_unicode_dash_key_typo() {
+    find_excludes_noai_key_typo("no\u{2013}ai", "no-ai-en-dash-token");
+}
+
+#[test]
+fn find_excludes_obsidian_wikilink_to_uncleared_person() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea\nsee: \"[[{ADA}]]\"\n---\n\nobsidian-bea-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "obsidian-bea-token");
+    assert!(!token_in_hits(&result, "obsidian-bea-token"), "{result:?}");
+}
+
+#[test]
+fn find_excludes_note_linked_only_by_deal_to_excluded_deal() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("deals/{DEAL}/deal.md"),
+        &format!(
+            "---\nid: {DEAL}\ntype: deal\nname: Secret\nno-ai: true\n---\n\nexcluded-deal-token\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\ndeal: {DEAL}\n---\n\ndeal-linked-note-token\n"),
+    );
+    let result = search_q(dir.path(), "deal-linked-note-token");
+    assert!(
+        !token_in_hits(&result, "deal-linked-note-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_excludes_dangling_person_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {GHOST}\ndate: 2026-10-01\n---\n\ndangling-person-token\n"
+        ),
+    );
+    let result = search_q(dir.path(), "dangling-person-token");
+    assert!(
+        !token_in_hits(&result, "dangling-person-token"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn find_json_omits_filename_under_excluded_person() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nhidden-under-person\n"
+        ),
+    );
+    let result = search_q(dir.path(), "hidden-under-person");
+    let dumped = serde_json::to_string(&result).unwrap();
+    assert!(!dumped.contains(NOTE), "{dumped}");
+    assert!(!dumped.contains(&format!("people/{ADA}")), "{dumped}");
+}
+
+#[test]
+fn find_json_findings_omit_excluded_id_on_malformed_ledger_line() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("not-an-entry malformed-ledger-token {ADA}\n"),
+    );
+    let result = search_q(dir.path(), "malformed-ledger-token");
+    assert!(
+        !token_in_hits(&result, "malformed-ledger-token"),
+        "{result:?}"
+    );
+    let dumped = serde_json::to_string(&result.findings).unwrap();
+    assert!(!dumped.contains(ADA), "{dumped}");
+    assert!(!dumped.contains("malformed-ledger-token"), "{dumped}");
+}
+
+#[test]
+fn returning_client_new_package_resets_gap_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-01-01");
+    write(
+        dir.path(),
+        "ledger/2026/01.cfd",
+        &format!(
+            "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-01-01 session {ADA} 60m paid note:{NOTE}\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n"),
+    );
+    let json = report_json(dir.path(), Some("2026-10-08"));
+    assert!(
+        !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        "{json}"
+    );
 }

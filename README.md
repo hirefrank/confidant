@@ -21,12 +21,14 @@ not put real clients in it.
 
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores
-nothing; that depends on the provider's terms. `no-ai: true` is a boolean on
-person, note, interaction, and deal records. `confidant find` is
-privacy-first (if unsure, exclude): it omits those records, people whose
-profile will not parse or is missing, every member of a merge group when any
-member is excluded, linked interactions and deals, and ledger lines that
-mention an excluded ID. Milestone 3 `context` continues to honour the flag.
+nothing; that depends on the provider's terms. `confidant find` returns
+content only from a cleared allowlist (spec section 12): a record is
+searchable only when it parsed cleanly, has no `no-ai` flag, has no
+duplicate or path-id mismatch, every ID in its front matter is cleared,
+its whole merge group is cleared, and any `people/<id>/` parent is cleared.
+Ledger lines are searchable only when every ID on the line is cleared.
+Findings about uncleared items give a code and a count, never a path or
+raw text. Milestone 3 `context` continues to honour `no-ai`.
 
 ## Quickstart
 
@@ -76,13 +78,12 @@ on `code`, never on message text.
 
 Gap rules from the architecture (section 9b): a session with no notes, and a
 paid client (`sessions_remaining > 0` or a `pps` session in the lookback)
-with no session inside a configurable window. Never-started packages measure
-that window from the most recent `open`. Session billing tags are `paid`
+with no session inside a configurable window. The gap clock runs from
+`max(last session, latest open)`. Session billing tags are `paid`
 (consumes a slot), `pps`, and `comp` (complimentary; never consume). A
 session with none of these still consumes and is `W_SESSION_UNTAGGED`; more
 than one is `E_SESSION_TAGS`. A merge between different record types is
-`E_WRONG_ID_TYPE`. `find` follows the privacy-first rules in spec section 12
-(ledger lines included).
+`E_WRONG_ID_TYPE`. `find` follows the section 12 allowlist.
 
 ```sh
 confidant check --json --fail-on warning --as-of 2026-10-08

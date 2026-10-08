@@ -210,6 +210,54 @@ pub fn is_ulid(s: &str) -> bool {
     canonicalize_ulid(s).is_some()
 }
 
+/// Scan `text` for ID-shaped tokens (`p-`/`o-`/`d-`/`i-`/`n-`/`pkg-` plus ULID),
+/// case-insensitively. Finds IDs inside junk such as `[[p-…]]`.
+pub fn scan_ids(text: &str) -> Vec<RecordId> {
+    let mut out = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if let Some((id, len)) = match_id_at(remaining) {
+            out.push(id);
+            remaining = &remaining[len..];
+        } else {
+            let ch = remaining.chars().next().unwrap();
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn match_id_at(s: &str) -> Option<(RecordId, usize)> {
+    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
+    for pref in PREFIXES {
+        let plen = pref.len();
+        if s.len() < plen + 1 + ULID_LEN {
+            continue;
+        }
+        let head = s.get(..plen)?;
+        if !head.eq_ignore_ascii_case(pref) {
+            continue;
+        }
+        if s.as_bytes().get(plen) != Some(&b'-') {
+            continue;
+        }
+        let ulid = s.get(plen + 1..plen + 1 + ULID_LEN)?;
+        if ulid.len() != ULID_LEN || !ulid.is_ascii() {
+            continue;
+        }
+        let raw = format!("{pref}-{ulid}");
+        if let Ok(id) = RecordId::parse(&raw) {
+            return Some((id, plen + 1 + ULID_LEN));
+        }
+    }
+    None
+}
+
+/// Package IDs are ledger-only in 0.1 and do not participate in the find allowlist.
+pub fn is_vault_record_prefix(prefix: Prefix) -> bool {
+    prefix != Prefix::Package
+}
+
 /// Encode `value` as `len` Crockford characters (big-endian).
 pub fn encode_crockford(mut value: u128, len: usize) -> String {
     let mut chars = vec![b'0'; len];
@@ -275,5 +323,14 @@ mod tests {
         assert!(RecordId::parse("p-81M3TC5H00MPJG000000000000").is_err());
         assert!(RecordId::parse("p-01M3TC5H00MPJG000000000000").is_ok());
         assert!(RecordId::parse("p-71M3TC5H00MPJG000000000000").is_ok());
+    }
+
+    #[test]
+    fn scan_ids_finds_obsidian_and_junk() {
+        let id = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let found = super::scan_ids("see [[p-01M3TC5H00MPJG000000000000]] please");
+        assert_eq!(found, vec![id.clone()]);
+        let mixed = super::scan_ids("P-01m3tc5h00mpjg000000000000");
+        assert_eq!(mixed, vec![id]);
     }
 }

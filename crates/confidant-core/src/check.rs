@@ -476,11 +476,11 @@ fn check_aliases_and_merges(
                 .for_id(&e.id)
                 .with_fix("Write: merge <from-id> into <to-id>"),
             ),
-            MergeParse::InvalidTo { raw } => findings.push(
+            MergeParse::InvalidTo => findings.push(
                 Finding::new(
                     FindingCode::InvalidId,
                     Severity::Error,
-                    format!("merge destination '{raw}' is not a record ID"),
+                    "merge destination is not a record ID".to_owned(),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
@@ -610,7 +610,7 @@ fn check_aliases_and_merges(
 
 pub(crate) enum MergeParse {
     Ok { from: RecordId, to: RecordId },
-    InvalidTo { raw: String },
+    InvalidTo,
     Malformed,
 }
 
@@ -629,9 +629,7 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
             from: entry.id.clone(),
             to,
         },
-        Err(_) => MergeParse::InvalidTo {
-            raw: raw.to_owned(),
-        },
+        Err(_) => MergeParse::InvalidTo,
     }
 }
 
@@ -874,7 +872,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     Finding::new(
                         FindingCode::InvalidId,
                         Severity::Error,
-                        format!("front matter {key} '{raw}' is not a record ID"),
+                        format!("front matter key '{key}' is not a record ID"),
                     )
                     .at_file(&rec.path)
                     .for_id(&rec.id)
@@ -884,7 +882,7 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     Finding::new(
                         FindingCode::DanglingRef,
                         Severity::Error,
-                        format!("front matter {key} '{id}' has no record file"),
+                        format!("front matter key '{key}' has no record"),
                     )
                     .at_file(&rec.path)
                     .for_id(&rec.id)
@@ -920,7 +918,7 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
     }
 }
 
-fn sort_findings(findings: &mut [Finding]) {
+pub(crate) fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)
