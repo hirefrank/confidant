@@ -124,7 +124,14 @@ Spec 0.1 reserves `keys/`; this design fills it in:
 keys/
 ├── vault/
 │   └── lookup.age          # alias-lookup key, age-encrypted to each device/agent
-└── p-<ULID>/               # one dir per client with encrypted content
+├── p-<ULID>/               # one dir per client with encrypted content
+│   ├── epoch               # ASCII decimal, current key epoch (plaintext)
+│   ├── recipients.toml     # recipient list: key id -> {age_pubkey, label, scope_ref}
+│   ├── recipients.sig      # Ed25519 signature over recipients.toml + epoch
+│   └── wrapped/
+│       ├── <key-id>.age    # data key (this epoch) age-encrypted to that recipient
+│       └── recovery.age    # data key (this epoch) age-encrypted to the recovery key
+└── shared/                 # the vault:shared client for orgs and person-less deals
     ├── epoch               # ASCII decimal, current key epoch (plaintext)
     ├── recipients.toml     # recipient list: key id -> {age_pubkey, label, scope_ref}
     ├── recipients.sig      # Ed25519 signature over recipients.toml + epoch
