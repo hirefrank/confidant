@@ -42,8 +42,9 @@ Session-note and paid-gap checks are `off` in the generated config so
 ## Results
 
 Measured 2026-10-08 on the milestone 1 cloud-agent VM after the section 12
-allowlist (cleared set, malformed ID tokens, `pkg-` openers, body-line
-filter, finding redaction).
+allowlist (shared front-matter offsets, raw FM comment/key scan, session
+`note:` reverse map, 20–32 character malformed IDs, one tokenize per line,
+`HashSet` reverse deps).
 
 Hardware: Intel Xeon (4 logical CPUs), Linux 6.12, `confidant` release
 build (`rustc 1.99.0`). Hyperfine 2.0.0, **3 warmup runs, 10 timed runs**.
@@ -51,20 +52,20 @@ Spread is mean ± one standard deviation; min and max are the observed range.
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| `find zxqvUniqueTokenAda0` (one profile) | 1 | **100.0 ms** | 2.4 ms | 96.5 ms | 102.9 ms |
-| `find coaching-practice` (every record) | 2,400 | **103.5 ms** | 2.7 ms | 99.5 ms | 107.4 ms |
-| `check` | 0 findings | **70.6 ms** | 1.7 ms | 68.0 ms | 73.4 ms |
+| `find zxqvUniqueTokenAda0` (one profile) | 1 | **103.5 ms** | 2.7 ms | 99.1 ms | 107.5 ms |
+| `find coaching-practice` (every record) | 2,400 | **109.4 ms** | 4.3 ms | 104.8 ms | 119.0 ms |
+| `check` | 0 findings | **81.3 ms** | 12.9 ms | 74.3 ms | 114.7 ms |
 
-Peak RSS was about 34–38 MiB.
+Peak RSS was about 34–43 MiB (check ~34 MiB, find ~43 MiB).
 
 ## Section 9b item 4
 
 A sequential plaintext scan of a few hundred clients, with realistic
 note sizes (KB transcripts), dozens of sessions per client, and
-multi-year ledgers, stays around **100 ms** for `find` (cleared allowlist
-plus scan) and **70 ms** for `check` — still inside interactive range.
-The earlier ~70 ms `find` figure was the same 400×5 layout before the
-fixed-point allowlist.
+multi-year ledgers, stays around **100–110 ms** for `find` (cleared
+allowlist plus scan) and **80 ms** for `check` — still inside interactive
+range. The earlier ~70 ms `find` figure was the same 400×5 layout before
+the fixed-point allowlist.
 
 QMD (local BM25 + vectors, index never in git) is still the plan after
 v0. Milestone 2 record-bound AEAD is **not** in this measurement; do not
