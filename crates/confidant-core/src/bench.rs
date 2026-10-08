@@ -91,7 +91,7 @@ coaching.paid_session_gap_days = 45
             &mut ledgers,
             2024,
             1,
-            &format!("2024-01-15 open {pid} package {pkg} 36 sessions\n"),
+            &format!("2024-01-01 open {pid} package {pkg} 36 sessions\n"),
         );
         for s in 0..SESSIONS_PER_PERSON {
             let month_offset = (s as u32) % 12;
@@ -180,6 +180,12 @@ mod tests {
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
         assert_eq!(search(&vault, &unique).len(), 1);
         assert!(search(&vault, &common).len() >= 3);
+        let report = crate::check_vault(&vault, &crate::CheckOptions::default());
+        assert!(
+            report.findings.is_empty(),
+            "generated vault should check clean: {:?}",
+            report.findings
+        );
         assert!(generate_realistic_vault(dir.path(), 1, 1).is_err());
     }
 }
