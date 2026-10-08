@@ -229,8 +229,8 @@ There is no separate audit journal. The audit trail is the ledger plus git histo
 - Shipped skills (prep session, log session, open renewal, weekly pipeline review) confirm with the human before writing.
 
 ```sh
-confidant log session p-01J9Z3K4QF 60m paid --request-id run-7f3a --json --no-input --dry-run
-confidant context p-01J9Z3K4QF --exclude private --json
+confidant log session p-01J9Z3K4QF 60m paid --request-id 01J9Z3K4QF7F3A000000000000 --json --no-input --dry-run
+confidant context p-01J9Z3K4QF --exclude-private --json
 confidant check --json
 ```
 
