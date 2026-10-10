@@ -34,10 +34,11 @@ fn push_component(buf: &mut Vec<u8>, data: &[u8]) {
 
 /// Build the associated data for a record encryption.
 ///
-/// Components, in order: `confidant1`, `vault_id`, record ULID, relative
-/// path, `purpose`, key epoch (ASCII decimal), then the outer header fields
-/// (`id`, `type`, `no-ai`, `enc`, `key_id`) each length-prefixed in that
-/// fixed order. The nonce is the AEAD nonce and is NOT part of the AAD.
+/// Components, in order: `confidant1`, `vault_id`, record ULID,
+/// `client_id`, relative path, `purpose`, key epoch (ASCII decimal), then
+/// the outer header fields (`id`, `type`, `no-ai`, `enc`, `key_id`) each
+/// length-prefixed in that fixed order. The nonce is the AEAD nonce and is
+/// NOT part of the AAD.
 #[allow(clippy::too_many_arguments)]
 pub fn build_aad(
     vault_id: &str,
