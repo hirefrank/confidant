@@ -625,6 +625,10 @@ fn pubkey_mismatch_refuses() {
 
 #[test]
 fn pubkey_pin_match_proceeds() {
+    // No local inbox key: exercise the pin comparison in isolation from the
+    // #55 local-key check (which skips without a key).
+    let g = EnvGuard::lock();
+    g.unset();
     let r = Repo::new();
     let key = "age1operatorpin00000000000000000000000000000000000000000";
     let toml = std::fs::read_to_string(r.root().join("confidant.toml")).unwrap();
@@ -834,4 +838,198 @@ fn all_signed_proceeds() {
         run_with(&r, vec![fingerprint], false, None).expect("all-signed run should proceed");
     assert_eq!(report.merged, 2);
     assert_eq!(report.cleared, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Real-crypto round trips (#30) and the local-pubkey hard error (#55).
+//
+// These tests drive the production decryptor (`inbox_decrypt`) with a fixed
+// test-only inbox identity loaded via the `CONFIDANT_INBOX_KEY` env override
+// (headless-safe: no OS keychain needed). Every test uses the same identity
+// so parallel tests never race on the env var's value; no test unsets it.
+// ---------------------------------------------------------------------------
+
+/// Test-only inbox identity ("the operator's key").
+const TEST_INBOX_SECRET: [u8; 32] = [7u8; 32];
+/// A different test-only identity ("someone else's key").
+const OTHER_INBOX_SECRET: [u8; 32] = [9u8; 32];
+
+/// Serializes `CONFIDANT_INBOX_KEY` mutation: `run_inbox` reads the local
+/// inbox identity from the process environment, so tests that set a vault
+/// `[inbox].pubkey` must not race with tests that set the env var.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    saved: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn lock() -> Self {
+        EnvGuard {
+            saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
+            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+    fn set(&self, val: &str) {
+        std::env::set_var("CONFIDANT_INBOX_KEY", val);
+    }
+    fn unset(&self) {
+        std::env::remove_var("CONFIDANT_INBOX_KEY");
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.saved.take() {
+            Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY", v),
+            None => std::env::remove_var("CONFIDANT_INBOX_KEY"),
+        }
+    }
+}
+
+fn test_recipient(secret: &[u8; 32]) -> String {
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_recipient_string()
+}
+
+fn test_bech32(secret: &[u8; 32]) -> String {
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_bech32()
+}
+
+/// Point this test process at the fixed test inbox identity. Holds the
+/// env lock for the caller's scope so vault-pubkey tests can't interleave.
+fn use_test_inbox_key() -> EnvGuard {
+    let g = EnvGuard::lock();
+    g.set(&test_bech32(&TEST_INBOX_SECRET));
+    g
+}
+
+fn encrypt_item(plaintext: &str, recipient: &str) -> Vec<u8> {
+    confidant_crypt::age_wrap::wrap_to_recipient(plaintext.as_bytes(), recipient).unwrap()
+}
+
+impl Repo {
+    /// Orphan `inbox` branch holding age-encrypted items (real crypto).
+    fn with_encrypted_inbox(&self, files: &[(&str, Vec<u8>)]) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(self.root())
+            .args(["branch", "-D", "inbox"])
+            .output();
+        git(self.root(), &["checkout", "-q", "--orphan", "inbox"]);
+        git(self.root(), &["rm", "-q", "-rf", "."]);
+        for (name, bytes) in files {
+            std::fs::write(self.root().join(name), bytes).unwrap();
+        }
+        git(self.root(), &["add", "."]);
+        git(self.root(), &["commit", "-q", "-m", "drop items"]);
+        git(self.root(), &["checkout", "-q", "main"]);
+    }
+
+    /// Advertise an `[inbox].pubkey` in the vault config (committed).
+    fn with_vault_inbox_pubkey(&self, pubkey: &str) {
+        let path = self.root().join("confidant.toml");
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(&format!("\n[inbox]\npubkey = \"{pubkey}\"\n"));
+        std::fs::write(&path, toml).unwrap();
+        git(self.root(), &["add", "confidant.toml"]);
+        git(
+            self.root(),
+            &["commit", "-q", "-m", "advertise inbox pubkey"],
+        );
+    }
+}
+
+/// Run the inbox with the production decryptor.
+fn run_real(r: &Repo) -> anyhow::Result<confidant_core::InboxReport> {
+    run_inbox(
+        r.root(),
+        &InboxOptions {
+            dry_run: false,
+            trusted_signers: Vec::new(),
+            allow_unsigned: true,
+            pinned_pubkey: None,
+        },
+        &confidant_core::inbox_decrypt,
+    )
+}
+
+#[test]
+fn real_crypto_round_trip_merges() {
+    // #30: encrypt fixture items to the vault pubkey with real age crypto,
+    // merge them through the production decryptor.
+    let _g = use_test_inbox_key();
+    let r = Repo::new();
+    let recipient = test_recipient(&TEST_INBOX_SECRET);
+    r.with_vault_inbox_pubkey(&recipient);
+    r.with_encrypted_inbox(&[
+        ("01JAAA.age", encrypt_item(LEDGER_ITEM, &recipient)),
+        ("01JAAB.age", encrypt_item(RECORD_ITEM, &recipient)),
+    ]);
+
+    let report = run_real(&r).expect("real-crypto inbox run failed");
+    assert_eq!(report.merged, 2);
+    assert_eq!(report.cleared, 2);
+
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(ledger.contains("src:e2e-1"), "ledger:\n{ledger}");
+}
+
+#[test]
+fn local_pubkey_mismatch_is_hard_error() {
+    // #55: the vault advertises someone else's key while the local private
+    // key is ours — refuse before decrypting anything.
+    let _g = use_test_inbox_key();
+    let r = Repo::new();
+    r.with_vault_inbox_pubkey(&test_recipient(&OTHER_INBOX_SECRET));
+    r.with_encrypted_inbox(&[(
+        "01JAAA.age",
+        encrypt_item(LEDGER_ITEM, &test_recipient(&TEST_INBOX_SECRET)),
+    )]);
+
+    let err = run_real(&r).expect_err("expected E_INBOX_UNTRUSTED");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
+
+    // Nothing touched: the item stays on the inbox branch.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert!(tree.contains("01JAAA.age"), "inbox tree:\n{tree}");
+}
+
+#[test]
+fn local_pubkey_match_allows_decrypt() {
+    // #55, positive case: vault pubkey matches the local key; the run
+    // proceeds to real decryption.
+    let _g = use_test_inbox_key();
+    let r = Repo::new();
+    let recipient = test_recipient(&TEST_INBOX_SECRET);
+    r.with_vault_inbox_pubkey(&recipient);
+    r.with_encrypted_inbox(&[
+        ("01JAAA.age", encrypt_item(LEDGER_ITEM, &recipient)),
+        ("01JAAB.age", encrypt_item(RECORD_ITEM, &recipient)),
+    ]);
+
+    let report = run_real(&r).expect("matching-pubkey run failed");
+    assert_eq!(report.merged, 2);
+}
+
+#[test]
+fn wrong_key_fails_closed() {
+    // Items encrypted to someone else's key while the vault correctly
+    // advertises ours (#55 passes): decryption fails closed with
+    // E_INBOX_CRYPTO and nothing is merged or cleared.
+    let _g = use_test_inbox_key();
+    let r = Repo::new();
+    r.with_vault_inbox_pubkey(&test_recipient(&TEST_INBOX_SECRET));
+    r.with_encrypted_inbox(&[(
+        "01JAAA.age",
+        encrypt_item(LEDGER_ITEM, &test_recipient(&OTHER_INBOX_SECRET)),
+    )]);
+
+    let err = run_real(&r).expect_err("expected E_INBOX_CRYPTO");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CRYPTO");
+
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert!(tree.contains("01JAAA.age"), "inbox tree:\n{tree}");
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(!ledger.contains("src:e2e-1"));
 }

@@ -404,7 +404,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     allow_unsigned: *allow_unsigned,
                     pinned_pubkey,
                 },
-                &confidant_core::stub_decrypt,
+                &confidant_core::inbox_decrypt,
             ) {
                 Ok(report) => report,
                 Err(err) => {

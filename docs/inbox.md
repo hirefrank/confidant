@@ -28,13 +28,13 @@ inbox key). The private half is **never** in git, and it isn't wrapped to the
 recovery identity either — that's what keeps it cheap to destroy on rotation
 and shred.
 
-1. Generate it on the operator's machine — with milestone 2. M2 generates the
-   keypair and stores the private half in the **OS keychain** on the one
-   device that runs `confidant inbox`. It is never a file under `~/.config`,
-   because Time Machine backs that up and "destroy the old key" would then be
-   false. `confidant inbox rotate` rotates it (see the inbox-key section of
-   `docs/crypto-design.md`). Until milestone 2 lands there is nothing to
-   generate, because decryption is a stub.
+1. Generate it on the operator's machine. Milestone 2 stores the private half
+   in the **OS keychain** on the one device that runs `confidant inbox`
+   (via the keychain module; `CONFIDANT_INBOX_KEY` overrides it on headless
+   hosts). It is never a file under `~/.config`, because Time Machine backs
+   that up and "destroy the old key" would then be false — a plaintext
+   `inbox.key` file is refused outright. `confidant inbox rotate` rotates it
+   (see the inbox-key section of `docs/crypto-design.md`).
 2. Publish the public half in the vault's `confidant.toml`:
    ```toml
    [inbox]
@@ -57,8 +57,12 @@ and shred.
    the vault's advertised key to receive your future intake: stop and
    investigate, do not merge.
 
-Until milestone 2 lands, `confidant inbox` cannot decrypt anything:
-`confidant-crypt` is a stub and every item fails closed with `E_INBOX_CRYPTO`.
+`confidant inbox` decrypts each item with the inbox private key from the OS
+keychain (or `CONFIDANT_INBOX_KEY`); anything that fails to decrypt fails
+closed with `E_INBOX_CRYPTO`. Before decrypting, it also derives the
+recipient from the local private key and compares it against the vault's
+`[inbox].pubkey` — a mismatch is a hard `E_INBOX_UNTRUSTED`, so a substituted
+vault key is caught even if the out-of-band pin were tampered with.
 
 ## The `inbox` branch
 
