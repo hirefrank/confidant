@@ -108,6 +108,72 @@ pub struct RecordCtx {
     pub epoch: u64,
 }
 
+/// Resolve which client key encrypts a record (design §2, issue #62).
+///
+/// - `person`, `note`, and `interaction` records — and `deal` records whose
+///   `person` field is set — encrypt under that person's data key.
+/// - `org` records, and `deal` records with no `person` (`None`), encrypt
+///   under the reserved [`manifest::SHARED_CLIENT_ID`] (`vault:shared`)
+///   vault key.
+///
+/// A blank `person` (`Some` but empty/whitespace) is an error for every
+/// record type: only `None` routes to `vault:shared`, so a writer bug that
+/// blanks the field can't silently file a client's data under the shared
+/// key (which would survive that client's shred, breaking §8).
+///
+/// Unknown record types, person-bearing types without a person id, and
+/// malformed person ids are errors. The operator's own person record is
+/// never consulted: there is no operator parameter, so routing through it
+/// is impossible by construction. When a deal's `person` changes, the
+/// writer re-encrypts it under the new person's current epoch in the same
+/// signed commit (the writer calls this to pick the target key).
+pub fn client_id_for_record(record_type: &str, person: Option<&str>) -> Result<String, Error> {
+    // Blank is an error for every record type — only None falls back.
+    if let Some(p) = person {
+        if p.trim().is_empty() {
+            return Err(Error::Header(format!(
+                "{record_type} record has a blank person id"
+            )));
+        }
+        validate_person_id(p.trim())?;
+    }
+    let person = person.map(str::trim);
+    match record_type {
+        "person" | "note" | "interaction" => person
+            .map(str::to_string)
+            .ok_or_else(|| Error::Header(format!("{record_type} record needs a person id"))),
+        "deal" => Ok(person
+            .map(str::to_string)
+            .unwrap_or_else(|| manifest::SHARED_CLIENT_ID.to_string())),
+        "org" => Ok(manifest::SHARED_CLIENT_ID.to_string()),
+        _ => Err(Error::Header(format!(
+            "unknown record type {record_type:?}"
+        ))),
+    }
+}
+
+/// Validate a person id's shape before it routes to a key directory.
+/// Requires the `p-` prefix and rejects path separators and reserved
+/// `vault:` ids, so the returned id is always safe to join under `keys/`.
+fn validate_person_id(p: &str) -> Result<(), Error> {
+    if !p.starts_with("p-") {
+        return Err(Error::Header(format!(
+            "person id {p:?} must start with \"p-\""
+        )));
+    }
+    if p.contains('/') || p.contains('\\') || p.contains("..") {
+        return Err(Error::Header(format!(
+            "person id {p:?} contains a path separator"
+        )));
+    }
+    if p.starts_with("vault:") {
+        return Err(Error::Header(format!(
+            "person id {p:?} uses the reserved \"vault:\" namespace"
+        )));
+    }
+    Ok(())
+}
+
 /// Encrypt a record's inner plaintext under `key`, producing a serialized
 /// envelope. The outer header (including `no-ai`) is authenticated via the
 /// AAD, so it cannot be flipped with only git write access.
