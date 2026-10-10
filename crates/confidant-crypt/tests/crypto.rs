@@ -11,13 +11,13 @@ use age::secrecy::ExposeSecret;
 use confidant_crypt::{
     aead, age_wrap, alias,
     anchor::{self, Anchor},
-    decrypt_record, encrypt_record,
+    client_id_for_record, decrypt_record, encrypt_record,
     envelope::{self, purpose_for_type},
     error::Error,
     history::{verify_history, SignerChecker},
     keys::{DataKey, DeviceKeypair, LookupKey},
     lifecycle::KeyStore,
-    manifest::{RecipientEntry, RecipientMap},
+    manifest::{RecipientEntry, RecipientMap, SHARED_CLIENT_ID},
     recovery::Recovery,
     scope::{authorize, sign as sign_scope, to_toml as scope_to_toml, Capability, Scope},
     RecordCtx,
@@ -1489,5 +1489,187 @@ fn manifest_clients_lists_vault_and_client_dirs() {
     assert_eq!(
         f.keys.manifest_clients(),
         vec!["p-01ABC".to_string(), VAULT_CLIENT_ID.to_string()]
+// ---------------------------------------------------------------------------
+// vault:shared reserved key (issue #62)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vault_shared_key_layout() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    let key = f
+        .keys
+        .init_client(
+            SHARED_CLIENT_ID,
+            &recipients,
+            &f.anchor,
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Lands at keys/shared/ — never keys/vault:shared.
+    let keys = f._tmp.path().join("keys");
+    assert!(keys.join("shared").join("epoch").exists());
+    assert!(keys.join("shared").join("recipients.toml").exists());
+    assert!(keys.join("shared").join("recipients.sig").exists());
+    assert!(keys
+        .join("shared")
+        .join("wrapped")
+        .join("laptop.age")
+        .exists());
+    assert!(keys
+        .join("shared")
+        .join("wrapped")
+        .join("recovery.age")
+        .exists());
+    assert!(!keys.join("vault:shared").exists());
+
+    // The key unwraps through the verified-manifest + commitment path.
+    let back = f
+        .keys
+        .unwrap_data_key(SHARED_CLIENT_ID, "laptop", 1, &f.device_id, &f.anchor)
+        .unwrap();
+    assert_eq!(back.as_bytes(), key.as_bytes());
+
+    // Rotate works on the shared key like any client key.
+    let key2 = f
+        .keys
+        .rotate(
+            SHARED_CLIENT_ID,
+            &f.anchor,
+            &f.operator_sk,
+            &f.anchor,
+        )
+        .unwrap();
+    assert_ne!(key2.as_bytes(), key.as_bytes());
+    let back2 = f
+        .keys
+        .unwrap_data_key(SHARED_CLIENT_ID, "laptop", 2, &f.device_id, &f.anchor)
+        .unwrap();
+    assert_eq!(back2.as_bytes(), key2.as_bytes());
+}
+
+#[test]
+fn test_client_id_for_record_mapping() {
+    // Person-bearing types route to the person.
+    for t in ["person", "note", "interaction"] {
+        assert_eq!(client_id_for_record(t, Some("p-01AAA")).unwrap(), "p-01AAA");
+    }
+    // Deals follow their person when set...
+    assert_eq!(
+        client_id_for_record("deal", Some("p-01AAA")).unwrap(),
+        "p-01AAA"
+    );
+    // ...and fall back to vault:shared without one (blank counts as unset).
+    assert_eq!(
+        client_id_for_record("deal", None).unwrap(),
+        SHARED_CLIENT_ID
+    );
+    assert_eq!(
+        client_id_for_record("deal", Some("  ")).unwrap(),
+        SHARED_CLIENT_ID
+    );
+    // Orgs always use vault:shared, even if a person is passed.
+    assert_eq!(client_id_for_record("org", None).unwrap(), SHARED_CLIENT_ID);
+    assert_eq!(
+        client_id_for_record("org", Some("p-01AAA")).unwrap(),
+        SHARED_CLIENT_ID
+    );
+    // Person-bearing types without a person fail closed.
+    assert!(client_id_for_record("note", None).is_err());
+    assert!(client_id_for_record("person", Some("")).is_err());
+    // Unknown record types fail closed.
+    assert!(client_id_for_record("weird", Some("p-01AAA")).is_err());
+}
+
+#[test]
+fn test_shred_client_preserves_shared() {
+    // Per Silas (#62): shredding a client makes their deal unreadable,
+    // while an org record — and a person-less deal — under vault:shared
+    // stay readable.
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    let client_key = f
+        .keys
+        .init_client(
+            "p-CLI1",
+            &recipients,
+            &f.anchor,
+            &f.operator_sk,
+        )
+        .unwrap();
+    let shared_key = f
+        .keys
+        .init_client(
+            SHARED_CLIENT_ID,
+            &recipients,
+            &f.anchor,
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // A deal with a person encrypts under the person's key...
+    let deal_ctx = f.ctx("d-01DEAL", "p-CLI1", "deal", 1);
+    let deal_env = encrypt_record(&deal_ctx, &client_key, "deal", false, b"deal terms").unwrap();
+    // ...an org record and a person-less deal under vault:shared.
+    let org_ctx = f.ctx("o-01ORG", SHARED_CLIENT_ID, "org", 1);
+    let org_env = encrypt_record(&org_ctx, &shared_key, "org", false, b"org profile").unwrap();
+    let pld_ctx = f.ctx("d-02NODEAL", SHARED_CLIENT_ID, "deal", 1);
+    let pld_env =
+        encrypt_record(&pld_ctx, &shared_key, "deal", false, b"person-less deal").unwrap();
+    assert_eq!(
+        decrypt_record(&deal_ctx, &client_key, &deal_env, false).unwrap(),
+        b"deal terms"
+    );
+    assert_eq!(
+        decrypt_record(&org_ctx, &shared_key, &org_env, false).unwrap(),
+        b"org profile"
+    );
+
+    // Shred the client (fresh recipients, like onboarding after shred).
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    let new_id = age::x25519::Identity::from_str(&{
+        use confidant_crypt::age_wrap::RawX25519Identity;
+        RawX25519Identity::new(*dev_new.secret_bytes()).to_bech32()
+    })
+    .unwrap();
+    f.keys
+        .shred(
+            "p-CLI1",
+            &["p-CLI1", SHARED_CLIENT_ID],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap();
+
+    // The client's key tree is gone: the deal is unreadable (fail closed).
+    assert!(!f._tmp.path().join("keys").join("p-CLI1").exists());
+    assert!(f
+        .keys
+        .unwrap_data_key("p-CLI1", "laptop", 1, &f.device_id, &f.anchor)
+        .is_err());
+
+    // The shared key survives, re-wrapped to the new recipients...
+    let shared_new = f
+        .keys
+        .unwrap_data_key(SHARED_CLIENT_ID, "laptop-new", 1, &new_id, &f.anchor)
+        .unwrap();
+    assert_eq!(shared_new.as_bytes(), shared_key.as_bytes());
+    // ...the old device identity no longer opens it...
+    assert!(f
+        .keys
+        .unwrap_data_key(SHARED_CLIENT_ID, "laptop", 1, &f.device_id, &f.anchor)
+        .is_err());
+    // ...and the org record plus the person-less deal still decrypt.
+    assert_eq!(
+        decrypt_record(&org_ctx, &shared_new, &org_env, false).unwrap(),
+        b"org profile"
+    );
+    assert_eq!(
+        decrypt_record(&pld_ctx, &shared_new, &pld_env, false).unwrap(),
+        b"person-less deal"
     );
 }

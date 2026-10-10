@@ -33,6 +33,13 @@ const COMMIT_DOMAIN: &[u8] = b"confidant-key-commit-v1";
 /// Fixed client id for the vault-level lookup-key manifest (`keys/vault/`).
 pub const VAULT_CLIENT_ID: &str = "vault:lookup";
 
+/// Fixed client id for the vault-level shared-key manifest (`keys/shared/`).
+/// Orgs and person-less deals encrypt under this key (design §2, issue
+/// #62): it runs the same machinery as `vault:lookup` — a manifest v2 with
+/// `seq`, key commitments, rotation, revocation, and recovery wrapping —
+/// and never routes through the operator's own person record.
+pub const SHARED_CLIENT_ID: &str = "vault:shared";
+
 /// Key id reserved for the recovery wrapping (`recovery.age`); it is never
 /// a manifest recipient entry.
 pub const RECOVERY_KEY_ID: &str = "recovery";

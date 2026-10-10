@@ -108,6 +108,35 @@ pub struct RecordCtx {
     pub epoch: u64,
 }
 
+/// Resolve which client key encrypts a record (design §2, issue #62).
+///
+/// - `person`, `note`, and `interaction` records — and `deal` records whose
+///   `person` field is set — encrypt under that person's data key.
+/// - `org` records, and `deal` records with no `person`, encrypt under the
+///   reserved [`manifest::SHARED_CLIENT_ID`] (`vault:shared`) vault key.
+///
+/// Unknown record types, and person-bearing types without a person id, are
+/// errors. The operator's own person record is never consulted: there is no
+/// operator parameter, so routing through it is impossible by construction.
+/// When a deal's `person` changes, the writer re-encrypts it under the new
+/// person's current epoch in the same signed commit (the writer calls this
+/// to pick the target key).
+pub fn client_id_for_record(record_type: &str, person: Option<&str>) -> Result<String, Error> {
+    let person = person.map(str::trim).filter(|p| !p.is_empty());
+    match record_type {
+        "person" | "note" | "interaction" => person
+            .map(str::to_string)
+            .ok_or_else(|| Error::Header(format!("{record_type} record needs a person id"))),
+        "deal" => Ok(person
+            .map(str::to_string)
+            .unwrap_or_else(|| manifest::SHARED_CLIENT_ID.to_string())),
+        "org" => Ok(manifest::SHARED_CLIENT_ID.to_string()),
+        _ => Err(Error::Header(format!(
+            "unknown record type {record_type:?}"
+        ))),
+    }
+}
+
 /// Encrypt a record's inner plaintext under `key`, producing a serialized
 /// envelope. The outer header (including `no-ai`) is authenticated via the
 /// AAD, so it cannot be flipped with only git write access.

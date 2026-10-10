@@ -44,7 +44,8 @@ use crate::anchor::Anchor;
 use crate::error::Error;
 use crate::keys::{DataKey, LookupKey};
 use crate::manifest::{
-    self, CommitmentEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID, VAULT_CLIENT_ID,
+    self, CommitmentEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID, SHARED_CLIENT_ID,
+    VAULT_CLIENT_ID,
 };
 use crate::recovery::Recovery;
 use zeroize::{Zeroize, Zeroizing};
@@ -101,18 +102,22 @@ impl KeyStore {
     }
 
     /// Directory holding a client's (or the vault's) manifest + wrappings.
-    /// The vault-level lookup-key manifest lives at `keys/vault/` under the
-    /// fixed [`VAULT_CLIENT_ID`] binding.
+    /// The vault-level lookup-key manifest lives at `keys/vault/` and the
+    /// shared-key manifest at `keys/shared/`, under the fixed
+    /// [`VAULT_CLIENT_ID`] / [`SHARED_CLIENT_ID`] bindings (design §4).
+    /// Everything else lives at `keys/<client_id>/`.
     fn manifest_dir(&self, client_id: &str) -> PathBuf {
         if client_id == VAULT_CLIENT_ID {
             self.keys_dir.join("vault")
+        } else if client_id == SHARED_CLIENT_ID {
+            self.keys_dir.join("shared")
         } else {
             self.client_dir(client_id)
         }
     }
 
     fn wrapped_dir(&self, client_id: &str) -> PathBuf {
-        self.client_dir(client_id).join("wrapped")
+        self.manifest_dir(client_id).join("wrapped")
     }
 
     fn manifest_paths(&self, client_id: &str) -> (PathBuf, PathBuf) {
@@ -294,7 +299,8 @@ impl KeyStore {
     }
 
     /// Initialize a client's key directory: epoch 1, wrap the new data key
-    /// to every recipient + recovery, sign the manifest.
+    /// to every recipient + recovery, sign the manifest. Works for the
+    /// reserved [`SHARED_CLIENT_ID`] too (lands at `keys/shared/`).
     ///
     /// The recovery recipient comes from the [`Anchor`] (the off-vault
     /// pinned `recovery_age_recipient`), never from a caller-supplied
@@ -307,7 +313,7 @@ impl KeyStore {
         anchor: &Anchor,
         operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
-        let dir = self.client_dir(client_id);
+        let dir = self.manifest_dir(client_id);
         if dir.join("epoch").exists() {
             return Err(Error::Manifest(format!(
                 "client {client_id} already initialized; use rotate"
@@ -559,7 +565,18 @@ impl KeyStore {
             .keys_dir
             .parent()
             .ok_or_else(|| Error::Manifest("keys dir has no parent; not a vault".to_string()))?;
-        let rel = format!("keys/{client_id}/recipients.toml");
+        // Derive from manifest_dir so reserved ids (vault:lookup,
+        // vault:shared) resolve to their real locations (keys/vault,
+        // keys/shared) rather than keys/<client_id>.
+        let rel = self
+            .manifest_dir(client_id)
+            .strip_prefix(repo)
+            .map_err(|_| {
+                Error::Manifest(format!("manifest dir for {client_id} is outside the vault"))
+            })?
+            .join("recipients.toml")
+            .to_string_lossy()
+            .into_owned();
         let out = std::process::Command::new("git")
             // Never leak the device key into git/gpg/hooks via the environment.
             .env_remove("CONFIDANT_DEVICE_KEY")
@@ -701,7 +718,7 @@ impl KeyStore {
         let new_recovery_recipient = new_recovery.age_identity().to_recipient_string();
 
         // 1. Delete the shredded client's key tree.
-        let cdir = self.client_dir(shredded_client);
+        let cdir = self.manifest_dir(shredded_client);
         if cdir.exists() {
             std::fs::remove_dir_all(&cdir)?;
         }
