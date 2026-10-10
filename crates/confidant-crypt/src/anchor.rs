@@ -190,6 +190,9 @@ mod hex {
 
     pub fn decode_hex(what: &str, s: &str) -> Result<Vec<u8>, Error> {
         let s = s.trim();
+        if !s.is_ascii() {
+            return Err(Error::Anchor(format!("{what}: non-ASCII hex")));
+        }
         if s.len() % 2 != 0 {
             return Err(Error::Anchor(format!("{what}: odd-length hex")));
         }
@@ -255,5 +258,17 @@ mod tests {
         let vault = tmp.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
         assert!(matches!(load(&cfg, &vault), Err(Error::Anchor(_))));
+    }
+
+    #[test]
+    fn anchor_hex_rejects_non_ascii() {
+        // Same guard as manifest::decode_hex: byte 2 of "é01" splits the
+        // 'é', which panicked in the slice before the is_ascii() check.
+        let err = hex::decode_hex("test-key", "é01").unwrap_err();
+        assert!(format!("{err}").contains("non-ASCII"), "{err}");
+        assert_eq!(
+            hex::decode_hex("test-key", "00ff").unwrap(),
+            vec![0x00, 0xff]
+        );
     }
 }
