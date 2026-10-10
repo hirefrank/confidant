@@ -1508,12 +1508,7 @@ fn test_vault_shared_key_layout() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
-        .init_client(
-            SHARED_CLIENT_ID,
-            &recipients,
-            &f.anchor,
-            &f.operator_sk,
-        )
+        .init_client(SHARED_CLIENT_ID, &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Lands at keys/shared/ — never keys/vault:shared.
@@ -1543,12 +1538,7 @@ fn test_vault_shared_key_layout() {
     // Rotate works on the shared key like any client key.
     let key2 = f
         .keys
-        .rotate(
-            SHARED_CLIENT_ID,
-            &f.anchor,
-            &f.operator_sk,
-            &f.anchor,
-        )
+        .rotate(SHARED_CLIENT_ID, &f.anchor, &f.operator_sk)
         .unwrap();
     assert_ne!(key2.as_bytes(), key.as_bytes());
     let back2 = f
@@ -1569,15 +1559,19 @@ fn test_client_id_for_record_mapping() {
         client_id_for_record("deal", Some("p-01AAA")).unwrap(),
         "p-01AAA"
     );
-    // ...and fall back to vault:shared without one (blank counts as unset).
+    // ...and fall back to vault:shared only when person is None.
     assert_eq!(
         client_id_for_record("deal", None).unwrap(),
         SHARED_CLIENT_ID
     );
-    assert_eq!(
-        client_id_for_record("deal", Some("  ")).unwrap(),
-        SHARED_CLIENT_ID
-    );
+    // A blank person is an error for EVERY record type — it must not fall
+    // back to vault:shared (fail-open: a blanked field would file a
+    // client's data under the shared key, surviving their shred).
+    for t in ["person", "note", "interaction", "deal", "org"] {
+        assert!(client_id_for_record(t, Some("")).is_err());
+        assert!(client_id_for_record(t, Some("   ")).is_err());
+        assert!(client_id_for_record(t, Some("\t\n ")).is_err());
+    }
     // Orgs always use vault:shared, even if a person is passed.
     assert_eq!(client_id_for_record("org", None).unwrap(), SHARED_CLIENT_ID);
     assert_eq!(
@@ -1586,7 +1580,18 @@ fn test_client_id_for_record_mapping() {
     );
     // Person-bearing types without a person fail closed.
     assert!(client_id_for_record("note", None).is_err());
-    assert!(client_id_for_record("person", Some("")).is_err());
+    // Person ids must have the p- prefix...
+    assert!(client_id_for_record("note", Some("01AAA")).is_err());
+    assert!(client_id_for_record("note", Some("x-01AAA")).is_err());
+    // ...must not contain path separators...
+    assert!(client_id_for_record("note", Some("p-01/../etc")).is_err());
+    assert!(client_id_for_record("note", Some("p-01/AAA")).is_err());
+    assert!(client_id_for_record("note", Some("p-01\\AAA")).is_err());
+    assert!(client_id_for_record("note", Some("p-..")).is_err());
+    // ...and must not use the reserved vault: namespace.
+    assert!(client_id_for_record("note", Some("vault:lookup")).is_err());
+    assert!(client_id_for_record("note", Some("vault:shared")).is_err());
+    assert!(client_id_for_record("deal", Some("vault:shared")).is_err());
     // Unknown record types fail closed.
     assert!(client_id_for_record("weird", Some("p-01AAA")).is_err());
 }
@@ -1600,21 +1605,11 @@ fn test_shred_client_preserves_shared() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let client_key = f
         .keys
-        .init_client(
-            "p-CLI1",
-            &recipients,
-            &f.anchor,
-            &f.operator_sk,
-        )
+        .init_client("p-CLI1", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     let shared_key = f
         .keys
-        .init_client(
-            SHARED_CLIENT_ID,
-            &recipients,
-            &f.anchor,
-            &f.operator_sk,
-        )
+        .init_client(SHARED_CLIENT_ID, &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // A deal with a person encrypts under the person's key...
@@ -1681,4 +1676,128 @@ fn test_shred_client_preserves_shared() {
         decrypt_record(&pld_ctx, &shared_new, &pld_env, false).unwrap(),
         b"person-less deal"
     );
+}
+
+#[test]
+fn test_shred_refuses_reserved_lookup_id() {
+    // shred("vault:lookup") must error before the verify pass and leave
+    // keys/vault untouched (deleting it would destroy the alias key and
+    // leave the vault half-mutated).
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    let new_recipients = f.recipients(&[("laptop-new", &f.device_recipient)]);
+
+    let vault_dir = f._tmp.path().join("keys").join("vault");
+    assert!(vault_dir.join("recipients.toml").exists());
+
+    let err = f
+        .keys
+        .shred(
+            VAULT_CLIENT_ID,
+            &[VAULT_CLIENT_ID],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("reserved"),
+        "unexpected error: {err:?}"
+    );
+    // Nothing changed.
+    assert!(vault_dir.join("recipients.toml").exists());
+    assert!(vault_dir.join("lookup.age").exists());
+    let _ = recipients;
+}
+
+#[test]
+fn test_shred_refuses_reserved_shared_id() {
+    // shred("vault:shared") must error before the verify pass and leave
+    // keys/shared untouched (it would destroy every org record and
+    // person-less deal).
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(SHARED_CLIENT_ID, &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    let new_recipients = f.recipients(&[("laptop-new", &f.device_recipient)]);
+
+    let shared_dir = f._tmp.path().join("keys").join("shared");
+    assert!(shared_dir.join("recipients.toml").exists());
+
+    let err = f
+        .keys
+        .shred(
+            SHARED_CLIENT_ID,
+            &[SHARED_CLIENT_ID],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("reserved"),
+        "unexpected error: {err:?}"
+    );
+    // Nothing changed.
+    assert!(shared_dir.join("recipients.toml").exists());
+    assert!(shared_dir.join("epoch").exists());
+}
+
+#[test]
+fn test_shred_omitting_shared_errors_before_mutation() {
+    // A shred whose all_clients omits an initialized vault:shared must
+    // fail closed before changing anything: otherwise the shared key
+    // would stay wrapped only to keys the operator is told to destroy.
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client("p-CLI1", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    f.keys
+        .init_client(SHARED_CLIENT_ID, &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    let new_recipients = f.recipients(&[("laptop-new", &f.device_recipient)]);
+
+    // Snapshot every file under keys/ before the call.
+    let snapshot = || -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![f._tmp.path().join("keys")];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap();
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(f._tmp.path()).unwrap().to_path_buf();
+                    out.push((rel, std::fs::read(&p).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+    let before = snapshot();
+
+    let err = f
+        .keys
+        .shred(
+            "p-CLI1",
+            &["p-CLI1"], // vault:shared omitted
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("strand"),
+        "unexpected error: {err:?}"
+    );
+    // Every file unchanged.
+    assert_eq!(snapshot(), before);
 }

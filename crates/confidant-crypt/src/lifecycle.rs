@@ -580,15 +580,22 @@ impl KeyStore {
         // Derive from manifest_dir so reserved ids (vault:lookup,
         // vault:shared) resolve to their real locations (keys/vault,
         // keys/shared) rather than keys/<client_id>.
+        //
+        // Git pathspecs need forward slashes, so join the components with
+        // `/` explicitly instead of relying on the OS separator (which is
+        // `\` on Windows). All components here are ASCII (keys/, the fixed
+        // dir names, validated client ids), so this is exact.
         let rel = self
             .manifest_dir(client_id)
             .strip_prefix(repo)
             .map_err(|_| {
                 Error::Manifest(format!("manifest dir for {client_id} is outside the vault"))
             })?
-            .join("recipients.toml")
-            .to_string_lossy()
-            .into_owned();
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/recipients.toml";
         let out = std::process::Command::new("git")
             // Never leak the device key into git/gpg/hooks via the environment.
             .env_remove("CONFIDANT_DEVICE_KEY")
@@ -659,6 +666,43 @@ impl KeyStore {
         anchor: &Anchor,
         identity: &dyn age::Identity,
     ) -> Result<ShredOutcome, Error> {
+        // The reserved vault-level ids are not shreddable: shredding
+        // vault:lookup would destroy the alias key and leave the vault
+        // half-mutated, and shredding vault:shared would destroy every org
+        // record and person-less deal. Reject before the verify pass.
+        if shredded_client == VAULT_CLIENT_ID || shredded_client == SHARED_CLIENT_ID {
+            return Err(Error::Manifest(format!(
+                "refusing to shred reserved client id {shredded_client:?}"
+            )));
+        }
+        // Fail closed on a caller list that would strand a client: every
+        // initialized directory under keys/ (other than the vault lookup
+        // dir, which shred handles separately) must be in all_clients, or
+        // it would stay wrapped only to keys the operator is told to
+        // destroy. Check before changing anything.
+        let mut initialized: Vec<String> = Vec::new();
+        let entries = std::fs::read_dir(&self.keys_dir).map_err(Error::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(Error::Io)?;
+            if !entry.file_type().map_err(Error::Io)?.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            if dir_name == "vault" {
+                continue;
+            }
+            if !entry.path().join("epoch").exists() {
+                continue;
+            }
+            initialized.push(Self::client_id_for_dir(&dir_name).to_string());
+        }
+        for id in &initialized {
+            if id != shredded_client && !all_clients.contains(&id.as_str()) {
+                return Err(Error::Manifest(format!(
+                    "shred would strand initialized client {id:?}: add it to all_clients or it stays wrapped to destroyed keys"
+                )));
+            }
+        }
         // Build the destroy list from EVERY historical version of the
         // manifest: a recipient revoked earlier still has old wrappings in
         // git history that open the shredded client's historical data keys
