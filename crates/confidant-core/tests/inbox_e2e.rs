@@ -119,6 +119,15 @@ const RECORD_ITEM: &str = "confidant-inbox/1\nkind: record\npath: people/p-01M3T
 fn merge_commit_and_clear() {
     let r = Repo::new();
     r.with_inbox(&[("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)]);
+    // #52: the merge and clear commits must be signed; without signing
+    // configured the run refuses.
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    // #51: capture the HEAD reflog before the run — the inbox branch must
+    // never be checked out in the worktree.
+    let reflog_before = head_reflog_len(r.root());
 
     let report = r.run(false).expect("inbox run failed");
     assert!(!report.empty);
@@ -144,6 +153,13 @@ fn merge_commit_and_clear() {
     assert!(log.contains("01JAAA ledger"));
     assert!(!log.contains("intake"), "no PII in commit message");
 
+    // #52: both the merge commit (main) and the clear commit (inbox) carry
+    // good signatures.
+    for rev in ["main", "inbox"] {
+        let validity = git_out(r.root(), &["log", "-1", "--format=%G?", rev]);
+        assert_eq!(validity, "G", "{rev} commit is not signed");
+    }
+
     // Inbox branch is cleared (empty tree).
     let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
     assert!(tree.is_empty(), "inbox tree:\n{tree}");
@@ -155,6 +171,31 @@ fn merge_commit_and_clear() {
         git_out(r.root(), &["rev-parse", "--abbrev-ref", "HEAD"]),
         "main"
     );
+
+    // #51: no checkout of the inbox branch happened during the run — the
+    // new HEAD reflog entries contain no checkout.
+    let new_entries = head_reflog_since(r.root(), reflog_before);
+    assert!(
+        !new_entries.iter().any(|m| m.contains("checkout")),
+        "inbox branch was checked out during the run: {new_entries:?}"
+    );
+}
+
+/// Number of HEAD reflog entries (for #51's no-checkout assertion).
+fn head_reflog_len(root: &Path) -> usize {
+    git_out(root, &["log", "-g", "--format=%gs", "HEAD"])
+        .lines()
+        .count()
+}
+
+/// HEAD reflog messages added since `before` entries existed (newest first).
+fn head_reflog_since(root: &Path, before: usize) -> Vec<String> {
+    let all: Vec<String> = git_out(root, &["log", "-g", "--format=%gs", "HEAD"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let new_count = all.len().saturating_sub(before);
+    all.into_iter().take(new_count).collect()
 }
 
 #[test]
@@ -162,6 +203,10 @@ fn reimporting_adds_nothing() {
     let r = Repo::new();
     let items = [("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)];
     r.with_inbox(&items);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let first = r.run(false).expect("first run failed");
     assert_eq!(first.merged, 2);
 
@@ -198,6 +243,12 @@ fn check_failure_reverts_everything() {
     // Parses fine, but names a record that does not exist -> E_UNKNOWN_RECORD.
     let bad = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000009999 45m src:e2e-bad\n";
     r.with_inbox(&[("01JAAA.age", bad), ("01JAAB.age", LEDGER_ITEM)]);
+    // Signing must be configured to get past the pre-commit gate (#52) and
+    // reach the check-failure path.
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
 
     let err = r.run(false).expect_err("expected E_INBOX_CHECK_FAILED");
     assert_eq!(
@@ -230,6 +281,10 @@ fn symlinked_vault_root_merges() {
     let elsewhere = TempDir::new().unwrap();
     let link = elsewhere.path().join("link-root");
     std::os::unix::fs::symlink(r.root(), &link).unwrap();
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let identity: &DecryptFn = &|b: &[u8]| Ok(b.to_vec());
     let report = run_inbox(
         &link,
@@ -262,6 +317,12 @@ fn conflicting_record_is_all_or_nothing() {
     git(r.root(), &["commit", "-q", "-m", "existing note"]);
 
     r.with_inbox(&[("01JAAB.age", RECORD_ITEM)]);
+    // Signing must be configured to get past the pre-commit gate (#52) and
+    // reach the conflict path.
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let err = r.run(false).expect_err("expected E_INBOX_CONFLICT");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CONFLICT");
 
@@ -300,9 +361,219 @@ fn refuses_without_signers_unless_allow_unsigned() {
     // No signers, no opt-in: fail closed.
     let err = run_with(&r, Vec::new(), false, None).expect_err("expected E_INBOX_UNTRUSTED");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
-    // Explicit opt-in proceeds.
+    // Explicit opt-in proceeds (needs commit signing for the merge/clear).
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let report = run_with(&r, Vec::new(), true, None).expect("allow_unsigned should proceed");
     assert_eq!(report.merged, 2);
+}
+
+#[test]
+fn refuses_when_commit_signing_not_configured() {
+    // #52 (ADR-10): without commit signing configured the run refuses
+    // before merging or clearing, rather than creating unsigned commits.
+    // Repo::new sets no signing config.
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAB.age", LEDGER_ITEM)]);
+    let err = run_with(&r, Vec::new(), true, None).expect_err("expected E_INBOX_UNTRUSTED");
+    let domain = DomainError::of(&err).unwrap();
+    assert_eq!(domain.code(), "E_INBOX_UNTRUSTED");
+    assert!(
+        domain.message().contains("signing is not configured"),
+        "unexpected message: {}",
+        domain.message()
+    );
+    // Nothing was merged or cleared.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(!ledger.contains("src:e2e-1"));
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert!(tree.contains("01JAAB.age"));
+    assert_eq!(
+        git_out(r.root(), &["log", "-1", "--format=%s", "main"]),
+        "init"
+    );
+}
+
+#[test]
+fn failed_merge_commit_leaves_tree_and_index_clean() {
+    // #52 follow-up: signing is configured but unusable, so `git commit -S`
+    // fails at commit time. The all-or-nothing contract requires the run to
+    // unstage the applied paths and revert the worktree — not leave the
+    // writes staged in the index.
+    let r = Repo::new();
+    // Both items: the ledger line references the note, so the merged vault
+    // passes check and the run reaches the (failing) signed commit.
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)]);
+    git(r.root(), &["config", "gpg.format", "ssh"]);
+    git(r.root(), &["config", "user.signingkey", "/nonexistent/key"]);
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+    let err = r
+        .run(false)
+        .expect_err("expected the signed commit to fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("commit") || msg.contains("sign"),
+        "unexpected error: {msg}"
+    );
+    // Clean worktree AND clean index: nothing staged, nothing modified.
+    assert!(
+        git_out(r.root(), &["status", "--porcelain"]).is_empty(),
+        "worktree or index dirty after failed commit"
+    );
+    // Nothing merged, nothing cleared: main and inbox untouched.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(!ledger.contains("src:e2e-1"));
+    assert!(
+        !r.root()
+            .join(format!(
+                "people/{PID}/notes/n-01M3TC5H00MPJG000000000001.md"
+            ))
+            .exists(),
+        "record write was not reverted"
+    );
+    assert_eq!(
+        git_out(r.root(), &["log", "-1", "--format=%s", "main"]),
+        "init"
+    );
+    assert_eq!(git_out(r.root(), &["rev-parse", "inbox"]), tip_before);
+}
+
+#[test]
+fn push_between_verify_and_read_refuses() {
+    // #29: a push that lands between signature verification and the item
+    // reads must not slip unsigned items past the trust check. The evil
+    // decryptor moves the inbox tip on first use (simulating the push);
+    // the tip pinned before verification no longer matches, so the run
+    // refuses with E_INBOX_RACE before merging anything.
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let root = r.root().to_path_buf();
+    let moved = std::sync::Mutex::new(false);
+    let evil: &DecryptFn = &move |b: &[u8]| {
+        let mut guard = moved.lock().unwrap();
+        if !*guard {
+            *guard = true;
+            let tip = git_out(&root, &["rev-parse", "inbox"]);
+            let tree = git_out(&root, &["rev-parse", "inbox^{tree}"]);
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit-tree", &tree, "-p", &tip, "-m", "evil push"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("commit-tree failed");
+            assert!(out.status.success());
+            let new_commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["update-ref", "refs/heads/inbox", &new_commit, &tip])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("update-ref failed");
+            assert!(out.status.success());
+        }
+        Ok(b.to_vec())
+    };
+    let err = run_inbox(
+        r.root(),
+        &InboxOptions {
+            dry_run: false,
+            trusted_signers: Vec::new(),
+            allow_unsigned: true,
+            pinned_pubkey: None,
+        },
+        evil,
+    )
+    .expect_err("expected E_INBOX_RACE");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
+    // Nothing was merged: the worktree is untouched.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(!ledger.contains("src:e2e-1"));
+}
+
+#[test]
+fn push_after_pin_is_neither_verified_nor_read() {
+    // Pin-before-verify: the tip SHA is resolved before signature
+    // verification and used for every inbox read. An unsigned item pushed
+    // on top of the pinned tip mid-run (smuggled in via the decryptor)
+    // must be neither verified nor read; the recheck refuses with
+    // E_INBOX_RACE and the clear never runs.
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let Some((_keep, fingerprint)) = ssh_signing(&r) else {
+        if std::env::var_os("CI").is_some() {
+            panic!("ssh-keygen unavailable under CI: signing tests must not skip");
+        }
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    // Sign the inbox tip so verification actually runs against it.
+    git(r.root(), &["checkout", "-q", "inbox"]);
+    git(r.root(), &["commit", "-q", "-S", "--amend", "--no-edit"]);
+    git(r.root(), &["checkout", "-q", "main"]);
+    let tip = git_out(r.root(), &["rev-parse", "inbox"]);
+
+    let root = r.root().to_path_buf();
+    let moved = std::sync::Mutex::new(false);
+    let evil: &DecryptFn = &move |b: &[u8]| {
+        let mut guard = moved.lock().unwrap();
+        if !*guard {
+            *guard = true;
+            // Unsigned item on top of the pinned tip, mid-run.
+            git(&root, &["checkout", "-q", "inbox"]);
+            std::fs::write(
+                root.join("01JBBB.age"),
+                LEDGER_ITEM.replace("src:e2e-1", "src:evil-9"),
+            )
+            .unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-q", "-m", "evil push"]);
+            git(&root, &["checkout", "-q", "main"]);
+        }
+        Ok(b.to_vec())
+    };
+    let err = run_inbox(
+        r.root(),
+        &InboxOptions {
+            dry_run: false,
+            trusted_signers: vec![fingerprint],
+            allow_unsigned: false,
+            pinned_pubkey: None,
+        },
+        evil,
+    )
+    .expect_err("expected E_INBOX_RACE");
+    // E_INBOX_RACE, not E_INBOX_UNTRUSTED: the unsigned item was never
+    // subjected to verification — verification anchored at the pinned tip.
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
+    // Not read either: neither the pushed item's bytes nor the original
+    // item made it into the worktree.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        !ledger.contains("evil-9"),
+        "pushed item was read despite the pin"
+    );
+    assert!(
+        !ledger.contains("src:e2e-1"),
+        "original item merged despite the race"
+    );
+    // The clear never ran: the pushed commit sits on the inbox branch,
+    // untouched.
+    assert_ne!(git_out(r.root(), &["rev-parse", "inbox"]), tip);
+    assert!(git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]).contains("01JBBB.age"));
+    // And the worktree is back on main, clean.
+    assert_eq!(
+        git_out(r.root(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
+    assert!(git_out(r.root(), &["status", "--porcelain"]).is_empty());
 }
 
 #[test]
@@ -365,6 +636,10 @@ fn pubkey_pin_match_proceeds() {
     git(r.root(), &["add", "."]);
     git(r.root(), &["commit", "-q", "-m", "advertise inbox key"]);
     r.with_inbox(&[("01JAAB.age", LEDGER_ITEM), ("01JAAC.age", RECORD_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let report =
         run_with(&r, Vec::new(), true, Some(key.to_string())).expect("matching pin should proceed");
     assert_eq!(report.merged, 2);
@@ -423,20 +698,51 @@ fn merge_commit_on_inbox_refuses() {
     assert!(msg.contains("merge"), "unexpected message: {msg}");
 }
 
+/// Configure SSH commit signing on the test repo so `run_inbox` can create
+/// its signed merge and clear commits (#52, ADR-10). Returns the TempDir
+/// that must stay alive for the test, or `None` (skip the test) when
+/// ssh-keygen is unavailable.
+fn require_commit_signing(r: &Repo) -> Option<TempDir> {
+    ssh_signing(r).map(|(keep, _fingerprint)| keep)
+}
+
+/// Run ssh-keygen, or note its absence. A missing binary is `None` (the
+/// caller skips the test) — unless CI is set, in which case it's a hard
+/// failure so #52 coverage can't silently disappear (same family as #71).
+fn ssh_keygen(args: &[&str]) -> Option<std::process::Output> {
+    match Command::new("ssh-keygen").args(args).output() {
+        Ok(out) => Some(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::env::var_os("CI").is_some() {
+                panic!("ssh-keygen is not installed and CI is set: signing tests must not skip");
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// Configure SSH commit signing on the test repo with a throwaway key.
 /// Returns the key fingerprint (the `SHA256:…` id operators are told to
 /// read via `git log --format=%GK`) plus the TempDir that owns the key
 /// files (must stay alive while signing). Returns None when ssh-keygen is
-/// unavailable — the caller skips the test.
+/// unavailable — the caller skips the test (hard failure under CI, see
+/// `ssh_keygen`).
 fn ssh_signing(r: &Repo) -> Option<(TempDir, String)> {
     let keydir = TempDir::new().ok()?;
     let key = keydir.path().join("key");
-    let gen = Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-q", "-C", "inbox-e2e"])
-        .arg("-f")
-        .arg(&key)
-        .output()
-        .ok()?;
+    let key_s = key.to_str()?.to_string();
+    let gen = ssh_keygen(&[
+        "-t",
+        "ed25519",
+        "-N",
+        "",
+        "-q",
+        "-C",
+        "inbox-e2e",
+        "-f",
+        &key_s,
+    ])?;
     if !gen.status.success() {
         return None;
     }
@@ -460,11 +766,7 @@ fn ssh_signing(r: &Repo) -> Option<(TempDir, String)> {
     }
     // The fingerprint is what `ssh-keygen -lf` (and `git log --format=%GK`)
     // report: `256 SHA256:… inbox-e2e (ED25519)`.
-    let lf = Command::new("ssh-keygen")
-        .arg("-lf")
-        .arg(key.with_extension("pub"))
-        .output()
-        .ok()?;
+    let lf = ssh_keygen(&["-lf", key.with_extension("pub").to_str()?])?;
     let fingerprint = String::from_utf8_lossy(&lf.stdout)
         .split_whitespace()
         .nth(1)?

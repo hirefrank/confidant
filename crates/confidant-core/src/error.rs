@@ -53,6 +53,9 @@ pub enum ErrorKind {
     InboxCheckFailed,
     /// `confidant inbox` cannot decrypt: milestone 2 crypto is a stub.
     InboxCrypto,
+    /// `confidant inbox` refused: the inbox branch moved between reading
+    /// items and clearing them (TOCTOU).
+    InboxRace,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -77,9 +80,16 @@ impl ErrorKind {
             Self::InboxConflict => "E_INBOX_CONFLICT",
             Self::InboxCheckFailed => "E_INBOX_CHECK_FAILED",
             Self::InboxCrypto => "E_INBOX_CRYPTO",
+            Self::InboxRace => "E_INBOX_RACE",
             Self::Internal => "internal_error",
         }
     }
+}
+
+/// First 12 hex chars of a commit SHA for error messages (unambiguous,
+/// still readable).
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
 }
 
 /// A classified failure with optional file, line, and fix (ADR-7).
@@ -190,6 +200,30 @@ impl DomainError {
     pub fn inbox_crypto(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::InboxCrypto, detail.into()).with_fix(
             "Inbox decryption needs the milestone 2 crypto implementation; until then the inbox cannot be merged",
+        )
+    }
+
+    pub fn inbox_race(expected_tip: &str, actual_tip: &str) -> Self {
+        Self::new(
+            ErrorKind::InboxRace,
+            format!(
+                "inbox branch moved during the run (tip {} -> {}); refusing to clear",
+                short_sha(expected_tip),
+                short_sha(actual_tip),
+            ),
+        )
+        .with_fix(
+            "Re-run `confidant inbox`; the new items will be picked up and already-merged items are idempotent",
+        )
+    }
+
+    pub fn inbox_signing_unconfigured() -> Self {
+        Self::new(
+            ErrorKind::InboxUntrusted,
+            "`confidant inbox` will not create unsigned merge/clear commits: commit signing is not configured (ADR-10)",
+        )
+        .with_fix(
+            "Configure commit signing (`git config commit.gpgsign true` and a `user.signingkey`), then run `confidant inbox` again",
         )
     }
 
@@ -368,6 +402,25 @@ mod tests {
             "E_INBOX_CHECK_FAILED"
         );
         assert_eq!(DomainError::inbox_crypto("x").code(), "E_INBOX_CRYPTO");
+        assert_eq!(
+            DomainError::inbox_race(
+                "0123456789abcdef0123456789abcdef01234567",
+                "89abcdef0123456789abcdef0123456789abcdef"
+            )
+            .code(),
+            "E_INBOX_RACE"
+        );
+        assert!(DomainError::inbox_race("aaa", "bbb")
+            .message()
+            .contains("refusing to clear"));
+        assert_eq!(
+            DomainError::inbox_signing_unconfigured().code(),
+            "E_INBOX_UNTRUSTED"
+        );
+        assert!(DomainError::inbox_signing_unconfigured()
+            .fix()
+            .unwrap()
+            .contains("commit.gpgsign"));
         assert_eq!(
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"
