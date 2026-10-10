@@ -333,59 +333,45 @@ fn test6_scope_enforcement() {
         expires: "2026-12-01".to_string(),
     };
     let toml = scope_to_toml(&scope).unwrap();
-    let sig = sign_scope(&operator_sk, &scope).unwrap();
+    let sig = sign_scope(&operator_sk, "vault-01", &scope).unwrap();
     let pk = operator_sk.verifying_key();
+    let auth = |today: &str, client: &str, rtype: &str, cap: Capability| {
+        authorize(
+            &pk, "vault-01", "agent-1", &toml, &sig, today, client, rtype, cap,
+        )
+    };
 
     // In-scope read allowed.
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-01ABC",
-        "note",
-        Capability::Read
-    )
-    .is_ok());
+    assert!(auth("2026-10-08", "p-01ABC", "note", Capability::Read).is_ok());
     // Expired, wrong client, wrong type, write-with-read-only all refused.
+    assert!(auth("2026-12-02", "p-01ABC", "note", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-OTHER", "note", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-01ABC", "deal", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-01ABC", "note", Capability::Write).is_err());
+    // Wrong identity: the scope names agent-1.
     assert!(authorize(
         &pk,
-        &toml,
-        &sig,
-        "2026-12-02",
-        "p-01ABC",
-        "note",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-OTHER",
-        "note",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-01ABC",
-        "deal",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
+        "vault-01",
+        "agent-2",
         &toml,
         &sig,
         "2026-10-08",
         "p-01ABC",
         "note",
-        Capability::Write
+        Capability::Read
+    )
+    .is_err());
+    // Wrong vault: the scope was minted for vault-01.
+    assert!(authorize(
+        &pk,
+        "vault-02",
+        "agent-1",
+        &toml,
+        &sig,
+        "2026-10-08",
+        "p-01ABC",
+        "note",
+        Capability::Read
     )
     .is_err());
 }
@@ -925,24 +911,50 @@ impl SignerChecker for FakeChecker {
     }
 }
 
+/// Throwaway trust anchor for history tests (fake keys, ADR-14).
+fn test_anchor() -> (Anchor, String) {
+    use confidant_crypt::history::ssh_fingerprint;
+    let operator = SigningKey::generate(&mut OsRng).verifying_key();
+    let recovery = SigningKey::generate(&mut OsRng).verifying_key();
+    let fingerprint = ssh_fingerprint(&operator);
+    let anchor = Anchor {
+        operator,
+        recovery,
+        recovery_age: "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0".to_string(),
+        source: std::path::PathBuf::from("/test/trust.toml"),
+    };
+    (anchor, fingerprint)
+}
+
+/// Parse an `ssh-ed25519` public-key line into a `VerifyingKey`.
+fn ssh_pubkey_line_to_key(line: &str) -> ed25519_dalek::VerifyingKey {
+    use base64::prelude::*;
+    let b64 = line.split_whitespace().nth(1).expect("ssh pubkey line");
+    let wire = BASE64_STANDARD.decode(b64).expect("base64 pubkey");
+    // wire = u32 len || "ssh-ed25519" || u32 len || 32-byte key
+    let key_bytes: [u8; 32] = wire[wire.len() - 32..].try_into().expect("32-byte key");
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).expect("valid ed25519 key")
+}
+
 #[test]
 fn test15_rollback_replay_unsigned_refused() {
     // An older file version (valid AAD, stale no-ai: false) restored via an
     // UNSIGNED commit must be refused; the same restore via a trusted-signed
     // commit is honored.
+    let (anchor, fingerprint) = test_anchor();
+    let fp = fingerprint.clone();
     let checker = FakeChecker {
         signers: std::collections::HashMap::from([
-            ("tip-signed".to_string(), Some(('G', "KEY1".to_string()))),
-            ("v2-signed".to_string(), Some(('G', "KEY1".to_string()))),
+            ("tip-signed".to_string(), Some(('G', fp.clone()))),
+            ("v2-signed".to_string(), Some(('G', fp))),
             ("rollback-unsigned".to_string(), None),
         ]),
     };
-    let trusted = vec!["KEY1".to_string()];
 
     // Unsigned rollback introducing the stale content -> hard error.
     let err = verify_history(
         &checker,
-        &trusted,
+        &anchor,
         "tip-signed",
         &["rollback-unsigned".to_string()],
     )
@@ -950,7 +962,7 @@ fn test15_rollback_replay_unsigned_refused() {
     assert!(format!("{err}").contains("untrusted/unsigned"));
 
     // Same content via a trusted-signed commit -> honored.
-    assert!(verify_history(&checker, &trusted, "tip-signed", &["v2-signed".to_string()]).is_ok());
+    assert!(verify_history(&checker, &anchor, "tip-signed", &["v2-signed".to_string()]).is_ok());
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -1008,7 +1020,8 @@ fn test15_rollback_replay_real_git() {
 
     let checker = GitSignerChecker::new(repo);
     // No signatures anywhere -> tip unsigned -> refused.
-    let err = verify_history(&checker, &["KEY1".to_string()], &tip, &[rollback]).unwrap_err();
+    let (anchor, _) = test_anchor();
+    let err = verify_history(&checker, &anchor, &tip, &[rollback]).unwrap_err();
     assert!(format!("{err}").contains("not signed by a trusted key"));
 }
 
@@ -1112,12 +1125,25 @@ fn test15_merge_rollback_unsigned_side_refused() {
     assert!(with_m.contains(&side), "side commit must be listed");
 
     // The merge is signed by a trusted key, but the unsigned side commit in
-    // the introducing list is refused.
+    // the introducing list is refused. The trust anchor pins the merge's
+    // SSH signing key: its fingerprint must match what git reports (%GF).
     use confidant_crypt::history::GitSignerChecker;
+    let operator = ssh_pubkey_line_to_key(&pubkey);
+    assert_eq!(
+        confidant_crypt::history::ssh_fingerprint(&operator),
+        fingerprint,
+        "anchor-derived fingerprint must match ssh-keygen"
+    );
+    let anchor = Anchor {
+        operator,
+        recovery: SigningKey::generate(&mut OsRng).verifying_key(),
+        recovery_age: "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0".to_string(),
+        source: std::path::PathBuf::from("/test/trust.toml"),
+    };
     let checker = GitSignerChecker::new(repo);
     let err = verify_history(
         &checker,
-        &[fingerprint],
+        &anchor,
         &merge_commit,
         &[merge_commit.clone(), side],
     )
@@ -1342,6 +1368,64 @@ fn test_commitment_planted_lookup_age_refused() {
     }
 }
 
+#[test]
+fn test_shred_refuses_planted_lookup_age() {
+    // #69 blocking: shred's verify-first pass must check the lookup key
+    // commitment before re-wrapping. A planted lookup.age must make shred
+    // refuse with nothing changed.
+    let mut f = Fixture::new();
+    // Fixture::new already ran init_lookup_key for the device recipient.
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // Snapshot state so we can assert nothing changed.
+    let keys_dir = f._tmp.path().join("keys");
+    let vault_manifest_before =
+        std::fs::read(keys_dir.join("vault").join("recipients.toml")).unwrap();
+    assert!(keys_dir.join("p-01ABC").exists());
+
+    // Plant a lookup.age wrapping of an attacker-known key.
+    let attacker_key = [0xCCu8; 32];
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.device_recipient).unwrap();
+    std::fs::write(keys_dir.join("vault").join("lookup.age"), &planted).unwrap();
+
+    // Shred must refuse: the planted wrapping doesn't match the epoch-1
+    // commitment in the verified vault manifest.
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    match f.keys.shred(
+        "p-01ABC",
+        &["p-01ABC"],
+        &new_recipients,
+        &f.operator_sk,
+        &f.anchor,
+        &f.device_id,
+    ) {
+        Err(Error::Manifest(_)) => {}
+        Err(e) => panic!("expected Manifest error, got: {e:?}"),
+        Ok(_) => panic!("shred with planted lookup.age must be refused"),
+    }
+
+    // Nothing changed: the shredded client's key tree is still there, the
+    // vault manifest is untouched, and the planted file was never re-wrapped.
+    assert!(keys_dir.join("p-01ABC").exists());
+    assert_eq!(
+        std::fs::read(keys_dir.join("vault").join("recipients.toml")).unwrap(),
+        vault_manifest_before
+    );
+    assert_eq!(
+        std::fs::read(keys_dir.join("vault").join("lookup.age")).unwrap(),
+        planted
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Key id charset regression tests (must-fix 4)
 // ---------------------------------------------------------------------------
@@ -1499,12 +1583,86 @@ fn test_note_under_a_key_fails_as_b() {
     );
 }
 
+#[test]
+fn manifest_state_distinguishes_absent_and_corrupt() {
+    // #73: a corrupt manifest must not read as "no manifest" (seq 0).
+    use confidant_crypt::lifecycle::ManifestState;
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+
+    let mut f = Fixture::new();
+
+    // Absent: client never initialized.
+    assert_eq!(
+        f.keys.manifest_state("p-01NEVER000000000000000001"),
+        ManifestState::Absent
+    );
+
+    // Valid: the fixture initializes the vault lookup key (seq 1).
+    assert!(matches!(
+        f.keys.manifest_state(VAULT_CLIENT_ID),
+        ManifestState::Valid(1)
+    ));
+
+    // Valid with the right seq after init_client.
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    assert!(matches!(
+        f.keys.manifest_state("p-01ABC"),
+        ManifestState::Valid(1)
+    ));
+
+    // Corrupt: garbage bytes where recipients.toml should parse.
+    let keys_dir = f._tmp.path().join("keys");
+    std::fs::write(
+        keys_dir.join("p-01ABC").join("recipients.toml"),
+        b"this is not toml \x00 {{{",
+    )
+    .unwrap();
+    match f.keys.manifest_state("p-01ABC") {
+        ManifestState::Corrupt(reason) => assert!(!reason.is_empty()),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+
+    // Corrupt is also distinct from a missing file in the same dir.
+    std::fs::remove_file(keys_dir.join("p-01ABC").join("recipients.toml")).unwrap();
+    assert_eq!(f.keys.manifest_state("p-01ABC"), ManifestState::Absent);
+}
+
+#[test]
+fn manifest_clients_lists_vault_and_client_dirs() {
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    // A stray non-dir entry is ignored.
+    std::fs::write(f._tmp.path().join("keys").join("README"), b"x").unwrap();
+    assert_eq!(
+        f.keys.manifest_clients(),
+        vec!["p-01ABC".to_string(), VAULT_CLIENT_ID.to_string()]
+    );
+}
+
 // ---------------------------------------------------------------------------
-// #69: commitments come from the verified buffer, never a re-read
+// #69: a tampered manifest fails closed (commitments are never re-read)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_commitments_come_from_verified_bytes() {
+fn test_tampered_manifest_fails_closed() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
@@ -1523,9 +1681,9 @@ fn test_commitments_come_from_verified_bytes() {
     assert_eq!(commitments.len(), 1);
     let verified_commitment = commitments[0].commitment.clone();
 
-    // 2. Tamper: swap the on-disk commitments for garbage, simulating a
-    // file changed between the verify and a later read. The signature no
-    // longer matches, so these bytes are untrusted.
+    // 2. Tamper: swap the on-disk commitments for garbage. The signature
+    // no longer matches, so these bytes are untrusted and every path that
+    // needs commitments must fail closed.
     let keys_dir = f._tmp.path().join("keys");
     let toml_path = keys_dir.join("p-01ABC").join("recipients.toml");
     let toml = std::fs::read_to_string(&toml_path).unwrap();
@@ -1533,10 +1691,9 @@ fn test_commitments_come_from_verified_bytes() {
     let tampered = toml.replace(&verified_commitment, &"00".repeat(32));
     std::fs::write(&toml_path, tampered).unwrap();
 
-    // 3. The tampered bytes don't verify: every path that needs
-    // commitments re-verifies first and fails closed. There is no
-    // unverified re-read of the file anywhere (the old
-    // `current_commitments` helper is gone).
+    // 3. The tampered bytes don't verify: re-verification fails closed.
+    // (The old `current_commitments` re-read helper is gone, so there is
+    // no path that trusts the tampered file.)
     assert!(f.keys.verified_recipients("p-01ABC", &f.anchor).is_err());
     assert!(f
         .keys

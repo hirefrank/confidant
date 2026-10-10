@@ -19,6 +19,23 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::error::Error;
 
+impl Anchor {
+    /// SSH `SHA256:` fingerprints of the anchor's signing keys.
+    ///
+    /// The operator key and the recovery Ed25519 key are the trusted
+    /// commit signers (design §4, ADR-10). Fingerprints are derived from
+    /// the anchor inside the library — never supplied by the caller — so
+    /// a compromised caller cannot widen trust. Compared against
+    /// `git log --format=%GF` output (full fingerprint, not the 16-char
+    /// `%GK` key id).
+    pub fn signer_fingerprints(&self) -> [String; 2] {
+        [
+            crate::history::ssh_fingerprint(&self.operator),
+            crate::history::ssh_fingerprint(&self.recovery),
+        ]
+    }
+}
+
 /// File holding the `[trust]` section, relative to the config dir.
 pub const TRUST_FILE: &str = "trust.toml";
 

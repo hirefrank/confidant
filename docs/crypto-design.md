@@ -354,6 +354,11 @@ expires = "2026-11-08"
 
 - The CLI checks the scope signature, expiry, client list, types, and
   capability **before** unwrapping or encrypting for that key.
+- The signed bytes are `b"confidant-scope-v1" ‖ le64(len(vault_id)) ‖
+  vault_id ‖ scope_toml`: a scope minted for one vault does not verify in
+  another. `expires` is parsed strictly as `YYYY-MM-DD` (a malformed date
+  is a hard error, never "unexpired"), the scope's `key_id` must equal the
+  identity in use, and verification uses Ed25519 `verify_strict`.
 - A client data key is wrapped to an agent key only for clients in its
   scope. Narrowing a scope = remove wrappings + re-sign manifest.
 - Agent private keys live in the agent host's secret store, never in the
@@ -413,8 +418,15 @@ vault-wide keypair:
    only one device runs `confidant inbox`.
 2. **Storage: the OS keychain on the device that runs `confidant inbox`.**
    Not a file under `~/.config` (raw key files go against §2's "device
-   keys live in the OS keychain", and Time Machine backs up `~/.config`,
-   so "destroy the old key" would be false). Not wrapped to devices in
+   keys live in the OS keychain", and Time Machine backs up `~/.config` as
+   plaintext, so "destroy the old key" would be false there). The keychain
+   narrows that backup exposure rather than removing it: the macOS login
+   keychain (`~/Library/Keychains/login.keychain-db`) and GNOME's keyring
+   files are in those backups too, encrypted under the login password, and
+   deleting an item doesn't reach old backup copies. What the keychain buys
+   is encrypted-at-rest storage plus a per-app access list on macOS. §8
+   already lists old keys lingering in OS keychains or OS backups as a
+   leftover limit. Not wrapped to devices in
    `keys/` like the alias lookup key, and not wrapped to the recovery
    identity either: either wrapping would leave the old inbox key's
    wrapping in git history, readable by any device key that hasn't been
@@ -522,6 +534,12 @@ writes.
 - A compromised trusted device (malware, stolen unlocked laptop): keys are
   present, so content decrypts. Mitigation is device hygiene + revocation,
   not cryptography.
+- A process running as the user reading an unlocked OS keychain entry
+  (Linux): the Secret Service keeps an unlocked collection's items readable
+  to any process in the user's session, with no further prompt. A malicious
+  or compromised app on the same desktop can read the stored keys. The
+  macOS login keychain's per-app access list narrows this; GNOME's keyring
+  does not.
 - A revoked device keeping ciphertext it already decrypted — revocation
   covers future writes only (ADR-5).
 - Metadata analysis: commit timing, commit counts, file counts and sizes,
@@ -798,3 +816,16 @@ drain and `--finish` skipped) and the non-inbox-device shred case
 device, stays incomplete until then); §9 notes `confidant recover` does
 not restore the inbox key (run `inbox rotate` on the new device and
 re-pin); the Scope line says "this doc's §8a".
+
+## 22. Keychain backup-precision round (2026-10-10)
+
+Per Silas's review of PR #94 (non-blocking item 6): §8a.2 no longer argues
+the keychain removes the backup exposure that `~/.config` files have — the
+macOS login keychain (`~/Library/Keychains/login.keychain-db`) and GNOME's
+keyring files are in Time Machine backups too, encrypted under the login
+password, and deleting an item doesn't reach old backup copies. The doc
+now says the keychain *narrows* that exposure (encrypted at rest, plus a
+per-app access list on macOS); §8 already lists old keys lingering in OS
+keychains or OS backups as a leftover limit. §11 notes the Linux Secret
+Service caveat: any process in the user's session can read an unlocked
+collection.

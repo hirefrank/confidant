@@ -62,6 +62,26 @@ pub struct KeyStore {
     seq: Option<SeqTracker>,
 }
 
+/// What `doctor` reports for one client's recipient manifest.
+///
+/// A corrupt manifest used to read as seq 0 — indistinguishable from "no
+/// manifest yet" — which made a damaged `keys/` tree look healthy. The
+/// replay protection (off-vault high-water mark compared in
+/// [`KeyStore::verified_recipients`]) never depended on that read; this
+/// enum exists purely so diagnostics can tell the two states apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestState {
+    /// No `recipients.toml` at this client's manifest dir. Normal for a
+    /// client that was never initialized (or a fresh vault).
+    Absent,
+    /// The file exists but does not parse as a manifest. Needs operator
+    /// attention: crypto operations on this client will fail closed.
+    /// Carries the parse failure.
+    Corrupt(String),
+    /// Parses; carries the manifest seq.
+    Valid(u64),
+}
+
 impl KeyStore {
     pub fn new(keys_dir: PathBuf, vault_id: &str) -> Self {
         KeyStore {
@@ -119,14 +139,60 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Current manifest seq for a client (0 if no manifest yet).
-    fn current_seq(&self, client_id: &str) -> u64 {
+    /// Classify one client's manifest for diagnostics (`doctor`).
+    ///
+    /// This is parse-level only: signature verification still happens in
+    /// [`KeyStore::verified_recipients`] and fails closed there. A
+    /// signature failure is not "corrupt" for this purpose — the file is
+    /// well-formed but untrusted, which is a different problem with a
+    /// different error.
+    pub fn manifest_state(&self, client_id: &str) -> ManifestState {
         let (toml_path, _) = self.manifest_paths(client_id);
-        std::fs::read(&toml_path)
-            .ok()
-            .and_then(|b| manifest::from_toml(&b).ok())
-            .map(|(seq, _, _)| seq)
-            .unwrap_or(0)
+        let bytes = match std::fs::read(&toml_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ManifestState::Absent,
+            Err(e) => return ManifestState::Corrupt(format!("unreadable: {e}")),
+        };
+        match manifest::from_toml(&bytes) {
+            Ok((seq, _, _)) => ManifestState::Valid(seq),
+            Err(e) => ManifestState::Corrupt(e.to_string()),
+        }
+    }
+
+    /// Every client id with a manifest directory under `keys/`, sorted.
+    /// The vault lookup key's `vault/` dir is reported as
+    /// [`VAULT_CLIENT_ID`].
+    pub fn manifest_clients(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.keys_dir) else {
+            return ids;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            ids.push(if name == "vault" {
+                VAULT_CLIENT_ID.to_string()
+            } else {
+                name
+            });
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Current manifest seq for a client (0 if no manifest yet).
+    ///
+    /// A corrupt manifest also reads as 0 here — deliberately, and now
+    /// explicitly: seq assignment must never advance on bytes it couldn't
+    /// parse, and `doctor` (via [`KeyStore::manifest_state`]) is where the
+    /// operator learns the file is damaged instead of missing.
+    fn current_seq(&self, client_id: &str) -> u64 {
+        match self.manifest_state(client_id) {
+            ManifestState::Valid(seq) => seq,
+            ManifestState::Absent | ManifestState::Corrupt(_) => 0,
+        }
     }
 
     fn high_water(&self, client_id: &str) -> u64 {
@@ -621,10 +687,14 @@ impl KeyStore {
                 )));
             }
         }
-        // 3. The lookup key must unwrap with the identity. Verify its
-        // manifest and carry the commitments for the re-wrap below.
+        // 3. The lookup key must unwrap with the identity AND match the
+        // commitment in the verified vault manifest. read_lookup_key
+        // verifies the manifest and checks the commitment — a planted
+        // lookup.age fails closed here, before any mutation. (Client epoch
+        // keys get the same check inside unwrap_data_key in step 1.)
+        let lookup_key = self.read_lookup_key(identity, anchor)?;
+        // Commitments for the re-wrap below, from the verified buffer.
         let (_, _, lookup_commitments) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
-        let lookup_raw = self.read_lookup_raw(identity)?;
 
         // All checks passed: now mutate.
         let new_recovery = Recovery::generate();
@@ -657,7 +727,7 @@ impl KeyStore {
         }
         // Lookup key: re-wrap the verified bytes to new recipients.
         self.write_lookup_raw(
-            &lookup_raw,
+            lookup_key.as_bytes(),
             new_recipients,
             &lookup_commitments,
             operator_sk,
