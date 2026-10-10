@@ -141,10 +141,12 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
             Listed::Ok(listing.entries)
         }
         Err(_) => {
+            // #7: keep "." for the empty root; anything else goes through
+            // the redactor so a leaky directory name never reaches JSON.
             let file = if rel.as_os_str().is_empty() {
                 ".".to_owned()
             } else {
-                paths::display_relative(rel)
+                redacted_filename(rel)
             };
             findings.push(
                 Finding::new(
@@ -878,7 +880,8 @@ fn walk_ledger(
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(paths::display_relative(&rel.join(&name)))
+                    // #7: entry names from a directory listing are unvalidated.
+                    .at_file(redacted_filename(&rel.join(&name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
@@ -923,7 +926,9 @@ fn walk_ledger_resolved(
                     Severity::Error,
                     "path is unreadable".to_owned(),
                 )
-                .at_file(paths::display_relative(rel))
+                // #7: the symlinked directory's vault-relative name is
+                // unvalidated.
+                .at_file(redacted_filename(rel))
                 .with_fix("Fix permissions or replace the unreadable path"),
             );
             return;
@@ -1128,7 +1133,10 @@ fn load_ledger_file(
     findings: &mut Vec<Finding>,
     unread: &mut u32,
 ) {
-    let file = paths::display_relative(rel);
+    // #7: the file value feeds E_MERGE_CONFLICT and E_UNREADABLE findings as
+    // well as ledger lines, so it must be redacted here. A canonical
+    // ledger/YYYY/MM.cfd is fully trusted and comes back unchanged.
+    let file = redacted_filename(rel);
     let searchable = is_canonical_ledger_cfd(rel);
     if !searchable {
         findings.push(
