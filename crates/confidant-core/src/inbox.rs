@@ -117,8 +117,10 @@ impl InboxKeys {
     }
 }
 
-/// The production decryptor. Kept for tests that exercise the old path;
-/// production code loads [`InboxKeys`] once and closes over it.
+/// The old load-per-call decryptor. Test-only: production code loads
+/// [`InboxKeys`] once and closes over it, so the N+1 key-loading path
+/// can't get wired back in outside tests.
+#[cfg(test)]
 pub fn inbox_decrypt(ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
     let keys = InboxKeys::load()?;
     keys.decrypt(ciphertext)
@@ -1303,6 +1305,7 @@ mod tests {
     /// test already fails the run.
     struct EnvGuard {
         saved: Option<String>,
+        saved_previous: Option<String>,
         saved_keychain: Option<String>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
@@ -1311,6 +1314,7 @@ mod tests {
         fn lock() -> Self {
             EnvGuard {
                 saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
+                saved_previous: std::env::var("CONFIDANT_INBOX_KEY_PREVIOUS").ok(),
                 saved_keychain: std::env::var("CONFIDANT_KEYCHAIN").ok(),
                 _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
             }
@@ -1320,6 +1324,7 @@ mod tests {
         }
         fn unset(&self) {
             std::env::remove_var("CONFIDANT_INBOX_KEY");
+            std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS");
         }
         /// Keep the test off the real OS keychain backend.
         fn no_keychain(&self) {
@@ -1333,6 +1338,10 @@ mod tests {
                 Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY", v),
                 None => std::env::remove_var("CONFIDANT_INBOX_KEY"),
             }
+            match self.saved_previous.take() {
+                Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY_PREVIOUS", v),
+                None => std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS"),
+            }
             match self.saved_keychain.take() {
                 Some(v) => std::env::set_var("CONFIDANT_KEYCHAIN", v),
                 None => std::env::remove_var("CONFIDANT_KEYCHAIN"),
@@ -1345,7 +1354,9 @@ mod tests {
     }
 
     fn test_bech32(secret: &[u8; 32]) -> String {
-        confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_bech32()
+        confidant_crypt::age_wrap::RawX25519Identity::new(*secret)
+            .to_bech32()
+            .to_string()
     }
 
     const LEDGER_ITEM: &str = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m note \"intake call\" src:tt-1\n";

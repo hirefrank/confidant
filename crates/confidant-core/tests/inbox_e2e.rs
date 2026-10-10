@@ -493,6 +493,7 @@ fn push_between_verify_and_read_refuses() {
             pinned_pubkey: None,
         },
         evil,
+        None,
     )
     .expect_err("expected E_INBOX_RACE");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
@@ -551,6 +552,7 @@ fn push_after_pin_is_neither_verified_nor_read() {
             pinned_pubkey: None,
         },
         evil,
+        None,
     )
     .expect_err("expected E_INBOX_RACE");
     // E_INBOX_RACE, not E_INBOX_UNTRUSTED: the unsigned item was never
@@ -864,6 +866,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvGuard {
     saved: Option<String>,
+    saved_previous: Option<String>,
     saved_keychain: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -872,6 +875,7 @@ impl EnvGuard {
     fn lock() -> Self {
         EnvGuard {
             saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
+            saved_previous: std::env::var("CONFIDANT_INBOX_KEY_PREVIOUS").ok(),
             saved_keychain: std::env::var("CONFIDANT_KEYCHAIN").ok(),
             _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
         }
@@ -881,6 +885,7 @@ impl EnvGuard {
     }
     fn unset(&self) {
         std::env::remove_var("CONFIDANT_INBOX_KEY");
+        std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS");
     }
 }
 
@@ -889,6 +894,10 @@ impl Drop for EnvGuard {
         match self.saved.take() {
             Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY", v),
             None => std::env::remove_var("CONFIDANT_INBOX_KEY"),
+        }
+        match self.saved_previous.take() {
+            Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY_PREVIOUS", v),
+            None => std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS"),
         }
         match self.saved_keychain.take() {
             Some(v) => std::env::set_var("CONFIDANT_KEYCHAIN", v),
@@ -902,7 +911,9 @@ fn test_recipient(secret: &[u8; 32]) -> String {
 }
 
 fn test_bech32(secret: &[u8; 32]) -> String {
-    confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_bech32()
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret)
+        .to_bech32()
+        .to_string()
 }
 
 /// Point this test process at the fixed test inbox identity. Holds the

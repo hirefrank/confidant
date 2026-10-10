@@ -103,7 +103,8 @@ impl Fixture {
             .arg(self.root())
             .env("HOME", self.home.path())
             .env("CONFIDANT_KEYCHAIN", "off")
-            .env_remove("CONFIDANT_INBOX_KEY");
+            .env_remove("CONFIDANT_INBOX_KEY")
+            .env_remove("CONFIDANT_INBOX_KEY_PREVIOUS");
         if let Some(k) = inbox_key {
             cmd.env("CONFIDANT_INBOX_KEY", k);
         }
@@ -210,7 +211,9 @@ fn test_recipient(secret: &[u8; 32]) -> String {
 }
 
 fn test_bech32(secret: &[u8; 32]) -> String {
-    confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_bech32()
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret)
+        .to_bech32()
+        .to_string()
 }
 
 const TEST_INBOX_SECRET: [u8; 32] = [7u8; 32];
