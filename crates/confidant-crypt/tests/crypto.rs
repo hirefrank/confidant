@@ -403,9 +403,7 @@ fn test7_revocation() {
     assert!(!names.iter().any(|n| n.starts_with("phone")), "{names:?}");
 
     // Rotate to a new epoch; revoked key cannot unwrap it.
-    f.keys
-        .rotate("p-01ABC", &f.anchor, &f.operator_sk)
-        .unwrap();
+    f.keys.rotate("p-01ABC", &f.anchor, &f.operator_sk).unwrap();
     assert!(f.keys.current_epoch("p-01ABC").unwrap() == 2);
     assert!(matches!(
         f.keys
@@ -505,15 +503,15 @@ fn test8_shredding() {
     // New recovery phrase: 24 words, differs from the old one; old phrase fails.
     let new_phrase = outcome.recovery_phrase_for_display();
     assert_eq!(new_phrase.split_whitespace().count(), 24);
-    assert_ne!(new_phrase, f.recovery.phrase().to_string());
-    let old_rec = Recovery::from_phrase(&f.recovery.phrase()).unwrap();
+    assert_ne!(new_phrase.as_str(), f.recovery.phrase().as_str());
+    let old_rec = Recovery::from_phrase(f.recovery.phrase().as_str()).unwrap();
     let old_age_id = old_rec.age_identity().to_age_identity().unwrap();
     assert!(f
         .keys
         .unwrap_data_key("p-BBBB", "recovery", 2, &old_age_id, &f.anchor)
         .is_err());
     // New recovery identity unwraps (current and old epoch).
-    let new_rec = Recovery::from_phrase(&new_phrase).unwrap();
+    let new_rec = Recovery::from_phrase(new_phrase.as_str()).unwrap();
     let new_age_id = new_rec.age_identity().to_age_identity().unwrap();
     assert!(f
         .keys
@@ -535,7 +533,7 @@ fn test8_shredding() {
     // common words may legitimately appear in warnings.
     let dbg = format!("{outcome:?}");
     assert!(
-        !dbg.contains(&new_phrase),
+        !dbg.contains(new_phrase.as_str()),
         "phrase leaked in ShredOutcome Debug"
     );
     let words: Vec<&str> = new_phrase.split_whitespace().collect();
@@ -1453,12 +1451,7 @@ fn manifest_state_distinguishes_absent_and_corrupt() {
     // Valid with the right seq after init_client.
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     assert!(matches!(
         f.keys.manifest_state("p-01ABC"),
@@ -1489,12 +1482,7 @@ fn manifest_clients_lists_vault_and_client_dirs() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     // A stray non-dir entry is ignored.
     std::fs::write(f._tmp.path().join("keys").join("README"), b"x").unwrap();

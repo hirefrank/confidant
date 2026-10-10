@@ -912,11 +912,12 @@ impl std::fmt::Debug for ShredOutcome {
 
 impl ShredOutcome {
     /// The new recovery phrase, for the single operator display. The caller
-    /// must confirm it was written down and never log it. The [`Zeroizing`]
-    /// wrapper is dropped (wiped) here; the returned plain `String` is the
-    /// single display copy.
-    pub fn recovery_phrase_for_display(&self) -> String {
-        self.new_recovery.phrase().to_string()
+    /// must confirm it was written down and never log it. Returned wrapped
+    /// in [`Zeroizing`] so the copy is wiped when dropped; the display site
+    /// should deref it (`print!("{}", phrase.as_str())`). The only plaintext
+    /// left is the terminal's own buffer.
+    pub fn recovery_phrase_for_display(&self) -> Zeroizing<String> {
+        self.new_recovery.phrase()
     }
 
     /// The new recovery identity (for pinning its public halves).

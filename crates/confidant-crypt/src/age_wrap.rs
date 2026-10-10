@@ -37,9 +37,11 @@ impl RawX25519Identity {
     /// The `AGE-SECRET-KEY-1…` Bech32 encoding of this secret, matching
     /// `age::x25519::Identity::to_string` (uppercase). Returned in a
     /// [`Zeroizing`] wrapper so the secret bytes are wiped when the
-    /// caller is done with it.
+    /// caller is done with it. The lowercase intermediate is also wrapped
+    /// and wiped on drop.
     pub fn to_bech32(&self) -> Zeroizing<String> {
-        Zeroizing::new(bech32_encode("age-secret-key-", &self.0).to_uppercase())
+        let lower = Zeroizing::new(bech32_encode("age-secret-key-", &self.0));
+        Zeroizing::new(lower.to_uppercase())
     }
 
     /// As an `age` identity, via the public Bech32 parse path.
