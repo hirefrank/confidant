@@ -21,7 +21,7 @@ use bip39::{Language, Mnemonic, WordCount};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::age_wrap::RawX25519Identity;
 use crate::error::Error;
@@ -109,12 +109,13 @@ impl Recovery {
         Ok(Self::from_mnemonic(&m))
     }
 
-    /// The phrase as a single space-separated string.
+    /// The phrase as a single space-separated string, in a [`Zeroizing`]
+    /// wrapper so the secret is wiped when the caller drops it.
     ///
     /// Callers must display this exactly once (at `init` / after `shred`)
     /// and never log it.
-    pub fn phrase(&self) -> String {
-        self.phrase_words.join(" ")
+    pub fn phrase(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.phrase_words.join(" "))
     }
 
     /// X25519 secret bytes for age unwrapping.
@@ -174,6 +175,15 @@ mod tests {
     fn generate_gives_24_words() {
         let r = Recovery::generate();
         assert_eq!(r.phrase().split_whitespace().count(), 24);
+    }
+
+    #[test]
+    fn phrase_returns_zeroizing() {
+        // Per Silas's #54 sign-off: the phrase must not sit in a plain
+        // String. The type annotation pins the Zeroizing return.
+        let r = Recovery::generate();
+        let phrase: Zeroizing<String> = r.phrase();
+        assert_eq!(phrase.split_whitespace().count(), 24);
     }
 
     #[test]
