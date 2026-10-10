@@ -1051,6 +1051,47 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
                     message: "check is clean".to_owned(),
                 });
             }
+            // #73: key-manifest health. A corrupt recipients.toml used to
+            // read as seq 0, indistinguishable from "no manifest yet".
+            // Report corrupt manifests as errors naming the client; absent
+            // manifests (and a vault with no keys/ tree at all) are normal
+            // and stay quiet.
+            let keys_dir = root.join("keys");
+            if keys_dir.is_dir() {
+                let store =
+                    confidant_crypt::lifecycle::KeyStore::new(keys_dir, &vault.config.vault_id);
+                let mut corrupt: Vec<String> = Vec::new();
+                let mut valid = 0u64;
+                for client_id in store.manifest_clients() {
+                    match store.manifest_state(&client_id) {
+                        confidant_crypt::lifecycle::ManifestState::Valid(_) => valid += 1,
+                        confidant_crypt::lifecycle::ManifestState::Corrupt(reason) => {
+                            corrupt.push(format!("{client_id} ({reason})"));
+                        }
+                        confidant_crypt::lifecycle::ManifestState::Absent => {}
+                    }
+                }
+                if corrupt.is_empty() {
+                    checks.push(DoctorCheck {
+                        id: "crypto-manifests",
+                        status: "ok",
+                        message: if valid == 0 {
+                            "no key manifests yet".to_owned()
+                        } else {
+                            format!("{valid} key manifest(s) parse")
+                        },
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        id: "crypto-manifests",
+                        status: "error",
+                        message: format!(
+                            "corrupt key manifest(s); fix or re-init before crypto operations: {}",
+                            corrupt.join("; ")
+                        ),
+                    });
+                }
+            }
         }
         Err(e) => checks.push(DoctorCheck {
             id: "vault-load",
