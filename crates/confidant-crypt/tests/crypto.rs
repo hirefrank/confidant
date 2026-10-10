@@ -1040,12 +1040,19 @@ fn test15_merge_rollback_unsigned_side_refused() {
     // SSH signing for the merge commit (throwaway key).
     let keydir = tempfile::tempdir().unwrap();
     let key = keydir.path().join("key");
-    let gen = std::process::Command::new("ssh-keygen")
+    let gen = match std::process::Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-N", "", "-q", "-C", "test"])
         .arg("-f")
         .arg(&key)
         .output()
-        .unwrap();
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping: ssh-keygen not installed");
+            return;
+        }
+        Err(e) => panic!("spawning ssh-keygen failed: {e}"),
+    };
     if !gen.status.success() {
         eprintln!("skipping: ssh-keygen unavailable");
         return;
