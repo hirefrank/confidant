@@ -151,7 +151,11 @@ The run, in order:
    trusted signer (`E_INBOX_UNTRUSTED`). The inbox branch is append-only and
    linear: any merge commit on it is refused (`E_INBOX_UNTRUSTED`), because
    merge diffs are invisible to the per-file provenance walk.
-5. Decrypt and parse every item (`E_INBOX_CRYPTO`, `E_INBOX_ITEM`).
+5. Pin the inbox tip (resolve its SHA once), then verify signatures,
+   decrypt, and parse every item — all against that pinned SHA, never the
+   branch name. A push mid-run can't slip unsigned items past the trust
+   check or swap the bytes under the reads. The tip is re-verified after
+   the reads; any movement refuses (`E_INBOX_RACE`).
 6. Plan the merge. Ledger lines are appended to `ledger/YYYY/MM.cfd` by entry
    date. Intake is limited on purpose:
    - Every ledger line needs a `src:` (provenance and idempotency).
@@ -161,12 +165,28 @@ The run, in order:
    vault, exact-duplicate lines, and records identical to the target are
    skipped; a record path that exists with different content is
    `E_INBOX_CONFLICT`.
-6. Apply the merge, then run `check` (fail on error). If `check` fails,
+7. Apply the merge, then run `check` (fail on error). If `check` fails,
    everything is reverted and nothing is committed (`E_INBOX_CHECK_FAILED`).
-7. Commit the merge — **one commit per run**, message `inbox: merge N item(s)`
-   with only opaque item IDs in the body (ADR-7).
-8. Clear the merged items from the inbox branch with their own commit
-   (`inbox: clear N item(s)`).
+8. Commit the merge — **one commit per run**, message `inbox: merge N item(s)`
+   with only opaque item IDs in the body (ADR-7). The commit is signed
+   (`-S`, honoring the operator's git signing config); with no commit
+   signing configured the run refuses (`E_INBOX_UNTRUSTED`) rather than
+   creating unsigned commits (ADR-10: main accepts trusted signers only).
+   If the commit itself fails (e.g. a configured-but-broken signing setup),
+   the applied paths are unstaged and the worktree reverted — the
+   all-or-nothing contract holds.
+9. Re-verify the recorded inbox tip immediately before clearing: a push to
+   the inbox branch mid-run means the merged bytes may be stale, so the run
+   refuses (`E_INBOX_RACE`) instead of clearing content it never saw.
+   Clearing uses plumbing only (`mktree` / `commit-tree` / `update-ref`,
+   the last as an atomic compare-and-swap on the expected tip) — the inbox
+   branch is never checked out in the worktree. The clear commit
+   (`inbox: clear N item(s)`) is signed like the merge commit.
 
-The run is all-or-nothing: any failure leaves both branches untouched.
+The run is all-or-nothing up to the merge commit: any failure before it
+leaves both branches untouched. If the merge commit lands and the clear
+then refuses — the tip moved (`E_INBOX_RACE`), or the clear commit failed
+to sign — main keeps the merge and the inbox keeps its items. Re-running
+is safe: already-merged items are skipped as duplicates (idempotent), and
+the clear is retried against the new tip.
 `--dry-run` decrypts and plans without committing or clearing.
