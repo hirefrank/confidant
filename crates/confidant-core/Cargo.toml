@@ -10,6 +10,7 @@ description = "Parse, model, derived values, and check engine for Confidant vaul
 
 [dependencies]
 anyhow.workspace = true
+age.workspace = true
 chrono.workspace = true
 confidant-crypt.workspace = true
 hmac.workspace = true

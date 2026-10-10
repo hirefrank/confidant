@@ -1,8 +1,10 @@
 //! Integration tests for `confidant inbox` against throwaway git repos.
 //!
-//! The decryptor is the production `confidant-crypt` stub, so any item that
-//! reaches decryption fails closed with E_INBOX_CRYPTO. Crypto-real tests
-//! belong to milestone 2 (PR B). All data is fake.
+//! The decryptor is the production `confidant-crypt` age path: the inbox
+//! identity comes from the `CONFIDANT_INBOX_KEY` env override (headless
+//! tests) or the OS keychain. Tests that need "no key" remove the env var;
+//! tests that need a key set it to a fixed test-only identity. All data is
+//! fake.
 
 use std::path::Path;
 use std::process::Command;
@@ -86,19 +88,45 @@ impl Fixture {
     }
 
     fn inbox(&self, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_confidant"))
-            .arg("inbox")
+        self.inbox_with_env(args, None)
+    }
+
+    /// Run `confidant inbox`, controlling the inbox identity: `Some(bech32)`
+    /// sets `CONFIDANT_INBOX_KEY`, `None` removes it so the run has no key
+    /// (deterministic even if the ambient environment sets one).
+    /// `CONFIDANT_KEYCHAIN=off` keeps the child off the real OS keychain.
+    fn inbox_with_env(&self, args: &[&str], inbox_key: Option<&str>) -> (i32, String, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_confidant"));
+        cmd.arg("inbox")
             .args(args)
             .arg("--vault")
             .arg(self.root())
             .env("HOME", self.home.path())
-            .output()
-            .expect("confidant failed to run");
+            .env("CONFIDANT_KEYCHAIN", "off")
+            .env_remove("CONFIDANT_INBOX_KEY")
+            .env_remove("CONFIDANT_INBOX_KEY_PREVIOUS");
+        if let Some(k) = inbox_key {
+            cmd.env("CONFIDANT_INBOX_KEY", k);
+        }
+        let out = cmd.output().expect("confidant failed to run");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).to_string(),
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
+    }
+
+    /// Advertise an `[inbox].pubkey` in the vault config (committed).
+    fn with_vault_inbox_pubkey(&self, pubkey: &str) {
+        let path = self.root().join("confidant.toml");
+        let mut toml = std::fs::read_to_string(&path).unwrap();
+        toml.push_str(&format!("\n[inbox]\npubkey = \"{pubkey}\"\n"));
+        std::fs::write(&path, toml).unwrap();
+        git(self.root(), &["add", "confidant.toml"]);
+        git(
+            self.root(),
+            &["commit", "-q", "-m", "advertise inbox pubkey"],
+        );
     }
 
     fn with_home_config(&self, toml: &str) {
@@ -154,7 +182,7 @@ fn non_age_file_on_inbox_is_rejected() {
 }
 
 #[test]
-fn stub_decrypt_fails_closed() {
+fn inbox_decrypt_fails_closed_without_key() {
     let f = Fixture::new();
     f.with_inbox(&[("01JABC.age", b"opaque ciphertext")]);
     let (code, stdout, _) = f.inbox(&["--json", "--allow-unsigned"]);
@@ -168,13 +196,62 @@ fn stub_decrypt_fails_closed() {
 }
 
 #[test]
-fn stub_decrypt_fails_closed_human_output() {
+fn inbox_decrypt_fails_closed_human_output() {
     let f = Fixture::new();
     f.with_inbox(&[("01JABC.age", b"opaque ciphertext")]);
     let (code, _, stderr) = f.inbox(&["--allow-unsigned"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("E_INBOX_CRYPTO"), "stderr: {stderr}");
     assert!(stderr.contains("fix:"), "stderr: {stderr}");
+}
+
+/// Fixed test-only inbox identities (fake data).
+fn test_recipient(secret: &[u8; 32]) -> String {
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret).to_recipient_string()
+}
+
+fn test_bech32(secret: &[u8; 32]) -> String {
+    confidant_crypt::age_wrap::RawX25519Identity::new(*secret)
+        .to_bech32()
+        .to_string()
+}
+
+const TEST_INBOX_SECRET: [u8; 32] = [7u8; 32];
+const OTHER_INBOX_SECRET: [u8; 32] = [9u8; 32];
+
+#[test]
+fn local_pubkey_mismatch_is_hard_error() {
+    // #55: the vault advertises someone else's key while the local private
+    // key is ours — the CLI refuses with E_INBOX_UNTRUSTED before decrypting.
+    let f = Fixture::new();
+    f.with_vault_inbox_pubkey(&test_recipient(&OTHER_INBOX_SECRET));
+    f.with_inbox(&[("01JABC.age", b"opaque ciphertext")]);
+    let key = test_bech32(&TEST_INBOX_SECRET);
+    let (code, stdout, _) = f.inbox_with_env(&["--json", "--allow-unsigned"], Some(&key));
+    assert_eq!(code, 1, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["error"]["code"], "E_INBOX_UNTRUSTED");
+}
+
+#[test]
+fn real_crypto_item_decrypts_end_to_end() {
+    // #30: an age-encrypted item decrypts through the real production path
+    // in the built binary (dry run: decrypt + plan, merge nothing).
+    let f = Fixture::new();
+    let recipient = test_recipient(&TEST_INBOX_SECRET);
+    f.with_vault_inbox_pubkey(&recipient);
+    let item = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m src:cli-crypto-1\n";
+    let ciphertext =
+        confidant_crypt::age_wrap::wrap_to_recipient(item.as_bytes(), &recipient).unwrap();
+    f.with_inbox(&[("01JABC.age", &ciphertext)]);
+    let key = test_bech32(&TEST_INBOX_SECRET);
+    let (code, stdout, _) =
+        f.inbox_with_env(&["--json", "--dry-run", "--allow-unsigned"], Some(&key));
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["merged"], 1);
 }
 
 #[test]
