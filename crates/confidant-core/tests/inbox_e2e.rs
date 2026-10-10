@@ -108,6 +108,7 @@ impl Repo {
                 pinned_pubkey: None,
             },
             identity,
+            None,
         )
     }
 }
@@ -295,6 +296,7 @@ fn symlinked_vault_root_merges() {
             pinned_pubkey: None,
         },
         identity,
+        None,
     )
     .expect("inbox run via symlinked root failed");
     assert_eq!(report.merged, 2);
@@ -351,6 +353,7 @@ fn run_with(
             pinned_pubkey,
         },
         identity,
+        None,
     )
 }
 
@@ -861,6 +864,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvGuard {
     saved: Option<String>,
+    saved_keychain: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -868,6 +872,7 @@ impl EnvGuard {
     fn lock() -> Self {
         EnvGuard {
             saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
+            saved_keychain: std::env::var("CONFIDANT_KEYCHAIN").ok(),
             _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
@@ -885,6 +890,10 @@ impl Drop for EnvGuard {
             Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY", v),
             None => std::env::remove_var("CONFIDANT_INBOX_KEY"),
         }
+        match self.saved_keychain.take() {
+            Some(v) => std::env::set_var("CONFIDANT_KEYCHAIN", v),
+            None => std::env::remove_var("CONFIDANT_KEYCHAIN"),
+        }
     }
 }
 
@@ -898,9 +907,12 @@ fn test_bech32(secret: &[u8; 32]) -> String {
 
 /// Point this test process at the fixed test inbox identity. Holds the
 /// env lock for the caller's scope so vault-pubkey tests can't interleave.
+/// Also disables the real OS keychain backend — the previous-slot lookup
+/// must not touch it.
 fn use_test_inbox_key() -> EnvGuard {
     let g = EnvGuard::lock();
     g.set(&test_bech32(&TEST_INBOX_SECRET));
+    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
     g
 }
 
@@ -940,8 +952,17 @@ impl Repo {
     }
 }
 
-/// Run the inbox with the production decryptor.
+/// Run the inbox with the production decryptor. Loads the test inbox
+/// key once (the caller holds the env lock via `use_test_inbox_key`).
 fn run_real(r: &Repo) -> anyhow::Result<confidant_core::InboxReport> {
+    let keys = std::sync::Arc::new(
+        confidant_core::InboxKeys::load_opt()?
+            .expect("test inbox key must be enrolled via CONFIDANT_INBOX_KEY"),
+    );
+    let decrypt = {
+        let keys = keys.clone();
+        move |b: &[u8]| keys.decrypt(b)
+    };
     run_inbox(
         r.root(),
         &InboxOptions {
@@ -950,7 +971,8 @@ fn run_real(r: &Repo) -> anyhow::Result<confidant_core::InboxReport> {
             allow_unsigned: true,
             pinned_pubkey: None,
         },
-        &confidant_core::inbox_decrypt,
+        &decrypt,
+        Some(&keys),
     )
 }
 

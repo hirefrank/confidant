@@ -557,6 +557,7 @@ dependencies = [
 name = "confidant-core"
 version = "0.1.0"
 dependencies = [
+ "age",
  "anyhow",
  "chrono",
  "confidant-crypt",

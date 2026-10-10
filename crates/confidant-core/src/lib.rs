@@ -35,7 +35,8 @@ pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
 pub use inbox::{
-    inbox_decrypt, run_inbox, DecryptFn, InboxOptions, InboxReport, ItemOutcome, INBOX_BRANCH,
+    inbox_decrypt, run_inbox, DecryptFn, InboxKeys, InboxOptions, InboxReport, ItemOutcome,
+    INBOX_BRANCH,
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};

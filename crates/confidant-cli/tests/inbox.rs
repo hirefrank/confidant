@@ -94,6 +94,7 @@ impl Fixture {
     /// Run `confidant inbox`, controlling the inbox identity: `Some(bech32)`
     /// sets `CONFIDANT_INBOX_KEY`, `None` removes it so the run has no key
     /// (deterministic even if the ambient environment sets one).
+    /// `CONFIDANT_KEYCHAIN=off` keeps the child off the real OS keychain.
     fn inbox_with_env(&self, args: &[&str], inbox_key: Option<&str>) -> (i32, String, String) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_confidant"));
         cmd.arg("inbox")
@@ -101,6 +102,7 @@ impl Fixture {
             .arg("--vault")
             .arg(self.root())
             .env("HOME", self.home.path())
+            .env("CONFIDANT_KEYCHAIN", "off")
             .env_remove("CONFIDANT_INBOX_KEY");
         if let Some(k) = inbox_key {
             cmd.env("CONFIDANT_INBOX_KEY", k);

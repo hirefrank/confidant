@@ -49,20 +49,79 @@ const HEADER_SEP: &str = "---";
 /// Collection roots a `kind: record` item may target.
 const RECORD_ROOTS: &[&str] = &["people", "orgs", "deals", "interactions", "notes"];
 
-/// Decrypts item ciphertext. Production passes [`inbox_decrypt`] (the
-/// real `confidant-crypt` age path); tests inject a fake.
+/// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
+/// (the real `confidant-crypt` age path); tests inject a fake.
 pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Vec<u8>>;
 
-/// The production decryptor. Loads the inbox identity from the OS keychain
-/// (or `CONFIDANT_INBOX_KEY` on headless hosts — see
-/// `confidant_crypt::keychain`) and unwraps the age-encrypted item.
-/// Fails closed with `E_INBOX_CRYPTO`: a missing key, a bad key, or
-/// undecryptable ciphertext is an error, never silent plaintext.
+/// Inbox decryption key material, loaded once per run.
+///
+/// Holds the current inbox identity and, during the rotation window
+/// (§8a.3), the previous one. Decryption tries current then previous
+/// ("tries old then new"); the #55 pubkey comparison uses the current key
+/// only, since the vault advertises the new key after `rotate`.
+pub struct InboxKeys {
+    current: age::x25519::Identity,
+    previous: Option<age::x25519::Identity>,
+}
+
+impl InboxKeys {
+    /// Load both slots from the OS keychain (or `CONFIDANT_INBOX_KEY` /
+    /// `CONFIDANT_INBOX_KEY_PREVIOUS` on headless hosts — see
+    /// `confidant_crypt::keychain`). Fails closed with `E_INBOX_CRYPTO`:
+    /// a missing key, a bad key, or an undecryptable identity is an error,
+    /// never silent plaintext.
+    pub fn load() -> anyhow::Result<Self> {
+        let (current, previous) = confidant_crypt::keychain::inbox_identities()
+            .map_err(|e| anyhow::Error::new(DomainError::inbox_crypto(format!("{e}"))))?;
+        Ok(Self { current, previous })
+    }
+
+    /// Load, returning `None` when no key is enrolled (genuine `NoKey`).
+    /// A legacy-file refusal or keychain error surfaces directly — it is
+    /// not skipped, so it cannot resurface later as a generic decrypt
+    /// failure.
+    pub fn load_opt() -> anyhow::Result<Option<Self>> {
+        match confidant_crypt::keychain::inbox_identities() {
+            Ok((current, previous)) => Ok(Some(Self { current, previous })),
+            Err(confidant_crypt::Error::NoKey(_)) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
+                "{e}"
+            )))),
+        }
+    }
+
+    /// Decrypt with the current key, falling back to the previous one
+    /// during the rotation window. Fails closed with `E_INBOX_CRYPTO`.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, &self.current) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(first) => {
+                if let Some(previous) = &self.previous {
+                    if let Ok(plaintext) =
+                        confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, previous)
+                    {
+                        return Ok(plaintext);
+                    }
+                }
+                Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
+                    "{first}"
+                ))))
+            }
+        }
+    }
+
+    /// The current key's age recipient, for the #55 comparison against the
+    /// vault's advertised `[inbox].pubkey`.
+    pub fn current_recipient(&self) -> String {
+        self.current.to_public().to_string()
+    }
+}
+
+/// The production decryptor. Kept for tests that exercise the old path;
+/// production code loads [`InboxKeys`] once and closes over it.
 pub fn inbox_decrypt(ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let identity = confidant_crypt::keychain::inbox_identity()
-        .map_err(|e| anyhow::Error::new(DomainError::inbox_crypto(format!("{e}"))))?;
-    confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, &identity)
-        .map_err(|e| anyhow::Error::new(DomainError::inbox_crypto(format!("{e}"))))
+    let keys = InboxKeys::load()?;
+    keys.decrypt(ciphertext)
 }
 
 /// Options for [`run_inbox`].
@@ -133,10 +192,17 @@ enum ItemKind {
 ///
 /// `vault_root` is the discovered vault directory (need not be the git
 /// toplevel). The working tree must be clean; the run refuses otherwise.
+///
+/// `inbox_keys` is the key material loaded once by the caller (see
+/// [`InboxKeys::load_opt`]); the #55 pubkey comparison uses its current
+/// recipient. Pass `None` when no key is enrolled — the comparison is
+/// skipped and decryption fails closed later. Tests that inject a fake
+/// `decrypt` pass `None`.
 pub fn run_inbox(
     vault_root: &Path,
     opts: &InboxOptions,
     decrypt: &DecryptFn,
+    inbox_keys: Option<&InboxKeys>,
 ) -> anyhow::Result<InboxReport> {
     // Canonicalize up front: git reports the physical toplevel (e.g. macOS
     // /private/var vs /var), and path prefix checks below must agree.
@@ -192,7 +258,15 @@ pub fn run_inbox(
     // Key-substitution defense, second factor (#55): the local private key
     // is the ground truth for who can read these items, so its recipient
     // must agree with the vault's advertised key. Hard error on mismatch.
-    check_local_inbox_pubkey(vault.config.inbox.pubkey.as_deref())?;
+    // Compares against the CURRENT key only: the vault advertises the new
+    // key after `inbox rotate`, while decrypt still accepts the previous
+    // one during the rotation window.
+    if let Some(keys) = inbox_keys {
+        check_local_inbox_pubkey(
+            vault.config.inbox.pubkey.as_deref(),
+            &keys.current_recipient(),
+        )?;
+    }
 
     // Fail closed on unconfigured trust: warn-and-proceed let an unsigned
     // branch through, so it is gone. --allow-unsigned is the explicit opt-in.
@@ -445,33 +519,42 @@ fn check_inbox_pubkey(
     }
 }
 
-/// Defense in depth against key substitution (#55): derive the recipient
-/// from the *local* inbox private key (OS keychain, or `CONFIDANT_INBOX_KEY`
-/// on headless hosts) and compare it against the vault's advertised
-/// `[inbox].pubkey`. A mismatch is a hard `E_INBOX_UNTRUSTED`: the pin in
-/// the user config is itself a file an attacker with local write access
-/// could tamper with, but the private key is the ground truth for who can
-/// actually read these items.
+/// Defense in depth against key substitution (#55): compare the recipient
+/// derived from the *local* inbox private key (loaded once per run — see
+/// [`InboxKeys`]) against the vault's advertised `[inbox].pubkey`. A
+/// mismatch is a hard `E_INBOX_UNTRUSTED`: the pin in the user config is
+/// itself a file an attacker with local write access could tamper with,
+/// but the private key is the ground truth for who can actually read
+/// these items.
+///
+/// Compares against the CURRENT key only: the vault advertises the new key
+/// after `inbox rotate`, while decrypt still accepts the previous one
+/// during the rotation window (§8a.3).
 ///
 /// Skips (returns `Ok`) when the vault advertises no pubkey — nothing to
-/// compare against — and when no local identity is loadable for any reason
-/// (no key, no keychain on headless hosts, malformed key): decryption is
-/// the enforcement point and fails closed later with `E_INBOX_CRYPTO`, so
-/// this check never blocks a run on key availability.
-fn check_local_inbox_pubkey(vault_pubkey: Option<&str>) -> anyhow::Result<()> {
+/// compare against.
+fn check_local_inbox_pubkey(
+    vault_pubkey: Option<&str>,
+    local_recipient: &str,
+) -> anyhow::Result<()> {
     let vault_pubkey = match vault_pubkey.map(str::trim).filter(|s| !s.is_empty()) {
         Some(k) => k,
         None => return Ok(()),
     };
-    let Ok(identity) = confidant_crypt::keychain::inbox_identity() else {
-        return Ok(());
-    };
+    // A malformed vault value gets its own message — it is a config error,
+    // not evidence of substitution. Still a hard error.
+    if !confidant_crypt::age_wrap::is_valid_recipient(vault_pubkey) {
+        return Err(anyhow::Error::new(DomainError::inbox_untrusted(format!(
+            "vault [inbox].pubkey is not a valid age recipient: '{vault_pubkey}'; \
+             fix: correct the value in confidant.toml and do not merge until resolved"
+        ))));
+    }
     // Recipients are public values, so a plain comparison is fine.
-    let local = identity.to_public().to_string();
-    if local != vault_pubkey {
+    if local_recipient != vault_pubkey {
         return Err(anyhow::Error::new(DomainError::inbox_untrusted(format!(
             "local inbox key does not match vault [inbox].pubkey \
-             (local: '{local}', vault: '{vault_pubkey}'); refusing — possible key substitution"
+             (local: '{local_recipient}', vault: '{vault_pubkey}'); refusing — possible key substitution; \
+             fix: compare against your out-of-band pin and do not merge until resolved"
         ))));
     }
     Ok(())
@@ -1220,6 +1303,7 @@ mod tests {
     /// test already fails the run.
     struct EnvGuard {
         saved: Option<String>,
+        saved_keychain: Option<String>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1227,6 +1311,7 @@ mod tests {
         fn lock() -> Self {
             EnvGuard {
                 saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
+                saved_keychain: std::env::var("CONFIDANT_KEYCHAIN").ok(),
                 _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
             }
         }
@@ -1236,6 +1321,10 @@ mod tests {
         fn unset(&self) {
             std::env::remove_var("CONFIDANT_INBOX_KEY");
         }
+        /// Keep the test off the real OS keychain backend.
+        fn no_keychain(&self) {
+            std::env::set_var("CONFIDANT_KEYCHAIN", "off");
+        }
     }
 
     impl Drop for EnvGuard {
@@ -1243,6 +1332,10 @@ mod tests {
             match self.saved.take() {
                 Some(v) => std::env::set_var("CONFIDANT_INBOX_KEY", v),
                 None => std::env::remove_var("CONFIDANT_INBOX_KEY"),
+            }
+            match self.saved_keychain.take() {
+                Some(v) => std::env::set_var("CONFIDANT_KEYCHAIN", v),
+                None => std::env::remove_var("CONFIDANT_KEYCHAIN"),
             }
         }
     }
@@ -1342,10 +1435,11 @@ mod tests {
 
     #[test]
     fn inbox_decrypt_fails_closed_without_key() {
-        // No local key: unset the env override and rely on the keychain
-        // having no entry for the test service (fail closed either way).
+        // No local key: unset the env override and disable the keychain
+        // backend (fail closed either way).
         let g = EnvGuard::lock();
         g.unset();
+        g.no_keychain();
         let err = inbox_decrypt(b"nope").unwrap_err();
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CRYPTO");
     }
@@ -1354,6 +1448,7 @@ mod tests {
     fn inbox_decrypt_round_trips_with_key() {
         let g = EnvGuard::lock();
         g.set(&test_bech32(&TEST_INBOX_SECRET_A));
+        g.no_keychain();
         let ciphertext = confidant_crypt::age_wrap::wrap_to_recipient(
             b"item bytes",
             &test_recipient(&TEST_INBOX_SECRET_A),
@@ -1367,6 +1462,7 @@ mod tests {
     fn inbox_decrypt_wrong_key_fails_closed() {
         let g = EnvGuard::lock();
         g.set(&test_bech32(&TEST_INBOX_SECRET_A));
+        g.no_keychain();
         let ciphertext = confidant_crypt::age_wrap::wrap_to_recipient(
             b"item bytes",
             &test_recipient(&TEST_INBOX_SECRET_B),
@@ -1377,35 +1473,84 @@ mod tests {
     }
 
     #[test]
-    fn local_pubkey_check_skips_without_vault_pubkey() {
+    fn decrypt_tries_previous_during_rotation_window() {
+        // Item encrypted to the PREVIOUS key decrypts while the previous
+        // slot is populated (§8a.3 "tries old then new").
         let g = EnvGuard::lock();
         g.set(&test_bech32(&TEST_INBOX_SECRET_A));
-        // Vault advertises nothing: nothing to compare against.
-        check_local_inbox_pubkey(None).unwrap();
-        check_local_inbox_pubkey(Some("  ")).unwrap();
+        // Keep the test off the real OS keychain; the previous slot comes
+        // from the env override below.
+        g.no_keychain();
+        std::env::set_var(
+            "CONFIDANT_INBOX_KEY_PREVIOUS",
+            test_bech32(&TEST_INBOX_SECRET_B),
+        );
+        let keys = InboxKeys::load().unwrap();
+        let ciphertext = confidant_crypt::age_wrap::wrap_to_recipient(
+            b"item bytes",
+            &test_recipient(&TEST_INBOX_SECRET_B),
+        )
+        .unwrap();
+        let plaintext = keys.decrypt(&ciphertext).unwrap();
+        assert_eq!(plaintext, b"item bytes");
+        std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS");
     }
 
     #[test]
-    fn local_pubkey_check_skips_without_local_key() {
+    fn decrypt_fails_closed_after_previous_deleted() {
+        // Previous slot empty: an item encrypted to the old key fails
+        // closed with E_INBOX_CRYPTO.
+        let g = EnvGuard::lock();
+        g.set(&test_bech32(&TEST_INBOX_SECRET_A));
+        std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS");
+        g.no_keychain();
+        let keys = InboxKeys::load().unwrap();
+        let ciphertext = confidant_crypt::age_wrap::wrap_to_recipient(
+            b"item bytes",
+            &test_recipient(&TEST_INBOX_SECRET_B),
+        )
+        .unwrap();
+        let err = keys.decrypt(&ciphertext).unwrap_err();
+        assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CRYPTO");
+    }
+
+    #[test]
+    fn load_opt_returns_none_without_key() {
+        // Genuine NoKey: env unset and keychain disabled → None (skip #55,
+        // decrypt fails closed later).
         let g = EnvGuard::lock();
         g.unset();
-        // No local key: decryption fails closed later anyway.
-        check_local_inbox_pubkey(Some(&test_recipient(&TEST_INBOX_SECRET_A))).unwrap();
+        g.no_keychain();
+        let keys = InboxKeys::load_opt().unwrap();
+        assert!(keys.is_none());
+    }
+
+    #[test]
+    fn local_pubkey_check_skips_without_vault_pubkey() {
+        let local = test_recipient(&TEST_INBOX_SECRET_A);
+        // Vault advertises nothing: nothing to compare against.
+        check_local_inbox_pubkey(None, &local).unwrap();
+        check_local_inbox_pubkey(Some("  "), &local).unwrap();
     }
 
     #[test]
     fn local_pubkey_match_is_ok() {
-        let g = EnvGuard::lock();
-        g.set(&test_bech32(&TEST_INBOX_SECRET_A));
-        check_local_inbox_pubkey(Some(&test_recipient(&TEST_INBOX_SECRET_A))).unwrap();
+        let local = test_recipient(&TEST_INBOX_SECRET_A);
+        check_local_inbox_pubkey(Some(&test_recipient(&TEST_INBOX_SECRET_A)), &local).unwrap();
     }
 
     #[test]
     fn local_pubkey_mismatch_is_hard_error() {
-        let g = EnvGuard::lock();
-        g.set(&test_bech32(&TEST_INBOX_SECRET_A));
-        let err =
-            check_local_inbox_pubkey(Some(&test_recipient(&TEST_INBOX_SECRET_B))).unwrap_err();
+        let local = test_recipient(&TEST_INBOX_SECRET_A);
+        let err = check_local_inbox_pubkey(Some(&test_recipient(&TEST_INBOX_SECRET_B)), &local)
+            .unwrap_err();
+        assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
+    }
+
+    #[test]
+    fn local_pubkey_malformed_vault_key_is_hard_error() {
+        let local = test_recipient(&TEST_INBOX_SECRET_A);
+        let err = check_local_inbox_pubkey(Some("not-a-recipient"), &local).unwrap_err();
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
     }
 
