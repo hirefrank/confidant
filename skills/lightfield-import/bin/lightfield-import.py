@@ -7,14 +7,21 @@ import). Keep it on a trusted device.
 
 Expected export shape (JSON; unknown fields ignored, bad rows warned+skipped):
   {"contacts": [{"id": "lf-c-1", "name": "Ada Example",
-                 "emails": ["a@x.co"], "phones": ["+1…"], "notes": "…"}],
+                 "emails": ["a@x.co"], "phones": ["+1…"], "notes": "…",
+                 "no-ai": true}],
    "deals": [{"id": "lf-d-1", "contact_id": "lf-c-1", "title": "…",
               "stage": "proposal", "notes": "…"}],
    "notes": [{"id": "lf-n-1", "contact_id": "lf-c-1",
-              "date": "2026-09-01", "text": "…"}],
+              "date": "2026-09-01", "text": "…", "no-ai": true}],
    "transcripts": [{"id": "lf-t-1", "contact_id": "lf-c-1",
                     "date": "2026-09-02", "duration_minutes": 60,
                     "billing": "paid", "text": "…"}]}
+
+`"no-ai": true` on a contact marks the proposed person record `no-ai`
+(and the contact's deals inherit it — a deal belongs to its client);
+on a note it marks the note record and the manifest's `no_ai` flag so the
+`note add --no-ai` apply step picks it up. Only the boolean `true`
+counts; anything else is treated as unset.
 
 Proposes (never writes):
   contacts    -> people/p-<new>/profile.md (+ alias *candidates* in the
@@ -51,6 +58,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import common  # noqa: E402
 
 _NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
+_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
+
+
+def is_no_ai(row: dict) -> bool:
+    """True only when the row explicitly sets `"no-ai": true` (#47).
+
+    The JSON key mirrors the front-matter field name. Only the boolean
+    `true` counts — strings like "true"/"yes" are treated as unset so a
+    truthy-looking typo can't silently flip a privacy flag.
+    """
+    return row.get("no-ai") is True
 
 
 def parse_args(argv=None):
@@ -94,9 +112,14 @@ def load_map(vault: str) -> dict[str, str]:
         return {}
 
 
-def existing_people(vault: str) -> dict[str, str]:
-    """Map profile display name -> person ID for exact-match linking."""
-    people: dict[str, str] = {}
+def existing_people(vault: str) -> dict[str, tuple[str, bool]]:
+    """Map profile display name -> (person ID, no-ai flag) for exact-match linking.
+
+    The no-ai flag is read from the person's front matter so a contact that
+    matches an existing no-ai person seeds no-ai onto their new deals, notes
+    and transcripts.
+    """
+    people: dict[str, tuple[str, bool]] = {}
     base = os.path.join(vault, "people")
     if not os.path.isdir(base):
         return people
@@ -112,7 +135,8 @@ def existing_people(vault: str) -> dict[str, str]:
                 continue
             m = _NAME_RE.search(head)
             if m:
-                people.setdefault(m.group(1).strip(), pid)
+                no_ai = _NO_AI_RE.search(head) is not None
+                people.setdefault(m.group(1).strip(), (pid, no_ai))
     return people
 
 
@@ -204,6 +228,12 @@ def main(argv=None) -> int:
     if args.out:
         manifest_path = args.out
         lines_path = _manifest_stem(args.out) + ".cfd"
+        # #57: a custom --out inside the vault must be git-ignored too —
+        # the note bodies stage next to the manifest, before any PII
+        # touches disk.
+        common.ensure_out_ignored(
+            vault, manifest_path, lines_path,
+            os.path.join(_manifest_stem(args.out), "notes"))
     else:
         manifest_path, lines_path = common.proposal_paths(vault, "lightfield-import")
 
@@ -216,6 +246,7 @@ def main(argv=None) -> int:
 
     existing_srcs = common.collect_srcs(vault)
     people_by_name = existing_people(vault)
+    people_no_ai = {pid: no_ai for pid, no_ai in people_by_name.values()}
     lf_map = load_map(vault)
     warnings: list[str] = []
     skipped: list[dict] = []
@@ -223,6 +254,7 @@ def main(argv=None) -> int:
     records: list[dict] = []
     alias_candidates: list[dict] = []
     contact_to_person: dict[str, str] = {}
+    contact_no_ai: dict[str, bool] = {}
     seen_in_batch: set[str] = set()
     import_map_additions: dict[str, str] = {}
 
@@ -264,22 +296,41 @@ def main(argv=None) -> int:
             # Already imported in an earlier run: link dependents to the
             # existing person, propose nothing new.
             contact_to_person[cid] = lf_map[f"contact:{cid}"]
+            # Still seed no-ai: the linked person's new deals, notes and
+            # transcripts inherit it even though the contact row is skipped.
+            if people_no_ai.get(lf_map[f"contact:{cid}"], False):
+                contact_no_ai[cid] = True
             skipped.append({"id": cid,
                             "reason": f"already imported (contact:{cid} in "
                                       f"lightfield-import-map.json)"})
             continue
         if not not_seen("contact", cid):
             continue
-        pid = people_by_name.get(name)
-        if pid:
+        no_ai = is_no_ai(c)
+        contact_no_ai[cid] = no_ai
+        matched = people_by_name.get(name)
+        if matched:
+            pid, existing_no_ai = matched
             warnings.append(f"contact {cid} ({name}): matched existing person {pid}; "
                             f"linking, please verify")
+            if existing_no_ai:
+                # The vault person is already no-ai: inherit it so the
+                # contact's new deals, notes and transcripts can't arrive
+                # cleared.
+                contact_no_ai[cid] = True
+            elif no_ai:
+                warnings.append(f"contact {cid} ({name}): no-ai set on the export row "
+                                f"but {pid} already exists — set no-ai on the person "
+                                f"record by hand")
         else:
             pid = "p-" + common.new_ulid()
             body = (c.get("notes") or "").strip()
+            front = [f"id: {pid}", "type: person", f"name: {name}"]
+            if no_ai:
+                front.append("no-ai: true")
             records.append({
                 "path": f"people/{pid}/profile.md",
-                "content": f"---\nid: {pid}\ntype: person\nname: {name}\n---\n\n{body}\n",
+                "content": "---\n" + "\n".join(front) + f"\n---\n\n{body}\n",
             })
             warnings.append(f"contact {cid} ({name}): no vault match; new person {pid} "
                             f"(merge duplicates later if needed)")
@@ -317,6 +368,10 @@ def main(argv=None) -> int:
         front = [f"id: {deal_id}", "type: deal", f"name: {title}"]
         if pid:
             front.append(f"person: {pid}")
+        # A deal belongs to its client: inherit no-ai from the contact row
+        # so a no-ai client's deal can't arrive cleared.
+        if contact_no_ai.get(d.get("contact_id", ""), False):
+            front.append("no-ai: true")
         notes = (d.get("notes") or "").strip()
         records.append({
             "path": f"deals/{deal_id}/deal.md",
@@ -354,6 +409,11 @@ def main(argv=None) -> int:
         else:
             path = f"notes/{note_id}.md"
             warnings.append(f"note {nid}: no person link; top-level note {note_id}")
+        # no-ai on the row, or inherited from a no-ai contact: the note
+        # belongs to that client either way.
+        no_ai = is_no_ai(n) or contact_no_ai.get(n.get("contact_id", ""), False)
+        if no_ai:
+            front.append("no-ai: true")
         text = (n.get("text") or "").strip()
         if notes_dir is None:
             notes_dir = common.proposal_notes_dir(manifest_path)
@@ -364,6 +424,7 @@ def main(argv=None) -> int:
                         "note_id": note_id,
                         "person": pid or None,
                         "date": date,
+                        "no_ai": no_ai,
                         "body_file": body_file,
                         "request_id": common.new_ulid()})
         import_map_additions[f"note:{nid}"] = note_id
@@ -397,10 +458,13 @@ def main(argv=None) -> int:
             continue
         iid = "i-" + common.new_ulid()
         text = (t.get("text") or "").strip()
+        front = [f"id: {iid}", "type: interaction",
+                 f"name: Session {date}", f"date: {date}", f"person: {pid}"]
+        if contact_no_ai.get(t.get("contact_id", ""), False):
+            front.append("no-ai: true")
         records.append({
             "path": f"interactions/{iid}/interaction.md",
-            "content": (f"---\nid: {iid}\ntype: interaction\n"
-                        f"name: Session {date}\ndate: {date}\nperson: {pid}\n---\n\n{text}\n"),
+            "content": "---\n" + "\n".join(front) + f"\n---\n\n{text}\n",
         })
         import_map_additions[f"transcript:{tid}"] = iid
         add_line(date, f"{date} session {pid} {common.format_duration(minutes)} {billing} "

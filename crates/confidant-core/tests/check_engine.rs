@@ -3180,9 +3180,27 @@ fn check_messages_do_not_echo_seeded_filenames() {
         .iter()
         .filter_map(|f| f["file"].as_str())
         .collect();
+    // #7: the file field must not carry a name either — only trusted
+    // path components plus the redaction marker, so the operator can
+    // locate it. Valid paths (like ledger/2026/10.cfd) still appear; only
+    // the seeded bad names must be absent.
+    let bad_names = leaks
+        .iter()
+        .filter(|l| l.contains("ZXQVLEAK"))
+        .collect::<Vec<_>>();
+    for leak in bad_names {
+        assert!(
+            !files.iter().any(|f| f.contains(leak)),
+            "{leak} leaked in check file field: {files:?}"
+        );
+    }
     assert!(
-        files.iter().any(|f| f.contains("ZXQVLEAKFILE")),
-        "location field should still name the invalid path: {files:?}"
+        files.contains(&"people/<invalid-filename>"),
+        "redacted file field should name the parent dir: {files:?}"
+    );
+    assert!(
+        files.contains(&"ledger/<invalid-filename>"),
+        "bad ledger year dir should redact to ledger/: {files:?}"
     );
     assert!(codes(&json).contains(&"E_LEDGER_DATE".into()), "{json}");
     let date_msgs: Vec<_> = json["findings"]
@@ -3201,6 +3219,140 @@ fn check_messages_do_not_echo_seeded_filenames() {
     assert!(
         files.contains(&"ledger/2026/10.cfd"),
         "E_LEDGER_DATE keeps the path in file: {files:?}"
+    );
+}
+
+/// #7: a valid record that is merely unreadable (bad permissions) keeps its
+/// exact vault-relative path — it is not redacted and gains no marker.
+#[test]
+#[cfg(unix)]
+fn check_unreadable_valid_record_keeps_exact_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    let rel = format!("people/{ADA}.md");
+    write(
+        dir.path(),
+        &rel,
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake.\n"),
+    );
+    let path = dir.path().join(&rel);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    // Self-calibrating root check: root bypasses permission bits, so the
+    // file stays readable and the test would be vacuous.
+    if fs::File::open(&path).is_ok() {
+        eprintln!("skipping: running as root, chmod 000 has no effect");
+        return;
+    }
+    let json = report_json(dir.path(), None);
+    let finding = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "E_UNREADABLE")
+        .expect("expected an E_UNREADABLE finding");
+    assert_eq!(
+        finding["file"].as_str().unwrap(),
+        format!("people/{ADA}.md"),
+        "valid-but-unreadable record must keep its exact path: {finding:?}"
+    );
+}
+
+/// #7: the EntryKind::Other arm (FIFO, socket, …) redacts a leaky name.
+#[test]
+#[cfg(unix)]
+fn check_fifo_entry_does_not_leak_name() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let fifo = dir.path().join("people/ZXQVLEAKFIFO");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success(), "mkfifo failed");
+    let json = report_json(dir.path(), None);
+    let dumped = json.to_string();
+    assert!(
+        !dumped.contains("ZXQVLEAKFIFO"),
+        "FIFO name leaked in check output: {dumped}"
+    );
+    let files: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"people/<invalid-filename>"),
+        "expected the redacted Other-arm finding: {files:?}"
+    );
+}
+
+/// #7 (round 2): a non-canonical ledger file with conflict markers redacts
+/// both the LedgerPath finding and the E_MERGE_CONFLICT file field.
+#[test]
+fn check_ledger_merge_conflict_does_not_leak_name() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(
+        dir.path(),
+        "ledger/2026/ZXQVLEAK.cfd",
+        "<<<<<<< HEAD\n2026-09-01 session\n=======\n>>>>>>> branch\n",
+    );
+    let json = report_json(dir.path(), None);
+    let dumped = json.to_string();
+    assert!(
+        !dumped.contains("ZXQVLEAK"),
+        "ledger filename leaked in check output: {dumped}"
+    );
+    assert!(codes(&json).contains(&"E_LEDGER_PATH".into()), "{json}");
+    assert!(codes(&json).contains(&"E_MERGE_CONFLICT".into()), "{json}");
+    let files: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"ledger/2026/<invalid-filename>"),
+        "expected the redacted ledger path on both findings: {files:?}"
+    );
+}
+
+/// #7 (round 2): an unreadable ledger subdirectory redacts the directory
+/// name in the directory-level Unreadable finding.
+#[test]
+#[cfg(unix)]
+fn check_unreadable_ledger_dir_does_not_leak_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    let sub = dir.path().join("ledger/2026/ZXQVLEAKDIR");
+    fs::create_dir_all(&sub).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+    // Self-calibrating root check: root bypasses permission bits, so the
+    // directory stays listable and the test would be vacuous.
+    if std::fs::read_dir(&sub).is_ok() {
+        eprintln!("skipping: running as root, chmod 000 has no effect");
+        return;
+    }
+    let json = report_json(dir.path(), None);
+    let dumped = json.to_string();
+    assert!(
+        !dumped.contains("ZXQVLEAKDIR"),
+        "ledger directory name leaked in check output: {dumped}"
+    );
+    let files: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_UNREADABLE")
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"ledger/2026/<invalid-filename>"),
+        "expected the redacted ledger dir path: {files:?}"
     );
 }
 

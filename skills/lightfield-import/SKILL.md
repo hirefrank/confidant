@@ -88,7 +88,9 @@ rows are warned and skipped):
        --body-file <body_file from the note record> \
        --request-id <note's request_id from the manifest> --json --no-input
    ```
-   (Omit `--person` when the note record's `person` is null.)
+   (Omit `--person` when the note record's `person` is null. Add
+   `--no-ai` when the note record's `no_ai` is true — the proposer sets
+   it from the export row's `"no-ai"` or from a no-ai contact.)
 6. Person/deal/interaction records: **pre-M2 only**, hand-create the
    files from the manifest's `records[]`, then run
    `confidant check --json` to validate before committing (one commit).
