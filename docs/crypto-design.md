@@ -847,3 +847,14 @@ operator's own person record is impossible by construction. The milestone-3
 writer calls it to pick the target key and re-encrypts a deal under the new
 person's epoch in the same signed commit when the deal's `person` changes.
 
+Guarantees (stated behavior, reviewed in #87): `shred` refuses the reserved
+client ids `vault:lookup` and `vault:shared` up front, before the verify
+pass, leaving `keys/vault` (including `lookup.age`) and `keys/shared`
+untouched; it fails closed — every file under `keys/` byte-identical — when
+any initialized dir under `keys/` other than `vault/` is absent from
+`all_clients` (the strand check, mapping dir names back through
+`client_id_for_dir`, so an omitted `vault:shared` is caught). A blank or
+whitespace `person` errors for every record type, `org` included; only
+`None` routes to `vault:shared`. `client_id_for_record` requires the `p-`
+person-id prefix and rejects `/`, `\`, `..`, and reserved `vault:` ids.
+
