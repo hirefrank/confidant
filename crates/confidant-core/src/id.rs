@@ -1056,43 +1056,97 @@ mod tests {
     fn scan_id_tokens_is_linear_on_long_cjk_and_url_lines() {
         use std::collections::HashSet;
         use std::time::{Duration, Instant};
-        let cjk = format!("{}-{}", "漢".repeat(40_000), "字".repeat(40_000));
-        let url = format!("https://example.com/{}", "-".repeat(320_000));
+
+        // Linearity is checked by scaling, not by a wall-clock budget. Each
+        // adversarial input is scanned at two sizes 2x apart; the larger
+        // must take at most 3x the smaller (true linear growth is ~2x, so
+        // the headroom is for timing noise, while quadratic growth at ~4x
+        // fails clearly). Each round times the small input and then the
+        // large input back-to-back so both see the same load, and the
+        // minimum ratio across rounds is asserted: scheduling noise only
+        // ever inflates a run, and pairing the runs keeps drifting load
+        // from skewing the comparison. Ratios stay stable on a loaded
+        // machine, where the old absolute budget flaked (#43). A generous
+        // absolute cap remains purely as a hang guard, not a performance
+        // budget.
+
+        /// Minimum large/small scan-time ratio over back-to-back rounds.
+        /// Fails fast if a single run exceeds the hang-guard cap.
+        fn min_scaling_ratio(
+            small: &str,
+            large: &str,
+            scan: impl Fn(&str) -> Vec<super::IdToken>,
+        ) -> f64 {
+            const ROUNDS: u32 = 5;
+            const HANG_CAP: Duration = Duration::from_secs(30);
+            let mut best = f64::INFINITY;
+            for _ in 0..ROUNDS {
+                let t0 = Instant::now();
+                std::hint::black_box(scan(small));
+                let small_dt = t0.elapsed();
+                let t1 = Instant::now();
+                std::hint::black_box(scan(large));
+                let large_dt = t1.elapsed();
+                for (dt, what) in [(small_dt, "small"), (large_dt, "large")] {
+                    assert!(
+                        dt <= HANG_CAP,
+                        "scan hung: the {what} run took {dt:?} (cap {HANG_CAP:?})"
+                    );
+                }
+                let ratio = large_dt.as_secs_f64() / small_dt.as_secs_f64().max(1e-9);
+                best = best.min(ratio);
+            }
+            best
+        }
+
+        /// Assert doubling the input less than triples scan time.
+        fn assert_linear(name: &str, ratio: f64) {
+            assert!(
+                ratio <= 3.0,
+                "{name} scan is not linear: 2x input took {ratio:.2}x the time of 1x input"
+            );
+        }
+
         let ulid = "01M3TC5H00MPJG001248000002";
-        let mut crockford = "A".repeat(1_000_000);
-        crockford.push_str(ulid);
-        crockford.push_str(&"A".repeat(1_000_000));
+
+        // Long multibyte-char line.
+        let small_cjk = format!("{}-{}", "漢".repeat(20_000), "字".repeat(20_000));
+        let large_cjk = format!("{}-{}", "漢".repeat(40_000), "字".repeat(40_000));
+        assert_linear(
+            "CJK 40k→80k-char line",
+            min_scaling_ratio(&small_cjk, &large_cjk, super::scan_id_tokens),
+        );
+        assert!(super::scan_id_tokens(&large_cjk).is_empty());
+
+        // Long dash run inside a URL token.
+        let small_url = format!("https://example.com/{}", "-".repeat(160_000));
+        let large_url = format!("https://example.com/{}", "-".repeat(320_000));
+        assert_linear(
+            "URL 160k→320k-char line",
+            min_scaling_ratio(&small_url, &large_url, super::scan_id_tokens),
+        );
+        assert!(super::scan_id_tokens(&large_url).is_empty());
+
+        // 2 MB Crockford run with a vault ULID (bare-window scan).
         let mut vault = HashSet::new();
         vault.insert(ulid.to_owned());
-        let budget = Duration::from_millis(if cfg!(debug_assertions) { 1000 } else { 250 });
-        let t0 = Instant::now();
-        let cjk_toks = super::scan_id_tokens(&cjk);
-        let cjk_elapsed = t0.elapsed();
-        let t1 = Instant::now();
-        let url_toks = super::scan_id_tokens(&url);
-        let url_elapsed = t1.elapsed();
-        let t2 = Instant::now();
-        let crock_toks = super::scan_id_tokens_against(&crockford, Some(&vault));
-        let crock_elapsed = t2.elapsed();
-        assert!(cjk_toks.is_empty(), "{cjk_toks:?}");
-        assert!(url_toks.is_empty(), "{url_toks:?}");
+        let mut small_crock = "A".repeat(500_000);
+        small_crock.push_str(ulid);
+        small_crock.push_str(&"A".repeat(500_000));
+        let mut large_crock = "A".repeat(1_000_000);
+        large_crock.push_str(ulid);
+        large_crock.push_str(&"A".repeat(1_000_000));
+        assert_linear(
+            "Crockford 1MB→2MB line",
+            min_scaling_ratio(&small_crock, &large_crock, |s| {
+                super::scan_id_tokens_against(s, Some(&vault))
+            }),
+        );
         assert!(
-            crock_toks
+            super::scan_id_tokens_against(&large_crock, Some(&vault))
                 .iter()
                 .any(|t| matches!(t, super::IdToken::BareUlid(u) if u == ulid)),
-            "{crock_toks:?}"
-        );
-        assert!(
-            cjk_elapsed <= budget,
-            "CJK 80k-char line took {cjk_elapsed:?} (budget {budget:?})"
-        );
-        assert!(
-            url_elapsed <= budget,
-            "320k-char URL line took {url_elapsed:?} (budget {budget:?})"
-        );
-        assert!(
-            crock_elapsed <= budget,
-            "2 MB Crockford line took {crock_elapsed:?} (budget {budget:?})"
+            "expected the embedded ULID to be found"
         );
     }
 
