@@ -3222,6 +3222,73 @@ fn check_messages_do_not_echo_seeded_filenames() {
     );
 }
 
+/// #7: a valid record that is merely unreadable (bad permissions) keeps its
+/// exact vault-relative path — it is not redacted and gains no marker.
+#[test]
+#[cfg(unix)]
+fn check_unreadable_valid_record_keeps_exact_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    let rel = format!("people/{ADA}.md");
+    write(
+        dir.path(),
+        &rel,
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake.\n"),
+    );
+    let path = dir.path().join(&rel);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    // Self-calibrating root check: root bypasses permission bits, so the
+    // file stays readable and the test would be vacuous.
+    if fs::File::open(&path).is_ok() {
+        eprintln!("skipping: running as root, chmod 000 has no effect");
+        return;
+    }
+    let json = report_json(dir.path(), None);
+    let finding = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "E_UNREADABLE")
+        .expect("expected an E_UNREADABLE finding");
+    assert_eq!(
+        finding["file"].as_str().unwrap(),
+        format!("people/{ADA}.md"),
+        "valid-but-unreadable record must keep its exact path: {finding:?}"
+    );
+}
+
+/// #7: the EntryKind::Other arm (FIFO, socket, …) redacts a leaky name.
+#[test]
+#[cfg(unix)]
+fn check_fifo_entry_does_not_leak_name() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    let fifo = dir.path().join("people/ZXQVLEAKFIFO");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo must run");
+    assert!(status.success(), "mkfifo failed");
+    let json = report_json(dir.path(), None);
+    let dumped = json.to_string();
+    assert!(
+        !dumped.contains("ZXQVLEAKFIFO"),
+        "FIFO name leaked in check output: {dumped}"
+    );
+    let files: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+    assert!(
+        files.contains(&"people/<invalid-filename>"),
+        "expected the redacted Other-arm finding: {files:?}"
+    );
+}
+
 fn ulid_of(id: &str) -> &str {
     id.rsplit_once('-').unwrap().1
 }

@@ -37,12 +37,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
 import common  # noqa: E402
 
 BILLING_TAGS = ("paid", "pps", "comp")
+
+_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
+
+
+def _person_is_no_ai(vault: str, person: str) -> bool:
+    """True when the target person's record has `no-ai: true` in front matter."""
+    base = os.path.join(vault, "people", person)
+    for cand in (os.path.join(base, "profile.md"), base + ".md"):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        return _NO_AI_RE.search(head) is not None
+    return False
 
 
 def parse_args(argv=None):
@@ -127,7 +143,9 @@ def main(argv=None) -> int:
     record_path = f"interactions/{iid}/interaction.md"
     front = [f"id: {iid}", "type: interaction", f"name: {title}",
              f"date: {date}", f"person: {person}"]
-    no_ai = d.get("no-ai") is True
+    # no-ai on the descriptor, or inherited from a no-ai target person: the
+    # interaction belongs to that client either way.
+    no_ai = d.get("no-ai") is True or _person_is_no_ai(vault, person)
     if no_ai:
         front.append("no-ai: true")
     record_body = (

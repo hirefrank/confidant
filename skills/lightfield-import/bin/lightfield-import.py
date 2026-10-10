@@ -58,6 +58,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import common  # noqa: E402
 
 _NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
+_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
 
 
 def is_no_ai(row: dict) -> bool:
@@ -111,9 +112,14 @@ def load_map(vault: str) -> dict[str, str]:
         return {}
 
 
-def existing_people(vault: str) -> dict[str, str]:
-    """Map profile display name -> person ID for exact-match linking."""
-    people: dict[str, str] = {}
+def existing_people(vault: str) -> dict[str, tuple[str, bool]]:
+    """Map profile display name -> (person ID, no-ai flag) for exact-match linking.
+
+    The no-ai flag is read from the person's front matter so a contact that
+    matches an existing no-ai person seeds no-ai onto their new deals, notes
+    and transcripts.
+    """
+    people: dict[str, tuple[str, bool]] = {}
     base = os.path.join(vault, "people")
     if not os.path.isdir(base):
         return people
@@ -129,7 +135,8 @@ def existing_people(vault: str) -> dict[str, str]:
                 continue
             m = _NAME_RE.search(head)
             if m:
-                people.setdefault(m.group(1).strip(), pid)
+                no_ai = _NO_AI_RE.search(head) is not None
+                people.setdefault(m.group(1).strip(), (pid, no_ai))
     return people
 
 
@@ -239,6 +246,7 @@ def main(argv=None) -> int:
 
     existing_srcs = common.collect_srcs(vault)
     people_by_name = existing_people(vault)
+    people_no_ai = {pid: no_ai for pid, no_ai in people_by_name.values()}
     lf_map = load_map(vault)
     warnings: list[str] = []
     skipped: list[dict] = []
@@ -288,6 +296,10 @@ def main(argv=None) -> int:
             # Already imported in an earlier run: link dependents to the
             # existing person, propose nothing new.
             contact_to_person[cid] = lf_map[f"contact:{cid}"]
+            # Still seed no-ai: the linked person's new deals, notes and
+            # transcripts inherit it even though the contact row is skipped.
+            if people_no_ai.get(lf_map[f"contact:{cid}"], False):
+                contact_no_ai[cid] = True
             skipped.append({"id": cid,
                             "reason": f"already imported (contact:{cid} in "
                                       f"lightfield-import-map.json)"})
@@ -296,11 +308,17 @@ def main(argv=None) -> int:
             continue
         no_ai = is_no_ai(c)
         contact_no_ai[cid] = no_ai
-        pid = people_by_name.get(name)
-        if pid:
+        matched = people_by_name.get(name)
+        if matched:
+            pid, existing_no_ai = matched
             warnings.append(f"contact {cid} ({name}): matched existing person {pid}; "
                             f"linking, please verify")
-            if no_ai:
+            if existing_no_ai:
+                # The vault person is already no-ai: inherit it so the
+                # contact's new deals, notes and transcripts can't arrive
+                # cleared.
+                contact_no_ai[cid] = True
+            elif no_ai:
                 warnings.append(f"contact {cid} ({name}): no-ai set on the export row "
                                 f"but {pid} already exists — set no-ai on the person "
                                 f"record by hand")
