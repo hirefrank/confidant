@@ -151,7 +151,10 @@ The run, in order:
    trusted signer (`E_INBOX_UNTRUSTED`). The inbox branch is append-only and
    linear: any merge commit on it is refused (`E_INBOX_UNTRUSTED`), because
    merge diffs are invisible to the per-file provenance walk.
-5. Decrypt and parse every item (`E_INBOX_CRYPTO`, `E_INBOX_ITEM`).
+5. Decrypt and parse every item (`E_INBOX_CRYPTO`, `E_INBOX_ITEM`). The
+   inbox tip is pinned before signature verification and re-verified after
+   the reads: a push in between could slip unsigned items past the trust
+   check, so any movement refuses (`E_INBOX_RACE`).
 6. Plan the merge. Ledger lines are appended to `ledger/YYYY/MM.cfd` by entry
    date. Intake is limited on purpose:
    - Every ledger line needs a `src:` (provenance and idempotency).
@@ -164,9 +167,17 @@ The run, in order:
 6. Apply the merge, then run `check` (fail on error). If `check` fails,
    everything is reverted and nothing is committed (`E_INBOX_CHECK_FAILED`).
 7. Commit the merge — **one commit per run**, message `inbox: merge N item(s)`
-   with only opaque item IDs in the body (ADR-7).
-8. Clear the merged items from the inbox branch with their own commit
-   (`inbox: clear N item(s)`).
+   with only opaque item IDs in the body (ADR-7). The commit is signed
+   (`-S`, honoring the operator's git signing config); with no commit
+   signing configured the run refuses (`E_INBOX_UNTRUSTED`) rather than
+   creating unsigned commits (ADR-10: main accepts trusted signers only).
+8. Re-verify the recorded inbox tip immediately before clearing: a push to
+   the inbox branch mid-run means the merged bytes may be stale, so the run
+   refuses (`E_INBOX_RACE`) instead of clearing content it never saw.
+   Clearing uses plumbing only (`mktree` / `commit-tree` / `update-ref`,
+   the last as an atomic compare-and-swap on the expected tip) — the inbox
+   branch is never checked out in the worktree. The clear commit
+   (`inbox: clear N item(s)`) is signed like the merge commit.
 
 The run is all-or-nothing: any failure leaves both branches untouched.
 `--dry-run` decrypts and plans without committing or clearing.

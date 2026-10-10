@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::check::{run as check_vault, CheckOptions, Severity};
 use crate::error::DomainError;
@@ -195,6 +195,12 @@ pub fn run_inbox(
 
     verify_inbox_signatures(&repo, &opts.trusted_signers)?;
 
+    // #29: pin the inbox tip before any inbox reads. A push between the
+    // signature verification above and the item reads below could slip
+    // unsigned items past the trust check; the tip is re-verified after
+    // the reads and again immediately before clearing.
+    let tip_before_reads = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+
     let names = list_items(&repo)?;
     let mut items = Vec::with_capacity(names.len());
     for name in &names {
@@ -211,6 +217,25 @@ pub fn run_inbox(
             )))
         })?;
         items.push(parse_item(name, &text)?);
+    }
+
+    // #29: record the inbox tip once every inbox read is done, and confirm
+    // it hasn't moved since the signature verification. A push in between
+    // means the bytes we merged may be stale (or unverified), so the run
+    // refuses instead of clearing content it never saw.
+    let inbox_tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    if inbox_tip != tip_before_reads {
+        return Err(anyhow::Error::new(DomainError::inbox_race(
+            &tip_before_reads,
+            &inbox_tip,
+        )));
+    }
+
+    // #52 (ADR-10): the merge and clear commits below must be signed — main
+    // accepts trusted signers only. Fail closed before applying any writes
+    // when the operator hasn't configured commit signing.
+    if !opts.dry_run && !names.is_empty() && !commit_signing_configured(&repo)? {
+        return Err(anyhow::Error::new(DomainError::inbox_signing_unconfigured()));
     }
 
     let existing_srcs = collect_ledger_srcs(vault_root);
@@ -257,7 +282,7 @@ pub fn run_inbox(
         if merged > 0 {
             commit_applied(&repo, &applied, &outcomes)?;
         }
-        clear_inbox(&repo, &branch, &names)?;
+        clear_inbox(&repo, &inbox_tip, &names)?;
     }
 
     let merged = outcomes.iter().filter(|o| o.action == "merge").count();
@@ -895,7 +920,9 @@ fn revert_applied(applied: &[AppliedChange]) {
 }
 
 /// Commit the applied writes on the current branch. Commit messages carry
-/// only opaque IDs and verbs (ADR-7): item names are ULIDs.
+/// only opaque IDs and verbs (ADR-7): item names are ULIDs. The commit is
+/// signed (`-S`, honoring the operator's git signing config); run_inbox
+/// refuses before getting here when signing isn't configured (#52, ADR-10).
 fn commit_applied(
     repo: &Path,
     applied: &[AppliedChange],
@@ -922,6 +949,7 @@ fn commit_applied(
         &[
             "commit",
             "-q",
+            "-S",
             "-m",
             &format!("inbox: merge {} item(s)", merged.len()),
             "-m",
@@ -932,31 +960,149 @@ fn commit_applied(
 }
 
 /// Remove the merged items from the inbox branch and commit the clearing.
-fn clear_inbox(repo: &Path, mainline: &str, names: &[String]) -> anyhow::Result<()> {
+///
+/// #51: plumbing only — the cleared tree is built with `mktree` from the old
+/// tip minus the cleared items, committed with `commit-tree` (parent = old
+/// tip), and the ref is moved with `update-ref`. The inbox branch is never
+/// checked out in the operator's worktree, so a crash can't strand them on
+/// it.
+///
+/// #29: `expected_tip` is the tip recorded after the items were read.
+/// It is re-verified immediately before clearing; on mismatch the run
+/// refuses with `E_INBOX_RACE` instead of deleting content it never saw.
+/// The final `update-ref` also passes the expected old value, so the move
+/// is an atomic compare-and-swap.
+///
+/// #52: the clear commit is signed (`-S`, honoring the operator's git
+/// signing config); run_inbox refuses before getting here when signing
+/// isn't configured (ADR-10).
+fn clear_inbox(repo: &Path, expected_tip: &str, names: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         return Ok(());
     }
-    git(repo, &["checkout", "-q", INBOX_BRANCH])?;
-    let result = (|| -> anyhow::Result<()> {
-        for name in names {
-            git(repo, &["rm", "-q", "--", &format!("{name}.age")])?;
+    verify_inbox_tip(repo, expected_tip)?;
+    let new_tree = build_cleared_tree(repo, expected_tip, names)?;
+    let new_commit = git_line(
+        repo,
+        &[
+            "commit-tree",
+            &new_tree,
+            "-p",
+            expected_tip,
+            "-S",
+            "-m",
+            &format!("inbox: clear {} item(s)", names.len()),
+        ],
+    )?;
+    if let Err(e) = git(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/heads/{INBOX_BRANCH}"),
+            &new_commit,
+            expected_tip,
+        ],
+    ) {
+        // The swap is atomic: failure almost always means the tip moved
+        // between the recheck above and the swap. Confirm before reporting.
+        let current = git_line(repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])
+            .unwrap_or_default();
+        if !current.is_empty() && current != expected_tip {
+            return Err(anyhow::Error::new(DomainError::inbox_race(
+                expected_tip,
+                &current,
+            )));
         }
-        git(
-            repo,
-            &[
-                "commit",
-                "-q",
-                "-m",
-                &format!("inbox: clear {} item(s)", names.len()),
-            ],
-        )?;
-        Ok(())
-    })();
-    // Always return to the mainline branch, even on failure.
-    let back = git(repo, &["checkout", "-q", mainline]);
-    result?;
-    back?;
+        return Err(e);
+    }
     Ok(())
+}
+
+/// #29: re-verify that the inbox tip is still the one recorded after the
+/// items were read. Any push in between means the merged bytes may be
+/// stale, so refuse instead of clearing.
+fn verify_inbox_tip(repo: &Path, expected_tip: &str) -> anyhow::Result<()> {
+    let current = git_line(repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    if current != expected_tip {
+        return Err(anyhow::Error::new(DomainError::inbox_race(
+            expected_tip,
+            &current,
+        )));
+    }
+    Ok(())
+}
+
+/// Build the cleared inbox tree: the old tip's tree minus the cleared
+/// items, via `git mktree`. The tip recheck guarantees the tree still
+/// holds exactly the listed items, so this is normally the empty tree;
+///
+/// keeping only unlisted entries is the safe direction regardless.
+fn build_cleared_tree(repo: &Path, old_tip: &str, names: &[String]) -> anyhow::Result<String> {
+    let ls = git(repo, &["ls-tree", old_tip])?;
+    let text = String::from_utf8_lossy(&ls.stdout);
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("mktree")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("could not run git mktree: {e}"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .expect("git mktree was spawned with piped stdin");
+        for line in text.lines() {
+            // `ls-tree` lines are `<mode> <type> <sha>\t<name>` — the same
+            // format `mktree` reads. Item stems can't contain tabs or `/`
+            // (list_items rejects them), so the tab split is safe.
+            let name = line.split('\t').nth(1).unwrap_or("");
+            let stem = name.strip_suffix(".age").unwrap_or(name);
+            if names.iter().any(|n| n == stem) {
+                continue;
+            }
+            use std::io::Write as _;
+            writeln!(stdin, "{line}")
+                .map_err(|e| anyhow::anyhow!("could not write to git mktree: {e}"))?;
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| anyhow::anyhow!("could not run git mktree: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git mktree failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// #52 (ADR-10): whether the operator has commit signing configured. Either
+/// `commit.gpgsign=true` or an explicit `user.signingkey` counts — with
+/// `-S` passed explicitly, git signs in both cases.
+fn commit_signing_configured(repo: &Path) -> anyhow::Result<bool> {
+    if git_config_get(repo, "commit.gpgsign")?.as_deref() == Some("true") {
+        return Ok(true);
+    }
+    Ok(git_config_get(repo, "user.signingkey")?.is_some_and(|s| !s.is_empty()))
+}
+
+/// `git config --get`: `None` when the key is unset (git exits 1).
+fn git_config_get(repo: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--get", key])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
 }
 
 #[cfg(test)]
@@ -1205,5 +1351,126 @@ mod tests {
         let pt = identity(LEDGER_ITEM.as_bytes()).unwrap();
         let item = parse_item("01JABC", &String::from_utf8(pt).unwrap()).unwrap();
         assert_eq!(item.kind, ItemKind::Ledger);
+    }
+
+    /// Minimal git repo for plumbing unit tests: one commit on `main` plus
+    /// an `inbox` branch holding `files`. Returns the TempDir (must stay
+    /// alive) and the repo root.
+    fn plumbing_repo(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let sh = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git failed to run");
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["init", "-b", "main", "-q"]);
+        sh(&["config", "user.name", "Test"]);
+        sh(&["config", "user.email", "test@example.com"]);
+        std::fs::write(root.join("init.txt"), "init\n").unwrap();
+        sh(&["add", "."]);
+        sh(&["commit", "-q", "-m", "init"]);
+        sh(&["checkout", "-q", "--orphan", "inbox"]);
+        sh(&["rm", "-q", "-rf", "."]);
+        for (name, text) in files {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+        sh(&["add", "."]);
+        if files.is_empty() {
+            sh(&["commit", "-q", "--allow-empty", "-m", "drop items"]);
+        } else {
+            sh(&["commit", "-q", "-m", "drop items"]);
+        }
+        sh(&["checkout", "-q", "main"]);
+        let root = root.to_path_buf();
+        (dir, root)
+    }
+
+    fn rev_parse(root: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", rev])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git rev-parse failed");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn tip_recheck_refuses_moved_tip() {
+        // #29: the tip recorded after reading no longer matches — refuse
+        // with E_INBOX_RACE instead of clearing content the run never saw.
+        // The refusal happens before any signing or tree building, so no
+        // signing config is needed here.
+        let (_dir, root) = plumbing_repo(&[("01JAAA.age", "ciphertext")]);
+        let tip = rev_parse(&root, "inbox");
+        // Unchanged tip passes.
+        verify_inbox_tip(&root, &tip).unwrap();
+        // Simulate a mid-run push: a new commit on the inbox branch, built
+        // with plumbing so the worktree is untouched.
+        let tree = rev_parse(&root, "inbox^{tree}");
+        let new_commit = {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit-tree", &tree, "-p", &tip, "-m", "mid-run push"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git commit-tree failed");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["update-ref", "refs/heads/inbox", &new_commit, &tip])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git update-ref failed");
+        assert!(out.status.success());
+        // The recorded tip is now stale: both the recheck and clear_inbox
+        // refuse, and the pushed content is untouched.
+        let err = verify_inbox_tip(&root, &tip).unwrap_err();
+        assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
+        let err = clear_inbox(&root, &tip, &["01JAAA".to_string()]).unwrap_err();
+        assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
+        assert_eq!(rev_parse(&root, "inbox"), new_commit);
+    }
+
+    #[test]
+    fn signing_check_accepts_gpgsign_or_signingkey() {
+        let (_dir, root) = plumbing_repo(&[]);
+        // Neither set: not configured.
+        assert!(!commit_signing_configured(&root).unwrap());
+        // user.signingkey alone counts (explicit -S signs).
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "user.signingkey", "test-key"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git config failed");
+        assert!(out.status.success());
+        assert!(commit_signing_configured(&root).unwrap());
     }
 }
