@@ -33,8 +33,9 @@ and shred.
    (via the keychain module; `CONFIDANT_INBOX_KEY` overrides it on headless
    hosts). It is never a file under `~/.config`, because Time Machine backs
    that up and "destroy the old key" would then be false — a plaintext
-   `inbox.key` file is refused outright. `confidant inbox rotate` rotates it
-   (see the inbox-key section of `docs/crypto-design.md`).
+   `inbox.key` file is refused outright. Rotation is handled by the planned
+   `confidant inbox rotate` command (#77; see the inbox-key section of
+   `docs/crypto-design.md`).
 2. Publish the public half in the vault's `confidant.toml`:
    ```toml
    [inbox]
