@@ -36,6 +36,15 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 getrandom = "0.2"
 hkdf = "0.12"
 hmac = "0.12"
+# OS keychain backends (keyring 3.6 has no default features — without these
+# it falls back to an in-memory mock). `dep:`-gated per platform, so all
+# are safe to enable unconditionally: macOS → Keychain Services,
+# Linux → Secret Service. The async backend is pure-Rust zbus exposed
+# through a blocking wrapper (no system libdbus needed); crypto-rust
+# avoids an OpenSSL dep. `async-io` is enabled explicitly (not left to
+# transitive resolution) because keyring's docs require picking a runtime
+# when `async-secret-service` is used.
+keyring = { version = "3.6", features = ["apple-native", "async-io", "async-secret-service", "crypto-rust"] }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
