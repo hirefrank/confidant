@@ -11,17 +11,18 @@
 //! device/agent like a data key. Importers match on aliases by recomputing
 //! the HMAC of the normalized value.
 //!
-//! Normalization: trim surrounding whitespace and lowercase (Unicode
-//! lowercase). Documented here; importers must apply the same rule.
+//! Normalization: NFC, then trim surrounding whitespace and lowercase
+//! (Unicode lowercase). Documented here; importers must apply the same rule.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::keys::LookupKey;
 
-/// Normalize an alias value before HMAC: trim + lowercase.
+/// Normalize an alias value before HMAC: NFC, then trim + lowercase.
 pub fn normalize(value: &str) -> String {
-    value.trim().to_lowercase()
+    value.nfc().collect::<String>().trim().to_lowercase()
 }
 
 /// Compute the alias HMAC, hex-encoded (at least 32 hex chars per spec §6;
@@ -72,5 +73,17 @@ mod tests {
         let h = alias_hmac(&k, "Bob");
         assert!(matches(&k, "  bob ", &h));
         assert!(!matches(&k, "alice", &h));
+    }
+
+    #[test]
+    fn nfc_before_lowercase() {
+        // "Café" precomposed (U+00E9) vs decomposed (e + U+0301) must
+        // normalize identically, or the same alias would HMAC differently.
+        let composed = "Caf\u{e9}@example.com";
+        let decomposed = "Cafe\u{301}@example.com";
+        assert_ne!(composed.to_lowercase(), decomposed.to_lowercase());
+        assert_eq!(normalize(composed), normalize(decomposed));
+        let k = LookupKey::generate();
+        assert_eq!(alias_hmac(&k, composed), alias_hmac(&k, decomposed));
     }
 }

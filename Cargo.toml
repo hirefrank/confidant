@@ -43,6 +43,7 @@ sha2 = "0.10"
 tempfile = "3.13"
 thiserror = "2.0"
 toml = "0.8.19"
+unicode-normalization = "0.1"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
