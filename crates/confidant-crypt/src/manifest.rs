@@ -130,6 +130,9 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 /// Hex-decode (for commitment comparison).
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, Error> {
     let s = s.trim();
+    if !s.is_ascii() {
+        return Err(Error::Manifest("non-ASCII hex commitment".to_string()));
+    }
     if s.len() % 2 != 0 {
         return Err(Error::Manifest("odd-length hex commitment".to_string()));
     }
@@ -503,5 +506,15 @@ mod tests {
         let t2 = SeqTracker::load(&path).unwrap();
         assert_eq!(t2.high_water("v1", "p-A"), 3);
         assert_eq!(t2.high_water("v1", "p-B"), 0);
+    }
+
+    #[test]
+    fn decode_hex_rejects_non_ascii() {
+        // "é01" is 4 bytes (even length) but byte 2 splits the 'é':
+        // without the is_ascii() guard this panicked in the slice.
+        let err = decode_hex("é01").unwrap_err();
+        assert!(format!("{err}").contains("non-ASCII"), "{err}");
+        // Sanity: valid hex still decodes.
+        assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xff]);
     }
 }
