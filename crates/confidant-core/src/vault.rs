@@ -128,28 +128,25 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
     match paths::read_dir(root, rel) {
         Ok(listing) => {
             for (name, _) in listing.errors {
-                let child = if rel.as_os_str().is_empty() {
-                    name.clone()
-                } else {
-                    paths::display_relative(&rel.join(&name))
-                };
                 findings.push(
                     Finding::new(
                         FindingCode::Unreadable,
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(child)
+                    .at_file(redacted_filename(&rel.join(name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
             Listed::Ok(listing.entries)
         }
         Err(_) => {
+            // #7: keep "." for the empty root; anything else goes through
+            // the redactor so a leaky directory name never reaches JSON.
             let file = if rel.as_os_str().is_empty() {
                 ".".to_owned()
             } else {
-                paths::display_relative(rel)
+                redacted_filename(rel)
             };
             findings.push(
                 Finding::new(
@@ -245,14 +242,75 @@ fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
             Severity::Error,
             "leftover temporary file".to_owned(),
         )
-        .at_file(paths::display_relative(child))
+        .at_file(redacted_filename(child))
         .with_fix("Delete .confidant-tmp-* leftovers from a crashed write"),
     );
     true
 }
 
+/// `file` value for a finding about a path that is not a valid vault path
+/// (#7). Any component could be a client name — the threat model (§4)
+/// protects against filenames revealing who is a client — so the path is
+/// reported only up to the first untrusted component, which is replaced
+/// with a marker. The operator lists that directory to find the offending
+/// file; `check --json` output an agent might forward to a model never
+/// carries the name. When every component is trusted, the joined path is
+/// returned unchanged (callers must pass vault-relative paths: an absolute
+/// or `./`-prefixed path fails the trust test on its first component and
+/// collapses to a bare marker, losing the parent directory).
+fn redacted_filename(child: &Path) -> String {
+    const MARKER: &str = "<invalid-filename>";
+    let mut kept: Vec<&str> = Vec::new();
+    let mut truncated = false;
+    for comp in child.components() {
+        let Some(s) = comp.as_os_str().to_str() else {
+            truncated = true;
+            break;
+        };
+        if is_trusted_component(s) {
+            kept.push(s);
+        } else {
+            truncated = true;
+            break;
+        }
+    }
+    if kept.is_empty() {
+        return MARKER.to_owned();
+    }
+    if truncated {
+        format!("{}/{MARKER}", kept.join("/"))
+    } else {
+        kept.join("/")
+    }
+}
+
+/// Path components that can never be a client name: structural directories,
+/// valid record IDs (bare or with the `.md` record-file suffix), ledger
+/// years/months, and fixed filenames.
+fn is_trusted_component(name: &str) -> bool {
+    matches!(
+        name,
+        "people"
+            | "orgs"
+            | "deals"
+            | "interactions"
+            | "notes"
+            | "ledger"
+            | "keys"
+            | ".confidant"
+            | "confidant.toml"
+            | "profile.md"
+            | "deal.md"
+            | "interaction.md"
+    ) || is_yyyy(name)
+        || is_month_cfd(name)
+        || RecordId::parse(name).is_ok()
+        || name
+            .strip_suffix(".md")
+            .is_some_and(|stem| RecordId::parse(stem).is_ok())
+}
+
 fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
-    let file = paths::display_relative(child);
     if !ent.utf8 {
         findings.push(
             Finding::new(
@@ -260,7 +318,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "non-UTF-8 filename".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(child))
             .with_fix("Rename the file to a UTF-8 record ID"),
         );
         return;
@@ -272,7 +330,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "symbolic link".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(child))
             .with_fix("Replace the symlink with a real file or directory"),
         );
     }
@@ -313,7 +371,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                     Severity::Error,
                     "unexpected vault entry".to_owned(),
                 )
-                .at_file(&ent.name)
+                .at_file(redacted_filename(Path::new(&ent.name)))
                 .with_fix("Use the layout in spec/0.1.md (people/, orgs/, deals/, ledger/, …)"),
             );
         }
@@ -343,7 +401,7 @@ fn scan_collections(
                             Severity::Error,
                             "path is unreadable".to_owned(),
                         )
-                        .at_file(paths::display_relative(&rel.join(&name)))
+                        .at_file(redacted_filename(&rel.join(&name)))
                         .with_fix("Fix permissions or replace the unreadable entry"),
                     );
                 }
@@ -376,7 +434,7 @@ fn scan_collections(
                                         Severity::Error,
                                         "filename is not a valid record ID".to_owned(),
                                     )
-                                    .at_file(paths::display_relative(&child))
+                                    .at_file(redacted_filename(&child))
                                     .with_fix("Rename to <prefix>-<ULID>.md or move it out of the collection"),
                                 );
                             }
@@ -392,7 +450,7 @@ fn scan_collections(
                                 Severity::Error,
                                 "record directory contains an unexpected entry".to_owned(),
                             )
-                            .at_file(paths::display_relative(&child)),
+                            .at_file(redacted_filename(&child)),
                         ),
                         EntryKind::Symlink => {}
                     }
@@ -421,7 +479,7 @@ fn ingest_file(
                     Severity::Error,
                     "filename is not a valid record ID".to_owned(),
                 )
-                .at_file(&file)
+                .at_file(redacted_filename(relative))
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
             );
             return;
@@ -464,7 +522,7 @@ fn ingest_dir(
                     Severity::Error,
                     "directory name is not a valid record ID".to_owned(),
                 )
-                .at_file(&dir)
+                .at_file(redacted_filename(relative))
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
             return;
@@ -529,7 +587,7 @@ fn ingest_dir(
                 Severity::Error,
                 "record directory contains an unexpected entry".to_owned(),
             )
-            .at_file(paths::display_relative(&child))
+            .at_file(redacted_filename(&child))
             .for_id(&path_id)
             .with_fix(format!(
                 "Keep only {main} (and notes/ for people) in the record directory"
@@ -573,7 +631,7 @@ fn scan_person_notes(
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(paths::display_relative(&notes_rel.join(&name)))
+                    .at_file(redacted_filename(&notes_rel.join(&name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
@@ -599,7 +657,7 @@ fn scan_person_notes(
                             Severity::Error,
                             "filename is not a valid record ID".to_owned(),
                         )
-                        .at_file(paths::display_relative(&child)),
+                        .at_file(redacted_filename(&child)),
                     );
                     continue;
                 }
@@ -822,7 +880,8 @@ fn walk_ledger(
                         Severity::Error,
                         "path is unreadable".to_owned(),
                     )
-                    .at_file(paths::display_relative(&rel.join(&name)))
+                    // #7: entry names from a directory listing are unvalidated.
+                    .at_file(redacted_filename(&rel.join(&name)))
                     .with_fix("Fix permissions or replace the unreadable entry"),
                 );
             }
@@ -867,7 +926,9 @@ fn walk_ledger_resolved(
                     Severity::Error,
                     "path is unreadable".to_owned(),
                 )
-                .at_file(paths::display_relative(rel))
+                // #7: the symlinked directory's vault-relative name is
+                // unvalidated.
+                .at_file(redacted_filename(rel))
                 .with_fix("Fix permissions or replace the unreadable path"),
             );
             return;
@@ -972,7 +1033,7 @@ fn process_ledger_entry(
                         Severity::Error,
                         "ledger year directory is not a four-digit year".to_owned(),
                     )
-                    .at_file(paths::display_relative(&child))
+                    .at_file(redacted_filename(&child))
                     .with_fix("Use ledger/YYYY/MM.cfd"),
                 );
             }
@@ -1072,7 +1133,10 @@ fn load_ledger_file(
     findings: &mut Vec<Finding>,
     unread: &mut u32,
 ) {
-    let file = paths::display_relative(rel);
+    // #7: the file value feeds E_MERGE_CONFLICT and E_UNREADABLE findings as
+    // well as ledger lines, so it must be redacted here. A canonical
+    // ledger/YYYY/MM.cfd is fully trusted and comes back unchanged.
+    let file = redacted_filename(rel);
     let searchable = is_canonical_ledger_cfd(rel);
     if !searchable {
         findings.push(
@@ -1081,7 +1145,7 @@ fn load_ledger_file(
                 Severity::Error,
                 "ledger file is not MM.cfd".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(rel))
             .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
         );
     }
@@ -1225,7 +1289,8 @@ fn is_month_cfd(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_month_cfd;
+    use super::{is_month_cfd, redacted_filename};
+    use std::path::Path;
 
     #[test]
     fn month_names() {
@@ -1234,5 +1299,47 @@ mod tests {
         assert!(!is_month_cfd("1.cfd"));
         assert!(!is_month_cfd("13.cfd"));
         assert!(!is_month_cfd("10.md"));
+    }
+
+    #[test]
+    fn redacted_filename_cases() {
+        // A valid record file is trusted: returned unchanged, no marker.
+        assert_eq!(
+            redacted_filename(Path::new("people/p-01M3TC5H00MPJG000000000000.md")),
+            "people/p-01M3TC5H00MPJG000000000000.md"
+        );
+        // Bare valid record IDs stay trusted too.
+        assert_eq!(
+            redacted_filename(Path::new("people/p-01M3TC5H00MPJG000000000000")),
+            "people/p-01M3TC5H00MPJG000000000000"
+        );
+        // Nested note path: every component trusted, unchanged.
+        assert_eq!(
+            redacted_filename(Path::new(
+                "people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"
+            )),
+            "people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"
+        );
+        // Untrusted filename: redacted at the first bad component.
+        assert_eq!(
+            redacted_filename(Path::new("people/ZXQVLEAK.md")),
+            "people/<invalid-filename>"
+        );
+        // A non-record .md is not trusted.
+        assert_eq!(
+            redacted_filename(Path::new("people/notes.md")),
+            "people/<invalid-filename>"
+        );
+        // Absolute paths fail the trust test on the first component and
+        // collapse to a bare marker (callers must pass vault-relative paths).
+        assert_eq!(
+            redacted_filename(Path::new("/vault/people/ZXQVLEAK.md")),
+            "<invalid-filename>"
+        );
+        // Same for ./-prefixed paths.
+        assert_eq!(
+            redacted_filename(Path::new("./people/ZXQVLEAK.md")),
+            "<invalid-filename>"
+        );
     }
 }

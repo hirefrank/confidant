@@ -11,7 +11,13 @@ Descriptor schema:
    "duration_minutes": 60, "billing": "paid",
    "title": "Coaching session",
    "notes": "prose for the interaction body (optional)",
+   "no-ai": true,
    "transcript_path": "/path/to/transcript.txt (optional, used when notes is absent)"}
+
+`"no-ai": true` marks the proposed interaction record `no-ai` (only the
+boolean `true` counts). Use it when the client opted out in the source
+system — otherwise the transcript arrives cleared and the operator has
+to fix it by hand.
 
 Writes (proposed):
   - interactions/i-<new ULID>/interaction.md  (front matter + body)
@@ -31,12 +37,28 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
 import common  # noqa: E402
 
 BILLING_TAGS = ("paid", "pps", "comp")
+
+_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
+
+
+def _person_is_no_ai(vault: str, person: str) -> bool:
+    """True when the target person's record has `no-ai: true` in front matter."""
+    base = os.path.join(vault, "people", person)
+    for cand in (os.path.join(base, "profile.md"), base + ".md"):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        return _NO_AI_RE.search(head) is not None
+    return False
 
 
 def parse_args(argv=None):
@@ -119,14 +141,17 @@ def main(argv=None) -> int:
     iid = "i-" + common.new_ulid()
     title = d.get("title", f"Session {date}")
     record_path = f"interactions/{iid}/interaction.md"
+    front = [f"id: {iid}", "type: interaction", f"name: {title}",
+             f"date: {date}", f"person: {person}"]
+    # no-ai on the descriptor, or inherited from a no-ai target person: the
+    # interaction belongs to that client either way.
+    no_ai = d.get("no-ai") is True or _person_is_no_ai(vault, person)
+    if no_ai:
+        front.append("no-ai: true")
     record_body = (
         "---\n"
-        f"id: {iid}\n"
-        "type: interaction\n"
-        f"name: {title}\n"
-        f"date: {date}\n"
-        f"person: {person}\n"
-        "---\n"
+        + "\n".join(front) + "\n"
+        + "---\n"
         f"\n{notes}\n"
     )
     duration = common.format_duration(minutes)
@@ -154,6 +179,8 @@ def main(argv=None) -> int:
     if args.out:
         manifest_path = args.out
         lines_path = (args.out[:-5] if args.out.endswith(".json") else args.out) + ".cfd"
+        # #57: a custom --out inside the vault must be git-ignored too.
+        common.ensure_out_ignored(vault, manifest_path, lines_path)
     else:
         manifest_path, lines_path = common.proposal_paths(vault, "transcript-import")
     ledger = {common.month_file(vault, date): [line]}

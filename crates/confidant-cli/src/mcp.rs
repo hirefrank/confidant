@@ -118,12 +118,12 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "context",
-            "Context bundle for one person. Honors no-ai and --exclude-private.",
+            "Context bundle for one person. Honors no-ai; private data is stripped by default.",
             obj(
                 &["person"],
                 json!({
                     "person": str_prop("Opaque person id (p-…)."),
-                    "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies."},
+                    "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies. Default true: private data is stripped unless explicitly set to false."},
                 }),
             ),
         ),
@@ -195,6 +195,21 @@ fn get_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Privacy default for the `context` tool (#50): strip private data unless
+/// the caller explicitly opts in with `exclude_private: false`.
+///
+/// Backward compatibility: callers that passed `exclude_private: true`
+/// get the same behavior as before (stripped); callers that passed
+/// `exclude_private: false` explicitly keep getting private data. Only
+/// callers that passed nothing change — and they change toward the
+/// privacy-safe default, which is the point of #50.
+fn context_strips_private(args: &Value) -> bool {
+    !matches!(
+        args.get("exclude_private").and_then(|v| v.as_bool()),
+        Some(false)
+    )
+}
+
 /// Build the CLI argv for a tool call and run it via `current_exe`.
 fn call_tool(params: &Value, vault: &Path) -> Result<String, String> {
     let name = params
@@ -228,7 +243,7 @@ fn call_tool(params: &Value, vault: &Path) -> Result<String, String> {
         "context" => {
             cli.push("context".to_owned());
             cli.push(get_str(&args, "person")?);
-            if get_bool(&args, "exclude_private") {
+            if context_strips_private(&args) {
                 cli.push("--exclude-private".to_owned());
             }
         }
@@ -357,5 +372,31 @@ mod tests {
         let resp = handle("not json", Path::new("/tmp")).unwrap();
         assert_eq!(resp["error"]["code"], -32700);
         assert!(resp["id"].is_null());
+    }
+
+    #[test]
+    fn context_strips_private_by_default() {
+        // #50: absent -> strip (the new privacy-safe default).
+        assert!(context_strips_private(&json!({})));
+        assert!(context_strips_private(&json!({"person": "p-01"})));
+    }
+
+    #[test]
+    fn context_exclude_private_true_still_strips() {
+        // Backward compatible: explicit true keeps the old behavior.
+        assert!(context_strips_private(&json!({"exclude_private": true})));
+    }
+
+    #[test]
+    fn context_exclude_private_false_opts_in() {
+        // The only way to get private data: explicitly set false.
+        assert!(!context_strips_private(&json!({"exclude_private": false})));
+    }
+
+    #[test]
+    fn context_strips_private_ignores_non_bool() {
+        // Non-boolean values fail closed toward stripping.
+        assert!(context_strips_private(&json!({"exclude_private": "yes"})));
+        assert!(context_strips_private(&json!({"exclude_private": 1})));
     }
 }

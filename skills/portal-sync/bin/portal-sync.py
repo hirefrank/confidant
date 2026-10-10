@@ -125,6 +125,8 @@ def main(argv=None) -> int:
     if args.out:
         manifest_path = args.out
         lines_path = (args.out[:-5] if args.out.endswith(".json") else args.out) + ".cfd"
+        # #57: a custom --out inside the vault must be git-ignored too.
+        common.ensure_out_ignored(vault, manifest_path, lines_path)
     else:
         manifest_path, lines_path = common.proposal_paths(vault, "portal-sync")
     common.write_lines_file(lines_path, by_file)
