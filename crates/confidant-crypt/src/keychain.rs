@@ -22,7 +22,11 @@
 //! Resolution order for each slot:
 //! 1. `${CONFIDANT_DEVICE_KEY}` / `${CONFIDANT_INBOX_KEY}` /
 //!    `${CONFIDANT_INBOX_KEY_PREVIOUS}` env var (tests, CI, agent hosts).
-//! 2. The OS keychain.
+//! 2. The OS keychain — unless `${CONFIDANT_KEYCHAIN}=off` (tests only),
+//!    which skips the keychain as if it held no key. The switch only ever
+//!    *removes* a source: it never points at a file, it still runs the
+//!    legacy-plaintext-file refusal, and it affects loads only —
+//!    store/rotate/delete ignore it.
 //! 3. Otherwise fail closed ([`Error::NoKey`]).
 //!
 //! Before any of that: if a legacy plaintext key file
@@ -84,6 +88,13 @@ pub const DEVICE_KEY_ENV: &str = "CONFIDANT_DEVICE_KEY";
 pub const INBOX_KEY_ENV: &str = "CONFIDANT_INBOX_KEY";
 /// Env-var override for the previous inbox key (tests).
 pub const INBOX_KEY_PREVIOUS_ENV: &str = "CONFIDANT_INBOX_KEY_PREVIOUS";
+/// Env var that disables the OS keychain backend (tests only). When set
+/// to exactly `off`, loads skip the keychain as if it held no key. It
+/// only ever *removes* a source — it never points at a file — so it
+/// cannot weaken production. Env-var overrides above still work, the
+/// legacy-plaintext-file refusal still runs, and store/rotate/delete
+/// ignore it.
+pub const KEYCHAIN_DISABLE_ENV: &str = "CONFIDANT_KEYCHAIN";
 
 /// Legacy plaintext device-key file. Its presence is a hard error, never
 /// a fallback — see the module docs.
@@ -133,7 +144,9 @@ impl KeychainBackend for OsKeychain {
             Ok(s) => Ok(Some(Zeroizing::new(s))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(Error::Keychain(format!(
-                "OS keychain read failed ({service}/{account}): {e}"
+                "OS keychain read failed ({service}/{account}): {e}. \
+                 Headless Linux hosts have no Secret Service; use the key's \
+                 env-var override there."
             ))),
         }
     }
@@ -291,6 +304,12 @@ pub fn device_identity() -> Result<age::x25519::Identity, Error> {
 
 /// Parse [`inbox_key`] into an age identity for decryption. This is the
 /// decrypt entry point used by the inbox clear path.
+///
+/// NOTE for whoever wires `inbox clear` / `inbox rotate --finish`: during
+/// a rotation window (§8a.3) this only covers the *current* key. Any path
+/// that must still drain items encrypted to the old key needs
+/// [`inbox_identities`] ("tries old then new") instead, or old-key items
+/// fail before `--finish` can drain them.
 pub fn inbox_identity() -> Result<age::x25519::Identity, Error> {
     parse_identity(&inbox_key()?, "inbox key")
 }
@@ -358,7 +377,7 @@ fn load_key_opt(
         }
     }
 
-    match backend.get_password(service, account)? {
+    match backend_password(backend, service, account)? {
         Some(raw) => {
             let trimmed = raw.trim();
             validate_bech32(trimmed, what, &format!("keychain {service}/{account}"))?;
@@ -366,6 +385,22 @@ fn load_key_opt(
         }
         None => Ok(None),
     }
+}
+
+/// Read a password from the backend, unless the keychain is disabled for
+/// tests (`CONFIDANT_KEYCHAIN=off`). The kill switch only ever *removes*
+/// a source — it never points at a file — so it cannot weaken
+/// production. Loads only: store/rotate/delete call the backend
+/// directly and ignore the switch.
+fn backend_password(
+    backend: &dyn KeychainBackend,
+    service: &str,
+    account: &str,
+) -> Result<Option<Zeroizing<String>>, Error> {
+    if std::env::var(KEYCHAIN_DISABLE_ENV).as_deref() == Ok("off") {
+        return Ok(None);
+    }
+    backend.get_password(service, account)
 }
 
 fn parse_identity(raw: &[u8], what: &str) -> Result<age::x25519::Identity, Error> {
@@ -450,6 +485,14 @@ pub fn delete_inbox_key_previous() -> Result<(), Error> {
 /// slot (if there is one) so in-flight items stay drainable, then install
 /// `new_bech32` as the current key. `inbox rotate --finish` later calls
 /// [`delete_inbox_key_previous`].
+///
+/// Rotation is a keychain operation: it reads the current key from the
+/// backend only and refuses when `CONFIDANT_INBOX_KEY` or
+/// `CONFIDANT_INBOX_KEY_PREVIOUS` is set (an env override would otherwise
+/// land in the previous slot while the keychain's real key is lost). It
+/// also refuses while the previous slot is occupied — run
+/// `confidant inbox rotate --finish` first — so a second rotate can never
+/// silently destroy the oldest key without draining it.
 pub fn rotate_inbox_key(new_bech32: &str) -> Result<(), Error> {
     rotate_inbox_key_with(&OsKeychain, config_dir().as_deref(), new_bech32)
 }
@@ -462,20 +505,47 @@ fn rotate_inbox_key_with(
     // Validate the new key before touching anything.
     let new_bech32 = new_bech32.trim();
     validate_bech32(new_bech32, "inbox key", "caller")?;
-    // Preserve the current key in the previous slot so items encrypted to
-    // it stay drainable ("tries old then new"). When the current key comes
-    // from the env var (tests), the env value is what gets preserved.
-    if let Some(current) = load_key_opt(
-        backend,
-        config_dir,
-        INBOX_SERVICE,
-        INBOX_ACCOUNT,
-        INBOX_KEY_ENV,
-        LEGACY_INBOX_FILE,
-        "inbox key",
-    )? {
-        let current_str = std::str::from_utf8(&current)
-            .map_err(|e| Error::Age(format!("current inbox key is not valid UTF-8: {e}")))?;
+    // A legacy plaintext file is never silently ignored, even by rotate.
+    if let Some(dir) = config_dir {
+        refuse_if_legacy_file(
+            dir,
+            LEGACY_INBOX_FILE,
+            INBOX_SERVICE,
+            INBOX_ACCOUNT,
+            "inbox key",
+        )?;
+    }
+    // Rotation must move the key the keychain actually holds. Refuse when
+    // an env override is set: the env value would land in the previous
+    // slot while the keychain's real current key is overwritten and lost
+    // (and the env var would keep masking the new key afterwards).
+    for var in [INBOX_KEY_ENV, INBOX_KEY_PREVIOUS_ENV] {
+        if env_override_is_set(var) {
+            return Err(Error::Keychain(format!(
+                "refusing inbox key rotation: {var} is set; rotation is a keychain \
+                 operation — unset the env var first"
+            )));
+        }
+    }
+    // Refuse a second rotate inside the window: overwriting the previous
+    // slot would destroy the oldest key without ever draining it (§8a.3).
+    if backend
+        .get_password(INBOX_SERVICE, INBOX_PREVIOUS_ACCOUNT)?
+        .is_some()
+    {
+        return Err(Error::Keychain(
+            "refusing inbox key rotation: a previous key is still present; \
+             run `confidant inbox rotate --finish` first"
+                .to_string(),
+        ));
+    }
+    // Move the backend's current key into the previous slot so items
+    // encrypted to it stay drainable ("tries old then new", §8a.3). The
+    // keychain kill switch is ignored here: rotation writes the keychain,
+    // it is not a load.
+    if let Some(current) = backend.get_password(INBOX_SERVICE, INBOX_ACCOUNT)? {
+        let current_str = current.trim();
+        validate_bech32(current_str, "current inbox key", "keychain")?;
         store_key(
             backend,
             INBOX_SERVICE,
@@ -491,6 +561,14 @@ fn rotate_inbox_key_with(
         new_bech32,
         "inbox key",
     )
+}
+
+/// An env override counts as set only when it is non-empty, matching
+/// [`load_key_opt`]: an empty var falls through to the keychain.
+fn env_override_is_set(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn store_key(
@@ -671,6 +749,9 @@ mod tests {
         fn rotate(&self, new_bech32: &str) {
             rotate_inbox_key_with(&self.backend, self.dir(), new_bech32).unwrap();
         }
+        fn try_rotate(&self, new_bech32: &str) -> Result<(), Error> {
+            rotate_inbox_key_with(&self.backend, self.dir(), new_bech32)
+        }
         fn finish(&self) {
             delete_key(
                 &self.backend,
@@ -763,6 +844,11 @@ mod tests {
     fn store_load_delete_round_trip() {
         let bech32 = fresh_identity_bech32();
         let h = Harness::new();
+        // Take the env lock and clear the override: without it this test
+        // races env-setting tests and fails on shells that export the var
+        // (the env wins, so "nothing was written" would be false).
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
         store_key(
             &h.backend,
             DEVICE_SERVICE,
@@ -841,6 +927,46 @@ mod tests {
     }
 
     #[test]
+    fn rotate_refuses_while_previous_occupied() {
+        // A second rotate before `--finish` must refuse: overwriting the
+        // previous slot would destroy the oldest key without draining it.
+        let first = fresh_identity_bech32();
+        let second = fresh_identity_bech32();
+        let third = fresh_identity_bech32();
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset(INBOX_KEY_ENV);
+        _g.unset(INBOX_KEY_PREVIOUS_ENV);
+
+        h.store_inbox(&first);
+        h.rotate(&second);
+
+        let err = h.try_rotate(&third).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refusing inbox key rotation"), "{msg}");
+        assert!(msg.contains("rotate --finish"), "{msg}");
+
+        // Nothing changed: current is still the second key, previous is
+        // still the first — the oldest key was not destroyed.
+        let (current, previous) = h.load_inbox_keys().expect("unchanged");
+        assert_eq!(current.as_slice(), second.as_bytes());
+        assert_eq!(
+            previous.expect("previous kept").as_slice(),
+            first.as_bytes()
+        );
+
+        // After --finish the window is clear and rotate works again.
+        h.finish();
+        h.rotate(&third);
+        let (current, previous) = h.load_inbox_keys().expect("after finish+rotate");
+        assert_eq!(current.as_slice(), third.as_bytes());
+        assert_eq!(
+            previous.expect("previous kept").as_slice(),
+            second.as_bytes()
+        );
+    }
+
+    #[test]
     fn rotate_with_no_current_installs_new() {
         let new = fresh_identity_bech32();
         let h = Harness::new();
@@ -855,23 +981,31 @@ mod tests {
     }
 
     #[test]
-    fn rotate_preserves_env_provided_current() {
-        // When the current key comes from the env var (tests), the env
-        // value is what moves into the previous slot.
-        let old = fresh_identity_bech32();
-        let new = fresh_identity_bech32();
-        let h = Harness::new();
-        let mut _g = EnvGuard::lock();
-        _g.set(INBOX_KEY_ENV, &old);
-        _g.unset(INBOX_KEY_PREVIOUS_ENV);
+    fn rotate_refuses_when_env_var_set() {
+        // Rotation is a keychain operation: it must move the key the
+        // keychain actually holds. With an env override set, rotate
+        // refuses instead of parking the env value in the previous slot
+        // while the keychain's real current key is overwritten and lost.
+        for var in [INBOX_KEY_ENV, INBOX_KEY_PREVIOUS_ENV] {
+            let old = fresh_identity_bech32();
+            let new = fresh_identity_bech32();
+            let h = Harness::new();
+            h.store_inbox(&old);
+            let mut _g = EnvGuard::lock();
+            _g.set(var, &fresh_identity_bech32());
 
-        h.rotate(&new);
-        // The env var still points at the old key; clear it so the loader
-        // reads what rotate actually wrote to the backend.
-        _g.unset(INBOX_KEY_ENV);
-        let (current, previous) = h.load_inbox_keys().expect("after rotate");
-        assert_eq!(current.as_slice(), new.as_bytes());
-        assert_eq!(previous.expect("previous kept").as_slice(), old.as_bytes());
+            let err = h.try_rotate(&new).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("refusing inbox key rotation"), "{msg}");
+            assert!(msg.contains(var), "{msg}");
+
+            // Nothing changed: the keychain still holds the old current
+            // key and no previous slot was created.
+            _g.unset(var);
+            let (current, previous) = h.load_inbox_keys().expect("unchanged");
+            assert_eq!(current.as_slice(), old.as_bytes());
+            assert!(previous.is_none());
+        }
     }
 
     #[test]
@@ -918,6 +1052,9 @@ mod tests {
     fn store_validates_before_touching_keychain() {
         // Invalid Bech32 is refused before any keychain write is attempted.
         let h = Harness::new();
+        // Same env-lock rationale as `store_load_delete_round_trip`.
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
         let err = store_key(
             &h.backend,
             DEVICE_SERVICE,
@@ -938,6 +1075,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Age(_)), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn keychain_off_does_not_bypass_legacy_refusal() {
+        // The kill switch only removes the keychain source: the legacy
+        // plaintext-file refusal still runs with CONFIDANT_KEYCHAIN=off.
+        let bech32 = fresh_identity_bech32();
+        let h = Harness::new();
+        std::fs::write(h.dir.path().join(LEGACY_DEVICE_FILE), &bech32).unwrap();
+        let mut _g = EnvGuard::lock();
+        _g.set(KEYCHAIN_DISABLE_ENV, "off");
+        _g.set(DEVICE_KEY_ENV, &bech32);
+        let err = h.load_device().unwrap_err();
+        assert!(
+            err.to_string().contains("legacy plaintext key file"),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn keychain_off_affects_loads_only() {
+        // With CONFIDANT_KEYCHAIN=off, loads skip the backend as if it
+        // were empty (env overrides still work). Store/rotate/delete
+        // ignore the switch — they must never silently no-op.
+        let bech32 = fresh_identity_bech32();
+        let h = Harness::new();
+        h.store_inbox(&bech32);
+        let mut _g = EnvGuard::lock();
+        _g.set(KEYCHAIN_DISABLE_ENV, "off");
+        _g.unset(INBOX_KEY_ENV);
+        _g.unset(INBOX_KEY_PREVIOUS_ENV);
+
+        // Backend skipped → NoKey, even though the backend holds the key.
+        let err = h.load_inbox().unwrap_err();
+        assert!(matches!(err, Error::NoKey(_)), "unexpected: {err:?}");
+
+        // Env override still works with the switch off.
+        _g.set(INBOX_KEY_ENV, &bech32);
+        let raw = h.load_inbox().expect("env override works");
+        assert_eq!(raw.as_slice(), bech32.as_bytes());
+        _g.unset(INBOX_KEY_ENV);
+
+        // Rotate ignores the switch: it reads the real backend, moves the
+        // old key into the previous slot, and installs the new one.
+        let new = fresh_identity_bech32();
+        h.rotate(&new);
+        // Delete ignores the switch too.
+        h.finish();
+
+        _g.unset(KEYCHAIN_DISABLE_ENV);
+        let (current, previous) = h.load_inbox_keys().expect("after rotate");
+        assert_eq!(current.as_slice(), new.as_bytes());
+        assert!(previous.is_none(), "finish deleted previous despite switch");
     }
 
     fn bech32_public(bech32: &str) -> String {

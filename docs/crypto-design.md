@@ -455,6 +455,9 @@ vault-wide keypair:
    tries old then new during this window), then destroys the old private
    key from the keychain. After `--finish`, items sent to the old key fail
    closed with `E_INBOX_CRYPTO` and the tool drops them again from source.
+   `inbox rotate` refuses while the previous slot is still occupied — run
+   `inbox rotate --finish` first — so a second rotate can never silently
+   destroy the oldest key without draining it.
 4. **Shredding rotates the inbox key.** Cleared items stay in the inbox
    branch history, encrypted to whatever inbox key was current, and item
    names are opaque — we can't tell which past items belonged to the
