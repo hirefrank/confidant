@@ -925,24 +925,50 @@ impl SignerChecker for FakeChecker {
     }
 }
 
+/// Throwaway trust anchor for history tests (fake keys, ADR-14).
+fn test_anchor() -> (Anchor, String) {
+    use confidant_crypt::history::ssh_fingerprint;
+    let operator = SigningKey::generate(&mut OsRng).verifying_key();
+    let recovery = SigningKey::generate(&mut OsRng).verifying_key();
+    let fingerprint = ssh_fingerprint(&operator);
+    let anchor = Anchor {
+        operator,
+        recovery,
+        recovery_age: "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0".to_string(),
+        source: std::path::PathBuf::from("/test/trust.toml"),
+    };
+    (anchor, fingerprint)
+}
+
+/// Parse an `ssh-ed25519` public-key line into a `VerifyingKey`.
+fn ssh_pubkey_line_to_key(line: &str) -> ed25519_dalek::VerifyingKey {
+    use base64::prelude::*;
+    let b64 = line.split_whitespace().nth(1).expect("ssh pubkey line");
+    let wire = BASE64_STANDARD.decode(b64).expect("base64 pubkey");
+    // wire = u32 len || "ssh-ed25519" || u32 len || 32-byte key
+    let key_bytes: [u8; 32] = wire[wire.len() - 32..].try_into().expect("32-byte key");
+    ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).expect("valid ed25519 key")
+}
+
 #[test]
 fn test15_rollback_replay_unsigned_refused() {
     // An older file version (valid AAD, stale no-ai: false) restored via an
     // UNSIGNED commit must be refused; the same restore via a trusted-signed
     // commit is honored.
+    let (anchor, fingerprint) = test_anchor();
+    let fp = fingerprint.clone();
     let checker = FakeChecker {
         signers: std::collections::HashMap::from([
-            ("tip-signed".to_string(), Some(('G', "KEY1".to_string()))),
-            ("v2-signed".to_string(), Some(('G', "KEY1".to_string()))),
+            ("tip-signed".to_string(), Some(('G', fp.clone()))),
+            ("v2-signed".to_string(), Some(('G', fp))),
             ("rollback-unsigned".to_string(), None),
         ]),
     };
-    let trusted = vec!["KEY1".to_string()];
 
     // Unsigned rollback introducing the stale content -> hard error.
     let err = verify_history(
         &checker,
-        &trusted,
+        &anchor,
         "tip-signed",
         &["rollback-unsigned".to_string()],
     )
@@ -950,7 +976,7 @@ fn test15_rollback_replay_unsigned_refused() {
     assert!(format!("{err}").contains("untrusted/unsigned"));
 
     // Same content via a trusted-signed commit -> honored.
-    assert!(verify_history(&checker, &trusted, "tip-signed", &["v2-signed".to_string()]).is_ok());
+    assert!(verify_history(&checker, &anchor, "tip-signed", &["v2-signed".to_string()]).is_ok());
 }
 
 fn git(repo: &Path, args: &[&str]) {
@@ -1008,7 +1034,8 @@ fn test15_rollback_replay_real_git() {
 
     let checker = GitSignerChecker::new(repo);
     // No signatures anywhere -> tip unsigned -> refused.
-    let err = verify_history(&checker, &["KEY1".to_string()], &tip, &[rollback]).unwrap_err();
+    let (anchor, _) = test_anchor();
+    let err = verify_history(&checker, &anchor, &tip, &[rollback]).unwrap_err();
     assert!(format!("{err}").contains("not signed by a trusted key"));
 }
 
@@ -1105,12 +1132,25 @@ fn test15_merge_rollback_unsigned_side_refused() {
     assert!(with_m.contains(&side), "side commit must be listed");
 
     // The merge is signed by a trusted key, but the unsigned side commit in
-    // the introducing list is refused.
+    // the introducing list is refused. The trust anchor pins the merge's
+    // SSH signing key: its fingerprint must match what git reports (%GF).
     use confidant_crypt::history::GitSignerChecker;
+    let operator = ssh_pubkey_line_to_key(&pubkey);
+    assert_eq!(
+        confidant_crypt::history::ssh_fingerprint(&operator),
+        fingerprint,
+        "anchor-derived fingerprint must match ssh-keygen"
+    );
+    let anchor = Anchor {
+        operator,
+        recovery: SigningKey::generate(&mut OsRng).verifying_key(),
+        recovery_age: "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0".to_string(),
+        source: std::path::PathBuf::from("/test/trust.toml"),
+    };
     let checker = GitSignerChecker::new(repo);
     let err = verify_history(
         &checker,
-        &[fingerprint],
+        &anchor,
         &merge_commit,
         &[merge_commit.clone(), side],
     )
