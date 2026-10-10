@@ -37,7 +37,8 @@ pub use id::RecordId;
 #[cfg(test)]
 pub use inbox::inbox_decrypt;
 pub use inbox::{
-    run_inbox, DecryptFn, InboxKeys, InboxOptions, InboxReport, ItemOutcome, INBOX_BRANCH,
+    run_inbox, run_inbox_rotate, DecryptFn, InboxKeys, InboxOptions, InboxReport,
+    InboxRotateOptions, InboxRotateOutcome, ItemOutcome, INBOX_BRANCH,
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};

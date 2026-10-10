@@ -1008,6 +1008,6 @@ fn leftover_warnings() -> Vec<String> {
         "Old private keys may linger in OS keychains or OS backups — destroy them now.".to_string(),
         "Copies outside Confidant entirely (e.g. Drive transcripts) are not affected.".to_string(),
         "This shred issued a new recovery phrase. Destroy every copy of the old recovery phrase (paper, 1Password); until you do, it still opens history.".to_string(),
-        "Inbox rotation is pending: run `confidant inbox rotate --finish` to destroy the old inbox key; until then old form answers in history remain readable.".to_string(),
+        "Inbox rotation is pending: this shred is not complete until `confidant inbox rotate --finish` has run on the inbox device; until then old form answers in history remain readable.".to_string(),
     ]
 }

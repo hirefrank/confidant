@@ -113,8 +113,9 @@ pub type InboxKeys = (Zeroizing<Vec<u8>>, Option<Zeroizing<Vec<u8>>>);
 
 /// How key material is read and written. The production backend is the
 /// real OS keychain; tests use an in-memory map so they never touch the
-/// real keychain.
-trait KeychainBackend {
+/// real keychain. Public so `confidant-core`'s inbox rotation can run
+/// against an injected backend in tests.
+pub trait KeychainBackend {
     fn get_password(
         &self,
         service: &str,
@@ -124,8 +125,9 @@ trait KeychainBackend {
     fn delete_credential(&self, service: &str, account: &str) -> Result<(), Error>;
 }
 
-/// The production backend: the real OS keychain via `keyring`.
-struct OsKeychain;
+/// The production backend: the real OS keychain via `keyring`. Public so
+/// the CLI can pass it to backend-parameterized operations.
+pub struct OsKeychain;
 
 impl KeychainBackend for OsKeychain {
     fn get_password(
@@ -181,22 +183,27 @@ impl KeychainBackend for OsKeychain {
 
 /// In-memory backend for tests. `keyring`'s built-in mock does not share
 /// state between separate `Entry::new` calls, so it cannot do a
-/// store→load→delete round trip; this one can.
-#[cfg(test)]
-struct MemoryKeychain {
+/// store→load→delete round trip; this one can. Always compiled (not
+/// `#[cfg(test)]`) so integration tests in other crates can use it.
+pub struct MemoryKeychain {
     map: std::sync::Mutex<std::collections::HashMap<(String, String), String>>,
 }
 
-#[cfg(test)]
 impl MemoryKeychain {
-    fn new() -> Self {
+    /// An empty in-memory keychain.
+    pub fn new() -> Self {
         MemoryKeychain {
             map: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
 
-#[cfg(test)]
+impl Default for MemoryKeychain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeychainBackend for MemoryKeychain {
     fn get_password(
         &self,
@@ -317,7 +324,16 @@ pub fn inbox_identity() -> Result<age::x25519::Identity, Error> {
 /// Parse both inbox slots into age identities for decryption ("tries old
 /// then new", §8a.3).
 pub fn inbox_identities() -> Result<(age::x25519::Identity, Option<age::x25519::Identity>), Error> {
-    let (current, previous) = inbox_keys()?;
+    inbox_identities_with(&OsKeychain, config_dir().as_deref())
+}
+
+/// Backend-parameterized [`inbox_identities`]. Public so `confidant-core`
+/// can load inbox key material from an injected backend in tests.
+pub fn inbox_identities_with(
+    backend: &dyn KeychainBackend,
+    config_dir: Option<&Path>,
+) -> Result<(age::x25519::Identity, Option<age::x25519::Identity>), Error> {
+    let (current, previous) = inbox_keys_with(backend, config_dir)?;
     let current = parse_identity(&current, "inbox key")?;
     let previous = previous
         .map(|p| parse_identity(&p, "previous inbox key"))
@@ -473,8 +489,15 @@ pub fn delete_inbox_key() -> Result<(), Error> {
 /// Delete the previous inbox key. Deleting a key that is not there is a
 /// no-op.
 pub fn delete_inbox_key_previous() -> Result<(), Error> {
+    delete_inbox_key_previous_with(&OsKeychain)
+}
+
+/// Delete the previous inbox key via an injected backend. Deleting a key
+/// that is not there is a no-op. Used by `inbox rotate --finish` (§8a.3);
+/// public so `confidant-core` can run it against a test backend.
+pub fn delete_inbox_key_previous_with(backend: &dyn KeychainBackend) -> Result<(), Error> {
     delete_key(
-        &OsKeychain,
+        backend,
         INBOX_SERVICE,
         INBOX_PREVIOUS_ACCOUNT,
         "previous inbox key",
@@ -497,7 +520,9 @@ pub fn rotate_inbox_key(new_bech32: &str) -> Result<(), Error> {
     rotate_inbox_key_with(&OsKeychain, config_dir().as_deref(), new_bech32)
 }
 
-fn rotate_inbox_key_with(
+/// Backend-parameterized [`rotate_inbox_key`]. Public so `confidant-core`'s
+/// inbox rotation can run against an injected backend in tests.
+pub fn rotate_inbox_key_with(
     backend: &dyn KeychainBackend,
     config_dir: Option<&Path>,
     new_bech32: &str,

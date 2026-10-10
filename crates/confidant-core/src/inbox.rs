@@ -90,6 +90,27 @@ impl InboxKeys {
         }
     }
 
+    /// Backend-parameterized [`InboxKeys::load_opt`]: load from an injected
+    /// keychain backend (tests) instead of the OS keychain.
+    pub fn load_opt_with(
+        backend: &dyn confidant_crypt::keychain::KeychainBackend,
+        config_dir: Option<&Path>,
+    ) -> anyhow::Result<Option<Self>> {
+        match confidant_crypt::keychain::inbox_identities_with(backend, config_dir) {
+            Ok((current, previous)) => Ok(Some(Self { current, previous })),
+            Err(confidant_crypt::Error::NoKey(_)) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
+                "{e}"
+            )))),
+        }
+    }
+
+    /// True while the previous slot is occupied (the rotation window,
+    /// §8a.3): old-key items still decrypt, `--finish` is pending.
+    pub fn has_previous(&self) -> bool {
+        self.previous.is_some()
+    }
+
     /// Decrypt with the current key, falling back to the previous one
     /// during the rotation window. Fails closed with `E_INBOX_CRYPTO`.
     pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -396,6 +417,245 @@ pub fn run_inbox(
         warnings,
         empty: false,
     })
+}
+
+/// Options for [`run_inbox_rotate`].
+pub struct InboxRotateOptions {
+    /// `false`: `inbox rotate` — drain, install a new keypair, update pins.
+    /// `true`: `inbox rotate --finish` — drain leftovers, destroy the old key.
+    pub finish: bool,
+    /// Proceed without verifying inbox branch signatures during the drain.
+    pub allow_unsigned: bool,
+    /// Signing key IDs trusted to push the inbox branch (ADR-10).
+    pub trusted_signers: Vec<String>,
+    /// The operator's out-of-band pin of the vault's inbox public key.
+    pub pinned_pubkey: Option<String>,
+}
+
+/// What `inbox rotate` / `inbox rotate --finish` did (§8a.3).
+#[derive(Clone, Debug)]
+pub struct InboxRotateOutcome {
+    /// The drain report, when a drain ran (`None` on the lost-key path).
+    pub drain: Option<InboxReport>,
+    /// The new age recipient (`age1...`), when a new keypair was installed.
+    pub new_recipient: Option<String>,
+    /// True when `--finish` destroyed the old private key.
+    pub old_key_destroyed: bool,
+    /// True when the old key was unavailable: the drain was skipped and
+    /// there is no `--finish` to run (lost-key path, §8a.2).
+    pub lost_key: bool,
+}
+
+/// Rotate the inbox key: drain-then-destroy (§8a.3).
+///
+/// `inbox rotate` (finish `false`): drains the inbox with a normal run,
+/// generates a new X25519 keypair, moves the old key into the keychain's
+/// previous slot via [`rotate_inbox_key_with`], and updates
+/// `confidant.toml [inbox].pubkey` (committed) and the user-config pin.
+/// When no old key is enrolled the drain is skipped — the lost-key path
+/// (§8a.2): there is no old private key to drain with, and no `--finish`
+/// to run.
+///
+/// `inbox rotate --finish` (finish `true`): drains anything still
+/// encrypted to the old key (decryption tries old then new during the
+/// window), then destroys the old private key with
+/// [`delete_inbox_key_previous_with`]. Afterwards, items sent to the old
+/// key fail closed with `E_INBOX_CRYPTO`. Idempotent: with no previous key
+/// it reports `old_key_destroyed: false` and changes nothing.
+///
+/// [`rotate_inbox_key_with`]: confidant_crypt::keychain::rotate_inbox_key_with
+/// [`delete_inbox_key_previous_with`]: confidant_crypt::keychain::delete_inbox_key_previous_with
+pub fn run_inbox_rotate(
+    vault_root: &Path,
+    backend: &dyn confidant_crypt::keychain::KeychainBackend,
+    keychain_config_dir: Option<&Path>,
+    vault_config_path: &Path,
+    user_config_path: &Path,
+    opts: &InboxRotateOptions,
+) -> anyhow::Result<InboxRotateOutcome> {
+    use confidant_crypt::keychain as kc;
+
+    let keys: Option<std::sync::Arc<InboxKeys>> =
+        InboxKeys::load_opt_with(backend, keychain_config_dir)?.map(std::sync::Arc::new);
+
+    if opts.finish {
+        let keys = keys.ok_or_else(|| {
+            DomainError::inbox_crypto("no inbox key enrolled; nothing to finish".to_string())
+        })?;
+        if !keys.has_previous() {
+            // Idempotent: the window is already closed.
+            return Ok(InboxRotateOutcome {
+                drain: None,
+                new_recipient: None,
+                old_key_destroyed: false,
+                lost_key: false,
+            });
+        }
+        let drain = drain_for_rotate(vault_root, &keys, opts)?;
+        kc::delete_inbox_key_previous_with(backend).map_err(|e| {
+            anyhow::Error::new(DomainError::inbox_crypto(format!(
+                "could not destroy the old inbox key: {e}"
+            )))
+        })?;
+        return Ok(InboxRotateOutcome {
+            drain: Some(drain),
+            new_recipient: None,
+            old_key_destroyed: true,
+            lost_key: false,
+        });
+    }
+
+    // `inbox rotate`.
+    let (drain, lost_key) = match &keys {
+        Some(keys) => {
+            if keys.has_previous() {
+                // Fail fast with the same message the keychain rotation
+                // would refuse with — draining first would be pointless.
+                return Err(anyhow::Error::new(DomainError::inbox_crypto(
+                    "refusing inbox key rotation: a previous key is still present; \
+                     run `confidant inbox rotate --finish` first"
+                        .to_string(),
+                )));
+            }
+            (Some(drain_for_rotate(vault_root, keys, opts)?), false)
+        }
+        // Lost-key path (§8a.2): no old private key, so no drain and no
+        // `--finish` — generate and install the new keypair directly.
+        None => (None, true),
+    };
+
+    // Generate the new keypair. The secret lives in a `Zeroizing<String>`
+    // from here until the keychain takes its copy.
+    let identity = age::x25519::Identity::generate();
+    let new_recipient = identity.to_public().to_string();
+    let new_secret = zeroize::Zeroizing::new({
+        use age::secrecy::ExposeSecret;
+        identity.to_string().expose_secret().to_owned()
+    });
+    kc::rotate_inbox_key_with(backend, keychain_config_dir, new_secret.as_str()).map_err(|e| {
+        anyhow::Error::new(DomainError::inbox_crypto(format!(
+            "could not rotate the inbox key: {e}"
+        )))
+    })?;
+    drop(new_secret);
+
+    // Update the pins: the vault's advertised pubkey (committed) and the
+    // operator's out-of-band pin in the user config.
+    update_inbox_pubkey_pin(vault_config_path, &new_recipient)?;
+    commit_vault_config(vault_root, vault_config_path, &new_recipient)?;
+    update_inbox_pubkey_pin(user_config_path, &new_recipient)?;
+
+    Ok(InboxRotateOutcome {
+        drain,
+        new_recipient: Some(new_recipient),
+        old_key_destroyed: false,
+        lost_key,
+    })
+}
+
+/// Run a normal (non-dry-run) inbox drain as the first step of a rotation.
+/// The decrypt closure owns an `Arc` clone so it is `'static`, as
+/// [`run_inbox`] requires.
+fn drain_for_rotate(
+    vault_root: &Path,
+    keys: &std::sync::Arc<InboxKeys>,
+    opts: &InboxRotateOptions,
+) -> anyhow::Result<InboxReport> {
+    let owned = keys.clone();
+    let decrypt = move |ciphertext: &[u8]| owned.decrypt(ciphertext);
+    run_inbox(
+        vault_root,
+        &InboxOptions {
+            dry_run: false,
+            trusted_signers: opts.trusted_signers.clone(),
+            allow_unsigned: opts.allow_unsigned,
+            pinned_pubkey: opts.pinned_pubkey.clone(),
+        },
+        &decrypt,
+        Some(keys.as_ref()),
+    )
+}
+
+/// Set `[inbox].pubkey` in a TOML file, preserving formatting and comments
+/// (`toml_edit`). Creates the file — and its parent directories — holding
+/// just the `[inbox]` table when it does not exist yet.
+fn update_inbox_pubkey_pin(path: &Path, recipient: &str) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| DomainError::config(format!("{} is not valid TOML: {e}", path.display())))?;
+    if !doc.contains_key("inbox") {
+        doc["inbox"] = toml_edit::table();
+    }
+    doc["inbox"]["pubkey"] = toml_edit::value(recipient);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("could not create {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Commit the rotated `confidant.toml`. The pin is public key material, so
+/// the commit message names it. This is a config change, not an intake
+/// item, so it does not go through the inbox signing gate (#52).
+fn commit_vault_config(
+    vault_root: &Path,
+    vault_config_path: &Path,
+    new_recipient: &str,
+) -> anyhow::Result<()> {
+    // The drain may have run in a subdirectory of the repo; commit from the
+    // git toplevel so the path resolves.
+    let toplevel = git_toplevel(vault_root)?;
+    let rel = toplevel_relative(&toplevel, vault_config_path)?;
+    git(&toplevel, &["add", "--", &rel.to_string_lossy()])?;
+    git(
+        &toplevel,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            &format!("inbox: rotate pubkey to {new_recipient}"),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The git toplevel containing `path`.
+fn git_toplevel(path: &Path) -> anyhow::Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("not a git repository: {}", path.display());
+    }
+    Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+}
+
+/// `path` relative to the git toplevel.
+fn toplevel_relative(toplevel: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    // Canonicalize both sides: macOS `/private/var` vs `/var` and similar
+    // must agree, or `strip_prefix` fails on identical files.
+    let canon_top = toplevel
+        .canonicalize()
+        .unwrap_or_else(|_| toplevel.to_path_buf());
+    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canon_path
+        .strip_prefix(&canon_top)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "vault config {} is not under the git toplevel {}",
+                path.display(),
+                toplevel.display()
+            )
+        })
 }
 
 impl ItemKind {

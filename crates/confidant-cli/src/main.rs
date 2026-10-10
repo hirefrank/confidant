@@ -110,6 +110,9 @@ enum Command {
         /// setups that have not configured `[trust] signers` yet.
         #[arg(long)]
         allow_unsigned: bool,
+        /// Rotate the inbox encryption key (drain-then-destroy, §8a.3).
+        #[command(subcommand)]
+        action: Option<InboxAction>,
     },
     /// Append to the ledger (one commit per write).
     Log {
@@ -154,6 +157,31 @@ enum Command {
         /// Fill note bodies with no-space CJK prose (quadratic-scan guard).
         #[arg(long)]
         cjk: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum InboxAction {
+    /// Rotate the inbox encryption key (drain-then-destroy, §8a.3).
+    ///
+    /// Drains the inbox with a normal run, generates a new X25519 keypair
+    /// in the OS keychain, and updates `confidant.toml [inbox].pubkey` and
+    /// the user-config pin. Re-pin every outside tool to the new key, then
+    /// run `inbox rotate --finish` to destroy the old private key.
+    ///
+    /// When the old key is unavailable (lost, compromised, or revoked
+    /// inbox device), the drain is skipped and there is no `--finish` to
+    /// run: old-key items fail closed with `E_INBOX_CRYPTO` and the tools
+    /// drop them again from source (§8a.2).
+    Rotate {
+        /// Finish a pending rotation: drain anything still encrypted to
+        /// the old key, then destroy the old private key from the keychain.
+        /// After this, items sent to the old key fail with `E_INBOX_CRYPTO`.
+        #[arg(long)]
+        finish: bool,
+        /// Proceed without verifying inbox branch signatures during the drain.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
 }
 
@@ -389,101 +417,112 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Inbox {
             dry_run,
             allow_unsigned,
+            action,
         } => {
             let root = vault_root.unwrap();
-            let trusted_signers = user_config
-                .as_ref()
-                .map(|u| u.trust.signers.clone())
-                .unwrap_or_default();
-            let pinned_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
-            // Load the inbox key material once per run. `None` when no key
-            // is enrolled (genuine NoKey): the #55 comparison is skipped and
-            // decryption fails closed later. Legacy-file refusals and
-            // keychain errors surface here directly.
-            let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
-                match confidant_core::InboxKeys::load_opt() {
-                    Ok(keys) => keys.map(std::sync::Arc::new),
-                    Err(err) => {
-                        let domain = DomainError::of(&err)
-                            .cloned()
-                            .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-                        print_error(json, Some(&root.display().to_string()), &domain)?;
-                        return Ok(ExitCode::from(domain.exit_code() as u8));
+            match action {
+                Some(InboxAction::Rotate {
+                    finish,
+                    allow_unsigned: rotate_unsigned,
+                }) => {
+                    cmd_inbox_rotate(&root, user_config.as_ref(), json, *finish, *rotate_unsigned)
+                }
+                None => {
+                    let trusted_signers = user_config
+                        .as_ref()
+                        .map(|u| u.trust.signers.clone())
+                        .unwrap_or_default();
+                    let pinned_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
+                    // Load the inbox key material once per run. `None` when no key
+                    // is enrolled (genuine NoKey): the #55 comparison is skipped and
+                    // decryption fails closed later. Legacy-file refusals and
+                    // keychain errors surface here directly.
+                    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
+                        match confidant_core::InboxKeys::load_opt() {
+                            Ok(keys) => keys.map(std::sync::Arc::new),
+                            Err(err) => {
+                                let domain = DomainError::of(&err)
+                                    .cloned()
+                                    .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+                                print_error(json, Some(&root.display().to_string()), &domain)?;
+                                return Ok(ExitCode::from(domain.exit_code() as u8));
+                            }
+                        };
+                    let decrypt = {
+                        let keys = inbox_keys.clone();
+                        move |ciphertext: &[u8]| match &keys {
+                            Some(k) => k.decrypt(ciphertext),
+                            None => Err(anyhow::Error::new(DomainError::inbox_crypto(
+                                "no inbox key enrolled".to_string(),
+                            ))),
+                        }
+                    };
+                    let report = match confidant_core::run_inbox(
+                        &root,
+                        &confidant_core::InboxOptions {
+                            dry_run: *dry_run,
+                            trusted_signers,
+                            allow_unsigned: *allow_unsigned,
+                            pinned_pubkey,
+                        },
+                        &decrypt,
+                        inbox_keys.as_deref(),
+                    ) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            let domain = DomainError::of(&err)
+                                .cloned()
+                                .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+                            print_error(json, Some(&root.display().to_string()), &domain)?;
+                            return Ok(ExitCode::from(domain.exit_code() as u8));
+                        }
+                    };
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "ok": true,
+                                "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                                "vault": root.display().to_string(),
+                                "branch": report.branch,
+                                "dry_run": report.dry_run,
+                                "empty": report.empty,
+                                "merged": report.merged,
+                                "cleared": report.cleared,
+                                "items": report.items.iter().map(|i| serde_json::json!({
+                                    "name": i.name,
+                                    "kind": i.kind,
+                                    "target": i.target,
+                                    "action": i.action,
+                                })).collect::<Vec<_>>(),
+                                "warnings": report.warnings,
+                            })
+                        );
+                    } else {
+                        if report.empty {
+                            println!("inbox: nothing to do (no inbox branch)");
+                        } else if report.dry_run {
+                            println!(
+                                "inbox: dry run — {} item(s) would merge, {} would be skipped",
+                                report.merged,
+                                report.items.len() - report.merged
+                            );
+                        } else {
+                            println!(
+                                "inbox: {} item(s) merged into {}, {} cleared",
+                                report.merged, report.branch, report.cleared
+                            );
+                        }
+                        for i in &report.items {
+                            println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+                        }
+                        for w in &report.warnings {
+                            println!("warning: {w}");
+                        }
                     }
-                };
-            let decrypt = {
-                let keys = inbox_keys.clone();
-                move |ciphertext: &[u8]| match &keys {
-                    Some(k) => k.decrypt(ciphertext),
-                    None => Err(anyhow::Error::new(DomainError::inbox_crypto(
-                        "no inbox key enrolled".to_string(),
-                    ))),
-                }
-            };
-            let report = match confidant_core::run_inbox(
-                &root,
-                &confidant_core::InboxOptions {
-                    dry_run: *dry_run,
-                    trusted_signers,
-                    allow_unsigned: *allow_unsigned,
-                    pinned_pubkey,
-                },
-                &decrypt,
-                inbox_keys.as_deref(),
-            ) {
-                Ok(report) => report,
-                Err(err) => {
-                    let domain = DomainError::of(&err)
-                        .cloned()
-                        .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-                    print_error(json, Some(&root.display().to_string()), &domain)?;
-                    return Ok(ExitCode::from(domain.exit_code() as u8));
-                }
-            };
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": true,
-                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                        "vault": root.display().to_string(),
-                        "branch": report.branch,
-                        "dry_run": report.dry_run,
-                        "empty": report.empty,
-                        "merged": report.merged,
-                        "cleared": report.cleared,
-                        "items": report.items.iter().map(|i| serde_json::json!({
-                            "name": i.name,
-                            "kind": i.kind,
-                            "target": i.target,
-                            "action": i.action,
-                        })).collect::<Vec<_>>(),
-                        "warnings": report.warnings,
-                    })
-                );
-            } else {
-                if report.empty {
-                    println!("inbox: nothing to do (no inbox branch)");
-                } else if report.dry_run {
-                    println!(
-                        "inbox: dry run — {} item(s) would merge, {} would be skipped",
-                        report.merged,
-                        report.items.len() - report.merged
-                    );
-                } else {
-                    println!(
-                        "inbox: {} item(s) merged into {}, {} cleared",
-                        report.merged, report.branch, report.cleared
-                    );
-                }
-                for i in &report.items {
-                    println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
-                }
-                for w in &report.warnings {
-                    println!("warning: {w}");
+                    Ok(ExitCode::SUCCESS)
                 }
             }
-            Ok(ExitCode::SUCCESS)
         }
         Command::Log { action } => {
             let root = vault_root.unwrap();
@@ -707,6 +746,94 @@ fn parse_date_arg(raw: &Option<String>) -> anyhow::Result<chrono::NaiveDate> {
 fn month_path(date: &chrono::NaiveDate) -> PathBuf {
     use chrono::Datelike;
     PathBuf::from(format!("ledger/{}/{:02}.cfd", date.year(), date.month()))
+}
+
+#[allow(clippy::too_many_arguments)]
+/// `confidant inbox rotate [--finish]` (drain-then-destroy, §8a.3).
+///
+/// The inbox private key lives in the OS keychain (never a file); rotation
+/// is a keychain operation, so the keychain's own refusals surface here
+/// directly: it refuses while `CONFIDANT_INBOX_KEY` / `_PREVIOUS` are set
+/// (unset them first) and while a previous key is still present (run
+/// `--finish` first).
+fn cmd_inbox_rotate(
+    root: &Path,
+    user_config: Option<&UserConfig>,
+    json: bool,
+    finish: bool,
+    allow_unsigned: bool,
+) -> anyhow::Result<ExitCode> {
+    use confidant_core::inbox::{run_inbox_rotate, InboxRotateOptions};
+
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        DomainError::usage("inbox rotate needs $HOME to update the user-config pin")
+    })?;
+    let user_config_path = home.join(".config/confidant/config.toml");
+    let vault_config_path = root.join("confidant.toml");
+
+    let outcome = match run_inbox_rotate(
+        root,
+        &confidant_crypt::keychain::OsKeychain,
+        None,
+        &vault_config_path,
+        &user_config_path,
+        &InboxRotateOptions {
+            finish,
+            allow_unsigned,
+            trusted_signers: user_config
+                .map(|u| u.trust.signers.clone())
+                .unwrap_or_default(),
+            pinned_pubkey: user_config.and_then(|u| u.inbox.pubkey.clone()),
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let domain = DomainError::of(&err)
+                .cloned()
+                .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+            print_error(json, Some(&root.display().to_string()), &domain)?;
+            return Ok(ExitCode::from(domain.exit_code() as u8));
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                "vault": root.display().to_string(),
+                "finish": finish,
+                "drained": outcome.drain.as_ref().map(|d| d.merged),
+                "new_recipient": outcome.new_recipient,
+                "old_key_destroyed": outcome.old_key_destroyed,
+                "lost_key": outcome.lost_key,
+            })
+        );
+    } else if finish {
+        if outcome.old_key_destroyed {
+            let merged = outcome.drain.as_ref().map(|d| d.merged).unwrap_or(0);
+            println!(
+                "inbox: rotation finished — {merged} leftover item(s) drained, old private key destroyed"
+            );
+            println!("inbox: items sent to the old key now fail with E_INBOX_CRYPTO");
+        } else {
+            println!("inbox: nothing to finish (no previous inbox key)");
+        }
+    } else if outcome.lost_key {
+        println!(
+            "inbox: rotated to {} (no old key found — drain skipped, no --finish needed)",
+            outcome.new_recipient.as_deref().unwrap_or("?")
+        );
+        println!("inbox: re-pin every outside tool to the new key; old-key items fail with E_INBOX_CRYPTO");
+    } else {
+        println!(
+            "inbox: rotated to {}",
+            outcome.new_recipient.as_deref().unwrap_or("?")
+        );
+        println!("inbox: re-pin every outside tool to the new key, then run `confidant inbox rotate --finish`");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]
