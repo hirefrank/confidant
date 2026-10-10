@@ -295,11 +295,16 @@ impl KeyStore {
 
     /// Initialize a client's key directory: epoch 1, wrap the new data key
     /// to every recipient + recovery, sign the manifest.
+    ///
+    /// The recovery recipient comes from the [`Anchor`] (the off-vault
+    /// pinned `recovery_age_recipient`), never from a caller-supplied
+    /// string or an in-vault copy — a caller passing in a vault copy
+    /// would let a compromised vault redirect the recovery wrapping.
     pub fn init_client(
         &mut self,
         client_id: &str,
         recipients: &RecipientMap,
-        recovery_recipient: &str,
+        anchor: &Anchor,
         operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
         let dir = self.client_dir(client_id);
@@ -311,26 +316,27 @@ impl KeyStore {
         std::fs::create_dir_all(dir.join("wrapped"))?;
         let key = DataKey::generate();
         self.write_epoch(client_id, 1)?;
-        self.wrap_current(client_id, &key, recipients, recovery_recipient)?;
+        self.wrap_current(client_id, &key, recipients, anchor)?;
         let commitments = vec![self.commitment_entry(client_id, 1, key.as_bytes())];
         self.write_manifest(client_id, 1, recipients, &commitments, operator_sk)?;
         Ok(key)
     }
 
-    /// Wrap the current-epoch data key to each recipient + recovery.
+    /// Wrap the current-epoch data key to each recipient + recovery
+    /// (the anchor's pinned recovery recipient).
     fn wrap_current(
         &self,
         client_id: &str,
         key: &DataKey,
         recipients: &RecipientMap,
-        recovery_recipient: &str,
+        anchor: &Anchor,
     ) -> Result<(), Error> {
         let wdir = self.wrapped_dir(client_id);
         for (key_id, entry) in recipients {
             let wrapped = wrap_to_recipient(key.as_bytes(), &entry.age_pubkey)?;
             std::fs::write(wdir.join(format!("{key_id}.age")), wrapped)?;
         }
-        let wrapped = wrap_to_recipient(key.as_bytes(), recovery_recipient)?;
+        let wrapped = wrap_to_recipient(key.as_bytes(), &anchor.recovery_age)?;
         std::fs::write(wdir.join(format!("{RECOVERY_KEY_ID}.age")), wrapped)?;
         Ok(())
     }
@@ -475,12 +481,14 @@ impl KeyStore {
     /// Rotate a client's data key: new key, `epoch += 1`, wrap to all
     /// current recipients + recovery, re-sign. Old wrappings are renamed to
     /// `.e<epoch>.age` so history stays readable. No re-encryption.
+    ///
+    /// The recovery recipient comes from the [`Anchor`], as in
+    /// [`init_client`](Self::init_client).
     pub fn rotate(
         &mut self,
         client_id: &str,
-        recovery_recipient: &str,
-        operator_sk: &SigningKey,
         anchor: &Anchor,
+        operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
         let (epoch, recipients) = self.verified_recipients(client_id, anchor)?;
         let new_epoch = epoch + 1;
@@ -495,7 +503,7 @@ impl KeyStore {
             }
         }
         let key = DataKey::generate();
-        self.wrap_current(client_id, &key, &recipients, recovery_recipient)?;
+        self.wrap_current(client_id, &key, &recipients, anchor)?;
         self.write_epoch(client_id, new_epoch)?;
         // Carry forward prior epochs' commitments; append the new epoch's.
         let mut commitments = self.current_commitments(client_id);
@@ -904,9 +912,11 @@ impl std::fmt::Debug for ShredOutcome {
 
 impl ShredOutcome {
     /// The new recovery phrase, for the single operator display. The caller
-    /// must confirm it was written down and never log it.
+    /// must confirm it was written down and never log it. The [`Zeroizing`]
+    /// wrapper is dropped (wiped) here; the returned plain `String` is the
+    /// single display copy.
     pub fn recovery_phrase_for_display(&self) -> String {
-        self.new_recovery.phrase()
+        self.new_recovery.phrase().to_string()
     }
 
     /// The new recovery identity (for pinning its public halves).

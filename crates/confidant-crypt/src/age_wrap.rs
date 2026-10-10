@@ -12,7 +12,7 @@ use std::iter;
 use std::str::FromStr;
 
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::Error;
 
@@ -35,9 +35,11 @@ impl RawX25519Identity {
     }
 
     /// The `AGE-SECRET-KEY-1…` Bech32 encoding of this secret, matching
-    /// `age::x25519::Identity::to_string` (uppercase).
-    pub fn to_bech32(&self) -> String {
-        bech32_encode("age-secret-key-", &self.0).to_uppercase()
+    /// `age::x25519::Identity::to_string` (uppercase). Returned in a
+    /// [`Zeroizing`] wrapper so the secret bytes are wiped when the
+    /// caller is done with it.
+    pub fn to_bech32(&self) -> Zeroizing<String> {
+        Zeroizing::new(bech32_encode("age-secret-key-", &self.0).to_uppercase())
     }
 
     /// As an `age` identity, via the public Bech32 parse path.
@@ -125,6 +127,15 @@ mod tests {
         let wrapped = wrap_to_recipient(b"payload", &recipient).unwrap();
         let back = unwrap_with_raw_secret(&wrapped, &raw).unwrap();
         assert_eq!(back, b"payload");
+    }
+
+    #[test]
+    fn bech32_returns_zeroizing() {
+        // Per Silas's #54 sign-off: the secret encoding must not sit in a
+        // plain String. The type annotation pins the Zeroizing return.
+        let id = RawX25519Identity::new([7u8; 32]);
+        let s: Zeroizing<String> = id.to_bech32();
+        assert!(s.starts_with("AGE-SECRET-KEY-1"));
     }
 
     #[test]

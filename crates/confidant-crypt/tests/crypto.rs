@@ -113,10 +113,6 @@ impl Fixture {
         m
     }
 
-    fn recovery_recipient(&self) -> String {
-        self.anchor.recovery_age.clone()
-    }
-
     fn ctx(&self, ulid: &str, client_id: &str, purpose: &str, epoch: u64) -> RecordCtx {
         RecordCtx {
             vault_id: "vault-01".to_string(),
@@ -239,12 +235,7 @@ fn test4_age_wrap_round_trip() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Unwrap with the device identity.
@@ -291,12 +282,7 @@ fn test5_manifest_verification() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Valid manifest verifies (implicit in unwrap).
@@ -394,12 +380,7 @@ fn test7_revocation() {
 
     let recipients = f.recipients(&[("laptop", &f.device_recipient), ("phone", &dev2_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Both devices unwrap epoch 1.
@@ -423,12 +404,7 @@ fn test7_revocation() {
 
     // Rotate to a new epoch; revoked key cannot unwrap it.
     f.keys
-        .rotate(
-            "p-01ABC",
-            &f.recovery_recipient(),
-            &f.operator_sk,
-            &f.anchor,
-        )
+        .rotate("p-01ABC", &f.anchor, &f.operator_sk)
         .unwrap();
     assert!(f.keys.current_epoch("p-01ABC").unwrap() == 2);
     assert!(matches!(
@@ -458,28 +434,15 @@ fn test8_shredding() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key_a = f
         .keys
-        .init_client(
-            "p-AAAA",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-AAAA", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     let key_b = f
         .keys
-        .init_client(
-            "p-BBBB",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-BBBB", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     // Rotate B so it has a retained old epoch: shred must keep history readable.
     let key_b_e1 = key_b.clone();
-    let key_b = f
-        .keys
-        .rotate("p-BBBB", &f.recovery_recipient(), &f.operator_sk, &f.anchor)
-        .unwrap();
+    let key_b = f.keys.rotate("p-BBBB", &f.anchor, &f.operator_sk).unwrap();
     assert_ne!(key_b.as_bytes(), key_b_e1.as_bytes());
 
     // Encrypt a record for each client.
@@ -542,7 +505,7 @@ fn test8_shredding() {
     // New recovery phrase: 24 words, differs from the old one; old phrase fails.
     let new_phrase = outcome.recovery_phrase_for_display();
     assert_eq!(new_phrase.split_whitespace().count(), 24);
-    assert_ne!(new_phrase, f.recovery.phrase());
+    assert_ne!(new_phrase, f.recovery.phrase().to_string());
     let old_rec = Recovery::from_phrase(&f.recovery.phrase()).unwrap();
     let old_age_id = old_rec.age_identity().to_age_identity().unwrap();
     assert!(f
@@ -605,12 +568,7 @@ fn test_revoke_replay_refused() {
         ("phone", &dev2.recipient()),
     ]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Save the pre-revocation manifest (has both recipients).
@@ -653,18 +611,13 @@ fn test_shred_destroy_list_covers_history() {
         ("phone", &dev2.recipient()),
     ]);
     f.keys
-        .init_client(
-            "p-AAAA",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-AAAA", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     f.keys
         .init_client(
             "p-BBBB",
             &f.recipients(&[("laptop", &f.device_recipient)]),
-            &f.recovery_recipient(),
+            &f.anchor,
             &f.operator_sk,
         )
         .unwrap();
@@ -718,12 +671,7 @@ fn test9_recovery_drill() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
     let old_phrase = f.recovery.phrase();
 
@@ -772,20 +720,12 @@ fn test9b_recovery_key_signs_manifest() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Rotate, signing the new manifest with ONLY the recovery key.
     let rec_sk = f.recovery.signing_key().clone();
-    let rotated = f
-        .keys
-        .rotate("p-01ABC", &f.recovery_recipient(), &rec_sk, &f.anchor)
-        .unwrap();
+    let rotated = f.keys.rotate("p-01ABC", &f.anchor, &rec_sk).unwrap();
     // Unwrap via the recovery identity (still valid — no rotate_recovery ran).
     let rec_id = f.recovery.age_identity().to_age_identity().unwrap();
     let back = f
@@ -849,7 +789,7 @@ fn test13_never_log_phrase() {
     // Debug, Display of errors, and struct Debug impls never contain the phrase.
     let dbg = format!("{r:?}");
     assert!(dbg.contains("<redacted>"));
-    assert!(!dbg.contains(&phrase), "phrase in Recovery Debug");
+    assert!(!dbg.contains(phrase.as_str()), "phrase in Recovery Debug");
     let words: Vec<&str> = phrase.split_whitespace().collect();
     for w in words.windows(3) {
         assert!(!dbg.contains(&w.join(" ")), "phrase fragment in Debug");
@@ -1187,47 +1127,42 @@ fn git_log_path(repo: &Path, with_m: bool) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test16_recovery_pubkey_pinning() {
+fn test16_recovery_recipient_comes_from_anchor() {
     let mut f = Fixture::new();
 
-    // Attacker swaps the recovery public halves in a *vault config copy*.
-    let evil_recovery = Recovery::generate();
-    let evil_recipient = evil_recovery.age_identity().to_recipient_string();
-    assert_ne!(evil_recipient, f.recovery_recipient());
+    // Pin a DIFFERENT recovery recipient in the anchor than the fixture's
+    // own recovery identity. init_client takes the anchor (not a free
+    // recipient string), so the only way the wrapping opens with the
+    // pinned identity is if the code read it from the anchor — the test
+    // can no longer hand the right value in and prove nothing.
+    let pinned = Recovery::generate();
+    let pinned_recipient = pinned.age_identity().to_recipient_string();
+    assert_ne!(pinned_recipient, f.anchor.recovery_age);
+    let mut anchor = f.anchor.clone();
+    anchor.recovery_age = pinned_recipient.clone();
 
-    // Our code paths take the recovery recipient from the off-vault anchor,
-    // never from a vault copy: init_client wraps to the anchor's recipient.
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &anchor, &f.operator_sk)
         .unwrap();
 
-    // The attacker's recovery identity cannot unwrap (nothing was wrapped to it).
-    let evil_id = evil_recovery.age_identity().to_age_identity().unwrap();
+    // The pinned identity (from the anchor) unwraps the recovery wrapping.
+    let pinned_id = pinned.age_identity().to_age_identity().unwrap();
     assert!(f
         .keys
-        .unwrap_data_key("p-01ABC", "recovery", 1, &evil_id, &f.anchor)
-        .is_err());
-
-    // The real recovery identity (matching the pinned anchor) can.
-    let real_id = f.recovery.age_identity().to_age_identity().unwrap();
-    assert!(f
-        .keys
-        .unwrap_data_key("p-01ABC", "recovery", 1, &real_id, &f.anchor)
+        .unwrap_data_key("p-01ABC", "recovery", 1, &pinned_id, &anchor)
         .is_ok());
 
-    // Manifest verification uses the anchor's operator key; a manifest
-    // "verified" against a swapped in-vault operator key is meaningless to us
-    // because we never read operator keys from the vault.
-    assert_eq!(
-        f.anchor.recovery_age,
-        f.recovery.age_identity().to_recipient_string()
-    );
+    // The fixture's own recovery identity does NOT (nothing was wrapped
+    // to it): a caller-supplied or in-vault copy is never trusted.
+    let fixture_id = f.recovery.age_identity().to_age_identity().unwrap();
+    assert!(f
+        .keys
+        .unwrap_data_key("p-01ABC", "recovery", 1, &fixture_id, &anchor)
+        .is_err());
+
+    // Manifest verification still uses the anchor's operator key.
+    assert_eq!(anchor.recovery_age, pinned_recipient);
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,12 +1217,7 @@ fn test_commitment_planted_device_wrapping_refused() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Attacker with push access plants a wrapping of an attacker-known key.
@@ -1316,17 +1246,12 @@ fn test_commitment_planted_recovery_wrapping_refused() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // Plant a recovery wrapping of an attacker-known key.
     let attacker_key = [0xBBu8; 32];
-    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.recovery_recipient()).unwrap();
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.anchor.recovery_age).unwrap();
     let keys_dir = f._tmp.path().join("keys");
     std::fs::write(
         keys_dir
@@ -1377,12 +1302,7 @@ fn test_revoke_recovery_reserved() {
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     // "recovery" is reserved: revoke must reject it before touching anything.
@@ -1466,12 +1386,7 @@ fn test_note_round_trip_under_person_key() {
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     let key = f
         .keys
-        .init_client(
-            "p-01ABC",
-            &recipients,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
 
     let ctx = f.ctx("n-01NOTE", "p-01ABC", "note", 1);
@@ -1494,22 +1409,12 @@ fn test_note_under_a_key_fails_as_b() {
     let recipients_a = f.recipients(&[("laptop", &f.device_recipient)]);
     let key_a = f
         .keys
-        .init_client(
-            "p-AAAA",
-            &recipients_a,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-AAAA", &recipients_a, &f.anchor, &f.operator_sk)
         .unwrap();
     let recipients_b = f.recipients(&[("laptop", &f.device_recipient)]);
     let key_b = f
         .keys
-        .init_client(
-            "p-BBBB",
-            &recipients_b,
-            &f.recovery_recipient(),
-            &f.operator_sk,
-        )
+        .init_client("p-BBBB", &recipients_b, &f.anchor, &f.operator_sk)
         .unwrap();
 
     let ctx_a = f.ctx("n-01NOTE", "p-AAAA", "note", 1);
