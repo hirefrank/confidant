@@ -760,6 +760,48 @@ fn doctor_reports_expected_checks() {
 }
 
 #[test]
+fn doctor_flags_corrupt_manifest_not_absent() {
+    // #73: a corrupt recipients.toml must surface as an error, distinct
+    // from "no manifest".
+    let dir = make_vault();
+    let root = dir.path();
+    let mdir = root.join("keys/p-01J9Z3K4QF0000000000000006");
+    std::fs::create_dir_all(&mdir).unwrap();
+    std::fs::write(mdir.join("recipients.toml"), b"this is not toml {{{").unwrap();
+
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&["doctor", "--json", "--no-input", "--vault", &vroot]);
+    assert!(!ok, "{v}");
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "crypto-manifests")
+        .expect("missing crypto-manifests check");
+    assert_eq!(check["status"], "error");
+    let msg = check["message"].as_str().unwrap();
+    assert!(msg.contains("corrupt"), "{msg}");
+    assert!(msg.contains("p-01J9Z3K4QF0000000000000006"), "{msg}");
+}
+
+#[test]
+fn doctor_manifest_check_ok_when_no_keys_dir() {
+    // No keys/ tree at all: nothing to diagnose, check stays quiet.
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let (ok, v) = run_json(&["doctor", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{v}");
+    assert!(
+        !v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "crypto-manifests"),
+        "{v}"
+    );
+}
+
+#[test]
 fn schema_is_valid_json_schema() {
     let (ok, v) = run_json(&["schema", "--json", "--vault", &vault_arg(&demo())]);
     assert!(ok, "{v}");
