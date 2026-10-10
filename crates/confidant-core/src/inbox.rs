@@ -193,18 +193,21 @@ pub fn run_inbox(
             .push("proceeding without inbox signature verification (--allow-unsigned)".to_string());
     }
 
-    verify_inbox_signatures(&repo, &opts.trusted_signers)?;
+    // #29: resolve the inbox tip SHA once, BEFORE signature verification,
+    // and use that SHA for every inbox read below (verification, item list,
+    // item bytes). Reading by branch name would reopen the verify->read
+    // window: a push landing between verification and the reads could slip
+    // unsigned items past the trust check or swap the bytes under the
+    // reads. The tip is rechecked after the reads and again immediately
+    // before clearing.
+    let tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
 
-    // #29: pin the inbox tip before any inbox reads. A push between the
-    // signature verification above and the item reads below could slip
-    // unsigned items past the trust check; the tip is re-verified after
-    // the reads and again immediately before clearing.
-    let tip_before_reads = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    verify_inbox_signatures(&repo, &tip, &opts.trusted_signers)?;
 
-    let names = list_items(&repo)?;
+    let names = list_items(&repo, &tip)?;
     let mut items = Vec::with_capacity(names.len());
     for name in &names {
-        let bytes = git_bytes(&repo, &format!("{INBOX_BRANCH}:{name}.age"))?;
+        let bytes = git_bytes(&repo, &format!("{tip}:{name}.age"))?;
         let plaintext = decrypt(bytes.as_slice()).map_err(|e| match DomainError::of(&e) {
             Some(d) => anyhow::Error::new(d.clone()),
             None => anyhow::Error::new(DomainError::inbox_item(format!(
@@ -219,15 +222,15 @@ pub fn run_inbox(
         items.push(parse_item(name, &text)?);
     }
 
-    // #29: record the inbox tip once every inbox read is done, and confirm
-    // it hasn't moved since the signature verification. A push in between
-    // means the bytes we merged may be stale (or unverified), so the run
-    // refuses instead of clearing content it never saw.
-    let inbox_tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
-    if inbox_tip != tip_before_reads {
+    // #29: confirm the tip hasn't moved since it was pinned before
+    // verification. A push in between means the bytes we merged may be
+    // stale (or unverified), so the run refuses instead of clearing
+    // content it never saw.
+    let current_tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    if current_tip != tip {
         return Err(anyhow::Error::new(DomainError::inbox_race(
-            &tip_before_reads,
-            &inbox_tip,
+            &tip,
+            &current_tip,
         )));
     }
 
@@ -280,9 +283,17 @@ pub fn run_inbox(
         }
         let merged = outcomes.iter().filter(|o| o.action == "merge").count();
         if merged > 0 {
-            commit_applied(&repo, &applied, &outcomes)?;
+            if let Err(e) = commit_applied(&repo, &applied, &outcomes) {
+                // All-or-nothing: the merge commit failed (e.g. a
+                // configured-but-broken signing setup), so unstage the
+                // applied paths and restore the worktree. The inbox is
+                // untouched — the clear never ran.
+                unstage_applied(&repo, &applied);
+                revert_applied(&applied);
+                return Err(e);
+            }
         }
-        clear_inbox(&repo, &inbox_tip, &names)?;
+        clear_inbox(&repo, &tip, &names)?;
     }
 
     let merged = outcomes.iter().filter(|o| o.action == "merge").count();
@@ -426,6 +437,10 @@ fn check_inbox_pubkey(
 /// that added, modified, or renamed it — back to and including its most
 /// recent add — must carry a valid signature from a trusted signer.
 ///
+/// `tip` is the pinned inbox SHA resolved before this call: every git read
+/// here anchors at it, never at the branch name, so a push mid-verification
+/// can't change what is examined.
+///
 /// Checking only the tip is not enough: an unsigned commit dropping a
 /// malicious item passes as soon as a trusted signer commits on top of it.
 /// And scoping by "commits since the last clear" is not enough either:
@@ -438,7 +453,7 @@ fn check_inbox_pubkey(
 /// they are signed). An empty `trusted` list verifies nothing; the caller
 /// only passes an empty list under the explicit `--allow-unsigned` opt-in
 /// (otherwise it refuses before getting here).
-fn verify_inbox_signatures(repo: &Path, trusted: &[String]) -> anyhow::Result<()> {
+fn verify_inbox_signatures(repo: &Path, tip: &str, trusted: &[String]) -> anyhow::Result<()> {
     if trusted.is_empty() {
         return Ok(());
     }
@@ -448,13 +463,13 @@ fn verify_inbox_signatures(repo: &Path, trusted: &[String]) -> anyhow::Result<()
     // original (signed) add while the tip holds tampered bytes. The inbox is
     // append-only and linear by design, so any merge on the branch is a
     // policy violation. Fail closed.
-    let merges = git_line(repo, &["rev-list", "--merges", "--count", INBOX_BRANCH])?;
+    let merges = git_line(repo, &["rev-list", "--merges", "--count", tip])?;
     if merges != "0" {
         return Err(anyhow::Error::new(DomainError::inbox_untrusted(
             "inbox branch contains merge commits; the inbox is append-only and linear",
         )));
     }
-    for name in list_items(repo)? {
+    for name in list_items(repo, tip)? {
         let file = format!("{name}.age");
         let log = git_line(
             repo,
@@ -463,7 +478,7 @@ fn verify_inbox_signatures(repo: &Path, trusted: &[String]) -> anyhow::Result<()
                 "--format=%H",
                 "--name-status",
                 "--diff-filter=AMR",
-                INBOX_BRANCH,
+                tip,
                 "--",
                 &file,
             ],
@@ -527,11 +542,11 @@ fn verify_commit_signature(
     Ok(())
 }
 
-/// Item file stems on the inbox branch. The inbox branch is an orphan
-/// branch whose root holds only `<name>.age` items; anything else is
-/// `E_INBOX_ITEM` (fail closed).
-fn list_items(repo: &Path) -> anyhow::Result<Vec<String>> {
-    let out = git(repo, &["ls-tree", "-r", "--name-only", INBOX_BRANCH, "--"])?;
+/// Item file stems on the inbox branch at the pinned `tip` SHA. The inbox
+/// branch is an orphan branch whose root holds only `<name>.age` items;
+/// anything else is `E_INBOX_ITEM` (fail closed).
+fn list_items(repo: &Path, tip: &str) -> anyhow::Result<Vec<String>> {
+    let out = git(repo, &["ls-tree", "-r", "--name-only", tip, "--"])?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut names = Vec::new();
     for line in text.lines() {
@@ -919,6 +934,27 @@ fn revert_applied(applied: &[AppliedChange]) {
     }
 }
 
+/// Unstage the applied paths after a failed merge commit. The tree was clean
+/// when the run started, so the applied paths are the only staged entries;
+/// leaving them staged would break the all-or-nothing contract just as
+/// surely as leaving the worktree dirty. Best effort: cleanup must not fail
+/// the run a second time.
+fn unstage_applied(repo: &Path, applied: &[AppliedChange]) {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).arg("reset").arg("-q").arg("--");
+    let mut any = false;
+    for change in applied {
+        let AppliedChange::Modified { abs, .. } = change;
+        if let Ok(rel) = abs.strip_prefix(repo) {
+            cmd.arg(rel);
+            any = true;
+        }
+    }
+    if any {
+        let _ = cmd.output();
+    }
+}
+
 /// Commit the applied writes on the current branch. Commit messages carry
 /// only opaque IDs and verbs (ADR-7): item names are ULIDs. The commit is
 /// signed (`-S`, honoring the operator's git signing config); run_inbox
@@ -1035,7 +1071,6 @@ fn verify_inbox_tip(repo: &Path, expected_tip: &str) -> anyhow::Result<()> {
 /// Build the cleared inbox tree: the old tip's tree minus the cleared
 /// items, via `git mktree`. The tip recheck guarantees the tree still
 /// holds exactly the listed items, so this is normally the empty tree;
-///
 /// keeping only unlisted entries is the safe direction regardless.
 fn build_cleared_tree(repo: &Path, old_tip: &str, names: &[String]) -> anyhow::Result<String> {
     let ls = git(repo, &["ls-tree", old_tip])?;
@@ -1081,13 +1116,29 @@ fn build_cleared_tree(repo: &Path, old_tip: &str, names: &[String]) -> anyhow::R
 }
 
 /// #52 (ADR-10): whether the operator has commit signing configured. Either
-/// `commit.gpgsign=true` or an explicit `user.signingkey` counts — with
-/// `-S` passed explicitly, git signs in both cases.
+/// `commit.gpgsign` set to a true boolean (`git config --type=bool`
+/// normalizes `yes`/`on`/`1`/`True` too) or an explicit `user.signingkey`
+/// counts — with `-S` passed explicitly, git signs in both cases.
 fn commit_signing_configured(repo: &Path) -> anyhow::Result<bool> {
-    if git_config_get(repo, "commit.gpgsign")?.as_deref() == Some("true") {
+    if git_config_bool(repo, "commit.gpgsign")?.unwrap_or(false) {
         return Ok(true);
     }
     Ok(git_config_get(repo, "user.signingkey")?.is_some_and(|s| !s.is_empty()))
+}
+
+/// `git config --type=bool --get`: `None` when the key is unset or not a
+/// valid boolean (git exits non-zero); otherwise the normalized value.
+fn git_config_bool(repo: &Path, key: &str) -> anyhow::Result<Option<bool>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["config", "--type=bool", "--get", key])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).trim() == "true"))
 }
 
 /// `git config --get`: `None` when the key is unset (git exits 1).
@@ -1458,6 +1509,93 @@ mod tests {
     }
 
     #[test]
+    fn pinned_tip_anchors_all_reads() {
+        // Pin-before-verify: every inbox read anchors at the pinned tip SHA,
+        // never the branch name. A push that lands after the pin adds an
+        // item the branch can see but the pinned reads must not.
+        let (_dir, root) = plumbing_repo(&[("01JAAA.age", "ciphertext")]);
+        let tip = rev_parse(&root, "inbox");
+        // Push a new item on top of the pinned tip (plumbing; worktree
+        // untouched).
+        let blob = {
+            let f = root.join("tmp-item.age");
+            std::fs::write(&f, "ciphertext-evil").unwrap();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["hash-object", "-w", f.to_string_lossy().as_ref()])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git hash-object failed");
+            std::fs::remove_file(&f).unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let tree = {
+            let ls = git(&root, &["ls-tree", &tip]).unwrap();
+            let mut text = String::from_utf8_lossy(&ls.stdout).into_owned();
+            text.push_str(&format!("100644 blob {blob}\t01JBBB.age\n"));
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .arg("mktree")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("git mktree failed to spawn");
+            use std::io::Write as _;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().expect("git mktree failed");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let new_commit = {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit-tree", &tree, "-p", &tip, "-m", "evil push"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git commit-tree failed");
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(
+            &root,
+            &["update-ref", "refs/heads/inbox", &new_commit, &tip],
+        )
+        .unwrap();
+        assert_ne!(rev_parse(&root, "inbox"), tip);
+        // The branch sees the pushed item; the pinned reads do not.
+        assert_eq!(list_items(&root, &tip).unwrap(), vec!["01JAAA".to_string()]);
+        assert!(git_bytes(&root, &format!("{tip}:01JBBB.age")).is_err());
+        // The merge-count check also anchors at the tip: a merge pushed on
+        // top must not affect verification of the pinned snapshot. (The
+        // per-file walk still fails closed on the unsigned T0 commit, which
+        // is the point — the pushed content is never examined.)
+        let err = verify_inbox_signatures(&root, &tip, &["DEADBEEF".to_string()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("01JAAA.age"),
+            "verification must examine the pinned tip's items, got: {msg}"
+        );
+        assert!(
+            !msg.contains("01JBBB"),
+            "verification must not see the pushed item, got: {msg}"
+        );
+    }
+
+    #[test]
     fn signing_check_accepts_gpgsign_or_signingkey() {
         let (_dir, root) = plumbing_repo(&[]);
         // Neither set: not configured.
@@ -1472,5 +1610,54 @@ mod tests {
             .expect("git config failed");
         assert!(out.status.success());
         assert!(commit_signing_configured(&root).unwrap());
+        // commit.gpgsign accepts every git boolean spelling, not just
+        // "true" (--type=bool normalizes them).
+        for value in ["true", "yes", "on", "1", "True", "TRUE"] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "commit.gpgsign", value])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git config failed");
+            assert!(out.status.success());
+            assert!(
+                commit_signing_configured(&root).unwrap(),
+                "commit.gpgsign={value} should count"
+            );
+        }
+        for value in ["false", "no", "off", "0"] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "commit.gpgsign", value])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git config failed");
+            assert!(out.status.success());
+            // user.signingkey is still set from above, so this stays true;
+            // unset it first to isolate the boolean.
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "--unset", "user.signingkey"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git config failed");
+            assert!(out.status.success());
+            assert!(
+                !commit_signing_configured(&root).unwrap(),
+                "commit.gpgsign={value} should not count"
+            );
+            // Restore for the next iteration.
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["config", "user.signingkey", "test-key"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git config failed");
+            assert!(out.status.success());
+        }
     }
 }
