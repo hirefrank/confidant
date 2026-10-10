@@ -829,3 +829,21 @@ per-app access list on macOS); §8 already lists old keys lingering in OS
 keychains or OS backups as a leftover limit. §11 notes the Linux Secret
 Service caveat: any process in the user's session can read an unlocked
 collection.
+
+## 23. vault:shared key implementation (2026-10-10)
+
+Implements the §2 record-type-to-key mapping from Silas's #62 call in
+`confidant-crypt`: new reserved `client_id = "vault:shared"` next to
+`vault:lookup`, living at `keys/shared/` with the standard per-client
+machinery (manifest v2 with `seq`, key commitments, rotation, revocation,
+recovery wrapping — no new primitives, no new format). `KeyStore` maps the
+reserved id in `manifest_dir` (also fixing `wrapped_dir`, `init_client`,
+`shred`'s delete, and `historical_recipients` to resolve through it, so no
+`keys/vault:shared` path is ever formed). New
+`client_id_for_record(record_type, person)` picks the key: `p`/`n`/`i` and
+`d` with a `person` go to that person's key, `o` and person-less `d` go to
+`vault:shared`; it takes no operator parameter, so routing through the
+operator's own person record is impossible by construction. The milestone-3
+writer calls it to pick the target key and re-encrypts a deal under the new
+person's epoch in the same signed commit when the deal's `person` changes.
+
