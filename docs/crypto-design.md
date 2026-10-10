@@ -354,6 +354,11 @@ expires = "2026-11-08"
 
 - The CLI checks the scope signature, expiry, client list, types, and
   capability **before** unwrapping or encrypting for that key.
+- The signed bytes are `b"confidant-scope-v1" ‖ le64(len(vault_id)) ‖
+  vault_id ‖ scope_toml`: a scope minted for one vault does not verify in
+  another. `expires` is parsed strictly as `YYYY-MM-DD` (a malformed date
+  is a hard error, never "unexpired"), the scope's `key_id` must equal the
+  identity in use, and verification uses Ed25519 `verify_strict`.
 - A client data key is wrapped to an agent key only for clients in its
   scope. Narrowing a scope = remove wrappings + re-sign manifest.
 - Agent private keys live in the agent host's secret store, never in the

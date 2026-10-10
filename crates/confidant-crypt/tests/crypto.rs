@@ -333,59 +333,45 @@ fn test6_scope_enforcement() {
         expires: "2026-12-01".to_string(),
     };
     let toml = scope_to_toml(&scope).unwrap();
-    let sig = sign_scope(&operator_sk, &scope).unwrap();
+    let sig = sign_scope(&operator_sk, "vault-01", &scope).unwrap();
     let pk = operator_sk.verifying_key();
+    let auth = |today: &str, client: &str, rtype: &str, cap: Capability| {
+        authorize(
+            &pk, "vault-01", "agent-1", &toml, &sig, today, client, rtype, cap,
+        )
+    };
 
     // In-scope read allowed.
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-01ABC",
-        "note",
-        Capability::Read
-    )
-    .is_ok());
+    assert!(auth("2026-10-08", "p-01ABC", "note", Capability::Read).is_ok());
     // Expired, wrong client, wrong type, write-with-read-only all refused.
+    assert!(auth("2026-12-02", "p-01ABC", "note", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-OTHER", "note", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-01ABC", "deal", Capability::Read).is_err());
+    assert!(auth("2026-10-08", "p-01ABC", "note", Capability::Write).is_err());
+    // Wrong identity: the scope names agent-1.
     assert!(authorize(
         &pk,
-        &toml,
-        &sig,
-        "2026-12-02",
-        "p-01ABC",
-        "note",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-OTHER",
-        "note",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
-        &toml,
-        &sig,
-        "2026-10-08",
-        "p-01ABC",
-        "deal",
-        Capability::Read
-    )
-    .is_err());
-    assert!(authorize(
-        &pk,
+        "vault-01",
+        "agent-2",
         &toml,
         &sig,
         "2026-10-08",
         "p-01ABC",
         "note",
-        Capability::Write
+        Capability::Read
+    )
+    .is_err());
+    // Wrong vault: the scope was minted for vault-01.
+    assert!(authorize(
+        &pk,
+        "vault-02",
+        "agent-1",
+        &toml,
+        &sig,
+        "2026-10-08",
+        "p-01ABC",
+        "note",
+        Capability::Read
     )
     .is_err());
 }
