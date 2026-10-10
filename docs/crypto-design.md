@@ -204,7 +204,7 @@ recipients only unwrap that key via age (X25519, `age` crate).
 length-prefixed encoding (`append_component` pattern):
 
 ```
-aad = len_prefixed("confidant1" || vault_id || record ULID || relative path || purpose || key epoch || outer header)
+aad = len_prefixed("confidant1" || vault_id || record ULID || client_id || relative path || purpose || key epoch || outer header)
 ```
 
 where `outer header` is the envelope's plaintext front matter (`id`,
@@ -217,6 +217,10 @@ not part of the AAD.)
 - `vault_id` — ciphertext cannot be moved between vaults.
 - record ULID + relative path — a file cannot be swapped for another
   client's file or renamed into a different record.
+- `client_id` — the record owner's key holder (the person's `p-…` id for
+  `p`/`n`/`i` and person-bearing `d` records, `vault:shared` for `o`
+  records and person-less `d` records, §2); a record's ciphertext cannot
+  be re-attributed to another client's key.
 - `purpose` — one of `profile`, `note`, `interaction`, `org`, `deal`
   (domain separation; a note ciphertext is not valid as a profile).
 - `key epoch` — ciphertext is bound to the key epoch that wrote it, so
@@ -606,10 +610,11 @@ in the repo, tests, or CI.
 
 This is the milestone 2 implementation PR. Format changes from spec 0.1:
 
-- **Manifest v2**: `recipients.toml` gains `vault_id` (binds the manifest
-  to the vault) and `[[commitments]]` (key commitments for every retained
-  epoch, §4). Readers must reject manifests without commitments (fail
-  closed).
+- **Manifest v2**: `recipients.toml` gains `[[commitments]]` (key
+  commitments for every retained epoch, §4); `vault_id` is bound in the
+  signed manifest bytes, not stored in the file itself, binding the
+  manifest to the vault. Readers must reject manifests without
+  commitments (fail closed).
 - **Key id charset**: `[a-z0-9-]`, `recovery` reserved (§4).
 - **Envelope**: `key_id` is `<client_id>/e<epoch>` where `client_id` is the
   record owner's key holder (for `n-`/`i-` records, the person's `p-…` id,
@@ -618,7 +623,7 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1:
 - **AAD**: adds a `client_id` component after `ulid` (§5).
 
 These are documented here; the normative spec 0.1 edits land in a
-follow-up after crypto review.
+follow-up after crypto review (issue #85).
 
 ## 14. Decisions I made
 
