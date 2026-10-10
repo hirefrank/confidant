@@ -993,6 +993,12 @@ fn real_crypto_round_trip_merges() {
     // merge them through the production decryptor.
     let _g = use_test_inbox_key();
     let r = Repo::new();
+    // #52: the merge and clear commits must be signed; without signing
+    // configured the run refuses.
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let recipient = test_recipient(&TEST_INBOX_SECRET);
     r.with_vault_inbox_pubkey(&recipient);
     r.with_encrypted_inbox(&[
@@ -1034,6 +1040,12 @@ fn local_pubkey_match_allows_decrypt() {
     // proceeds to real decryption.
     let _g = use_test_inbox_key();
     let r = Repo::new();
+    // #52: the merge and clear commits must be signed; without signing
+    // configured the run refuses.
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let recipient = test_recipient(&TEST_INBOX_SECRET);
     r.with_vault_inbox_pubkey(&recipient);
     r.with_encrypted_inbox(&[

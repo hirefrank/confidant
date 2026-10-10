@@ -543,16 +543,21 @@ fn check_local_inbox_pubkey(
         Some(k) => k,
         None => return Ok(()),
     };
-    // A malformed vault value gets its own message — it is a config error,
-    // not evidence of substitution. Still a hard error.
-    if !confidant_crypt::age_wrap::is_valid_recipient(vault_pubkey) {
-        return Err(anyhow::Error::new(DomainError::inbox_untrusted(format!(
-            "vault [inbox].pubkey is not a valid age recipient: '{vault_pubkey}'; \
+    // Compare parsed recipients, not raw strings: age's parser may accept
+    // non-canonical encodings (e.g. all-uppercase Bech32) that a string
+    // comparison would misreport as substitution.
+    let vault_recipient =
+        confidant_crypt::age_wrap::parse_recipient(vault_pubkey).map_err(|_| {
+            // A malformed vault value gets its own message — it is a config error,
+            // not evidence of substitution. Still a hard error.
+            anyhow::Error::new(DomainError::inbox_untrusted(format!(
+                "vault [inbox].pubkey is not a valid age recipient: '{vault_pubkey}'; \
              fix: correct the value in confidant.toml and do not merge until resolved"
-        ))));
-    }
-    // Recipients are public values, so a plain comparison is fine.
-    if local_recipient != vault_pubkey {
+            )))
+        })?;
+    let local = confidant_crypt::age_wrap::parse_recipient(local_recipient)
+        .map_err(|e| anyhow::anyhow!("local inbox recipient failed to parse: {e}"))?;
+    if local.to_string() != vault_recipient.to_string() {
         return Err(anyhow::Error::new(DomainError::inbox_untrusted(format!(
             "local inbox key does not match vault [inbox].pubkey \
              (local: '{local_recipient}', vault: '{vault_pubkey}'); refusing — possible key substitution; \
@@ -1563,6 +1568,14 @@ mod tests {
         let local = test_recipient(&TEST_INBOX_SECRET_A);
         let err = check_local_inbox_pubkey(Some("not-a-recipient"), &local).unwrap_err();
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_UNTRUSTED");
+    }
+
+    #[test]
+    fn local_pubkey_noncanonical_encoding_is_ok() {
+        // The vault's pubkey parses to the same recipient even in
+        // non-canonical case: comparison is on parsed values, not strings.
+        let local = test_recipient(&TEST_INBOX_SECRET_A);
+        check_local_inbox_pubkey(Some(&local.to_uppercase()), &local).unwrap();
     }
 
     #[test]
