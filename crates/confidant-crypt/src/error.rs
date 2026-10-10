@@ -44,6 +44,11 @@ pub enum Error {
     #[error("no key available: {0}")]
     NoKey(String),
 
+    /// OS keychain access failed (unavailable, locked, or a legacy
+    /// plaintext key file was found and refused).
+    #[error("keychain: {0}")]
+    Keychain(String),
+
     /// I/O error.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

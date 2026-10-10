@@ -20,6 +20,7 @@ pub mod anchor;
 pub mod envelope;
 pub mod error;
 pub mod history;
+pub mod keychain;
 pub mod keys;
 pub mod lifecycle;
 pub mod manifest;
@@ -49,25 +50,13 @@ pub fn writes_encrypted() -> bool {
 
 /// Resolve the device age identity.
 ///
-/// From the `CONFIDANT_DEVICE_KEY` env var (Bech32 `AGE-SECRET-KEY-1…`).
-/// There is no file fallback: §2 says device keys live in the OS keychain,
-/// and #36 rejected key files under `~/.config` (Time Machine backs them
-/// up, so "destroy the old key" would be false). OS-keychain storage lands
-/// with the CLI wiring; until then the env var covers tests and agent
-/// hosts. Absent → fail closed with [`Error::NoKey`].
+/// From the `CONFIDANT_DEVICE_KEY` env var (Bech32 `AGE-SECRET-KEY-1…`)
+/// or the OS keychain (`confidant` / `device-key`), per
+/// `docs/crypto-design.md` §2. There is no file fallback: if a legacy
+/// `~/.config/confidant/device.key` exists, loading refuses — see
+/// [`keychain`]. Absent → fail closed with [`Error::NoKey`].
 fn device_identity() -> Result<age::x25519::Identity, Error> {
-    use std::str::FromStr;
-    if let Ok(s) = std::env::var("CONFIDANT_DEVICE_KEY") {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return age::x25519::Identity::from_str(&s)
-                .map_err(|e| Error::Age(format!("bad CONFIDANT_DEVICE_KEY: {e}")));
-        }
-    }
-    Err(Error::NoKey(
-        "no device key: set CONFIDANT_DEVICE_KEY (OS-keychain storage lands with the CLI wiring)"
-            .to_string(),
-    ))
+    keychain::device_identity()
 }
 
 /// Encrypt a file to this device's age key.
