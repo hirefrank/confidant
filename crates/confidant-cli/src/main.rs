@@ -396,6 +396,30 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 .map(|u| u.trust.signers.clone())
                 .unwrap_or_default();
             let pinned_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
+            // Load the inbox key material once per run. `None` when no key
+            // is enrolled (genuine NoKey): the #55 comparison is skipped and
+            // decryption fails closed later. Legacy-file refusals and
+            // keychain errors surface here directly.
+            let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
+                match confidant_core::InboxKeys::load_opt() {
+                    Ok(keys) => keys.map(std::sync::Arc::new),
+                    Err(err) => {
+                        let domain = DomainError::of(&err)
+                            .cloned()
+                            .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+                        print_error(json, Some(&root.display().to_string()), &domain)?;
+                        return Ok(ExitCode::from(domain.exit_code() as u8));
+                    }
+                };
+            let decrypt = {
+                let keys = inbox_keys.clone();
+                move |ciphertext: &[u8]| match &keys {
+                    Some(k) => k.decrypt(ciphertext),
+                    None => Err(anyhow::Error::new(DomainError::inbox_crypto(
+                        "no inbox key enrolled".to_string(),
+                    ))),
+                }
+            };
             let report = match confidant_core::run_inbox(
                 &root,
                 &confidant_core::InboxOptions {
@@ -404,7 +428,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     allow_unsigned: *allow_unsigned,
                     pinned_pubkey,
                 },
-                &confidant_core::stub_decrypt,
+                &decrypt,
+                inbox_keys.as_deref(),
             ) {
                 Ok(report) => report,
                 Err(err) => {

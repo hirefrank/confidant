@@ -64,12 +64,22 @@ pub fn unwrap_with_raw_secret(data: &[u8], secret: &[u8; 32]) -> Result<Vec<u8>,
     unwrap_with_identity(data, &id)
 }
 
+/// Parse an `age1…` X25519 recipient. Used to distinguish a malformed
+/// configured value from a mismatch.
+pub fn parse_recipient(s: &str) -> Result<age::x25519::Recipient, Error> {
+    s.parse()
+        .map_err(|e| Error::Age(format!("bad recipient: {e}")))
+}
+
+/// Returns true when `s` parses as an `age1…` X25519 recipient.
+pub fn is_valid_recipient(s: &str) -> bool {
+    parse_recipient(s).is_ok()
+}
+
 /// Wrap `data` (typically a 32-byte data key) to an `age1…` recipient,
 /// producing a complete age-encrypted file.
 pub fn wrap_to_recipient(data: &[u8], recipient: &str) -> Result<Vec<u8>, Error> {
-    let recipient: age::x25519::Recipient = recipient
-        .parse()
-        .map_err(|e| Error::Age(format!("bad recipient: {e}")))?;
+    let recipient = parse_recipient(recipient)?;
     let encryptor =
         age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
             .map_err(|e| Error::Age(format!("encryptor: {e}")))?;

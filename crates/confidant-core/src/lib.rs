@@ -34,8 +34,10 @@ pub use config::{InboxConfig, TrustConfig, VaultConfig, SPEC_VERSION};
 pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
+#[cfg(test)]
+pub use inbox::inbox_decrypt;
 pub use inbox::{
-    run_inbox, stub_decrypt, DecryptFn, InboxOptions, InboxReport, ItemOutcome, INBOX_BRANCH,
+    run_inbox, DecryptFn, InboxKeys, InboxOptions, InboxReport, ItemOutcome, INBOX_BRANCH,
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
