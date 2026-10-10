@@ -3180,9 +3180,27 @@ fn check_messages_do_not_echo_seeded_filenames() {
         .iter()
         .filter_map(|f| f["file"].as_str())
         .collect();
+    // #7: the file field must not carry a name either — only trusted
+    // path components plus the redaction marker, so the operator can
+    // locate it. Valid paths (like ledger/2026/10.cfd) still appear; only
+    // the seeded bad names must be absent.
+    let bad_names = leaks
+        .iter()
+        .filter(|l| l.contains("ZXQVLEAK"))
+        .collect::<Vec<_>>();
+    for leak in bad_names {
+        assert!(
+            !files.iter().any(|f| f.contains(leak)),
+            "{leak} leaked in check file field: {files:?}"
+        );
+    }
     assert!(
-        files.iter().any(|f| f.contains("ZXQVLEAKFILE")),
-        "location field should still name the invalid path: {files:?}"
+        files.contains(&"people/<invalid-filename>"),
+        "redacted file field should name the parent dir: {files:?}"
+    );
+    assert!(
+        files.contains(&"ledger/<invalid-filename>"),
+        "bad ledger year dir should redact to ledger/: {files:?}"
     );
     assert!(codes(&json).contains(&"E_LEDGER_DATE".into()), "{json}");
     let date_msgs: Vec<_> = json["findings"]

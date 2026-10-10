@@ -245,14 +245,61 @@ fn leftover_tmp(name: &str, child: &Path, findings: &mut Vec<Finding>) -> bool {
             Severity::Error,
             "leftover temporary file".to_owned(),
         )
-        .at_file(paths::display_relative(child))
+        .at_file(redacted_filename(child))
         .with_fix("Delete .confidant-tmp-* leftovers from a crashed write"),
     );
     true
 }
 
+/// `file` value for a finding about a path that is not a valid vault path
+/// (#7). Any component could be a client name — the threat model (§4)
+/// protects against filenames revealing who is a client — so the path is
+/// reported only up to the first untrusted component, which is replaced
+/// with a marker. The operator lists that directory to find the offending
+/// file; `check --json` output an agent might forward to a model never
+/// carries the name.
+fn redacted_filename(child: &Path) -> String {
+    const MARKER: &str = "<invalid-filename>";
+    let mut kept: Vec<&str> = Vec::new();
+    for comp in child.components() {
+        let Some(s) = comp.as_os_str().to_str() else {
+            break;
+        };
+        if is_trusted_component(s) {
+            kept.push(s);
+        } else {
+            break;
+        }
+    }
+    if kept.is_empty() {
+        return MARKER.to_owned();
+    }
+    format!("{}/{MARKER}", kept.join("/"))
+}
+
+/// Path components that can never be a client name: structural directories,
+/// valid record IDs, ledger years/months, and fixed filenames.
+fn is_trusted_component(name: &str) -> bool {
+    matches!(
+        name,
+        "people"
+            | "orgs"
+            | "deals"
+            | "interactions"
+            | "notes"
+            | "ledger"
+            | "keys"
+            | ".confidant"
+            | "confidant.toml"
+            | "profile.md"
+            | "deal.md"
+            | "interaction.md"
+    ) || is_yyyy(name)
+        || is_month_cfd(name)
+        || RecordId::parse(name).is_ok()
+}
+
 fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Finding>) {
-    let file = paths::display_relative(child);
     if !ent.utf8 {
         findings.push(
             Finding::new(
@@ -260,7 +307,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "non-UTF-8 filename".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(child))
             .with_fix("Rename the file to a UTF-8 record ID"),
         );
         return;
@@ -272,7 +319,7 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
                 Severity::Error,
                 "symbolic link".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(child))
             .with_fix("Replace the symlink with a real file or directory"),
         );
     }
@@ -313,7 +360,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                     Severity::Error,
                     "unexpected vault entry".to_owned(),
                 )
-                .at_file(&ent.name)
+                .at_file(redacted_filename(Path::new(&ent.name)))
                 .with_fix("Use the layout in spec/0.1.md (people/, orgs/, deals/, ledger/, …)"),
             );
         }
@@ -376,7 +423,7 @@ fn scan_collections(
                                         Severity::Error,
                                         "filename is not a valid record ID".to_owned(),
                                     )
-                                    .at_file(paths::display_relative(&child))
+                                    .at_file(redacted_filename(&child))
                                     .with_fix("Rename to <prefix>-<ULID>.md or move it out of the collection"),
                                 );
                             }
@@ -421,7 +468,7 @@ fn ingest_file(
                     Severity::Error,
                     "filename is not a valid record ID".to_owned(),
                 )
-                .at_file(&file)
+                .at_file(redacted_filename(relative))
                 .with_fix("Name the file <prefix>-<26-character ULID>.md"),
             );
             return;
@@ -464,7 +511,7 @@ fn ingest_dir(
                     Severity::Error,
                     "directory name is not a valid record ID".to_owned(),
                 )
-                .at_file(&dir)
+                .at_file(redacted_filename(relative))
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
             return;
@@ -529,7 +576,7 @@ fn ingest_dir(
                 Severity::Error,
                 "record directory contains an unexpected entry".to_owned(),
             )
-            .at_file(paths::display_relative(&child))
+            .at_file(redacted_filename(&child))
             .for_id(&path_id)
             .with_fix(format!(
                 "Keep only {main} (and notes/ for people) in the record directory"
@@ -599,7 +646,7 @@ fn scan_person_notes(
                             Severity::Error,
                             "filename is not a valid record ID".to_owned(),
                         )
-                        .at_file(paths::display_relative(&child)),
+                        .at_file(redacted_filename(&child)),
                     );
                     continue;
                 }
@@ -972,7 +1019,7 @@ fn process_ledger_entry(
                         Severity::Error,
                         "ledger year directory is not a four-digit year".to_owned(),
                     )
-                    .at_file(paths::display_relative(&child))
+                    .at_file(redacted_filename(&child))
                     .with_fix("Use ledger/YYYY/MM.cfd"),
                 );
             }
@@ -1081,7 +1128,7 @@ fn load_ledger_file(
                 Severity::Error,
                 "ledger file is not MM.cfd".to_owned(),
             )
-            .at_file(&file)
+            .at_file(redacted_filename(rel))
             .with_fix("Name monthly ledgers 01.cfd through 12.cfd"),
         );
     }

@@ -169,6 +169,51 @@ def _ensure_proposals_gitignored(vault: str) -> None:
 # Proposal manifests
 # ---------------------------------------------------------------------------
 
+def ensure_out_ignored(vault: str, *paths: str) -> None:
+    """Refuse unless every custom --out path inside the vault is git-ignored.
+
+    #57: proposers use --out directly, skipping the check-ignore probe that
+    proposal_paths() runs on the default location. A manifest, lines file,
+    or staged note body landing inside the vault unignored is plaintext PII
+    one `git add -A` away from a commit. Paths outside the vault have no
+    vault-git commit vector and are left alone. Skips with a note when the
+    vault isn't a git repo or git is absent (same as _ensure_proposals_gitignored).
+    """
+    git = shutil.which("git")
+    if git is None:
+        print("note: git not found; skipping gitignore check "
+              "(nothing to commit the proposals with)", file=sys.stderr)
+        return
+    rp = subprocess.run([git, "-C", vault, "rev-parse", "--git-dir"],
+                        capture_output=True, text=True)
+    if rp.returncode != 0:
+        print("note: vault is not a git repo; skipping gitignore check",
+              file=sys.stderr)
+        return
+    vault_abs = os.path.realpath(vault)
+    for p in paths:
+        if not p:
+            continue
+        target = os.path.realpath(p)
+        try:
+            inside = os.path.commonpath([vault_abs, target]) == vault_abs
+        except ValueError:
+            inside = False
+        if not inside:
+            continue
+        rel = os.path.relpath(target, vault_abs)
+        r = subprocess.run([git, "-C", vault, "check-ignore", "-q", rel],
+                           capture_output=True)
+        if r.returncode != 0:
+            sys.exit(
+                f"error: refusing to write proposal: --out path {p!r} is inside "
+                f"the vault but not git-ignored\n"
+                "The proposal set is plaintext PII (names, emails, notes, "
+                "transcripts); one `git add -A` would commit it.\n"
+                f"Fix: add a matching pattern to the vault .gitignore, e.g.\n"
+                f"  (cd {vault} && echo '{rel}' >> .gitignore)\n"
+                "then re-run, or point --out outside the vault.")
+
 def new_request_id() -> str:
     """Fresh random idempotency key for one proposal.
 

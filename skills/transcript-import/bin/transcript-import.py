@@ -11,7 +11,13 @@ Descriptor schema:
    "duration_minutes": 60, "billing": "paid",
    "title": "Coaching session",
    "notes": "prose for the interaction body (optional)",
+   "no-ai": true,
    "transcript_path": "/path/to/transcript.txt (optional, used when notes is absent)"}
+
+`"no-ai": true` marks the proposed interaction record `no-ai` (only the
+boolean `true` counts). Use it when the client opted out in the source
+system — otherwise the transcript arrives cleared and the operator has
+to fix it by hand.
 
 Writes (proposed):
   - interactions/i-<new ULID>/interaction.md  (front matter + body)
@@ -119,14 +125,15 @@ def main(argv=None) -> int:
     iid = "i-" + common.new_ulid()
     title = d.get("title", f"Session {date}")
     record_path = f"interactions/{iid}/interaction.md"
+    front = [f"id: {iid}", "type: interaction", f"name: {title}",
+             f"date: {date}", f"person: {person}"]
+    no_ai = d.get("no-ai") is True
+    if no_ai:
+        front.append("no-ai: true")
     record_body = (
         "---\n"
-        f"id: {iid}\n"
-        "type: interaction\n"
-        f"name: {title}\n"
-        f"date: {date}\n"
-        f"person: {person}\n"
-        "---\n"
+        + "\n".join(front) + "\n"
+        + "---\n"
         f"\n{notes}\n"
     )
     duration = common.format_duration(minutes)
@@ -154,6 +161,8 @@ def main(argv=None) -> int:
     if args.out:
         manifest_path = args.out
         lines_path = (args.out[:-5] if args.out.endswith(".json") else args.out) + ".cfd"
+        # #57: a custom --out inside the vault must be git-ignored too.
+        common.ensure_out_ignored(vault, manifest_path, lines_path)
     else:
         manifest_path, lines_path = common.proposal_paths(vault, "transcript-import")
     ledger = {common.month_file(vault, date): [line]}
