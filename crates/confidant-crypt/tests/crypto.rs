@@ -1491,3 +1491,77 @@ fn test_note_under_a_key_fails_as_b() {
         "expected Header error, got: {err:?}"
     );
 }
+
+#[test]
+fn manifest_state_distinguishes_absent_and_corrupt() {
+    // #73: a corrupt manifest must not read as "no manifest" (seq 0).
+    use confidant_crypt::lifecycle::ManifestState;
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+
+    let mut f = Fixture::new();
+
+    // Absent: client never initialized.
+    assert_eq!(
+        f.keys.manifest_state("p-01NEVER000000000000000001"),
+        ManifestState::Absent
+    );
+
+    // Valid: the fixture initializes the vault lookup key (seq 1).
+    assert!(matches!(
+        f.keys.manifest_state(VAULT_CLIENT_ID),
+        ManifestState::Valid(1)
+    ));
+
+    // Valid with the right seq after init_client.
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    assert!(matches!(
+        f.keys.manifest_state("p-01ABC"),
+        ManifestState::Valid(1)
+    ));
+
+    // Corrupt: garbage bytes where recipients.toml should parse.
+    let keys_dir = f._tmp.path().join("keys");
+    std::fs::write(
+        keys_dir.join("p-01ABC").join("recipients.toml"),
+        b"this is not toml \x00 {{{",
+    )
+    .unwrap();
+    match f.keys.manifest_state("p-01ABC") {
+        ManifestState::Corrupt(reason) => assert!(!reason.is_empty()),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+
+    // Corrupt is also distinct from a missing file in the same dir.
+    std::fs::remove_file(keys_dir.join("p-01ABC").join("recipients.toml")).unwrap();
+    assert_eq!(f.keys.manifest_state("p-01ABC"), ManifestState::Absent);
+}
+
+#[test]
+fn manifest_clients_lists_vault_and_client_dirs() {
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+    // A stray non-dir entry is ignored.
+    std::fs::write(f._tmp.path().join("keys").join("README"), b"x").unwrap();
+    assert_eq!(
+        f.keys.manifest_clients(),
+        vec!["p-01ABC".to_string(), VAULT_CLIENT_ID.to_string()]
+    );
+}
