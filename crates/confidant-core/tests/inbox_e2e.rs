@@ -427,7 +427,9 @@ fn failed_merge_commit_leaves_tree_and_index_clean() {
     assert!(!ledger.contains("src:e2e-1"));
     assert!(
         !r.root()
-            .join(format!("people/{PID}/notes/n-01M3TC5H00MPJG000000000001.md"))
+            .join(format!(
+                "people/{PID}/notes/n-01M3TC5H00MPJG000000000001.md"
+            ))
             .exists(),
         "record write was not reverted"
     );
