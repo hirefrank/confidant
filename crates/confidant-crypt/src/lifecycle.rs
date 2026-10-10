@@ -116,6 +116,20 @@ impl KeyStore {
         }
     }
 
+    /// Inverse of [`manifest_dir`]: map a `keys/` subdirectory name back to
+    /// its client id. Keeps the reserved-id ↔ dirname binding in one place
+    /// (design §4) so `doctor` (via [`manifest_clients`]) reports the same
+    /// ids the key machinery uses.
+    fn client_id_for_dir(dir_name: &str) -> &str {
+        if dir_name == "vault" {
+            VAULT_CLIENT_ID
+        } else if dir_name == "shared" {
+            SHARED_CLIENT_ID
+        } else {
+            dir_name
+        }
+    }
+
     fn wrapped_dir(&self, client_id: &str) -> PathBuf {
         self.manifest_dir(client_id).join("wrapped")
     }
@@ -164,7 +178,9 @@ impl KeyStore {
 
     /// Every client id with a manifest directory under `keys/`, sorted.
     /// The vault lookup key's `vault/` dir is reported as
-    /// [`VAULT_CLIENT_ID`].
+    /// [`VAULT_CLIENT_ID`] and the shared key's `shared/` dir as
+    /// [`SHARED_CLIENT_ID`], via [`client_id_for_dir`] (the inverse of
+    /// [`manifest_dir`]).
     pub fn manifest_clients(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.keys_dir) else {
@@ -175,11 +191,7 @@ impl KeyStore {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            ids.push(if name == "vault" {
-                VAULT_CLIENT_ID.to_string()
-            } else {
-                name
-            });
+            ids.push(Self::client_id_for_dir(&name).to_string());
         }
         ids.sort();
         ids

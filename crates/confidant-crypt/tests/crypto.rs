@@ -1477,18 +1477,27 @@ fn manifest_state_distinguishes_absent_and_corrupt() {
 
 #[test]
 fn manifest_clients_lists_vault_and_client_dirs() {
-    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+    use confidant_crypt::manifest::{SHARED_CLIENT_ID, VAULT_CLIENT_ID};
 
     let mut f = Fixture::new();
     let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
     f.keys
         .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
         .unwrap();
+    f.keys
+        .init_client(SHARED_CLIENT_ID, &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
     // A stray non-dir entry is ignored.
     std::fs::write(f._tmp.path().join("keys").join("README"), b"x").unwrap();
     assert_eq!(
         f.keys.manifest_clients(),
-        vec!["p-01ABC".to_string(), VAULT_CLIENT_ID.to_string()]
+        vec![
+            "p-01ABC".to_string(),
+            VAULT_CLIENT_ID.to_string(),
+            SHARED_CLIENT_ID.to_string()
+        ]
+    );
+}
 // ---------------------------------------------------------------------------
 // vault:shared reserved key (issue #62)
 // ---------------------------------------------------------------------------

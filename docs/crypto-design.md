@@ -846,3 +846,4 @@ reserved id in `manifest_dir` (also fixing `wrapped_dir`, `init_client`,
 operator's own person record is impossible by construction. The milestone-3
 writer calls it to pick the target key and re-encrypts a deal under the new
 person's epoch in the same signed commit when the deal's `person` changes.
+
