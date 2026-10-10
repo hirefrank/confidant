@@ -639,7 +639,7 @@ fn test_revoke_replay_refused() {
         .revoke("p-01ABC", &["phone"], &f.operator_sk, &f.anchor)
         .unwrap();
     // Sanity: phone is gone from the current manifest.
-    let (_, map) = f.keys.verified_recipients("p-01ABC", &f.anchor).unwrap();
+    let (_, map, _) = f.keys.verified_recipients("p-01ABC", &f.anchor).unwrap();
     assert!(!map.contains_key("phone"));
 
     // Restore the pre-revocation manifest (valid sig, same epoch, stale seq).
@@ -1497,4 +1497,53 @@ fn test_note_under_a_key_fails_as_b() {
         matches!(err, Error::Header(_)),
         "expected Header error, got: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #69: commitments come from the verified buffer, never a re-read
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_commitments_come_from_verified_bytes() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client(
+            "p-01ABC",
+            &recipients,
+            &f.recovery_recipient(),
+            &f.operator_sk,
+        )
+        .unwrap();
+
+    // 1. Verify: the commitments are parsed from the buffer that was
+    // verified, returned alongside the epoch and recipient map.
+    let (epoch, _, commitments) = f.keys.verified_recipients("p-01ABC", &f.anchor).unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(commitments.len(), 1);
+    let verified_commitment = commitments[0].commitment.clone();
+
+    // 2. Tamper: swap the on-disk commitments for garbage, simulating a
+    // file changed between the verify and a later read. The signature no
+    // longer matches, so these bytes are untrusted.
+    let keys_dir = f._tmp.path().join("keys");
+    let toml_path = keys_dir.join("p-01ABC").join("recipients.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    assert!(toml.contains(&verified_commitment));
+    let tampered = toml.replace(&verified_commitment, &"00".repeat(32));
+    std::fs::write(&toml_path, tampered).unwrap();
+
+    // 3. The tampered bytes don't verify: every path that needs
+    // commitments re-verifies first and fails closed. There is no
+    // unverified re-read of the file anywhere (the old
+    // `current_commitments` helper is gone).
+    assert!(f.keys.verified_recipients("p-01ABC", &f.anchor).is_err());
+    assert!(f
+        .keys
+        .unwrap_data_key("p-01ABC", "laptop", 1, &f.device_id, &f.anchor)
+        .is_err());
+
+    // 4. The commitments returned in step 1 are intact: they came from
+    // the verified buffer, not from the (now tampered) file.
+    assert_eq!(commitments[0].commitment, verified_commitment);
 }
