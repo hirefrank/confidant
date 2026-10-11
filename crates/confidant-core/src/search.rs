@@ -1,6 +1,7 @@
 //! Plaintext scan of records and ledger lines (milestone 1 stopgap).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -43,11 +44,11 @@ struct RecordFacts {
 /// Indexes built once per search so the allowlist is a worklist, not nested scans.
 struct Allowlist<'a> {
     vault: &'a Vault,
-    cleared: BTreeSet<RecordId>,
+    cleared: HashSet<RecordId>,
     facts: BTreeMap<RecordId, RecordFacts>,
     by_path: BTreeMap<&'a str, &'a RecordId>,
-    by_ulid: BTreeMap<String, Vec<RecordId>>,
-    strong_by_ulid: BTreeMap<String, Vec<RecordId>>,
+    by_ulid: HashMap<Arc<str>, Vec<RecordId>>,
+    strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>>,
     ledger_at: HashMap<(&'a str, u32), usize>,
     ledger_tokens: Vec<Vec<IdToken>>,
     named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
@@ -98,7 +99,7 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
 }
 
 /// Record IDs in the section 12 cleared set. Used by tests to assert a fixed point.
-pub fn cleared_record_ids(vault: &Vault) -> BTreeSet<RecordId> {
+pub fn cleared_record_ids(vault: &Vault) -> HashSet<RecordId> {
     Allowlist::build(vault).cleared
 }
 
@@ -132,7 +133,7 @@ impl<'a> Allowlist<'a> {
             ledger_at.insert((line.file.as_str(), line.line), idx);
         }
 
-        let mut strong_by_ulid = BTreeMap::new();
+        let mut strong_by_ulid: HashMap<Arc<str>, Vec<RecordId>> = HashMap::new();
         for id in vault.records.keys() {
             insert_by_ulid(&mut strong_by_ulid, id.clone());
         }
@@ -169,8 +170,13 @@ impl<'a> Allowlist<'a> {
         sort_by_ulid(&mut by_ulid);
         sort_by_ulid(&mut strong_by_ulid);
 
-        let mut vault_ulids: HashSet<String> = by_ulid.keys().cloned().collect();
-        vault_ulids.extend(vault.path_ulids.iter().cloned());
+        let mut vault_ulids: HashSet<Arc<str>> = by_ulid.keys().cloned().collect();
+        vault_ulids.extend(
+            vault
+                .path_ulids
+                .iter()
+                .map(|u| Arc::<str>::from(u.as_str())),
+        );
 
         let mut facts = BTreeMap::new();
         for rec in vault.records.values() {
@@ -204,7 +210,7 @@ impl<'a> Allowlist<'a> {
         }
         let mut allow = Self {
             vault,
-            cleared: BTreeSet::new(),
+            cleared: HashSet::new(),
             facts,
             by_path,
             by_ulid,
@@ -226,14 +232,14 @@ impl<'a> Allowlist<'a> {
     }
 }
 
-fn compute_cleared(allow: &Allowlist<'_>) -> BTreeSet<RecordId> {
+fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
     let vault = allow.vault;
     let tainted = tainted_ids(vault);
     let components = merge_components(allow);
     let open_lines = pkg_open_lines(allow);
     let dependents = reverse_deps(allow, &components);
 
-    let mut cleared: BTreeSet<RecordId> = vault
+    let mut cleared: HashSet<RecordId> = vault
         .records
         .values()
         .filter(|rec| !rec.no_ai() && !tainted.contains(&rec.id))
@@ -241,7 +247,7 @@ fn compute_cleared(allow: &Allowlist<'_>) -> BTreeSet<RecordId> {
         .map(|rec| rec.id.clone())
         .collect();
 
-    let pkgs: BTreeSet<RecordId> = open_lines
+    let pkgs: HashSet<RecordId> = open_lines
         .iter()
         .flat_map(|line| line.pkgs.iter().cloned())
         .collect();
@@ -252,7 +258,7 @@ fn compute_cleared(allow: &Allowlist<'_>) -> BTreeSet<RecordId> {
     }
 
     let mut stack: Vec<RecordId> = cleared.iter().cloned().collect();
-    let mut queued: BTreeSet<RecordId> = cleared.iter().cloned().collect();
+    let mut queued: HashSet<RecordId> = cleared.iter().cloned().collect();
     while let Some(id) = stack.pop() {
         queued.remove(&id);
         if !cleared.contains(&id) {
@@ -277,8 +283,8 @@ fn compute_cleared(allow: &Allowlist<'_>) -> BTreeSet<RecordId> {
 fn still_cleared(
     allow: &Allowlist<'_>,
     id: &RecordId,
-    cleared: &BTreeSet<RecordId>,
-    tainted: &BTreeSet<RecordId>,
+    cleared: &HashSet<RecordId>,
+    tainted: &HashSet<RecordId>,
     components: &MergeComponents,
     open_lines: &[OpenLine],
 ) -> bool {
@@ -327,12 +333,12 @@ fn still_cleared(
 
 fn drop_from_cleared(
     id: &RecordId,
-    cleared: &mut BTreeSet<RecordId>,
+    cleared: &mut HashSet<RecordId>,
     components: &MergeComponents,
     open_lines: &[OpenLine],
-    dependents: &BTreeMap<RecordId, BTreeSet<RecordId>>,
+    dependents: &HashMap<RecordId, HashSet<RecordId>>,
     stack: &mut Vec<RecordId>,
-    queued: &mut BTreeSet<RecordId>,
+    queued: &mut HashSet<RecordId>,
 ) {
     let mut work = vec![id.clone()];
     while let Some(dropped) = work.pop() {
@@ -342,7 +348,7 @@ fn drop_from_cleared(
         if let Some(members) = components.members_of(&dropped) {
             work.extend(members.iter().cloned());
         }
-        let mut opened = BTreeSet::new();
+        let mut opened = HashSet::new();
         for line in open_lines {
             if line.people.contains(&dropped) {
                 opened.extend(line.pkgs.iter().cloned());
@@ -359,7 +365,7 @@ fn drop_from_cleared(
     }
 }
 
-fn pkg_is_clear(pkg: &RecordId, open_lines: &[OpenLine], cleared: &BTreeSet<RecordId>) -> bool {
+fn pkg_is_clear(pkg: &RecordId, open_lines: &[OpenLine], cleared: &HashSet<RecordId>) -> bool {
     let mut mentioned = false;
     for line in open_lines {
         if !line.pkgs.contains(pkg) {
@@ -373,8 +379,8 @@ fn pkg_is_clear(pkg: &RecordId, open_lines: &[OpenLine], cleared: &BTreeSet<Reco
     mentioned
 }
 
-fn tainted_ids(vault: &Vault) -> BTreeSet<RecordId> {
-    let mut tainted = BTreeSet::new();
+fn tainted_ids(vault: &Vault) -> HashSet<RecordId> {
+    let mut tainted = HashSet::new();
     for finding in &vault.load_findings {
         if finding.code != FindingCode::DuplicateId && finding.code != FindingCode::IdPathMismatch {
             continue;
@@ -394,7 +400,7 @@ fn tainted_ids(vault: &Vault) -> BTreeSet<RecordId> {
 }
 
 struct MergeComponents {
-    of: BTreeMap<RecordId, usize>,
+    of: HashMap<RecordId, usize>,
     members: Vec<Vec<RecordId>>,
 }
 
@@ -406,8 +412,8 @@ impl MergeComponents {
 }
 
 fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
-    let mut parent: BTreeMap<RecordId, RecordId> = BTreeMap::new();
-    let find = |parent: &mut BTreeMap<RecordId, RecordId>, id: &RecordId| -> RecordId {
+    let mut parent: HashMap<RecordId, RecordId> = HashMap::new();
+    let find = |parent: &mut HashMap<RecordId, RecordId>, id: &RecordId| -> RecordId {
         if !parent.contains_key(id) {
             parent.insert(id.clone(), id.clone());
             return id.clone();
@@ -428,7 +434,7 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
         }
         root
     };
-    let union = |parent: &mut BTreeMap<RecordId, RecordId>, a: &RecordId, b: &RecordId| {
+    let union = |parent: &mut HashMap<RecordId, RecordId>, a: &RecordId, b: &RecordId| {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -462,9 +468,9 @@ fn merge_components(allow: &Allowlist<'_>) -> MergeComponents {
     }
 
     let ids: Vec<RecordId> = parent.keys().cloned().collect();
-    let mut root_index: BTreeMap<RecordId, usize> = BTreeMap::new();
+    let mut root_index: HashMap<RecordId, usize> = HashMap::new();
     let mut members: Vec<Vec<RecordId>> = Vec::new();
-    let mut of = BTreeMap::new();
+    let mut of = HashMap::new();
     for id in ids {
         let root = find(&mut parent, &id);
         let idx = *root_index.entry(root.clone()).or_insert_with(|| {
@@ -522,8 +528,8 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
 fn reverse_deps(
     allow: &Allowlist<'_>,
     components: &MergeComponents,
-) -> BTreeMap<RecordId, BTreeSet<RecordId>> {
-    let mut dependents: BTreeMap<RecordId, BTreeSet<RecordId>> = BTreeMap::new();
+) -> HashMap<RecordId, HashSet<RecordId>> {
+    let mut dependents: HashMap<RecordId, HashSet<RecordId>> = HashMap::new();
     let mut link = |from: RecordId, to: RecordId| {
         dependents.entry(from).or_default().insert(to);
     };
@@ -538,7 +544,7 @@ fn reverse_deps(
                 }
             }
             for ulid in &facts.fm_bare_ulids {
-                if let Some(ids) = allow.by_ulid.get(ulid) {
+                if let Some(ids) = allow.by_ulid.get(ulid.as_str()) {
                     for id in ids {
                         link(id.clone(), rec.id.clone());
                     }
@@ -573,7 +579,7 @@ fn reverse_deps(
 fn record_facts(
     rec: &crate::record::Record,
     mut lines: Vec<(u32, PrefixedScan)>,
-    vault_ulids: &HashSet<String>,
+    vault_ulids: &HashSet<Arc<str>>,
 ) -> RecordFacts {
     let text = rec.source.trim_start_matches('\u{feff}');
     let mut fm_ids = Vec::new();
@@ -618,14 +624,14 @@ fn ledger_named_prefix(prefix: Prefix) -> bool {
     }
 }
 
-fn insert_by_ulid(by_ulid: &mut BTreeMap<String, Vec<RecordId>>, id: RecordId) {
-    let entry = by_ulid.entry(id.ulid().to_owned()).or_default();
+fn insert_by_ulid(by_ulid: &mut HashMap<Arc<str>, Vec<RecordId>>, id: RecordId) {
+    let entry = by_ulid.entry(id.ulid_shared()).or_default();
     if !entry.contains(&id) {
         entry.push(id);
     }
 }
 
-fn sort_by_ulid(by_ulid: &mut BTreeMap<String, Vec<RecordId>>) {
+fn sort_by_ulid(by_ulid: &mut HashMap<Arc<str>, Vec<RecordId>>) {
     for ids in by_ulid.values_mut() {
         ids.sort();
     }
@@ -633,8 +639,8 @@ fn sort_by_ulid(by_ulid: &mut BTreeMap<String, Vec<RecordId>>) {
 
 fn ids_named_by<'a>(
     tok: &'a IdToken,
-    by_ulid: &'a BTreeMap<String, Vec<RecordId>>,
-    strong_by_ulid: &'a BTreeMap<String, Vec<RecordId>>,
+    by_ulid: &'a HashMap<Arc<str>, Vec<RecordId>>,
+    strong_by_ulid: &'a HashMap<Arc<str>, Vec<RecordId>>,
 ) -> Vec<&'a RecordId> {
     match tok {
         IdToken::Valid(id)
@@ -653,7 +659,7 @@ fn ids_named_by<'a>(
         }
         IdToken::Malformed { candidate: None } => Vec::new(),
         IdToken::BareUlid(ulid) => by_ulid
-            .get(ulid)
+            .get(ulid.as_str())
             .map(|ids| ids.iter().collect())
             .unwrap_or_default(),
     }
@@ -665,7 +671,7 @@ fn tokens_allowed(toks: &[IdToken], allow: &Allowlist<'_>) -> bool {
 
 fn tokens_allowed_with(
     toks: &[IdToken],
-    cleared: &BTreeSet<RecordId>,
+    cleared: &HashSet<RecordId>,
     allow: &Allowlist<'_>,
 ) -> bool {
     for tok in toks {
@@ -685,7 +691,7 @@ fn tokens_allowed_with(
                 if allow.vault.path_ulids.contains(ulid) {
                     return false;
                 }
-                if let Some(ids) = allow.by_ulid.get(ulid) {
+                if let Some(ids) = allow.by_ulid.get(ulid.as_str()) {
                     if ids.iter().any(|id| !cleared.contains(id)) {
                         return false;
                     }

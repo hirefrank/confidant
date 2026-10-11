@@ -5,10 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
-use crate::id::{
-    collect_uncovered_ulid_windows, record_id_from_entry_name, scan_id_tokens, IdToken, Prefix,
-    RecordId,
-};
+use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
 use crate::record::{
@@ -92,7 +89,13 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut ledger_unread_count = 0u32;
 
     if config.spec == SPEC_VERSION {
-        scan_collections(root, &mut records, &mut path_ids, &mut findings);
+        let mut jobs = Vec::new();
+        let mut names = Vec::new();
+        scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
+        let outs = load_markdown_jobs(root, &jobs);
+        for (job, out) in jobs.iter().zip(outs) {
+            merge_markdown_job(job, out, &mut records, &mut findings);
+        }
         scan_ledger(
             root,
             &mut entries,
@@ -101,7 +104,6 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
             &mut ledger_unread_count,
         );
         scan_unexpected_top_level(root, &mut findings);
-        let mut names = Vec::new();
         walk_seed_names(root, Path::new(""), &mut path_ids, &mut names);
         seed_path_ulids(&names, &records, &mut path_ulids);
     }
@@ -159,12 +161,6 @@ fn list_dir(root: &Path, rel: &Path, findings: &mut Vec<Finding>) -> Listed {
             );
             Listed::Failed
         }
-    }
-}
-
-fn seed_entry_id(name: &str, path_ids: &mut BTreeSet<RecordId>) {
-    if let Some(id) = record_id_from_entry_name(name) {
-        path_ids.insert(id);
     }
 }
 
@@ -227,6 +223,12 @@ fn walk_seed_names(
             continue;
         }
         if ent.kind == EntryKind::Directory {
+            // Collection subtrees were already seeded name-by-name during
+            // scan_collections; descending again would re-list hundreds of
+            // directories for identical seeds (#2).
+            if rel.as_os_str().is_empty() && COLLECTIONS.contains(&ent.name.as_str()) {
+                continue;
+            }
             walk_seed_names(root, &rel.join(&ent.name), path_ids, names);
         }
     }
@@ -382,9 +384,10 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
 
 fn scan_collections(
     root: &Path,
-    records: &mut BTreeMap<RecordId, Record>,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
+    jobs: &mut Vec<MarkdownJob>,
+    names: &mut Vec<String>,
 ) {
     for collection in COLLECTIONS {
         let rel = Path::new(collection);
@@ -396,7 +399,7 @@ fn scan_collections(
             }
             Ok(listing) => {
                 for (name, _) in listing.errors {
-                    seed_entry_id(&name, path_ids);
+                    seed_name_tokens(&name, path_ids, names);
                     findings.push(
                         Finding::new(
                             FindingCode::Unreadable,
@@ -411,7 +414,7 @@ fn scan_collections(
                 for ent in listing.entries {
                     let child = rel.join(&ent.name);
                     if ent.utf8 {
-                        seed_entry_id(&ent.name, path_ids);
+                        seed_name_tokens(&ent.name, path_ids, names);
                     }
                     if leftover_tmp(&ent.name, &child, findings) {
                         continue;
@@ -426,9 +429,7 @@ fn scan_collections(
                     match ent.kind {
                         EntryKind::File => {
                             if let Some(stem) = ent.name.strip_suffix(".md") {
-                                ingest_file(
-                                    root, &child, stem, prefix, records, path_ids, findings,
-                                );
+                                ingest_file(&child, stem, prefix, path_ids, findings, jobs, None);
                             } else {
                                 findings.push(
                                     Finding::new(
@@ -443,7 +444,7 @@ fn scan_collections(
                         }
                         EntryKind::Directory => {
                             ingest_dir(
-                                root, &child, &ent.name, prefix, records, path_ids, findings,
+                                root, &child, &ent.name, prefix, path_ids, findings, jobs, names,
                             );
                         }
                         EntryKind::Other => findings.push(
@@ -463,13 +464,13 @@ fn scan_collections(
 }
 
 fn ingest_file(
-    root: &Path,
     relative: &Path,
     stem: &str,
     expected_prefix: Prefix,
-    records: &mut BTreeMap<RecordId, Record>,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
+    jobs: &mut Vec<MarkdownJob>,
+    note_owner: Option<&RecordId>,
 ) {
     let file = paths::display_relative(relative);
     let path_id = match RecordId::parse(stem) {
@@ -502,17 +503,24 @@ fn ingest_file(
             .for_id(&path_id),
         );
     }
-    load_markdown(root, relative, Some(&path_id), records, findings);
+    // Content loads in parallel; the walk keeps going.
+    jobs.push(MarkdownJob {
+        relative: relative.to_path_buf(),
+        path_id: Some(path_id),
+        note_owner: note_owner.cloned(),
+    });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_dir(
     root: &Path,
     relative: &Path,
     name: &str,
     expected_prefix: Prefix,
-    records: &mut BTreeMap<RecordId, Record>,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
+    jobs: &mut Vec<MarkdownJob>,
+    names: &mut Vec<String>,
 ) {
     let dir = paths::display_relative(relative);
     let path_id = match RecordId::parse(name) {
@@ -556,7 +564,7 @@ fn ingest_dir(
     for ent in entries {
         let child = relative.join(&ent.name);
         if ent.utf8 {
-            seed_entry_id(&ent.name, path_ids);
+            seed_name_tokens(&ent.name, path_ids, names);
         }
         if leftover_tmp(&ent.name, &child, findings) {
             continue;
@@ -573,14 +581,18 @@ fn ingest_dir(
         }
         if ent.name == main && ent.kind == EntryKind::File {
             saw_main = true;
-            load_markdown(root, &child, Some(&path_id), records, findings);
+            jobs.push(MarkdownJob {
+                relative: child,
+                path_id: Some(path_id.clone()),
+                note_owner: None,
+            });
             continue;
         }
         if expected_prefix == Prefix::Person
             && ent.name == "notes"
             && ent.kind == EntryKind::Directory
         {
-            scan_person_notes(root, relative, &path_id, records, path_ids, findings);
+            scan_person_notes(root, relative, &path_id, path_ids, findings, jobs, names);
             continue;
         }
         findings.push(
@@ -614,9 +626,10 @@ fn scan_person_notes(
     root: &Path,
     person_dir: &Path,
     person_id: &RecordId,
-    records: &mut BTreeMap<RecordId, Record>,
     path_ids: &mut BTreeSet<RecordId>,
     findings: &mut Vec<Finding>,
+    jobs: &mut Vec<MarkdownJob>,
+    names: &mut Vec<String>,
 ) {
     let notes_rel = person_dir.join("notes");
     match paths::read_dir(root, &notes_rel) {
@@ -626,7 +639,7 @@ fn scan_person_notes(
         }
         Ok(listing) => {
             for (name, _) in listing.errors {
-                seed_entry_id(&name, path_ids);
+                seed_name_tokens(&name, path_ids, names);
                 findings.push(
                     Finding::new(
                         FindingCode::Unreadable,
@@ -640,7 +653,7 @@ fn scan_person_notes(
             for ent in listing.entries {
                 let child = notes_rel.join(&ent.name);
                 if ent.utf8 {
-                    seed_entry_id(&ent.name, path_ids);
+                    seed_name_tokens(&ent.name, path_ids, names);
                 }
                 if leftover_tmp(&ent.name, &child, findings) {
                     continue;
@@ -665,43 +678,109 @@ fn scan_person_notes(
                 }
                 let stem = ent.name.trim_end_matches(".md");
                 ingest_file(
-                    root,
                     &child,
                     stem,
                     Prefix::Note,
-                    records,
                     path_ids,
                     findings,
+                    jobs,
+                    Some(person_id),
                 );
-                if let Ok(id) = RecordId::parse(stem) {
-                    if let Some(rec) = records.get(&id) {
-                        if rec.person().as_ref().is_some_and(|p| p != person_id) {
-                            findings.push(
-                                Finding::new(
-                                    FindingCode::IdPathMismatch,
-                                    Severity::Error,
-                                    "front matter key 'person' does not match the path".to_owned(),
-                                )
-                                .at_file(paths::display_relative(&child))
-                                .for_id(&id),
-                            );
-                        }
-                    }
-                }
             }
         }
     }
 }
 
-fn load_markdown(
-    root: &Path,
-    relative: &Path,
-    path_id: Option<&RecordId>,
+/// One markdown record file whose content loads in parallel. The
+/// directory walk collects jobs serially; worker threads read, parse and
+/// check them; the merge step folds results back in walk order, so
+/// findings, records and duplicate detection match a serial load
+/// exactly (#2).
+struct MarkdownJob {
+    relative: PathBuf,
+    path_id: Option<RecordId>,
+    /// Owning person directory for a note under `people/<id>/notes/`.
+    /// The person-mismatch check runs at merge against the merged
+    /// (first-inserted) record, mirroring the serial walk.
+    note_owner: Option<RecordId>,
+}
+
+/// Read, parse and check the jobs on worker threads, preserving job
+/// order in the output so the merge is deterministic.
+fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<(Option<Record>, Vec<Finding>)> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(jobs.len());
+    let chunk = jobs.len().div_ceil(threads);
+    let mut out = Vec::with_capacity(jobs.len());
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(threads);
+        for part in jobs.chunks(chunk) {
+            handles.push(s.spawn(|| {
+                part.iter()
+                    .map(|job| run_markdown_job(root, job))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for handle in handles {
+            out.extend(handle.join().expect("markdown loader thread panicked"));
+        }
+    });
+    out
+}
+
+/// Merge one job result: content findings first (walk order is preserved
+/// by the caller), then duplicate detection and insert, then the
+/// note-owner mismatch check against the merged record.
+fn merge_markdown_job(
+    job: &MarkdownJob,
+    out: (Option<Record>, Vec<Finding>),
     records: &mut BTreeMap<RecordId, Record>,
     findings: &mut Vec<Finding>,
 ) {
-    let file = paths::display_relative(relative);
-    let text = match paths::read_to_string(root, relative) {
+    let (parsed, mut job_findings) = out;
+    findings.append(&mut job_findings);
+    let Some(rec) = parsed else { return };
+    let id = rec.id.clone();
+    if records.contains_key(&id) {
+        findings.push(
+            Finding::new(
+                FindingCode::DuplicateId,
+                Severity::Error,
+                "the same id appears in two files".to_owned(),
+            )
+            .at_file(&rec.path)
+            .for_id(&id)
+            .with_fix("Keep one file per id"),
+        );
+    } else {
+        records.insert(id.clone(), rec);
+    }
+    if let Some(owner) = &job.note_owner {
+        if let Some(merged) = records.get(&id) {
+            if merged.person().as_ref().is_some_and(|p| p != owner) {
+                findings.push(
+                    Finding::new(
+                        FindingCode::IdPathMismatch,
+                        Severity::Error,
+                        "front matter key 'person' does not match the path".to_owned(),
+                    )
+                    .at_file(paths::display_relative(&job.relative))
+                    .for_id(&id),
+                );
+            }
+        }
+    }
+}
+
+fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Finding>) {
+    let mut findings = Vec::new();
+    let file = paths::display_relative(&job.relative);
+    let text = match paths::read_to_string(root, &job.relative) {
         Ok(t) => t,
         Err(_) => {
             findings.push(
@@ -713,7 +792,7 @@ fn load_markdown(
                 .at_file(&file)
                 .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
-            return;
+            return (None, findings);
         }
     };
     if has_conflict_markers(&text) {
@@ -735,11 +814,12 @@ fn load_markdown(
                 finding = finding.at_line(line);
             }
             findings.push(finding.with_fix(err.fix));
+            (None, findings)
         }
         Ok(mut rec) => {
             rec.path = file.clone();
-            flag_malformed_frontmatter(&rec, findings);
-            if let Some(pid) = path_id {
+            flag_malformed_frontmatter(&rec, &mut findings);
+            if let Some(pid) = &job.path_id {
                 if rec.id != *pid {
                     findings.push(
                         Finding::new(
@@ -783,20 +863,9 @@ fn load_markdown(
                     );
                 }
             }
-            if records.contains_key(&rec.id) {
-                findings.push(
-                    Finding::new(
-                        FindingCode::DuplicateId,
-                        Severity::Error,
-                        "the same id appears in two files".to_owned(),
-                    )
-                    .at_file(&file)
-                    .for_id(&rec.id)
-                    .with_fix("Keep one file per id"),
-                );
-            } else {
-                records.insert(rec.id.clone(), rec);
-            }
+            // Duplicate detection and insert happen at merge, in walk
+            // order, so parallel results match a serial load exactly.
+            (Some(rec), findings)
         }
     }
 }

@@ -85,14 +85,18 @@ pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
     let mut toks = trimmed.split_whitespace();
     let first = toks.next()?;
     let second = toks.next();
-    let norm = |s: &str| s.trim_end_matches(':').to_ascii_lowercase();
-    let first = norm(first);
-    if first == "merge" || first == "open" {
-        return Some(first);
+    // Compare without allocating: only "merge"/"open" matter, and the
+    // result is owned only on match (#2).
+    let norm_eq = |s: &str| {
+        let s = s.trim_end_matches(':');
+        s.eq_ignore_ascii_case("merge") || s.eq_ignore_ascii_case("open")
+    };
+    if norm_eq(first) {
+        return Some(first.trim_end_matches(':').to_ascii_lowercase());
     }
-    let second = second.map(norm)?;
-    if second == "merge" || second == "open" {
-        return Some(second);
+    let second = second?;
+    if norm_eq(second) {
+        return Some(second.trim_end_matches(':').to_ascii_lowercase());
     }
     None
 }

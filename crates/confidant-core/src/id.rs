@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -121,15 +122,22 @@ impl Prefix {
 }
 
 /// `prefix '-' ULID`, canonicalized to uppercase ULID characters.
+///
+/// The ULID is reference-counted (`Arc<str>`): the allowlist clones
+/// thousands of IDs while building the cleared set, and a shared
+/// allocation keeps those clones free of heap work; `Arc` (not `Rc`) keeps
+/// records movable across threads for parallel loading (#2). `Eq`/`Ord`/
+/// `Hash` still compare by value, so sets and maps behave exactly as with
+/// an owned string.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RecordId {
     prefix: Prefix,
-    ulid: String,
+    ulid: Arc<str>,
 }
 
 impl RecordId {
     pub fn new(prefix: Prefix, ulid: String) -> Result<Self, IdError> {
-        let ulid = canonicalize_ulid(&ulid).ok_or(IdError::BadUlid)?;
+        let ulid: Arc<str> = canonicalize_ulid(&ulid).ok_or(IdError::BadUlid)?.into();
         Ok(Self { prefix, ulid })
     }
 
@@ -145,6 +153,11 @@ impl RecordId {
 
     pub fn ulid(&self) -> &str {
         &self.ulid
+    }
+
+    /// Cheap shared handle to the ULID for index keys (#2).
+    pub(crate) fn ulid_shared(&self) -> Arc<str> {
+        Arc::clone(&self.ulid)
     }
 
     pub fn as_str(&self) -> String {
@@ -291,7 +304,7 @@ pub(crate) struct PrefixedScan {
 
 pub(crate) fn scan_id_tokens_against(
     text: &str,
-    vault_ulids: Option<&HashSet<String>>,
+    vault_ulids: Option<&HashSet<Arc<str>>>,
 ) -> Vec<IdToken> {
     let mut scan = scan_prefixed_line(text);
     if let Some(ulids) = vault_ulids {
@@ -308,10 +321,9 @@ pub(crate) fn scan_prefixed_line(text: &str) -> PrefixedScan {
 }
 
 /// Append BareUlid tokens for vault ULIDs whose 26-character windows are not
-/// already covered by a prefixed token on this line.
 pub(crate) fn add_bare_ulid_windows(
     text: &str,
-    vault_ulids: &HashSet<String>,
+    vault_ulids: &HashSet<Arc<str>>,
     scan: &mut PrefixedScan,
 ) {
     let mapped = map_soft_hyphen_after_prefix(text);
@@ -547,7 +559,7 @@ fn each_crockford_window(
 
 fn scan_vault_ulid_windows(
     text: &str,
-    vault_ulids: &HashSet<String>,
+    vault_ulids: &HashSet<Arc<str>>,
     covered: &[(usize, usize)],
     out: &mut Vec<IdToken>,
 ) {
@@ -712,19 +724,6 @@ pub(crate) fn is_id_dash(c: char) -> bool {
                 | '\u{ff0d}'
                 | '\u{10ead}'
     )
-}
-
-/// Parse a directory or file name as a record ID. Any single extension is
-/// stripped case-insensitively (`p-<ULID>.MD`, `n-<ULID>.txt`).
-pub(crate) fn record_id_from_entry_name(name: &str) -> Option<RecordId> {
-    if let Ok(id) = RecordId::parse(name) {
-        return Some(id);
-    }
-    let (stem, ext) = name.rsplit_once('.')?;
-    if stem.is_empty() || ext.is_empty() {
-        return None;
-    }
-    RecordId::parse(stem).ok()
 }
 
 /// Person ID for a vault-relative path under `people/<id>/` or `people/<id>.md`.
@@ -1033,8 +1032,8 @@ mod tests {
     }
 
     fn scan_with_ulids(text: &str, ulids: &[&str]) -> Vec<super::IdToken> {
-        let set: std::collections::HashSet<String> =
-            ulids.iter().map(|u| (*u).to_owned()).collect();
+        let set: std::collections::HashSet<std::sync::Arc<str>> =
+            ulids.iter().map(|u| (*u).into()).collect();
         super::scan_id_tokens_against(text, Some(&set))
     }
 
@@ -1178,7 +1177,7 @@ mod tests {
 
         // 2 MB Crockford run with a vault ULID (bare-window scan).
         let mut vault = HashSet::new();
-        vault.insert(ulid.to_owned());
+        vault.insert(std::sync::Arc::<str>::from(ulid));
         let mut small_crock = "A".repeat(500_000);
         small_crock.push_str(ulid);
         small_crock.push_str(&"A".repeat(500_000));
@@ -1211,30 +1210,5 @@ mod tests {
             Some(id)
         );
         assert!(super::person_id_from_path("notes/n-01M3TC5H00MPJG002NAM000005/note.md").is_none());
-    }
-
-    #[test]
-    fn record_id_from_entry_name_strips_any_extension() {
-        let cam = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
-        let note = RecordId::parse("n-01M3TC5H000068T0000000000C").unwrap();
-        assert_eq!(
-            super::record_id_from_entry_name(&cam.to_string()),
-            Some(cam.clone())
-        );
-        assert_eq!(
-            super::record_id_from_entry_name(&format!("{cam}.MD")),
-            Some(cam.clone())
-        );
-        assert_eq!(
-            super::record_id_from_entry_name(&format!("{cam}.md")),
-            Some(cam)
-        );
-        assert_eq!(
-            super::record_id_from_entry_name(&format!("{note}.txt")),
-            Some(note)
-        );
-        assert!(super::record_id_from_entry_name("profile.md").is_none());
-        assert!(super::record_id_from_entry_name(".MD").is_none());
-        assert!(super::record_id_from_entry_name("not-an-id.md").is_none());
     }
 }
