@@ -51,7 +51,9 @@ use crate::recovery::Recovery;
 use zeroize::{Zeroize, Zeroizing};
 
 /// A client's verified epoch keys, ready for re-wrapping (shred's verify-first pass).
-type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>);
+/// Commitments come from the verified manifest buffer (see
+/// [`KeyStore::verified_recipients`]).
+type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>, Vec<CommitmentEntry>);
 
 /// Manages the `keys/` tree of one vault.
 #[derive(Debug)]
@@ -242,16 +244,6 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Key commitments currently recorded in a client's signed manifest.
-    fn current_commitments(&self, client_id: &str) -> Vec<CommitmentEntry> {
-        let (toml_path, _) = self.manifest_paths(client_id);
-        std::fs::read(&toml_path)
-            .ok()
-            .and_then(|b| manifest::from_toml(&b).ok())
-            .map(|(_, _, c)| c)
-            .unwrap_or_default()
-    }
-
     /// Build a [`CommitmentEntry`] for a 32-byte key under the vault's id.
     fn commitment_entry(&self, client_id: &str, epoch: u64, key: &[u8; 32]) -> CommitmentEntry {
         CommitmentEntry {
@@ -271,11 +263,17 @@ impl KeyStore {
     /// key (both are trust-anchor members, design §4) — so a recovery from
     /// the phrase alone can authorize the new device's manifest. Refuses a
     /// seq below the off-vault high-water mark.
+    ///
+    /// Returns the epoch, the recipient map, and the key commitments —
+    /// all parsed from the one buffer that was verified. Callers must use
+    /// these commitments; re-reading `recipients.toml` from disk would
+    /// trust bytes that were never verified (the file can change between
+    /// the verify and the second read).
     pub fn verified_recipients(
         &mut self,
         client_id: &str,
         anchor: &Anchor,
-    ) -> Result<(u64, RecipientMap), Error> {
+    ) -> Result<(u64, RecipientMap, Vec<CommitmentEntry>), Error> {
         let epoch = self.current_epoch(client_id)?;
         let (toml_path, sig_path) = self.manifest_paths(client_id);
         let toml = std::fs::read(&toml_path)
@@ -304,10 +302,12 @@ impl KeyStore {
                 min_seq,
             )
         })?;
-        // Advance the high-water mark past what we just verified.
-        let seq = manifest::from_toml(&toml)?.0;
+        // Advance the high-water mark past what we just verified, and
+        // return the commitments from the verified buffer — never re-read
+        // the file.
+        let (seq, _, commitments) = manifest::from_toml(&toml)?;
         self.advance_seq(client_id, seq)?;
-        Ok((epoch, map))
+        Ok((epoch, map, commitments))
     }
 
     /// Initialize a client's key directory: epoch 1, wrap the new data key
@@ -452,7 +452,8 @@ impl KeyStore {
         identity: &dyn age::Identity,
         anchor: &Anchor,
     ) -> Result<DataKey, Error> {
-        let (current_epoch, recipients) = self.verified_recipients(client_id, anchor)?;
+        let (current_epoch, recipients, commitments) =
+            self.verified_recipients(client_id, anchor)?;
         if !recipients.contains_key(key_id) && key_id != RECOVERY_KEY_ID {
             return Err(Error::NoKey(format!(
                 "key id {key_id} not in manifest for {client_id}"
@@ -471,11 +472,11 @@ impl KeyStore {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&raw);
-        // Authenticate the unwrapped key against the manifest's commitment.
+        // Authenticate the unwrapped key against the manifest's commitment,
+        // taken from the verified buffer above — never re-read from disk.
         // Without this, anyone with push access could plant a wrapping of
         // an attacker-known key and the manifest would still verify.
-        let expected = self
-            .current_commitments(client_id)
+        let expected = commitments
             .into_iter()
             .find(|c| c.epoch == epoch)
             .ok_or_else(|| {
@@ -508,7 +509,7 @@ impl KeyStore {
         anchor: &Anchor,
         operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
-        let (epoch, recipients) = self.verified_recipients(client_id, anchor)?;
+        let (epoch, recipients, mut commitments) = self.verified_recipients(client_id, anchor)?;
         let new_epoch = epoch + 1;
         // Rename current wrappings to the old epoch.
         for entry in std::fs::read_dir(self.wrapped_dir(client_id))? {
@@ -523,8 +524,8 @@ impl KeyStore {
         let key = DataKey::generate();
         self.wrap_current(client_id, &key, &recipients, anchor)?;
         self.write_epoch(client_id, new_epoch)?;
-        // Carry forward prior epochs' commitments; append the new epoch's.
-        let mut commitments = self.current_commitments(client_id);
+        // Carry forward prior epochs' commitments (from the verified
+        // buffer); append the new epoch's.
         commitments.push(self.commitment_entry(client_id, new_epoch, key.as_bytes()));
         self.write_manifest(client_id, new_epoch, &recipients, &commitments, operator_sk)?;
         Ok(key)
@@ -546,7 +547,7 @@ impl KeyStore {
         for id in revoked_key_ids {
             manifest::validate_key_id(id)?;
         }
-        let (epoch, mut recipients) = self.verified_recipients(client_id, anchor)?;
+        let (epoch, mut recipients, commitments) = self.verified_recipients(client_id, anchor)?;
         for id in revoked_key_ids {
             recipients.remove(*id);
         }
@@ -561,8 +562,8 @@ impl KeyStore {
                 }
             }
         }
-        // Commitments are unchanged by revocation; carry them forward.
-        let commitments = self.current_commitments(client_id);
+        // Commitments are unchanged by revocation; carry them forward
+        // from the verified buffer.
         self.write_manifest(client_id, epoch, &recipients, &commitments, operator_sk)?;
         Ok(())
     }
@@ -711,7 +712,7 @@ impl KeyStore {
         for map in self.historical_recipients(shredded_client)? {
             destroy_ids.extend(map.keys().cloned());
         }
-        let (_, current_recipients) = self.verified_recipients(shredded_client, anchor)?;
+        let (_, current_recipients, _) = self.verified_recipients(shredded_client, anchor)?;
         destroy_ids.extend(current_recipients.keys().cloned());
         let destroy_key_ids: Vec<String> = destroy_ids.into_iter().collect();
 
@@ -719,12 +720,13 @@ impl KeyStore {
         // nothing has changed and the old keys still work.
         //
         // 1. The identity must open every remaining client's every epoch.
+        // Commitments are captured from each verified manifest buffer.
         let mut to_rewrap: Vec<VerifiedEpochKeys> = Vec::new();
         for client in all_clients {
             if *client == shredded_client {
                 continue;
             }
-            let (epoch, old_map) = self.verified_recipients(client, anchor)?;
+            let (epoch, old_map, commitments) = self.verified_recipients(client, anchor)?;
             let mut epoch_keys = Vec::new();
             for e in 1..=epoch {
                 let mut key_opt = None;
@@ -744,7 +746,7 @@ impl KeyStore {
                 }
                 epoch_keys.push((e, key_opt.ok_or(last_err)?));
             }
-            to_rewrap.push((client, epoch, epoch_keys));
+            to_rewrap.push((client, epoch, epoch_keys, commitments));
         }
         // 2. No new recipient pubkey may match any current or historical
         // recipient (including recovery): reusing a pubkey would keep the
@@ -754,7 +756,7 @@ impl KeyStore {
             for map in self.historical_recipients(client)? {
                 old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
             }
-            let (_, map) = self.verified_recipients(client, anchor)?;
+            let (_, map, _) = self.verified_recipients(client, anchor)?;
             old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
         }
         old_pubkeys.insert(anchor.recovery_age.clone());
@@ -766,8 +768,14 @@ impl KeyStore {
                 )));
             }
         }
-        // 3. The lookup key must unwrap with the identity.
-        let lookup_raw = self.read_lookup_raw(identity)?;
+        // 3. The lookup key must unwrap with the identity AND match the
+        // commitment in the verified vault manifest. read_lookup_key
+        // verifies the manifest and checks the commitment — a planted
+        // lookup.age fails closed here, before any mutation. (Client epoch
+        // keys get the same check inside unwrap_data_key in step 1.)
+        // The commitments come from the same verified buffer, so there is
+        // no second manifest read.
+        let (lookup_key, lookup_commitments) = self.read_lookup_key(identity, anchor)?;
 
         // All checks passed: now mutate.
         let new_recovery = Recovery::generate();
@@ -780,7 +788,7 @@ impl KeyStore {
         }
 
         // 2. Re-wrap every remaining client to the new set.
-        for (client, epoch, epoch_keys) in &to_rewrap {
+        for (client, epoch, epoch_keys, commitments) in &to_rewrap {
             for entry in std::fs::read_dir(self.wrapped_dir(client))? {
                 std::fs::remove_file(entry?.path())?;
             }
@@ -794,12 +802,17 @@ impl KeyStore {
                     &new_recovery_recipient,
                 )?;
             }
-            // Keys are unchanged by the re-wrap, so commitments carry forward.
-            let commitments = self.current_commitments(client);
-            self.write_manifest(client, *epoch, new_recipients, &commitments, operator_sk)?;
+            // Keys are unchanged by the re-wrap, so commitments carry forward
+            // from the verified buffer.
+            self.write_manifest(client, *epoch, new_recipients, commitments, operator_sk)?;
         }
         // Lookup key: re-wrap the verified bytes to new recipients.
-        self.write_lookup_raw(&lookup_raw, new_recipients, operator_sk)?;
+        self.write_lookup_raw(
+            lookup_key.as_bytes(),
+            new_recipients,
+            &lookup_commitments,
+            operator_sk,
+        )?;
 
         Ok(ShredOutcome {
             new_recovery,
@@ -818,10 +831,13 @@ impl KeyStore {
     }
 
     /// Write raw lookup key bytes re-wrapped to new recipients (for shred).
+    /// Commitments come from the caller, which verified the vault manifest
+    /// (see [`KeyStore::verified_recipients`]).
     fn write_lookup_raw(
         &mut self,
         raw: &[u8],
         new_recipients: &RecipientMap,
+        commitments: &[CommitmentEntry],
         operator_sk: &SigningKey,
     ) -> Result<(), Error> {
         let vdir = self.keys_dir.join("vault");
@@ -859,11 +875,7 @@ impl KeyStore {
                     .unwrap_or(0),
             )
             + 1;
-        let toml = manifest::to_toml(
-            seq,
-            new_recipients,
-            &self.current_commitments(VAULT_CLIENT_ID),
-        )?;
+        let toml = manifest::to_toml(seq, new_recipients, commitments)?;
         let sig = manifest::sign(operator_sk, &self.vault_id, VAULT_CLIENT_ID, 1, seq, &toml);
         std::fs::write(vdir.join("recipients.toml"), toml)?;
         std::fs::write(vdir.join("recipients.sig"), sig)?;
@@ -889,7 +901,7 @@ impl KeyStore {
         let new_recovery = Recovery::generate();
         let new_recipient = new_recovery.age_identity().to_recipient_string();
         for client in clients {
-            let (epoch, recipients) = self.verified_recipients(client, anchor)?;
+            let (epoch, recipients, commitments) = self.verified_recipients(client, anchor)?;
             // Re-wrap the current epoch's recovery file.
             let key = self.unwrap_data_key(client, RECOVERY_KEY_ID, epoch, old_identity, anchor)?;
             let wrapped = wrap_to_recipient(key.as_bytes(), &new_recipient)?;
@@ -910,8 +922,7 @@ impl KeyStore {
             }
             // Manifest unchanged (recipients are the same key ids); re-sign
             // to bind the rotation — epoch unchanged. Keys don't change,
-            // so carry the commitments forward.
-            let commitments = self.current_commitments(client);
+            // so carry the commitments forward from the verified buffer.
             self.write_manifest(client, epoch, &recipients, &commitments, operator_sk)?;
         }
         Ok(new_recovery)
@@ -922,29 +933,29 @@ impl KeyStore {
     /// dictionary attack), then unwrap and check the key commitment.
     /// Mismatch — or a missing commitment — is a hard error; no key is
     /// returned.
+    ///
+    /// Returns the key plus the commitments from the verified buffer, so
+    /// callers don't re-verify the manifest a second time.
     pub fn read_lookup_key(
         &mut self,
         identity: &dyn age::Identity,
         anchor: &Anchor,
-    ) -> Result<LookupKey, Error> {
-        // Verify the vault manifest before touching the wrapping.
-        let _ = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
+    ) -> Result<(LookupKey, Vec<CommitmentEntry>), Error> {
+        // Verify the vault manifest before touching the wrapping, and take
+        // the commitments from the verified buffer — never re-read.
+        let (_, _, commitments) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
         let raw = self.read_lookup_raw(identity)?;
         if raw.len() != 32 {
             return Err(Error::Age("lookup key is not 32 bytes".to_string()));
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&raw);
-        let expected = self
-            .current_commitments(VAULT_CLIENT_ID)
-            .into_iter()
-            .find(|c| c.epoch == 1)
-            .ok_or_else(|| {
-                Error::Manifest(
-                    "no key commitment for the vault lookup key; refusing unauthenticated key"
-                        .to_string(),
-                )
-            })?;
+        let expected = commitments.iter().find(|c| c.epoch == 1).ok_or_else(|| {
+            Error::Manifest(
+                "no key commitment for the vault lookup key; refusing unauthenticated key"
+                    .to_string(),
+            )
+        })?;
         let expected_bytes = manifest::decode_hex(&expected.commitment)?;
         let computed = manifest::key_commitment(&arr, &self.vault_id, VAULT_CLIENT_ID, 1);
         if !manifest::ct_eq(&computed, &expected_bytes) {
@@ -955,7 +966,7 @@ impl KeyStore {
                     .to_string(),
             ));
         }
-        Ok(LookupKey::from_bytes(arr))
+        Ok((LookupKey::from_bytes(arr), commitments))
     }
 }
 
