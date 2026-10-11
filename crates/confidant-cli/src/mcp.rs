@@ -402,5 +402,4 @@ mod tests {
         assert!(context_strips_private(&json!({"exclude_private": "yes"})));
         assert!(context_strips_private(&json!({"exclude_private": 1})));
     }
-
 }
