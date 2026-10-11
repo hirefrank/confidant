@@ -549,6 +549,7 @@ dependencies = [
  "clap",
  "confidant-core",
  "confidant-crypt",
+ "serde",
  "serde_json",
  "tempfile",
 ]

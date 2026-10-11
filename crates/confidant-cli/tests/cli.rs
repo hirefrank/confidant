@@ -132,15 +132,18 @@ as_of = "2026-10-08"
 
 #[test]
 fn missing_vault_json_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-vault");
     let out = Command::new(bin())
         .args([
             "check",
             "--json",
             "--no-input",
             "--vault",
-            "/tmp/confidant-no-such-vault",
+            missing.to_str().unwrap(),
         ])
         .env_remove("CONFIDANT_VAULT")
+        .env_remove("HOME")
         .output()
         .unwrap();
     assert!(!out.status.success());

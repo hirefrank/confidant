@@ -75,7 +75,15 @@ fn commits(root: &Path) -> usize {
 
 fn run_json(args: &[&str]) -> (bool, Value) {
     let out = Command::new(bin()).args(args).output().unwrap();
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v: Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => panic!(
+            "stdout is not JSON ({e}); status={}; stdout={}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    };
     (out.status.success(), v)
 }
 
@@ -805,6 +813,74 @@ fn doctor_manifest_check_ok_when_no_keys_dir() {
 }
 
 #[test]
+fn context_json_includes_vault() {
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let (ok, v) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{v}");
+    assert!(v["vault"]
+        .as_str()
+        .unwrap()
+        .contains(dir.path().to_str().unwrap()));
+}
+
+#[test]
+fn doctor_json_includes_vault() {
+    let dir = make_vault();
+    let (ok, v) = run_json(&[
+        "doctor",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vault_arg(dir.path()),
+    ]);
+    assert!(ok, "{v}");
+    assert!(v["vault"]
+        .as_str()
+        .unwrap()
+        .contains(dir.path().to_str().unwrap()));
+}
+
+#[test]
+fn usage_error_envelope_matches_contract() {
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let out = Command::new(bin())
+        .args([
+            "context",
+            "n-DOESNOTEXIST",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["schema_version"], "1");
+    assert!(v["vault"].is_string());
+    assert_eq!(v["error"]["code"], "usage_error");
+    assert!(v["error"]["message"].is_string());
+}
+
+#[test]
+fn find_json_survives_closed_pipe() {
+    let dir = make_vault();
+    let mut child = Command::new(bin())
+        .args(["find", "Test", "--json", "--vault"])
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = [0u8; 1];
+    let _ = std::io::Read::read(&mut stdout, &mut buf);
+    let status = child.wait().unwrap();
+    assert_ne!(status.code(), Some(101), "EPIPE must not panic the CLI");
+}
+
+#[test]
 fn schema_is_valid_json_schema() {
     let (ok, v) = run_json(&["schema", "--json", "--vault", &vault_arg(&demo())]);
     assert!(ok, "{v}");
@@ -916,6 +992,43 @@ fn mcp_call_wraps_cli() {
     let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
     let doc: Value = serde_json::from_str(text).unwrap();
     assert_eq!(doc["ok"], true);
+}
+
+#[test]
+fn mcp_tool_failure_returns_cli_error_envelope() {
+    let dir = make_vault();
+    let resps = mcp_exchange(
+        dir.path(),
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"context","arguments":{"person":"n-DOESNOTEXIST"}}}"#,
+        ],
+    );
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"]["code"], "usage_error");
+}
+
+#[test]
+fn mcp_context_honors_no_ai_by_default() {
+    let resps = mcp_exchange(
+        demo().as_path(),
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"context","arguments":{"person":"p-01M3TC5H00MPJG001248000002"}}}"#,
+        ],
+    );
+    let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains("Cam Sample"),
+        "no-ai person name leaked through MCP: {text}"
+    );
+    assert!(
+        !text.contains("Fake client"),
+        "no-ai body leaked through MCP: {text}"
+    );
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["ok"], true);
+    assert!(body["vault"].as_str().unwrap().contains("demo-vault"));
 }
 
 #[test]

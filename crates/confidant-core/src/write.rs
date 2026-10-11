@@ -181,14 +181,6 @@ pub fn find_request_commit(
     Ok(None)
 }
 
-/// True if `text` contains unresolved git merge-conflict markers.
-/// `=======` alone is not a conflict (setext headings); only the
-/// `<<<<<<<` / `>>>>>>>` fences fail closed (§9b item 1).
-pub fn has_conflict_markers(text: &str) -> bool {
-    text.lines()
-        .any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>"))
-}
-
 /// Generate a fresh ULID (`p-`/`n-`/… bodies are added by the caller).
 ///
 /// Randomness comes from `/dev/urandom` on unix; the fallback hashes
@@ -320,9 +312,9 @@ pub fn apply_write(
     let mut snapshots: Vec<(PathBuf, Option<String>)> = Vec::new();
     for change in &pending.changes {
         let rel = change.path();
-        let existing = std::fs::read_to_string(root.join(rel)).ok();
+        let existing = crate::paths::read_to_string(root, rel).ok();
         if let Some(ref text) = existing {
-            if has_conflict_markers(text) {
+            if crate::record::has_conflict_markers(text) {
                 return Err(anyhow::Error::new(
                     DomainError::new(
                         ErrorKind::Conflict,
@@ -342,7 +334,7 @@ pub fn apply_write(
     for change in &pending.changes {
         match change {
             FileChange::AppendLines { path, lines } => {
-                let mut text = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+                let mut text = crate::paths::read_to_string(root, path).unwrap_or_default();
                 if !text.is_empty() && !text.ends_with('\n') {
                     text.push('\n');
                 }
@@ -356,8 +348,8 @@ pub fn apply_write(
             FileChange::WriteFile { path, contents } => {
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(root.join(parent))
-                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e}"))?;
+                        crate::paths::ensure_directory(root, parent)
+                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
                     }
                 }
                 crate::paths::write_replace(root, path, contents.as_bytes())
@@ -454,9 +446,9 @@ mod tests {
 
     #[test]
     fn conflict_markers_detected() {
-        assert!(has_conflict_markers("a\n<<<<<<< HEAD\nb\n"));
-        assert!(has_conflict_markers(">>>>>>> branch\n"));
-        assert!(!has_conflict_markers("a\n=======\nb\n"));
-        assert!(!has_conflict_markers("plain text\n"));
+        assert!(crate::record::has_conflict_markers("a\n<<<<<<< HEAD\nb\n"));
+        assert!(crate::record::has_conflict_markers(">>>>>>> branch\n"));
+        assert!(!crate::record::has_conflict_markers("a\n=======\nb\n"));
+        assert!(!crate::record::has_conflict_markers("plain text\n"));
     }
 }
