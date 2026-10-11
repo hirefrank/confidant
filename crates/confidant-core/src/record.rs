@@ -67,6 +67,8 @@ pub struct Record {
     pub source: String,
     /// 1-based line after the closing `---` fence (BOM-stripped layout).
     pub body_start_line: u32,
+    /// 1-based front-matter line for each key (for findings).
+    pub field_lines: BTreeMap<String, u32>,
 }
 
 impl Record {
@@ -519,6 +521,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         body,
         source: text.to_owned(),
         body_start_line,
+        field_lines: key_lines,
     })
 }
 

@@ -295,6 +295,9 @@ fn call_tool(params: &Value, vault: &Path) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if out.status.success() {
         Ok(stdout)
+    } else if !stdout.trim().is_empty() {
+        // JSON mode writes the error envelope to stdout; stderr is empty.
+        Ok(stdout)
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let detail = stderr.trim();
@@ -399,4 +402,5 @@ mod tests {
         assert!(context_strips_private(&json!({"exclude_private": "yes"})));
         assert!(context_strips_private(&json!({"exclude_private": 1})));
     }
+
 }

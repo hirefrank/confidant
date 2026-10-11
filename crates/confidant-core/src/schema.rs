@@ -35,20 +35,27 @@ pub fn contract_schema() -> Value {
         "$defs": {
             "error": {
                 "title": "Error envelope",
-                "description": "Every failure prints this on stderr. `code` is stable; `message` is human-only.",
+                "description": "Every failure prints this on stdout in `--json` mode. `error.code` is stable; `error.message` is human-only.",
                 "type": "object",
-                "required": ["ok", "code", "message"],
+                "required": ["ok", "schema_version", "vault", "error"],
                 "properties": {
                     "ok": {"type": "boolean", "const": false},
-                    "code": {
-                        "type": "string",
-                        "description": "Stable machine code, e.g. E_VAULT_NOT_FOUND, E_IDEMPOTENCY_CONFLICT, E_CONFLICT, E_NOT_FOUND, usage_error."
-                    },
-                    "message": {"type": "string"},
-                    "file": {"type": ["string", "null"]},
-                    "line": {"type": ["integer", "null"]},
-                    "fix": {"type": ["string", "null"]},
-                    "vault": {"type": ["string", "null"]}
+                    "schema_version": {"type": "string"},
+                    "vault": {"type": ["string", "null"]},
+                    "error": {
+                        "type": "object",
+                        "required": ["code", "message"],
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "Stable machine code, e.g. E_VAULT_NOT_FOUND, E_IDEMPOTENCY_CONFLICT, E_CONFLICT, E_NOT_FOUND, usage_error."
+                            },
+                            "message": {"type": "string"},
+                            "file": {"type": ["string", "null"]},
+                            "line": {"type": ["integer", "null"]},
+                            "fix": {"type": ["string", "null"]}
+                        }
+                    }
                 }
             },
             "checkReport": {

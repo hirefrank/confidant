@@ -187,6 +187,12 @@ fn open_directory(root: &Path, relative: &Path) -> Result<Directory> {
     Ok(directory)
 }
 
+/// Create `relative` beneath `root` without following symlinks.
+pub fn ensure_directory(root: &Path, relative: &Path) -> Result<()> {
+    let _ = create_directory_all(root, relative)?;
+    Ok(())
+}
+
 fn create_directory_all(root: &Path, relative: &Path) -> Result<Directory> {
     let mut directory = Directory::open_root(root)
         .map_err(|error| io_failure(error, "vault root", "could not open the vault root".into()))?;

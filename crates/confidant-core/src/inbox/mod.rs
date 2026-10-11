@@ -30,7 +30,7 @@
 //! already present) are skipped, and record items identical to the target
 //! are skipped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -39,6 +39,12 @@ use crate::error::DomainError;
 use crate::ledger::parse_line;
 use crate::paths;
 use crate::vault::load_vault;
+
+mod keys;
+
+pub use keys::InboxKeys;
+#[cfg(test)]
+pub use keys::inbox_decrypt;
 
 /// The git branch outside tools push intake items to.
 pub const INBOX_BRANCH: &str = "inbox";
@@ -52,100 +58,6 @@ const RECORD_ROOTS: &[&str] = &["people", "orgs", "deals", "interactions", "note
 /// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
 /// (the real `confidant-crypt` age path); tests inject a fake.
 pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Vec<u8>>;
-
-/// Inbox decryption key material, loaded once per run.
-///
-/// Holds the current inbox identity and, during the rotation window
-/// (§8a.3), the previous one. Decryption tries current then previous
-/// ("tries old then new"); the #55 pubkey comparison uses the current key
-/// only, since the vault advertises the new key after `rotate`.
-pub struct InboxKeys {
-    current: age::x25519::Identity,
-    previous: Option<age::x25519::Identity>,
-}
-
-impl InboxKeys {
-    /// Load both slots from the OS keychain (or `CONFIDANT_INBOX_KEY` /
-    /// `CONFIDANT_INBOX_KEY_PREVIOUS` on headless hosts — see
-    /// `confidant_crypt::keychain`). Fails closed with `E_INBOX_CRYPTO`:
-    /// a missing key, a bad key, or an undecryptable identity is an error,
-    /// never silent plaintext.
-    pub fn load() -> anyhow::Result<Self> {
-        let (current, previous) = confidant_crypt::keychain::inbox_identities()
-            .map_err(|e| anyhow::Error::new(DomainError::inbox_crypto(format!("{e}"))))?;
-        Ok(Self { current, previous })
-    }
-
-    /// Load, returning `None` when no key is enrolled (genuine `NoKey`).
-    /// A legacy-file refusal or keychain error surfaces directly — it is
-    /// not skipped, so it cannot resurface later as a generic decrypt
-    /// failure.
-    pub fn load_opt() -> anyhow::Result<Option<Self>> {
-        match confidant_crypt::keychain::inbox_identities() {
-            Ok((current, previous)) => Ok(Some(Self { current, previous })),
-            Err(confidant_crypt::Error::NoKey(_)) => Ok(None),
-            Err(e) => Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
-                "{e}"
-            )))),
-        }
-    }
-
-    /// Backend-parameterized [`InboxKeys::load_opt`]: load from an injected
-    /// keychain backend (tests) instead of the OS keychain.
-    pub fn load_opt_with(
-        backend: &dyn confidant_crypt::keychain::KeychainBackend,
-        config_dir: Option<&Path>,
-    ) -> anyhow::Result<Option<Self>> {
-        match confidant_crypt::keychain::inbox_identities_with(backend, config_dir) {
-            Ok((current, previous)) => Ok(Some(Self { current, previous })),
-            Err(confidant_crypt::Error::NoKey(_)) => Ok(None),
-            Err(e) => Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
-                "{e}"
-            )))),
-        }
-    }
-
-    /// True while the previous slot is occupied (the rotation window,
-    /// §8a.3): old-key items still decrypt, `--finish` is pending.
-    pub fn has_previous(&self) -> bool {
-        self.previous.is_some()
-    }
-
-    /// Decrypt with the current key, falling back to the previous one
-    /// during the rotation window. Fails closed with `E_INBOX_CRYPTO`.
-    pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        match confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, &self.current) {
-            Ok(plaintext) => Ok(plaintext),
-            Err(first) => {
-                if let Some(previous) = &self.previous {
-                    if let Ok(plaintext) =
-                        confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, previous)
-                    {
-                        return Ok(plaintext);
-                    }
-                }
-                Err(anyhow::Error::new(DomainError::inbox_crypto(format!(
-                    "{first}"
-                ))))
-            }
-        }
-    }
-
-    /// The current key's age recipient, for the #55 comparison against the
-    /// vault's advertised `[inbox].pubkey`.
-    pub fn current_recipient(&self) -> String {
-        self.current.to_public().to_string()
-    }
-}
-
-/// The old load-per-call decryptor. Test-only: production code loads
-/// [`InboxKeys`] once and closes over it, so the N+1 key-loading path
-/// can't get wired back in outside tests.
-#[cfg(test)]
-pub fn inbox_decrypt(ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let keys = InboxKeys::load()?;
-    keys.decrypt(ciphertext)
-}
 
 /// Options for [`run_inbox`].
 #[derive(Clone, Debug, Default)]
@@ -352,11 +264,12 @@ pub fn run_inbox(
         return Err(anyhow::Error::new(DomainError::inbox_signing_unconfigured()));
     }
 
-    let existing_srcs = collect_ledger_srcs(vault_root);
+    let existing_srcs = collect_vault_srcs(&vault);
+    let mut ledger_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut outcomes = Vec::new();
     let mut applied: Vec<AppliedChange> = Vec::new();
     for item in &items {
-        match plan_item(vault_root, item, &existing_srcs)? {
+        match plan_item(vault_root, item, &existing_srcs, &mut ledger_cache)? {
             Some((outcome, writes)) => {
                 if !opts.dry_run {
                     apply_writes(vault_root, &writes, &mut applied)?;
@@ -1171,30 +1084,11 @@ fn entry_srcs(args: &[crate::ledger::Arg]) -> Vec<String> {
         .collect()
 }
 
-/// All `src:` values already present in the vault's ledger files.
-fn collect_ledger_srcs(vault_root: &Path) -> BTreeSet<String> {
+/// All `src:` values already present in the loaded vault ledger.
+fn collect_vault_srcs(vault: &crate::vault::Vault) -> BTreeSet<String> {
     let mut srcs = BTreeSet::new();
-    let ledger = vault_root.join("ledger");
-    let mut stack = vec![ledger];
-    while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            for line in text.lines() {
-                if let Ok(Some(e)) = parse_line(line) {
-                    srcs.extend(entry_srcs(&e.args));
-                }
-            }
-        }
+    for sourced in &vault.entries {
+        srcs.extend(entry_srcs(&sourced.entry.args));
     }
     srcs
 }
@@ -1225,6 +1119,7 @@ fn plan_item(
     vault_root: &Path,
     item: &ParsedItem,
     existing_srcs: &BTreeSet<String>,
+    ledger_cache: &mut HashMap<PathBuf, String>,
 ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
     match item.kind {
         ItemKind::Ledger => {
@@ -1269,8 +1164,9 @@ fn plan_item(
                 if dominated {
                     continue;
                 }
-                let existing =
-                    std::fs::read_to_string(vault_root.join(&target)).unwrap_or_default();
+                let existing = ledger_cache.entry(target.clone()).or_insert_with(|| {
+                    paths::read_to_string(vault_root, &target).unwrap_or_default()
+                });
                 if existing.lines().any(|l| l.trim_end() == raw.trim_end()) {
                     continue;
                 }
@@ -1303,15 +1199,15 @@ fn plan_item(
         }
         ItemKind::Record => {
             let rel = item.path.as_ref().expect("record items have a path");
-            let abs = vault_root.join(rel);
-            if abs.is_file() {
-                let current = std::fs::read_to_string(&abs).unwrap_or_default();
-                if current == item.content {
-                    return Ok(None);
+            match paths::read_to_string(vault_root, rel) {
+                Ok(current) if current == item.content => return Ok(None),
+                Ok(_) => {
+                    return Err(anyhow::Error::new(DomainError::inbox_conflict(
+                        rel.display().to_string(),
+                    )));
                 }
-                return Err(anyhow::Error::new(DomainError::inbox_conflict(
-                    rel.display().to_string(),
-                )));
+                Err(e) if crate::error::is_missing(&e) => {}
+                Err(e) => return Err(e),
             }
             let writes = vec![PlannedWrite::RecordWrite {
                 path: rel.clone(),
@@ -1341,11 +1237,15 @@ fn apply_writes(
         match w {
             PlannedWrite::LedgerAppend { file, lines } => {
                 let abs = vault_root.join(file);
-                let previous = std::fs::read(&abs).ok();
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        anyhow::anyhow!("could not create {}: {e}", parent.display())
-                    })?;
+                let previous = paths::read_to_string(vault_root, file)
+                    .ok()
+                    .map(|s| s.into_bytes());
+                if let Some(parent) = file.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        paths::ensure_directory(vault_root, parent).map_err(|e| {
+                            anyhow::anyhow!("could not create {}: {e:#}", parent.display())
+                        })?;
+                    }
                 }
                 let mut text = previous
                     .as_deref()
@@ -1364,11 +1264,15 @@ fn apply_writes(
             }
             PlannedWrite::RecordWrite { path, content } => {
                 let abs = vault_root.join(path);
-                let previous = std::fs::read(&abs).ok();
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        anyhow::anyhow!("could not create {}: {e}", parent.display())
-                    })?;
+                let previous = paths::read_to_string(vault_root, path)
+                    .ok()
+                    .map(|s| s.into_bytes());
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        paths::ensure_directory(vault_root, parent).map_err(|e| {
+                            anyhow::anyhow!("could not create {}: {e:#}", parent.display())
+                        })?;
+                    }
                 }
                 paths::write_replace(vault_root, path, content.as_bytes())
                     .map_err(|e| anyhow::anyhow!("could not write {}: {e:#}", path.display()))?;
@@ -1933,6 +1837,14 @@ mod tests {
         assert_eq!(warnings.len(), 1);
     }
 
+    fn plan_test(
+        root: &Path,
+        item: &ParsedItem,
+        srcs: &BTreeSet<String>,
+    ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
+        plan_item(root, item, srcs, &mut HashMap::new())
+    }
+
     #[test]
     fn plans_ledger_append_grouped_by_month() {
         let dir = TempDir::new().unwrap();
@@ -1941,7 +1853,7 @@ mod tests {
             "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 src:a\n2026-11-02 email p-01M3TC5H00MPJG000000000000 src:b\n",
         )
         .unwrap();
-        let (outcome, writes) = plan_item(dir.path(), &item, &BTreeSet::new())
+        let (outcome, writes) = plan_test(dir.path(), &item, &BTreeSet::new())
             .unwrap()
             .unwrap();
         assert_eq!(outcome.action, "merge");
@@ -1955,7 +1867,7 @@ mod tests {
         let mut srcs = BTreeSet::new();
         srcs.insert("tt-1".to_string());
         let item = parse_item("01JABC", LEDGER_ITEM).unwrap();
-        assert!(plan_item(dir.path(), &item, &srcs).unwrap().is_none());
+        assert!(plan_test(dir.path(), &item, &srcs).unwrap().is_none());
     }
 
     #[test]
@@ -1967,7 +1879,7 @@ mod tests {
             "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m\n",
         )
         .unwrap();
-        let err = plan_item(dir.path(), &item, &BTreeSet::new()).unwrap_err();
+        let err = plan_test(dir.path(), &item, &BTreeSet::new()).unwrap_err();
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_ITEM");
     }
 
@@ -1987,7 +1899,7 @@ mod tests {
             "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m src:tt-9\n",
         )
         .unwrap();
-        assert!(plan_item(dir.path(), &item, &BTreeSet::new())
+        assert!(plan_test(dir.path(), &item, &BTreeSet::new())
             .unwrap()
             .is_none());
     }
@@ -2003,7 +1915,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let err = plan_item(dir.path(), &item, &BTreeSet::new()).unwrap_err();
+            let err = plan_test(dir.path(), &item, &BTreeSet::new()).unwrap_err();
             assert_eq!(
                 DomainError::of(&err).unwrap().code(),
                 "E_INBOX_ITEM",
@@ -2018,7 +1930,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("people/p-acme")).unwrap();
         std::fs::write(dir.path().join("people/p-acme/profile.md"), "# Acme old\n").unwrap();
         let item = parse_item("01JABC", RECORD_ITEM).unwrap();
-        let err = plan_item(dir.path(), &item, &BTreeSet::new()).unwrap_err();
+        let err = plan_test(dir.path(), &item, &BTreeSet::new()).unwrap_err();
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CONFLICT");
     }
 
@@ -2028,7 +1940,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("people/p-acme")).unwrap();
         std::fs::write(dir.path().join("people/p-acme/profile.md"), "# Acme").unwrap();
         let item = parse_item("01JABC", RECORD_ITEM).unwrap();
-        assert!(plan_item(dir.path(), &item, &BTreeSet::new())
+        assert!(plan_test(dir.path(), &item, &BTreeSet::new())
             .unwrap()
             .is_none());
     }
@@ -2036,13 +1948,24 @@ mod tests {
     #[test]
     fn collect_srcs_from_ledger_files() {
         let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            r#"spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "test"
+[checks]
+as_of = "2026-10-08"
+"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
         std::fs::write(
             dir.path().join("ledger/2026/10.cfd"),
             "2026-10-08 session p-01M3TC5H00MPJG000000000000 src:tt-1\n; comment\n2026-10-09 email p-01M3TC5H00MPJG000000000000 src:tt-2\n",
         )
         .unwrap();
-        let srcs = collect_ledger_srcs(dir.path());
+        let vault = load_vault(dir.path()).unwrap();
+        let srcs = collect_vault_srcs(&vault);
         assert!(srcs.contains("tt-1"));
         assert!(srcs.contains("tt-2"));
     }
