@@ -1803,7 +1803,7 @@ fn test_shred_omitting_shared_errors_before_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// #69: commitments come from the verified buffer, never a re-read
+// #69: a tampered manifest fails closed on every path
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1844,4 +1844,57 @@ fn test_tampered_manifest_fails_closed() {
     // 4. The commitments returned in step 1 are intact: they came from
     // the verified buffer, not from the (now tampered) file.
     assert_eq!(commitments[0].commitment, verified_commitment);
+}
+
+#[test]
+fn test_shred_refuses_planted_lookup_age() {
+    // #69 blocking: shred's verify-first pass must check the lookup key
+    // commitment before re-wrapping. A planted lookup.age must make shred
+    // refuse with nothing changed.
+    let mut f = Fixture::new();
+    // Fixture::new already ran init_lookup_key for the device recipient.
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+
+    // Snapshot state so we can assert nothing changed.
+    let keys_dir = f._tmp.path().join("keys");
+    let vault_manifest_before =
+        std::fs::read(keys_dir.join("vault").join("recipients.toml")).unwrap();
+    assert!(keys_dir.join("p-01ABC").exists());
+
+    // Plant a lookup.age wrapping of an attacker-known key.
+    let attacker_key = [0xCCu8; 32];
+    let planted = age_wrap::wrap_to_recipient(&attacker_key, &f.device_recipient).unwrap();
+    std::fs::write(keys_dir.join("vault").join("lookup.age"), &planted).unwrap();
+
+    // Shred must refuse: the planted wrapping doesn't match the epoch-1
+    // commitment in the verified vault manifest.
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    match f.keys.shred(
+        "p-01ABC",
+        &["p-01ABC"],
+        &new_recipients,
+        &f.operator_sk,
+        &f.anchor,
+        &f.device_id,
+    ) {
+        Err(Error::Manifest(_)) => {}
+        Err(e) => panic!("expected Manifest error, got: {e:?}"),
+        Ok(_) => panic!("shred with planted lookup.age must be refused"),
+    }
+
+    // Nothing changed: the shredded client's key tree is still there, the
+    // vault manifest is untouched, and the planted file was never re-wrapped.
+    assert!(keys_dir.join("p-01ABC").exists());
+    assert_eq!(
+        std::fs::read(keys_dir.join("vault").join("recipients.toml")).unwrap(),
+        vault_manifest_before
+    );
+    assert_eq!(
+        std::fs::read(keys_dir.join("vault").join("lookup.age")).unwrap(),
+        planted
+    );
 }

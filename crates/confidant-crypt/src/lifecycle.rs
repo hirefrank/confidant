@@ -768,10 +768,14 @@ impl KeyStore {
                 )));
             }
         }
-        // 3. The lookup key must unwrap with the identity. Verify its
-        // manifest and carry the commitments for the re-wrap below.
-        let (_, _, lookup_commitments) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
-        let lookup_raw = self.read_lookup_raw(identity)?;
+        // 3. The lookup key must unwrap with the identity AND match the
+        // commitment in the verified vault manifest. read_lookup_key
+        // verifies the manifest and checks the commitment — a planted
+        // lookup.age fails closed here, before any mutation. (Client epoch
+        // keys get the same check inside unwrap_data_key in step 1.)
+        // The commitments come from the same verified buffer, so there is
+        // no second manifest read.
+        let (lookup_key, lookup_commitments) = self.read_lookup_key(identity, anchor)?;
 
         // All checks passed: now mutate.
         let new_recovery = Recovery::generate();
@@ -804,7 +808,7 @@ impl KeyStore {
         }
         // Lookup key: re-wrap the verified bytes to new recipients.
         self.write_lookup_raw(
-            &lookup_raw,
+            lookup_key.as_bytes(),
             new_recipients,
             &lookup_commitments,
             operator_sk,
@@ -929,11 +933,14 @@ impl KeyStore {
     /// dictionary attack), then unwrap and check the key commitment.
     /// Mismatch — or a missing commitment — is a hard error; no key is
     /// returned.
+    ///
+    /// Returns the key plus the commitments from the verified buffer, so
+    /// callers don't re-verify the manifest a second time.
     pub fn read_lookup_key(
         &mut self,
         identity: &dyn age::Identity,
         anchor: &Anchor,
-    ) -> Result<LookupKey, Error> {
+    ) -> Result<(LookupKey, Vec<CommitmentEntry>), Error> {
         // Verify the vault manifest before touching the wrapping, and take
         // the commitments from the verified buffer — never re-read.
         let (_, _, commitments) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
@@ -943,15 +950,12 @@ impl KeyStore {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&raw);
-        let expected = commitments
-            .into_iter()
-            .find(|c| c.epoch == 1)
-            .ok_or_else(|| {
-                Error::Manifest(
-                    "no key commitment for the vault lookup key; refusing unauthenticated key"
-                        .to_string(),
-                )
-            })?;
+        let expected = commitments.iter().find(|c| c.epoch == 1).ok_or_else(|| {
+            Error::Manifest(
+                "no key commitment for the vault lookup key; refusing unauthenticated key"
+                    .to_string(),
+            )
+        })?;
         let expected_bytes = manifest::decode_hex(&expected.commitment)?;
         let computed = manifest::key_commitment(&arr, &self.vault_id, VAULT_CLIENT_ID, 1);
         if !manifest::ct_eq(&computed, &expected_bytes) {
@@ -962,7 +966,7 @@ impl KeyStore {
                     .to_string(),
             ));
         }
-        Ok(LookupKey::from_bytes(arr))
+        Ok((LookupKey::from_bytes(arr), commitments))
     }
 }
 
