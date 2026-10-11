@@ -443,12 +443,13 @@ fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
 /// Unicode Default_Ignorable_Code_Point: Cf (ZWSP, soft hyphen, word
 /// joiner, BOM, bidi marks, tags) plus the ignorables outside Cf —
 /// variation selectors, the grapheme joiner, Hangul/Khmer fillers, the
-/// variation-selector supplement, and the unassigned ranges, covered
-/// whole (2060–206F, FFF0–FFFB, E0000–E0FFF are entirely
-/// Default_Ignorable). Stripped before ID scanning so an invisible
-/// character cannot split or hide an ID (#4). The pre-existing Cf ranges
-/// are kept verbatim; the additions are strictly additive, so nothing
-/// that was stripped before is kept now.
+/// variation-selector supplement, and the whole ranges 2060–206F,
+/// FFF0–FFFB, E0000–E0FFF (which include unassigned ignorables; the
+/// ranges also contain a few assigned Cf characters, which were already
+/// stripped before and stay stripped). Stripped before ID scanning so an
+/// invisible character cannot split or hide an ID (#4). The pre-existing
+/// Cf ranges are kept verbatim; the additions are strictly additive, so
+/// nothing that was stripped before is kept now.
 pub(crate) fn is_ignorable(c: char) -> bool {
     matches!(
         c,
