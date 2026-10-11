@@ -42,9 +42,9 @@ use crate::vault::load_vault;
 
 mod keys;
 
-pub use keys::InboxKeys;
 #[cfg(test)]
 pub use keys::inbox_decrypt;
+pub use keys::InboxKeys;
 
 /// The git branch outside tools push intake items to.
 pub const INBOX_BRANCH: &str = "inbox";
