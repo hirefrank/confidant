@@ -205,6 +205,62 @@ mod tests {
     #[test]
     fn bench_gen_vault_stays_within_search_timings() {
         use std::time::{Duration, Instant};
+
+        // Scaling is checked, not wall-clock budgets. The 400x5 vault is
+        // searched and checked against a 200x5 vault (2x the records); the
+        // larger run must take at most 3x the smaller (true linear growth
+        // is ~2x, so the headroom is for timing noise, while quadratic
+        // growth at ~4x fails clearly). Each round times the small vault
+        // and then the large vault back-to-back so both see the same load,
+        // and the minimum ratio across rounds is asserted: scheduling
+        // noise only ever inflates a run, and pairing the runs keeps
+        // drifting load from skewing the comparison. Ratios stay stable
+        // on a loaded machine, where the old absolute budget flaked under
+        // full-suite load (#101). A generous absolute cap remains purely
+        // as a hang guard, not a performance budget. Pattern from #78.
+
+        /// Minimum large/small run-time ratio over back-to-back rounds.
+        /// Fails fast if a single run exceeds the hang-guard cap.
+        fn min_scaling_ratio<S, L>(small: impl Fn() -> S, large: impl Fn() -> L) -> f64 {
+            const ROUNDS: u32 = 5;
+            const HANG_CAP: Duration = Duration::from_secs(120);
+            let mut best = f64::INFINITY;
+            for _ in 0..ROUNDS {
+                let t0 = Instant::now();
+                std::hint::black_box(small());
+                let small_dt = t0.elapsed();
+                let t1 = Instant::now();
+                std::hint::black_box(large());
+                let large_dt = t1.elapsed();
+                for (dt, what) in [(small_dt, "small"), (large_dt, "large")] {
+                    assert!(
+                        dt <= HANG_CAP,
+                        "run hung: the {what} run took {dt:?} (cap {HANG_CAP:?})"
+                    );
+                }
+                let ratio = large_dt.as_secs_f64() / small_dt.as_secs_f64().max(1e-9);
+                best = best.min(ratio);
+            }
+            best
+        }
+
+        /// Assert doubling the vault less than triples the run time.
+        fn assert_linear(name: &str, ratio: f64) {
+            assert!(
+                ratio <= 3.0,
+                "{name} is not linear: 2x vault took {ratio:.2}x the time of 1x vault"
+            );
+        }
+
+        let small_dir = tempfile::tempdir().unwrap();
+        let (small_unique, small_common) =
+            generate_realistic_vault(small_dir.path(), 200, 5, false).unwrap();
+        let small_vault = load_vault(small_dir.path()).unwrap();
+        assert!(
+            small_vault.records.len() >= 1_200,
+            "expected ~1250 files, got {} records",
+            small_vault.records.len()
+        );
         let dir = tempfile::tempdir().unwrap();
         let (unique, common) = generate_realistic_vault(dir.path(), 400, 5, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
@@ -213,35 +269,57 @@ mod tests {
             "expected ~2500 files, got {} records",
             vault.records.len()
         );
-        let budget = if cfg!(debug_assertions) {
-            Duration::from_secs(8)
-        } else {
-            Duration::from_millis(200)
-        };
-        let t0 = Instant::now();
-        let one = search(&vault, &unique).expect("search");
-        let find_unique = t0.elapsed();
-        let t1 = Instant::now();
-        let many = search(&vault, &common).expect("search");
-        let find_common = t1.elapsed();
-        let t2 = Instant::now();
+
+        // Functional asserts (kept out of the timed rounds).
+        assert_eq!(
+            search(&small_vault, &small_unique)
+                .expect("search")
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            search(&small_vault, &small_common)
+                .expect("search")
+                .hits
+                .len()
+                >= 200
+        );
+        let small_report = crate::check_vault(&small_vault, &crate::CheckOptions::default());
+        assert!(
+            small_report.findings.is_empty(),
+            "generated vault should check clean: {:?}",
+            small_report.findings
+        );
+        assert_eq!(search(&vault, &unique).expect("search").hits.len(), 1);
+        assert!(search(&vault, &common).expect("search").hits.len() >= 400);
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());
-        let check = t2.elapsed();
-        assert_eq!(one.hits.len(), 1, "{:?}", one.hits);
-        assert!(many.hits.len() >= 400, "{}", many.hits.len());
         assert!(
             report.findings.is_empty(),
             "generated vault should check clean: {:?}",
             report.findings
         );
-        assert!(
-            find_unique <= budget,
-            "find unique {find_unique:?} exceeded {budget:?}"
+
+        assert_linear(
+            "find unique 1200→2400 records",
+            min_scaling_ratio(
+                || search(&small_vault, &small_unique).expect("search"),
+                || search(&vault, &unique).expect("search"),
+            ),
         );
-        assert!(
-            find_common <= budget,
-            "find common {find_common:?} exceeded {budget:?}"
+        assert_linear(
+            "find common 1200→2400 records",
+            min_scaling_ratio(
+                || search(&small_vault, &small_common).expect("search"),
+                || search(&vault, &common).expect("search"),
+            ),
         );
-        assert!(check <= budget, "check {check:?} exceeded {budget:?}");
+        assert_linear(
+            "check 1200→2400 records",
+            min_scaling_ratio(
+                || crate::check_vault(&small_vault, &crate::CheckOptions::default()),
+                || crate::check_vault(&vault, &crate::CheckOptions::default()),
+            ),
+        );
     }
 }
