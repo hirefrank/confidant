@@ -1,0 +1,8 @@
+#!/bin/sh
+# Reject AI agent co-author trailers (Marigold is a local agent name, not a GitHub user).
+set -eu
+msg_file="${1:?}"
+if grep -qiE '^(Co-authored-by|Signed-off-by):.*(marigold|cursoragent@cursor\.com)' "$msg_file"; then
+	echo "commit-msg: do not attribute AI agents in git trailers (see AGENTS.md hard rule 9)" >&2
+	exit 1
+fi

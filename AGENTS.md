@@ -119,6 +119,13 @@ These are blocking. Do not open a PR for review that breaks one.
    and `--no-input`; JSON includes the resolved vault path; usage errors
    exit 2; callers branch on error and finding `code`, never on message
    text. Breaking changes to this contract need versioning.
+9. **Human-only git attribution.** Commits list the operator as author and
+   committer only. Never add `Co-authored-by`, `Signed-off-by`, or similar
+   trailers for AI assistants (including local names like **Marigold** or
+   **Cursor**). Local branch prefixes such as `marigold/` are workflow
+   labels only — they must not appear in author metadata or commit trailers.
+   Enable the guard with `git config core.hooksPath .githooks` (see
+   `CONTRIBUTING.md`).
 
 ## Code conventions
 

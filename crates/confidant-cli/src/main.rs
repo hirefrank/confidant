@@ -31,6 +31,7 @@ use confidant_core::write::{
     apply_write, require_git_repo, FileChange, PendingWrite, WriteOptions, WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, CheckOptions};
+use serde_json::Value;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -310,18 +311,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let (unique, common) =
                 confidant_core::bench::generate_realistic_vault(dir, *people, *notes, *cjk)?;
             if json {
-                println!(
-                    "{}",
+                print_json(&ok_envelope(
+                    Some(dir),
                     serde_json::json!({
-                        "ok": true,
-                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                        "vault": dir.canonicalize().unwrap_or_else(|_| dir.clone()).display().to_string(),
                         "people": people,
                         "notes_per_person": notes,
                         "unique_token": unique,
                         "common_token": common,
-                    })
-                );
+                    }),
+                ))?;
             } else {
                 println!("wrote {people} people × {notes} notes at {}", dir.display());
                 println!("unique token: {unique}");
@@ -351,8 +349,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 },
             );
             if json {
-                serde_json::to_writer(io::stdout(), &report)?;
-                println!();
+                print_json(&report)?;
             } else {
                 print_check_human(&report)?;
             }
@@ -363,64 +360,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Find { query, limit } => {
-            if query.trim().is_empty() {
-                return Err(anyhow::Error::new(DomainError::usage(
-                    "find requires a non-empty query",
-                )));
-            }
             let root = vault_root.unwrap();
-            let vault = vault_or!(&root, json);
-            if vault.config.spec != confidant_core::SPEC_VERSION {
-                print_error(
-                    json,
-                    Some(&vault.root.display().to_string()),
-                    &DomainError::spec_unsupported(&vault.config.spec),
-                )?;
-                return Ok(ExitCode::from(1));
-            }
-            let result = match search(&vault, query) {
-                Ok(result) => result,
-                Err(err) => {
-                    print_error(json, Some(&vault.root.display().to_string()), &err)?;
-                    return Ok(ExitCode::from(err.exit_code() as u8));
-                }
-            };
-            let hits: Vec<_> = result.hits.into_iter().take(*limit).collect();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": true,
-                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                        "vault": vault.root.display().to_string(),
-                        "query": query,
-                        "matches": hits,
-                        "findings": result.findings,
-                    })
-                );
-            } else {
-                for f in &result.findings {
-                    writeln!(
-                        io::stdout(),
-                        "{:<7}  {}  {}",
-                        f.severity.label(),
-                        f.code.as_str(),
-                        f.message
-                    )?;
-                }
-                for hit in &hits {
-                    let id = hit.id.as_deref().unwrap_or("-");
-                    writeln!(
-                        io::stdout(),
-                        "{id}\t{}:{}\t{}",
-                        hit.path,
-                        hit.line,
-                        hit.excerpt
-                    )?;
-                }
-                writeln!(io::stdout(), "{} matches", hits.len())?;
-            }
-            Ok(ExitCode::SUCCESS)
+            cmd_find(json, &root, query, *limit)
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
@@ -492,101 +433,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }) => {
                     cmd_inbox_rotate(&root, user_config.as_ref(), json, *finish, *rotate_unsigned)
                 }
-                None => {
-                    let trusted_signers = user_config
-                        .as_ref()
-                        .map(|u| u.trust.signers.clone())
-                        .unwrap_or_default();
-                    let pinned_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
-                    // Load the inbox key material once per run. `None` when no key
-                    // is enrolled (genuine NoKey): the #55 comparison is skipped and
-                    // decryption fails closed later. Legacy-file refusals and
-                    // keychain errors surface here directly.
-                    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
-                        match confidant_core::InboxKeys::load_opt() {
-                            Ok(keys) => keys.map(std::sync::Arc::new),
-                            Err(err) => {
-                                let domain = DomainError::of(&err)
-                                    .cloned()
-                                    .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-                                print_error(json, Some(&root.display().to_string()), &domain)?;
-                                return Ok(ExitCode::from(domain.exit_code() as u8));
-                            }
-                        };
-                    let decrypt = {
-                        let keys = inbox_keys.clone();
-                        move |ciphertext: &[u8]| match &keys {
-                            Some(k) => k.decrypt(ciphertext),
-                            None => Err(anyhow::Error::new(DomainError::inbox_crypto(
-                                "no inbox key enrolled".to_string(),
-                            ))),
-                        }
-                    };
-                    let report = match confidant_core::run_inbox(
-                        &root,
-                        &confidant_core::InboxOptions {
-                            dry_run: *dry_run,
-                            trusted_signers,
-                            allow_unsigned: *allow_unsigned,
-                            pinned_pubkey,
-                        },
-                        &decrypt,
-                        inbox_keys.as_deref(),
-                    ) {
-                        Ok(report) => report,
-                        Err(err) => {
-                            let domain = DomainError::of(&err)
-                                .cloned()
-                                .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-                            print_error(json, Some(&root.display().to_string()), &domain)?;
-                            return Ok(ExitCode::from(domain.exit_code() as u8));
-                        }
-                    };
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "ok": true,
-                                "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                                "vault": root.display().to_string(),
-                                "branch": report.branch,
-                                "dry_run": report.dry_run,
-                                "empty": report.empty,
-                                "merged": report.merged,
-                                "cleared": report.cleared,
-                                "items": report.items.iter().map(|i| serde_json::json!({
-                                    "name": i.name,
-                                    "kind": i.kind,
-                                    "target": i.target,
-                                    "action": i.action,
-                                })).collect::<Vec<_>>(),
-                                "warnings": report.warnings,
-                            })
-                        );
-                    } else {
-                        if report.empty {
-                            println!("inbox: nothing to do (no inbox branch)");
-                        } else if report.dry_run {
-                            println!(
-                                "inbox: dry run — {} item(s) would merge, {} would be skipped",
-                                report.merged,
-                                report.items.len() - report.merged
-                            );
-                        } else {
-                            println!(
-                                "inbox: {} item(s) merged into {}, {} cleared",
-                                report.merged, report.branch, report.cleared
-                            );
-                        }
-                        for i in &report.items {
-                            println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
-                        }
-                        for w in &report.warnings {
-                            println!("warning: {w}");
-                        }
-                    }
-                    Ok(ExitCode::SUCCESS)
-                }
+                None => cmd_inbox(json, &root, user_config.as_ref(), *dry_run, *allow_unsigned),
             }
         }
         Command::Log { action } => {
@@ -656,6 +503,196 @@ fn load_vault_or(root: &Path, json: bool) -> Result<confidant_core::Vault, ExitC
     }
 }
 
+fn is_broken_pipe(err: &serde_json::Error) -> bool {
+    err.io_error_kind() == Some(io::ErrorKind::BrokenPipe)
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    if let Err(err) = serde_json::to_writer(&mut out, value) {
+        if is_broken_pipe(&err) {
+            return Ok(());
+        }
+        return Err(err.into());
+    }
+    match writeln!(out) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn vault_json(root: Option<&Path>) -> Value {
+    match root {
+        Some(p) => Value::String(p.display().to_string()),
+        None => Value::Null,
+    }
+}
+
+/// Standard `--json` envelope for successful command output.
+fn ok_envelope(root: Option<&Path>, extra: Value) -> Value {
+    let mut map = serde_json::Map::new();
+    if let Value::Object(obj) = extra {
+        map.extend(obj);
+    }
+    map.insert("ok".to_owned(), Value::Bool(true));
+    map.insert(
+        "schema_version".to_owned(),
+        Value::String(confidant_core::check::JSON_SCHEMA_VERSION.to_owned()),
+    );
+    map.insert("vault".to_owned(), vault_json(root));
+    Value::Object(map)
+}
+
+fn fail_command(json: bool, vault: Option<&str>, err: &anyhow::Error) -> anyhow::Result<ExitCode> {
+    let domain = DomainError::of(err)
+        .cloned()
+        .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
+    print_error(json, vault, &domain)?;
+    Ok(ExitCode::from(domain.exit_code() as u8))
+}
+
+fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Result<ExitCode> {
+    if query.trim().is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "find requires a non-empty query",
+        )));
+    }
+    let vault = vault_or!(root, json);
+    let vault_path = vault.root.display().to_string();
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        print_error(
+            json,
+            Some(&vault_path),
+            &DomainError::spec_unsupported(&vault.config.spec),
+        )?;
+        return Ok(ExitCode::from(1));
+    }
+    let result = match search(&vault, query) {
+        Ok(result) => result,
+        Err(err) => {
+            print_error(json, Some(&vault_path), &err)?;
+            return Ok(ExitCode::from(err.exit_code() as u8));
+        }
+    };
+    let hits: Vec<_> = result.hits.into_iter().take(limit).collect();
+    if json {
+        print_json(&ok_envelope(
+            Some(&vault.root),
+            serde_json::json!({
+                "query": query,
+                "matches": hits,
+                "findings": result.findings,
+            }),
+        ))?;
+    } else {
+        for f in &result.findings {
+            writeln!(
+                io::stdout(),
+                "{:<7}  {}  {}",
+                f.severity.label(),
+                f.code.as_str(),
+                f.message
+            )?;
+        }
+        for hit in &hits {
+            let id = hit.id.as_deref().unwrap_or("-");
+            writeln!(
+                io::stdout(),
+                "{id}\t{}:{}\t{}",
+                hit.path,
+                hit.line,
+                hit.excerpt
+            )?;
+        }
+        writeln!(io::stdout(), "{} matches", hits.len())?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_inbox(
+    json: bool,
+    root: &Path,
+    user_config: Option<&UserConfig>,
+    dry_run: bool,
+    allow_unsigned: bool,
+) -> anyhow::Result<ExitCode> {
+    let vault_path = root.display().to_string();
+    let trusted_signers = user_config
+        .map(|u| u.trust.signers.clone())
+        .unwrap_or_default();
+    let pinned_pubkey = user_config.and_then(|u| u.inbox.pubkey.clone());
+    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
+        match confidant_core::InboxKeys::load_opt() {
+            Ok(keys) => keys.map(std::sync::Arc::new),
+            Err(err) => return fail_command(json, Some(&vault_path), &err),
+        };
+    let decrypt = {
+        let keys = inbox_keys.clone();
+        move |ciphertext: &[u8]| match &keys {
+            Some(k) => k.decrypt(ciphertext),
+            None => Err(anyhow::Error::new(DomainError::inbox_crypto(
+                "no inbox key enrolled".to_string(),
+            ))),
+        }
+    };
+    let report = match confidant_core::run_inbox(
+        root,
+        &confidant_core::InboxOptions {
+            dry_run,
+            trusted_signers,
+            allow_unsigned,
+            pinned_pubkey,
+        },
+        &decrypt,
+        inbox_keys.as_deref(),
+    ) {
+        Ok(report) => report,
+        Err(err) => return fail_command(json, Some(&vault_path), &err),
+    };
+    if json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "branch": report.branch,
+                "dry_run": report.dry_run,
+                "empty": report.empty,
+                "merged": report.merged,
+                "cleared": report.cleared,
+                "items": report.items.iter().map(|i| serde_json::json!({
+                    "name": i.name,
+                    "kind": i.kind,
+                    "target": i.target,
+                    "action": i.action,
+                })).collect::<Vec<_>>(),
+                "warnings": report.warnings,
+            }),
+        ))?;
+    } else {
+        if report.empty {
+            println!("inbox: nothing to do (no inbox branch)");
+        } else if report.dry_run {
+            println!(
+                "inbox: dry run — {} item(s) would merge, {} would be skipped",
+                report.merged,
+                report.items.len() - report.merged
+            );
+        } else {
+            println!(
+                "inbox: {} item(s) merged into {}, {} cleared",
+                report.merged, report.branch, report.cleared
+            );
+        }
+        for i in &report.items {
+            println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+        }
+        for w in &report.warnings {
+            println!("warning: {w}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 // ---------------------------------------------------------------------------
 // Write commands
 // ---------------------------------------------------------------------------
@@ -666,24 +703,6 @@ fn write_options(cli: &Cli) -> WriteOptions {
         no_input: cli.no_input,
         request_id: cli.request_id.clone(),
     }
-}
-
-/// Standard --json envelope for successful write outcomes.
-fn ok_envelope(root: &Path, extra: serde_json::Value) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    map.insert("ok".to_owned(), serde_json::Value::Bool(true));
-    map.insert(
-        "schema_version".to_owned(),
-        serde_json::Value::String(confidant_core::check::JSON_SCHEMA_VERSION.to_owned()),
-    );
-    map.insert(
-        "vault".to_owned(),
-        serde_json::Value::String(root.display().to_string()),
-    );
-    if let serde_json::Value::Object(obj) = extra {
-        map.extend(obj);
-    }
-    serde_json::Value::Object(map)
 }
 
 /// Print a [`WriteOutcome`] and return the exit code.
@@ -707,7 +726,7 @@ fn finish_write(
                 if let serde_json::Value::Object(e) = extra {
                     obj.as_object_mut().unwrap().extend(e);
                 }
-                println!("{}", ok_envelope(root, obj));
+                print_json(&ok_envelope(Some(root), obj))?;
             } else {
                 println!(
                     "committed {} ({} file(s))",
@@ -741,7 +760,7 @@ fn finish_write(
                 if let serde_json::Value::Object(e) = extra {
                     obj.as_object_mut().unwrap().extend(e);
                 }
-                println!("{}", ok_envelope(root, obj));
+                print_json(&ok_envelope(Some(root), obj))?;
             } else {
                 println!("dry run — no files written, no commit:");
                 for p in &preview {
@@ -753,17 +772,14 @@ fn finish_write(
         }
         WriteOutcome::Idempotent { commit } => {
             if cli.json {
-                println!(
-                    "{}",
-                    ok_envelope(
-                        root,
-                        serde_json::json!({
-                            "command": command,
-                            "idempotent": true,
-                            "commit": commit,
-                        })
-                    )
-                );
+                print_json(&ok_envelope(
+                    Some(root),
+                    serde_json::json!({
+                        "command": command,
+                        "idempotent": true,
+                        "commit": commit,
+                    }),
+                ))?;
             } else {
                 println!(
                     "already applied (commit {})",
@@ -774,8 +790,7 @@ fn finish_write(
         }
         WriteOutcome::CheckBlocked { report } => {
             if cli.json {
-                serde_json::to_writer(io::stdout(), &report)?;
-                println!();
+                print_json(&report)?;
             } else {
                 writeln!(io::stderr(), "write blocked: check failed")?;
                 print_check_human(&report)?;
@@ -862,19 +877,16 @@ fn cmd_inbox_rotate(
     };
 
     if json {
-        println!(
-            "{}",
+        print_json(&ok_envelope(
+            Some(root),
             serde_json::json!({
-                "ok": true,
-                "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                "vault": root.display().to_string(),
                 "finish": finish,
                 "drained": outcome.drain.as_ref().map(|d| d.merged),
                 "new_recipient": outcome.new_recipient,
                 "old_key_destroyed": outcome.old_key_destroyed,
                 "lost_key": outcome.lost_key,
-            })
-        );
+            }),
+        ))?;
     } else if finish {
         if outcome.old_key_destroyed {
             let merged = outcome.drain.as_ref().map(|d| d.merged).unwrap_or(0);
@@ -941,6 +953,7 @@ fn cmd_log_session(
             body: text.clone(),
             source: String::new(),
             body_start_line: 0,
+            field_lines: BTreeMap::new(),
         };
         changes.push(FileChange::WriteFile {
             path: rel,
@@ -1100,6 +1113,7 @@ fn cmd_note_add(
         body: body.clone(),
         source: String::new(),
         body_start_line: 0,
+        field_lines: BTreeMap::new(),
     };
     let outcome = apply_write(
         root,
@@ -1150,8 +1164,8 @@ fn cmd_context(
         .context("use `confidant find <name>` to look up the id")
     })?;
     if cli.json {
-        let value = serde_json::to_value(&bundle).unwrap_or(serde_json::Value::Null);
-        println!("{}", ok_envelope(root, value));
+        let value = serde_json::to_value(&bundle)?;
+        print_json(&ok_envelope(Some(root), value))?;
     } else {
         let p = &bundle.person;
         println!(
@@ -1359,9 +1373,9 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
             .collect();
         let mut extra = serde_json::Map::new();
         extra.insert("checks".to_owned(), serde_json::Value::Array(items));
-        let mut envelope = ok_envelope(root, serde_json::Value::Object(extra));
+        let mut envelope = ok_envelope(Some(root), serde_json::Value::Object(extra));
         envelope["ok"] = serde_json::Value::Bool(ok);
-        println!("{envelope}");
+        print_json(&envelope)?;
     } else {
         for c in &checks {
             println!("{:7} {}: {}", c.status, c.id, c.message);
@@ -1381,11 +1395,7 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
 fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
     let schema = contract_schema();
     if cli.json {
-        let root = vault.map(|v| v.display().to_string()).unwrap_or_default();
-        println!(
-            "{}",
-            ok_envelope(Path::new(&root), serde_json::json!({"contract": schema}))
-        );
+        print_json(&ok_envelope(vault, serde_json::json!({"contract": schema})))?;
     } else {
         println!("{}", serde_json::to_string_pretty(&schema)?);
     }
@@ -1416,8 +1426,7 @@ fn help_json_value() -> serde_json::Value {
 fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::Result<ExitCode> {
     if cli.json {
         // Generated from the live clap definitions, so it cannot drift.
-        let root = vault.map(|v| v.display().to_string()).unwrap_or_default();
-        println!("{}", ok_envelope(Path::new(&root), help_json_value()));
+        print_json(&ok_envelope(vault, help_json_value()))?;
         return Ok(ExitCode::SUCCESS);
     }
     let mut cmd = Cli::command();
@@ -1502,7 +1511,7 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
             "vault": vault,
             "error": err.to_json(),
         });
-        writeln!(io::stdout(), "{body}")?;
+        print_json(&body)?;
     } else {
         writeln!(io::stderr(), "error: {} ({})", err.message(), err.code())?;
         if let Some(fix) = err.fix() {

@@ -268,7 +268,8 @@ fn apply_open(
             Finding::new(FindingCode::OpenMalformed, Severity::Error, msg)
                 .at_file(file)
                 .at_line(line)
-                .for_id(&entry.id),
+                .for_id(&entry.id)
+                .with_fix("Use open <pkg-id> <positive-integer> on its own ledger line"),
         ),
         Some(Ok((pkg, n))) => {
             if pkg.prefix() != Prefix::Package {
@@ -611,11 +612,7 @@ fn note_coverage(
 }
 
 fn person_from_path(path: &str) -> Option<RecordId> {
-    let mut parts = path.split('/');
-    if parts.next()? != "people" {
-        return None;
-    }
-    RecordId::parse(parts.next()?).ok()
+    crate::id::person_id_from_path(path)
 }
 
 fn paid_session_gap(

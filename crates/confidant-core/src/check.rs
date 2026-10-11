@@ -567,7 +567,8 @@ fn check_aliases_and_merges(
                         )
                         .at_file(&sourced.file)
                         .at_line(sourced.line)
-                        .for_id(&from),
+                        .for_id(&from)
+                        .with_fix("Remove the self-merge or merge into a different record"),
                     );
                     continue;
                 }
@@ -611,14 +612,25 @@ fn check_aliases_and_merges(
     }
 
     if let Some(cycle) = detect_cycle(&parent) {
-        findings.push(
-            Finding::new(
-                FindingCode::MergeCycle,
-                Severity::Error,
-                format!("merge entries form a cycle involving {cycle}"),
-            )
-            .with_fix("Remove one merge so every id has a single canonical root"),
-        );
+        let mut finding = Finding::new(
+            FindingCode::MergeCycle,
+            Severity::Error,
+            format!("merge entries form a cycle involving {cycle}"),
+        )
+        .with_fix("Remove one merge so every id has a single canonical root");
+        if let Some(sourced) = vault.entries.iter().find(|s| {
+            s.entry.verb == "merge"
+                && matches!(
+                    parse_merge(&s.entry),
+                    MergeParse::Ok { from, to } if from == cycle || to == cycle
+                )
+        }) {
+            finding = finding
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&cycle);
+        }
+        findings.push(finding);
     }
 
     let mut seen_alias: BTreeMap<(String, String), RecordId> = BTreeMap::new();
@@ -802,7 +814,8 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
-                    .for_id(&e.id),
+                    .for_id(&e.id)
+                    .with_fix("Use sessions_remaining or icf_hours, or remove the balance line"),
                 );
                 continue;
             }
@@ -821,7 +834,8 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                         )
                         .at_file(&sourced.file)
                         .at_line(sourced.line)
-                        .for_id(&e.id),
+                        .for_id(&e.id)
+                        .with_fix("Use an integer such as 3 for sessions_remaining"),
                     );
                     continue;
                 }
@@ -852,7 +866,8 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
-                    .for_id(&e.id),
+                    .for_id(&e.id)
+                    .with_fix("Use a decimal such as 1.50 for icf_hours"),
                 );
                 continue;
             };
@@ -899,20 +914,27 @@ fn check_duplicate_ulids(vault: &Vault, findings: &mut Vec<Finding>) {
         }
         let mut ids = ids;
         ids.sort();
-        findings.push(
-            Finding::new(
-                FindingCode::DuplicateUlid,
-                Severity::Error,
-                format!(
-                    "ULID {ulid} is used under more than one prefix ({})",
-                    ids.iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            )
-            .for_id(ids[0]),
-        );
+        let file = vault
+            .records
+            .get(ids[1])
+            .map(|r| r.path.clone())
+            .or_else(|| vault.records.get(ids[0]).map(|r| r.path.clone()));
+        let mut finding = Finding::new(
+            FindingCode::DuplicateUlid,
+            Severity::Error,
+            format!(
+                "ULID {ulid} is used under more than one prefix ({})",
+                ids.iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .for_id(ids[0]);
+        if let Some(path) = file {
+            finding = finding.at_file(&path);
+        }
+        findings.push(finding);
     }
 }
 
@@ -942,16 +964,20 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                         .with_fix("Use a prefixed 26-character Crockford ULID"),
                     );
                 }
-                FrontmatterRef::Id(id) if !known_ids.contains(&id) => findings.push(
-                    Finding::new(
+                FrontmatterRef::Id(id) if !known_ids.contains(&id) => {
+                    let mut finding = Finding::new(
                         FindingCode::DanglingRef,
                         Severity::Error,
                         format!("front matter key '{key}' has no record"),
                     )
                     .at_file(&rec.path)
                     .for_id(&rec.id)
-                    .with_fix("Create the record or fix the reference"),
-                ),
+                    .with_fix("Create the record or fix the reference");
+                    if let Some(line) = rec.field_lines.get(key) {
+                        finding = finding.at_line(*line);
+                    }
+                    findings.push(finding);
+                }
                 FrontmatterRef::Id(_) => {}
             }
         }
