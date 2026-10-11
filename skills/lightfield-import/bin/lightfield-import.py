@@ -58,7 +58,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import common  # noqa: E402
 
 _NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
-_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
+# Quoted "no-ai" / 'no-ai' are the same flag (spec section 13); anything
+# else that normalises to noai is a typo. Bare `true` only (#47).
+_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*true\s*$""", re.MULTILINE)
 
 
 def is_no_ai(row: dict) -> bool:
@@ -112,18 +114,29 @@ def load_map(vault: str) -> dict[str, str]:
         return {}
 
 
-def existing_people(vault: str) -> dict[str, tuple[str, bool]]:
+def existing_people(vault: str) -> tuple[dict[str, tuple[str, bool]], dict[str, bool]]:
     """Map profile display name -> (person ID, no-ai flag) for exact-match linking.
 
     The no-ai flag is read from the person's front matter so a contact that
     matches an existing no-ai person seeds no-ai onto their new deals, notes
     and transcripts.
+
+    Returns (by_name, by_id). by_name keeps the first person per display
+    name (sorted person-ID order); by_id covers *every* scanned person, so
+    a duplicate display name can't drop a no-ai person from inheritance
+    (#100-10). Both directory (`people/p-<ULID>/profile.md`) and flat
+    (`people/p-<ULID>.md`) records are read (#100-9).
     """
-    people: dict[str, tuple[str, bool]] = {}
+    by_name: dict[str, tuple[str, bool]] = {}
+    by_id: dict[str, bool] = {}
     base = os.path.join(vault, "people")
     if not os.path.isdir(base):
-        return people
-    for pid in sorted(os.listdir(base)):
+        return by_name, by_id
+    for entry in sorted(os.listdir(base)):
+        # A flat record lists as `p-<ULID>.md`; strip the suffix so the
+        # candidates below resolve (mirror transcript-import's
+        # _person_is_no_ai, which takes the bare ID).
+        pid = entry[:-3] if entry.endswith(".md") else entry
         for cand in (os.path.join(base, pid, "profile.md"),
                      os.path.join(base, pid + ".md")):
             if not os.path.isfile(cand):
@@ -133,11 +146,12 @@ def existing_people(vault: str) -> dict[str, tuple[str, bool]]:
                     head = f.read(4096)
             except OSError:
                 continue
+            no_ai = _NO_AI_RE.search(head) is not None
+            by_id.setdefault(pid, no_ai)
             m = _NAME_RE.search(head)
             if m:
-                no_ai = _NO_AI_RE.search(head) is not None
-                people.setdefault(m.group(1).strip(), (pid, no_ai))
-    return people
+                by_name.setdefault(m.group(1).strip(), (pid, no_ai))
+    return by_name, by_id
 
 
 
@@ -245,8 +259,7 @@ def main(argv=None) -> int:
         return 2
 
     existing_srcs = common.collect_srcs(vault)
-    people_by_name = existing_people(vault)
-    people_no_ai = {pid: no_ai for pid, no_ai in people_by_name.values()}
+    people_by_name, people_no_ai = existing_people(vault)
     lf_map = load_map(vault)
     warnings: list[str] = []
     skipped: list[dict] = []

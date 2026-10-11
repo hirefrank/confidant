@@ -45,7 +45,9 @@ import common  # noqa: E402
 
 BILLING_TAGS = ("paid", "pps", "comp")
 
-_NO_AI_RE = re.compile(r"^no-ai:\s*true\s*$", re.MULTILINE)
+# Quoted "no-ai" / 'no-ai' are the same flag (spec section 13); anything
+# else that normalises to noai is a typo. Bare `true` only (#47).
+_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*true\s*$""", re.MULTILINE)
 
 
 def _person_is_no_ai(vault: str, person: str) -> bool:

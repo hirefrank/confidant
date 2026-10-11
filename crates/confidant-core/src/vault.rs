@@ -300,6 +300,8 @@ fn is_trusted_component(name: &str) -> bool {
             | ".confidant"
             | "confidant.toml"
             | "profile.md"
+            | "org.md"
+            | "note.md"
             | "deal.md"
             | "interaction.md"
     ) || is_yyyy(name)
@@ -1329,6 +1331,16 @@ mod tests {
         assert_eq!(
             redacted_filename(Path::new("people/notes.md")),
             "people/<invalid-filename>"
+        );
+        // Valid org and note files keep their last component (#100-12:
+        // org.md and note.md are trusted components per spec section 2).
+        assert_eq!(
+            redacted_filename(Path::new("orgs/o-01M3TC5H00MPJG000000000000/org.md")),
+            "orgs/o-01M3TC5H00MPJG000000000000/org.md"
+        );
+        assert_eq!(
+            redacted_filename(Path::new("notes/n-01M3TC5H00MPJG002NAM000005/note.md")),
+            "notes/n-01M3TC5H00MPJG002NAM000005/note.md"
         );
         // Absolute paths fail the trust test on the first component and
         // collapse to a bare marker (callers must pass vault-relative paths).
