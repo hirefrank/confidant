@@ -398,7 +398,12 @@ expires = "2026-11-08"
   the command says what it is about to do and confirms before proceeding.
   Because the recovery identity is rotated, **each shred means a new
   recovery phrase**: the command displays it once and requires confirmation
-  it was written down, exactly like `init`. `keys shred` also states its
+  it was written down, exactly like `init`. **Re-pin the anchor before any
+  other key operation** (`init_client`, `rotate`): both read the recovery
+  recipient from the anchor, so a client initialized after a shred but
+  before the re-pin wraps to the recovery key the shred just destroyed and
+  cannot be recovered from the new phrase (issue #99, test in
+  `confidant-crypt`). `keys shred` also states its
   leftover limits plainly in its output: decrypted copies already on
   devices, `.confidant/` caches and search indexes on every device, old
   keys lingering in OS keychains or OS backups, copies outside
