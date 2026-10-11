@@ -2476,6 +2476,126 @@ fn bare_pipe_person_is_invalid_id() {
     assert!(codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
 }
 
+fn finding_messages(v: &Value, code: &str) -> Vec<String> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == code)
+        .map(|f| f["message"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn capitalised_person_key_with_name_is_invalid_id() {
+    // #5: `Person: Ada Example` is a reference under identical rules — a
+    // name value is E_INVALID_ID (naming the key as written) and the note
+    // stays out of find.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nPerson: Ada Example\ndate: 2026-10-01\n---\n\ncapitalised-person-token\n"),
+    );
+    let result = search_q(dir.path(), "capitalised-person-token");
+    assert!(
+        !token_in_hits(&result, "capitalised-person-token"),
+        "{result:?}"
+    );
+    let json = report_json(dir.path(), None);
+    let msgs = finding_messages(&json, "E_INVALID_ID");
+    assert!(
+        msgs.iter().any(|m| m.contains("'Person'")),
+        "expected the key named as written: {json}"
+    );
+}
+
+#[test]
+fn capitalised_person_key_with_id_links() {
+    // #5: `Person: <id>` is a clean link — searchable, no findings.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nPerson: {ADA}\ndate: 2026-10-01\n---\n\nlinked-capitalised-token\n"),
+    );
+    let result = search_q(dir.path(), "linked-capitalised-token");
+    assert!(
+        token_in_hits(&result, "linked-capitalised-token"),
+        "{result:?}"
+    );
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(!codes(&json).contains(&"E_DANGLING_REF".into()), "{json}");
+}
+
+#[test]
+fn alias_client_key_is_still_ignored() {
+    // #5: `client:` is not a spec key, so it is not a reference even when
+    // it holds a name — no E_INVALID_ID, note stays searchable.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nclient: Ada Example\ndate: 2026-10-01\n---\n\nalias-client-token\n"),
+    );
+    let result = search_q(dir.path(), "alias-client-token");
+    assert!(token_in_hits(&result, "alias-client-token"), "{result:?}");
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(!codes(&json).contains(&"E_DANGLING_REF".into()), "{json}");
+}
+
+#[test]
+fn dangling_capitalised_org_is_dangling_ref() {
+    // #5: `Org: <missing>` is E_DANGLING_REF, naming the key as written.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nOrg: {GHOST}\ndate: 2026-10-01\n---\n\ndangling-org-token\n"),
+    );
+    let json = report_json(dir.path(), None);
+    let msgs = finding_messages(&json, "E_DANGLING_REF");
+    assert!(
+        msgs.iter().any(|m| m.contains("'Org'")),
+        "expected the key named as written: {json}"
+    );
+}
+
+#[test]
+fn malformed_id_on_capitalised_key_names_the_key() {
+    // #5: a malformed token on a `Person:` line is E_INVALID_ID with the
+    // key name (a variant key is a known ref key), and the note is uncleared.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE}/note.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nPerson: p-01M3TC5H00MPJG0000000\ndate: 2026-10-01\n---\n\nmalformed-variant-token\n"),
+    );
+    let result = search_q(dir.path(), "malformed-variant-token");
+    assert!(
+        !token_in_hits(&result, "malformed-variant-token"),
+        "{result:?}"
+    );
+    let json = report_json(dir.path(), None);
+    let msgs = finding_messages(&json, "E_INVALID_ID");
+    assert!(
+        msgs.iter().any(|m| m.contains("'Person'")),
+        "expected the key named as written: {json}"
+    );
+}
+
 #[test]
 fn yaml_null_person_is_not_a_reference() {
     let dir = tempfile::tempdir().unwrap();

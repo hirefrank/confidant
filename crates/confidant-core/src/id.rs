@@ -303,7 +303,7 @@ pub(crate) fn scan_id_tokens_against(
 /// Tokenize the prefixed form of a line once (no bare-ULID windows).
 pub(crate) fn scan_prefixed_line(text: &str) -> PrefixedScan {
     let mapped = map_soft_hyphen_after_prefix(text);
-    let stripped = strip_cf(&mapped);
+    let stripped = strip_ignorable(&mapped);
     scan_prefixed(stripped.as_ref())
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn add_bare_ulid_windows(
     scan: &mut PrefixedScan,
 ) {
     let mapped = map_soft_hyphen_after_prefix(text);
-    let stripped = strip_cf(&mapped);
+    let stripped = strip_ignorable(&mapped);
     scan_vault_ulid_windows(
         stripped.as_ref(),
         vault_ulids,
@@ -328,7 +328,7 @@ pub(crate) fn add_bare_ulid_windows(
 /// Used to seed the allowlist from file and directory names.
 pub(crate) fn collect_uncovered_ulid_windows(text: &str, out: &mut BTreeSet<String>) {
     let mapped = map_soft_hyphen_after_prefix(text);
-    let stripped = strip_cf(&mapped);
+    let stripped = strip_ignorable(&mapped);
     let scan = scan_prefixed(stripped.as_ref());
     collect_ulid_windows(stripped.as_ref(), &scan.covered, out);
 }
@@ -440,24 +440,36 @@ fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
     None
 }
 
-/// Unicode General Category Cf (Format): ZWSP, soft hyphen, word joiner, BOM,
-/// bidi marks, tags.
-pub(crate) fn is_cf(c: char) -> bool {
+/// Unicode Default_Ignorable_Code_Point: Cf (ZWSP, soft hyphen, word
+/// joiner, BOM, bidi marks, tags) plus the ignorables outside Cf —
+/// variation selectors, the grapheme joiner, Hangul/Khmer fillers, and
+/// the variation-selector supplement. Stripped before ID scanning so an
+/// invisible character cannot split or hide an ID (#4). The pre-existing
+/// Cf ranges are kept verbatim; the additions are strictly additive, so
+/// nothing that was stripped before is kept now.
+pub(crate) fn is_ignorable(c: char) -> bool {
     matches!(
         c,
         '\u{00ad}'
+            | '\u{034f}'
             | '\u{0600}'..='\u{0605}'
             | '\u{061c}'
             | '\u{06dd}'
             | '\u{070f}'
             | '\u{0890}'..='\u{0891}'
             | '\u{08e2}'
-            | '\u{180e}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180d}'
+            | '\u{180e}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{ffa0}'
             | '\u{fff9}'..='\u{fffb}'
             | '\u{110bd}'
             | '\u{110cd}'
@@ -466,14 +478,15 @@ pub(crate) fn is_cf(c: char) -> bool {
             | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0001}'
             | '\u{e0020}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
     )
 }
 
-pub(crate) fn strip_cf(s: &str) -> Cow<'_, str> {
-    if s.is_ascii() || !s.chars().any(is_cf) {
+pub(crate) fn strip_ignorable(s: &str) -> Cow<'_, str> {
+    if s.is_ascii() || !s.chars().any(is_ignorable) {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(s.chars().filter(|c| !is_cf(*c)).collect())
+    Cow::Owned(s.chars().filter(|c| !is_ignorable(*c)).collect())
 }
 
 fn starts_id_prefix(s: &str) -> bool {
@@ -929,6 +942,43 @@ mod tests {
             scan_id_tokens("Ana-p\u{2013}01M3TC5H00MPJG001248000002"),
             vec![malformed_cam]
         );
+    }
+
+    #[test]
+    fn non_cf_ignorables_are_stripped_before_scanning() {
+        use super::{scan_id_tokens, IdToken};
+        // #4: Default_Ignorable characters outside Cf must not split or
+        // hide an ID — an ignorable between the dash and the ULID, or
+        // inside the run, strips away and the Valid token is found.
+        let ada = super::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        for ign in [
+            '\u{fe00}',  // variation selector (Mn, not Cf)
+            '\u{fe0f}',  // variation selector
+            '\u{034f}',  // grapheme joiner (Mn)
+            '\u{115f}',  // Hangul filler (Lo)
+            '\u{17b4}',  // Khmer filler (Mn)
+            '\u{3164}',  // Hangul filler (Lo)
+            '\u{ffa0}',  // halfwidth Hangul filler (Lo)
+            '\u{180b}',  // Mongolian variation selector (Mn)
+            '\u{1d173}', // musical symbol (non-BMP, Mn)
+            '\u{e0100}', // variation selector supplement (non-BMP, Mn)
+        ] {
+            let text = format!("p-{ign}01M3TC5H00MPJG000000000000");
+            assert_eq!(
+                scan_id_tokens(&text),
+                vec![IdToken::Valid(ada.clone())],
+                "ignorable U+{:04X} must be stripped",
+                ign as u32
+            );
+        }
+        assert_eq!(
+            scan_id_tokens("p-01M3TC5H00MPJG000000\u{fe00}000000"),
+            vec![IdToken::Valid(ada.clone())]
+        );
+        // Line/paragraph separators are not ignorable: they still break
+        // runs rather than joining text into IDs.
+        assert!(!super::is_ignorable('\u{2028}'));
+        assert!(!super::is_ignorable('\u{2029}'));
     }
 
     #[test]
