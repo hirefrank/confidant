@@ -44,6 +44,8 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
+| `E_KEY_COMMITMENT` | error | | A key manifest (`keys/<client>/recipients.toml`) lacks key commitments (`[[commitments]]`) for every retained epoch. Fires only in encrypted vaults (spec §14). |
+| `E_ENVELOPE` | error | | An encrypted record envelope is structurally invalid: duplicate header keys, or a `key_id` that is not `<client_id>/e<epoch>` under the §14 routing. Fires only in encrypted vaults (spec §14). |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
 cleared records and ledger lines are searchable. A note, interaction, or
