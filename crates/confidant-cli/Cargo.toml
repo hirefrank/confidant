@@ -8,15 +8,16 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "CLI for the Confidant plain-text CRM."
-publish = false
 
 [[bin]]
 name = "confidant"
 path = "src/main.rs"
 
 [package.metadata.dist]
-# The binary ships via GitHub Releases (cargo-dist); it is not published to
-# crates.io as a package (publish = false stays).
+# The binary ships via GitHub Releases (cargo-dist) AND as a crates.io
+# package (#39): `cargo install confidant-cli` installs the `confidant`
+# binary. (The package keeps the `-cli` suffix; renaming it to `confidant`
+# would churn manifests, lockfile, docs, and CI for no functional gain.)
 dist = true
 
 [dependencies]
