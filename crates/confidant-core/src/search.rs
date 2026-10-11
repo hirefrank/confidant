@@ -1,6 +1,6 @@
 //! Plaintext scan of records and ledger lines (milestone 1 stopgap).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -101,6 +101,39 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
 /// Record IDs in the section 12 cleared set. Used by tests to assert a fixed point.
 pub fn cleared_record_ids(vault: &Vault) -> HashSet<RecordId> {
     Allowlist::build(vault).cleared
+}
+
+/// Vault-relative paths of the records in the section 12 cleared set.
+///
+/// Sorted. Only cleared records appear, so (like `find` hits) this carries
+/// no `no-ai` content: it is the index-time exclusion list for `qmd-index`
+/// (issue #38). The query-time allowlist stays the authority; this only
+/// narrows what is copied into the local corpus.
+pub fn cleared_record_paths(vault: &Vault) -> BTreeSet<String> {
+    let allow = Allowlist::build(vault);
+    allow
+        .vault
+        .records
+        .values()
+        .filter(|rec| allow.cleared.contains(&rec.id))
+        .map(|rec| rec.path.clone())
+        .collect()
+}
+
+/// Cleared ledger lines per vault-relative ledger path: sorted 1-based line
+/// numbers. Only canonical `ledger/YYYY/MM.cfd` lines can be cleared (other
+/// ledger files are read for link tokens but never searched, so they map to
+/// nothing and are left out of an index-time corpus entirely). Same
+/// fail-closed posture as [`cleared_record_paths`].
+pub fn cleared_ledger_lines(vault: &Vault) -> BTreeMap<String, Vec<u32>> {
+    let allow = Allowlist::build(vault);
+    let mut out: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for (idx, line) in allow.vault.ledger_lines.iter().enumerate() {
+        if allow.ledger_ok.get(idx).copied().unwrap_or(false) {
+            out.entry(line.file.clone()).or_default().push(line.line);
+        }
+    }
+    out
 }
 
 /// True when every cleared id still satisfies every allowlist rule (merge

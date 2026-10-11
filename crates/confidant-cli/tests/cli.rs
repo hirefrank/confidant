@@ -236,3 +236,75 @@ fn find_unsupported_spec_is_command_error() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "E_SPEC_UNSUPPORTED");
 }
+
+#[test]
+fn allowlist_demo_excludes_no_ai() {
+    let out = Command::new(bin())
+        .args(["allowlist", "--json", "--no-input", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["schema_version"], "1");
+    assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
+    // Opaque paths and line numbers only: never content.
+    let dumped = serde_json::to_string(&v).unwrap();
+    assert!(!dumped.contains("Ada Example"), "{dumped}");
+    let files: Vec<&str> = v["cleared_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    // Cleared: Ada's profile is in.
+    assert!(
+        files
+            .iter()
+            .any(|f| f == &"people/p-01M3TC5H00MPJG000000000000/profile.md"),
+        "{files:?}"
+    );
+    // Uncleared: Cam Sample is no-ai, so none of their files are in.
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.contains("p-01M3TC5H00MPJG001248000002")),
+        "{files:?}"
+    );
+    // Ledger lines naming Cam (open line 4, session line 8, balance line 12
+    // of ledger/2026/10.cfd) are out; every other line is in.
+    let lines: Vec<u64> = v["cleared_ledger_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            assert_eq!(e["file"], "ledger/2026/10.cfd");
+            e["line"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(lines, vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13], "{lines:?}");
+}
+
+#[test]
+fn allowlist_unsupported_spec_is_command_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"9.9\"\nvault_id = \"x\"\n",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["allowlist", "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_SPEC_UNSUPPORTED");
+}
