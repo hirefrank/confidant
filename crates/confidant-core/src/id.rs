@@ -442,11 +442,13 @@ fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
 
 /// Unicode Default_Ignorable_Code_Point: Cf (ZWSP, soft hyphen, word
 /// joiner, BOM, bidi marks, tags) plus the ignorables outside Cf —
-/// variation selectors, the grapheme joiner, Hangul/Khmer fillers, and
-/// the variation-selector supplement. Stripped before ID scanning so an
-/// invisible character cannot split or hide an ID (#4). The pre-existing
-/// Cf ranges are kept verbatim; the additions are strictly additive, so
-/// nothing that was stripped before is kept now.
+/// variation selectors, the grapheme joiner, Hangul/Khmer fillers, the
+/// variation-selector supplement, and the unassigned ranges, covered
+/// whole (2060–206F, FFF0–FFFB, E0000–E0FFF are entirely
+/// Default_Ignorable). Stripped before ID scanning so an invisible
+/// character cannot split or hide an ID (#4). The pre-existing Cf ranges
+/// are kept verbatim; the additions are strictly additive, so nothing
+/// that was stripped before is kept now.
 pub(crate) fn is_ignorable(c: char) -> bool {
     matches!(
         c,
@@ -464,21 +466,18 @@ pub(crate) fn is_ignorable(c: char) -> bool {
             | '\u{180e}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
+            | '\u{2060}'..='\u{206f}'
             | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
-            | '\u{fff9}'..='\u{fffb}'
+            | '\u{fff0}'..='\u{fffb}'
             | '\u{110bd}'
             | '\u{110cd}'
             | '\u{13430}'..='\u{1343f}'
             | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0001}'
-            | '\u{e0020}'..='\u{e007f}'
-            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{e0000}'..='\u{e0fff}'
     )
 }
 
@@ -960,7 +959,7 @@ mod tests {
             '\u{3164}',  // Hangul filler (Lo)
             '\u{ffa0}',  // halfwidth Hangul filler (Lo)
             '\u{180b}',  // Mongolian variation selector (Mn)
-            '\u{1d173}', // musical symbol (non-BMP, Mn)
+            '\u{1d173}', // musical symbol (non-BMP, Cf)
             '\u{e0100}', // variation selector supplement (non-BMP, Mn)
         ] {
             let text = format!("p-{ign}01M3TC5H00MPJG000000000000");

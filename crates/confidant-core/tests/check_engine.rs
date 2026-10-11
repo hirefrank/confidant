@@ -943,6 +943,41 @@ fn find_excludes_note_with_no_ai() {
 }
 
 #[test]
+fn find_drops_no_ai_id_split_by_unassigned_ignorables() {
+    // #115 must-fix: the unassigned Default_Ignorable ranges (U+2065,
+    // U+FFF0–FFF8, U+E0000, U+E0002–E001F, U+E0080–E00FF, U+E01F0–E0FFF)
+    // are stripped before scanning. A no-ai person's ID glued with one of
+    // them mid-ULID is still recognized as that person's ID, so a line
+    // naming them stays out of `find` instead of leaking past the no-ai
+    // exclusion. (The note belongs to an ordinary person so it stays
+    // cleared; only the glued-ID line is dropped.)
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person_no_ai(dir.path(), ADA, "Ada");
+    person(dir.path(), BEA, "Bea Example");
+    let ulid = &ADA["p-".len()..];
+    let (head, tail) = ulid.split_at(10);
+    let mut body = String::new();
+    for (lo, hi) in [(0x2060u32, 0x206Fu32), (0xFFF0, 0xFFFB), (0xE0000, 0xE0FFF)] {
+        for cp in lo..=hi {
+            let ch = char::from_u32(cp).expect("valid scalar value");
+            body.push_str(&format!("see p-{head}{ch}{tail} token\n"));
+        }
+    }
+    write(
+        dir.path(),
+        &format!("people/{BEA}/notes/{NOTE}.md"),
+        &format!("---\nid: {NOTE}\ntype: note\nperson: {BEA}\ndate: 2026-10-01\n---\n\n{body}"),
+    );
+    let result = search_q(dir.path(), "token");
+    assert!(
+        result.hits.is_empty(),
+        "glued no-ai ID lines must be dropped from find, got: {:?}",
+        result.hits.iter().map(|h| &h.excerpt).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn comp_session_does_not_consume_package() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
