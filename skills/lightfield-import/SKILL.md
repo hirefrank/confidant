@@ -30,7 +30,7 @@ rows are warned and skipped):
 
 ```json
 {
-  "contacts": [{"id": "lf-c-1", "name": "Ada Example", "emails": ["a@x.co"], "phones": ["+1…"], "notes": "…"}],
+  "contacts": [{"id": "lf-c-1", "name": "Ada Example", "emails": ["ada@example.com"], "phones": ["+1…"], "notes": "…"}],
   "deals": [{"id": "lf-d-1", "contact_id": "lf-c-1", "title": "…", "stage": "proposal", "date": "2026-09-01", "notes": "…"}],
   "notes": [{"id": "lf-n-1", "contact_id": "lf-c-1", "date": "2026-09-01", "text": "…"}],
   "transcripts": [{"id": "lf-t-1", "contact_id": "lf-c-1", "date": "2026-09-02", "duration_minutes": 60, "billing": "paid", "text": "…"}]
