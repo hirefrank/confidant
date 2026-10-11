@@ -26,11 +26,11 @@ Two processes, two responsibilities:
 
 - **Index time** (`bin/qmd-index.py`): copy decrypted vault content into
   `.confidant/qmd-corpus/`, register it as the `confidant` QMD collection.
-  The index is *dumb*: it may contain content from records that are not
-  cleared (`no-ai`, malformed IDs, dangling refs, merge-group taint). This
-  is architecturally accepted — "local indexes and caches contain plaintext
-  and embeddings... sensitive, gitignored, stay on trusted devices" (§4
-  threat model).
+  Since #38 the copy excludes whatever `confidant allowlist` reports as
+  uncleared (`no-ai`, malformed IDs, dangling refs, merge-group taint) —
+  but treat the corpus as if it still contained them: exclusion goes stale
+  between reindexes, so the corpus stays sensitive, gitignored, and on
+  trusted devices (§4 threat model).
 - **Query time** (`bin/qmd-query.py`): run QMD, then verify *every* hit
   through `confidant find` before returning it. A hit is kept only if the
   same file appears in `find`'s matches with full detail, which happens
@@ -65,18 +65,29 @@ not just documented. `qmd-index` refuses to build unless all of these hold:
 `qmd-query` sets the same env vars, so queries always hit the vault-local
 store.
 
-## The allowlist decision (issue #8's core requirement)
+## The allowlist decision (issue #8's core requirement, #38's follow-up)
 
 **Chosen: filter at query time, with the CLI as the single source of
-truth.** The skill never reimplements §12.
+truth — plus index-time exclusion fed by the CLI (#38).** The skill never
+reimplements §12.
 
-Considered and rejected: *index only cleared content.* Computing the
-cleared set at index time would duplicate the §12 fixed-point logic (or
-lean on fragile tricks like `find "e"`), and any divergence between the
-two implementations is a leak. It also goes stale: a vault change between
-reindexes could leave newly-uncleared content searchable.
+Considered and rejected at the time: *index only cleared content.*
+Computing the cleared set at index time would duplicate the §12
+fixed-point logic (or lean on fragile tricks like `find "e"`), and any
+divergence between the two implementations is a leak.
 
-With query-time filtering:
+What changed (#38): the CLI now exposes the cleared set itself
+(`confidant allowlist` → cleared record files + cleared ledger lines, no
+content), so `qmd-index` excludes uncleared records *without* duplicating
+any logic — the §12 implementation still lives in exactly one place (the
+Rust CLI). This is defense in depth only: the query-time filter remains
+the authority, and exclusion goes stale the same way the index does (a
+vault change between reindexes can leave newly-uncleared content in the
+corpus — the live check still drops it). A query-path bug now degrades to
+missing results rather than risking a leak. When the CLI is unavailable at
+index time, the full corpus is built with a loud warning.
+
+With query-time filtering (unchanged):
 - No duplicated logic to drift. The §12 implementation lives in exactly
   one place (the Rust CLI).
 - Index staleness can only *miss* results, never leak: a hit for content
@@ -86,7 +97,8 @@ With query-time filtering:
 
 The cost is one `find` invocation per distinct hit file (~100–160 ms each
 on a 400-record vault) — acceptable for an interactive search skill, and
-the script dedupes files before verifying.
+the script dedupes files before verifying. Indexing costs one extra
+`allowlist` run per rebuild (same order as a `find`).
 
 ## Verification method
 
@@ -122,7 +134,9 @@ fail-closed choice. This is marked in the script, not silently assumed.
 
 ## What stays in the CLI
 
-- The §12 allowlist itself (unchanged).
+- The §12 allowlist itself (unchanged), plus `confidant allowlist`, which
+  exposes the cleared set (cleared record files + cleared ledger lines, no
+  content) for index-time exclusion.
 - Plain `find` as the fallback: when QMD or the index is missing,
   `qmd-query` delegates to `confidant find --json` and says so on stderr.
 - A future `confidant reindex` (ADR-6, PR C's CLI work) can subsume

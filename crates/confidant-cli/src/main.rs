@@ -95,6 +95,13 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Print the section-12 cleared set (cleared record files and ledger
+    /// lines) for index-time corpus exclusion (issue #38).
+    ///
+    /// Read-only: emits opaque paths and line numbers only, never content.
+    /// The query-time allowlist stays the authority; this only narrows what
+    /// an indexer copies into its local corpus.
+    Allowlist,
     /// Merge the encrypted `inbox` git branch into the current branch.
     ///
     /// Outside tools push age-encrypted items to the `inbox` branch; this
@@ -412,6 +419,63 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     )?;
                 }
                 writeln!(io::stdout(), "{} matches", hits.len())?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Allowlist => {
+            let root = vault_root.unwrap();
+            let vault = vault_or!(&root, json);
+            if vault.config.spec != confidant_core::SPEC_VERSION {
+                print_error(
+                    json,
+                    Some(&vault.root.display().to_string()),
+                    &DomainError::spec_unsupported(&vault.config.spec),
+                )?;
+                return Ok(ExitCode::from(1));
+            }
+            if vault.ledger_unread_count > 0 {
+                let err = DomainError::ledger_unreadable(vault.ledger_unread_count);
+                print_error(json, Some(&vault.root.display().to_string()), &err)?;
+                return Ok(ExitCode::from(err.exit_code() as u8));
+            }
+            let files: Vec<String> = confidant_core::cleared_record_paths(&vault)
+                .into_iter()
+                .collect();
+            let mut ledger: Vec<serde_json::Value> = Vec::new();
+            for (file, lines) in confidant_core::cleared_ledger_lines(&vault) {
+                for line in lines {
+                    ledger.push(serde_json::json!({"file": file, "line": line}));
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                        "vault": vault.root.display().to_string(),
+                        "cleared_files": files,
+                        "cleared_ledger_lines": ledger,
+                    })
+                );
+            } else {
+                for f in &files {
+                    writeln!(io::stdout(), "{f}")?;
+                }
+                for entry in &ledger {
+                    writeln!(
+                        io::stdout(),
+                        "{}:{}",
+                        entry["file"].as_str().unwrap_or(""),
+                        entry["line"].as_u64().unwrap_or(0)
+                    )?;
+                }
+                writeln!(
+                    io::stdout(),
+                    "{} file(s), {} ledger line(s) cleared",
+                    files.len(),
+                    ledger.len()
+                )?;
             }
             Ok(ExitCode::SUCCESS)
         }

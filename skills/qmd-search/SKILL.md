@@ -29,13 +29,18 @@ truth for the search allowlist.
   3. QMD's index DB and collection registry are moved under the vault via
      `INDEX_PATH`/`QMD_CONFIG_DIR` (never `~/.cache`), and any `confidant`
      collection left in qmd's default store is removed on first run.
-- **The §12 allowlist is enforced at query time, not index time.** The index
-  may contain decrypted content from records that are *not* cleared
-  (`no-ai`, malformed IDs, dangling refs, merge-group taint). `bin/qmd-query`
-  drops every hit whose record is not cleared *before* returning anything,
-  by asking `confidant find` — the CLI stays the single source of truth, so
+- **The §12 allowlist is enforced at query time, and uncleared records are
+  also excluded at index time.** `bin/qmd-index` asks `confidant allowlist`
+  for the exact cleared set (computed by the CLI — the skill never
+  reimplements §12) and copies only cleared record files and cleared ledger
+  lines into the corpus, so a query-path bug degrades to missing results
+  rather than risking a leak. `bin/qmd-query` still drops every hit whose
+  record is not cleared *before* returning anything, by asking
+  `confidant find` — the CLI stays the single source of truth, so
   allowlist logic can never drift between the index and the CLI. A hit that
-  cannot be verified as cleared is dropped (fail closed).
+  cannot be verified as cleared is dropped (fail closed). If the CLI is
+  unavailable at index time, the full corpus is built with a loud warning
+  and the query-time filter stays the only protection.
 - **Encrypted envelopes are never indexed as plaintext.** `bin/qmd-index`
   skips files carrying an `enc:` envelope and warns. Indexing ciphertext is
   pointless and indexing wrongly-decrypted content is a leak; when
@@ -99,16 +104,19 @@ it on stderr.
 
 ## Tooling
 
-- `bin/qmd-index.py [--vault PATH] [--embed] [--i-confirm-encrypted-disk]` — builds
+- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk]` — builds
   `<vault>/.confidant/qmd-corpus/` from decrypted vault content and registers
   it as the `confidant` QMD collection (always a full rebuild: wipes the old
   corpus and re-adds the collection). Refuses unless the corpus and the QMD
   store are git-ignored and the disk is encrypted (see guardrails above).
   Puts QMD's own store under
   `<vault>/.confidant/qmd/`. Skips `enc:`-enveloped files with a
-  warning. Mirrors each `ledger/*.cfd` as a sibling `.cfd.md` so QMD's
-  `**/*.md` collection pattern covers ledger facts too (hits map back to the
-  real `.cfd` path). `--embed` runs `qmd embed` afterwards.
+  warning. Excludes uncleared records and ledger lines via
+  `confidant allowlist` (counts reported; `--cli` points at the binary,
+  default `confidant` on PATH). Mirrors each kept `ledger/*.cfd` as a sibling
+  `.cfd.md` so QMD's `**/*.md` collection pattern covers ledger facts too
+  (hits map back to the real `.cfd` path). `--embed` runs `qmd embed`
+  afterwards.
 - `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] QUERY`
   — queries QMD, allowlist-filters every hit through `confidant find`, and
   emits the JSON above. Falls back to plain `find` when QMD/index is absent.

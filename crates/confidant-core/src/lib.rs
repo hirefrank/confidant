@@ -42,5 +42,8 @@ pub use inbox::{
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
-pub use search::{allowlist_is_fixed_point, cleared_record_ids, search, SearchHit, SearchResult};
+pub use search::{
+    allowlist_is_fixed_point, cleared_ledger_lines, cleared_record_ids, cleared_record_paths,
+    search, SearchHit, SearchResult,
+};
 pub use vault::{load_vault, Vault};

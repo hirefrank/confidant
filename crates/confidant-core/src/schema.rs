@@ -20,11 +20,12 @@ pub fn contract_schema() -> Value {
             "schema_version": {"type": "string", "const": "1"},
             "shapes": {
                 "type": "object",
-                "required": ["error", "check", "find", "write", "context", "doctor", "help"],
+                "required": ["error", "check", "find", "allowlist", "write", "context", "doctor", "help"],
                 "properties": {
                     "error": {"$ref": "#/$defs/error"},
                     "check": {"$ref": "#/$defs/checkReport"},
                     "find": {"$ref": "#/$defs/findResponse"},
+                    "allowlist": {"$ref": "#/$defs/allowlistResponse"},
                     "write": {"$ref": "#/$defs/writeResponse"},
                     "context": {"$ref": "#/$defs/contextBundle"},
                     "doctor": {"$ref": "#/$defs/doctorReport"},
@@ -111,6 +112,34 @@ pub fn contract_schema() -> Value {
                         }
                     },
                     "findings": {"type": "array", "description": "Load findings; raw record text never included."}
+                }
+            },
+            "allowlistResponse": {
+                "title": "allowlist --json",
+                "description": "Section-12 cleared set for index-time corpus exclusion (issue #38). Opaque paths and line numbers only, never content; no-ai records never appear. The query-time allowlist stays the authority.",
+                "type": "object",
+                "required": ["ok", "schema_version", "vault", "cleared_files", "cleared_ledger_lines"],
+                "properties": {
+                    "ok": {"type": "boolean", "const": true},
+                    "schema_version": {"type": "string"},
+                    "vault": {"type": "string"},
+                    "cleared_files": {
+                        "type": "array",
+                        "description": "Vault-relative paths of cleared record files, sorted.",
+                        "items": {"type": "string"}
+                    },
+                    "cleared_ledger_lines": {
+                        "type": "array",
+                        "description": "Cleared canonical ledger lines, sorted by file then line.",
+                        "items": {
+                            "type": "object",
+                            "required": ["file", "line"],
+                            "properties": {
+                                "file": {"type": "string"},
+                                "line": {"type": "integer"}
+                            }
+                        }
+                    }
                 }
             },
             "writeResponse": {
@@ -280,7 +309,14 @@ mod tests {
         let s = contract_schema();
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
         for shape in [
-            "error", "check", "find", "write", "context", "doctor", "help",
+            "error",
+            "check",
+            "find",
+            "allowlist",
+            "write",
+            "context",
+            "doctor",
+            "help",
         ] {
             assert!(
                 s["properties"]["shapes"]["properties"][shape].is_object(),
@@ -297,6 +333,7 @@ mod tests {
         match shape {
             "check" => "checkReport",
             "find" => "findResponse",
+            "allowlist" => "allowlistResponse",
             "write" => "writeResponse",
             "context" => "contextBundle",
             "doctor" => "doctorReport",
