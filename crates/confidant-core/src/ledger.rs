@@ -87,18 +87,15 @@ pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
     let second = toks.next();
     // Compare without allocating: only "merge"/"open" matter, and the
     // result is owned only on match (#2).
-    let norm_eq = |s: &str| {
+    let verb_of = |s: &str| {
         let s = s.trim_end_matches(':');
-        s.eq_ignore_ascii_case("merge") || s.eq_ignore_ascii_case("open")
+        (s.eq_ignore_ascii_case("merge") || s.eq_ignore_ascii_case("open"))
+            .then(|| s.to_ascii_lowercase())
     };
-    if norm_eq(first) {
-        return Some(first.trim_end_matches(':').to_ascii_lowercase());
+    if let Some(verb) = verb_of(first) {
+        return Some(verb);
     }
-    let second = second?;
-    if norm_eq(second) {
-        return Some(second.trim_end_matches(':').to_ascii_lowercase());
-    }
-    None
+    verb_of(second?)
 }
 
 fn skip_markdown_bullet(s: &str) -> &str {

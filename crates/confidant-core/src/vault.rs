@@ -535,6 +535,10 @@ fn ingest_dir(
                 .at_file(redacted_filename(relative))
                 .with_fix("Name the directory <prefix>-<26-character ULID>"),
             );
+            // The walk stops here, but the seed walk must still see the
+            // names below: an unexpected directory can hide ID-shaped file
+            // names that seed bare-ULID matching (#116 hold).
+            walk_seed_names(root, relative, path_ids, names);
             return;
         }
     };
@@ -607,6 +611,12 @@ fn ingest_dir(
                 "Keep only {main} (and notes/ for people) in the record directory"
             )),
         );
+        // Same seed-walk reasoning as the invalid-dir return above: the
+        // walk stops here, so an unexpected directory's subtree still
+        // needs name seeding (#116 hold).
+        if ent.kind == EntryKind::Directory {
+            walk_seed_names(root, &child, path_ids, names);
+        }
     }
     if !saw_main {
         findings.push(
@@ -674,6 +684,11 @@ fn scan_person_notes(
                         )
                         .at_file(redacted_filename(&child)),
                     );
+                    // Unexpected directories (e.g. notes/sub/) still need
+                    // name seeding for the seed walk (#116 hold).
+                    if ent.kind == EntryKind::Directory {
+                        walk_seed_names(root, &child, path_ids, names);
+                    }
                     continue;
                 }
                 let stem = ent.name.trim_end_matches(".md");
