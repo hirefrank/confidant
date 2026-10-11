@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::id::{strip_cf, Prefix, RecordId};
+use crate::id::{strip_ignorable, Prefix, RecordId};
 use crate::ledger::parse_strict_date;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,8 +74,19 @@ impl Record {
         self.fields.get(key).map(String::as_str)
     }
 
+    /// Raw value of a `person` / `org` / `deal` reference, accepting ASCII
+    /// case variants of the key (`Person:`, `DEAL:`). First match in key
+    /// sort order wins; every variant is still validated where refs are
+    /// checked (#5).
+    pub fn ref_field(&self, canonical: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| canonical_ref_key(k).is_some_and(|c| c == canonical))
+            .map(|(_, v)| v.as_str())
+    }
+
     pub fn person(&self) -> Option<RecordId> {
-        match parse_ref_id(self.field("person")?) {
+        match parse_ref_id(self.ref_field("person")?) {
             FrontmatterRef::Id(id) => Some(id),
             FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
         }
@@ -129,6 +140,21 @@ pub(crate) fn is_spec_key(key: &str) -> bool {
     SPEC_KEYS.contains(&key)
 }
 
+/// ASCII case-insensitive match of the three reference keys to canonical
+/// form (`Person:` → `person`). Alias or custom keys (`client:`, ...) never
+/// match: only case variants of the spec keys are references (#5).
+pub(crate) fn canonical_ref_key(key: &str) -> Option<&'static str> {
+    if key.eq_ignore_ascii_case("person") {
+        Some("person")
+    } else if key.eq_ignore_ascii_case("org") {
+        Some("org")
+    } else if key.eq_ignore_ascii_case("deal") {
+        Some("deal")
+    } else {
+        None
+    }
+}
+
 /// Spec key on a raw front-matter line, if any. Comments and unknown keys
 /// return `None` so callers can name the line without echoing it.
 /// Result of parsing a `person` / `org` / `deal` front-matter value.
@@ -146,7 +172,7 @@ pub(crate) enum FrontmatterRef {
 /// closing quote), and `[[id|Alias]]` only inside `[[…]]`. Empty, `~`, and
 /// YAML `null` are [`FrontmatterRef::Absent`].
 pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
-    let stripped = strip_cf(raw);
+    let stripped = strip_ignorable(raw);
     let trimmed = strip_comment_after_quoted(stripped.trim());
     let unquoted = unquote(trimmed.trim());
     let mut trimmed = unquoted.trim();
@@ -238,7 +264,13 @@ pub(crate) fn frontmatter_line_spec_key(raw: &str) -> Option<String> {
     }
     let (key, _) = line.split_once(':')?;
     let key = unquote(key.trim());
-    is_spec_key(&key).then_some(key)
+    // A case-variant ref key (`Person:`) names itself: it is a known ref
+    // key, so malformed-ID findings on its line carry the key name (#5).
+    if is_spec_key(&key) {
+        Some(key)
+    } else {
+        canonical_ref_key(&key).map(|_| key)
+    }
 }
 
 fn is_noai_typo(key: &str) -> bool {
@@ -805,5 +837,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(quoted_wikilink.person().as_ref(), Some(&id));
+    }
+
+    #[test]
+    fn case_variant_ref_keys_resolve() {
+        // #5: ASCII case variants of person/org/deal are references under
+        // identical value rules; alias or custom keys never match.
+        assert_eq!(super::canonical_ref_key("person"), Some("person"));
+        assert_eq!(super::canonical_ref_key("Person"), Some("person"));
+        assert_eq!(super::canonical_ref_key("PERSON"), Some("person"));
+        assert_eq!(super::canonical_ref_key("oRg"), Some("org"));
+        assert_eq!(super::canonical_ref_key("DEAL"), Some("deal"));
+        assert_eq!(super::canonical_ref_key("client"), None);
+        assert_eq!(super::canonical_ref_key("persons"), None);
+        assert_eq!(super::canonical_ref_key(""), None);
+        assert_eq!(super::canonical_ref_key("p"), None);
+        let id = crate::id::RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        for key in ["Person", "PERSON", "pErSoN"] {
+            let src = format!(
+                "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\n{key}: p-01M3TC5H00MPJG000000000000\n---\n"
+            );
+            let rec = parse_record(&src, "x.md").unwrap();
+            assert_eq!(rec.person().as_ref(), Some(&id), "{key}");
+            assert_eq!(
+                rec.ref_field("person"),
+                Some("p-01M3TC5H00MPJG000000000000")
+            );
+        }
+        // A name value under a variant key is Invalid, like lowercase.
+        let named = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nPerson: Ada Example\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(named.person(), None);
+        assert_eq!(
+            super::parse_ref_id(named.ref_field("person").unwrap()),
+            super::FrontmatterRef::Invalid
+        );
+        // Alias keys are not references even when they hold an ID.
+        let alias = parse_record(
+            "---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nclient: p-01M3TC5H00MPJG000000000000\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(alias.person(), None);
+        assert_eq!(alias.ref_field("person"), None);
+        // Malformed-ID lines name a variant key (it is a known ref key).
+        assert_eq!(
+            super::frontmatter_line_spec_key("Person: p-01M3TC5H00MPJG00"),
+            Some("Person".to_owned())
+        );
+        assert_eq!(
+            super::frontmatter_line_spec_key("client: p-01M3TC5H00MPJG00"),
+            None
+        );
     }
 }

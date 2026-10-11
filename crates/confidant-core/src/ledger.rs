@@ -2,7 +2,7 @@
 
 use chrono::NaiveDate;
 
-use crate::id::{strip_cf, RecordId};
+use crate::id::{strip_ignorable, RecordId};
 
 /// One argument after the record ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,7 +76,7 @@ pub fn parse_strict_date(s: &str) -> Option<NaiveDate> {
 /// or not a date parses (`2026-10-3 merge`, `merge:`, a merge with no date).
 /// A leading Markdown bullet (`*`, `-`, or `+` plus whitespace) is skipped.
 pub(crate) fn ledger_line_verb(text: &str) -> Option<String> {
-    let stripped = strip_cf(text);
+    let stripped = strip_ignorable(text);
     let trimmed = stripped.trim();
     if trimmed.starts_with('#') || trimmed.starts_with(';') {
         return None;

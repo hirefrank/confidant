@@ -593,9 +593,12 @@ fn record_facts(
         }
         line_tokens.push((line_no, scan.tokens));
     }
-    let fm_bad_ref = ["person", "org", "deal"].iter().any(|key| {
-        rec.field(key)
-            .is_some_and(|raw| matches!(parse_ref_id(raw), FrontmatterRef::Invalid))
+    // A `person` / `org` / `deal` value — including ASCII case variants
+    // (`Person:`, #5) — that is not a record ID uncleares the record.
+    // Alias or custom keys are not references.
+    let fm_bad_ref = rec.fields.iter().any(|(key, raw)| {
+        crate::record::canonical_ref_key(key).is_some()
+            && matches!(parse_ref_id(raw), FrontmatterRef::Invalid)
     });
     RecordFacts {
         fm_ids,
