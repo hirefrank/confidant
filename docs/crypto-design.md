@@ -526,6 +526,10 @@ be dictionary-attacked), the value is:
 hmac = HMAC(vault_lookup_key, normalized_value)
 ```
 
+`normalized_value` is the alias value normalized as spec §6 requires:
+NFC, then trim surrounding whitespace, then Unicode lowercase. Importers
+must apply the same rule before hashing.
+
 The **vault lookup key** is generated at `init` and wrapped with age to each
 device/agent like a data key (`keys/vault/lookup.age`, covered by the
 signed recipient manifest). The real alias values live encrypted in the
@@ -643,7 +647,8 @@ in the repo, tests, or CI.
 
 ## 13. What changes in the spec
 
-This is the milestone 2 implementation PR. Format changes from spec 0.1:
+This is the milestone 2 implementation PR. Format changes from spec 0.1
+(now normative in spec 0.1 §14, Encryption):
 
 - **Manifest v2**: `recipients.toml` gains `[[commitments]]` (key
   commitments for every retained epoch, §4); `vault_id` is bound in the
