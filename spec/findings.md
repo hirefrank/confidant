@@ -13,7 +13,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is not compiled into this CLI. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key, the key name; it never echoes the token. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value (including ASCII case variants: `Person:`, `ORG:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
@@ -42,7 +42,7 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. The gap clock runs from `max(last session, latest open)`. |
 | `W_SESSION_UNTAGGED` | warning | | A session has none of `paid`, `pps`, or `comp`. The session still consumes a package slot. |
 | `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
-| `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID has no record. |
+| `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
@@ -56,7 +56,8 @@ cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,
 key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
 is code and count only. Name-only mentions with no ID are not detected
-in body prose and comments; a `person` / `org` / `deal` value that is
+in body prose and comments; a `person` / `org` / `deal` value (including
+case variants) that is
 not a record ID (including a bare `p-A|Name` pipe alias) is `E_INVALID_ID`
 and uncleared. Empty, `~`, and YAML `null` are not references. Ledger parse errors
 give the line number and code without echoing tokens. If any ledger file

@@ -917,10 +917,14 @@ fn check_duplicate_ulids(vault: &Vault, findings: &mut Vec<Finding>) {
 }
 
 fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut Vec<Finding>) {
-    const REF_KEYS: &[&str] = &["person", "org", "deal"];
     for rec in vault.records.values() {
-        for key in REF_KEYS {
-            let Some(raw) = rec.field(key) else { continue };
+        // Every field whose key is a `person` / `org` / `deal` reference —
+        // including ASCII case variants (`Person:`, #5) — must hold a
+        // record ID. Alias or custom keys are not references.
+        for (key, raw) in &rec.fields {
+            if crate::record::canonical_ref_key(key).is_none() {
+                continue;
+            };
             match parse_ref_id(raw) {
                 FrontmatterRef::Absent => {}
                 FrontmatterRef::Invalid => {
