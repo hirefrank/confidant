@@ -250,7 +250,7 @@ fn request_id_is_idempotent_then_conflicts() {
 fn request_id_rejects_low_entropy_ids() {
     let dir = make_vault();
     let vroot = vault_arg(dir.path());
-    // 17 chars: under the 128-bit floor.
+    // 17 chars: under the unguessability floor.
     let (ok, v) = run_json(&[
         "log",
         "session",
@@ -266,7 +266,10 @@ fn request_id_rejects_low_entropy_ids() {
     ]);
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "usage_error");
-    assert!(v["error"]["message"].as_str().unwrap().contains("128 bits"));
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unguessable"));
     // Exactly 22 chars clears the floor.
     let (ok, _) = run_json(&[
         "log",

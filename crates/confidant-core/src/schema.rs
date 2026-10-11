@@ -115,7 +115,7 @@ pub fn contract_schema() -> Value {
             },
             "writeResponse": {
                 "title": "log session / import / note add --json",
-                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must carry at least 128 bits of entropy (at least 22 characters; ULID/UUIDv4 recommended): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding.",
+                "description": "One commit per write. Commit messages carry only opaque IDs, verbs, hashes. --request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4): the Request-Hash trailer HMACs the canonical request with the raw id as key, and trailers are permanent, so a guessable id is an offline guessing oracle even after shredding.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "command"],
                 "properties": {
