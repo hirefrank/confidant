@@ -480,13 +480,21 @@ pub fn run_inbox_rotate(
     // lost-key path — while the rotation itself writes the real backend,
     // quietly moving the operator's real key into the previous slot with
     // the drain skipped and nothing reported pending. Rotation is a
-    // keychain operation: refuse outright while the switch is set.
-    if std::env::var(kc::KEYCHAIN_DISABLE_ENV).as_deref() == Ok("off") {
-        return Err(anyhow::Error::new(DomainError::inbox_crypto(
-            "refusing inbox key rotation: CONFIDANT_KEYCHAIN=off is set; \
-             unset it to rotate (it is a test-only switch)"
-                .to_string(),
-        )));
+    // keychain operation: refuse outright while the switch is set. An
+    // unrecognized switch value fails closed too — a typo must not
+    // silently mean keychain-on (issue #103 F).
+    match kc::keychain_switch() {
+        Ok(kc::KeychainSwitch::Off) => {
+            return Err(anyhow::Error::new(DomainError::inbox_crypto(
+                "refusing inbox key rotation: CONFIDANT_KEYCHAIN=off is set; \
+                 unset it to rotate (it is a test-only switch)"
+                    .to_string(),
+            )));
+        }
+        Ok(kc::KeychainSwitch::On) => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(DomainError::inbox_crypto(e.to_string())));
+        }
     }
 
     let keys: Option<std::sync::Arc<InboxKeys>> =
