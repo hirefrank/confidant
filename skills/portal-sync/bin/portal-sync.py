@@ -130,6 +130,10 @@ def main(argv=None) -> int:
     else:
         manifest_path, lines_path = common.proposal_paths(vault, "portal-sync")
     common.write_lines_file(lines_path, by_file)
+    # Same manifest contract as the other proposers: records_blocked is
+    # always present (portal-sync proposes ledger lines only, so records is
+    # empty and this is false on a plaintext vault).
+    encrypted = common.vault_looks_encrypted(vault)
     manifest = {
         "skill": "portal-sync",
         "vault": vault,
@@ -137,6 +141,7 @@ def main(argv=None) -> int:
         "ledger": by_file,
         "lines_file": lines_path,
         "records": [],
+        "records_blocked": encrypted,
         "skipped": skipped,
         "warnings": warnings,
         "summary": (f"{new_lines} new ledger line(s) from {len(events)} portal event(s); "
