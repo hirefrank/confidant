@@ -24,9 +24,11 @@
 //!    `${CONFIDANT_INBOX_KEY_PREVIOUS}` env var (tests, CI, agent hosts).
 //! 2. The OS keychain — unless `${CONFIDANT_KEYCHAIN}=off` (tests only),
 //!    which skips the keychain as if it held no key. The switch only ever
-//!    *removes* a source: it never points at a file, it still runs the
-//!    legacy-plaintext-file refusal, and it affects loads only —
-//!    store/rotate/delete ignore it.
+//!    *removes* a source: it never points at a file, and it still runs the
+//!    legacy-plaintext-file refusal. Any other set value is an error (a
+//!    typo must not silently mean keychain-on), and while it is set,
+//!    writes (store/rotate/delete) refuse — so a test that sets the
+//!    switch can never touch the operator's real keychain.
 //! 3. Otherwise fail closed ([`Error::NoKey`]).
 //!
 //! Before any of that: if a legacy plaintext key file
@@ -89,12 +91,41 @@ pub const INBOX_KEY_ENV: &str = "CONFIDANT_INBOX_KEY";
 /// Env-var override for the previous inbox key (tests).
 pub const INBOX_KEY_PREVIOUS_ENV: &str = "CONFIDANT_INBOX_KEY_PREVIOUS";
 /// Env var that disables the OS keychain backend (tests only). When set
-/// to exactly `off`, loads skip the keychain as if it held no key. It
-/// only ever *removes* a source — it never points at a file — so it
-/// cannot weaken production. Env-var overrides above still work, the
-/// legacy-plaintext-file refusal still runs, and store/rotate/delete
-/// ignore it.
+/// to exactly `off`, loads skip the keychain as if it held no key and
+/// writes refuse. It only ever *removes* a source — it never points at a
+/// file — so it cannot weaken production. Any other set value is an error
+/// (a typo must not silently mean keychain-on). Env-var overrides above
+/// still work and the legacy-plaintext-file refusal still runs.
 pub const KEYCHAIN_DISABLE_ENV: &str = "CONFIDANT_KEYCHAIN";
+
+/// The state of the [`KEYCHAIN_DISABLE_ENV`] test-only kill switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeychainSwitch {
+    /// `CONFIDANT_KEYCHAIN=off`: loads skip the OS keychain, writes refuse.
+    Off,
+    /// Unset or empty: the OS keychain is used.
+    On,
+}
+
+/// Read the kill switch, failing closed on an unrecognized value.
+///
+/// Exactly `off` → [`KeychainSwitch::Off`]; unset or empty →
+/// [`KeychainSwitch::On`] (matching the module's "empty means unset"
+/// convention). Any other set value is an error: a typo like `0` or
+/// `false` must not silently mean keychain-on, because that would let a
+/// test believe the keychain was disabled while writes still hit the
+/// operator's real keychain.
+pub fn keychain_switch() -> Result<KeychainSwitch, Error> {
+    match std::env::var(KEYCHAIN_DISABLE_ENV) {
+        Ok(v) if v == "off" => Ok(KeychainSwitch::Off),
+        Ok(v) if v.trim().is_empty() => Ok(KeychainSwitch::On),
+        Ok(v) => Err(Error::Keychain(format!(
+            "{KEYCHAIN_DISABLE_ENV} must be exactly \"off\" (got {v:?}); \
+             a typo would silently mean keychain-on"
+        ))),
+        Err(_) => Ok(KeychainSwitch::On),
+    }
+}
 
 /// Legacy plaintext device-key file. Its presence is a hard error, never
 /// a fallback — see the module docs.
@@ -406,14 +437,14 @@ fn load_key_opt(
 /// Read a password from the backend, unless the keychain is disabled for
 /// tests (`CONFIDANT_KEYCHAIN=off`). The kill switch only ever *removes*
 /// a source — it never points at a file — so it cannot weaken
-/// production. Loads only: store/rotate/delete call the backend
-/// directly and ignore the switch.
+/// production. An unrecognized switch value fails closed (see
+/// [`keychain_switch`]).
 fn backend_password(
     backend: &dyn KeychainBackend,
     service: &str,
     account: &str,
 ) -> Result<Option<Zeroizing<String>>, Error> {
-    if std::env::var(KEYCHAIN_DISABLE_ENV).as_deref() == Ok("off") {
+    if keychain_switch()? == KeychainSwitch::Off {
         return Ok(None);
     }
     backend.get_password(service, account)
@@ -530,6 +561,15 @@ pub fn rotate_inbox_key_with(
     // Validate the new key before touching anything.
     let new_bech32 = new_bech32.trim();
     validate_bech32(new_bech32, "inbox key", "caller")?;
+    // Rotation writes the keychain, so it refuses while the test-only kill
+    // switch is set — a test that set the switch must not touch the real
+    // keychain (issue #103 G).
+    if keychain_switch()? == KeychainSwitch::Off {
+        return Err(Error::Keychain(format!(
+            "refusing inbox key rotation: {KEYCHAIN_DISABLE_ENV}=off is set; \
+             unset it to rotate (it is a test-only switch)"
+        )));
+    }
     // A legacy plaintext file is never silently ignored, even by rotate.
     if let Some(dir) = config_dir {
         refuse_if_legacy_file(
@@ -612,15 +652,22 @@ fn store_key(
     bech32: &str,
     what: &str,
 ) -> Result<(), Error> {
+    // Writes refuse while the test-only kill switch is set: a test that
+    // sets CONFIDANT_KEYCHAIN=off must never touch the operator's real
+    // keychain, whichever write path it takes.
+    if keychain_switch()? == KeychainSwitch::Off {
+        return Err(Error::Keychain(format!(
+            "refusing to write {what}: {KEYCHAIN_DISABLE_ENV}=off is set; \
+             unset it to write to the OS keychain (it is a test-only switch)"
+        )));
+    }
     validate_bech32(bech32, what, "caller")?;
-    backend.set_password(service, account, bech32).map_err(|e| {
-        // `set_password` already wraps backend errors; keep the `what`
-        // context uniform here.
-        match e {
+    backend
+        .set_password(service, account, bech32)
+        .map_err(|e| match e {
             Error::Keychain(msg) => Error::Keychain(format!("{what}: {msg}")),
             other => other,
-        }
-    })
+        })
 }
 
 fn delete_key(
@@ -629,6 +676,16 @@ fn delete_key(
     account: &str,
     what: &str,
 ) -> Result<(), Error> {
+    // Deletions are writes too: refuse while the test-only kill switch is
+    // set — a test that sets CONFIDANT_KEYCHAIN=off must never touch the
+    // operator's real keychain, whichever write path it takes (issue
+    // #103 G).
+    if keychain_switch()? == KeychainSwitch::Off {
+        return Err(Error::Keychain(format!(
+            "refusing to delete {what}: {KEYCHAIN_DISABLE_ENV}=off is set; \
+             unset it to delete from the OS keychain (it is a test-only switch)"
+        )));
+    }
     backend
         .delete_credential(service, account)
         .map_err(|e| match e {
@@ -689,9 +746,19 @@ mod tests {
 
     impl EnvGuard {
         fn lock() -> Self {
+            // Acquire the lock BEFORE touching the env: the save/clear must
+            // be serialized too, or a concurrent test's lock() could wipe
+            // the switch this test just set (issue #103 H).
+            let _lock = ENV_LOCK.lock().unwrap();
+            // Save and clear the kill switch: a dev shell that exports
+            // CONFIDANT_KEYCHAIN (e.g. =off) would otherwise make every
+            // backend read fail closed and every write refuse — the tests
+            // must be hermetic w.r.t. it.
+            let switch = std::env::var(KEYCHAIN_DISABLE_ENV).ok();
+            std::env::remove_var(KEYCHAIN_DISABLE_ENV);
             EnvGuard {
-                saved: Vec::new(),
-                _lock: ENV_LOCK.lock().unwrap(),
+                saved: vec![(KEYCHAIN_DISABLE_ENV, switch)],
+                _lock,
             }
         }
         fn set(&mut self, key: &'static str, val: &str) {
@@ -852,8 +919,11 @@ mod tests {
         // Empty env var is treated as unset: the backend is consulted.
         let bech32 = fresh_identity_bech32();
         let h = Harness::new();
-        h.store_inbox(&bech32);
+        // Take the env lock BEFORE the store: a concurrent test's
+        // deliberately bad CONFIDANT_KEYCHAIN value would make the write
+        // refuse (issue #103 F).
         let mut _g = EnvGuard::lock();
+        h.store_inbox(&bech32);
         _g.set(INBOX_KEY_ENV, "");
         let raw = h.load_inbox().expect("backend has the key");
         assert_eq!(raw.as_slice(), bech32.as_bytes());
@@ -1024,8 +1094,11 @@ mod tests {
             let old = fresh_identity_bech32();
             let new = fresh_identity_bech32();
             let h = Harness::new();
-            h.store_inbox(&old);
+            // Take the env lock BEFORE the store: a concurrent test's
+            // deliberately bad CONFIDANT_KEYCHAIN value would make the
+            // write refuse (issue #103 F).
             let mut _g = EnvGuard::lock();
+            h.store_inbox(&old);
             _g.set(var, &fresh_identity_bech32());
 
             let err = h.try_rotate(&new).unwrap_err();
@@ -1129,19 +1202,22 @@ mod tests {
     }
 
     #[test]
-    fn keychain_off_affects_loads_only() {
+    fn keychain_off_skips_loads_and_refuses_writes() {
         // With CONFIDANT_KEYCHAIN=off, loads skip the backend as if it
-        // were empty (env overrides still work). Store/rotate/delete
-        // ignore the switch — they must never silently no-op.
+        // were empty (env overrides still work) and writes refuse — a
+        // test that sets the switch must never touch the real keychain
+        // (issue #103 G).
         let bech32 = fresh_identity_bech32();
         let h = Harness::new();
-        h.store_inbox(&bech32);
         let mut _g = EnvGuard::lock();
+        // Setup with the switch clear (the guard took it).
+        h.store_inbox(&bech32);
+
         _g.set(KEYCHAIN_DISABLE_ENV, "off");
         _g.unset(INBOX_KEY_ENV);
         _g.unset(INBOX_KEY_PREVIOUS_ENV);
 
-        // Backend skipped → NoKey, even though the backend holds the key.
+        // Loads skip the backend → NoKey, even though the backend holds the key.
         let err = h.load_inbox().unwrap_err();
         assert!(matches!(err, Error::NoKey(_)), "unexpected: {err:?}");
 
@@ -1151,17 +1227,90 @@ mod tests {
         assert_eq!(raw.as_slice(), bech32.as_bytes());
         _g.unset(INBOX_KEY_ENV);
 
-        // Rotate ignores the switch: it reads the real backend, moves the
-        // old key into the previous slot, and installs the new one.
+        // Writes refuse while the switch is on: rotate and store both error.
         let new = fresh_identity_bech32();
-        h.rotate(&new);
-        // Delete ignores the switch too.
-        h.finish();
+        let err = h.try_rotate(&new).unwrap_err();
+        assert!(
+            err.to_string().contains("CONFIDANT_KEYCHAIN=off"),
+            "unexpected: {err}"
+        );
+        let err = store_key(&h.backend, INBOX_SERVICE, INBOX_ACCOUNT, &new, "inbox key")
+            .expect_err("store must refuse while the switch is on");
+        assert!(
+            err.to_string().contains("CONFIDANT_KEYCHAIN=off"),
+            "unexpected: {err}"
+        );
 
+        // Delete refuses too (--finish deletes the previous slot).
+        let err = delete_inbox_key_previous_with(&h.backend)
+            .expect_err("delete must refuse while the switch is on");
+        assert!(
+            err.to_string().contains("CONFIDANT_KEYCHAIN=off"),
+            "unexpected: {err}"
+        );
+
+        // The backend is unchanged: still holds only the original key.
+        assert_eq!(
+            h.backend
+                .get_password(INBOX_SERVICE, INBOX_ACCOUNT)
+                .unwrap()
+                .expect("original key still present")
+                .as_str(),
+            bech32
+        );
+        assert!(h
+            .backend
+            .get_password(INBOX_SERVICE, INBOX_PREVIOUS_ACCOUNT)
+            .unwrap()
+            .is_none());
+
+        // After unsetting the switch, writes work again.
         _g.unset(KEYCHAIN_DISABLE_ENV);
+        h.rotate(&new);
+        h.finish();
         let (current, previous) = h.load_inbox_keys().expect("after rotate");
         assert_eq!(current.as_slice(), new.as_bytes());
-        assert!(previous.is_none(), "finish deleted previous despite switch");
+        assert!(previous.is_none(), "finish deleted previous");
+    }
+
+    #[test]
+    fn keychain_switch_rejects_unrecognized_value() {
+        // A typo'd CONFIDANT_KEYCHAIN must fail closed, not silently mean
+        // keychain-on (issue #103 F).
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        for bad in ["0", "false", "off ", "OFF", "no"] {
+            _g.set(KEYCHAIN_DISABLE_ENV, bad);
+            let err = keychain_switch().unwrap_err();
+            assert!(
+                err.to_string().contains("must be exactly \"off\""),
+                "{bad:?}: {err}"
+            );
+            // Loads fail closed too (the switch read is on the load path).
+            assert!(h.load_inbox().is_err(), "{bad:?} must fail closed");
+        }
+        // Exactly "off" is accepted.
+        _g.set(KEYCHAIN_DISABLE_ENV, "off");
+        assert_eq!(keychain_switch().unwrap(), KeychainSwitch::Off);
+        // Unset is On.
+        _g.unset(KEYCHAIN_DISABLE_ENV);
+        assert_eq!(keychain_switch().unwrap(), KeychainSwitch::On);
+    }
+
+    #[test]
+    fn env_guard_saves_and_clears_switch() {
+        // EnvGuard::lock() saves and clears CONFIDANT_KEYCHAIN so a dev
+        // shell's export can't break the tests (issue #103 H). The whole
+        // sequence runs under one guard — the mutex isn't reentrant, so
+        // the "pre-existing" value is simulated by setting it under the
+        // guard first.
+        let mut g = EnvGuard::lock();
+        g.set(KEYCHAIN_DISABLE_ENV, "off");
+        assert_eq!(keychain_switch().unwrap(), KeychainSwitch::Off);
+        g.unset(KEYCHAIN_DISABLE_ENV);
+        assert_eq!(keychain_switch().unwrap(), KeychainSwitch::On);
+        g.set(KEYCHAIN_DISABLE_ENV, "off");
+        assert_eq!(keychain_switch().unwrap(), KeychainSwitch::Off);
     }
 
     fn bech32_public(bech32: &str) -> String {
