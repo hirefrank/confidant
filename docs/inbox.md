@@ -33,9 +33,9 @@ and shred.
    (via the keychain module; `CONFIDANT_INBOX_KEY` overrides it on headless
    hosts). It is never a file under `~/.config`, because Time Machine backs
    that up and "destroy the old key" would then be false — a plaintext
-   `inbox.key` file is refused outright. Rotation is handled by the planned
-   `confidant inbox rotate` command (#77; see the inbox-key section of
-   `docs/crypto-design.md`).
+   `inbox.key` file is refused outright. Rotation is handled by
+   `confidant inbox rotate` / `confidant inbox rotate --finish` (see the
+   inbox-key section of `docs/crypto-design.md`).
 2. Publish the public half in the vault's `confidant.toml`:
    ```toml
    [inbox]
@@ -64,6 +64,16 @@ closed with `E_INBOX_CRYPTO`. Before decrypting, it also derives the
 recipient from the local private key and compares it against the vault's
 `[inbox].pubkey` — a mismatch is a hard `E_INBOX_UNTRUSTED`, so a substituted
 vault key is caught even if the out-of-band pin were tampered with.
+
+### Rotation
+
+`confidant inbox rotate` drains the inbox, installs a new keypair, and
+updates both pins; `confidant inbox rotate --finish` drains leftovers and
+destroys the old private key (crypto-design §8a.3). Note: `--finish` drains
+through a normal inbox run, so an item that fails to decrypt under both the
+old and new keys blocks it — delete the undecryptable item from the `inbox`
+branch directly (check it out, remove the file, commit, push) and re-run
+`--finish`.
 
 ## The `inbox` branch
 
