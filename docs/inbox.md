@@ -65,6 +65,16 @@ recipient from the local private key and compares it against the vault's
 `[inbox].pubkey` — a mismatch is a hard `E_INBOX_UNTRUSTED`, so a substituted
 vault key is caught even if the out-of-band pin were tampered with.
 
+### Rotation
+
+`confidant inbox rotate` drains the inbox, installs a new keypair, and
+updates both pins; `confidant inbox rotate --finish` drains leftovers and
+destroys the old private key (crypto-design §8a.3). Note: `--finish` drains
+through a normal inbox run, so an item that fails to decrypt under both the
+old and new keys blocks it — delete the undecryptable item from the `inbox`
+branch directly (check it out, remove the file, commit, push) and re-run
+`--finish`.
+
 ## The `inbox` branch
 
 The inbox branch is an **orphan branch** whose root holds only items. Create

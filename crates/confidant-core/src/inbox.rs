@@ -475,6 +475,20 @@ pub fn run_inbox_rotate(
 ) -> anyhow::Result<InboxRotateOutcome> {
     use confidant_crypt::keychain as kc;
 
+    // The keychain kill switch (`CONFIDANT_KEYCHAIN=off`) blanks backend
+    // reads for tests, so a load would report `NoKey` and take the
+    // lost-key path — while the rotation itself writes the real backend,
+    // quietly moving the operator's real key into the previous slot with
+    // the drain skipped and nothing reported pending. Rotation is a
+    // keychain operation: refuse outright while the switch is set.
+    if std::env::var(kc::KEYCHAIN_DISABLE_ENV).as_deref() == Ok("off") {
+        return Err(anyhow::Error::new(DomainError::inbox_crypto(
+            "refusing inbox key rotation: CONFIDANT_KEYCHAIN=off is set; \
+             unset it to rotate (it is a test-only switch)"
+                .to_string(),
+        )));
+    }
+
     let keys: Option<std::sync::Arc<InboxKeys>> =
         InboxKeys::load_opt_with(backend, keychain_config_dir)?.map(std::sync::Arc::new);
 
@@ -508,6 +522,14 @@ pub fn run_inbox_rotate(
     // `inbox rotate`.
     let (drain, lost_key) = match &keys {
         Some(keys) => {
+            // Fail fast before the drain: the keychain rotation refuses
+            // while an env override is set, so a full drain first would
+            // be pointless work ending in the same refusal.
+            kc::refuse_if_inbox_env_override().map_err(|e| {
+                anyhow::Error::new(DomainError::inbox_crypto(format!(
+                    "could not rotate the inbox key: {e}"
+                )))
+            })?;
             if keys.has_previous() {
                 // Fail fast with the same message the keychain rotation
                 // would refuse with — draining first would be pointless.
@@ -578,14 +600,36 @@ fn drain_for_rotate(
 
 /// Set `[inbox].pubkey` in a TOML file, preserving formatting and comments
 /// (`toml_edit`). Creates the file — and its parent directories — holding
-/// just the `[inbox]` table when it does not exist yet.
+/// just the `[inbox]` table when it does not exist yet. A missing file is
+/// the only case treated as empty: any other read error (permissions,
+/// non-UTF-8) fails instead of overwriting the file and dropping tables
+/// like `[trust] signers`. The write is atomic (temp file + rename) so a
+/// crash mid-write can't leave a truncated config.
 fn update_inbox_pubkey_pin(path: &Path, recipient: &str) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "could not read {}: {e} — refusing to overwrite it",
+                path.display()
+            ))
+        }
+    };
     let mut doc: toml_edit::DocumentMut = text
         .parse()
         .map_err(|e| DomainError::config(format!("{} is not valid TOML: {e}", path.display())))?;
-    if !doc.contains_key("inbox") {
-        doc["inbox"] = toml_edit::table();
+    match doc.get("inbox") {
+        None => {
+            doc["inbox"] = toml_edit::table();
+        }
+        Some(v) if v.is_table() => {}
+        Some(_) => {
+            return Err(anyhow::Error::new(DomainError::config(format!(
+                "{}: [inbox] is not a table — refusing to overwrite it",
+                path.display()
+            ))))
+        }
     }
     doc["inbox"]["pubkey"] = toml_edit::value(recipient);
     if let Some(parent) = path.parent() {
@@ -594,8 +638,17 @@ fn update_inbox_pubkey_pin(path: &Path, recipient: &str) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("could not create {}: {e}", parent.display()))?;
         }
     }
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow::anyhow!("could not replace {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -612,6 +665,9 @@ fn commit_vault_config(
     let toplevel = git_toplevel(vault_root)?;
     let rel = toplevel_relative(&toplevel, vault_config_path)?;
     git(&toplevel, &["add", "--", &rel.to_string_lossy()])?;
+    // Commit with a pathspec: a bare `git commit` would sweep anything
+    // the operator already had staged into the rotation commit, and in a
+    // privacy vault that is a real risk.
     git(
         &toplevel,
         &[
@@ -619,6 +675,8 @@ fn commit_vault_config(
             "-q",
             "-m",
             &format!("inbox: rotate pubkey to {new_recipient}"),
+            "--",
+            &rel.to_string_lossy(),
         ],
     )?;
     Ok(())
@@ -2244,5 +2302,41 @@ mod tests {
                 .expect("git config failed");
             assert!(out.status.success());
         }
+    }
+    /// Must-fix 2 (#104 review): the rotation commit carries only
+    /// `confidant.toml` — a file the operator had staged beforehand must
+    /// not be swept into it. Tested here (not via `run_inbox_rotate`)
+    /// because the drain refuses on a non-clean tree.
+    #[test]
+    fn rotation_commit_keeps_staged_files_out() {
+        let (_dir, root) = plumbing_repo(&[]);
+        let config = root.join("confidant.toml");
+        std::fs::write(&config, "spec = \"0.1\"\n").unwrap();
+
+        // The operator stages an unrelated file.
+        std::fs::write(root.join("draft.md"), "Unrelated draft.\n").unwrap();
+        let sh = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git failed to run");
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        sh(&["add", "--", "draft.md"]);
+
+        commit_vault_config(&root, &config, "age1testrecipient").unwrap();
+
+        let files = sh(&["show", "--name-only", "--format=", "HEAD"]);
+        assert_eq!(
+            files, "confidant.toml",
+            "rotation commit swept staged files: {files}"
+        );
+        // The staged file is still staged, untouched.
+        let staged = sh(&["diff", "--cached", "--name-only"]);
+        assert_eq!(staged, "draft.md", "staged file lost: {staged}");
     }
 }

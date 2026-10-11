@@ -544,14 +544,7 @@ pub fn rotate_inbox_key_with(
     // an env override is set: the env value would land in the previous
     // slot while the keychain's real current key is overwritten and lost
     // (and the env var would keep masking the new key afterwards).
-    for var in [INBOX_KEY_ENV, INBOX_KEY_PREVIOUS_ENV] {
-        if env_override_is_set(var) {
-            return Err(Error::Keychain(format!(
-                "refusing inbox key rotation: {var} is set; rotation is a keychain \
-                 operation — unset the env var first"
-            )));
-        }
-    }
+    refuse_if_inbox_env_override()?;
     // Refuse a second rotate inside the window: overwriting the previous
     // slot would destroy the oldest key without ever draining it (§8a.3).
     if backend
@@ -594,6 +587,22 @@ fn env_override_is_set(var: &str) -> bool {
     std::env::var(var)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// Refuse an inbox-key rotation while `CONFIDANT_INBOX_KEY` or
+/// `CONFIDANT_INBOX_KEY_PREVIOUS` is set. Public so callers (e.g.
+/// `confidant-core`'s rotation orchestration) can fail fast *before* a
+/// drain, rather than after a full run when the keychain itself refuses.
+pub fn refuse_if_inbox_env_override() -> Result<(), Error> {
+    for var in [INBOX_KEY_ENV, INBOX_KEY_PREVIOUS_ENV] {
+        if env_override_is_set(var) {
+            return Err(Error::Keychain(format!(
+                "refusing inbox key rotation: {var} is set; rotation is a keychain \
+                 operation — unset the env var first"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn store_key(

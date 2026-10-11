@@ -401,3 +401,129 @@ fn rotate_lost_key_skips_drain() {
     .unwrap();
     assert!(!outcome.old_key_destroyed);
 }
+
+/// Must-fix 1: with `CONFIDANT_KEYCHAIN=off`, both `rotate` and `--finish`
+/// refuse instead of taking the lost-key path and half-rotating the real
+/// backend (drain skipped, real key moved into the previous slot, nothing
+/// reported pending).
+#[test]
+fn rotate_refuses_with_kill_switch() {
+    let _g = EnvGuard::lock();
+    let repo = Repo::new();
+
+    let backend = MemoryKeychain::new();
+    let home = TempDir::new().unwrap();
+    let user_config = home.path().join(".config/confidant/config.toml");
+
+    // A real key enrolled in the backend.
+    let old_id = age::x25519::Identity::generate();
+    let old_recipient = old_id.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&old_id)).unwrap();
+    repo.set_vault_pubkey(&old_recipient);
+
+    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
+
+    for finish in [false, true] {
+        let err = run_inbox_rotate(
+            repo.root(),
+            &backend,
+            None,
+            &repo.root().join("confidant.toml"),
+            &user_config,
+            &rotate_opts(finish, Some(old_recipient.clone())),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("CONFIDANT_KEYCHAIN=off"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    // The backend is untouched: no half-rotation happened.
+    std::env::remove_var("CONFIDANT_KEYCHAIN");
+    let keys = confidant_core::InboxKeys::load_opt_with(&backend, None)
+        .unwrap()
+        .expect("inbox key must still be enrolled");
+    assert!(!keys.has_previous(), "previous slot must be empty");
+    assert_eq!(keys.current_recipient(), old_recipient);
+    assert!(
+        !user_config.exists(),
+        "no pin file should have been written"
+    );
+}
+
+/// Must-fix 3 + item 7: the pin write fails closed instead of clobbering.
+/// A user-config path that can't be read (here: a directory) errors rather
+/// than being overwritten with only `[inbox]`; a non-table `[inbox]`
+/// value is a config error, not a panic.
+#[test]
+fn rotate_pin_write_fails_closed() {
+    let _g = EnvGuard::lock();
+    let repo = Repo::new();
+    if !require_commit_signing(&repo) {
+        return;
+    }
+
+    let backend = MemoryKeychain::new();
+    let home = TempDir::new().unwrap();
+
+    let old_id = age::x25519::Identity::generate();
+    let old_recipient = old_id.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&old_id)).unwrap();
+    repo.set_vault_pubkey(&old_recipient);
+    repo.with_encrypted_inbox(&[("item1.age", encrypt_item(RECORD_ITEM, &old_recipient))]);
+
+    // Case 1: the user-config path is a directory (read fails with
+    // EISDIR, not NotFound) — must error, not overwrite.
+    let user_config_dir = home.path().join(".config/confidant/config.toml");
+    std::fs::create_dir_all(&user_config_dir).unwrap();
+    let err = run_inbox_rotate(
+        repo.root(),
+        &backend,
+        None,
+        &repo.root().join("confidant.toml"),
+        &user_config_dir,
+        &rotate_opts(false, Some(old_recipient.clone())),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to overwrite"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        user_config_dir.is_dir(),
+        "the directory must not have been replaced by a file"
+    );
+
+    // Case 2: `[inbox]` exists but isn't a table — a config error, not a
+    // toml_edit panic. Fresh backend and repo so the rotate runs cleanly
+    // up to the user-config write.
+    let repo2 = Repo::new();
+    if !require_commit_signing(&repo2) {
+        return;
+    }
+    let backend2 = MemoryKeychain::new();
+    let old_id2 = age::x25519::Identity::generate();
+    let old_recipient2 = old_id2.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend2, None, &bech32(&old_id2)).unwrap();
+    repo2.set_vault_pubkey(&old_recipient2);
+    let user_config_file = home.path().join("other.confidant/config.toml");
+    std::fs::create_dir_all(user_config_file.parent().unwrap()).unwrap();
+    std::fs::write(&user_config_file, "inbox = \"x\"\n[trust]\nsigners = []\n").unwrap();
+    let err = run_inbox_rotate(
+        repo2.root(),
+        &backend2,
+        None,
+        &repo2.root().join("confidant.toml"),
+        &user_config_file,
+        &rotate_opts(false, Some(old_recipient2.clone())),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a table"),
+        "unexpected error: {err:#}"
+    );
+    // The [trust] table must still be there — nothing was clobbered.
+    let text = std::fs::read_to_string(&user_config_file).unwrap();
+    assert!(text.contains("[trust]"), "config was clobbered:\n{text}");
+}
