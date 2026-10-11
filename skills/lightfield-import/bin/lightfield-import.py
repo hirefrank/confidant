@@ -7,7 +7,7 @@ import). Keep it on a trusted device.
 
 Expected export shape (JSON; unknown fields ignored, bad rows warned+skipped):
   {"contacts": [{"id": "lf-c-1", "name": "Ada Example",
-                 "emails": ["a@x.co"], "phones": ["+1…"], "notes": "…",
+                 "emails": ["ada@example.com"], "phones": ["+1…"], "notes": "…",
                  "no-ai": true}],
    "deals": [{"id": "lf-d-1", "contact_id": "lf-c-1", "title": "…",
               "stage": "proposal", "notes": "…"}],
