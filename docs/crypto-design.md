@@ -359,6 +359,15 @@ expires = "2026-11-08"
   another. `expires` is parsed strictly as `YYYY-MM-DD` (a malformed date
   is a hard error, never "unexpired"), the scope's `key_id` must equal the
   identity in use, and verification uses Ed25519 `verify_strict`.
+  `confidant-scope-v1` is the **first released v1 layout**; any future
+  change to the signed bytes or the scope document bumps the tag (e.g.
+  `confidant-scope-v2`), so old scopes stop verifying rather than being
+  silently reinterpreted.
+- The `vault_id` and the expected `key_id` passed to the authorize check
+  must come from verified state (the signed manifest / trust anchor, the
+  key the CLI actually loaded) — never from the scope file, an env var,
+  or unverified config — and the "today" date must be UTC. The authorize
+  boundary refuses an empty `vault_id` or `key_id`.
 - A client data key is wrapped to an agent key only for clients in its
   scope. Narrowing a scope = remove wrappings + re-sign manifest.
 - Agent private keys live in the agent host's secret store, never in the
