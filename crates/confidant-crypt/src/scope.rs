@@ -128,6 +128,15 @@ pub fn sign(operator_sk: &SigningKey, vault_id: &str, scope: &Scope) -> Result<V
 /// parsed strictly as `YYYY-MM-DD` UTC), client membership, type
 /// membership, and capability. Any failure → [`Error::Scope`]; the caller
 /// must refuse before any crypto.
+///
+/// Caller contract (Silas's #91 sign-off):
+/// - `vault_id` and `expected_key_id` must come from **verified state** —
+///   the signed manifest / trust anchor, the key the CLI actually loaded —
+///   never from the scope file itself, an env var, or unverified config.
+///   An empty `vault_id` or `expected_key_id` is refused at this boundary.
+/// - `today_ymd` must be the **UTC** date as `YYYY-MM-DD`; the scope's
+///   `expires` is compared against it, so a non-UTC date silently shifts
+///   the expiry check by a day.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize(
     operator_pk: &VerifyingKey,
@@ -140,6 +149,20 @@ pub fn authorize(
     record_type: &str,
     capability: Capability,
 ) -> Result<Scope, Error> {
+    if vault_id.is_empty() {
+        return Err(Error::Scope(
+            "vault_id is empty; pass the verified vault id (from the signed \
+                 manifest or trust anchor), never an empty value"
+                .to_string(),
+        ));
+    }
+    if expected_key_id.is_empty() {
+        return Err(Error::Scope(
+            "expected_key_id is empty; pass the key id actually in use, \
+                 never an empty value"
+                .to_string(),
+        ));
+    }
     let sig_arr: [u8; 64] = sig_bytes
         .try_into()
         .map_err(|_| Error::Scope("scope signature must be 64 bytes".to_string()))?;
@@ -484,5 +507,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("64 bytes"));
+    }
+
+    #[test]
+    fn empty_vault_id_refused() {
+        // An empty vault_id must be refused at the boundary: it can never
+        // come from verified state, and signing over it would authorize a
+        // scope with no vault binding.
+        let (pk, toml, sig) = signed();
+        let err = authorize(
+            &pk,
+            "",
+            KEY_ID,
+            &toml,
+            &sig,
+            "2026-10-08",
+            "p-01ABC",
+            "deal",
+            Capability::Read,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("vault_id"), "{err}");
+    }
+
+    #[test]
+    fn empty_expected_key_id_refused() {
+        // An empty expected_key_id must be refused: the scope's key_id can
+        // never match it, so accepting it would be a fail-open hole.
+        let (pk, toml, sig) = signed();
+        let err = authorize(
+            &pk,
+            VAULT,
+            "",
+            &toml,
+            &sig,
+            "2026-10-08",
+            "p-01ABC",
+            "deal",
+            Capability::Read,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("expected_key_id"), "{err}");
     }
 }
