@@ -63,7 +63,8 @@ struct Cli {
 
     /// Idempotency key for this write (HMAC idempotency, ADR-7).
     ///
-    /// Must carry at least 128 bits of entropy (at least 22 characters):
+    /// Must be unguessable and at least 22 characters (use a ULID or
+    /// UUIDv4 — a ULID carries 80 random bits plus a timestamp):
     /// the Request-Hash trailer HMACs the canonical request with the raw id
     /// as key, and trailers are permanent, so a guessable id lets anyone with
     /// repo read access confirm guesses about note contents offline, even

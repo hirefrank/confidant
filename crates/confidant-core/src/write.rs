@@ -252,12 +252,12 @@ pub fn apply_write(
         // as key, and trailers are permanent (crypto-shredding can't reach
         // them, ADR-7). A guessable id lets anyone with repo read access
         // confirm guesses about note contents offline — even after shredding.
-        // 22 chars is the 128-bit floor (base64 length); ULIDs and UUIDv4s
+        // 22 chars is the unguessability floor; ULIDs and UUIDv4s
         // clear it comfortably.
         if rid.chars().count() < 22 {
             return Err(anyhow::Error::new(
                 DomainError::usage(
-                    "--request-id must carry at least 128 bits of entropy (at least 22 characters)",
+                    "--request-id must be unguessable (at least 22 characters; use a ULID or UUIDv4)",
                 )
                 .with_fix("Generate a ULID or UUIDv4 once and reuse it on retry"),
             ));
