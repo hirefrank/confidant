@@ -83,6 +83,49 @@ in release (guarded by `scan_id_tokens_is_linear_on_long_cjk_and_url_lines`).
 One `open` line with 2,000 `p-` and 2,000 `pkg-` tokens finishes in
 well under 1 s in release (guarded by `find_open_line_with_thousands_of_ids_is_fast`).
 
+## Follow-up: issue #2 (2026-10-11)
+
+Same 400×5 vaults, regenerated. Machine: AMD Ryzen 5 7640U (12 logical
+CPUs), Linux, release build with system rustc 1.98.1 (repo pins 1.99.0;
+no behavior-relevant APIs involved). No hyperfine on this machine:
+each cell is min / median / max over 10–15 `date`-timed runs after
+3 warmups. `common` uses `--limit 2500` so all 2,400 hits render
+(the default `--limit 50` truncates printing, not scanning).
+
+| Command | Hits | Min | Median | Max |
+|---|---:|---:|---:|---:|
+| `find zxqvUniqueTokenAda0` (English) | 1 | 107 ms | 110 ms | 115 ms |
+| `find coaching-practice --limit 2500` (English) | 2,400 | 111 ms | 113 ms | 117 ms |
+| `check` (English vault) | 0 findings | 58 ms | 60 ms | 62 ms |
+| `find zxqvUniqueTokenAda0` (`--cjk` vault) | 1 | 173 ms | 177 ms | 181 ms |
+
+Main-branch numbers on the same machine for comparison: find unique
+154/172/187, find common-full 159/174/180, check 107/110/112
+(min/median/max). So find is down ~50 ms (~30%) and check ~50 ms
+(~45%), back at the ~115 ms Review #11 baseline for English.
+
+What changed (no §12 change — the allowlist rules, token verdicts, and
+output shapes are untouched):
+
+- Markdown record files load in parallel (`std::thread::scope`, one
+  chunk per core, merged back in walk order).
+- ULIDs are interned (`Arc<str>` in `RecordId`): clones across the
+  worklist and indexes share the allocation instead of re-allocating.
+- The ULID indexes and the cleared-set worklist use hash maps/sets
+  instead of ordered maps/sets (iteration order never affects output:
+  hits and findings are sorted at the end, the worklist converges to
+  the same fixed point regardless of processing order).
+- `ledger_line_verb` compares without allocating (owned only on match).
+- The seed walk no longer re-lists collection subtrees: names and
+  token seeds are captured during the collections walk that already
+  visits every entry.
+
+Equivalence evidence: `load_vault` output (records, findings, path
+IDs, path ULIDs, ledger lines) dumped on the bench vault is
+byte-identical before/after; `find --json` with 2,400 matches is
+byte-identical before/after; the full workspace suite and golden files
+pass unchanged.
+
 ## Section 9b item 4
 
 A sequential plaintext scan of a few hundred clients, with realistic
@@ -101,4 +144,6 @@ name.
 
 QMD (local BM25 + vectors, index never in git) is still the plan after
 v0. Milestone 2 record-bound AEAD is **not** in this measurement; do not
-treat 100 ms as a decrypt-inclusive budget.
+treat 100 ms as a decrypt-inclusive budget. The issue-#2 follow-up
+above re-measured after the perf work: ~110 ms English `find`,
+~60 ms `check` on the Ryzen machine.

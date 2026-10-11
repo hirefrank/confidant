@@ -1342,6 +1342,94 @@ fn find_excludes_dangling_person_reference() {
     );
 }
 
+/// Marker note + deep unexpected dir, checked for one location. Without
+/// the deep file the marker line is searchable (control); once a file
+/// whose name carries CAM's bare ULID lands in the unexpected dir, the
+/// path seed drops the line. Fails if the seed walk skips collection
+/// subtrees that scan_collections never lists (#116 hold).
+fn deep_seed_location(dir: &Path, deep_rel: &str, token: &str) {
+    vault_toml(dir, DEFAULT_CHECKS);
+    person(dir, ADA, "Ada Example");
+    person(dir, CAM, "Cam Example");
+    write(
+        dir,
+        &format!("notes/{NOTE2}/note.md"),
+        &format!(
+            "---\nid: {NOTE2}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\n{token} bare {} here\n",
+            &CAM[2..]
+        ),
+    );
+    // Control: no deep file yet, the cleared note's line is searchable.
+    let result = search_q(dir, token);
+    assert!(token_in_hits(&result, token), "{result:?}");
+    // The deep file's name seeds CAM's ULID for bare-window matching.
+    write(dir, deep_rel, "fake deep file\n");
+    let result = search_q(dir, token);
+    assert!(!token_in_hits(&result, token), "{result:?}");
+    let json = report_json(dir, None);
+    assert!(
+        codes(&json).contains(&"E_INVALID_FILENAME".into()),
+        "unexpected dir must still be flagged: {json}"
+    );
+}
+
+#[test]
+fn find_drops_line_seeded_from_deep_extra_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    deep_seed_location(
+        dir.path(),
+        "people/p-01M3TC5H00MPJG001248000002/extra/deep/x01M3TC5H00MPJG001248000002.txt",
+        "extra-deep-token",
+    );
+}
+
+#[test]
+fn find_drops_line_seeded_from_notes_sub_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    deep_seed_location(
+        dir.path(),
+        "people/p-01M3TC5H00MPJG001248000002/notes/sub/x01M3TC5H00MPJG001248000002.txt",
+        "notes-sub-token",
+    );
+}
+
+#[test]
+fn find_drops_line_seeded_from_interactions_junk_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    deep_seed_location(
+        dir.path(),
+        "interactions/zz/x/x01M3TC5H00MPJG001248000002.txt",
+        "junk-dir-token",
+    );
+}
+
+#[test]
+fn find_drops_line_seeded_from_deep_dangling_name() {
+    // Parity: a deep filename carrying a dangling (record-less) ULID
+    // seeds bare-window matching the same way — the line is dropped.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), CAM, "Cam Example");
+    write(
+        dir.path(),
+        &format!("notes/{NOTE2}/note.md"),
+        &format!(
+            "---\nid: {NOTE2}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\ndangling-deep-token bare {} here\n",
+            &GHOST[2..]
+        ),
+    );
+    let result = search_q(dir.path(), "dangling-deep-token");
+    assert!(token_in_hits(&result, "dangling-deep-token"), "{result:?}");
+    write(
+        dir.path(),
+        &format!("people/{CAM}/extra/deep/x{}.txt", &GHOST[2..]),
+        "fake deep file\n",
+    );
+    let result = search_q(dir.path(), "dangling-deep-token");
+    assert!(!token_in_hits(&result, "dangling-deep-token"), "{result:?}");
+}
+
 #[test]
 fn find_json_omits_filename_under_excluded_person() {
     let dir = tempfile::tempdir().unwrap();
