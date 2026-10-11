@@ -1803,6 +1803,71 @@ fn test_shred_omitting_shared_errors_before_mutation() {
 }
 
 // ---------------------------------------------------------------------------
+// #99: re-pin the anchor after shred before any other key operation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_shred_repin_anchor_before_next_key_op() {
+    // init_client and rotate read the recovery recipient from the anchor.
+    // A client initialized after a shred but before the anchor is re-pinned
+    // wraps to the recovery key the shred just destroyed — it then cannot be
+    // recovered from the new phrase. The caller must re-pin first.
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client("p-AAAA", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+
+    // Shred A; a fresh recovery identity is issued.
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    let outcome = f
+        .keys
+        .shred(
+            "p-AAAA",
+            &["p-AAAA"],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap();
+    let new_recovery = outcome.new_recovery();
+    let new_recovery_id = new_recovery.age_identity().to_age_identity().unwrap();
+
+    // init_client with the STALE anchor (the shred did not re-pin it).
+    f.keys
+        .init_client("p-BBBB", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    // B's recovery wrapping opens with the OLD recovery identity (the one
+    // the shred destroyed)...
+    let old_recovery_id = f.recovery.age_identity().to_age_identity().unwrap();
+    assert!(f
+        .keys
+        .unwrap_data_key("p-BBBB", "recovery", 1, &old_recovery_id, &f.anchor)
+        .is_ok());
+    // ...but NOT with the new one: B cannot be recovered from the new phrase.
+    assert!(f
+        .keys
+        .unwrap_data_key("p-BBBB", "recovery", 1, &new_recovery_id, &f.anchor)
+        .is_err());
+
+    // Re-pin the anchor with the new recovery identity's public halves.
+    let mut new_anchor = f.anchor.clone();
+    new_anchor.recovery = new_recovery.verifying_key();
+    new_anchor.recovery_age = new_recovery.age_identity().to_recipient_string();
+
+    // Now a new client wraps to the NEW recovery key.
+    f.keys
+        .init_client("p-CCCC", &recipients, &new_anchor, &f.operator_sk)
+        .unwrap();
+    assert!(f
+        .keys
+        .unwrap_data_key("p-CCCC", "recovery", 1, &new_recovery_id, &new_anchor)
+        .is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // #69: a tampered manifest fails closed on every path
 // ---------------------------------------------------------------------------
 

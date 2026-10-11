@@ -658,6 +658,16 @@ impl KeyStore {
     ///
     /// `identity` must unwrap the current keys (an old device or recovery
     /// identity) so remaining keys can be re-wrapped.
+    ///
+    /// **Re-pin the anchor before any other key operation.** `init_client`
+    /// and `rotate` read the recovery recipient from the [`Anchor`], so a
+    /// client initialized after a shred but before the anchor is re-pinned
+    /// wraps to the recovery key this shred just destroyed — it then cannot
+    /// be recovered from the new phrase.
+    ///
+    /// Pin [`ShredOutcome::new_recovery`]'s public halves (Ed25519 verifying
+    /// key + X25519 age recipient) into the trust anchor immediately, then
+    /// confirm the new phrase was written down.
     pub fn shred(
         &mut self,
         shredded_client: &str,
@@ -891,6 +901,11 @@ impl KeyStore {
     /// caller pins its public halves in the trust anchor and confirms the
     /// phrase was written down. Destroy every copy of the old recovery
     /// phrase (paper, 1Password); until you do, it still opens history.
+    ///
+    /// **Re-pin the anchor before any other key operation** ([`shred`]'s
+    /// note applies here too): `init_client` and `rotate` read the
+    /// recovery recipient from the anchor, so a stale anchor wraps new
+    /// clients to the old recovery key.
     pub fn rotate_recovery(
         &mut self,
         clients: &[&str],
