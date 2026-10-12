@@ -38,63 +38,31 @@ allowlist, and `no-ai` all work, but they are not a substitute for the
 outside audit. This section will say plainly when the audit lands; until
 then it is the disclosure.
 
+## Install
+
+```sh
+cargo install confidant-cli
+```
+
+This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli).
+Requires a recent Rust toolchain (MSRV 1.85, see `rust-version` in `Cargo.toml`).
+
 ## Privacy (read this)
 
 Plaintext belongs only on trusted devices (your laptop, or an agent computer
-acting for you). A git remote must not hold client notes in plaintext; on a keyed vault
-the write path now encrypts record content (see Status above). Vaults that
-opt out with `[crypto] mode = "plaintext"` stay plaintext in git — do not
-put real clients in those.
+acting for you). A git remote must not hold client notes in plaintext. On a
+keyed vault the write path encrypts record content (see Status above). Vaults that opt out with `[crypto] mode = "plaintext"` stay
+plaintext in git — do not put real clients in those.
 
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores
-nothing; that depends on the provider's terms. `confidant find` returns
-content only from a cleared allowlist (spec section 12): a record is
-searchable only when it parsed cleanly, has no `no-ai` flag, has no
-duplicate or path-id mismatch on that record, every ID in its front matter is
-cleared, its whole merge group is cleared, and any `people/<id>/` parent is
-cleared. A path mismatch on a note, interaction, or deal uncleares only that
-record; a mismatch or duplicate on a person's profile uncleares that whole
-person. `pkg-` IDs follow their openers. A leading Markdown bullet is skipped
-before detecting `merge` / `open`. Malformed ID-like tokens un-clear the
-record or line. Body lines that mention an uncleared or invalid ID are
-dropped. Ledger lines are searchable only when every ID on the line is
-cleared. A note, interaction, or deal is cleared only when every ledger
-line that names it is allowed; this does not apply to persons. Findings
-are themselves an allowlist: kept verbatim only when they have no file
-and no ID, or resolve to a cleared record or ledger line; otherwise a
-code and a count, never a path or raw text. Name-only mentions with no
-ID are not detected in body prose and comments; a `person` / `org` /
-`deal` value that is not a record ID (`person: "Jane Doe"`, bare
-`p-A|Name`) is `E_INVALID_ID` and uncleared. Empty, `~`, and YAML `null`
-are not references. A `|` alias is accepted only inside `[[…]]`. A trailing
-comment after a closing quote (one or more spaces or tabs, then `#`) is
-stripped (`"p-…" # Ada`, `"p-…"  # Bea`). After an alphanumeric, `_`, or
-`-` in the same run, and inside a `scheme://` token, a prefix is glued: an
-exact ULID is Valid; a longer run whose first 26 characters are a ULID, a
-Unicode dash plus a ULID, or a dash run (`--`, soft hyphen then `-`) plus
-a ULID, is malformed with that candidate; other glued lookalikes
-(Drive/Docs, Notion, 32-hex) are not tokens. Unicode Pd dashes plus
-U+30FC and U+2043 count as the ID dash. A bare 26-character ULID that
-exactly equals any ULID the vault names (loaded records, packages,
-dangling prefixed IDs, and IDs found in visited file/directory names,
-including nested dirs, `(copy)` / `.bak` / uppercase prefixes / bare
-`<ULID>.md` / `.n-<ULID>.md.swp`) is treated as that ID as any
-26-character window inside a Crockford run (`src:zoom/rec_<ULID>.vtt`,
-`p_<ULID>`, `p<ULID>`, `<ULID>abc`), except windows already covered by a
-prefixed token (a record's `id:` line is not a bare window). ULIDs named
-only by a dangling or malformed prefixed token match genuinely bare
-windows only; loaded records and path IDs still apply inside prefixed
-tokens. Near-ULID bare runs are not IDs. Each mapped ID stays
-uncleared unless it is a cleared record or a cleared package. Merge and
-open name that ID the same way. Dropping a record walks merge peers and
-package openers to a fixed point. If any ledger file cannot be
-read, `find` exits non-zero with `E_LEDGER_UNREADABLE` (code and count
-only) and no hits. Remaining limits: glued inexact IDs whose first 26
-characters do not canonicalize, non-Cf invisible characters, capitalised
-or other keys holding names, name-only prose, and that `check`'s
-location field still shows the paths of invalid files. Milestone 3
-`context` continues to honour `no-ai`.
+nothing; that depends on the provider's terms.
+
+`confidant find` returns content only from a **cleared allowlist** — a record
+is searchable only when it parsed cleanly, has no `no-ai` flag, and every ID
+it references is cleared. The full allowlist rules (merge groups, ledger
+lines, package propagation, ID edge cases) are in
+[`docs/privacy.md`](docs/privacy.md).
 
 ## Quickstart
 
