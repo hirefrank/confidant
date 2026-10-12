@@ -18,3 +18,8 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# The release workflow is generated, then trimmed by hand (push-tags-only
+# trigger, attest + publish-crates-io jobs, pinned actions, verified dist
+# install). dist's freshness check would fail on those edits, so it is
+# scoped off for CI scripts only.
+allow-dirty = ["ci"]
