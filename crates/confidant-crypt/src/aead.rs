@@ -32,6 +32,40 @@ fn push_component(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
+/// The context and outer-header fields bound into a record's AAD.
+///
+/// Named fields instead of eleven positional arguments: `encrypt_record`
+/// and `decrypt_record` pass the same values in the same order, and a
+/// silent transposition between the two would otherwise only surface when
+/// the header-consistency check happened to fail (#136 item 3). The field
+/// order here mirrors the components' order in the AAD, and the byte
+/// layout is unchanged.
+pub struct AadHeader<'a> {
+    /// Vault id (`confidant.toml`), binding ciphertext to this vault.
+    pub vault_id: &'a str,
+    /// Record ULID.
+    pub ulid: &'a str,
+    /// Record owner's key holder (person id or `vault:shared`).
+    pub client_id: &'a str,
+    /// Vault-relative path.
+    pub path: &'a str,
+    /// AAD purpose: `profile`, `note`, `interaction`, `org`, `deal`.
+    pub purpose: &'a str,
+    /// Key epoch that wrote the file.
+    pub epoch: u64,
+    // --- outer (envelope) header fields, authenticated as stored ---
+    /// Envelope `id` header.
+    pub header_id: &'a str,
+    /// Envelope `type` header.
+    pub header_type: &'a str,
+    /// Envelope `no-ai` header.
+    pub no_ai: bool,
+    /// Envelope `enc` header.
+    pub enc: &'a str,
+    /// Envelope `key_id` header.
+    pub key_id: &'a str,
+}
+
 /// Build the associated data for a record encryption.
 ///
 /// Components, in order: `confidant1`, `vault_id`, record ULID,
@@ -39,41 +73,29 @@ fn push_component(buf: &mut Vec<u8>, data: &[u8]) {
 /// the outer header fields (`id`, `type`, `no-ai`, `enc`, `key_id`) each
 /// length-prefixed in that fixed order. The nonce is the AEAD nonce and is
 /// NOT part of the AAD.
-#[allow(clippy::too_many_arguments)]
-pub fn build_aad(
-    vault_id: &str,
-    ulid: &str,
-    client_id: &str,
-    path: &str,
-    purpose: &str,
-    epoch: u64,
-    header_id: &str,
-    header_type: &str,
-    header_no_ai: bool,
-    header_enc: &str,
-    header_key_id: &str,
-) -> Vec<u8> {
+pub fn build_aad(h: &AadHeader<'_>) -> Vec<u8> {
     let mut aad = Vec::new();
     push_component(&mut aad, DOMAIN);
-    push_component(&mut aad, vault_id.as_bytes());
-    push_component(&mut aad, ulid.as_bytes());
-    push_component(&mut aad, client_id.as_bytes());
-    push_component(&mut aad, path.as_bytes());
-    push_component(&mut aad, purpose.as_bytes());
-    push_component(&mut aad, epoch.to_string().as_bytes());
-    push_component(&mut aad, header_id.as_bytes());
-    push_component(&mut aad, header_type.as_bytes());
-    push_component(&mut aad, if header_no_ai { b"true" } else { b"false" });
-    push_component(&mut aad, header_enc.as_bytes());
-    push_component(&mut aad, header_key_id.as_bytes());
+    push_component(&mut aad, h.vault_id.as_bytes());
+    push_component(&mut aad, h.ulid.as_bytes());
+    push_component(&mut aad, h.client_id.as_bytes());
+    push_component(&mut aad, h.path.as_bytes());
+    push_component(&mut aad, h.purpose.as_bytes());
+    push_component(&mut aad, h.epoch.to_string().as_bytes());
+    push_component(&mut aad, h.header_id.as_bytes());
+    push_component(&mut aad, h.header_type.as_bytes());
+    push_component(&mut aad, if h.no_ai { b"true" } else { b"false" });
+    push_component(&mut aad, h.enc.as_bytes());
+    push_component(&mut aad, h.key_id.as_bytes());
     aad
 }
 
 /// Encrypt `plaintext` under `key` with the given AAD.
 ///
 /// Returns the random 192-bit nonce and the ciphertext (which includes the
-/// 16-byte Poly1305 tag). A fresh nonce is drawn per call.
-pub fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+/// 16-byte Poly1305 tag). A fresh nonce is drawn per call. Fails closed
+/// ([`Error::Encrypt`]) rather than panicking (#136 item 5).
+pub fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let cipher = XChaCha20Poly1305::new(key.into());
@@ -85,8 +107,8 @@ pub fn encrypt(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8
                 aad,
             },
         )
-        .expect("XChaCha20-Poly1305 encryption cannot fail with a valid key");
-    (nonce.to_vec(), ct)
+        .map_err(|e| Error::Encrypt(e.to_string()))?;
+    Ok((nonce.to_vec(), ct))
 }
 
 /// Decrypt `ciphertext` under `key` with the given AAD.
@@ -119,25 +141,25 @@ mod tests {
     use super::*;
 
     fn aad() -> Vec<u8> {
-        build_aad(
-            "vault1",
-            "01ABC",
-            "p-01ABC",
-            "people/p-01ABC.cfd",
-            "profile",
-            3,
-            "p-01ABC",
-            "person",
-            false,
-            ALG,
-            "p-01ABC/e3",
-        )
+        build_aad(&AadHeader {
+            vault_id: "vault1",
+            ulid: "01ABC",
+            client_id: "p-01ABC",
+            path: "people/p-01ABC.cfd",
+            purpose: "profile",
+            epoch: 3,
+            header_id: "p-01ABC",
+            header_type: "person",
+            no_ai: false,
+            enc: ALG,
+            key_id: "p-01ABC/e3",
+        })
     }
 
     #[test]
     fn round_trip() {
         let key = [42u8; 32];
-        let (nonce, ct) = encrypt(&key, &aad(), b"hello");
+        let (nonce, ct) = encrypt(&key, &aad(), b"hello").unwrap();
         let pt = decrypt(&key, &nonce, &aad(), &ct).unwrap();
         assert_eq!(pt, b"hello");
     }
@@ -145,7 +167,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails() {
         let key = [42u8; 32];
-        let (nonce, mut ct) = encrypt(&key, &aad(), b"hello");
+        let (nonce, mut ct) = encrypt(&key, &aad(), b"hello").unwrap();
         ct[0] ^= 1;
         assert!(matches!(
             decrypt(&key, &nonce, &aad(), &ct),

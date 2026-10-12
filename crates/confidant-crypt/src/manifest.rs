@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -164,6 +165,8 @@ pub fn key_commitment(
     client_id: &str,
     epoch: u64,
 ) -> [u8; 32] {
+    // Infallible by HMAC's contract: any key length is accepted (#136 item
+    // 5). The commitment layout is unchanged.
     let mut mac =
         Hmac::<Sha256>::new_from_slice(data_key).expect("HMAC-SHA256 accepts any key length");
     mac.update(COMMIT_DOMAIN);
@@ -189,31 +192,12 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Hex-encode bytes (avoids a `hex` dependency).
 pub fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0xf) as usize] as char);
-    }
-    s
+    crate::hex::encode(bytes)
 }
 
-/// Hex-decode (for commitment comparison).
+/// Hex-decode a key commitment (for commitment comparison).
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, Error> {
-    let s = s.trim();
-    if !s.is_ascii() {
-        return Err(Error::Manifest("non-ASCII hex commitment".to_string()));
-    }
-    if s.len() % 2 != 0 {
-        return Err(Error::Manifest("odd-length hex commitment".to_string()));
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16)
-                .map_err(|_| Error::Manifest("invalid hex commitment".to_string()))
-        })
-        .collect()
+    crate::hex::decode(s).map_err(|reason| Error::Manifest(format!("{reason} commitment")))
 }
 
 /// One key commitment entry in the manifest: epoch → hex HMAC.

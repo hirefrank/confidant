@@ -45,6 +45,24 @@
 //! (`AGE-SECRET-KEY-1…`), the same format the env vars take, so keychain
 //! and env var are interchangeable.
 //!
+//! ## Not-yet-wired public entry points (audit note, #136 item 2)
+//!
+//! These `pub` functions have no in-tree caller yet, because the paths
+//! that will use them (`confidant init` / `recover` device enrollment,
+//! and the CLI wrappers around the `_with` variants) are not written. They
+//! are kept — with this note — rather than removed, so the device/inbox
+//! enrollment write path has one documented home instead of being
+//! re-invented later:
+//!
+//! [`inbox_keys`], [`store_device_key`], [`store_inbox_key`],
+//! [`store_inbox_key_previous`], [`delete_device_key`], [`delete_inbox_key`],
+//! [`delete_inbox_key_previous`], [`rotate_inbox_key`].
+//!
+//! Each is a thin `OsKeychain` wrapper over the exported `_with` form or
+//! the internal `store_key`/`delete_key` helpers, so keeping them costs
+//! no duplicated logic. An auditor can treat this list as the complete set
+//! of unreferenced public surface in this module.
+//!
 //! ## Test isolation
 //!
 //! The keychain is behind [`KeychainBackend`]: the real OS keychain in
@@ -749,7 +767,8 @@ mod tests {
             // Acquire the lock BEFORE touching the env: the save/clear must
             // be serialized too, or a concurrent test's lock() could wipe
             // the switch this test just set (issue #103 H).
-            let _lock = ENV_LOCK.lock().unwrap();
+            // Poison-tolerant: a panicking test must not wedge later ones.
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             // Save and clear the kill switch: a dev shell that exports
             // CONFIDANT_KEYCHAIN (e.g. =off) would otherwise make every
             // backend read fail closed and every write refuse — the tests
