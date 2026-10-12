@@ -114,47 +114,6 @@ def load_map(vault: str) -> dict[str, str]:
         return {}
 
 
-def existing_people(vault: str) -> tuple[dict[str, tuple[str, bool]], dict[str, bool]]:
-    """Map profile display name -> (person ID, no-ai flag) for exact-match linking.
-
-    The no-ai flag is read from the person's front matter so a contact that
-    matches an existing no-ai person seeds no-ai onto their new deals, notes
-    and transcripts.
-
-    Returns (by_name, by_id). by_name keeps the first person per display
-    name (sorted person-ID order); by_id covers *every* scanned person, so
-    a duplicate display name can't drop a no-ai person from inheritance
-    (#100-10). Both directory (`people/p-<ULID>/profile.md`) and flat
-    (`people/p-<ULID>.md`) records are read (#100-9).
-    """
-    by_name: dict[str, tuple[str, bool]] = {}
-    by_id: dict[str, bool] = {}
-    base = os.path.join(vault, "people")
-    if not os.path.isdir(base):
-        return by_name, by_id
-    for entry in sorted(os.listdir(base)):
-        # A flat record lists as `p-<ULID>.md`; strip the suffix so the
-        # candidates below resolve (mirror transcript-import's
-        # _person_is_no_ai, which takes the bare ID).
-        pid = entry[:-3] if entry.endswith(".md") else entry
-        for cand in (os.path.join(base, pid, "profile.md"),
-                     os.path.join(base, pid + ".md")):
-            if not os.path.isfile(cand):
-                continue
-            try:
-                with open(cand, encoding="utf-8") as f:
-                    head = f.read(4096)
-            except OSError:
-                continue
-            no_ai = _NO_AI_RE.search(head) is not None
-            by_id.setdefault(pid, no_ai)
-            m = _NAME_RE.search(head)
-            if m:
-                by_name.setdefault(m.group(1).strip(), (pid, no_ai))
-    return by_name, by_id
-
-
-
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -259,7 +218,7 @@ def main(argv=None) -> int:
         return 2
 
     existing_srcs = common.collect_srcs(vault)
-    people_by_name, people_no_ai = existing_people(vault)
+    people_by_name, people_no_ai = common.existing_people(vault)
     lf_map = load_map(vault)
     warnings: list[str] = []
     skipped: list[dict] = []
@@ -493,9 +452,10 @@ def main(argv=None) -> int:
     encrypted = common.vault_looks_encrypted(vault)
     if encrypted and records:
         warnings.append(
-            "vault looks encrypted: the records below are PROPOSED ONLY — "
-            "do NOT hand-write them (plaintext PII in git). They need "
-            "`confidant record add --file`, which does not exist yet.")
+            "vault looks encrypted: do NOT hand-write the records below into "
+            "the vault tree (plaintext PII in git). Apply each via "
+            "`confidant record add --file` (stage the manifest content to a "
+            "0600 scratch file per record).")
 
     rid = common.new_request_id()
     common.write_lines_file(lines_path, by_file)

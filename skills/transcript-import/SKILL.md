@@ -58,11 +58,11 @@ silently pick a package-consuming default.
    regenerate it for the same proposal.
 5. The interaction record: **pre-M2 only**, hand-create the file from the
    manifest's `records[]`, then run `confidant check --json` to validate
-   before committing (one commit). **Post-M2** (the manifest's
-   `records_blocked` is true — the vault looks encrypted): do NOT
-   hand-write the record; it needs `confidant record add --file`, which
-   does not exist yet. Writing it by hand would commit plaintext PII to
-   git.
+   before committing (one commit). **Post-M2** (`records_blocked` is true):
+   stage the record to a `0600` scratch file and apply with
+   `confidant record add --file <scratch.md> --request-id <ulid>
+   --dry-run --json --no-input`, then the real run. Never hand-write into
+   the vault tree.
 6. Delete the manifest after a successful apply — it is plaintext PII:
    ```sh
    rm <manifest path from step 1>

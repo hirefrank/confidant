@@ -23,6 +23,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import common  # noqa: E402
+
 SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # skill -> (fixture arg name, fixture path, relative to the repo root)
@@ -88,6 +91,12 @@ def main(argv=None) -> int:
         return 2
 
     failures: list[str] = []
+    by_name, _by_id = common.existing_people(args.vault)
+    if not by_name:
+        failures.append("common.existing_people: no people indexed on demo vault")
+    else:
+        print(f"ok: existing_people ({len(by_name)} name(s) on demo vault)")
+
     with tempfile.TemporaryDirectory(prefix="confidant-smoke-") as tmp:
         for skill, fixture_arg, fixture in PROPOSERS:
             out = os.path.join(tmp, skill + ".json")

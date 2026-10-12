@@ -275,6 +275,97 @@ def write_lines_file(path: str, by_file: dict[str, list[str]]) -> None:
 _ENC_RE = re.compile(r"^enc:\s*\S", re.MULTILINE)
 
 
+def confidant_json(vault: str, args: list[str]) -> dict:
+    """Run `confidant --json --no-input` and return the parsed envelope."""
+    bin_path = shutil.which("confidant")
+    if bin_path is None:
+        sys.exit("error: confidant binary not found on PATH")
+    cmd = [bin_path, "--vault", vault, "--json", "--no-input", *args]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = r.stdout.strip() or r.stderr.strip() or "unknown error"
+        sys.exit(f"error: confidant {' '.join(args)} failed: {detail}")
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        sys.exit(f"error: confidant returned invalid JSON: {e}")
+    if not data.get("ok", True) and "error" in data:
+        err = data["error"]
+        code = err.get("code", "error")
+        msg = err.get("message", "")
+        sys.exit(f"error: confidant {code}: {msg}")
+    return data
+
+
+def existing_people_plaintext(
+    vault: str,
+) -> tuple[dict[str, tuple[str, bool]], dict[str, bool]]:
+    """Scan plaintext profile files for display names (pre-M2 / local dev)."""
+    by_name: dict[str, tuple[str, bool]] = {}
+    by_id: dict[str, bool] = {}
+    base = os.path.join(vault, "people")
+    if not os.path.isdir(base):
+        return by_name, by_id
+    _name_re = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
+    _no_ai_re = re.compile(r"""^['"]?no-ai['"]?:\s*true\s*$""", re.MULTILINE)
+    for entry in sorted(os.listdir(base)):
+        pid = entry[:-3] if entry.endswith(".md") else entry
+        for cand in (
+            os.path.join(base, pid, "profile.md"),
+            os.path.join(base, pid + ".md"),
+        ):
+            if not os.path.isfile(cand):
+                continue
+            try:
+                with open(cand, encoding="utf-8") as f:
+                    head = f.read(4096)
+            except OSError:
+                continue
+            no_ai = _no_ai_re.search(head) is not None
+            by_id.setdefault(pid, no_ai)
+            m = _name_re.search(head)
+            if m:
+                by_name.setdefault(m.group(1).strip(), (pid, no_ai))
+    return by_name, by_id
+
+
+def existing_people_via_cli(
+    vault: str,
+) -> tuple[dict[str, tuple[str, bool]], dict[str, bool]]:
+    """Map display name -> (person id, no-ai) using allowlist + context (#46)."""
+    by_name: dict[str, tuple[str, bool]] = {}
+    by_id: dict[str, bool] = {}
+    allow = confidant_json(vault, ["allowlist"])
+    for path in allow.get("cleared_files") or []:
+        parts = path.split("/")
+        if parts and parts[0] == "people":
+            if len(parts) == 3 and parts[2] == "profile.md":
+                pid = parts[1]
+            elif len(parts) == 2 and parts[1].endswith(".md"):
+                pid = parts[1][:-3]
+            else:
+                continue
+        else:
+            continue
+        if not valid_id(pid) or not pid.startswith("p-"):
+            continue
+        ctx = confidant_json(vault, ["context", pid])
+        person = ctx.get("person") or {}
+        no_ai = bool(person.get("no_ai"))
+        by_id.setdefault(pid, no_ai)
+        name = person.get("name")
+        if isinstance(name, str) and name.strip():
+            by_name.setdefault(name.strip(), (pid, no_ai))
+    return by_name, by_id
+
+
+def existing_people(vault: str) -> tuple[dict[str, tuple[str, bool]], dict[str, bool]]:
+    """Person index for import matching; uses the CLI when the vault is encrypted."""
+    if vault_looks_encrypted(vault):
+        return existing_people_via_cli(vault)
+    return existing_people_plaintext(vault)
+
+
 def vault_looks_encrypted(vault: str) -> bool:
     """True when any record file carries an `enc:` envelope marker.
 

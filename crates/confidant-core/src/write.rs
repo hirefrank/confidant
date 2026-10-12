@@ -38,6 +38,8 @@ pub struct WriteOptions {
     pub no_input: bool,
     /// Client-supplied idempotency key (HMAC idempotency, ADR-7).
     pub request_id: Option<String>,
+    /// Opaque agent identity for the `Agent:` commit trailer (#49).
+    pub agent_id: Option<String>,
 }
 
 /// One file mutation inside a pending write. Paths are vault-relative.
@@ -396,6 +398,19 @@ pub fn apply_write(
         message.push_str(&format!(
             "\n\nRequest-Id-Hash: {id_hash}\nRequest-Hash: {req_hash}"
         ));
+    }
+    if let Some(agent) = opts
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if agent.contains('\n') || agent.len() > 128 {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "agent id must be a single opaque line (at most 128 characters)",
+            )));
+        }
+        message.push_str(&format!("\n\nAgent: {agent}"));
     }
     let files: Vec<String> = pending
         .changes
