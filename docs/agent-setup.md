@@ -26,7 +26,10 @@ Set up Confidant (a git-native CRM CLI plus agent skills) on this machine:
    `git -C <dir> checkout $(git -C <dir> describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)`.
    Export `CONFIDANT_REPO=<dir>` for this session and tell me what to add
    to my shell rc to keep it: it is how `confidant doctor` finds the
-   checkout to report when the skills are behind.
+   checkout to report when the skills are behind. (Optional: `confidant
+   doctor` checks GitHub for the latest release unless `CONFIDANT_OFFLINE=1`
+   is exported — add that too, this session and the shell rc, only if I
+   want that request disabled.)
 3. Make the skills visible to yourself: symlink every directory directly
    under `<repo>/skills/` that contains a `SKILL.md` into your agent
    skills directory (`~/.config/opencode/skills/` for OpenCode,
@@ -55,7 +58,10 @@ the `check` result, and any `confidant doctor` staleness warnings.
 GitHub Release — the CLI by its version, and the skills checkout by its
 release tag. Both are warnings only: a stale install never fails `doctor`,
 and when GitHub cannot be reached they read `staleness unknown` rather than
-guessing. Apply updates with this loop:
+guessing. `doctor` checks GitHub by default; set `CONFIDANT_OFFLINE=1` to
+skip that request entirely, and both checks read `staleness check disabled`
+(see the README Privacy section and `docs/privacy.md`). Apply updates with
+this loop:
 
 - **Skills:** they live in the checkout from step 2, pinned to a release
   tag — never main. Skills run on devices holding plaintext client data,

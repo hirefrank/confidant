@@ -1930,13 +1930,27 @@ fn releases_url() -> String {
 /// informational, so `doctor` must never error or warn an offline user.
 const STALENESS_UNKNOWN: &str = "staleness unknown (could not reach github releases)";
 
+/// `ok` message when the operator disables the staleness checks outright
+/// with `CONFIDANT_OFFLINE=1`: no request is made and no release tag is
+/// fetched (see README and docs/privacy.md).
+const STALENESS_DISABLED: &str = "staleness check disabled (CONFIDANT_OFFLINE=1)";
+
+/// True when the operator has opted out of the outbound release check with
+/// `CONFIDANT_OFFLINE`. Unset or empty means normal behaviour; any other
+/// value (conventionally `1`) skips the fetch entirely.
+fn staleness_offline() -> bool {
+    std::env::var("CONFIDANT_OFFLINE")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// The `tag_name` of the latest GitHub Release, or `None` if it cannot be
 /// fetched for any reason. A single failure mode (offline, timeout,
 /// non-200, bad JSON) all collapse to `None`; only the parsed tag name is
 /// ever returned, never the response body.
 fn latest_release_tag() -> Option<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
         .build()
         .into();
     let mut response = agent
@@ -1952,8 +1966,9 @@ fn latest_release_tag() -> Option<String> {
 
 /// Parse a release tag like `v1.2.3` into `(major, minor, patch)`. The
 /// leading `v` is optional and any suffix on the patch (e.g. `-rc.1`) is
-/// ignored. Returns `None` for anything that is not `major.minor.patch`,
-/// which the caller treats the same as "unknown".
+/// ignored: `/releases/latest` never returns a prerelease, so dropping the
+/// suffix cannot mask one. Returns `None` for anything that is not
+/// `major.minor.patch`, which the caller treats the same as "unknown".
 fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
     let trimmed = tag.trim().trim_start_matches('v');
     let mut parts = trimmed.split('.');
@@ -1969,28 +1984,36 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 
 /// Build the CLI staleness check given the latest release tag (or `None`
 /// when it could not be fetched). Warning-only; ahead and equal are `ok`.
-fn cli_staleness_check(latest: Option<String>) -> DoctorCheck {
+/// With `offline`, the fetch was skipped and the check reports `ok`
+/// "disabled".
+fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
     let local = env!("CARGO_PKG_VERSION");
-    let (status, message) = match latest {
-        None => ("ok", STALENESS_UNKNOWN.to_owned()),
-        Some(tag) => match (parse_release_version(local), parse_release_version(&tag)) {
-            (Some(local_v), Some(latest_v)) if local_v < latest_v => (
-                "warning",
-                format!(
-                    "confidant-cli {local} is behind the latest release {tag}; \
-                     update with `cargo install confidant-cli`"
+    let (status, message) = if offline {
+        ("ok", STALENESS_DISABLED.to_owned())
+    } else {
+        match latest {
+            None => ("ok", STALENESS_UNKNOWN.to_owned()),
+            Some(tag) => match (parse_release_version(local), parse_release_version(&tag)) {
+                (Some(local_v), Some(latest_v)) if local_v < latest_v => (
+                    "warning",
+                    format!(
+                        "confidant-cli {local} is behind the latest release {tag}; \
+                         update with `cargo install confidant-cli`"
+                    ),
                 ),
-            ),
-            (Some(local_v), Some(latest_v)) if local_v > latest_v => (
-                "ok",
-                format!("confidant-cli {local} is ahead of the latest release {tag} (dev build)"),
-            ),
-            (Some(_), Some(_)) => (
-                "ok",
-                format!("confidant-cli {local} matches the latest release {tag}"),
-            ),
-            _ => ("ok", STALENESS_UNKNOWN.to_owned()),
-        },
+                (Some(local_v), Some(latest_v)) if local_v > latest_v => (
+                    "ok",
+                    format!(
+                        "confidant-cli {local} is ahead of the latest release {tag} (dev build)"
+                    ),
+                ),
+                (Some(_), Some(_)) => (
+                    "ok",
+                    format!("confidant-cli {local} matches the latest release {tag}"),
+                ),
+                _ => ("ok", STALENESS_UNKNOWN.to_owned()),
+            },
+        }
     };
     DoctorCheck {
         id: "cli-staleness",
@@ -2000,17 +2023,36 @@ fn cli_staleness_check(latest: Option<String>) -> DoctorCheck {
 }
 
 /// Build the skills staleness check for the checkout at `repo`, given the
-/// latest release tag (or `None`). Warning-only: a checkout that is behind
-/// warns with the update command, one that is not a pinned git checkout
-/// warns that it cannot be determined, and anything network-related
-/// degrades to `ok` "unknown".
-fn skills_staleness_check(repo: &str, latest: Option<String>, no_input: bool) -> DoctorCheck {
+/// latest release tag (or `None`). Warning-only: a checkout whose HEAD is
+/// behind warns with the update command, a checkout that carries a release
+/// tag but is not sitting on it warns that it is not pinned, and a
+/// directory that is not a pinned git checkout warns that the tag cannot be
+/// determined. Network failures degrade to `ok` "unknown", and `offline`
+/// reports `ok` "disabled" without running git at all.
+fn skills_staleness_check(
+    repo: &str,
+    latest: Option<String>,
+    no_input: bool,
+    offline: bool,
+) -> DoctorCheck {
+    if offline {
+        return DoctorCheck {
+            id: "skills-staleness",
+            status: "ok",
+            message: STALENESS_DISABLED.to_owned(),
+        };
+    }
+    // #166: the checkout must sit *exactly* on a release tag. A bare
+    // `describe` reports the nearest reachable tag, so a checkout on main
+    // past `v0.1.0` would read as current; `--exact-match` fails unless
+    // HEAD is the tagged commit itself.
     let describe = confidant_core::write::git(
         Path::new(repo),
         &[
             "describe",
             "--tags",
             "--abbrev=0",
+            "--exact-match",
             "--match",
             "v[0-9]*",
             "--exclude",
@@ -2019,17 +2061,48 @@ fn skills_staleness_check(repo: &str, latest: Option<String>, no_input: bool) ->
         no_input,
     );
     let checkout = match describe {
+        Ok(tag) => tag.trim().to_owned(),
         Err(_) => {
+            // `--exact-match` failed: HEAD is not on a release tag. Tell
+            // "the operator can pin this" apart from "nothing here can be
+            // pinned": a git work tree carrying at least one release tag is
+            // the former; anything else cannot be determined. These messages
+            // name only the checkout path and fixed commands, never repo or
+            // vault content.
+            let in_work_tree = confidant_core::write::git(
+                Path::new(repo),
+                &["rev-parse", "--is-inside-work-tree"],
+                no_input,
+            )
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false);
+            let has_release_tag = in_work_tree
+                && confidant_core::write::git(
+                    Path::new(repo),
+                    &["tag", "--list", "v[0-9]*"],
+                    no_input,
+                )
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            let message = if has_release_tag {
+                format!(
+                    "skills checkout at {repo} is not pinned to a release tag; \
+                     pin it with `git -C {repo} checkout $(git -C {repo} describe \
+                     --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)` \
+                     (see docs/agent-setup.md)"
+                )
+            } else {
+                format!(
+                    "cannot determine the skills checkout version at {repo}; \
+                     re-clone it and pin to a release tag (see docs/agent-setup.md)"
+                )
+            };
             return DoctorCheck {
                 id: "skills-staleness",
                 status: "warning",
-                message: format!(
-                    "cannot determine the skills checkout version at {repo}; \
-                     re-clone it and pin to a release tag (see docs/agent-setup.md)"
-                ),
+                message,
             };
         }
-        Ok(tag) => tag.trim().to_owned(),
     };
     let (status, message) = match latest {
         None => ("ok", STALENESS_UNKNOWN.to_owned()),
@@ -2356,9 +2429,14 @@ fn cmd_doctor(
     // release tag is fetched once and shared by both checks. Any network
     // failure degrades to `ok` "unknown" (offline-first): staleness is
     // informational, so `doctor` must not punish offline users.
+    //
+    // `CONFIDANT_OFFLINE=1` opts out entirely: the fetch is skipped before
+    // any request is made and both checks report `ok` "disabled". See the
+    // README Privacy section and docs/privacy.md for the disclosure.
     {
-        let latest = latest_release_tag();
-        checks.push(cli_staleness_check(latest.clone()));
+        let offline = staleness_offline();
+        let latest = if offline { None } else { latest_release_tag() };
+        checks.push(cli_staleness_check(latest.clone(), offline));
 
         // The skills checkout is located via CONFIDANT_REPO. Unset (or
         // empty) means the CLI does not know where the skills live, so
@@ -2366,7 +2444,12 @@ fn cmd_doctor(
         // not even noted: absence of configuration is normal.
         match std::env::var("CONFIDANT_REPO") {
             Ok(repo) if !repo.trim().is_empty() => {
-                checks.push(skills_staleness_check(repo.trim(), latest, cli.no_input));
+                checks.push(skills_staleness_check(
+                    repo.trim(),
+                    latest,
+                    cli.no_input,
+                    offline,
+                ));
             }
             _ => {}
         }

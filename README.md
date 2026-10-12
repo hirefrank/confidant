@@ -73,6 +73,13 @@ it references is cleared. The full allowlist rules (merge groups, ledger
 lines, package propagation, ID edge cases) are in
 [`docs/privacy.md`](docs/privacy.md).
 
+`confidant doctor` checks GitHub for the latest release. That is one
+unauthenticated `GET` to
+`api.github.com/repos/hirefrank/confidant/releases/latest`; no vault data is
+included, and only the `tag_name` is read — the response body is discarded.
+Set `CONFIDANT_OFFLINE=1` to skip the request; the checks then report
+`staleness check disabled`.
+
 ## Quickstart
 
 ```sh

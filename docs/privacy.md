@@ -91,3 +91,12 @@ Milestone 3 `context` continues to honour `no-ai`.
 
 If any ledger file cannot be read, `find` exits non-zero with
 `E_LEDGER_UNREADABLE` (code and count only) and no hits.
+
+## Network access
+
+`confidant doctor` checks GitHub for the latest release by default: one
+unauthenticated `GET` to `api.github.com/repos/hirefrank/confidant/releases/latest`.
+No vault data, record content, IDs, or paths are sent, and only the `tag_name`
+field is read from the response — the body is discarded. Set
+`CONFIDANT_OFFLINE=1` to skip the request entirely; both staleness checks then
+report `staleness check disabled`.
