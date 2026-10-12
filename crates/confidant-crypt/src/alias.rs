@@ -28,6 +28,11 @@ pub fn normalize(value: &str) -> String {
 /// Compute the alias HMAC, hex-encoded (at least 32 hex chars per spec §6;
 /// HMAC-SHA256 gives 64).
 pub fn alias_hmac(key: &LookupKey, value: &str) -> String {
+    // Infallible by HMAC's contract: `new_from_slice` accepts a key of any
+    // length for HMAC (the error case exists for fixed-size MACs). Keeping
+    // this as `expect` rather than `Result` keeps `alias_hmac`'s signature
+    // simple; the one AEAD `expect` that could genuinely fail was made a
+    // `Result` instead (#136 item 5).
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(normalize(value).as_bytes());

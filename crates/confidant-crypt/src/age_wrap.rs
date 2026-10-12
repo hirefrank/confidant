@@ -72,6 +72,10 @@ pub fn parse_recipient(s: &str) -> Result<age::x25519::Recipient, Error> {
 }
 
 /// Returns true when `s` parses as an `age1…` X25519 recipient.
+///
+/// Not yet wired (#136 item 2, audit note): the one-line convenience over
+/// [`parse_recipient`] for config/enrollment validation. Kept, with this
+/// note, so the `init`/`recover` recipient check has one documented home.
 pub fn is_valid_recipient(s: &str) -> bool {
     parse_recipient(s).is_ok()
 }
@@ -119,6 +123,11 @@ pub fn unwrap_with_identity(
 }
 
 /// Unwrap with an age Bech32 identity string (`AGE-SECRET-KEY-1…`).
+///
+/// Not yet wired (#136 item 2, audit note): the string→identity→unwrap
+/// path the `init`/`recover` enrollment flow will use. Kept, with this
+/// note, alongside [`unwrap_with_raw_secret`] (which takes the 32-byte
+/// secret directly) rather than re-invented later.
 pub fn unwrap_with_bech32(data: &[u8], identity: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
     let id = age::x25519::Identity::from_str(identity)
         .map_err(|e| Error::Age(format!("bad identity: {e}")))?;

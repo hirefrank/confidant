@@ -201,25 +201,14 @@ impl std::fmt::Display for Warning {
     }
 }
 
-/// Minimal hex decoding (avoids a `hex` dependency).
+/// Minimal hex decoding (avoids a `hex` dependency). Delegates to the
+/// crate-wide implementation ([`crate::hex`], #136 item 6) with the
+/// anchor's error variant and a `what` label.
 mod hex {
     use crate::error::Error;
 
     pub fn decode_hex(what: &str, s: &str) -> Result<Vec<u8>, Error> {
-        let s = s.trim();
-        if !s.is_ascii() {
-            return Err(Error::Anchor(format!("{what}: non-ASCII hex")));
-        }
-        if s.len() % 2 != 0 {
-            return Err(Error::Anchor(format!("{what}: odd-length hex")));
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 2], 16)
-                    .map_err(|_| Error::Anchor(format!("{what}: invalid hex")))
-            })
-            .collect()
+        crate::hex::decode_anchor(what, s)
     }
 }
 
