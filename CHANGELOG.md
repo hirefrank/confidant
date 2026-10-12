@@ -1,0 +1,45 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Pre-1.0: breaking changes bump the minor, fixes bump the patch.
+
+## [Unreleased]
+
+### Added
+- `confidant doctor` staleness checks: warning-only `cli-staleness` and
+  `skills-staleness` against the latest GitHub Release, with a
+  `CONFIDANT_OFFLINE=1` opt-out and README/privacy disclosure (#165, #168).
+- Agent setup docs (`docs/agent-setup.md`) with a copy/paste install prompt;
+  skills checkouts pin to release tags, never main (#164, #166, #167).
+
+## [0.1.0] - 2026-10-12
+
+First crates.io publish: `confidant-crypt`, `confidant-core`, and
+`confidant-cli` (the `confidant` binary; `cargo install confidant-cli`).
+The GitHub Release carries prebuilt binaries, shell installers, and
+build-provenance attestations.
+
+**Disclosure:** the milestone 2 encryption has had no outside review
+([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
+other people's client data in a vault until the audit lands.
+
+### Added
+- Encrypted writes: `record add`, `note add`, and `log session --note`
+  emit §14 envelopes on keyed vaults; inbox `RecordWrite` fails closed
+  rather than writing plaintext (#148).
+- Encrypted reads: `find` and `context` decrypt through the CLI with
+  `skipped_encrypted` / `refused_envelopes` counts; `no-ai` records are
+  never decrypted (#148).
+- Key lifecycle: `init`, `recover`, `keys init-client` / `rotate` /
+  `revoke` / `shred`, the `keys device-add` ceremony, and shred-coupled
+  inbox rotation (#148, #66, #105).
+- `confidant reindex`: builds the QMD search corpus through the CLI from
+  the §12 cleared set; `keys shred` deletes the local search index (#37).
+- `confidant allowlist` (the §12 cleared set for index-time exclusion),
+  `doctor` health checks, the MCP server, and the coaching schema pack.
+
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hirefrank/confidant/releases/tag/v0.1.0
