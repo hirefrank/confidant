@@ -44,8 +44,8 @@ use crate::anchor::Anchor;
 use crate::error::Error;
 use crate::keys::{DataKey, LookupKey};
 use crate::manifest::{
-    self, CommitmentEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID, SHARED_CLIENT_ID,
-    VAULT_CLIENT_ID,
+    self, CommitmentEntry, RecipientEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID,
+    SHARED_CLIENT_ID, VAULT_CLIENT_ID,
 };
 use crate::recovery::Recovery;
 use zeroize::Zeroizing;
@@ -685,6 +685,137 @@ impl KeyStore {
         // from the verified buffer.
         self.write_manifest(client_id, epoch, &recipients, &commitments, operator_sk)?;
         Ok(())
+    }
+
+    /// Add a new device recipient to every initialized client and the vault
+    /// lookup key (#66, design §6).
+    ///
+    /// Re-wraps every initialized client's every retained epoch to include
+    /// the new recipient (only the new recipient's wrapping files are
+    /// added; existing wrappings are untouched), re-wraps the vault lookup
+    /// key so the new device can compute alias HMACs, and re-signs every
+    /// manifest. The lookup key is handed off, never regenerated and never
+    /// recovery-wrapped (#142).
+    ///
+    /// Verify-first: the identity must open every client's every epoch and
+    /// the lookup key before anything is mutated. Returns the ids of the
+    /// clients updated.
+    pub fn add_recipient(
+        &mut self,
+        new_key_id: &str,
+        new_entry: &RecipientEntry,
+        identity: &dyn age::Identity,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<Vec<String>, Error> {
+        manifest::validate_key_id(new_key_id)?;
+        // Parse the new pubkey now: a bad recipient fails before any mutation.
+        let _: age::x25519::Recipient = new_entry
+            .age_pubkey
+            .parse()
+            .map_err(|e| Error::Age(format!("bad new recipient pubkey: {e}")))?;
+
+        // Initialized clients via manifest_clients() (same source as
+        // recover and shred), excluding the vault lookup dir (handled
+        // separately below).
+        let clients: Vec<String> = self
+            .manifest_clients()
+            .into_iter()
+            .filter(|c| c != VAULT_CLIENT_ID)
+            .collect();
+
+        struct VerifiedClient {
+            client: String,
+            epoch: u64,
+            new_map: RecipientMap,
+            epoch_keys: Vec<(u64, DataKey)>,
+            commitments: Vec<CommitmentEntry>,
+        }
+        let mut verified: Vec<VerifiedClient> = Vec::new();
+        for client in &clients {
+            let (epoch, old_map, commitments) = self.verified_recipients(client, anchor)?;
+            if old_map.contains_key(new_key_id) {
+                return Err(Error::Manifest(format!(
+                    "recipient {new_key_id:?} is already enrolled for {client}"
+                )));
+            }
+            if old_map
+                .values()
+                .any(|e| e.age_pubkey == new_entry.age_pubkey)
+            {
+                return Err(Error::Manifest(format!(
+                    "a recipient with this pubkey is already enrolled for {client}"
+                )));
+            }
+            let mut epoch_keys = Vec::new();
+            for e in 1..=epoch {
+                let mut key_opt = None;
+                let mut last_err =
+                    Error::NoKey(format!("identity opens no wrapping for {client} e{e}"));
+                for kid in old_map
+                    .keys()
+                    .chain(std::iter::once(&RECOVERY_KEY_ID.to_string()))
+                {
+                    match self.unwrap_data_key(client, kid, e, identity, anchor) {
+                        Ok(k) => {
+                            key_opt = Some(k);
+                            break;
+                        }
+                        Err(er) => last_err = er,
+                    }
+                }
+                epoch_keys.push((e, key_opt.ok_or(last_err)?));
+            }
+            let mut new_map = old_map;
+            new_map.insert(new_key_id.to_string(), new_entry.clone());
+            verified.push(VerifiedClient {
+                client: client.clone(),
+                epoch,
+                new_map,
+                epoch_keys,
+                commitments,
+            });
+        }
+
+        // Lookup key: read_lookup_key verifies the vault manifest, unwraps
+        // with the identity, and checks the commitment — a planted
+        // lookup.age fails closed here, before any mutation.
+        let (lookup_key, lookup_commitments, lookup_seq) =
+            self.read_lookup_key(identity, anchor)?;
+        let (_, vault_map, _) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
+        if vault_map.contains_key(new_key_id) {
+            return Err(Error::Manifest(format!(
+                "recipient {new_key_id:?} is already enrolled for the vault lookup key"
+            )));
+        }
+        let mut new_vault_map = vault_map;
+        new_vault_map.insert(new_key_id.to_string(), new_entry.clone());
+
+        // All checks passed: now mutate.
+        for v in &verified {
+            let wdir = self.wrapped_dir(&v.client);
+            for (e, key) in &v.epoch_keys {
+                let suffix = if *e == v.epoch {
+                    String::new()
+                } else {
+                    format!(".e{e}")
+                };
+                let wrapped = wrap_to_recipient(key.as_bytes(), &new_entry.age_pubkey)?;
+                std::fs::write(wdir.join(format!("{new_key_id}{suffix}.age")), wrapped)?;
+            }
+            // Keys are unchanged by the re-wrap, so commitments carry
+            // forward from the verified buffer.
+            self.write_manifest(&v.client, v.epoch, &v.new_map, &v.commitments, signing_sk)?;
+        }
+        self.write_lookup_raw(
+            lookup_key.as_bytes(),
+            &new_vault_map,
+            &lookup_commitments,
+            lookup_seq,
+            signing_sk,
+        )?;
+
+        Ok(clients)
     }
 
     /// All historical versions of a client's recipient manifest, oldest

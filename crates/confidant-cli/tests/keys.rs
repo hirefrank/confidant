@@ -105,10 +105,16 @@ impl Harness {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = self.cmd_no_vault(args);
+        c.arg("--vault").arg(&self.vault);
+        c
+    }
+
+    /// Command without --vault (for `keys device-add --initiate`, which
+    /// needs no vault).
+    fn cmd_no_vault(&self, args: &[&str]) -> Command {
         let mut c = Command::new(bin());
         c.args(args)
-            .arg("--vault")
-            .arg(&self.vault)
             .env("HOME", &self.home)
             .env("CONFIDANT_TEST_OPERATOR_KEY", &self.operator_hex)
             .env("CONFIDANT_KEYCHAIN", "off");
@@ -509,4 +515,482 @@ fn extract_phrase(stderr: &str) -> String {
         }
     }
     panic!("no 24-word phrase found on stderr:\n{stderr}");
+}
+
+// --- device-add (#66) -----------------------------------------------------
+
+/// Extract the 24-word recovery phrase from `init`'s stderr.
+fn extract_phrase(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|l| l.split_whitespace().count() == 24)
+        .expect("24-word phrase in init stderr")
+        .to_string()
+}
+
+/// Shared setup: h1 (enrolled device) with init + two clients (client-a
+/// rotated to epoch 2), h2 (new device) --initiate, h1 --from-request.
+/// Returns (h1, h2, request_path, new_key_id, init_stderr).
+fn device_add_setup() -> (Harness, Harness, PathBuf, String, String) {
+    let h1 = Harness::new();
+    let init_out = h1.init(&[]);
+    assert!(init_out.status.success(), "init failed");
+    let init_stderr = String::from_utf8_lossy(&init_out.stderr).into_owned();
+
+    for client in ["client-a", "client-b"] {
+        let out = h1
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    // Rotate client-a to epoch 2, leaving retained .e1 wrappings.
+    let out = h1
+        .cmd(&["keys", "rotate", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rotate failed");
+
+    // New device: --initiate (needs no vault). Uses --force because the
+    // test harness sets CONFIDANT_DEVICE_KEY (in production, a new device
+    // has no key yet).
+    let h2 = Harness::new();
+    let req_path = h2.home.join("device-add-request.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            "newdev",
+            "--output",
+            req_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Enrolled device: --from-request with out-of-band fingerprint check.
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "from-request failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("from-request JSON");
+    let key_id = v["key_id"].as_str().expect("key_id in JSON").to_string();
+
+    (h1, h2, req_path, key_id, init_stderr)
+}
+
+#[test]
+fn device_add_then_rotate_new_device_still_enrolled() {
+    // #151 blocker 1: after device-add, rotate must keep the new device
+    // enrolled (not silently drop it). The new device's key_id must be
+    // in the rotated manifest's recipients.
+    let (h1, _h2, _req_path, key_id, _init_stderr) = device_add_setup();
+
+    // Rotate client-a.
+    let out = h1
+        .cmd(&["keys", "rotate", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rotate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The rotated manifest must still include the new device.
+    let manifest = std::fs::read_to_string(h1.vault.join("keys/client-a/recipients.toml")).unwrap();
+    assert!(
+        manifest.contains(&key_id),
+        "new device {key_id} dropped from manifest after rotate:\n{manifest}"
+    );
+    // And the old device (device-0) must also still be there.
+    assert!(
+        manifest.contains("device-0"),
+        "device-0 dropped from manifest after rotate:\n{manifest}"
+    );
+}
+
+#[test]
+fn device_add_initiate_refuses_when_device_key_enrolled() {
+    // #151 blocker 2: --initiate on an already-enrolled device must
+    // refuse (it would overwrite the keychain entry and lock the device
+    // out). --force overrides.
+    let h = Harness::new();
+    // h has CONFIDANT_DEVICE_KEY set (enrolled).
+    let out = h
+        .cmd_no_vault(&["keys", "device-add", "--initiate", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--initiate should refuse when a device key is enrolled"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already enrolled"),
+        "expected 'already enrolled' error, got: {stderr}"
+    );
+
+    // With --force, it succeeds (and overwrites).
+    let out = h
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--initiate --force failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn device_add_initiate_output_contains_pubkey_only() {
+    let h2 = Harness::new();
+    // Bogus vault path: --initiate must neither need nor touch a vault.
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            "laptop2",
+            "--vault",
+            "/nonexistent-vault-path",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // B1: pubkey + label only; scan for private material.
+    assert!(stdout.contains("age1"), "request missing pubkey");
+    assert!(stdout.contains("laptop2"), "request missing label");
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY"),
+        "private key in request stdout"
+    );
+    assert!(!stderr.contains("AGE-SECRET-KEY"), "private key on stderr");
+    assert!(
+        stderr.contains("fingerprint"),
+        "fingerprint not shown on stderr: {stderr}"
+    );
+    // No vault touched.
+    assert!(
+        !h2.vault.join("keys").exists(),
+        "--initiate created a keys/ tree"
+    );
+}
+
+#[test]
+fn device_add_rewraps_all_clients_and_lookup_key_all_epochs() {
+    let (h1, _h2, _req, key_id, _stderr) = device_add_setup();
+
+    // B2: new recipient's wrappings — current epoch + retained epochs.
+    assert!(
+        h1.vault
+            .join(format!("keys/client-a/wrapped/{key_id}.age"))
+            .exists(),
+        "missing client-a epoch-2 wrapping"
+    );
+    assert!(
+        h1.vault
+            .join(format!("keys/client-a/wrapped/{key_id}.e1.age"))
+            .exists(),
+        "missing client-a retained epoch-1 wrapping"
+    );
+    assert!(
+        h1.vault
+            .join(format!("keys/client-b/wrapped/{key_id}.age"))
+            .exists(),
+        "missing client-b wrapping"
+    );
+    // Manifests list the new recipient.
+    for client in ["client-a", "client-b"] {
+        let toml = std::fs::read_to_string(h1.vault.join(format!("keys/{client}/recipients.toml")))
+            .unwrap();
+        assert!(
+            toml.contains(&key_id),
+            "{client} manifest missing new recipient"
+        );
+    }
+    // One commit for the device-add.
+    let out = std::process::Command::new("git")
+        .current_dir(&h1.vault)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    let msg = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        msg.contains("device-add"),
+        "last commit is not the device-add: {msg}"
+    );
+}
+
+#[test]
+fn lookup_key_handoff_never_recovery_wrapped() {
+    let (h1, h2, _req, _key_id, init_stderr) = device_add_setup();
+
+    use confidant_crypt::{anchor, lifecycle::KeyStore, recovery::Recovery};
+    let config_dir = h1.home.join(".config/confidant");
+    let (anchor, _) = anchor::load(&config_dir, &h1.vault).unwrap();
+    let mut store = KeyStore::with_config_dir(
+        h1.vault.join("keys"),
+        "01TEST00000000000000000000",
+        &config_dir,
+    )
+    .unwrap();
+
+    // B3: the new device unwraps the lookup key — handed off, not
+    // regenerated: the old device unwraps the identical bytes.
+    let new_identity: age::x25519::Identity = h2.device_bech32.trim().parse().unwrap();
+    let (new_lookup, _, _) = store
+        .read_lookup_key(&new_identity, &anchor)
+        .expect("new device cannot unwrap lookup key");
+    let old_identity: age::x25519::Identity = h1.device_bech32.trim().parse().unwrap();
+    let (old_lookup, _, _) = store.read_lookup_key(&old_identity, &anchor).unwrap();
+    assert_eq!(
+        new_lookup.as_bytes(),
+        old_lookup.as_bytes(),
+        "lookup key changed on device-add; it must be handed off"
+    );
+
+    // #142 invariant: the recovery identity unwraps client keys but NEVER
+    // the lookup key.
+    let phrase = extract_phrase(&init_stderr);
+    let recovery = Recovery::from_phrase(&phrase).unwrap();
+    let rec_identity = recovery.age_identity().to_age_identity().unwrap();
+    assert!(
+        store.read_lookup_key(&rec_identity, &anchor).is_err(),
+        "recovery identity unwrapped the lookup key"
+    );
+    assert!(
+        store
+            .unwrap_data_key("client-a", "recovery", 1, &rec_identity, &anchor)
+            .is_ok(),
+        "recovery cannot unwrap client data key"
+    );
+}
+
+#[test]
+fn device_add_requires_fingerprint_confirmation() {
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let h2 = Harness::new();
+    let req_path = h2.home.join("request.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--output",
+            req_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // B2 gate: --no-input without --fingerprint-verified refuses (exit 2).
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 without fingerprint verification"
+    );
+    // Nothing mutated: the keys/ tree is untouched.
+    let git_out = std::process::Command::new("git")
+        .current_dir(&h1.vault)
+        .args(["status", "--porcelain", "--", "keys"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&git_out.stdout).trim().is_empty(),
+        "keys/ tree mutated by refused device-add"
+    );
+}
+
+#[test]
+fn second_device_decrypts_after_add() {
+    let (h1, h2, _req, key_id, _stderr) = device_add_setup();
+
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    let config_dir = h1.home.join(".config/confidant");
+    let (anchor, _) = anchor::load(&config_dir, &h1.vault).unwrap();
+    let mut store = KeyStore::with_config_dir(
+        h1.vault.join("keys"),
+        "01TEST00000000000000000000",
+        &config_dir,
+    )
+    .unwrap();
+
+    let new_identity: age::x25519::Identity = h2.device_bech32.trim().parse().unwrap();
+    let old_identity: age::x25519::Identity = h1.device_bech32.trim().parse().unwrap();
+    // Old device's key id: device-0 (the init-enrolled device, per the
+    // one key-id scheme).
+    let old_key_id = "device-0".to_string();
+
+    // B3: new device unwraps every client's every epoch; old device still can.
+    for (client, epochs) in [("client-a", vec![1u64, 2u64]), ("client-b", vec![1u64])] {
+        for e in epochs {
+            assert!(
+                store
+                    .unwrap_data_key(client, &key_id, e, &new_identity, &anchor)
+                    .is_ok(),
+                "new device cannot unwrap {client} epoch {e}"
+            );
+            assert!(
+                store
+                    .unwrap_data_key(client, &old_key_id, e, &old_identity, &anchor)
+                    .is_ok(),
+                "old device lost access to {client} epoch {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn device_add_then_revoke_removes_new_device_wrappings() {
+    let (h1, _h2, _req, key_id, _stderr) = device_add_setup();
+
+    // B4: revocation is the existing `keys revoke` — no new code.
+    let out = h1
+        .cmd(&[
+            "keys",
+            "revoke",
+            "client-a",
+            &key_id,
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "revoke failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Wrappings gone across all epochs.
+    let wrapped_dir = h1.vault.join("keys/client-a/wrapped");
+    let entries: Vec<String> = std::fs::read_dir(&wrapped_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !entries.iter().any(|n| n.starts_with(&key_id)),
+        "revoked device wrappings remain: {entries:?}"
+    );
+    let toml = std::fs::read_to_string(h1.vault.join("keys/client-a/recipients.toml")).unwrap();
+    assert!(
+        !toml.contains(&key_id),
+        "manifest still lists the revoked device"
+    );
+}
+
+#[test]
+fn device_add_json_no_secrets() {
+    // B5: --json on both steps carries opaque fields only.
+    let h2 = Harness::new();
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            "x",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY"),
+        "secret in --initiate JSON"
+    );
+    assert!(stdout.contains("fingerprint"), "JSON missing fingerprint");
+
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let req_path = h2.home.join("r.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--output",
+            req_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("AGE-SECRET-KEY"),
+        "secret in --from-request JSON"
+    );
+    assert!(!stderr.contains("AGE-SECRET-KEY"), "secret on stderr");
 }

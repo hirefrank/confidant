@@ -358,6 +358,25 @@ pub fn device_identity() -> Result<age::x25519::Identity, Error> {
     parse_identity(&device_key()?, "device key")
 }
 
+/// Short fingerprint of an age recipient pubkey (`age1…`): the first 16
+/// hex chars of SHA-256 over the bech32 pubkey string. Used by
+/// `keys device-add` so the operator can verify the new device's key out
+/// of band before approving the request (design §7). Both sides compute it
+/// over the same bech32 string carried in the request, so they always agree.
+pub fn pubkey_fingerprint(age_pubkey: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(age_pubkey.as_bytes());
+    // 128 bits (32 hex chars), in groups of 4 for readability.
+    // Out-of-band verification against a chosen-key attacker needs at
+    // least 128 bits (Silas #151 nit).
+    let hex = crate::hex::encode(&digest[..16]);
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Parse [`inbox_key`] into an age identity for decryption. This is the
 /// decrypt entry point used by the inbox clear path.
 ///
