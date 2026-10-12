@@ -85,6 +85,8 @@ tokens. Near-ULID bare runs are not IDs.
 - Name-only prose.
 - `check`'s location field still shows the paths of invalid files.
 
+Milestone 3 `context` continues to honour `no-ai`.
+
 ## Error handling
 
 If any ledger file cannot be read, `find` exits non-zero with
