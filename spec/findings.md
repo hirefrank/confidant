@@ -44,6 +44,8 @@ demote, or turn a rule `off` where the table says "configurable".
 | `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
+| `E_KEY_COMMITMENT` | error | | A reader refused to use a key epoch because the verified key manifest carries no commitment for it. Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
+| `E_ENVELOPE` | error | | An encrypted record envelope is structurally invalid keylessly: duplicate header keys, unknown header keys, a missing required header, an `enc` other than `xchacha20poly1305`, a nonce that is not 24 bytes, bad base64, or a `key_id` that is not `<client_id>/e<epoch>` (shape only). Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
 
 `confidant find` uses the same codes and the section 12 allowlist: only
 cleared records and ledger lines are searchable. A note, interaction, or
