@@ -91,6 +91,18 @@ fn parse_recovery_recipients(text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Strict variant for the write path: an existing file that does not parse
+/// is an error (never silently overwritten), so append-only really holds.
+fn parse_recovery_recipients_strict(text: &str) -> Result<Vec<String>, Error> {
+    #[derive(serde::Deserialize)]
+    struct RecoveryRecipients {
+        recipients: Vec<String>,
+    }
+    toml::from_str::<RecoveryRecipients>(text)
+        .map(|f| f.recipients)
+        .map_err(|e| Error::Manifest(format!("{RECOVERY_HISTORY_FILE} is not valid TOML: {e}")))
+}
+
 /// Manages the `keys/` tree of one vault.
 #[derive(Debug)]
 pub struct KeyStore {
@@ -896,6 +908,7 @@ impl KeyStore {
                 "-C",
                 &repo.to_string_lossy(),
                 "log",
+                "--full-history",
                 "--format=%H",
                 "--end-of-options",
                 "--",
@@ -919,7 +932,7 @@ impl KeyStore {
                     "-C",
                     &repo.to_string_lossy(),
                     "show",
-                    &format!("{sha}:{rel}"),
+                    &format!("{sha}:./{rel}"),
                 ])
                 .output()
                 .map_err(Error::Io)?;
@@ -952,8 +965,14 @@ impl KeyStore {
                 "-C",
                 &repo.to_string_lossy(),
                 "log",
+                "--full-history",
                 "--diff-filter=D",
                 "--name-only",
+                // Paths are repo-root-relative by default; make them
+                // cwd-relative (the vault) so a vault inside a larger repo
+                // still parses. Without this the `keys/` strip below never
+                // matches and the shredded set silently comes back empty.
+                "--relative",
                 "--format=",
                 "--end-of-options",
                 "--",
@@ -1064,6 +1083,7 @@ impl KeyStore {
                 "-C",
                 &repo.to_string_lossy(),
                 "log",
+                "--full-history",
                 "--format=%H",
                 "--end-of-options",
                 "--",
@@ -1086,7 +1106,7 @@ impl KeyStore {
                     "-C",
                     &repo.to_string_lossy(),
                     "show",
-                    &format!("{sha}:{rel}"),
+                    &format!("{sha}:./{rel}"),
                 ])
                 .output();
             if let Ok(show) = show {
@@ -1100,6 +1120,64 @@ impl KeyStore {
         out
     }
 
+    /// Why the history-derived shred checks cannot be trusted on this vault,
+    /// or `None` when git history is fully usable.
+    ///
+    /// [`ever_seen_pubkeys`](Self::ever_seen_pubkeys) unions the working
+    /// tree with git history (`shredded_clients`,
+    /// [`historical_recipients`](Self::historical_recipients), and the
+    /// `recovery-recipients.toml` union). When `git` is missing, the vault
+    /// is not a repo, the clone is shallow, or `git log` fails, those reads
+    /// silently see only the working tree — the checks **fail open**. This
+    /// lets callers surface that at runtime: `keys device-add --from-request`
+    /// refuses (the denylist is load-bearing there), and `keys shred`,
+    /// `recover`, and `doctor` warn.
+    pub fn history_degraded_reason(&self) -> Option<String> {
+        let repo = self.keys_dir.parent()?;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                // Never leak the device key into git/gpg/hooks via the environment.
+                .env_remove("CONFIDANT_DEVICE_KEY")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+        };
+        let shallow = match git(&["rev-parse", "--is-shallow-repository"]) {
+            Err(_) => {
+                return Some(
+                    "git is unavailable, so the shredded-client, historical-recipient, and \
+                     retired-recovery-recipient checks cannot see history"
+                        .to_string(),
+                )
+            }
+            Ok(o) if !o.status.success() => {
+                return Some(
+                    "this vault is not a readable git repository, so the shredded-client, \
+                     historical-recipient, and retired-recovery-recipient checks cannot see \
+                     history"
+                        .to_string(),
+                )
+            }
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "true",
+        };
+        if shallow {
+            return Some(
+                "this is a shallow git clone, so the shredded-client, historical-recipient, \
+                 and retired-recovery-recipient checks can only see the working tree"
+                    .to_string(),
+            );
+        }
+        match git(&["log", "-1", "--format=%H"]) {
+            Ok(o) if o.status.success() => None,
+            _ => Some(
+                "git history is unreadable (git log failed), so the shredded-client, \
+                 historical-recipient, and retired-recovery-recipient checks cannot see history"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Append recovery age recipients to `keys/recovery-recipients.toml`
     /// (deduped, insertion order), creating the file when absent. Called on
     /// every recovery rotation with both the retired and the new recipient,
@@ -1107,9 +1185,14 @@ impl KeyStore {
     /// rebuild does not depend on the anchor to supply it).
     fn record_recovery_recipients(&self, recipients: &[&str]) -> Result<(), Error> {
         let path = self.keys_dir.join(RECOVERY_HISTORY_FILE);
-        let mut list: Vec<String> = std::fs::read_to_string(&path)
-            .map(|t| parse_recovery_recipients(&t))
-            .unwrap_or_default();
+        // Fail closed on an existing-but-unparseable file: silently
+        // rewriting it would drop entries the file is documented to keep
+        // forever.
+        let mut list = match std::fs::read_to_string(&path) {
+            Ok(text) => parse_recovery_recipients_strict(&text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(Error::Io(e)),
+        };
         for r in recipients {
             if !list.iter().any(|existing| existing == r) {
                 list.push((*r).to_string());
@@ -1126,7 +1209,11 @@ impl KeyStore {
             body.push_str(&format!("  {r:?},\n"));
         }
         body.push_str("]\n");
-        std::fs::write(&path, body)?;
+        // Temp file + rename in the same directory: a crash mid-write never
+        // leaves a truncated denylist (mirrors the anchor's atomic write).
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -1281,6 +1368,14 @@ impl KeyStore {
         let new_recovery = Recovery::generate();
         let new_recovery_recipient = new_recovery.age_identity().to_recipient_string();
 
+        // Record the retired and the new recovery recipient (#153 nit 7)
+        // BEFORE any mutation: a failure here leaves keys/ untouched, whereas
+        // a failure after the re-wrap would strand a half-shredded tree.
+        self.record_recovery_recipients(&[
+            anchor.recovery_age.as_str(),
+            new_recovery_recipient.as_str(),
+        ])?;
+
         // 1. Delete the shredded client's key tree.
         let cdir = self.manifest_dir(shredded_client);
         if cdir.exists() {
@@ -1314,13 +1409,6 @@ impl KeyStore {
             lookup_seq,
             operator_sk,
         )?;
-
-        // Record the retired and the new recovery recipient (#153 nit 7) so
-        // neither can ever be re-enrolled as a device.
-        self.record_recovery_recipients(&[
-            anchor.recovery_age.as_str(),
-            new_recovery_recipient.as_str(),
-        ])?;
 
         Ok(ShredOutcome {
             new_recovery,

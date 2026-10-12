@@ -617,13 +617,14 @@ writes.
   whole vault — ADR-15).
 - **A history-derived shred check failing open.** `shredded_clients`,
   `historical_recipients`, and the `keys/recovery-recipients.toml` union
-  consult git history. When `git` is unavailable, the clone is shallow,
-  or the vault sits inside a larger repository (so `keys/` paths and the
-  repo root do not line up), they see only the working tree. A recipient
-  whose only record is in history — a revoked key, a shredded client's
-  old device, a retired recovery recipient — would then not be refused.
-  Run the vault as its own full-history repository for these checks to
-  hold.
+  consult git history. When `git` is unavailable, `git log` fails, or the
+  clone is shallow, they see only the working tree. A recipient whose only
+  record is in history — a revoked key, a shredded client's old device, a
+  retired recovery recipient — would then not be refused. `keys device-add
+  --from-request` refuses outright in that state (the denylist is
+  load-bearing there); `keys shred`, `recover`, and `doctor` warn. Run the
+  vault as a full-history repository. (A vault inside a larger repo is
+  fine: the readers resolve paths relative to the vault.)
 
 ## 12. Test plan
 
@@ -987,8 +988,24 @@ Closes the non-blocking follow-ups on #153 plus the `recover` anchor file
   config dir until it does.
 - **Threat-model note (#153 nit 3).** §11 states that the history-derived
   shred checks (`shredded_clients`, `historical_recipients`, the recovery
-  history union) fail open when `git` is unavailable, history is shallow,
-  or the vault is inside a larger repo.
+  history union) fail open when `git` is unavailable, `git log` fails, or
+  the clone is shallow. `keys device-add --from-request` now **fails
+  closed** in that state; `keys shred`, `recover`, and `doctor` warn (JSON
+  `warnings[]` + stderr, and a `shred-history` doctor check). Paths are
+  read relative to the vault (`--relative`, `rev:./<path>`) and with
+  `--full-history`, so a vault inside a larger repo or a side-branch merge
+  no longer silently hides history.
+- **`--anchor-file` hardening.** The phrase must match the anchor's
+  **X25519 recovery recipient** too, not just its Ed25519 key; and when
+  `keys/operator.toml` exists it is verified against the phrase and its
+  operator key must match the file's. Only a vault with no certificate
+  accepts the file's operator key — so a tampered anchor backup can never
+  get the recovery key to certify an attacker's operator key. Refusals are
+  `E_INVALID`.
+- **Retired recovery recipients are written before any shred mutation**,
+  and an existing-but-unparseable `recovery-recipients.toml` fails closed
+  rather than being silently overwritten; the file is written via
+  temp-and-rename.
 - **Deferred:** a real-`keys shred` path through the shredded-only-pubkey
   test (#153 nit 2) needs scoped recipients (#138); tracked separately.
 

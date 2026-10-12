@@ -546,14 +546,17 @@ fn recover_with_anchor_file_mismatched_phrase_fails_closed() {
 #[test]
 fn recover_with_anchor_file_inside_vault_refused() {
     // #152: an anchor path inside the vault is refused (nothing in the
-    // vault may point at or override the anchor).
+    // vault may point at or override the anchor). The planted file is
+    // committed so recover reaches load_from's check rather than stopping
+    // at the dirty-tree guard.
     let h = Harness::new();
     let out = h.init(&[]);
     assert!(out.status.success());
     let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
-    // A copy of the anchor planted INSIDE the vault.
     let planted = h.vault.join("planted-anchor.toml");
     std::fs::copy(h.trust_toml(), &planted).unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "plant an anchor in the vault"]);
 
     let phrase_file = h.home.join("phrase");
     std::fs::write(&phrase_file, &phrase).unwrap();
@@ -572,6 +575,182 @@ fn recover_with_anchor_file_inside_vault_refused() {
         !out.status.success(),
         "an anchor inside the vault must be refused"
     );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("inside the vault"),
+        "expected the inside-the-vault refusal, got: {msg}"
+    );
+    assert_eq!(
+        v["error"]["code"], "E_INVALID",
+        "the refusal must be E_INVALID, not an internal error"
+    );
+}
+
+/// Read `[trust].recovery_age_recipient` from a harness's trust.toml.
+fn trust_recovery_age(home: &Path) -> String {
+    let text = std::fs::read_to_string(home.join(".config/confidant/trust.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    doc["trust"]["recovery_age_recipient"]
+        .as_str()
+        .expect("recovery_age_recipient in trust.toml")
+        .to_string()
+}
+
+#[test]
+fn recover_with_anchor_file_mismatched_recovery_age_fails_closed() {
+    // #154 must-fix 1: the phrase must also match the anchor's X25519
+    // recovery recipient, not only the Ed25519 key. Otherwise a tampered
+    // anchor records a forged recipient as retired and misses the real one.
+    let h = Harness::new();
+    let init_out = h.init(&[]);
+    assert!(init_out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&init_out.stderr));
+
+    // A different vault's recovery recipient.
+    let h2 = Harness::new();
+    assert!(h2.init(&[]).status.success());
+    let other_age = trust_recovery_age(&h2.home);
+
+    let original = std::fs::read_to_string(h.trust_toml()).unwrap();
+    let forged = original
+        .lines()
+        .map(|l| {
+            if l.starts_with("recovery_age_recipient") {
+                format!("recovery_age_recipient = \"{other_age}\"")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let forged_path = h.home.join("forged-anchor.toml");
+    std::fs::write(&forged_path, forged).unwrap();
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&forged_path)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "mismatched recovery recipient must fail closed"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("recovery recipient"), "got: {msg}");
+    // The config dir was not re-pinned.
+    assert_eq!(
+        std::fs::read_to_string(h.trust_toml()).unwrap(),
+        original,
+        "config dir written before the anchor was verified"
+    );
+}
+
+#[test]
+fn recover_with_anchor_file_mismatched_operator_fails_closed() {
+    // #154 must-fix 3: when the vault has a verifiable operator certificate,
+    // the supplied anchor's operator key must match it.
+    let h = Harness::new();
+    let init_out = h.init(&[]);
+    assert!(init_out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&init_out.stderr));
+
+    let other = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+    let other_hex = hex::encode(other.verifying_key().to_bytes());
+    let original = std::fs::read_to_string(h.trust_toml()).unwrap();
+    let forged = original
+        .lines()
+        .map(|l| {
+            if l.starts_with("operator_pubkey") {
+                format!("operator_pubkey = \"{other_hex}\"")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let forged_path = h.home.join("forged-operator.toml");
+    std::fs::write(&forged_path, forged).unwrap();
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&forged_path)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an anchor whose operator key disagrees with the certificate must be refused"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("operator"), "got: {msg}");
+    assert_eq!(
+        std::fs::read_to_string(h.trust_toml()).unwrap(),
+        original,
+        "config dir written before the anchor was verified"
+    );
+}
+
+#[test]
+fn recover_with_anchor_file_present_but_unverifiable_cert_fails_closed() {
+    // #154 must-fix 3: a present operator certificate that does not verify
+    // against the phrase must refuse the supplied anchor, never fall back to
+    // trusting the file.
+    let h = Harness::new();
+    let init_out = h.init(&[]);
+    assert!(init_out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&init_out.stderr));
+
+    // Corrupt the certificate signature and commit it.
+    std::fs::write(h.vault.join("keys/operator.sig"), [0u8; 64]).unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "tamper operator cert"]);
+
+    // The supplied anchor is the real one (correct operator).
+    let anchor_backup = h.home.join("anchor-backup.toml");
+    std::fs::copy(h.trust_toml(), &anchor_backup).unwrap();
+    let original = std::fs::read_to_string(h.trust_toml()).unwrap();
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&anchor_backup)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an unverifiable operator certificate must refuse the supplied anchor"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("does not verify"), "got: {msg}");
+    assert_eq!(std::fs::read_to_string(h.trust_toml()).unwrap(), original);
 }
 
 #[test]

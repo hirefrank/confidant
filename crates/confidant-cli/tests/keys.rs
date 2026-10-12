@@ -767,6 +767,11 @@ fn device_add_refuses_retired_recovery_recipient() {
         !out.status.success(),
         "erasing the history file must not re-allow the retired recovery recipient"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already been a recipient"),
+        "expected the historical-pubkey refusal after erasing, got: {stderr}"
+    );
 }
 
 #[test]
@@ -831,6 +836,109 @@ fn device_add_check_failure_points_at_recovery() {
     assert!(
         stderr.contains("git -C") && stderr.contains("checkout -- keys/"),
         "expected the keys/ recovery fix text, got: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_warns_on_shallow_clone() {
+    // #154 must-fix 4: a shallow clone silently weakens the
+    // history-derived checks; doctor must surface it.
+    let h = Harness::new();
+    assert!(h.init(&[]).status.success());
+    let clone = h.home.join("shallow");
+    let st = std::process::Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1"])
+        .arg(format!("file://{}", h.vault.display()))
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(st.success(), "shallow clone failed");
+    assert!(clone.join(".git/shallow").is_file(), "clone is not shallow");
+
+    let out = h
+        .cmd_no_vault(&[
+            "doctor",
+            "--json",
+            "--no-input",
+            "--vault",
+            clone.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "shred-history" && c["status"] == "warning"),
+        "expected a shred-history warning on a shallow clone: {v}"
+    );
+}
+
+#[test]
+fn device_add_fails_closed_on_shallow_clone() {
+    // #154 must-fix 4: the retired-recipient denylist is load-bearing for
+    // device-add, so a shallow clone (history invisible) must fail closed.
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "initiate failed");
+
+    let clone = h1.home.join("shallow");
+    let st = std::process::Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1"])
+        .arg(format!("file://{}", h1.vault.display()))
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(st.success(), "shallow clone failed");
+
+    let out = h1
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+            "--vault",
+            clone.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "device-add must fail closed on a shallow clone"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("shallow"),
+        "expected a shallow-clone refusal, got: {msg}"
     );
 }
 

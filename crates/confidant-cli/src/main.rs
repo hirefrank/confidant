@@ -1633,6 +1633,16 @@ fn cmd_doctor(
                                         ),
                                     });
                                 }
+                                // #154 must-fix 4: surface degraded git history,
+                                // which makes the shredded-client / retired-recovery
+                                // checks fail open.
+                                if let Some(reason) = store.history_degraded_reason() {
+                                    checks.push(DoctorCheck {
+                                        id: "shred-history",
+                                        status: "warning",
+                                        message: reason,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2104,11 +2114,50 @@ fn cmd_recover(
                 "recovery phrase does not match this vault's trust anchor",
             )));
         }
+        // The X25519 recovery recipient is a separate HKDF branch of the
+        // phrase; it must match too, or a tampered anchor file could get a
+        // forged recipient recorded in the denylist and the real retired
+        // recipient missed (#154 must-fix 1).
+        if a.recovery_age != old_recovery.age_identity().to_recipient_string() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+            )));
+        }
         Ok(())
     };
     let anchor = if let Some(path) = anchor_file {
-        let a = anchor::load_from(path, root).map_err(anyhow::Error::new)?;
+        let a = anchor::load_from(path, root).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "--anchor-file {} rejected: {e}",
+                path.display()
+            )))
+        })?;
         check_recovery(&a)?;
+        // #154 must-fix 3: the supplied operator key may only be accepted
+        // when the vault has no operator certificate (the pre-cert case the
+        // backup exists for). When a cert is present it must verify against
+        // the phrase-derived recovery key and name the same operator — so a
+        // tampered anchor backup can never get the recovery key to certify
+        // an attacker's operator key.
+        if keys_dir.join(anchor::OPERATOR_CERT_FILE).exists() {
+            let cert_operator = anchor::verify_operator_cert(
+                &keys_dir,
+                &vault.config.vault_id,
+                &old_recovery.verifying_key(),
+            )
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "operator certificate present but does not verify against the phrase; \
+                     refusing the supplied --anchor-file: {e}"
+                )))
+            })?;
+            if cert_operator != a.operator {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "--anchor-file's operator key does not match this vault's operator \
+                     certificate; refusing",
+                )));
+            }
+        }
         a
     } else {
         match anchor::load(&config_dir, root) {
@@ -2280,6 +2329,15 @@ fn cmd_recover(
 
     // The new phrase was already displayed (once, on stderr) before the
     // anchor swap above — it is not repeated here.
+    //
+    // #154 must-fix 4: warn — do not fail — when git history is degraded, so
+    // the operator knows the shredded-client / retired-recovery checks only
+    // saw the working tree.
+    let history_warning = store.history_degraded_reason();
+    let warnings: Vec<String> = history_warning.iter().cloned().collect();
+    if let Some(w) = &history_warning {
+        eprintln!("warning: {w}");
+    }
     if json {
         print_json(&ok_envelope(
             Some(root),
@@ -2288,6 +2346,7 @@ fn cmd_recover(
                 "keys_dir": keys_dir.display().to_string(),
                 "commit": commit,
                 "clients_recovered": clients,
+                "warnings": warnings,
                 "note": "only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery)",
             }),
         ))?;
@@ -3209,6 +3268,15 @@ fn cmd_keys_device_add_from_request(
     let keys_dir = root.join("keys");
     let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
         .map_err(anyhow::Error::new)?;
+    // #154 must-fix 4: the retired-recovery / shredded-client denylist is
+    // load-bearing here, so fail closed rather than warn when history is
+    // unreadable (shallow clone, missing git, git log failure).
+    if let Some(reason) = store.history_degraded_reason() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "refusing device-add: {reason}; the retired-recipient denylist would be \
+             incomplete and could re-open a shredded client"
+        ))));
+    }
     let entry = RecipientEntry {
         age_pubkey: request.pubkey.clone(),
         label: label.clone(),
@@ -3491,6 +3559,15 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         write_pending_inbox_rotation(&vault.config.vault_id, client_id)?;
     }
 
+    // #154 must-fix 4: warn (do not fail) when git history is degraded, so
+    // the operator knows the shredded-client / retired-recovery checks only
+    // saw the working tree.
+    let mut shred_warnings = outcome.warnings.clone();
+    if let Some(w) = store.history_degraded_reason() {
+        eprintln!("warning: {w}");
+        shred_warnings.push(w);
+    }
+
     if cli.json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -3498,7 +3575,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "vault": root.to_string_lossy(),
             "client_id": client_id,
             "destroy_key_ids": outcome.destroy_key_ids,
-            "warnings": outcome.warnings,
+            "warnings": shred_warnings,
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
             "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
