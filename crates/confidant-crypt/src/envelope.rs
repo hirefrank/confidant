@@ -67,6 +67,12 @@ fn parse_key_id(key_id: &str) -> Result<(String, u64), Error> {
     let (client, epoch) = key_id
         .rsplit_once("/e")
         .ok_or_else(|| Error::Envelope(format!("bad key_id: {key_id}")))?;
+    // Second validation layer (issue #133): the client half of a `key_id`
+    // must be a safe client id before any caller can route it into a
+    // `keys/<client_id>/` path. `KeyStore` validates again at its boundary
+    // (the choke point); this catches a hostile envelope early, at parse,
+    // so a writer that trusts the parsed envelope never sees a traversal id.
+    crate::manifest::validate_client_id(client)?;
     let epoch: u64 = epoch
         .parse()
         .map_err(|_| Error::Envelope(format!("bad key_id epoch: {key_id}")))?;
