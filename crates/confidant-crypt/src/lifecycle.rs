@@ -77,6 +77,11 @@ fn is_retained_epoch_file(name: &str) -> bool {
 /// re-enrolled as a device recipient (which would undo the shred).
 const RECOVERY_HISTORY_FILE: &str = "recovery-recipients.toml";
 
+/// Temp-file name prefix for the atomic write of [`RECOVERY_HISTORY_FILE`].
+/// Matches the vault's `.confidant-tmp-` leftover convention so the CLI can
+/// sweep a crash leftover before staging `keys/` (#156 nit 1).
+pub const RECOVERY_HISTORY_TMP_PREFIX: &str = ".confidant-tmp-recovery-recipients-";
+
 /// Parsed `keys/recovery-recipients.toml`. A missing or unparseable file is
 /// treated as empty: the file is only ever a denylist, so a version we
 /// cannot read contributes nothing (and the anchor's current recipient is
@@ -1211,9 +1216,21 @@ impl KeyStore {
         body.push_str("]\n");
         // Temp file + rename in the same directory: a crash mid-write never
         // leaves a truncated denylist (mirrors the anchor's atomic write).
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
+        // Named with the vault's `.confidant-tmp-` leftover prefix so the
+        // CLI's pre-staging sweep recognizes it (#156 nit 1); removed here on
+        // any write/rename error.
+        let tmp = self.keys_dir.join(format!(
+            "{RECOVERY_HISTORY_TMP_PREFIX}{}",
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, &body) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
+        }
         Ok(())
     }
 

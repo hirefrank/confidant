@@ -55,9 +55,15 @@ impl Harness {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
+        self.cmd_at(args, &self.vault)
+    }
+
+    /// Like [`cmd`], but against an explicit vault path (e.g. a shallow
+    /// clone) instead of this harness's own vault.
+    fn cmd_at(&self, args: &[&str], vault: &Path) -> Command {
         let mut c = Command::new(bin());
         c.args(args);
-        c.arg("--vault").arg(&self.vault);
+        c.arg("--vault").arg(vault);
         c.env("HOME", &self.home);
         c.env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
         // The keychain must never be consulted: the env var is the store.
@@ -751,6 +757,54 @@ fn recover_with_anchor_file_present_but_unverifiable_cert_fails_closed() {
     let msg = v["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("does not verify"), "got: {msg}");
     assert_eq!(std::fs::read_to_string(h.trust_toml()).unwrap(), original);
+}
+
+#[test]
+fn recover_warns_on_shallow_clone() {
+    // #156 nit 2: recover must warn (not fail) when git history is
+    // degraded, since the retired-recovery / shredded-client checks then
+    // only see the working tree.
+    let source = Harness::new();
+    let source_out = source.init(&[]);
+    assert!(source_out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&source_out.stderr));
+
+    let fresh = Harness::new();
+    let clone = fresh.home.join("shallow");
+    let st = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1"])
+        .arg(format!("file://{}", source.vault.display()))
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(st.success(), "shallow clone failed");
+
+    let phrase_file = fresh.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = fresh
+        .cmd_at(&["recover", "--no-input", "--json"], &clone)
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recover on a shallow clone should succeed with a warning: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("shallow")),
+        "expected a shallow-history warning: {v}"
+    );
 }
 
 #[test]

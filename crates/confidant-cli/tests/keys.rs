@@ -942,6 +942,102 @@ fn device_add_fails_closed_on_shallow_clone() {
     );
 }
 
+#[test]
+fn keys_shred_warns_on_shallow_clone() {
+    // #156 nit 2: shred must warn (not fail) when git history is degraded.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    assert!(h.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    let clone = h.home.join("shallow");
+    let st = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1"])
+        .arg(format!("file://{}", h.vault.display()))
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(st.success(), "shallow clone failed");
+
+    let out = h
+        .cmd_no_vault(&[
+            "keys",
+            "shred",
+            "client-a",
+            "--json",
+            "--no-input",
+            "--vault",
+            clone.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred on a shallow clone should succeed with a warning: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("shallow")),
+        "expected a shallow-history warning: {v}"
+    );
+}
+
+#[test]
+fn keys_shred_sweeps_stale_temp_files() {
+    // #156 nit 1: a leftover `.confidant-tmp-*` from a crashed atomic write
+    // must not survive into a `keys/` commit.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    assert!(h.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    let stale = h
+        .vault
+        .join("keys/.confidant-tmp-recovery-recipients-99999");
+    std::fs::write(&stale, "recipients = []\n").unwrap();
+
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stale.exists(),
+        "stale temp was not swept before staging keys/"
+    );
+
+    let tracked = std::process::Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-files", "--", "keys"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&tracked.stdout).contains(".confidant-tmp-"),
+        "a stale temp file was committed"
+    );
+}
+
 // --- device-add (#66) -----------------------------------------------------
 
 /// Extract the 24-word recovery phrase from `init`'s stderr.
