@@ -1230,6 +1230,108 @@ fn device_add_from_request_refuses_previously_seen_pubkey() {
 }
 
 #[test]
+fn device_add_from_request_refuses_shredded_only_pubkey() {
+    // Silas's gap (#151): the historical-pubkey refusal consulted only
+    // live manifest clients (and the lookup map). A pubkey present ONLY in
+    // a shredded client's git history was not refused — re-adding it
+    // re-wraps the lookup key to a key that still opens the shredded
+    // client's wrappings in git history, silently undoing the shred.
+    // (Realistic source: a device enrolled via `recover` — its pubkey
+    // enters client manifests, but the lookup key is re-initialized fresh
+    // so it never enters lookup history.)
+    let mut h1 = Harness::new();
+    h1.with_test_keychain();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    // B generates a request but is NEVER enrolled: its pubkey appears in
+    // no live manifest and no lookup history.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req_path = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req_toml = std::fs::read_to_string(&req_path).unwrap();
+    let pubkey = req_toml
+        .lines()
+        .find_map(|l| l.strip_prefix("pubkey = "))
+        .expect("pubkey line in request")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    assert!(pubkey.starts_with("age1"), "bad pubkey in request");
+
+    // Simulate a shredded client whose history contains B's pubkey: write
+    // a recipients.toml, commit it, then delete the tree and commit.
+    // (historical_recipients parses the TOML from git history without
+    // verifying signatures — same as shred's destroy-list derivation.)
+    let rogue = h1.vault.join("keys/rogue");
+    std::fs::create_dir_all(&rogue).unwrap();
+    std::fs::write(
+        rogue.join("recipients.toml"),
+        format!(
+            "seq = 1\n\n[recipients.device-0]\nage_pubkey = \"{pubkey}\"\nlabel = \"rogue-device\"\nscope_ref = \"\"\n"
+        ),
+    )
+    .unwrap();
+    git(&h1.vault, &["add", "-A"]);
+    git(&h1.vault, &["commit", "-qm", "rogue client"]);
+    std::fs::remove_dir_all(&rogue).unwrap();
+    git(&h1.vault, &["add", "-A"]);
+    git(&h1.vault, &["commit", "-qm", "shred rogue client"]);
+
+    let before = snapshot_keys(&h1.vault);
+
+    // from-request with B's request: must be refused — the pubkey is in
+    // the shredded client's history and nowhere else.
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "request with shredded-history pubkey must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already been a recipient"),
+        "expected historical-pubkey refusal, got: {stderr}"
+    );
+
+    // ...and keys/ must be byte-identical.
+    let after = snapshot_keys(&h1.vault);
+    assert_eq!(before, after, "refused --from-request mutated keys/");
+}
+
+#[test]
 fn device_add_shred_then_reenroll() {
     // Item 4 (#151): the main multi-device path after a shred — shred on
     // A, B re-enrolls with --initiate --force (fresh keypair), A runs

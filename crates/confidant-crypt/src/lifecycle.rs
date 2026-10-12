@@ -910,8 +910,61 @@ impl KeyStore {
         Ok(maps)
     }
 
+    /// Client ids whose `keys/<dir>/recipients.toml` was deleted in git
+    /// history — i.e. shredded clients. Their tree is gone, so
+    /// [`manifest_clients`](Self::manifest_clients) no longer lists them,
+    /// but their wrappings still exist in git history. Fails open to an
+    /// empty list when git is unavailable (mirroring
+    /// [`historical_recipients`](Self::historical_recipients)): without git
+    /// there is no shredded history to consult.
+    fn shredded_clients(&self) -> Vec<String> {
+        let repo = match self.keys_dir.parent() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let out = std::process::Command::new("git")
+            // Never leak the device key into git/gpg/hooks via the environment.
+            .env_remove("CONFIDANT_DEVICE_KEY")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "log",
+                "--diff-filter=D",
+                "--name-only",
+                "--format=",
+                "--end-of-options",
+                "--",
+                "keys/",
+            ])
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // Only exact `keys/<dir>/recipients.toml` paths: the shredded
+            // client's manifest. Anything else deleted under keys/ is not
+            // a client tree.
+            let rest = match line.trim().strip_prefix("keys/") {
+                Some(r) => r,
+                None => continue,
+            };
+            let (dir, file) = match rest.split_once('/') {
+                Some((d, f)) if !d.is_empty() && !d.contains('/') => (d, f),
+                _ => continue,
+            };
+            if file != "recipients.toml" {
+                continue;
+            }
+            ids.insert(Self::client_id_for_dir(dir).to_string());
+        }
+        ids.into_iter().collect()
+    }
+
     /// Every age pubkey that has ever been a recipient: the current and
-    /// historical manifests of each listed client, plus the recovery
+    /// historical manifests of each listed client, the historical manifests
+    /// of shredded (deleted-tree) clients, plus the recovery
     /// recipient. Shared by `shred` (step 2: no new recipient may reuse
     /// one, or the shredded history stays openable) and `add_recipient`
     /// (a re-sent device-add request after a shred must not silently undo
@@ -919,16 +972,27 @@ impl KeyStore {
     /// client's history). Callers choose the client list: `shred` passes
     /// its strand-checked `all_clients`; `add_recipient` passes every
     /// manifest client, including the vault lookup map — and compares
-    /// pubkeys, not just key ids.
+    /// pubkeys, not just key ids. Shredded clients are always included,
+    /// since their trees are gone from `manifest_clients` but their
+    /// wrappings persist in git history.
     fn ever_seen_pubkeys(
         &mut self,
         clients: &[&str],
         anchor: &Anchor,
     ) -> Result<std::collections::BTreeSet<String>, Error> {
         let mut seen = std::collections::BTreeSet::new();
-        for client in clients {
+        // Shredded clients' trees are deleted, so callers never list them;
+        // their historical pubkeys still forbid reuse.
+        let shredded = self.shredded_clients();
+        let shredded_refs: Vec<&str> = shredded.iter().map(|s| s.as_str()).collect();
+        for client in clients.iter().chain(shredded_refs.iter()) {
             for map in self.historical_recipients(client)? {
                 seen.extend(map.values().map(|e| e.age_pubkey.clone()));
+            }
+            // A shredded client's tree is gone, so there is no current
+            // manifest to verify; its history is what matters.
+            if shredded_refs.contains(client) {
+                continue;
             }
             let (_, map, _) = self.verified_recipients(client, anchor)?;
             seen.extend(map.values().map(|e| e.age_pubkey.clone()));
