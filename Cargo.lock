@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "age",
  "anyhow",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "age",
  "anyhow",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-crypt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "age",
  "base64 0.22.1",

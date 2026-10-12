@@ -8,6 +8,12 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-12
+
+Patch: `confidant doctor` staleness checks, agent-setup docs, and the
+changelog itself. First release published through crates.io trusted
+publishing (no API token).
+
 ### Added
 - `confidant doctor` staleness checks: warning-only `cli-staleness` and
   `skills-staleness` against the latest GitHub Release, with a
