@@ -97,8 +97,10 @@ pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
     // A repeated header key is ambiguous (first-value vs last-value readers
     // disagree); reject it rather than silently taking the last one.
     let mut seen = std::collections::HashSet::new();
+    let mut closed = false;
     for line in &mut lines {
         if line == "---" {
+            closed = true;
             break;
         }
         let (k, v) = line
@@ -125,6 +127,14 @@ pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
             }
             other => return Err(Error::Envelope(format!("unknown header field: {other}"))),
         }
+    }
+    // A header block that never closes is a distinct failure: without this
+    // the first missing field ("missing id") was reported instead, which
+    // points at the wrong thing (issue #136 item 7).
+    if !closed {
+        return Err(Error::Envelope(
+            "unterminated header: missing closing ---".to_string(),
+        ));
     }
     let id = id.ok_or_else(|| Error::Envelope("missing id".to_string()))?;
     let record_type = record_type.ok_or_else(|| Error::Envelope("missing type".to_string()))?;
@@ -263,6 +273,55 @@ mod tests {
         match parse(bytes) {
             Err(Error::Envelope(m)) if m.contains("duplicate header field") => {}
             other => panic!("expected duplicate-header Envelope error, got: {other:?}"),
+        }
+    }
+
+    // #136 item 7: the error branches below had no test coverage.
+
+    #[test]
+    fn rejects_unterminated_header() {
+        // No closing `---`: report the layout problem, not "missing id".
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("unterminated header") => {}
+            other => panic!("expected unterminated-header error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_nonce_length() {
+        // 16 bytes, not 24.
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("nonce must be 24 bytes") => {}
+            other => panic!("expected nonce-length error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_body() {
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\n\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("missing ciphertext body") => {}
+            other => panic!("expected empty-body error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_key_id_epoch() {
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: p-01ABC/eNOTANUMBER\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("bad key_id epoch") => {}
+            other => panic!("expected bad-epoch error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_enc() {
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: aes-gcm\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("unsupported enc") => {}
+            other => panic!("expected unsupported-enc error, got: {other:?}"),
         }
     }
 }

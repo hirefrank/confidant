@@ -21,6 +21,7 @@ pub mod alias;
 pub mod anchor;
 pub mod envelope;
 pub mod error;
+pub mod hex;
 pub mod history;
 pub mod keychain;
 pub mod keys;
@@ -189,20 +190,20 @@ pub fn encrypt_record(
         }
     }
     let key_id = format!("{}/e{}", ctx.client_id, ctx.epoch);
-    let aad = aead::build_aad(
-        &ctx.vault_id,
-        &ctx.ulid,
-        &ctx.client_id,
-        &ctx.path,
-        &ctx.purpose,
-        ctx.epoch,
-        &ctx.ulid,
-        record_type,
+    let aad = aead::build_aad(&aead::AadHeader {
+        vault_id: &ctx.vault_id,
+        ulid: &ctx.ulid,
+        client_id: &ctx.client_id,
+        path: &ctx.path,
+        purpose: &ctx.purpose,
+        epoch: ctx.epoch,
+        header_id: &ctx.ulid,
+        header_type: record_type,
         no_ai,
-        aead::ALG,
-        &key_id,
-    );
-    let (nonce, ciphertext) = aead::encrypt(key.as_bytes(), &aad, plaintext);
+        enc: aead::ALG,
+        key_id: &key_id,
+    });
+    let (nonce, ciphertext) = aead::encrypt(key.as_bytes(), &aad, plaintext)?;
     let env = envelope::Envelope {
         id: ctx.ulid.clone(),
         record_type: record_type.to_string(),
@@ -235,19 +236,19 @@ pub fn decrypt_record(
             "no-ai: refusing to decrypt for agent output".to_string(),
         ));
     }
-    let aad = aead::build_aad(
-        &ctx.vault_id,
-        &ctx.ulid,
-        &ctx.client_id,
-        &ctx.path,
-        &ctx.purpose,
-        ctx.epoch,
-        &env.id,
-        &env.record_type,
-        env.no_ai,
-        &env.enc,
-        &env.key_id,
-    );
+    let aad = aead::build_aad(&aead::AadHeader {
+        vault_id: &ctx.vault_id,
+        ulid: &ctx.ulid,
+        client_id: &ctx.client_id,
+        path: &ctx.path,
+        purpose: &ctx.purpose,
+        epoch: ctx.epoch,
+        header_id: &env.id,
+        header_type: &env.record_type,
+        no_ai: env.no_ai,
+        enc: &env.enc,
+        key_id: &env.key_id,
+    });
     aead::decrypt(key.as_bytes(), &env.nonce, &aad, &env.ciphertext)
 }
 

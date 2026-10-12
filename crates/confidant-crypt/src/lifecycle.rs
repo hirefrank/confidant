@@ -281,6 +281,23 @@ impl KeyStore {
         client_id: &str,
         anchor: &Anchor,
     ) -> Result<(u64, RecipientMap, Vec<CommitmentEntry>), Error> {
+        let (_seq, epoch, map, commitments) = self.verified_manifest(client_id, anchor)?;
+        Ok((epoch, map, commitments))
+    }
+
+    /// Verify a client's manifest and return everything parsed from the one
+    /// verified buffer: `(seq, epoch, recipients, commitments)`.
+    ///
+    /// [`verified_recipients`](Self::verified_recipients) drops the seq;
+    /// this form exists for callers that must re-write the same manifest
+    /// (the vault lookup key during `shred`) and so must take the seq from
+    /// the verified bytes rather than re-reading the file — the file can
+    /// change between the verify and the second read (#136 item 1).
+    fn verified_manifest(
+        &mut self,
+        client_id: &str,
+        anchor: &Anchor,
+    ) -> Result<(u64, u64, RecipientMap, Vec<CommitmentEntry>), Error> {
         manifest::validate_client_id(client_id)?;
         let epoch = self.current_epoch(client_id)?;
         let (toml_path, sig_path) = self.manifest_paths(client_id);
@@ -315,7 +332,7 @@ impl KeyStore {
         // the file.
         let (seq, _, commitments) = manifest::from_toml(&toml)?;
         self.advance_seq(client_id, seq)?;
-        Ok((epoch, map, commitments))
+        Ok((seq, epoch, map, commitments))
     }
 
     /// Initialize a client's key directory: epoch 1, wrap the new data key
@@ -808,7 +825,8 @@ impl KeyStore {
         // keys get the same check inside unwrap_data_key in step 1.)
         // The commitments come from the same verified buffer, so there is
         // no second manifest read.
-        let (lookup_key, lookup_commitments) = self.read_lookup_key(identity, anchor)?;
+        let (lookup_key, lookup_commitments, lookup_seq) =
+            self.read_lookup_key(identity, anchor)?;
 
         // All checks passed: now mutate.
         let new_recovery = Recovery::generate();
@@ -844,6 +862,7 @@ impl KeyStore {
             lookup_key.as_bytes(),
             new_recipients,
             &lookup_commitments,
+            lookup_seq,
             operator_sk,
         )?;
 
@@ -864,13 +883,15 @@ impl KeyStore {
     }
 
     /// Write raw lookup key bytes re-wrapped to new recipients (for shred).
-    /// Commitments come from the caller, which verified the vault manifest
-    /// (see [`KeyStore::verified_recipients`]).
+    /// `commitments` and `verified_seq` come from the caller, which verified
+    /// the vault manifest (see [`KeyStore::verified_manifest`]); the seq is
+    /// never re-read from disk.
     fn write_lookup_raw(
         &mut self,
         raw: &[u8],
         new_recipients: &RecipientMap,
         commitments: &[CommitmentEntry],
+        verified_seq: u64,
         operator_sk: &SigningKey,
     ) -> Result<(), Error> {
         let vdir = self.keys_dir.join("vault");
@@ -896,18 +917,11 @@ impl KeyStore {
             w.finish().map_err(|e| Error::Age(format!("finish: {e}")))?;
         }
         std::fs::write(vdir.join("lookup.age"), out)?;
-        let seq = std::fs::read(vdir.join("recipients.toml"))
-            .ok()
-            .and_then(|b| manifest::from_toml(&b).ok())
-            .map(|(s, _, _)| s)
-            .unwrap_or(0)
-            .max(
-                self.seq
-                    .as_ref()
-                    .map(|t| t.high_water(&self.vault_id, VAULT_CLIENT_ID))
-                    .unwrap_or(0),
-            )
-            + 1;
+        // The seq comes from the manifest buffer the caller already
+        // verified (plus the off-vault high-water mark) — never a re-read
+        // of the on-disk file, which could have changed since verification
+        // (#136 item 1).
+        let seq = verified_seq.max(self.high_water(VAULT_CLIENT_ID)) + 1;
         let toml = manifest::to_toml(seq, new_recipients, commitments)?;
         let sig = manifest::sign(operator_sk, &self.vault_id, VAULT_CLIENT_ID, 1, seq, &toml);
         std::fs::write(vdir.join("recipients.toml"), toml)?;
@@ -978,16 +992,17 @@ impl KeyStore {
     /// Mismatch — or a missing commitment — is a hard error; no key is
     /// returned.
     ///
-    /// Returns the key plus the commitments from the verified buffer, so
-    /// callers don't re-verify the manifest a second time.
+    /// Returns the key, the commitments from the verified buffer, and the
+    /// verified manifest seq (so a caller that re-writes the manifest —
+    /// `shred` — never re-reads `recipients.toml`).
     pub fn read_lookup_key(
         &mut self,
         identity: &dyn age::Identity,
         anchor: &Anchor,
-    ) -> Result<(LookupKey, Vec<CommitmentEntry>), Error> {
+    ) -> Result<(LookupKey, Vec<CommitmentEntry>, u64), Error> {
         // Verify the vault manifest before touching the wrapping, and take
         // the commitments from the verified buffer — never re-read.
-        let (_, _, commitments) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
+        let (seq, _, _, commitments) = self.verified_manifest(VAULT_CLIENT_ID, anchor)?;
         let raw = self.read_lookup_raw(identity)?;
         if raw.len() != 32 {
             return Err(Error::Age("lookup key is not 32 bytes".to_string()));
@@ -1011,7 +1026,7 @@ impl KeyStore {
                     .to_string(),
             ));
         }
-        Ok((LookupKey::from_bytes(*arr), commitments))
+        Ok((LookupKey::from_bytes(*arr), commitments, seq))
     }
 }
 

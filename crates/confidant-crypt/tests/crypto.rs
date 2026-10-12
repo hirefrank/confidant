@@ -190,7 +190,7 @@ fn test2_nonce_uniqueness() {
     let aad = b"test-aad";
     let mut nonces = HashSet::new();
     for _ in 0..1000 {
-        let (nonce, _) = aead::encrypt(&key, aad, b"x");
+        let (nonce, _) = aead::encrypt(&key, aad, b"x").unwrap();
         assert!(nonces.insert(nonce), "nonce repeated!");
     }
     assert_eq!(nonces.len(), 1000);
@@ -1195,15 +1195,48 @@ fn device_keypair_recipient_unwraps() {
 
 #[test]
 fn legacy_file_api_round_trip() {
-    // Device key via env var (Bech32 identity).
+    // Device key via env var (Bech32 identity). RAII guard: restores the
+    // previous value on drop, so a panic between set and restore cannot
+    // leak the var into later tests (#136 item 4; poison-tolerant lock).
     let id = age::x25519::Identity::generate();
-    std::env::set_var("CONFIDANT_DEVICE_KEY", id.to_string().expose_secret());
+    let guard = DeviceEnvGuard::set(id.to_string().expose_secret());
     let ct = confidant_crypt::encrypt_file(b"file bytes").unwrap();
     let pt = confidant_crypt::decrypt_file(&ct).unwrap();
     assert_eq!(&*pt, b"file bytes");
-    std::env::remove_var("CONFIDANT_DEVICE_KEY");
     // Without a key -> fail closed.
+    drop(guard);
     assert!(confidant_crypt::decrypt_file(&ct).is_err());
+}
+
+/// Serializes `CONFIDANT_DEVICE_KEY` access in this test binary and
+/// restores the previous value on drop (#136 item 4). The lock is
+/// poison-tolerant: a panicking test must not wedge every later test.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct DeviceEnvGuard {
+    previous: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl DeviceEnvGuard {
+    fn set(bech32: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("CONFIDANT_DEVICE_KEY").ok();
+        std::env::set_var("CONFIDANT_DEVICE_KEY", bech32);
+        DeviceEnvGuard {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for DeviceEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(v) => std::env::set_var("CONFIDANT_DEVICE_KEY", v),
+            None => std::env::remove_var("CONFIDANT_DEVICE_KEY"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,7 +2014,7 @@ fn recovery_drill_rebuilds_alias_index_with_fresh_lookup_key() {
         .unwrap();
 
     // Alias index built with the original device-wrapped lookup key.
-    let (old_key, _) = f.keys.read_lookup_key(&f.device_id, &f.anchor).unwrap();
+    let (old_key, _, _) = f.keys.read_lookup_key(&f.device_id, &f.anchor).unwrap();
     let old_hmac = alias::alias_hmac(&old_key, "Ada Example");
     assert!(alias::matches(&old_key, "Ada Example", &old_hmac));
 

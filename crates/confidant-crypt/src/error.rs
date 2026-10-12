@@ -12,6 +12,14 @@ pub enum Error {
     #[error("authentication failed: wrong key or tampered data")]
     Auth,
 
+    /// The AEAD rejected an encryption request that passed our own checks
+    /// (only possible for an input larger than XChaCha20-Poly1305's
+    /// 2^32-byte message limit). Fails closed instead of panicking:
+    /// AGENTS.md treats a panic on a library path as a bug, not a
+    /// fail-closed outcome (#136 item 5).
+    #[error("encryption failed: {0}")]
+    Encrypt(String),
+
     /// Envelope could not be parsed.
     #[error("invalid envelope: {0}")]
     Envelope(String),
