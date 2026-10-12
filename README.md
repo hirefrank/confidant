@@ -50,8 +50,8 @@ Requires a recent Rust toolchain (MSRV 1.85, see `rust-version` in `Cargo.toml`)
 ## Privacy (read this)
 
 Plaintext belongs only on trusted devices (your laptop, or an agent computer
-acting for you). On a keyed vault the write path encrypts record content (see
-Status above). Vaults that opt out with `[crypto] mode = "plaintext"` stay
+acting for you). A git remote must not hold client notes in plaintext. On a
+keyed vault the write path encrypts record content (see Status above). Vaults that opt out with `[crypto] mode = "plaintext"` stay
 plaintext in git — do not put real clients in those.
 
 When an agent reads notes, that content is sent to a hosted model provider.
