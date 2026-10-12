@@ -22,8 +22,8 @@
 #     generated `pull_request:` trigger was removed).
 #  2. The `attest` job (build-provenance attestations, ADR-14).
 #  3. The `publish-crates-io` job (ADR-14; trusted publishing via OIDC, no
-#     stored token; skips prereleases; publishes confidant-core then
-#     confidant-cli).
+#     stored token; skips prereleases; publishes confidant-crypt, then
+#     confidant-core, then confidant-cli).
 #  4. Action pins (2026-10-08, Silas review): every `uses:` is pinned to a
 #     full commit SHA with a `# vX` comment, matching ci.yml. If you
 #     regenerate, re-apply the pins — regeneration emits mutable tags, and
