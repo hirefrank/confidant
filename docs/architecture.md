@@ -425,6 +425,8 @@ Frank sends each client a form before and after every session. The answers shoul
 4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred clients (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks (FileVault on the laptop, and the agent's computer), and its index stays out of git and is never synced anywhere.
 5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with client data.
 
+   Changed 2026-10-12 by Frank: the crates.io release is **not** treated as the invitation. Publishing (needed for `cargo install confidant-cli` to resolve its dependencies) goes ahead with an explicit disclosure that the crypto is unaudited and the CLI write path still produces plaintext; a disclosure that withholds the invitation satisfies this item as written. The outside review and code audit are still required before any surface invites trust with client data, and remain tracked in issue #138. If the audit finds a defect, the fix ships as a new version; published versions are yanked, not deleted.
+
 ## Appendix A. Moving off Lightfield (Frank's context)
 
 - **No deadline.** Frank has already cancelled the renewal and hasn't opened Lightfield in a long time. Agents replaced how he used it. Its only valuable feature was meeting transcription, which isn't unique to it.

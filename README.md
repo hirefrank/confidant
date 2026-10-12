@@ -6,18 +6,38 @@ them. There is no server.
 
 Milestone 1 is the format spec, parser, generic records, derived values,
 balance assertions, `confidant check`, the coaching schema pack, and a fake
-demo vault. Encryption ships in milestone 2, after an independent crypto
-design review. Do not put real client data in a vault until then.
+demo vault. Milestone 2 implements the encryption primitives — per-client
+data keys, the signed recipient manifest, the encrypted record envelope, and
+recovery. The CLI does not encrypt vault content on write yet.
 
 The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 `CONFIDANT_VAULT` (or pass `--vault`) so they never write the wrong tree.
+
+## Status: two things are not ready for other people's data
+
+**1. The encryption has had no outside review.** The design was reviewed
+in-project and the implementation's tests pass, but no independent reviewer
+has audited it. Tracked in
+[#138](https://github.com/hirefrank/confidant/issues/138).
+
+**2. The CLI still writes plaintext.** The encryption library exists and is
+published, but the write path (`note add`, `log session`, `import`, …) does
+not encrypt records yet — `confidant doctor` reports this as a `crypto`
+warning. Until it does, a vault is plaintext in git, exactly as in
+milestone 1.
+
+So, today: **keep vaults on trusted devices with encrypted disks, and do not
+put other people's client data in them.** `confidant check`, the privacy
+allowlist, and `no-ai` all work, but they are not a substitute for at-rest
+encryption. This section will say plainly when the writes encrypt and when
+the audit lands; until then it is the disclosure.
 
 ## Privacy (read this)
 
 Plaintext belongs only on trusted devices (your laptop, or an agent computer
 acting for you). A git remote must not hold client notes once encryption
-exists; until milestone 2, treat the remote as if it were plaintext and do
-not put real clients in it.
+exists; until the write path encrypts (see Status above), treat the remote
+as if it were plaintext and do not put real clients in it.
 
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores

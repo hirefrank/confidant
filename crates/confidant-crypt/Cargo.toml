@@ -6,11 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Encryption for Confidant vaults (milestone 2: age + XChaCha20-Poly1305 per docs/crypto-design.md)."
-# publish=false until the §9b item 5 gate clears: outside design review +
-# code audit before inviting anyone else to trust Confidant. Publishing
-# can't be undone, only yanked.
-publish = false
+description = "Encryption for Confidant vaults (milestone 2: age + XChaCha20-Poly1305 per docs/crypto-design.md). Not yet independently audited — see the repository README."
+# Publishable since 2026-10-12: the crates.io release is how `cargo install
+# confidant-cli` resolves its dependencies, and publishing is disclosed as
+# unaudited (README Status + this crate's README + the description above).
+# The outside audit is still required before the project invites anyone to
+# trust it with client data (docs/architecture.md §9b item 5); tracked in
+# issue #138. Note the CLI write path still produces plaintext — do not
+# treat the presence of this crate on crates.io as "encryption is ready".
 
 [dependencies]
 age.workspace = true
