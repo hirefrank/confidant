@@ -2017,3 +2017,106 @@ fn recovery_drill_rebuilds_alias_index_with_fresh_lookup_key() {
     assert_ne!(old_hmac, new_hmac);
     assert!(!alias::matches(&fresh, "Ada Example", &old_hmac));
 }
+// #133: client id validation at the KeyStore boundary (+ envelope parse)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn keystore_rejects_unsafe_client_ids() {
+    let mut f = Fixture::new();
+    let bad = [
+        "../escape",
+        "p-01ABC/../evil",
+        "/etc/passwd",
+        "vault",
+        "shared",
+        "recovery",
+        "vault:other",
+        ".hidden",
+    ];
+
+    // Every entry point that joins the id under keys/ refuses before any
+    // filesystem work; none creates anything outside keys/.
+    for id in bad {
+        assert!(f.keys.current_epoch(id).is_err(), "current_epoch({id:?})");
+        assert!(
+            f.keys
+                .init_client(id, &RecipientMap::new(), &f.anchor, &f.operator_sk)
+                .is_err(),
+            "init_client({id:?})"
+        );
+        assert!(
+            f.keys.verified_recipients(id, &f.anchor).is_err(),
+            "verified_recipients({id:?})"
+        );
+        assert!(
+            f.keys.rotate(id, &f.anchor, &f.operator_sk).is_err(),
+            "rotate({id:?})"
+        );
+        assert!(
+            f.keys
+                .revoke(id, &["laptop"], &f.operator_sk, &f.anchor)
+                .is_err(),
+            "revoke({id:?})"
+        );
+        assert!(
+            f.keys
+                .unwrap_data_key(id, "laptop", 1, &f.device_id, &f.anchor)
+                .is_err(),
+            "unwrap_data_key({id:?})"
+        );
+        // A hostile id never even gets a manifest dir created.
+        assert!(!f.keys.manifest_clients().iter().any(|c| c == id), "{id:?}");
+    }
+
+    // The reserved ids stay usable as client ids (routing to keys/vault and
+    // keys/shared), so validation did not overreach.
+    assert!(f.keys.current_epoch("vault:lookup").is_ok());
+}
+
+#[test]
+fn shred_rejects_unsafe_client_ids() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient.clone())]);
+    f.keys
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    let new_recipients = f.recipients(&[(
+        "phone",
+        &age::x25519::Identity::generate().to_public().to_string(),
+    )]);
+
+    // A traversal id is refused before the verify pass (no mutation).
+    assert!(f
+        .keys
+        .shred(
+            "../evil",
+            &["p-01ABC"],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id
+        )
+        .is_err());
+    // A bad id in all_clients is refused too.
+    assert!(f
+        .keys
+        .shred(
+            "p-01ABC",
+            &["../evil"],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id
+        )
+        .is_err());
+    // The client's key tree is untouched.
+    assert!(f._tmp.path().join("keys").join("p-01ABC").exists());
+}
+
+#[test]
+fn envelope_rejects_unsafe_client_in_key_id() {
+    // A hostile key_id client half fails at parse, before any caller can
+    // route it into keys/<client_id>/.
+    let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: ../../evil/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+    assert!(confidant_crypt::envelope::parse(bytes).is_err());
+}

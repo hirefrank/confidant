@@ -87,6 +87,70 @@ pub fn validate_key_id(key_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validate a client id before it routes to a filesystem path.
+///
+/// Client ids end up as directory names under `keys/`
+/// (`keys/<client_id>/`), so a client id must be exactly one path
+/// component: no `/` or `\` (path traversal), no `..`, no leading `.` (a
+/// hidden dir that `manifest_clients` would report but readers skip), and
+/// no `:` outside the reserved ids — the `vault:` namespace is reserved
+/// ([`VAULT_CLIENT_ID`] / [`SHARED_CLIENT_ID`] are the only colon-bearing
+/// client ids) so a caller cannot invent a third vault-level client.
+/// The bare names `vault` and `shared` are rejected too: they would alias
+/// the reserved manifest dirs (`keys/vault/`, `keys/shared/`) and silently
+/// clobber the lookup/shared manifests. `recovery` is a recipient key id
+/// ([`RECOVERY_KEY_ID`]), never a client id; keeping the two id kinds
+/// distinct stops an id-kind mix-up from reaching the path join.
+///
+/// Beyond path safety the charset is `[A-Za-z0-9-]`: person ids are
+/// `p-` + Crockford base32 (parsed case-insensitively), and the KeyStore
+/// boundary does not re-implement the vault's ULID shape rules (spec §3,
+/// the CLI's job) — it guarantees only that the id is a safe, unambiguous
+/// directory name.
+pub(crate) fn validate_client_id(client_id: &str) -> Result<(), Error> {
+    if client_id.is_empty() {
+        return Err(Error::Manifest("empty client id".to_string()));
+    }
+    if client_id == RECOVERY_KEY_ID {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} is the reserved recovery key id, not a client id"
+        )));
+    }
+    // The two reserved vault-level ids are the only valid clients here.
+    if client_id == VAULT_CLIENT_ID || client_id == SHARED_CLIENT_ID {
+        return Ok(());
+    }
+    if client_id == "vault" || client_id == "shared" {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} aliases a reserved manifest dir (keys/vault or keys/shared)"
+        )));
+    }
+    if client_id.contains(':') {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} uses the reserved \"vault:\" namespace"
+        )));
+    }
+    if client_id.contains('/') || client_id.contains('\\') || client_id.contains("..") {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} contains a path separator"
+        )));
+    }
+    if client_id.starts_with('.') {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} starts with '.'"
+        )));
+    }
+    if !client_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(Error::Manifest(format!(
+            "client id {client_id:?} must match [A-Za-z0-9-]+ outside the reserved vault: ids"
+        )));
+    }
+    Ok(())
+}
+
 /// Key commitment: binds a data key to its (vault, client, epoch) so a
 /// planted `.age` wrapping can't substitute an attacker-known key.
 ///
@@ -523,5 +587,45 @@ mod tests {
         assert!(format!("{err}").contains("non-ASCII"), "{err}");
         // Sanity: valid hex still decodes.
         assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    #[test]
+    fn validate_client_id_accepts_person_and_reserved_ids() {
+        for ok in [
+            "p-01ABC",
+            "p-01M3TC5H00MPJG000000000000",
+            "vault:lookup",
+            "vault:shared",
+        ] {
+            assert!(validate_client_id(ok).is_ok(), "{ok:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_client_id_rejects_traversal_and_namespace_abuse() {
+        // Path traversal / absolute / hidden / separators.
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "p-01ABC/../evil",
+            "/etc/passwd",
+            "p-01ABC/notes",
+            "p-01ABC\\evil",
+            ".hidden",
+            "recovery",             // a recipient key id, not a client id
+            "vault",                // aliases keys/vault/
+            "shared",               // aliases keys/shared/
+            "vault:something-else", // reserved namespace, unclaimed id
+            "Vault:lookup",         // case variant of a reserved id
+            "p 01ABC",              // charset
+            "p_01ABC",              // charset
+            "p-01ABC\u{200b}",      // zero-width space
+        ] {
+            assert!(
+                validate_client_id(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }

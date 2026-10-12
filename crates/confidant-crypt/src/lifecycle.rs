@@ -143,6 +143,7 @@ impl KeyStore {
 
     /// Current epoch for a client (reads the `epoch` file).
     pub fn current_epoch(&self, client_id: &str) -> Result<u64, Error> {
+        manifest::validate_client_id(client_id)?;
         let text = std::fs::read_to_string(self.manifest_dir(client_id).join("epoch"))
             .map_err(|_| Error::NoKey(format!("no keys for client {client_id}")))?;
         text.trim()
@@ -164,8 +165,14 @@ impl KeyStore {
     /// [`KeyStore::verified_recipients`] and fails closed there. A
     /// signature failure is not "corrupt" for this purpose — the file is
     /// well-formed but untrusted, which is a different problem with a
-    /// different error.
+    /// different error. An invalid client id also lands here: crypto
+    /// operations on it fail closed (the [`KeyStore`] boundary refuses
+    /// it), which is exactly what `doctor` should report as needing
+    /// attention.
     pub fn manifest_state(&self, client_id: &str) -> ManifestState {
+        if let Err(e) = manifest::validate_client_id(client_id) {
+            return ManifestState::Corrupt(format!("invalid client id: {e}"));
+        }
         let (toml_path, _) = self.manifest_paths(client_id);
         let bytes = match std::fs::read(&toml_path) {
             Ok(b) => b,
@@ -274,6 +281,7 @@ impl KeyStore {
         client_id: &str,
         anchor: &Anchor,
     ) -> Result<(u64, RecipientMap, Vec<CommitmentEntry>), Error> {
+        manifest::validate_client_id(client_id)?;
         let epoch = self.current_epoch(client_id)?;
         let (toml_path, sig_path) = self.manifest_paths(client_id);
         let toml = std::fs::read(&toml_path)
@@ -325,6 +333,7 @@ impl KeyStore {
         anchor: &Anchor,
         operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
+        manifest::validate_client_id(client_id)?;
         let dir = self.manifest_dir(client_id);
         if dir.join("epoch").exists() {
             return Err(Error::Manifest(format!(
@@ -452,6 +461,7 @@ impl KeyStore {
         identity: &dyn age::Identity,
         anchor: &Anchor,
     ) -> Result<DataKey, Error> {
+        manifest::validate_client_id(client_id)?;
         let (current_epoch, recipients, commitments) =
             self.verified_recipients(client_id, anchor)?;
         if !recipients.contains_key(key_id) && key_id != RECOVERY_KEY_ID {
@@ -512,6 +522,7 @@ impl KeyStore {
         anchor: &Anchor,
         operator_sk: &SigningKey,
     ) -> Result<DataKey, Error> {
+        manifest::validate_client_id(client_id)?;
         let (epoch, recipients, mut commitments) = self.verified_recipients(client_id, anchor)?;
         let new_epoch = epoch + 1;
         // Rename current wrappings to the old epoch.
@@ -545,8 +556,10 @@ impl KeyStore {
         operator_sk: &SigningKey,
         anchor: &Anchor,
     ) -> Result<(), Error> {
-        // Validate key ids BEFORE touching the manifest or wrappings:
-        // "recovery" is reserved and can never be revoked.
+        // Validate the client id and the key ids BEFORE touching the
+        // manifest or wrappings: the client id must be safe to join under
+        // `keys/`, and "recovery" is reserved and can never be revoked.
+        manifest::validate_client_id(client_id)?;
         for id in revoked_key_ids {
             manifest::validate_key_id(id)?;
         }
@@ -680,6 +693,13 @@ impl KeyStore {
         anchor: &Anchor,
         identity: &dyn age::Identity,
     ) -> Result<ShredOutcome, Error> {
+        // Validate every id this call will join under `keys/` before doing
+        // anything: the shredded client, and each remaining client (the
+        // strand check and re-wrap both build paths from them).
+        manifest::validate_client_id(shredded_client)?;
+        for client in all_clients {
+            manifest::validate_client_id(client)?;
+        }
         // The reserved vault-level ids are not shreddable: shredding
         // vault:lookup would destroy the alias key and leave the vault
         // half-mutated, and shredding vault:shared would destroy every org
@@ -916,6 +936,12 @@ impl KeyStore {
         anchor: &Anchor,
         old_identity: &dyn age::Identity,
     ) -> Result<Recovery, Error> {
+        // Validate every id before mutating: the loop below re-wraps as it
+        // goes, so a bad id discovered mid-loop would leave the vault
+        // half-rotated.
+        for client in clients {
+            manifest::validate_client_id(client)?;
+        }
         let new_recovery = Recovery::generate();
         let new_recipient = new_recovery.age_identity().to_recipient_string();
         for client in clients {
