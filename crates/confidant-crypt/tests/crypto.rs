@@ -599,6 +599,66 @@ fn test_revoke_replay_refused() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn shred_records_recovery_recipients_and_forbids_their_reuse() {
+    // #153 nit 7: a recovery rotation records the retired and new recovery
+    // age recipients, and a retired one can never be re-enrolled as a
+    // device (which would undo the shred).
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client("p-AAAA", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    f.keys
+        .init_client("p-BBBB", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+    let old_recovery = f.anchor.recovery_age.clone();
+
+    let dev_new = DeviceKeypair::generate();
+    let new_recipients = f.recipients(&[("laptop-new", &dev_new.recipient())]);
+    let outcome = f
+        .keys
+        .shred(
+            "p-AAAA",
+            &["p-AAAA", "p-BBBB"],
+            &new_recipients,
+            &f.operator_sk,
+            &f.anchor,
+            &f.device_id,
+        )
+        .unwrap();
+    let new_recovery = outcome.new_recovery().age_identity().to_recipient_string();
+
+    // Both the retired and the new recovery recipient are recorded.
+    let hist = std::fs::read_to_string(f._tmp.path().join("keys/recovery-recipients.toml"))
+        .expect("recovery-recipients.toml written by the rotation");
+    assert!(
+        hist.contains(&old_recovery),
+        "retired not recorded:\n{hist}"
+    );
+    assert!(hist.contains(&new_recovery), "new not recorded:\n{hist}");
+
+    // A device-add reusing the retired recovery recipient is refused.
+    let new_id = age::x25519::Identity::from_str(&{
+        use confidant_crypt::age_wrap::RawX25519Identity;
+        RawX25519Identity::new(*dev_new.secret_bytes()).to_bech32()
+    })
+    .unwrap();
+    let entry = RecipientEntry {
+        age_pubkey: old_recovery,
+        label: "rogue".to_string(),
+        scope_ref: String::new(),
+    };
+    let err = f
+        .keys
+        .add_recipient("device-rogue", &entry, &new_id, &f.anchor, &f.operator_sk)
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("already been a recipient"),
+        "{err}"
+    );
+}
+
+#[test]
 fn test_shred_destroy_list_covers_history() {
     // A recipient revoked BEFORE the shred still has old wrappings in git
     // history. The destroy list must include it.

@@ -179,6 +179,12 @@ enum Command {
         /// File containing the 24-word recovery phrase (alternative to stdin).
         #[arg(long)]
         phrase_file: Option<PathBuf>,
+        /// Explicit trust-anchor file to load (outside the vault) instead of
+        /// `~/.config/confidant/trust.toml` or the `keys/`-tree rebuild. The
+        /// phrase must still match the anchor's recovery key. Validated
+        /// before anything is written to the config dir.
+        #[arg(long, value_name = "FILE")]
+        anchor_file: Option<PathBuf>,
     },
     /// Manage per-client encryption keys (init-client, rotate, revoke, shred).
     Keys {
@@ -612,9 +618,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             cmd_init(&cli, &root, *force)
         }
-        Command::Recover { phrase_file } => {
+        Command::Recover {
+            phrase_file,
+            anchor_file,
+        } => {
             let root = vault_root.unwrap();
-            cmd_recover(&cli, &root, phrase_file.as_deref())
+            cmd_recover(&cli, &root, phrase_file.as_deref(), anchor_file.as_deref())
         }
         Command::Keys { action } => {
             match action {
@@ -1045,9 +1054,10 @@ fn cmd_inbox_rotate(
     let user_config_path = home.join(".config/confidant/config.toml");
     let vault_config_path = root.join("confidant.toml");
 
+    let backend = keychain_backend();
     let outcome = match run_inbox_rotate(
         root,
-        &confidant_crypt::keychain::OsKeychain,
+        &*backend,
         None,
         &vault_config_path,
         &user_config_path,
@@ -1623,6 +1633,16 @@ fn cmd_doctor(
                                         ),
                                     });
                                 }
+                                // #154 must-fix 4: surface degraded git history,
+                                // which makes the shredded-client / retired-recovery
+                                // checks fail open.
+                                if let Some(reason) = store.history_degraded_reason() {
+                                    checks.push(DoctorCheck {
+                                        id: "shred-history",
+                                        status: "warning",
+                                        message: reason,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1992,7 +2012,12 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Result<ExitCode> {
+fn cmd_recover(
+    cli: &Cli,
+    root: &Path,
+    phrase_file: Option<&Path>,
+    anchor_file: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{
         anchor, keychain,
         lifecycle::KeyStore,
@@ -2070,34 +2095,91 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
 
-    // Load the trust anchor. On a fresh device (no trust.toml, no config
-    // backup), rebuild it from the vault's keys/ tree: the operator
-    // certificate (written at init, signed by the recovery key) is
-    // verified against the phrase-derived recovery pubkey. This is the
-    // lost-device path — the phrase alone re-establishes trust.
-    let anchor = match anchor::load(&config_dir, root) {
-        Ok((a, _warnings)) => {
-            // The phrase must be for THIS vault: the recovery public key
-            // in the anchor must match the phrase-derived one.
-            if a.recovery != old_recovery.verifying_key() {
-                return Err(anyhow::Error::new(DomainError::invalid(
-                    "recovery phrase does not match this vault's trust anchor",
-                )));
-            }
-            a
+    // Load the trust anchor. Three sources, in order of explicitness:
+    // 1. `--anchor-file <path>` (#152): load exactly this file; the phrase
+    //    must match its recovery key (fail closed). No keys/-tree fallback:
+    //    an explicit anchor that does not match is an error, never a cue to
+    //    rebuild from the vault.
+    // 2. The device's `~/.config/confidant/trust.toml`.
+    // 3. On a fresh device (no trust.toml, no config backup), rebuild it
+    //    from the vault's keys/ tree: the operator certificate (written at
+    //    init, signed by the recovery key) is verified against the
+    //    phrase-derived recovery pubkey. This is the lost-device path — the
+    //    phrase alone re-establishes trust.
+    //
+    // Nothing is written to the config dir until this succeeds.
+    let check_recovery = |a: &anchor::Anchor| -> anyhow::Result<()> {
+        if a.recovery != old_recovery.verifying_key() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "recovery phrase does not match this vault's trust anchor",
+            )));
         }
-        Err(_) => {
-            let operator_pubkey = anchor::verify_operator_cert(
+        // The X25519 recovery recipient is a separate HKDF branch of the
+        // phrase; it must match too, or a tampered anchor file could get a
+        // forged recipient recorded in the denylist and the real retired
+        // recipient missed (#154 must-fix 1).
+        if a.recovery_age != old_recovery.age_identity().to_recipient_string() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+            )));
+        }
+        Ok(())
+    };
+    let anchor = if let Some(path) = anchor_file {
+        let a = anchor::load_from(path, root).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "--anchor-file {} rejected: {e}",
+                path.display()
+            )))
+        })?;
+        check_recovery(&a)?;
+        // #154 must-fix 3: the supplied operator key may only be accepted
+        // when the vault has no operator certificate (the pre-cert case the
+        // backup exists for). When a cert is present it must verify against
+        // the phrase-derived recovery key and name the same operator — so a
+        // tampered anchor backup can never get the recovery key to certify
+        // an attacker's operator key.
+        if keys_dir.join(anchor::OPERATOR_CERT_FILE).exists() {
+            let cert_operator = anchor::verify_operator_cert(
                 &keys_dir,
                 &vault.config.vault_id,
                 &old_recovery.verifying_key(),
             )
-            .map_err(anyhow::Error::new)?;
-            anchor::Anchor {
-                operator: operator_pubkey,
-                recovery: old_recovery.verifying_key(),
-                recovery_age: old_recovery.age_identity().to_recipient_string(),
-                source: config_dir.join(anchor::TRUST_FILE),
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "operator certificate present but does not verify against the phrase; \
+                     refusing the supplied --anchor-file: {e}"
+                )))
+            })?;
+            if cert_operator != a.operator {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "--anchor-file's operator key does not match this vault's operator \
+                     certificate; refusing",
+                )));
+            }
+        }
+        a
+    } else {
+        match anchor::load(&config_dir, root) {
+            Ok((a, _warnings)) => {
+                // The phrase must be for THIS vault: the recovery public key
+                // in the anchor must match the phrase-derived one.
+                check_recovery(&a)?;
+                a
+            }
+            Err(_) => {
+                let operator_pubkey = anchor::verify_operator_cert(
+                    &keys_dir,
+                    &vault.config.vault_id,
+                    &old_recovery.verifying_key(),
+                )
+                .map_err(anyhow::Error::new)?;
+                anchor::Anchor {
+                    operator: operator_pubkey,
+                    recovery: old_recovery.verifying_key(),
+                    recovery_age: old_recovery.age_identity().to_recipient_string(),
+                    source: config_dir.join(anchor::TRUST_FILE),
+                }
             }
         }
     };
@@ -2247,6 +2329,15 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
 
     // The new phrase was already displayed (once, on stderr) before the
     // anchor swap above — it is not repeated here.
+    //
+    // #154 must-fix 4: warn — do not fail — when git history is degraded, so
+    // the operator knows the shredded-client / retired-recovery checks only
+    // saw the working tree.
+    let history_warning = store.history_degraded_reason();
+    let warnings: Vec<String> = history_warning.iter().cloned().collect();
+    if let Some(w) = &history_warning {
+        eprintln!("warning: {w}");
+    }
     if json {
         print_json(&ok_envelope(
             Some(root),
@@ -2255,6 +2346,7 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
                 "keys_dir": keys_dir.display().to_string(),
                 "commit": commit,
                 "clients_recovered": clients,
+                "warnings": warnings,
                 "note": "only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery)",
             }),
         ))?;
@@ -2510,6 +2602,121 @@ fn test_keychain_dir() -> Option<std::path::PathBuf> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// Whether a device key is enrolled on this device: the test keychain dir
+/// (test builds only, the stand-in for the OS keychain), the OS keychain,
+/// or — handled separately by the caller — `CONFIDANT_DEVICE_KEY`.
+/// `--initiate` uses this so the test keychain dir counts as enrolled,
+/// exactly like the OS keychain.
+fn device_key_enrolled() -> anyhow::Result<bool> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        return Ok(dir.join("device.key").is_file());
+    }
+    match confidant_crypt::keychain::device_key() {
+        Ok(_) => Ok(true),
+        Err(confidant_crypt::error::Error::NoKey(_)) => Ok(false),
+        Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot check device key: {e}"
+        )))),
+    }
+}
+
+/// Keychain backend for this process's key operations: the production OS
+/// keychain, or — in test builds with `CONFIDANT_TEST_KEYCHAIN_DIR` — a
+/// small file-backed backend so the inbox rotation can be exercised end to
+/// end (CI has no Secret Service). Never selected in release builds.
+fn keychain_backend() -> Box<dyn confidant_crypt::keychain::KeychainBackend> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        return Box::new(FileKeychain::new(dir));
+    }
+    Box::new(confidant_crypt::keychain::OsKeychain)
+}
+
+/// File-backed [`KeychainBackend`] for tests (`test-overrides` only): one
+/// file per `service.account`, mode 0600. The device key has its own fixed
+/// `device.key` path ([`device_key_bech32`]); this covers the inbox slots
+/// the rotation reads and writes.
+///
+/// [`KeychainBackend`]: confidant_crypt::keychain::KeychainBackend
+#[cfg(feature = "test-overrides")]
+struct FileKeychain {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(feature = "test-overrides")]
+impl FileKeychain {
+    fn new(dir: std::path::PathBuf) -> Self {
+        FileKeychain { dir }
+    }
+
+    fn path(&self, service: &str, account: &str) -> std::path::PathBuf {
+        self.dir.join(format!("{service}.{account}"))
+    }
+}
+
+#[cfg(feature = "test-overrides")]
+impl confidant_crypt::keychain::KeychainBackend for FileKeychain {
+    fn get_password(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Zeroizing<String>>, confidant_crypt::error::Error> {
+        match std::fs::read_to_string(self.path(service, account)) {
+            Ok(s) => Ok(Some(Zeroizing::new(s))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(confidant_crypt::error::Error::Keychain(format!(
+                "cannot read test keychain entry {service}/{account}: {e}"
+            ))),
+        }
+    }
+
+    fn set_password(
+        &self,
+        service: &str,
+        account: &str,
+        password: &str,
+    ) -> Result<(), confidant_crypt::error::Error> {
+        let path = self.path(service, account);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                confidant_crypt::error::Error::Keychain(format!(
+                    "cannot create test keychain dir: {e}"
+                ))
+            })?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        opts.open(&path)
+            .and_then(|mut f| f.write_all(password.as_bytes()))
+            .map_err(|e| {
+                confidant_crypt::error::Error::Keychain(format!(
+                    "cannot write test keychain entry {service}/{account}: {e}"
+                ))
+            })
+    }
+
+    fn delete_credential(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<(), confidant_crypt::error::Error> {
+        match std::fs::remove_file(self.path(service, account)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(confidant_crypt::error::Error::Keychain(format!(
+                "cannot delete test keychain entry {service}/{account}: {e}"
+            ))),
+        }
+    }
 }
 
 /// This device's secret key (Bech32): `$DIR/device.key` when
@@ -2786,14 +2993,21 @@ struct DeviceAddRequest {
 /// emits the request (pubkey + label only). Touches nothing else — no
 /// vault. The fingerprint goes to stderr so the operator can verify it
 /// out of band; the request goes to stdout (or --output).
-/// Validate a device-add request label: restrict charset and length,
-/// strip control characters (it flows into the commit message, manifest,
-/// and stderr — a hand-edited request file must not inject terminal
-/// escapes). Used by both `--initiate` and `--from-request`.
+/// Validate a device-add request label: restrict charset and length, reject
+/// control characters (it flows into the commit message, manifest, and
+/// stderr — a hand-edited request file must not inject terminal escapes).
+/// Used by both `--initiate` and `--from-request`.
 fn validate_device_label(raw: &str) -> anyhow::Result<String> {
-    // Strip control characters (including newlines) to avoid terminal escapes.
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
+    // Reject control characters outright (including newlines/ESC) rather
+    // than stripping them (#153 nit 6): stripping silently turns a hostile
+    // label into a different one, so the operator never learns the request
+    // was tampered with.
+    if raw.chars().any(|c| c.is_control()) {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label must not contain control characters",
+        )));
+    }
+    let cleaned = raw.trim();
     if cleaned.is_empty() {
         return Err(anyhow::Error::new(DomainError::usage(
             "label must not be empty",
@@ -2804,13 +3018,14 @@ fn validate_device_label(raw: &str) -> anyhow::Result<String> {
             "label must be at most 64 characters",
         )));
     }
-    // Allow alphanumerics, spaces, and common punctuation.
+    // ASCII only (#153 nit 6): labels travel into commit messages and the
+    // manifest, so keep them to a predictable, terminal-safe set.
     if !cleaned
         .chars()
-        .all(|c| c.is_alphanumeric() || " -_.()".contains(c))
+        .all(|c| c.is_ascii_alphanumeric() || " -_.()".contains(c))
     {
         return Err(anyhow::Error::new(DomainError::usage(
-            "label may contain only letters, numbers, spaces, and -_.()",
+            "label may contain only ASCII letters, numbers, spaces, and -_.()",
         )));
     }
     Ok(cleaned.to_string())
@@ -2829,20 +3044,28 @@ fn cmd_keys_device_add_initiate(
     use confidant_crypt::keychain;
     // Check via the keychain directly (not the env override): if a
     // device key is enrolled, refuse.
-    let enrolled = match keychain::device_key() {
-        Ok(_) => true,
-        Err(confidant_crypt::error::Error::NoKey(_)) => false,
-        Err(e) => {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot check device key: {e}"
-            ))));
-        }
-    };
+    let enrolled = device_key_enrolled()?;
     // Also check the env var (headless/test): if set, a key is enrolled.
     let env_enrolled = std::env::var(keychain::DEVICE_KEY_ENV)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     let already_enrolled = enrolled || env_enrolled;
+    // #153 nit 4: with CONFIDANT_DEVICE_KEY set, `--initiate` cannot
+    // generate a fresh keypair — `provision_device_key()` would re-emit the
+    // env key, and the enrolled device later refuses that pubkey as
+    // already-seen. Fail closed up front, like shred does.
+    if env_enrolled {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "cannot --initiate a fresh device key while CONFIDANT_DEVICE_KEY is set \
+                 (the request would re-emit the enrolled key)",
+            )
+            .with_fix(
+                "Unset CONFIDANT_DEVICE_KEY and enroll this device's key in the OS keychain \
+                 (run `confidant recover` on a new device), then retry `keys device-add --initiate`",
+            ),
+        ));
+    }
     if already_enrolled && !force {
         return Err(anyhow::Error::new(DomainError::invalid(
             "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
@@ -3045,6 +3268,15 @@ fn cmd_keys_device_add_from_request(
     let keys_dir = root.join("keys");
     let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
         .map_err(anyhow::Error::new)?;
+    // #154 must-fix 4: the retired-recovery / shredded-client denylist is
+    // load-bearing here, so fail closed rather than warn when history is
+    // unreadable (shallow clone, missing git, git log failure).
+    if let Some(reason) = store.history_degraded_reason() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "refusing device-add: {reason}; the retired-recipient denylist would be \
+             incomplete and could re-open a shredded client"
+        ))));
+    }
     let entry = RecipientEntry {
         age_pubkey: request.pubkey.clone(),
         label: label.clone(),
@@ -3078,9 +3310,19 @@ fn cmd_keys_device_add_from_request(
     let vault = load_vault(root)?;
     let pre = check_vault(&vault, &CheckOptions::default());
     if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree",
-        )));
+        // keys/ was already re-wrapped above; point at the exact recovery
+        // command (#153 nit 5), matching add_recipient's own error path.
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "check failed before committing keys/ tree; nothing was committed",
+            )
+            .with_fix(format!(
+                "inspect with `git -C {} status -- keys/`, then restore tracked files with \
+                 `git -C {} checkout -- keys/` and delete any new untracked {key_id}*.age wrappings",
+                root.display(),
+                root.display(),
+            )),
+        ));
     }
     confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
     confidant_core::write::git(
@@ -3166,31 +3408,28 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         ))));
     }
 
-    // #105 B4: refuse while the inbox rotation window is already open.
-    // Fail closed on keychain errors (but NoKey just means no inbox key,
-    // which is fine — the window is not open).
-    {
-        use confidant_crypt::keychain;
-        match keychain::inbox_keys() {
-            Ok(keys) => {
-                if keys.1.is_some() {
-                    return Err(anyhow::Error::new(DomainError::invalid(
-                        "inbox rotation window is already open (previous inbox key present); run `confidant inbox rotate --finish` first".to_string(),
-                    )));
-                }
-            }
-            Err(confidant_crypt::error::Error::NoKey(_)) => {
-                // No inbox key: window is not open, proceed.
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot check inbox rotation window: {e}"
-                ))));
-            }
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+
+    // #105 B4: load the inbox keypair once, through the same backend the
+    // rotation below will use, and refuse while the rotation window is
+    // already open. Fail closed on keychain errors; `NoKey` just means no
+    // inbox key on this device (the window is not open, and shred records
+    // the device-local reminder instead).
+    let backend = keychain_backend();
+    let inbox_keys = confidant_core::inbox::InboxKeys::load_opt_with(&*backend, Some(&config_dir))
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot check inbox rotation window: {e}"
+            )))
+        })?;
+    if let Some(keys) = &inbox_keys {
+        if keys.has_previous() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "inbox rotation window is already open (previous inbox key present); run `confidant inbox rotate --finish` first".to_string(),
+            )));
         }
     }
 
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
     let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
     let identity = keys_device_identity()?;
     let operator_sk = load_operator_sk(&anchor)?;
@@ -3292,10 +3531,9 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // (anchor already re-pinned above). Otherwise write the device-local
     // reminder.
     let mut inbox_rotated = false;
-    let new_inbox_required = confidant_crypt::keychain::inbox_key().is_ok();
-    if new_inbox_required {
-        // Run the inbox rotation on this device.
-        let backend = confidant_crypt::keychain::OsKeychain;
+    if inbox_keys.is_some() {
+        // Run the inbox rotation on this device, through the same backend
+        // the window check used.
         let vault_config = root.join("confidant.toml");
         let user_config = config_dir.join("config.toml");
         let opts = confidant_core::inbox::InboxRotateOptions {
@@ -3306,7 +3544,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         };
         confidant_core::inbox::run_inbox_rotate(
             root,
-            &backend,
+            &*backend,
             Some(&config_dir),
             &vault_config,
             &user_config,
@@ -3321,6 +3559,15 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         write_pending_inbox_rotation(&vault.config.vault_id, client_id)?;
     }
 
+    // #154 must-fix 4: warn (do not fail) when git history is degraded, so
+    // the operator knows the shredded-client / retired-recovery checks only
+    // saw the working tree.
+    let mut shred_warnings = outcome.warnings.clone();
+    if let Some(w) = store.history_degraded_reason() {
+        eprintln!("warning: {w}");
+        shred_warnings.push(w);
+    }
+
     if cli.json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -3328,7 +3575,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "vault": root.to_string_lossy(),
             "client_id": client_id,
             "destroy_key_ids": outcome.destroy_key_ids,
-            "warnings": outcome.warnings,
+            "warnings": shred_warnings,
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
             "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
