@@ -33,6 +33,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use zeroize::Zeroizing;
+
 use crate::check::{run as check_vault, CheckOptions, Severity};
 use crate::error::DomainError;
 use crate::vault::load_vault;
@@ -62,7 +64,7 @@ pub const INBOX_BRANCH: &str = "inbox";
 
 /// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
 /// (the real `confidant-crypt` age path); tests inject a fake.
-pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Vec<u8>>;
+pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>;
 
 /// Options for [`run_inbox`].
 #[derive(Clone, Debug, Default)]
@@ -407,7 +409,7 @@ mod tests {
         )
         .unwrap();
         let back = inbox_decrypt(&ciphertext).unwrap();
-        assert_eq!(back, b"item bytes");
+        assert_eq!(&*back, b"item bytes");
     }
 
     #[test]
@@ -441,7 +443,7 @@ mod tests {
         )
         .unwrap();
         let plaintext = keys.decrypt(&ciphertext).unwrap();
-        assert_eq!(plaintext, b"item bytes");
+        assert_eq!(&*plaintext, b"item bytes");
     }
 
     #[test]

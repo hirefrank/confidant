@@ -99,12 +99,14 @@ impl Recovery {
                 )));
             }
         }
-        let normalized = words
-            .iter()
-            .map(|w| w.to_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let m = Mnemonic::parse_in(Language::English, &normalized)
+        let normalized = Zeroizing::new(
+            words
+                .iter()
+                .map(|w| w.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let m = Mnemonic::parse_in(Language::English, normalized.as_str())
             .map_err(|e| Error::Recovery(format!("checksum invalid: {e}")))?;
         Ok(Self::from_mnemonic(&m))
     }
@@ -146,11 +148,10 @@ impl Recovery {
         entropy.zeroize();
         let ed25519_sk = SigningKey::from_bytes(&ed_seed);
         ed_seed.zeroize();
-        let phrase_words: Vec<String> = m
-            .to_string()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        // The full phrase string is the most sensitive intermediate here;
+        // wrap it so the `to_string()` buffer is wiped on drop (#135).
+        let phrase = Zeroizing::new(m.to_string());
+        let phrase_words: Vec<String> = phrase.split_whitespace().map(str::to_string).collect();
         Self {
             phrase_words,
             x25519_sk,

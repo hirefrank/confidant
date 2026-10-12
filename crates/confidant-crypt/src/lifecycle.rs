@@ -48,7 +48,7 @@ use crate::manifest::{
     VAULT_CLIENT_ID,
 };
 use crate::recovery::Recovery;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// A client's verified epoch keys, ready for re-wrapping (shred's verify-first pass).
 /// Commitments come from the verified manifest buffer (see
@@ -466,11 +466,14 @@ impl KeyStore {
         };
         let wrapped = std::fs::read(self.wrapped_dir(client_id).join(&filename))
             .map_err(|_| Error::NoKey(format!("no wrapping {filename} for {client_id}")))?;
-        let raw = Zeroizing::new(unwrap_with_identity(&wrapped, identity)?);
+        let raw = unwrap_with_identity(&wrapped, identity)?;
         if raw.len() != 32 {
             return Err(Error::Age("unwrapped key is not 32 bytes".to_string()));
         }
-        let mut arr = [0u8; 32];
+        // `Zeroizing`, so the candidate is wiped on drop whether the
+        // commitment check passes or fails (#135): the success path used
+        // to leave the key bytes on the stack.
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&raw);
         // Authenticate the unwrapped key against the manifest's commitment,
         // taken from the verified buffer above — never re-read from disk.
@@ -487,14 +490,14 @@ impl KeyStore {
         let expected_bytes = manifest::decode_hex(&expected.commitment)?;
         let computed = manifest::key_commitment(&arr, &self.vault_id, client_id, epoch);
         if !manifest::ct_eq(&computed, &expected_bytes) {
-            // Zero the candidate before failing: it may be attacker-chosen.
-            arr.zeroize();
+            // No explicit zeroize needed: `arr` is `Zeroizing` and wipes on
+            // this early return too (#135).
             return Err(Error::Manifest(format!(
                 "key commitment mismatch for {client_id} epoch {epoch}: \
                  the wrapping does not match the signed manifest; refusing"
             )));
         }
-        Ok(DataKey::from_bytes(arr))
+        Ok(DataKey::from_bytes(*arr))
     }
 
     /// Rotate a client's data key: new key, `epoch += 1`, wrap to all
@@ -837,7 +840,7 @@ impl KeyStore {
         let vdir = self.keys_dir.join("vault");
         let wrapped = std::fs::read(vdir.join("lookup.age"))
             .map_err(|_| Error::NoKey("no vault lookup.age".to_string()))?;
-        Ok(Zeroizing::new(unwrap_with_identity(&wrapped, identity)?))
+        unwrap_with_identity(&wrapped, identity)
     }
 
     /// Write raw lookup key bytes re-wrapped to new recipients (for shred).
@@ -963,7 +966,9 @@ impl KeyStore {
         if raw.len() != 32 {
             return Err(Error::Age("lookup key is not 32 bytes".to_string()));
         }
-        let mut arr = [0u8; 32];
+        // `Zeroizing`: wiped on drop on both the success and the mismatch
+        // path (#135).
+        let mut arr = Zeroizing::new([0u8; 32]);
         arr.copy_from_slice(&raw);
         let expected = commitments.iter().find(|c| c.epoch == 1).ok_or_else(|| {
             Error::Manifest(
@@ -974,14 +979,13 @@ impl KeyStore {
         let expected_bytes = manifest::decode_hex(&expected.commitment)?;
         let computed = manifest::key_commitment(&arr, &self.vault_id, VAULT_CLIENT_ID, 1);
         if !manifest::ct_eq(&computed, &expected_bytes) {
-            arr.zeroize();
             return Err(Error::Manifest(
                 "lookup key commitment mismatch: the wrapping does not match \
                  the signed vault manifest; refusing"
                     .to_string(),
             ));
         }
-        Ok((LookupKey::from_bytes(arr), commitments))
+        Ok((LookupKey::from_bytes(*arr), commitments))
     }
 }
 

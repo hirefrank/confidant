@@ -96,7 +96,7 @@ impl Repo {
     }
 
     fn run(&self, dry_run: bool) -> anyhow::Result<confidant_core::InboxReport> {
-        let identity: &DecryptFn = &|b: &[u8]| Ok(b.to_vec());
+        let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
         run_inbox(
             self.root(),
             &InboxOptions {
@@ -286,7 +286,7 @@ fn symlinked_vault_root_merges() {
         eprintln!("SKIP: ssh-keygen unavailable");
         return;
     };
-    let identity: &DecryptFn = &|b: &[u8]| Ok(b.to_vec());
+    let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
     let report = run_inbox(
         &link,
         &InboxOptions {
@@ -343,7 +343,7 @@ fn run_with(
     allow_unsigned: bool,
     pinned_pubkey: Option<String>,
 ) -> anyhow::Result<confidant_core::InboxReport> {
-    let identity: &DecryptFn = &|b: &[u8]| Ok(b.to_vec());
+    let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
     run_inbox(
         r.root(),
         &InboxOptions {
@@ -482,7 +482,7 @@ fn push_between_verify_and_read_refuses() {
                 .expect("update-ref failed");
             assert!(out.status.success());
         }
-        Ok(b.to_vec())
+        Ok(zeroize::Zeroizing::new(b.to_vec()))
     };
     let err = run_inbox(
         r.root(),
@@ -541,7 +541,7 @@ fn push_after_pin_is_neither_verified_nor_read() {
             git(&root, &["commit", "-q", "-m", "evil push"]);
             git(&root, &["checkout", "-q", "main"]);
         }
-        Ok(b.to_vec())
+        Ok(zeroize::Zeroizing::new(b.to_vec()))
     };
     let err = run_inbox(
         r.root(),

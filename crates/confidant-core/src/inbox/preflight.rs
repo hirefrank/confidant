@@ -114,12 +114,12 @@ pub(crate) fn preflight(
                 "item '{name}' could not be decrypted"
             ))),
         })?;
-        let text = String::from_utf8(plaintext).map_err(|_| {
+        let text = std::str::from_utf8(&plaintext).map_err(|_| {
             anyhow::Error::new(DomainError::inbox_item(format!(
                 "item '{name}' decrypted to non-UTF-8"
             )))
         })?;
-        items.push(parse_item(name, &text)?);
+        items.push(parse_item(name, text)?);
     }
 
     let current_tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;

@@ -59,7 +59,7 @@ pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> String {
 }
 
 /// Unwrap with a raw 32-byte X25519 secret (via Bech32 conversion).
-pub fn unwrap_with_raw_secret(data: &[u8], secret: &[u8; 32]) -> Result<Vec<u8>, Error> {
+pub fn unwrap_with_raw_secret(data: &[u8], secret: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, Error> {
     let id = RawX25519Identity::new(*secret).to_age_identity()?;
     unwrap_with_identity(data, &id)
 }
@@ -97,12 +97,20 @@ pub fn wrap_to_recipient(data: &[u8], recipient: &str) -> Result<Vec<u8>, Error>
 }
 
 /// Unwrap age-encrypted `data` with any identity implementing [`age::Identity`].
-pub fn unwrap_with_identity(data: &[u8], identity: &dyn age::Identity) -> Result<Vec<u8>, Error> {
+///
+/// Returns [`Zeroizing<Vec<u8>>`]: this is the crate's one function that
+/// produces secret material from ciphertext, so the safe, self-wiping type
+/// is the only choice — no caller can accidentally keep a bare `Vec<u8>`
+/// (issue #135). The buffer is wiped when the returned wrapper drops.
+pub fn unwrap_with_identity(
+    data: &[u8],
+    identity: &dyn age::Identity,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
     let decryptor = age::Decryptor::new(data).map_err(|e| Error::Age(format!("decryptor: {e}")))?;
     let mut reader = decryptor
         .decrypt(iter::once(identity))
         .map_err(|e| Error::Age(format!("decrypt: {e}")))?;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     use std::io::Read;
     reader
         .read_to_end(&mut out)
@@ -111,7 +119,7 @@ pub fn unwrap_with_identity(data: &[u8], identity: &dyn age::Identity) -> Result
 }
 
 /// Unwrap with an age Bech32 identity string (`AGE-SECRET-KEY-1…`).
-pub fn unwrap_with_bech32(data: &[u8], identity: &str) -> Result<Vec<u8>, Error> {
+pub fn unwrap_with_bech32(data: &[u8], identity: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
     let id = age::x25519::Identity::from_str(identity)
         .map_err(|e| Error::Age(format!("bad identity: {e}")))?;
     unwrap_with_identity(data, &id)
@@ -127,7 +135,7 @@ mod tests {
         let recipient = id.to_public().to_string();
         let wrapped = wrap_to_recipient(b"32-byte-data-key-payload!!!!!!", &recipient).unwrap();
         let back = unwrap_with_identity(&wrapped, &id).unwrap();
-        assert_eq!(back, b"32-byte-data-key-payload!!!!!!");
+        assert_eq!(&*back, b"32-byte-data-key-payload!!!!!!");
     }
 
     #[test]
@@ -138,7 +146,19 @@ mod tests {
         let recipient = bech32_encode("age", pk.as_bytes());
         let wrapped = wrap_to_recipient(b"payload", &recipient).unwrap();
         let back = unwrap_with_raw_secret(&wrapped, &raw).unwrap();
-        assert_eq!(back, b"payload");
+        assert_eq!(&*back, b"payload");
+    }
+
+    #[test]
+    fn unwrap_returns_zeroizing() {
+        // #135: the unwrap path must return a self-wiping type, so no
+        // caller can hold a bare Vec<u8> of secret material. The type
+        // annotation pins the Zeroizing return.
+        let id = age::x25519::Identity::generate();
+        let recipient = id.to_public().to_string();
+        let wrapped = wrap_to_recipient(b"payload", &recipient).unwrap();
+        let back: Zeroizing<Vec<u8>> = unwrap_with_identity(&wrapped, &id).unwrap();
+        assert_eq!(&*back, b"payload");
     }
 
     #[test]

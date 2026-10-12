@@ -13,6 +13,8 @@
 
 #![forbid(unsafe_code)]
 
+use zeroize::Zeroizing;
+
 pub mod aead;
 pub mod age_wrap;
 pub mod alias;
@@ -73,7 +75,10 @@ pub fn encrypt_file(plaintext: &[u8]) -> Result<Vec<u8>, Error> {
 
 /// Decrypt a file with this device's age key. Fails closed when the device
 /// key is absent or the ciphertext is not for this device.
-pub fn decrypt_file(ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+///
+/// Returns [`Zeroizing<Vec<u8>>`]: the output is decrypted content, so the
+/// buffer wipes itself on drop (#135).
+pub fn decrypt_file(ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
     let id = device_identity()?;
     age_wrap::unwrap_with_identity(ciphertext, &id)
 }
