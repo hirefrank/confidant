@@ -24,6 +24,9 @@ Set up Confidant (a git-native CRM CLI plus agent skills) on this machine:
    keeps the skills working — do not delete it afterwards. Then pin it to
    the latest release tag (never stay on main — see Staying current):
    `git -C <dir> checkout $(git -C <dir> describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)`.
+   Export `CONFIDANT_REPO=<dir>` for this session and tell me what to add
+   to my shell rc to keep it: it is how `confidant doctor` finds the
+   checkout to report when the skills are behind.
 3. Make the skills visible to yourself: symlink every directory directly
    under `<repo>/skills/` that contains a `SKILL.md` into your agent
    skills directory (`~/.config/opencode/skills/` for OpenCode,
@@ -43,13 +46,16 @@ Set up Confidant (a git-native CRM CLI plus agent skills) on this machine:
    records stay out of agent output).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
-and the `check` result.
+the `check` result, and any `confidant doctor` staleness warnings.
 ```
 
 ## Staying current (updates)
 
-Nothing checks automatically today — updates are a manual loop, documented
-here so it stays one:
+`confidant doctor` reports how far the local install is behind the latest
+GitHub Release — the CLI by its version, and the skills checkout by its
+release tag. Both are warnings only: a stale install never fails `doctor`,
+and when GitHub cannot be reached they read `staleness unknown` rather than
+guessing. Apply updates with this loop:
 
 - **Skills:** they live in the checkout from step 2, pinned to a release
   tag — never main. Skills run on devices holding plaintext client data,
@@ -65,6 +71,7 @@ here so it stays one:
 - **Optional search backend:** the `qmd-search` skill needs the `qmd` binary
   (`npm install -g @tobilu/qmd`); keyword-only `find` works without it.
 
-A future `confidant doctor` staleness check (CLI and skills each reporting
-whether they match the latest release) would make this automatic; until
-then, this loop is the mechanism.
+The skills staleness check is driven by `CONFIDANT_REPO` (set in step 2):
+it must point at the checkout from step 2 so `doctor` can read its tag. If
+it is unset, `doctor` omits the skills check — the CLI has no way to know
+where the checkout is.
