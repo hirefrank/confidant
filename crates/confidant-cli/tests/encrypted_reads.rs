@@ -49,6 +49,7 @@ struct Harness {
     vault: PathBuf,
     device_bech32: String,
     operator_hex: String,
+    keychain_dir: Option<PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -78,8 +79,29 @@ impl Harness {
             vault,
             device_bech32,
             operator_hex,
+            keychain_dir: None,
             _tmp: tmp,
         }
+    }
+
+    /// Switch this harness to the test keychain dir (for `keys shred`'s
+    /// device-key rotation): the device key is read from / written to
+    /// `$DIR/device.key` instead of `CONFIDANT_DEVICE_KEY`. Call before
+    /// `keyed`/`init`.
+    fn with_test_keychain(&mut self) {
+        let dir = self._tmp.path().join("keychain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("device.key"), &self.device_bech32).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("device.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        self.keychain_dir = Some(dir);
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -89,8 +111,17 @@ impl Harness {
             .arg(&self.vault)
             .env("HOME", &self.home)
             .env("CONFIDANT_TEST_OPERATOR_KEY", &self.operator_hex)
-            .env("CONFIDANT_KEYCHAIN", "off")
-            .env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
+            .env("CONFIDANT_KEYCHAIN", "off");
+        match &self.keychain_dir {
+            Some(dir) => {
+                c.env("CONFIDANT_TEST_KEYCHAIN_DIR", dir);
+                c.env_remove("CONFIDANT_DEVICE_KEY");
+            }
+            None => {
+                c.env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
+                c.env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
+            }
+        }
         c
     }
 
@@ -103,7 +134,8 @@ impl Harness {
             .env("HOME", &self.home)
             .env("CONFIDANT_TEST_OPERATOR_KEY", &self.operator_hex)
             .env("CONFIDANT_KEYCHAIN", "off")
-            .env_remove("CONFIDANT_DEVICE_KEY");
+            .env_remove("CONFIDANT_DEVICE_KEY")
+            .env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
         c
     }
 
@@ -744,4 +776,55 @@ fn reindex_refuses_unkeyed_on_encrypted_vault_with_counts() {
     let text = stdout(&out);
     assert!(!text.contains("enc:"), "envelope header leaked");
     assert!(!text.contains("AGE-SECRET-KEY"), "secret leaked");
+}
+
+/// `keys shred` deletes this device's local search index (corpus + QMD
+/// store), so the shredded client's plaintext does not linger on the device.
+#[test]
+fn reindex_shred_deletes_search_index() {
+    let mut h = Harness::new();
+    h.with_test_keychain(); // shred rotates the device key
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio with quantum baking."),
+    );
+    h.record_add(&input);
+
+    // Build the corpus (reindex requires `.confidant/` git-ignored).
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let out = h
+        .cmd(&["reindex", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reindex failed: {}", stderr(&out));
+
+    let corpus = h.vault.join(".confidant/qmd-corpus");
+    assert!(corpus.is_dir(), "corpus not built");
+    let profile =
+        std::fs::read_to_string(corpus.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert!(
+        profile.contains("quantum"),
+        "profile not decrypted: {profile}"
+    );
+
+    // Shred the client.
+    let out = h
+        .cmd(&["keys", "shred", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: stdout={} stderr={}",
+        stdout(&out),
+        stderr(&out)
+    );
+
+    // The local search index is gone (the client's plaintext with it).
+    assert!(!corpus.exists(), "corpus still exists after shred");
+    assert!(
+        !h.vault.join(".confidant/qmd").exists(),
+        "QMD store still exists after shred"
+    );
 }

@@ -443,11 +443,13 @@ expires = "2026-11-08"
   cannot be recovered from the new phrase (issue #99, test in
   `confidant-crypt`). `keys shred` also states its
   leftover limits plainly in its output: decrypted copies already on
-  devices, `.confidant/` caches and search indexes on every device, old
+  devices, `.confidant/` caches and search indexes on other devices, old
   keys lingering in OS keychains or OS backups, copies outside
   Confidant entirely (e.g. Drive transcripts), and — until
   `confidant inbox rotate --finish` has run — the old inbox key.
-  Shredding cannot reach any of these.
+  Shredding cannot reach any of these. (The exception is this device's
+  search index — `keys shred` deletes `.confidant/qmd-corpus/` and the QMD
+  store locally.)
 
 ## 8a. Inbox key (issue #36)
 
