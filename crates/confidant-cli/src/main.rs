@@ -1949,6 +1949,19 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
             .map_err(anyhow::Error::new)?;
     }
 
+    // Re-sign the operator certificate with the new recovery key. It was
+    // signed at init (or the previous recover) by the OLD recovery key;
+    // without this, the next fresh-device recover with the NEW phrase
+    // fails verify_operator_cert ("recovery phrase does not match this
+    // vault") — a silent lockout. The operator pubkey is unchanged.
+    anchor::write_operator_cert(
+        &keys_dir,
+        &vault.config.vault_id,
+        &operator_pubkey,
+        new_recovery.signing_key(),
+    )
+    .map_err(anyhow::Error::new)?;
+
     // Authorize the new device on every client (same path #66 reuses):
     // re-wrap each data key to the new device + new recovery.
     // Note: this drops every OTHER device's wrappings — recover is the

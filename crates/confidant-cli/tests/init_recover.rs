@@ -178,6 +178,62 @@ fn recover_without_prior_config() {
 }
 
 #[test]
+fn recover_twice_fresh_device_second_phrase_works() {
+    // The operator certificate must be re-signed on every recovery
+    // rotation: init, then fresh-device recover with phrase 1, then a
+    // SECOND fresh-device recover with phrase 2. Without the re-sign,
+    // the second recover fails verify_operator_cert ("recovery phrase
+    // does not match this vault") — a silent lockout.
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase1 = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+
+    // First fresh-device recover (phrase 1).
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase1).unwrap();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", age_generate_bech32())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "first fresh-device recover failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let phrase2 = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(phrase2, phrase1, "recovery must rotate the phrase");
+
+    // Second fresh-device recover (phrase 2) — the operator certificate
+    // must verify against the phrase-2-derived recovery pubkey.
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    std::fs::write(&phrase_file, &phrase2).unwrap();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", age_generate_bech32())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "second fresh-device recover failed (stale operator cert?): stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let phrase3 = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(phrase3, phrase2, "recovery must rotate the phrase again");
+    assert!(h.trust_toml().is_file(), "trust.toml not rebuilt");
+}
+
+#[test]
 fn init_writes_operator_certificate() {
     // The operator certificate (for fresh-device recover) is written
     // at init, signed by the recovery key, and committed with keys/.
