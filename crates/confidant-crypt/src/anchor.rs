@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signer, Verifier, VerifyingKey};
 
 use crate::error::Error;
 
@@ -86,10 +86,13 @@ fn parse_pubkey(hex: &str, what: &str) -> Result<VerifyingKey, Error> {
 /// Writes exactly the fields [`load`] reads (`operator_pubkey`,
 /// `recovery_pubkey`, `recovery_age_recipient` — hex-encoded Ed25519
 /// public keys). Creates the config dir with 0700 and writes the file
-/// with 0600. Refuses when the config dir is inside the vault (same
-/// rule as [`load`]), and refuses to overwrite an existing anchor —
-/// the anchor is a trust root and is never silently replaced (use
-/// `recover` to re-pin).
+/// with 0600, atomically: the file is created with `create_new` (no
+/// TOCTOU between the exists-check and the write) and mode 0600 from
+/// the first byte (no write-then-chmod window at the umask default).
+/// Refuses when the config dir is inside the vault (same rule as
+/// [`load`]), and refuses to overwrite an existing anchor — the anchor
+/// is a trust root and is never silently replaced (use [`replace`] to
+/// re-pin, or `recover` to rotate).
 pub fn save(
     config_dir: &Path,
     vault_path: &Path,
@@ -116,10 +119,67 @@ pub fn save(
     }
 
     let trust_path = config_dir.join(TRUST_FILE);
-    if trust_path.exists() {
-        return Err(Error::Anchor(format!(
-            "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` to re-pin)",
+
+    let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let text = format!(
+        "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"{}\"\n",
+        hex(operator.as_bytes()),
+        hex(recovery.as_bytes()),
+        recovery_age.trim(),
+    );
+
+    std::fs::create_dir_all(config_dir).map_err(|e| {
+        Error::Anchor(format!(
+            "cannot create config dir {}: {e}",
+            config_dir.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| Error::Anchor(format!("cannot set 0700 on {}: {e}", config_dir.display())),
+        )?;
+    }
+    write_file_0600_create_new(&trust_path, text.as_bytes()).map_err(|e| {
+        Error::Anchor(format!(
+            "cannot write {}: {e} (refusing to overwrite an existing anchor; run `confidant recover` to re-pin)",
             trust_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Atomically replace the trust anchor with new keys.
+///
+/// Writes to a temp file (0600, `create_new`) in the same directory and
+/// renames it into place, so a crash never leaves a half-written or
+/// missing `trust.toml`. Unlike [`save`], this overwrites — the caller
+/// must have validated the replacement first (recover re-pin after
+/// `rotate_recovery`, or `init --force` after its checks). The temp file
+/// is removed on error.
+pub fn replace(
+    config_dir: &Path,
+    vault_path: &Path,
+    operator: &VerifyingKey,
+    recovery: &VerifyingKey,
+    recovery_age: &str,
+) -> Result<(), Error> {
+    // Same inside-the-vault refusal as save/load.
+    let vault_canon = vault_path.canonicalize().map_err(|_| {
+        Error::Anchor(format!(
+            "cannot resolve vault path {}",
+            vault_path.display()
+        ))
+    })?;
+    let config_canon = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    if config_canon.starts_with(&vault_canon) {
+        return Err(Error::Anchor(format!(
+            "trust anchor path {} is inside the vault {}; refusing",
+            config_canon.display(),
+            vault_canon.display()
         )));
     }
 
@@ -144,16 +204,54 @@ pub fn save(
             |e| Error::Anchor(format!("cannot set 0700 on {}: {e}", config_dir.display())),
         )?;
     }
-    std::fs::write(&trust_path, text)
-        .map_err(|e| Error::Anchor(format!("cannot write {}: {e}", trust_path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |e| Error::Anchor(format!("cannot set 0600 on {}: {e}", trust_path.display())),
-        )?;
+
+    let trust_path = config_dir.join(TRUST_FILE);
+    let tmp_path = config_dir.join(".trust.toml.tmp");
+    // Clean up a stale temp file from a crashed run (best effort).
+    let _ = std::fs::remove_file(&tmp_path);
+    let write_result = write_file_0600_create_new(&tmp_path, text.as_bytes());
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Anchor(format!(
+            "cannot write temp anchor {}: {e}",
+            tmp_path.display()
+        )));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &trust_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Anchor(format!(
+            "cannot replace {}: {e}",
+            trust_path.display()
+        )));
     }
     Ok(())
+}
+
+/// Write `bytes` to `path` with mode 0600 from creation: `create_new`
+/// (fails if the file exists — no exists-then-write race) and the
+/// Unix mode set on the `OpenOptions` (no write-then-chmod window).
+fn write_file_0600_create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
 }
 
 /// Load and validate the trust anchor.
@@ -287,6 +385,103 @@ mod hex {
     }
 }
 
+/// Operator-pubkey certificate for fresh-device recovery.
+///
+/// Written at `init` to `keys/operator.toml` (+ `.sig`): the operator
+/// Ed25519 pubkey, signed by the **recovery** Ed25519 key. On a truly
+/// fresh device (no `trust.toml`, no config backup), `recover` verifies
+/// this certificate against the phrase-derived recovery pubkey and
+/// rebuilds the trust anchor from it. The signature binds the pubkey to
+/// the vault id, so a certificate transplanted from another vault does
+/// not verify.
+///
+/// This is a spec §14 file (like the manifests): it lives in `keys/`,
+/// is committed to git, and is verified before trust.
+pub const OPERATOR_CERT_FILE: &str = "operator.toml";
+pub const OPERATOR_CERT_SIG_FILE: &str = "operator.sig";
+
+/// Domain separation for the operator certificate signature.
+const OPERATOR_CERT_DOMAIN: &[u8] = b"confidant-operator-cert-v1";
+
+fn operator_cert_signing_bytes(vault_id: &str, pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(OPERATOR_CERT_DOMAIN.len() + 1 + vault_id.len() + 1 + 32);
+    v.extend_from_slice(OPERATOR_CERT_DOMAIN);
+    v.push(0);
+    v.extend_from_slice(vault_id.as_bytes());
+    v.push(0);
+    v.extend_from_slice(pubkey);
+    v
+}
+
+/// Write the operator-pubkey certificate to `keys_dir` (i.e.
+/// `keys/operator.toml` + `keys/operator.sig`), signed by the recovery
+/// key. Called at `init` before the `keys/` tree is committed.
+pub fn write_operator_cert(
+    keys_dir: &Path,
+    vault_id: &str,
+    operator: &VerifyingKey,
+    recovery_sk: &ed25519_dalek::SigningKey,
+) -> Result<(), Error> {
+    let pubkey = operator.as_bytes();
+    let hex_pubkey: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+    let text = format!("[operator]\npubkey = \"{hex_pubkey}\"\n");
+    let sig = recovery_sk
+        .sign(&operator_cert_signing_bytes(vault_id, pubkey))
+        .to_bytes();
+    std::fs::write(keys_dir.join(OPERATOR_CERT_FILE), text)
+        .map_err(|e| Error::Anchor(format!("cannot write operator certificate: {e}")))?;
+    std::fs::write(keys_dir.join(OPERATOR_CERT_SIG_FILE), sig)
+        .map_err(|e| Error::Anchor(format!("cannot write operator certificate signature: {e}")))?;
+    Ok(())
+}
+
+/// Verify the operator-pubkey certificate in `keys_dir` against the
+/// phrase-derived recovery pubkey. Returns the verified operator
+/// [`VerifyingKey`]. Fails closed on missing files, bad signature, or
+/// vault-id mismatch.
+pub fn verify_operator_cert(
+    keys_dir: &Path,
+    vault_id: &str,
+    recovery_pk: &VerifyingKey,
+) -> Result<VerifyingKey, Error> {
+    let text = std::fs::read_to_string(keys_dir.join(OPERATOR_CERT_FILE)).map_err(|_| {
+        Error::Anchor(
+            "no operator certificate in keys/ (vault predates fresh-device recovery; restore trust.toml from a config backup)".to_string(),
+        )
+    })?;
+    let sig_bytes = std::fs::read(keys_dir.join(OPERATOR_CERT_SIG_FILE))
+        .map_err(|_| Error::Anchor("operator certificate signature missing".to_string()))?;
+    if sig_bytes.len() != 64 {
+        return Err(Error::Anchor(
+            "operator certificate signature must be 64 bytes".to_string(),
+        ));
+    }
+    // Parse the pubkey from the TOML.
+    let doc: toml::Table = toml::from_str(&text)
+        .map_err(|e| Error::Anchor(format!("bad operator certificate: {e}")))?;
+    let pubkey_hex = doc
+        .get("operator")
+        .and_then(|t| t.get("pubkey"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Anchor("operator certificate missing pubkey".to_string()))?;
+    let pubkey = parse_pubkey(pubkey_hex, "operator pubkey")?;
+    // Verify the recovery signature (binds pubkey to this vault).
+    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
+        .map_err(|_| Error::Anchor("malformed operator certificate signature".to_string()))?;
+    recovery_pk
+        .verify(
+            &operator_cert_signing_bytes(vault_id, pubkey.as_bytes()),
+            &sig,
+        )
+        .map_err(|_| {
+            Error::Anchor(
+                "operator certificate signature does not verify: the recovery phrase does not match this vault"
+                    .to_string(),
+            )
+        })?;
+    Ok(pubkey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,10 +557,46 @@ mod tests {
             "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0",
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("already exists"), "{err}");
+        // create_new fails on existing file (no TOCTOU).
+        assert!(format!("{err}").contains("cannot write"), "{err}");
         // Original anchor untouched.
         let (anchor, _) = load(&cfg, &vault).unwrap();
         assert_eq!(anchor.operator, op);
+    }
+
+    #[test]
+    fn replace_swaps_atomically_with_strict_perms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let op = SigningKey::generate(&mut OsRng).verifying_key();
+        let rec = SigningKey::generate(&mut OsRng).verifying_key();
+        let age_recipient = "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0";
+
+        save(&cfg, &vault, &op, &rec, age_recipient).unwrap();
+
+        // Replace with a new recovery key.
+        let rec2 = SigningKey::generate(&mut OsRng).verifying_key();
+        replace(&cfg, &vault, &op, &rec2, age_recipient).unwrap();
+
+        let (anchor, warnings) = load(&cfg, &vault).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(anchor.operator, op);
+        assert_eq!(anchor.recovery, rec2);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(cfg.join(TRUST_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "replaced trust.toml must be 0600");
+        }
+        // No temp file left behind.
+        assert!(!cfg.join(".trust.toml.tmp").exists());
     }
 
     #[test]

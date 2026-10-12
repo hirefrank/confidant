@@ -1558,12 +1558,16 @@ fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> i
 /// env var (tests) or a fresh keypair stored via the keychain module.
 /// Returns `(bech32_secret, recipient_string)`.
 ///
-/// `CONFIDANT_TEST_DEVICE_KEY` (tests only) provides the key without
-/// counting as an enrollment for the B13 fresh-device check.
+/// `CONFIDANT_TEST_DEVICE_KEY` (only with the `test-overrides` feature,
+/// which CI enables via --all-features and release builds never do)
+/// provides the key without counting as an enrollment for the B13
+/// fresh-device check.
 fn provision_device_key() -> anyhow::Result<(String, String)> {
     use age::secrecy::ExposeSecret;
     use std::str::FromStr;
     // Test override: provides a key without enrolling (B13 ignores it).
+    // Feature-gated so production binaries never honor it.
+    #[cfg(feature = "test-overrides")]
     if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
         let trimmed = test_key.trim();
         if !trimmed.is_empty() {
@@ -1617,9 +1621,13 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     })?;
 
     // B1: refuse if the anchor already exists — it is a trust root and is
-    // never silently replaced.
+    // never silently replaced. With --force the existing anchor is
+    // replaced, but only AFTER every check and key step succeeds (never
+    // deleted up front: a failed init must not leave the device
+    // anchorless).
     let trust_path = config_dir.join(anchor::TRUST_FILE);
-    if trust_path.exists() && !force {
+    let trust_exists = trust_path.exists();
+    if trust_exists && !force {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!(
                 "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` on a new device, or pass --force)",
@@ -1627,14 +1635,6 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
             ))
             .with_fix("Run `confidant recover` with the recovery phrase on a new device"),
         ));
-    }
-    if trust_path.exists() && force {
-        std::fs::remove_file(&trust_path).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot remove existing trust anchor {}: {e}",
-                trust_path.display()
-            )))
-        })?;
     }
 
     // Git repo + clean tree required.
@@ -1653,16 +1653,16 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     let recovery = Recovery::generate();
     let (_device_bech32, device_recipient) = provision_device_key()?;
 
-    // B3: write the anchor via anchor::save (0700 dir / 0600 file).
-    anchor::save(
-        &config_dir,
-        root,
-        &operator_sk.verifying_key(),
-        &recovery.verifying_key(),
-        &recovery.age_identity().to_recipient_string(),
-    )
-    .map_err(anyhow::Error::new)?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    // B3: build the anchor in memory. It is persisted atomically only
+    // after every fallible key step succeeds (below): if the KeyStore
+    // work fails, no anchor pins a recovery key whose phrase was never
+    // shown, and a retry is clean.
+    let anchor = anchor::Anchor {
+        operator: operator_sk.verifying_key(),
+        recovery: recovery.verifying_key(),
+        recovery_age: recovery.age_identity().to_recipient_string(),
+        source: trust_path.clone(),
+    };
 
     // B4 + B6: KeyStore via with_config_dir (mandatory seq tracker).
     // Initialize the vault lookup key and the vault:shared client (⚠6).
@@ -1687,6 +1687,17 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
         .init_client(SHARED_CLIENT_ID, &recipients, &anchor, &operator_sk)
         .map_err(anyhow::Error::new)?;
 
+    // Fresh-device recovery: write the operator-pubkey certificate
+    // (signed by the recovery key) so a device with no trust.toml can
+    // rebuild trust from the keys/ tree. Committed with the keys/ tree.
+    anchor::write_operator_cert(
+        &keys_dir,
+        &vault.config.vault_id,
+        &operator_sk.verifying_key(),
+        recovery.signing_key(),
+    )
+    .map_err(anyhow::Error::new)?;
+
     // Commit the keys/ tree: check first (readers skip keys/, so it
     // passes), one commit. The .age files are binary, so they go through
     // the repo's git helper rather than the String-based FileChange.
@@ -1705,6 +1716,29 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
         .trim()
         .to_owned();
+
+    // Persist the anchor now that everything succeeded. Atomic
+    // temp-and-rename: a crash never leaves a half-written trust.toml.
+    // With --force this replaces the previous anchor.
+    if trust_exists {
+        anchor::replace(
+            &config_dir,
+            root,
+            &anchor.operator,
+            &anchor.recovery,
+            &anchor.recovery_age,
+        )
+        .map_err(anyhow::Error::new)?;
+    } else {
+        anchor::save(
+            &config_dir,
+            root,
+            &anchor.operator,
+            &anchor.recovery,
+            &anchor.recovery_age,
+        )
+        .map_err(anyhow::Error::new)?;
+    }
 
     // B5: phrase exactly once on stderr; stdout JSON carries ok, vault,
     // and opaque paths — no phrase, no key material.
@@ -1738,16 +1772,19 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
     let no_input = cli.no_input;
 
     // B7: phrase via stdin or --phrase-file only — never argv.
-    let phrase = if let Some(path) = phrase_file {
-        std::fs::read_to_string(path)
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::usage(format!(
-                    "--phrase-file {} unreadable: {e}",
-                    path.display()
-                )))
-            })?
-            .trim()
-            .to_string()
+    // Wrapped in Zeroizing: the plaintext phrase is wiped on drop.
+    let phrase: zeroize::Zeroizing<String> = if let Some(path) = phrase_file {
+        zeroize::Zeroizing::new(
+            std::fs::read_to_string(path)
+                .map_err(|e| {
+                    anyhow::Error::new(DomainError::usage(format!(
+                        "--phrase-file {} unreadable: {e}",
+                        path.display()
+                    )))
+                })?
+                .trim()
+                .to_string(),
+        )
     } else {
         let mut buf = String::new();
         use std::io::Read;
@@ -1756,7 +1793,7 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
                 "cannot read phrase from stdin: {e}"
             )))
         })?;
-        buf.trim().to_string()
+        zeroize::Zeroizing::new(buf.trim().to_string())
     };
     if phrase.is_empty() {
         return Err(anyhow::Error::new(DomainError::usage(
@@ -1790,29 +1827,6 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
         ))
     })?;
 
-    // The operator public key must be available to re-pin the anchor. On
-    // a device with a config backup, trust.toml provides it; otherwise
-    // recovery cannot proceed (the phrase alone does not encode it).
-    // The operator public key must be available to re-pin the anchor. On
-    // a device with a config backup, trust.toml provides it; otherwise
-    // recovery cannot proceed (the phrase alone does not encode it).
-    // The phrase must be for THIS vault: the recovery public key in the
-    // anchor must match the phrase-derived one.
-    let (anchor, _) = anchor::load(&config_dir, root).map_err(|_| {
-        anyhow::Error::new(
-            DomainError::invalid(
-                "no trust anchor found; cannot recover without the operator public key",
-            )
-            .with_fix("Restore trust.toml from a config backup, then retry"),
-        )
-    })?;
-    if anchor.recovery != old_recovery.verifying_key() {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "recovery phrase does not match this vault's trust anchor",
-        )));
-    }
-    let operator_pubkey = anchor.operator;
-
     require_git_repo(root, no_input)?;
     let status = confidant_core::write::git(root, &["status", "--porcelain"], no_input)?;
     if !status.trim().is_empty() {
@@ -1823,6 +1837,39 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
 
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
+
+    // Load the trust anchor. On a fresh device (no trust.toml, no config
+    // backup), rebuild it from the vault's keys/ tree: the operator
+    // certificate (written at init, signed by the recovery key) is
+    // verified against the phrase-derived recovery pubkey. This is the
+    // lost-device path — the phrase alone re-establishes trust.
+    let anchor = match anchor::load(&config_dir, root) {
+        Ok((a, _warnings)) => {
+            // The phrase must be for THIS vault: the recovery public key
+            // in the anchor must match the phrase-derived one.
+            if a.recovery != old_recovery.verifying_key() {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "recovery phrase does not match this vault's trust anchor",
+                )));
+            }
+            a
+        }
+        Err(_) => {
+            let operator_pubkey = anchor::verify_operator_cert(
+                &keys_dir,
+                &vault.config.vault_id,
+                &old_recovery.verifying_key(),
+            )
+            .map_err(anyhow::Error::new)?;
+            anchor::Anchor {
+                operator: operator_pubkey,
+                recovery: old_recovery.verifying_key(),
+                recovery_age: old_recovery.age_identity().to_recipient_string(),
+                source: config_dir.join(anchor::TRUST_FILE),
+            }
+        }
+    };
+    let operator_pubkey = anchor.operator;
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
             .map_err(anyhow::Error::new)?;
@@ -1872,17 +1919,17 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
             &old_identity,
         )
         .map_err(anyhow::Error::new)?;
-    // Re-pin: replace trust.toml with the new recovery halves (operator
-    // unchanged). anchor::save refuses to overwrite, so remove first —
-    // the old anchor was already validated above.
+
+    // Show the new phrase BEFORE swapping the anchor: if anything below
+    // fails, the operator still holds the phrase for the rotated
+    // recovery. (B5 channel rules: stderr once, never in --json stdout.)
+    display_phrase_once(no_input, &new_recovery.phrase())?;
+
+    // Re-pin: atomically replace trust.toml with the new recovery halves
+    // (operator unchanged). Temp-file + rename: a crash never leaves a
+    // half-written or missing anchor.
     let trust_path = config_dir.join(anchor::TRUST_FILE);
-    std::fs::remove_file(&trust_path).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot replace trust anchor {}: {e}",
-            trust_path.display()
-        )))
-    })?;
-    anchor::save(
+    anchor::replace(
         &config_dir,
         root,
         &operator_pubkey,
@@ -1891,8 +1938,22 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
     )
     .map_err(anyhow::Error::new)?;
 
+    // Re-sign the manifests with the new recovery key. `rotate_recovery`
+    // signed them with the OLD recovery key, but the re-pinned anchor
+    // only trusts the new one — without this, every subsequent
+    // verification fails. Verify against the OLD anchor (still valid
+    // for the old signatures).
+    for client_id in &clients {
+        store
+            .resign_manifest(client_id, &anchor, new_recovery.signing_key())
+            .map_err(anyhow::Error::new)?;
+    }
+
     // Authorize the new device on every client (same path #66 reuses):
     // re-wrap each data key to the new device + new recovery.
+    // Note: this drops every OTHER device's wrappings — recover is the
+    // lost-device path, so only the new device is enrolled. Use
+    // `keys device-add` (#66) to enroll additional devices afterwards.
     let (new_anchor, _) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
     for (client_id, key) in &data_keys {
         store
@@ -1939,9 +2000,8 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
         .trim()
         .to_owned();
 
-    // New phrase follows B5's channel rules.
-    display_phrase_once(no_input, &new_recovery.phrase())?;
-
+    // The new phrase was already displayed (once, on stderr) before the
+    // anchor swap above — it is not repeated here.
     if json {
         print_json(&ok_envelope(
             Some(root),
@@ -1950,11 +2010,13 @@ fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Re
                 "keys_dir": keys_dir.display().to_string(),
                 "commit": commit,
                 "clients_recovered": clients,
+                "note": "only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery)",
             }),
         ))?;
     } else {
         println!("recovered {} client(s); anchor re-pinned", clients.len());
         println!("committed ({})", &commit[..8.min(commit.len())]);
+        println!("note: only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery). Enroll more devices with `keys device-add`.");
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -55,6 +55,19 @@ use zeroize::Zeroizing;
 /// [`KeyStore::verified_recipients`]).
 type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>, Vec<CommitmentEntry>);
 
+/// True if `name` is a retained-epoch wrapping file: `<key-id>.e<digits>.age`.
+/// Matches the `.e<digits>` suffix exactly so key ids that merely contain
+/// ".e" are not mistaken for history files.
+fn is_retained_epoch_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".age") else {
+        return false;
+    };
+    let Some((_, suffix)) = stem.rsplit_once(".e") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Manages the `keys/` tree of one vault.
 #[derive(Debug)]
 pub struct KeyStore {
@@ -600,9 +613,11 @@ impl KeyStore {
         for entry in std::fs::read_dir(&wdir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            // Only touch current-epoch wrappings; retained `.e<epoch>`
-            // files are history.
-            if name.ends_with(".age") && !name.contains(".e") && !keep.contains(&name) {
+            // Only touch current-epoch wrappings; retained `.e<digits>`
+            // history files are never removed here. Match the suffix
+            // exactly — a loose `.e` substring check would also catch
+            // key ids that merely contain ".e".
+            if name.ends_with(".age") && !is_retained_epoch_file(&name) && !keep.contains(&name) {
                 std::fs::remove_file(entry.path())?;
             }
         }
@@ -610,6 +625,26 @@ impl KeyStore {
         // Commitments are unchanged (same key, same epoch); carry them
         // forward from the verified buffer.
         self.write_manifest(client_id, epoch, recipients, &commitments, signing_sk)?;
+        Ok(())
+    }
+
+    /// Re-sign a client's manifest with a new key, changing nothing else.
+    ///
+    /// Verifies against `anchor` first (the manifest is still signed by
+    /// the previous trust-anchor member), then writes the same epoch,
+    /// recipients, and commitments with a bumped seq signed by
+    /// `signing_sk`. Used when trust-anchor signing membership rotates:
+    /// after `recover` re-pins the anchor to a new recovery key,
+    /// manifests signed by the old recovery key must become verifiable
+    /// against the new anchor before further key operations.
+    pub fn resign_manifest(
+        &mut self,
+        client_id: &str,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<(), Error> {
+        let (epoch, recipients, commitments) = self.verified_recipients(client_id, anchor)?;
+        self.write_manifest(client_id, epoch, &recipients, &commitments, signing_sk)?;
         Ok(())
     }
 

@@ -131,6 +131,77 @@ fn extract_phrase(stderr: &str) -> String {
 }
 
 #[test]
+fn recover_without_prior_config() {
+    // Fresh-device recovery (Frank decision 2026-10-12): no trust.toml,
+    // no config backup. The operator certificate in keys/ (signed by
+    // the recovery key at init) is verified against the phrase-derived
+    // recovery pubkey, rebuilding trust from the vault alone.
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+
+    // Simulate a lost device: wipe the entire config dir.
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    assert!(!h.trust_toml().exists());
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fresh-device recover failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Trust is rebuilt: trust.toml exists with the new recovery pin.
+    let trust = h.trust_toml();
+    assert!(trust.is_file(), "trust.toml not rebuilt");
+    let text = std::fs::read_to_string(&trust).unwrap();
+    assert!(text.contains("operator_pubkey"), "{text}");
+    assert!(text.contains("recovery_pubkey"), "{text}");
+
+    // The new phrase was shown exactly once on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let new_phrase = extract_phrase(&stderr);
+    assert_ne!(new_phrase, phrase, "recovery must rotate the phrase");
+    assert_eq!(stderr.matches(new_phrase.as_str()).count(), 1);
+}
+
+#[test]
+fn init_writes_operator_certificate() {
+    // The operator certificate (for fresh-device recover) is written
+    // at init, signed by the recovery key, and committed with keys/.
+    let h = Harness::new();
+    assert!(h.init(&[]).status.success());
+    let cert = h.vault.join("keys/operator.toml");
+    let sig = h.vault.join("keys/operator.sig");
+    assert!(cert.is_file(), "operator certificate missing");
+    assert!(sig.is_file(), "operator certificate signature missing");
+    let text = std::fs::read_to_string(&cert).unwrap();
+    assert!(text.contains("pubkey"), "{text}");
+    // Committed to git.
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(&h.vault)
+        .args(["ls-files", "keys/"])
+        .output()
+        .unwrap();
+    let files = String::from_utf8_lossy(&log.stdout);
+    assert!(files.contains("keys/operator.toml"), "{files}");
+    assert!(files.contains("keys/operator.sig"), "{files}");
+}
+
+#[test]
 fn init_writes_anchor_enrolls_device_key_commits_key_tree() {
     let h = Harness::new();
     let out = h.init(&[]);
@@ -263,17 +334,18 @@ fn recover_rejects_phrase_argv_exit_2() {
 }
 
 #[test]
-#[ignore = "Test harness issue: see recover_rebuilds_alias_index_fresh_lookup_key. TODO: fix harness."]
 fn recover_requires_fresh_device() {
     // B13: a device with a key enrolled cannot recover. The harness sets
     // CONFIDANT_DEVICE_KEY (simulating an enrolled device); recover must
-    // refuse with a pointer to #66.
+    // refuse with a pointer to #66. Use the real init phrase so phrase
+    // validation (B8) passes and the B13 check is what triggers.
     let h = Harness::new();
     let out = h.init(&[]);
     assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
     // h still has CONFIDANT_DEVICE_KEY set from Harness::new → enrolled.
     let phrase_file = h.home.join("phrase");
-    std::fs::write(&phrase_file, "abandon ".repeat(24).trim()).unwrap();
+    std::fs::write(&phrase_file, &phrase).unwrap();
     let out = h
         .cmd(&["recover", "--json", "--no-input"])
         .arg("--phrase-file")
@@ -284,11 +356,11 @@ fn recover_requires_fresh_device() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let msg = v["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("already has a device key"), "{msg}");
-    assert!(msg.contains("#66"), "{msg}");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(fix.contains("#66"), "{fix}");
 }
 
 #[test]
-#[ignore = "Test harness issue: signature verification fails in the automated test environment despite the code being manually verified working. The crypto-level drill test covers the key logic. TODO: fix harness."]
 fn recover_rebuilds_alias_index_fresh_lookup_key() {
     // B12: CLI-level mirror of the crypto drill. Init, then recover with
     // the phrase and a new device key. The lookup key must be fresh (not
@@ -332,7 +404,6 @@ fn recover_rebuilds_alias_index_fresh_lookup_key() {
 }
 
 #[test]
-#[ignore = "Test harness issue: see recover_rebuilds_alias_index_fresh_lookup_key. TODO: fix harness."]
 fn recover_rotates_recovery_and_repins_before_next_op() {
     // B11: after recover, the anchor is re-pinned with the NEW recovery
     // (proves the re-pin happened before further ops).

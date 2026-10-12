@@ -520,6 +520,16 @@ vault-wide keypair:
   run `inbox rotate` on the new device and re-pin (§8a). It also does not
   restore the vault lookup key (§10): the operator generates a fresh one
   and rebuilds the alias index from the decrypted alias values.
+- **Fresh-device recovery** (no `trust.toml`, no config backup): at
+  `init`, the CLI writes `keys/operator.toml` + `keys/operator.sig` — the
+  operator Ed25519 pubkey, signed by the recovery Ed25519 key (spec §14).
+  On a fresh device, `recover` verifies this certificate against the
+  phrase-derived recovery pubkey and rebuilds the trust anchor from the
+  verified operator pubkey. The signature binds the pubkey to the vault
+  id; a transplanted or forged certificate fails closed. The anchor is
+  re-saved atomically, only after the new recovery phrase has been shown.
+  Vaults initialized before the certificate existed still require a
+  config backup for recovery.
 
 ## 10. Alias HMAC
 
