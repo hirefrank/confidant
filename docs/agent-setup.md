@@ -14,14 +14,16 @@ Set up Confidant (a git-native CRM CLI plus agent skills) on this machine:
    (No Rust toolchain? Download the `confidant` binary + installer from
    the latest GitHub Release at
    https://github.com/hirefrank/confidant/releases instead — and verify
-   it first: check the published `.sha256` checksum file, or run
-   `gh attestation verify <binary>` for build provenance.)
+   the downloaded `.tar.xz`/`.zip` first: check the published `.sha256`
+   checksum file (that's what it covers), or run
+   `gh attestation verify <archive> --repo hirefrank/confidant` for build
+   provenance.)
 2. Clone the Confidant repo (it carries the skills):
    `git clone https://github.com/hirefrank/confidant <dir>`
    (ask me where; suggest `~/Projects/confidant`). This checkout is what
    keeps the skills working — do not delete it afterwards. Then pin it to
    the latest release tag (never stay on main — see Staying current):
-   `git -C <dir> checkout $(git -C <dir> describe --tags --abbrev=0 origin/main)`.
+   `git -C <dir> checkout $(git -C <dir> describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)`.
 3. Make the skills visible to yourself: symlink every directory directly
    under `<repo>/skills/` that contains a `SKILL.md` into your agent
    skills directory (`~/.config/opencode/skills/` for OpenCode,
@@ -53,9 +55,10 @@ here so it stays one:
   tag — never main. Skills run on devices holding plaintext client data,
   so they track reviewed, published releases, not whatever merged last.
   Periodically: `git -C <repo> fetch --tags`, then `git -C <repo>
-  checkout $(git -C <repo> describe --tags --abbrev=0 origin/main)`. If a
-  new directory appears under `<repo>/skills/`, link it the same way as
-  step 3.
+  checkout $(git -C <repo> describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)`.
+  (The `--match`/`--exclude` keep stray or prerelease tags from being
+  picked.) If a new directory appears under `<repo>/skills/`, link it the
+  same way as step 3.
 - **CLI:** compare `confidant --version` against the latest GitHub Release
   (https://github.com/hirefrank/confidant/releases). If behind, re-run
   `cargo install confidant-cli` (or the release installer).
