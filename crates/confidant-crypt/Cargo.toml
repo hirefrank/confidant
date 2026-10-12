@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Encryption for Confidant vaults (milestone 2: age + XChaCha20-Poly1305 per docs/crypto-design.md). Not yet independently audited — see the repository README."
+readme = "README.md"
 # Publishable since 2026-10-12: the crates.io release is how `cargo install
 # confidant-cli` resolves its dependencies, and publishing is disclosed as
 # unaudited (README Status + this crate's README + the description above).
