@@ -319,10 +319,13 @@ above.
   (private key never leaves it). Onboarding takes **only the public key**
   from the operator — via QR, file, or paste. No agent or device private
   key is ever transmitted, moved, or escrowed, including during onboarding.
-  The operator wraps each authorized client data key (and the vault lookup
-  key) to the new public key, appends to `recipients.toml`, re-signs the
-  manifest. One commit per change, and the change itself must be in a
-  commit signed by an already-trusted key (ADR-4).
+  The operator wraps each authorized client data key to the new public key,
+  appends to `recipients.toml`, re-signs the manifest. The operator **must
+  also re-wrap the vault lookup key** (`keys/vault/lookup.age`) to the new
+  device: an existing device unwraps it and re-wraps to the current
+  recipient set including the new device, or the new device cannot compute
+  alias HMACs (§10). One commit per change, and the change itself must be in
+  a commit signed by an already-trusted key (ADR-4).
 - **Remove device/agent (revocation):** re-wrap keys without the revoked
   recipient, update + re-sign the manifest, commit. Re-wrapping covers
   **all retained epochs**, not just the current one: the revoked party's
@@ -514,7 +517,9 @@ vault-wide keypair:
   unwrap all client data keys → wrap them to a fresh device key → rotate to
   a fresh recovery identity and revoke the old one. Works from a clean
   clone with nothing but the phrase. It does not restore the inbox key:
-  run `inbox rotate` on the new device and re-pin (§8a).
+  run `inbox rotate` on the new device and re-pin (§8a). It also does not
+  restore the vault lookup key (§10): the operator generates a fresh one
+  and rebuilds the alias index from the decrypted alias values.
 
 ## 10. Alias HMAC
 
@@ -527,10 +532,19 @@ hmac = HMAC(vault_lookup_key, normalized_value)
 ```
 
 The **vault lookup key** is generated at `init` and wrapped with age to each
-device/agent like a data key (`keys/vault/lookup.age`, covered by the
-signed recipient manifest). The real alias values live encrypted in the
-profile. `HEX` is at least 32 hex chars (spec §6). Importers match on
-aliases by recomputing the HMAC of the normalized value.
+device and agent that needs alias lookups (`keys/vault/lookup.age`, covered
+by the signed recipient manifest). It is **device-only by design, never
+wrapped to the recovery key** — unlike client data keys, which are always
+recovery-wrapped (§9). Rationale: the lookup key is only an HMAC key. Every
+alias value lives encrypted under its client's recovery-wrapped data key,
+so after a full device-loss recovery nothing is lost: recover the client
+keys, decrypt the aliases, generate a fresh lookup key, and rebuild the
+index. Recovery-wrapping the lookup key would buy no privacy (the recovery
+phrase already opens all client data) and would add one more wrapping every
+shred and recovery rotation has to re-wrap and verify. The real alias
+values live encrypted in the profile. `HEX` is at least 32 hex chars
+(spec §6). Importers match on aliases by recomputing the HMAC of the
+normalized value.
 
 ## 11. Threat model
 
@@ -875,3 +889,14 @@ whitespace `person` errors for every record type, `org` included; only
 `None` routes to `vault:shared`. `client_id_for_record` requires the `p-`
 person-id prefix and rejects `/`, `\`, `..`, and reserved `vault:` ids.
 
+
+## 24. Lookup key device-only (2026-10-11)
+
+Per Silas's call on #98 ([crypto-review]): the vault lookup key is
+device-only by design, never recovery-wrapped. §10 states the rule and the
+rationale (HMAC-only key; alias values are encrypted under recovery-wrapped
+client keys, so recovery rebuilds the index with a fresh key; not wrapping
+keeps the shred/recovery re-wrap surface small). §9 notes `confidant
+recover` does not restore the lookup key. §6 makes the add-device handoff
+explicit: a new device must receive the current lookup key re-wrapped from
+an existing device. `init_lookup_key` / `write_lookup_raw` unchanged.
