@@ -83,7 +83,7 @@ impl Fixture {
         let seq_tracker =
             confidant_crypt::manifest::SeqTracker::load(&config_dir.join("manifest-seq.toml"))
                 .unwrap();
-        let mut keys = KeyStore::new(keys_dir, "vault-01").with_seq_tracker(seq_tracker);
+        let mut keys = KeyStore::new(keys_dir, "vault-01", seq_tracker);
         keys.init_lookup_key(std::slice::from_ref(&device_recipient), &operator_sk)
             .unwrap();
 

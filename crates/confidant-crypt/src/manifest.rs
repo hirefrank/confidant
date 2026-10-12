@@ -331,6 +331,16 @@ pub fn verify(
     Ok(from_toml(toml_bytes)?.1)
 }
 
+/// Conventional on-disk location of the seq tracker: next to `trust.toml`
+/// in the operator config dir (`~/.config/confidant/manifest-seq.toml`).
+///
+/// One definition so writers and readers cannot disagree about the path
+/// (issue #134). A missing file is a valid fresh state — see
+/// [`SeqTracker::load`].
+pub fn seq_tracker_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("manifest-seq.toml")
+}
+
 /// Off-vault high-water marks for manifest sequence numbers.
 ///
 /// Kept next to `trust.toml` (e.g. `~/.config/confidant/manifest-seq.toml`).

@@ -60,7 +60,8 @@ type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>, Vec<CommitmentE
 pub struct KeyStore {
     keys_dir: PathBuf,
     vault_id: String,
-    seq: Option<SeqTracker>,
+    /// Off-vault seq high-water marks. Required — see [`KeyStore::new`].
+    seq: SeqTracker,
 }
 
 /// What `doctor` reports for one client's recipient manifest.
@@ -84,19 +85,32 @@ pub enum ManifestState {
 }
 
 impl KeyStore {
-    pub fn new(keys_dir: PathBuf, vault_id: &str) -> Self {
+    /// Construct with the off-vault seq high-water tracker.
+    ///
+    /// The tracker is **required** (issue #134): without it the
+    /// `seq < min_seq` replay refusal is a no-op, so there is no
+    /// tracker-less constructor. A missing tracker *file* loads as "no
+    /// marks yet" ([`SeqTracker::load`]), which is the normal fresh-device
+    /// state — bootstrap needs no special case and no fail-open path.
+    pub fn new(keys_dir: PathBuf, vault_id: &str, seq: SeqTracker) -> Self {
         KeyStore {
             keys_dir,
             vault_id: vault_id.to_string(),
-            seq: None,
+            seq,
         }
     }
 
-    /// Attach the off-vault seq high-water tracker (next to `trust.toml`).
-    /// Without it, manifest seq replay checks are skipped — tests only.
-    pub fn with_seq_tracker(mut self, tracker: SeqTracker) -> Self {
-        self.seq = Some(tracker);
-        self
+    /// Construct with the tracker loaded from its conventional location
+    /// under `config_dir` (next to `trust.toml`; see
+    /// [`manifest::seq_tracker_path`]). The single place that decides
+    /// where the tracker lives for production callers.
+    pub fn with_config_dir(
+        keys_dir: PathBuf,
+        vault_id: &str,
+        config_dir: &std::path::Path,
+    ) -> Result<Self, Error> {
+        let tracker = SeqTracker::load(&manifest::seq_tracker_path(config_dir))?;
+        Ok(Self::new(keys_dir, vault_id, tracker))
     }
 
     fn client_dir(&self, client_id: &str) -> PathBuf {
@@ -220,17 +234,11 @@ impl KeyStore {
     }
 
     fn high_water(&self, client_id: &str) -> u64 {
-        self.seq
-            .as_ref()
-            .map(|t| t.high_water(&self.vault_id, client_id))
-            .unwrap_or(0)
+        self.seq.high_water(&self.vault_id, client_id)
     }
 
     fn advance_seq(&mut self, client_id: &str, seq: u64) -> Result<(), Error> {
-        if let Some(t) = self.seq.as_mut() {
-            t.advance(&self.vault_id, client_id, seq)?;
-        }
-        Ok(())
+        self.seq.advance(&self.vault_id, client_id, seq)
     }
 
     fn write_manifest(
@@ -920,7 +928,8 @@ impl KeyStore {
         // The seq comes from the manifest buffer the caller already
         // verified (plus the off-vault high-water mark) — never a re-read
         // of the on-disk file, which could have changed since verification
-        // (#136 item 1).
+        // (#136 item 1). `self.high_water` reads the mandatory tracker
+        // directly (#134).
         let seq = verified_seq.max(self.high_water(VAULT_CLIENT_ID)) + 1;
         let toml = manifest::to_toml(seq, new_recipients, commitments)?;
         let sig = manifest::sign(operator_sk, &self.vault_id, VAULT_CLIENT_ID, 1, seq, &toml);

@@ -1365,38 +1365,68 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
             // and stay quiet.
             let keys_dir = root.join("keys");
             if keys_dir.is_dir() {
-                let store =
-                    confidant_crypt::lifecycle::KeyStore::new(keys_dir, &vault.config.vault_id);
-                let mut corrupt: Vec<String> = Vec::new();
-                let mut valid = 0u64;
-                for client_id in store.manifest_clients() {
-                    match store.manifest_state(&client_id) {
-                        confidant_crypt::lifecycle::ManifestState::Valid(_) => valid += 1,
-                        confidant_crypt::lifecycle::ManifestState::Corrupt(reason) => {
-                            corrupt.push(format!("{client_id} ({reason})"));
-                        }
-                        confidant_crypt::lifecycle::ManifestState::Absent => {}
-                    }
-                }
-                if corrupt.is_empty() {
-                    checks.push(DoctorCheck {
-                        id: "crypto-manifests",
-                        status: "ok",
-                        message: if valid == 0 {
-                            "no key manifests yet".to_owned()
-                        } else {
-                            format!("{valid} key manifest(s) parse")
-                        },
-                    });
-                } else {
-                    checks.push(DoctorCheck {
+                // The seq tracker is mandatory (issue #134); resolve its
+                // conventional location from HOME. A tracker we cannot load
+                // is reported, not skipped: without it the replay check is
+                // a no-op.
+                match confidant_config_dir() {
+                    None => checks.push(DoctorCheck {
                         id: "crypto-manifests",
                         status: "error",
-                        message: format!(
-                            "corrupt key manifest(s); fix or re-init before crypto operations: {}",
-                            corrupt.join("; ")
-                        ),
-                    });
+                        message: "cannot locate the config dir (HOME unset); \
+                                  the manifest seq tracker cannot be checked"
+                            .to_owned(),
+                    }),
+                    Some(config_dir) => {
+                        match confidant_crypt::lifecycle::KeyStore::with_config_dir(
+                            keys_dir,
+                            &vault.config.vault_id,
+                            &config_dir,
+                        ) {
+                            Err(e) => checks.push(DoctorCheck {
+                                id: "crypto-manifests",
+                                status: "error",
+                                message: format!("manifest seq tracker unreadable: {e}"),
+                            }),
+                            Ok(store) => {
+                                let mut corrupt: Vec<String> = Vec::new();
+                                let mut valid = 0u64;
+                                for client_id in store.manifest_clients() {
+                                    match store.manifest_state(&client_id) {
+                                        confidant_crypt::lifecycle::ManifestState::Valid(_) => {
+                                            valid += 1
+                                        }
+                                        confidant_crypt::lifecycle::ManifestState::Corrupt(
+                                            reason,
+                                        ) => {
+                                            corrupt.push(format!("{client_id} ({reason})"));
+                                        }
+                                        confidant_crypt::lifecycle::ManifestState::Absent => {}
+                                    }
+                                }
+                                if corrupt.is_empty() {
+                                    checks.push(DoctorCheck {
+                                        id: "crypto-manifests",
+                                        status: "ok",
+                                        message: if valid == 0 {
+                                            "no key manifests yet".to_owned()
+                                        } else {
+                                            format!("{valid} key manifest(s) parse")
+                                        },
+                                    });
+                                } else {
+                                    checks.push(DoctorCheck {
+                                        id: "crypto-manifests",
+                                        status: "error",
+                                        message: format!(
+                                            "corrupt key manifest(s); fix or re-init before crypto operations: {}",
+                                            corrupt.join("; ")
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1530,6 +1560,12 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `~/.config/confidant`: the operator config dir, where `trust.toml` and
+/// the manifest seq tracker live. `None` when `HOME` is unset.
+fn confidant_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("confidant"))
 }
 
 fn discover(flag: Option<&std::path::Path>) -> Result<(PathBuf, Option<UserConfig>), DomainError> {
