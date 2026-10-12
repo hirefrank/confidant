@@ -12,7 +12,8 @@ elsewhere breaks it. The supported setup is [`docs/agent-setup.md`](../docs/agen
 clone the repo, symlink each `skills/<name>/` directory (whole directory,
 not just `SKILL.md`) into the agent's skills dir, set `CONFIDANT_VAULT`.
 That page also holds the single copy/paste install prompt and the update
-loop (`git pull` for skills, `cargo install` for the CLI).
+loop (fetch tags + check out the latest release tag for skills,
+`cargo install` for the CLI).
 
 ## The uniform workflow
 
