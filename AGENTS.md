@@ -168,3 +168,17 @@ These are blocking. Do not open a PR for review that breaks one.
 Update this file in the same PR when you change a CI command, the repo
 layout, or a rule above. Keep it short: link to the spec and docs rather
 than copying them.
+
+## Learned User Preferences
+
+- When syncing `main` to `origin/main` or setting `core.hooksPath`, run git
+  in `~/Projects/confidant` unless `main` is already checked out in the
+  current worktree.
+
+## Learned Workspace Facts
+
+- The primary clone where `main` usually lives is `~/Projects/confidant`;
+  Cursor agent worktrees are under `~/.cursor/worktrees/confidant/`.
+- Only one worktree may have `main` checked out; with `main` on the primary
+  clone, `git checkout main` in a Cursor worktree fails because `main` is
+  already in use there.
