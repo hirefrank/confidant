@@ -23,7 +23,9 @@ fn make_vault() -> tempfile::TempDir {
     let root = dir.path();
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        // Spec 3 (B10): the plaintext-write fixture declares the opt-out,
+        // so the suite keeps exercising the plaintext path.
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -865,13 +867,19 @@ fn doctor_reports_expected_checks() {
         .iter()
         .find(|c| c["id"] == "crypto")
         .unwrap();
-    // The crypto crate is present but the CLI write path is not wired yet:
-    // doctor warns plainly instead of reporting "ok" or "unknown".
-    assert_eq!(crypto["status"], "warning");
-    assert!(crypto["message"]
-        .as_str()
+    // Spec 3: the CLI write path encrypts by default; this fixture vault
+    // opts out via [crypto] mode = "plaintext", so doctor reports ok and
+    // names the opt-out.
+    assert_eq!(crypto["status"], "ok");
+    assert!(crypto["message"].as_str().unwrap().contains("opts out"));
+    // The record-encryption mix check is present (code + count only).
+    let mix = v["checks"]
+        .as_array()
         .unwrap()
-        .contains("stored as plaintext"));
+        .iter()
+        .find(|c| c["id"] == "record-encryption-mix")
+        .expect("record-encryption-mix check missing");
+    assert_eq!(mix["status"], "ok");
 }
 
 #[test]

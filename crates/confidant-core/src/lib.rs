@@ -12,6 +12,7 @@ pub mod bench;
 pub mod check;
 pub mod config;
 pub mod context;
+pub mod crypto_mode;
 pub mod discover;
 pub mod error;
 pub mod id;

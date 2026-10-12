@@ -22,11 +22,31 @@ pub(crate) enum AppliedChange {
 }
 /// Apply planned writes to the working tree, recording previous bytes for
 /// revert. Uses atomic replace (`paths::write_replace`).
+///
+/// Spec 3 (B11): a `RecordWrite` into a structurally encrypted vault fails
+/// closed — inbox transcripts must never land as plaintext. Ledger appends
+/// stay plaintext by design (spec §3).
 pub(crate) fn apply_writes(
     vault_root: &Path,
     writes: &[PlannedWrite],
     applied: &mut Vec<AppliedChange>,
 ) -> anyhow::Result<()> {
+    if writes
+        .iter()
+        .any(|w| matches!(w, PlannedWrite::RecordWrite { .. }))
+        && crate::crypto_mode::is_structurally_encrypted(vault_root)
+    {
+        return Err(anyhow::Error::new(
+            crate::error::DomainError::invalid(
+                "inbox: refusing to write a transcript record into an encrypted vault; \
+                 inbox RecordWrite cannot encrypt yet and must not write plaintext",
+            )
+            .with_fix(
+                "Track encrypted inbox ingestion on issue #148; until then, add the \
+                 record with `confidant record add` / `confidant note add`, which encrypt",
+            ),
+        ));
+    }
     for w in writes {
         match w {
             PlannedWrite::LedgerAppend { file, lines } => {
@@ -152,4 +172,62 @@ pub(crate) fn commit_applied(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vault_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn inbox_recordwrite_fails_closed_on_encrypted_vault() {
+        // B11: a RecordWrite into a structurally encrypted vault fails
+        // closed — never writes plaintext. LedgerAppend is unaffected.
+        let dir = vault_dir();
+        let root = dir.path();
+        // Structurally encrypted: a keys/ tree exists.
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/operator.toml"), "# placeholder\n").unwrap();
+
+        let writes = vec![PlannedWrite::RecordWrite {
+            path: PathBuf::from("people/p-01ABC/profile.md"),
+            content: "---\nid: p-01ABC\ntype: person\n---\n".to_string(),
+        }];
+        let mut applied = Vec::new();
+        let err = apply_writes(root, &writes, &mut applied).unwrap_err();
+        assert!(
+            err.to_string().contains("encrypted vault"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !root.join("people/p-01ABC/profile.md").exists(),
+            "no plaintext may be written"
+        );
+        assert!(applied.is_empty());
+
+        // LedgerAppend still goes through on the same vault.
+        let writes = vec![PlannedWrite::LedgerAppend {
+            file: PathBuf::from("ledger/2026/10.cfd"),
+            lines: vec!["2026-10-12 open p-01ABC package pkg-1 4 sessions".to_string()],
+        }];
+        let mut applied = Vec::new();
+        apply_writes(root, &writes, &mut applied).unwrap();
+        assert!(root.join("ledger/2026/10.cfd").exists());
+    }
+
+    #[test]
+    fn inbox_recordwrite_allowed_on_plaintext_vault() {
+        let dir = vault_dir();
+        let root = dir.path();
+        let writes = vec![PlannedWrite::RecordWrite {
+            path: PathBuf::from("people/p-01ABC/profile.md"),
+            content: "---\nid: p-01ABC\ntype: person\n---\n".to_string(),
+        }];
+        let mut applied = Vec::new();
+        apply_writes(root, &writes, &mut applied).unwrap();
+        assert!(root.join("people/p-01ABC/profile.md").exists());
+    }
 }

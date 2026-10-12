@@ -43,12 +43,14 @@ pub fn is_available() -> bool {
 
 /// True when the CLI write path actually encrypts vault content.
 ///
-/// This is separate from [`is_available`]: the crate can encrypt, but until
-/// the CLI wiring lands (`note add`, `log session --note`, etc. still write
-/// plaintext), `doctor` must not report the crypto check as `ok`. Key the
-/// doctor check off this, not off `is_available`.
+/// This is separate from [`is_available`]: the crate can encrypt, and since
+/// spec 3 (issue #148) the CLI write path does — `record add`, `note add`,
+/// and `log session --note` write §14 envelopes on encrypted vaults, and
+/// inbox `RecordWrite` fails closed there. `mode = "plaintext"` in
+/// `confidant.toml` is a per-vault writer opt-out for vaults that hold no
+/// real data; it never re-flips this global flag or the disclosure.
 pub fn writes_encrypted() -> bool {
-    false
+    true
 }
 
 /// Resolve the device age identity.
