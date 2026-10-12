@@ -1959,7 +1959,7 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
             "check failed before committing the keys/ tree; refusing to commit a broken vault",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &["commit", "-m", "init: trust anchor and vault keys"],
@@ -2313,7 +2313,7 @@ fn cmd_recover(
             "check failed before committing the recovered keys/ tree",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &[
@@ -2845,7 +2845,7 @@ fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Resu
             "check failed before committing keys/ tree",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &["commit", "-m", &format!("keys: init-client {client_id}")],
@@ -2893,7 +2893,7 @@ fn cmd_keys_rotate(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Ex
             "check failed before committing keys/ tree",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &[
@@ -2950,7 +2950,7 @@ fn cmd_keys_revoke(
             "check failed before committing keys/ tree",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &[
@@ -3324,7 +3324,7 @@ fn cmd_keys_device_add_from_request(
             )),
         ));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &[
@@ -3353,6 +3353,27 @@ fn cmd_keys_device_add_from_request(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Remove leftover `keys/.confidant-tmp-*` files from a crashed atomic
+/// write, then stage the `keys/` tree. The recovery-recipients denylist is
+/// written via temp-and-rename; a hard crash can leave the temp behind, and
+/// a bare `git add -- keys` would commit it (#156 nit 1).
+fn stage_keys(root: &Path, no_input: bool) -> anyhow::Result<()> {
+    let keys_dir = root.join("keys");
+    if let Ok(entries) = std::fs::read_dir(&keys_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".confidant-tmp-")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    Ok(())
 }
 
 /// Path to the pending inbox-rotation reminder file (#105, ⚠5).
@@ -3519,7 +3540,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "check failed before committing keys/ tree",
         )));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &["commit", "-m", &format!("keys: shred {client_id}")],

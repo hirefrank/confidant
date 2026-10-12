@@ -1005,7 +1005,9 @@ Closes the non-blocking follow-ups on #153 plus the `recover` anchor file
 - **Retired recovery recipients are written before any shred mutation**,
   and an existing-but-unparseable `recovery-recipients.toml` fails closed
   rather than being silently overwritten; the file is written via
-  temp-and-rename.
+  temp-and-rename. The temp file uses the vault's `.confidant-tmp-` leftover
+  prefix, is removed on error, and the CLI sweeps any stale copy before
+  staging `keys/` (so a crash cannot commit one — #156).
 - **Deferred:** a real-`keys shred` path through the shredded-only-pubkey
   test (#153 nit 2) needs scoped recipients (#138); tracked separately.
 
