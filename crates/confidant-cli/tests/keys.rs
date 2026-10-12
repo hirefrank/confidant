@@ -430,6 +430,77 @@ fn keys_shred_then_fresh_device_recover_with_new_phrase() {
     assert!(h.home.join(".config/confidant/trust.toml").is_file());
 }
 
+#[test]
+fn keys_shred_refused_leaves_device_key_untouched() {
+    // Silas's blocker: shred generated the fresh device keypair and stored
+    // the new private key BEFORE KeyStore::shred ran its verify-first
+    // checks, so a refused shred locked this device out of the
+    // still-unshredded vault. The fresh key must be stored only after
+    // shred returns Ok.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // Snapshot the enrolled device key.
+    let key_path = h.keychain_dir.as_ref().unwrap().join("device.key");
+    let before = std::fs::read_to_string(&key_path).unwrap();
+
+    // Plant an initialized-but-unverifiable client dir: it carries an
+    // epoch file, so the CLI lists it for the strand check, but its
+    // manifest is missing, so KeyStore::shred's verify-first pass refuses.
+    let rogue = h.vault.join("keys/rogue");
+    std::fs::create_dir_all(&rogue).unwrap();
+    std::fs::write(rogue.join("epoch"), "1\n").unwrap();
+
+    // Shred must refuse.
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "shred should have refused the unverifiable client"
+    );
+
+    // No half-installed rotation: the device key is byte-identical.
+    let after = std::fs::read_to_string(&key_path).unwrap();
+    assert_eq!(
+        before, after,
+        "device key changed despite refused shred (would lock the device out)"
+    );
+
+    // The device can still read: remove the rogue dir and shred for real.
+    // Success proves the old device key still unwraps every remaining
+    // client's wrappings (shred's verify-first pass) and that the rotation
+    // now happens properly.
+    std::fs::remove_dir_all(&rogue).unwrap();
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred after removing rogue dir failed (device locked out?): stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rotated = std::fs::read_to_string(&key_path).unwrap();
+    assert_ne!(
+        rotated.trim(),
+        before.trim(),
+        "device key was not rotated by the successful shred"
+    );
+}
+
 /// Extract the 24-word phrase from stderr (the display block).
 fn extract_phrase(stderr: &str) -> String {
     for line in stderr.lines() {
