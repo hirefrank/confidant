@@ -154,6 +154,26 @@ enum Command {
     },
     /// Vault health checks (the crypto check reports encryption availability).
     Doctor,
+    /// Initialize the vault's trust anchor and keys (first device).
+    ///
+    /// Generates the operator key, a 24-word recovery phrase (shown once on
+    /// stderr), and this device's key; writes the trust anchor to
+    /// ~/.config/confidant/trust.toml; creates the vault lookup key and the
+    /// vault:shared client. Requires a git repo with a clean tree.
+    Init {
+        /// Proceed even if a trust anchor already exists (re-initialization).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Recover the vault on a new device from the recovery phrase.
+    ///
+    /// The phrase arrives via stdin or --phrase-file only (never as an
+    /// argument). Requires a fresh device (no device key enrolled yet).
+    Recover {
+        /// File containing the 24-word recovery phrase (alternative to stdin).
+        #[arg(long)]
+        phrase_file: Option<PathBuf>,
+    },
     /// Print the agent-contract JSON Schema.
     Schema,
     /// Show help (with --json, the machine-readable form).
@@ -503,6 +523,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Doctor => {
             let root = vault_root.unwrap();
             cmd_doctor(&cli, &root)
+        }
+        Command::Init { force } => {
+            let root = vault_root.unwrap();
+            cmd_init(&cli, &root, *force)
+        }
+        Command::Recover { phrase_file } => {
+            let root = vault_root.unwrap();
+            cmd_recover(&cli, &root, phrase_file.as_deref())
         }
         Command::Schema => cmd_schema(&cli, vault_root.as_deref()),
         Command::Help { topic } => cmd_help(&cli, vault_root.as_deref(), topic.clone()),
@@ -1497,6 +1525,439 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
 // ---------------------------------------------------------------------------
 // schema / help
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// init / recover (milestone 2 key ceremony)
+// ---------------------------------------------------------------------------
+
+/// Display the recovery phrase exactly once on stderr, per the channel
+/// rules (spec ⚠4): never on stdout, never in `--json` output. Prompts
+/// for confirmation unless `--no-input` (then prints a louder warning).
+fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> io::Result<()> {
+    eprintln!("=================================================================");
+    eprintln!("RECOVERY PHRASE — write it down now. It will not be shown again.");
+    eprintln!("=================================================================");
+    eprintln!("{}", phrase.as_str());
+    eprintln!("=================================================================");
+    if no_input {
+        eprintln!("WARNING: --no-input was passed, so this phrase was not confirmed.");
+        eprintln!("Store it somewhere safe (paper, password manager) before continuing.");
+    } else {
+        eprint!("Have you written down the recovery phrase? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            eprintln!("WARNING: phrase not confirmed. Store it safely before continuing.");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the device key for init/recover: the `CONFIDANT_DEVICE_KEY`
+/// env var (tests) or a fresh keypair stored via the keychain module.
+/// Returns `(bech32_secret, recipient_string)`.
+///
+/// `CONFIDANT_TEST_DEVICE_KEY` (tests only) provides the key without
+/// counting as an enrollment for the B13 fresh-device check.
+fn provision_device_key() -> anyhow::Result<(String, String)> {
+    use age::secrecy::ExposeSecret;
+    use std::str::FromStr;
+    // Test override: provides a key without enrolling (B13 ignores it).
+    if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
+        let trimmed = test_key.trim();
+        if !trimmed.is_empty() {
+            let id = age::x25519::Identity::from_str(trimmed).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "CONFIDANT_TEST_DEVICE_KEY is not a valid age identity: {e}"
+                )))
+            })?;
+            let recipient = id.to_public().to_string();
+            return Ok((trimmed.to_string(), recipient));
+        }
+    }
+    if let Ok(env_key) = std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            // Test path: the env var IS the enrolled key; parse it for the
+            // recipient and skip the keychain write.
+            let id = age::x25519::Identity::from_str(trimmed).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "{} is not a valid age identity: {e}",
+                    confidant_crypt::keychain::DEVICE_KEY_ENV
+                )))
+            })?;
+            let recipient = id.to_public().to_string();
+            return Ok((trimmed.to_string(), recipient));
+        }
+    }
+    // Production path: generate and enroll via the keychain module.
+    let id = age::x25519::Identity::generate();
+    let bech32 = id.to_string().expose_secret().to_owned();
+    confidant_crypt::keychain::store_device_key(&bech32).map_err(anyhow::Error::new)?;
+    let recipient = id.to_public().to_string();
+    Ok((bech32, recipient))
+}
+
+fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{
+        anchor, lifecycle::KeyStore, manifest::SHARED_CLIENT_ID, recovery::Recovery,
+    };
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    let json = cli.json;
+    let no_input = cli.no_input;
+
+    // Config dir (off-vault, per design §4).
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+
+    // B1: refuse if the anchor already exists — it is a trust root and is
+    // never silently replaced.
+    let trust_path = config_dir.join(anchor::TRUST_FILE);
+    if trust_path.exists() && !force {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` on a new device, or pass --force)",
+                trust_path.display()
+            ))
+            .with_fix("Run `confidant recover` with the recovery phrase on a new device"),
+        ));
+    }
+    if trust_path.exists() && force {
+        std::fs::remove_file(&trust_path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot remove existing trust anchor {}: {e}",
+                trust_path.display()
+            )))
+        })?;
+    }
+
+    // Git repo + clean tree required.
+    require_git_repo(root, no_input)?;
+    let status = confidant_core::write::git(root, &["status", "--porcelain"], no_input)?;
+    if !status.trim().is_empty() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("vault tree is not clean; commit or stash changes first")
+                .with_fix("Run `git status` in the vault and clean the tree"),
+        ));
+    }
+
+    // B2: generate operator key, recovery phrase, and device keypair.
+    // None of this material is ever written into the vault.
+    let operator_sk = SigningKey::generate(&mut OsRng);
+    let recovery = Recovery::generate();
+    let (_device_bech32, device_recipient) = provision_device_key()?;
+
+    // B3: write the anchor via anchor::save (0700 dir / 0600 file).
+    anchor::save(
+        &config_dir,
+        root,
+        &operator_sk.verifying_key(),
+        &recovery.verifying_key(),
+        &recovery.age_identity().to_recipient_string(),
+    )
+    .map_err(anyhow::Error::new)?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+
+    // B4 + B6: KeyStore via with_config_dir (mandatory seq tracker).
+    // Initialize the vault lookup key and the vault:shared client (⚠6).
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store =
+        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
+    store
+        .init_lookup_key(std::slice::from_ref(&device_recipient), &operator_sk)
+        .map_err(anyhow::Error::new)?;
+    let mut recipients = confidant_crypt::manifest::RecipientMap::new();
+    recipients.insert(
+        "device-0".to_string(),
+        confidant_crypt::manifest::RecipientEntry {
+            age_pubkey: device_recipient.clone(),
+            label: "device-0".to_string(),
+            scope_ref: String::new(),
+        },
+    );
+    store
+        .init_client(SHARED_CLIENT_ID, &recipients, &anchor, &operator_sk)
+        .map_err(anyhow::Error::new)?;
+
+    // Commit the keys/ tree: check first (readers skip keys/, so it
+    // passes), one commit. The .age files are binary, so they go through
+    // the repo's git helper rather than the String-based FileChange.
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing the keys/ tree; refusing to commit a broken vault",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &["commit", "-m", "init: trust anchor and vault keys"],
+        no_input,
+    )?;
+    let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
+        .trim()
+        .to_owned();
+
+    // B5: phrase exactly once on stderr; stdout JSON carries ok, vault,
+    // and opaque paths — no phrase, no key material.
+    display_phrase_once(no_input, &recovery.phrase())?;
+
+    if json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "anchor": trust_path.display().to_string(),
+                "keys_dir": keys_dir.display().to_string(),
+                "commit": commit,
+            }),
+        ))?;
+    } else {
+        println!("initialized trust anchor at {}", trust_path.display());
+        println!("committed keys/ tree ({})", &commit[..8.min(commit.len())]);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_recover(cli: &Cli, root: &Path, phrase_file: Option<&Path>) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{
+        anchor, keychain,
+        lifecycle::KeyStore,
+        manifest::{RecipientEntry, RecipientMap, RECOVERY_KEY_ID, VAULT_CLIENT_ID},
+        recovery::Recovery,
+    };
+
+    let json = cli.json;
+    let no_input = cli.no_input;
+
+    // B7: phrase via stdin or --phrase-file only — never argv.
+    let phrase = if let Some(path) = phrase_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::usage(format!(
+                    "--phrase-file {} unreadable: {e}",
+                    path.display()
+                )))
+            })?
+            .trim()
+            .to_string()
+    } else {
+        let mut buf = String::new();
+        use std::io::Read;
+        io::stdin().read_to_string(&mut buf).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "cannot read phrase from stdin: {e}"
+            )))
+        })?;
+        buf.trim().to_string()
+    };
+    if phrase.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "recovery phrase is required via stdin or --phrase-file",
+        )));
+    }
+
+    // B8: validate (typo-in-word-N errors; never echoes the word).
+    let old_recovery = Recovery::from_phrase(&phrase).map_err(anyhow::Error::new)?;
+    let old_identity = old_recovery.age_identity().to_age_identity().map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!("bad recovery identity: {e}")))
+    })?;
+
+    // B13: recover requires a fresh device. A device key available via
+    // the OS keychain or CONFIDANT_DEVICE_KEY means this device already
+    // went through init (the CONFIDANT_TEST_DEVICE_KEY override does not
+    // count — it is how tests provide the new key).
+    let device_enrolled = keychain::device_key().is_ok();
+    if device_enrolled {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "this device already has a device key enrolled; recover is for fresh devices",
+            )
+            .with_fix("To add this device to the vault, wait for #66 (device add)"),
+        ));
+    }
+
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+
+    // The operator public key must be available to re-pin the anchor. On
+    // a device with a config backup, trust.toml provides it; otherwise
+    // recovery cannot proceed (the phrase alone does not encode it).
+    // The operator public key must be available to re-pin the anchor. On
+    // a device with a config backup, trust.toml provides it; otherwise
+    // recovery cannot proceed (the phrase alone does not encode it).
+    // The phrase must be for THIS vault: the recovery public key in the
+    // anchor must match the phrase-derived one.
+    let (anchor, _) = anchor::load(&config_dir, root).map_err(|_| {
+        anyhow::Error::new(
+            DomainError::invalid(
+                "no trust anchor found; cannot recover without the operator public key",
+            )
+            .with_fix("Restore trust.toml from a config backup, then retry"),
+        )
+    })?;
+    if anchor.recovery != old_recovery.verifying_key() {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "recovery phrase does not match this vault's trust anchor",
+        )));
+    }
+    let operator_pubkey = anchor.operator;
+
+    require_git_repo(root, no_input)?;
+    let status = confidant_core::write::git(root, &["status", "--porcelain"], no_input)?;
+    if !status.trim().is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "vault tree is not clean; commit or stash changes first",
+        )));
+    }
+
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store =
+        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
+
+    // B9: unwrap every initialized client's keys through their recovery
+    // wrappings. The vault lookup key is device-only (B12 handles it).
+    let mut clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != VAULT_CLIENT_ID)
+        .collect();
+    clients.sort();
+    let mut data_keys: Vec<(String, confidant_crypt::keys::DataKey)> = Vec::new();
+    for client_id in &clients {
+        let epoch = store.current_epoch(client_id).map_err(anyhow::Error::new)?;
+        let key = store
+            .unwrap_data_key(client_id, RECOVERY_KEY_ID, epoch, &old_identity, &anchor)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot unwrap keys for client {client_id} via recovery: {e}"
+                )))
+            })?;
+        data_keys.push((client_id.clone(), key));
+    }
+
+    // B10: new device key, enrolled.
+    let (_new_bech32, new_recipient) = provision_device_key()?;
+    let mut new_recipients = RecipientMap::new();
+    new_recipients.insert(
+        "device-0".to_string(),
+        RecipientEntry {
+            age_pubkey: new_recipient.clone(),
+            label: "device-0".to_string(),
+            scope_ref: String::new(),
+        },
+    );
+
+    // B11: rotate the recovery identity, then re-pin the anchor BEFORE any
+    // other key operation (#99 ordering). The recovery Ed25519 key is a
+    // trust-anchor signing member, so it authorizes the re-signing.
+    let client_refs: Vec<&str> = clients.iter().map(|s| s.as_str()).collect();
+    let new_recovery = store
+        .rotate_recovery(
+            &client_refs,
+            old_recovery.signing_key(),
+            &anchor,
+            &old_identity,
+        )
+        .map_err(anyhow::Error::new)?;
+    // Re-pin: replace trust.toml with the new recovery halves (operator
+    // unchanged). anchor::save refuses to overwrite, so remove first —
+    // the old anchor was already validated above.
+    let trust_path = config_dir.join(anchor::TRUST_FILE);
+    std::fs::remove_file(&trust_path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot replace trust anchor {}: {e}",
+            trust_path.display()
+        )))
+    })?;
+    anchor::save(
+        &config_dir,
+        root,
+        &operator_pubkey,
+        &new_recovery.verifying_key(),
+        &new_recovery.age_identity().to_recipient_string(),
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Authorize the new device on every client (same path #66 reuses):
+    // re-wrap each data key to the new device + new recovery.
+    let (new_anchor, _) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    for (client_id, key) in &data_keys {
+        store
+            .rewrap_recipients(
+                client_id,
+                key,
+                &new_recipients,
+                &new_anchor,
+                new_recovery.signing_key(),
+            )
+            .map_err(anyhow::Error::new)?;
+    }
+
+    // B12: fresh lookup key (never restored, #142), re-wrapped to the new
+    // device; the alias index rebuilds from the decrypted alias values
+    // (design §10) — the local .confidant/ index is gitignored and
+    // rebuilt on demand.
+    store
+        .init_lookup_key(
+            std::slice::from_ref(&new_recipient),
+            new_recovery.signing_key(),
+        )
+        .map_err(anyhow::Error::new)?;
+
+    // Commit: check first, one commit.
+    let vault2 = load_vault(root)?;
+    let pre = check_vault(&vault2, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing the recovered keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &[
+            "commit",
+            "-m",
+            "recover: re-wrap keys to new device, rotate recovery",
+        ],
+        no_input,
+    )?;
+    let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
+        .trim()
+        .to_owned();
+
+    // New phrase follows B5's channel rules.
+    display_phrase_once(no_input, &new_recovery.phrase())?;
+
+    if json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "anchor": trust_path.display().to_string(),
+                "keys_dir": keys_dir.display().to_string(),
+                "commit": commit,
+                "clients_recovered": clients,
+            }),
+        ))?;
+    } else {
+        println!("recovered {} client(s); anchor re-pinned", clients.len());
+        println!("committed ({})", &commit[..8.min(commit.len())]);
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
     let schema = contract_schema();

@@ -570,6 +570,49 @@ impl KeyStore {
         Ok(key)
     }
 
+    /// Re-wrap an existing client data key to a new recipient set, keeping
+    /// the same key and epoch. Used by `recover` (and #66 device add) to
+    /// authorize a new device without rotating the data key: existing
+    /// ciphertext stays decryptable.
+    ///
+    /// The caller must have unwrapped `key` through a trusted path first
+    /// (e.g. the recovery wrapping during `recover`). The manifest is
+    /// re-signed with `signing_sk` (the operator key, or the recovery key —
+    /// both are trust-anchor members). Old wrappings for recipients no
+    /// longer in the set are removed.
+    pub fn rewrap_recipients(
+        &mut self,
+        client_id: &str,
+        key: &DataKey,
+        recipients: &RecipientMap,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<(), Error> {
+        manifest::validate_client_id(client_id)?;
+        let (epoch, _, commitments) = self.verified_recipients(client_id, anchor)?;
+        // Remove wrappings for recipients that are going away, then write
+        // the new set. The recovery wrapping is always rewritten (its
+        // recipient may have rotated).
+        let wdir = self.wrapped_dir(client_id);
+        let mut keep: std::collections::HashSet<String> =
+            recipients.keys().map(|k| format!("{k}.age")).collect();
+        keep.insert(format!("{RECOVERY_KEY_ID}.age"));
+        for entry in std::fs::read_dir(&wdir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Only touch current-epoch wrappings; retained `.e<epoch>`
+            // files are history.
+            if name.ends_with(".age") && !name.contains(".e") && !keep.contains(&name) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        self.wrap_current(client_id, key, recipients, anchor)?;
+        // Commitments are unchanged (same key, same epoch); carry them
+        // forward from the verified buffer.
+        self.write_manifest(client_id, epoch, recipients, &commitments, signing_sk)?;
+        Ok(())
+    }
+
     /// Revoke recipients: delete their wrappings across **all retained
     /// epochs**, drop them from the manifest, re-sign. The revoked party
     /// keeps whatever ciphertext it already copied (ADR-5, future writes

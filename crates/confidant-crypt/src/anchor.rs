@@ -81,6 +81,81 @@ fn parse_pubkey(hex: &str, what: &str) -> Result<VerifyingKey, Error> {
     VerifyingKey::from_bytes(&arr).map_err(|_| Error::Anchor(format!("bad {what}")))
 }
 
+/// Save a new trust anchor.
+///
+/// Writes exactly the fields [`load`] reads (`operator_pubkey`,
+/// `recovery_pubkey`, `recovery_age_recipient` — hex-encoded Ed25519
+/// public keys). Creates the config dir with 0700 and writes the file
+/// with 0600. Refuses when the config dir is inside the vault (same
+/// rule as [`load`]), and refuses to overwrite an existing anchor —
+/// the anchor is a trust root and is never silently replaced (use
+/// `recover` to re-pin).
+pub fn save(
+    config_dir: &Path,
+    vault_path: &Path,
+    operator: &VerifyingKey,
+    recovery: &VerifyingKey,
+    recovery_age: &str,
+) -> Result<(), Error> {
+    // Same inside-the-vault refusal as load: canonicalize both sides.
+    let vault_canon = vault_path.canonicalize().map_err(|_| {
+        Error::Anchor(format!(
+            "cannot resolve vault path {}",
+            vault_path.display()
+        ))
+    })?;
+    let config_canon = config_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config_dir.to_path_buf());
+    if config_canon.starts_with(&vault_canon) {
+        return Err(Error::Anchor(format!(
+            "trust anchor path {} is inside the vault {}; refusing",
+            config_canon.display(),
+            vault_canon.display()
+        )));
+    }
+
+    let trust_path = config_dir.join(TRUST_FILE);
+    if trust_path.exists() {
+        return Err(Error::Anchor(format!(
+            "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` to re-pin)",
+            trust_path.display()
+        )));
+    }
+
+    let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let text = format!(
+        "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"{}\"\n",
+        hex(operator.as_bytes()),
+        hex(recovery.as_bytes()),
+        recovery_age.trim(),
+    );
+
+    std::fs::create_dir_all(config_dir).map_err(|e| {
+        Error::Anchor(format!(
+            "cannot create config dir {}: {e}",
+            config_dir.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| Error::Anchor(format!("cannot set 0700 on {}: {e}", config_dir.display())),
+        )?;
+    }
+    std::fs::write(&trust_path, text)
+        .map_err(|e| Error::Anchor(format!("cannot write {}: {e}", trust_path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| Error::Anchor(format!("cannot set 0600 on {}: {e}", trust_path.display())),
+        )?;
+    }
+    Ok(())
+}
+
 /// Load and validate the trust anchor.
 ///
 /// `config_dir` is the off-vault config directory (default
@@ -226,6 +301,90 @@ mod tests {
             format!("[trust]\noperator_pubkey = \"{hexop}\"\nrecovery_pubkey = \"{hexrec}\"\nrecovery_age_recipient = \"age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0\"\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn save_writes_loadable_anchor_with_strict_perms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let op = SigningKey::generate(&mut OsRng).verifying_key();
+        let rec = SigningKey::generate(&mut OsRng).verifying_key();
+        let age_recipient = "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0";
+
+        save(&cfg, &vault, &op, &rec, age_recipient).unwrap();
+
+        // Loads back with no warnings (perms are exactly 0700/0600).
+        let (anchor, warnings) = load(&cfg, &vault).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(anchor.operator, op);
+        assert_eq!(anchor.recovery, rec);
+        assert_eq!(anchor.recovery_age, age_recipient);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "config dir must be 0700");
+            let file_mode = std::fs::metadata(cfg.join(TRUST_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "trust.toml must be 0600");
+        }
+    }
+
+    #[test]
+    fn save_refuses_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let op = SigningKey::generate(&mut OsRng).verifying_key();
+        let rec = SigningKey::generate(&mut OsRng).verifying_key();
+
+        save(
+            &cfg,
+            &vault,
+            &op,
+            &rec,
+            "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0",
+        )
+        .unwrap();
+        let op2 = SigningKey::generate(&mut OsRng).verifying_key();
+        let err = save(
+            &cfg,
+            &vault,
+            &op2,
+            &rec,
+            "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("already exists"), "{err}");
+        // Original anchor untouched.
+        let (anchor, _) = load(&cfg, &vault).unwrap();
+        assert_eq!(anchor.operator, op);
+    }
+
+    #[test]
+    fn save_refuses_inside_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        let cfg = vault.join("evil-config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let op = SigningKey::generate(&mut OsRng).verifying_key();
+        let rec = SigningKey::generate(&mut OsRng).verifying_key();
+        let err = save(
+            &cfg,
+            &vault,
+            &op,
+            &rec,
+            "age1ql3z7hj432v2jl2z8alunwwun8hm4s4h6a2t6v26x4z5h7y9k3t9x2s0",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("inside the vault"), "{err}");
     }
 
     #[test]
