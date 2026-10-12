@@ -28,6 +28,13 @@ pub struct SearchHit {
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
     pub findings: Vec<Finding>,
+    /// Envelopes skipped as unreadable by the content hook (no device key,
+    /// or the data key won't unwrap). Spec 4 (⚠2): never silently empty.
+    /// no-ai envelopes load as shells instead and are not counted here.
+    pub skipped_encrypted: u32,
+    /// Envelopes refused as tampered/corrupt (structural parse or AEAD
+    /// failure). Never folded into `skipped_encrypted` (⚠2c).
+    pub refused_envelopes: u32,
 }
 
 struct RecordFacts {
@@ -71,6 +78,8 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
         return Ok(SearchResult {
             hits: Vec::new(),
             findings,
+            skipped_encrypted: vault.skipped_encrypted,
+            refused_envelopes: vault.refused_envelopes,
         });
     }
     let mut hits = Vec::new();
@@ -95,7 +104,12 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
         }
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    Ok(SearchResult { hits, findings })
+    Ok(SearchResult {
+        hits,
+        findings,
+        skipped_encrypted: vault.skipped_encrypted,
+        refused_envelopes: vault.refused_envelopes,
+    })
 }
 
 /// Record IDs in the section 12 cleared set. Used by tests to assert a fixed point.

@@ -47,4 +47,4 @@ pub use search::{
     allowlist_is_fixed_point, cleared_ledger_lines, cleared_record_ids, cleared_record_paths,
     search, SearchHit, SearchResult,
 };
-pub use vault::{load_vault, Vault};
+pub use vault::{load_vault, load_vault_with_hook, ContentHook, ContentOutcome, Vault};

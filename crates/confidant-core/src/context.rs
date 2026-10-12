@@ -69,6 +69,10 @@ pub struct PersonContext {
     pub coaching: Option<CoachingView>,
     /// Opaque `hmac:<hex>` values from ledger `alias` lines.
     pub aliases: Vec<String>,
+    /// Envelopes skipped as unreadable while loading (spec 4, ⚠2).
+    pub skipped_encrypted: u32,
+    /// Envelopes refused as tampered/corrupt while loading (spec 4, ⚠2c).
+    pub refused_envelopes: u32,
 }
 
 fn billing_tag(entry: &crate::ledger::LedgerEntry) -> Option<String> {
@@ -193,6 +197,8 @@ pub fn build_context(
         interactions,
         coaching,
         aliases,
+        skipped_encrypted: vault.skipped_encrypted,
+        refused_envelopes: vault.refused_envelopes,
     })
 }
 
