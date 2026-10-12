@@ -630,6 +630,29 @@ fn device_add_then_rotate_new_device_still_enrolled() {
         new_key, old_key,
         "new device unwrapped a different data key than the old device"
     );
+
+    // Nit: the new device must also still unwrap the vault lookup key
+    // after the rotate (completes the original handoff ask).
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    let config_dir = h1.home.join(".config/confidant");
+    let (anchor, _) = anchor::load(&config_dir, &h1.vault).unwrap();
+    let mut store = KeyStore::with_config_dir(
+        h1.vault.join("keys"),
+        "01TEST00000000000000000000",
+        &config_dir,
+    )
+    .unwrap();
+    let new_identity: age::x25519::Identity = h2.device_bech32.trim().parse().unwrap();
+    let (new_lookup, _, _) = store
+        .read_lookup_key(&new_identity, &anchor)
+        .expect("new device cannot unwrap lookup key after rotate");
+    let old_identity: age::x25519::Identity = h1.device_bech32.trim().parse().unwrap();
+    let (old_lookup, _, _) = store.read_lookup_key(&old_identity, &anchor).unwrap();
+    assert_eq!(
+        new_lookup.as_bytes(),
+        old_lookup.as_bytes(),
+        "lookup key changed across rotate"
+    );
 }
 
 /// Decrypt a client's wrapping file for `key_id` at the current epoch
@@ -668,11 +691,15 @@ fn device_add_from_request_rejects_bad_label() {
     let (h1, _h2, req_path, _key_id, _init_stderr) = device_add_setup();
 
     // Note: control chars are STRIPPED (matching --initiate), not
-    // rejected — so test the cases that fail validation outright.
+    // rejected — so test the cases that fail validation outright, plus
+    // an ESC/CR case (stripped to something invalid) asserting keys/ is
+    // untouched.
+    let before = snapshot_keys(&h1.vault);
     for (name, bad_label) in [
         ("empty", "   "),
         ("overlong", &"x".repeat(65)),
         ("charset", "bad;label|here"),
+        ("esc-cr", "\x1b[2J\r"),
     ] {
         let raw = std::fs::read_to_string(&req_path).unwrap();
         let mut request: toml::Value = toml::from_str(&raw).unwrap();
@@ -702,6 +729,12 @@ fn device_add_from_request_rejects_bad_label() {
             "expected label error for {name}, got: {stderr}"
         );
     }
+    // None of the refused requests may have touched keys/.
+    assert_eq!(
+        before,
+        snapshot_keys(&h1.vault),
+        "refused bad-label requests mutated keys/"
+    );
 }
 
 #[test]
@@ -1066,4 +1099,354 @@ fn device_add_json_no_secrets() {
         "secret in --from-request JSON"
     );
     assert!(!stderr.contains("AGE-SECRET-KEY"), "secret on stderr");
+}
+
+// --- #151 round 3 ----------------------------------------------------------
+
+/// Snapshot every file under keys/ as (relative path, bytes), sorted.
+/// For asserting a refused operation left keys/ byte-identical.
+fn snapshot_keys(vault: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![vault.join("keys")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else {
+                let rel = p
+                    .strip_prefix(vault)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn device_add_from_request_refuses_previously_seen_pubkey() {
+    // Blocker 2 (#151): after a shred, re-sending a device's ORIGINAL
+    // request must be refused — its pubkey is in history, and re-wrapping
+    // to it would silently undo the shred. keys/ must be byte-identical.
+    let mut h1 = Harness::new();
+    // Shred rotates the device key: use the test keychain dir.
+    h1.with_test_keychain();
+    assert!(h1.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h1
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // B enrolls with its original key.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req_path = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "from-request failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Shred client-a on A.
+    let out = h1
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Snapshot keys/ after the shred.
+    let before = snapshot_keys(&h1.vault);
+
+    // Re-send B's ORIGINAL request: must be refused (no --json so the
+    // error lands on stderr)...
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "re-sent request after shred must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already been a recipient"),
+        "expected historical-pubkey refusal, got: {stderr}"
+    );
+
+    // ...and keys/ must be byte-identical (the check runs before any
+    // mutation).
+    let after = snapshot_keys(&h1.vault);
+    assert_eq!(before, after, "refused --from-request mutated keys/");
+}
+
+#[test]
+fn device_add_shred_then_reenroll() {
+    // Item 4 (#151): the main multi-device path after a shred — shred on
+    // A, B re-enrolls with --initiate --force (fresh keypair), A runs
+    // --from-request, then B can unwrap a remaining client.
+    let mut h1 = Harness::new();
+    h1.with_test_keychain();
+    assert!(h1.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h1
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // B enrolls with its original key.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req1_path = h2.home.join("req1.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req1_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req1_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "from-request failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Shred client-a on A (rotates A's device key).
+    let out = h1
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // B re-enrolls: a FRESH keypair via --initiate --force (the old key is
+    // dead — its pubkey is in the shredded history, so re-sending the old
+    // request would be refused).
+    let fresh_bech32 = age_generate_bech32();
+    std::fs::write(
+        h2.keychain_dir.as_ref().unwrap().join("device.key"),
+        &fresh_bech32,
+    )
+    .unwrap();
+    let req2_path = h2.home.join("req2.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b2",
+            "--output",
+            req2_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "re-initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A approves the re-enrollment.
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req2_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "re-enroll from-request failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let key_id2 = v["key_id"].as_str().expect("key_id in JSON").to_string();
+
+    // B unwraps the remaining client (client-b) with its fresh identity;
+    // it must yield the same data key A gets (A's key was rotated by the
+    // shred — read it from the test keychain dir).
+    let h1_key =
+        std::fs::read_to_string(h1.keychain_dir.as_ref().unwrap().join("device.key")).unwrap();
+    let new_key = unwrap_wrapping(&h1.vault, "client-b", &key_id2, fresh_bech32.trim());
+    let old_key = unwrap_wrapping(&h1.vault, "client-b", "device-0", h1_key.trim());
+    assert_eq!(new_key.len(), 32, "unwrapped data key must be 32 bytes");
+    assert_eq!(
+        new_key, old_key,
+        "re-enrolled device unwrapped a different data key than A"
+    );
+}
+
+#[test]
+fn device_add_initiate_force_prompts_without_no_input() {
+    // Item 5 (#151): --force on --initiate must prompt for confirmation
+    // unless --no-input, and say plainly the old key's access is lost.
+    let h = Harness::new();
+    // h has CONFIDANT_DEVICE_KEY set (enrolled).
+
+    // Answer "y": proceeds.
+    let mut child = h
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            "x",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "--initiate --force (confirmed) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no longer work") || stderr.contains("lose access"),
+        "prompt must say the old key's access is lost, got: {stderr}"
+    );
+
+    // Answer "n": refused.
+    let mut child = h
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            "x",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"n\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "--initiate --force (declined) should refuse"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not confirmed"),
+        "expected not-confirmed refusal, got: {stderr}"
+    );
+}
+
+#[test]
+fn device_add_initiate_validates_label_before_provisioning() {
+    // Item 6 (#151): the label must be validated BEFORE the device key is
+    // provisioned. A bad label must fail as a usage error (exit 2) even
+    // when the key source itself is broken — proving validation ran first.
+    let h = Harness::new();
+    let out = h
+        .cmd_no_vault(&["keys", "device-add", "--initiate", "--label", "bad;label"])
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", "not-a-valid-key")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "bad label should fail");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bad label must be a usage error (exit 2), not a key error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("label"),
+        "expected label validation error, got: {stderr}"
+    );
 }

@@ -2824,37 +2824,62 @@ fn cmd_keys_device_add_initiate(
 ) -> anyhow::Result<ExitCode> {
     // Refuse to overwrite an already-enrolled device key (same check as
     // recover's B13): running --initiate on an enrolled device would
-    // replace its keychain entry and lock it out. --force overrides.
-    if !force {
-        use confidant_crypt::keychain;
-        // Check via the keychain directly (not the env override): if a
-        // device key is enrolled, refuse.
-        let enrolled = match keychain::device_key() {
-            Ok(_) => true,
-            Err(confidant_crypt::error::Error::NoKey(_)) => false,
-            Err(e) => {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot check device key: {e}"
-                ))));
-            }
-        };
-        // Also check the env var (headless/test): if set, a key is enrolled.
-        let env_enrolled = std::env::var(keychain::DEVICE_KEY_ENV)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        if enrolled || env_enrolled {
+    // replace its keychain entry and lock it out. --force overrides the
+    // refusal, but not the confirmation below.
+    use confidant_crypt::keychain;
+    // Check via the keychain directly (not the env override): if a
+    // device key is enrolled, refuse.
+    let enrolled = match keychain::device_key() {
+        Ok(_) => true,
+        Err(confidant_crypt::error::Error::NoKey(_)) => false,
+        Err(e) => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot check device key: {e}"
+            ))));
+        }
+    };
+    // Also check the env var (headless/test): if set, a key is enrolled.
+    let env_enrolled = std::env::var(keychain::DEVICE_KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let already_enrolled = enrolled || env_enrolled;
+    if already_enrolled && !force {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
+        )));
+    }
+    // Item 5: --force on --initiate replaces the enrolled device key.
+    // Confirm interactively unless --no-input, and say plainly that the
+    // old key's access from this device is lost — worded for the
+    // re-enroll-after-shred case, the main reason to reach for --force.
+    if already_enrolled && force && !cli.no_input {
+        eprintln!("WARNING: a device key is already enrolled on this device.");
+        eprintln!("--force will replace it: the old key will no longer work from here.");
+        eprintln!(
+            "After a `keys shred` dropped this device, re-enrolling with a fresh key is \
+             how it rejoins; the shredded client's history stays unopenable by the old key."
+        );
+        eprint!("Replace the enrolled device key? [y/N] ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
             return Err(anyhow::Error::new(DomainError::invalid(
-                "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
+                "device key replacement not confirmed; refusing",
             )));
         }
     }
 
+    // Item 6: validate the label BEFORE provisioning the key. A bad label
+    // must not store a key and then error — the retry would need --force
+    // to clean up the mess.
+    // (Shared validator with --from-request: a hand-edited request can
+    // inject controls into the commit message/manifest/stderr.)
+    let label = validate_device_label(label.unwrap_or("device"))?;
     let (_bech32, recipient) = provision_device_key()?;
     let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&recipient);
     let key_id = device_key_id(&recipient);
-    // Validate the label (shared with --from-request: a hand-edited
-    // request can inject controls into the commit message/manifest/stderr).
-    let label = validate_device_label(label.unwrap_or("device"))?;
 
     let request = DeviceAddRequest {
         version: DEVICE_ADD_REQUEST_VERSION,
@@ -3027,9 +3052,26 @@ fn cmd_keys_device_add_from_request(
     };
     // B2: every initialized client's every retained epoch + the lookup
     // key, all through KeyStore; verify-first inside add_recipient.
+    // Item 7: add_recipient writes client-by-client, so an IO failure
+    // mid-write can leave keys/ half-updated and uncommitted. Nothing is
+    // committed on this path, so point at the exact recovery command
+    // instead of attempting an in-code restore (which could clobber the
+    // operator's own uncommitted work).
     let clients = store
         .add_recipient(&key_id, &entry, identity.as_ref(), &anchor, &operator_sk)
-        .map_err(anyhow::Error::new)?;
+        .map_err(|e| {
+            anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "device-add failed; keys/ may be partially updated (nothing was committed): {e}"
+                ))
+                .with_fix(format!(
+                    "inspect with `git -C {} status -- keys/`, then restore tracked files with \
+                     `git -C {} checkout -- keys/` and delete any new untracked {key_id}*.age wrappings",
+                    root.display(),
+                    root.display(),
+                )),
+            )
+        })?;
 
     // One commit, check first, signed by the operator key (design §6).
     let no_input = cli.no_input;

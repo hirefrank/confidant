@@ -777,6 +777,25 @@ impl KeyStore {
             });
         }
 
+        // Blocker 2 (#151): refuse any pubkey that has EVER been a
+        // recipient — current or historical manifest of any client, the
+        // vault lookup map, or the recovery key (the same set shred's step
+        // 2 builds, shared via ever_seen_pubkeys). A device re-sending its
+        // original request after a shred would otherwise silently undo the
+        // shred: the old private key still opens the shredded client's
+        // wrappings in git history. Compares pubkeys, not just key ids.
+        // Runs before any mutation.
+        let all: Vec<String> = self.manifest_clients();
+        let all_refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let ever_seen = self.ever_seen_pubkeys(&all_refs, anchor)?;
+        if ever_seen.contains(&new_entry.age_pubkey) {
+            return Err(Error::Manifest(
+                "this pubkey has already been a recipient of this vault; \
+                 generate a fresh keypair with `keys device-add --initiate`"
+                    .to_string(),
+            ));
+        }
+
         // Lookup key: read_lookup_key verifies the vault manifest, unwraps
         // with the identity, and checks the commitment — a planted
         // lookup.age fails closed here, before any mutation.
@@ -889,6 +908,33 @@ impl KeyStore {
             }
         }
         Ok(maps)
+    }
+
+    /// Every age pubkey that has ever been a recipient: the current and
+    /// historical manifests of each listed client, plus the recovery
+    /// recipient. Shared by `shred` (step 2: no new recipient may reuse
+    /// one, or the shredded history stays openable) and `add_recipient`
+    /// (a re-sent device-add request after a shred must not silently undo
+    /// the shred by re-wrapping to a key that still opens the shredded
+    /// client's history). Callers choose the client list: `shred` passes
+    /// its strand-checked `all_clients`; `add_recipient` passes every
+    /// manifest client, including the vault lookup map — and compares
+    /// pubkeys, not just key ids.
+    fn ever_seen_pubkeys(
+        &mut self,
+        clients: &[&str],
+        anchor: &Anchor,
+    ) -> Result<std::collections::BTreeSet<String>, Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        for client in clients {
+            for map in self.historical_recipients(client)? {
+                seen.extend(map.values().map(|e| e.age_pubkey.clone()));
+            }
+            let (_, map, _) = self.verified_recipients(client, anchor)?;
+            seen.extend(map.values().map(|e| e.age_pubkey.clone()));
+        }
+        seen.insert(anchor.recovery_age.clone());
+        Ok(seen)
     }
 
     /// Crypto-shred a client: key destruction, not deletion.
@@ -1019,15 +1065,7 @@ impl KeyStore {
         // recipient (including recovery): reusing a pubkey would keep the
         // old private key able to unwrap the shredded client's history.
         // (B5: do not weaken this check.)
-        let mut old_pubkeys = std::collections::BTreeSet::new();
-        for client in all_clients {
-            for map in self.historical_recipients(client)? {
-                old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
-            }
-            let (_, map, _) = self.verified_recipients(client, anchor)?;
-            old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
-        }
-        old_pubkeys.insert(anchor.recovery_age.clone());
+        let old_pubkeys = self.ever_seen_pubkeys(all_clients, anchor)?;
         for (id, entry) in new_recipients {
             if old_pubkeys.contains(&entry.age_pubkey) {
                 return Err(Error::Manifest(format!(
