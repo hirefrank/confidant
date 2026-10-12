@@ -14,23 +14,30 @@ allowlist, `no-ai` included).
 vault/                                  trusted device, encrypted disk
 ├── people/...  orgs/...  ledger/...    plaintext in M1; enc: envelopes post-M2
 └── .confidant/
-    ├── qmd-corpus/                     decrypted corpus, gitignored (built by qmd-index)
+    ├── qmd-corpus/                     decrypted corpus, gitignored (built by `confidant reindex`)
     └── qmd/                            qmd's own store: index.sqlite + config/
                                         (INDEX_PATH/QMD_CONFIG_DIR env; was ~/.cache/qmd)
 
 agent ── bin/qmd-query ──┬── qmd query --json ──▶ ranked hits
                         └── confidant find ────▶ allowlist oracle (per hit)
+
+bin/qmd-index ── confidant reindex ──▶ corpus (+ gitignore/perm guardrails)
+              └── qmd collection add/embed ──▶ QMD registration
 ```
 
 Two processes, two responsibilities:
 
-- **Index time** (`bin/qmd-index.py`): copy decrypted vault content into
-  `.confidant/qmd-corpus/`, register it as the `confidant` QMD collection.
-  Since #38 the copy excludes whatever `confidant allowlist` reports as
-  uncleared (`no-ai`, malformed IDs, dangling refs, merge-group taint) —
-  but treat the corpus as if it still contained them: exclusion goes stale
-  between reindexes, so the corpus stays sensitive, gitignored, and on
-  trusted devices (§4 threat model).
+- **Index time** (`confidant reindex`, wrapped by `bin/qmd-index.py`): the
+  CLI copies decrypted vault content into `.confidant/qmd-corpus/` and
+  registers nothing; the skill then registers it as the `confidant` QMD
+  collection. Since #37 the CLI owns the corpus build — content, the §12
+  cleared set, decryption through the read path, and the gitignore/`0700`/
+  `0600` guardrails — so `no-ai` is excluded *by construction* (#38's
+  index-time exclusion, now enforced inside the CLI). The skill keeps only
+  the encrypted-disk device-policy check and the QMD registration. Treat the
+  corpus as if it still contained everything: exclusion goes stale between
+  reindexes, so the corpus stays sensitive, gitignored, and on trusted
+  devices (§4 threat model).
 - **Query time** (`bin/qmd-query.py`): run QMD, then verify *every* hit
   through `confidant find` before returning it. A hit is kept only if the
   same file appears in `find`'s matches with full detail, which happens
@@ -39,28 +46,39 @@ Two processes, two responsibilities:
 
 ## Guardrails on where the plaintext lives (Silas's PR review, 2026-10-08)
 
-The corpus is a plaintext mirror of the whole vault, *including* `no-ai`
-records — so where it (and QMD's own index) may live is enforced in code,
-not just documented. `qmd-index` refuses to build unless all of these hold:
+The corpus is a plaintext mirror of cleared vault content, so where it (and
+QMD's own index) may live is enforced in code, not just documented.
 
-1. **The corpus is git-ignored.** The script probes
-   `git -C <vault> check-ignore -q .confidant/qmd-corpus/x` and refuses with
-   a fix message (`echo '.confidant/' >> .gitignore`) if the corpus isn't
-   ignored. A user's vault is its own git repo and may not ignore
-   `.confidant/` — one `git add -A` must never commit the corpus.
-2. **The disk is encrypted** (architecture §9b item 4). Auto-detected:
+Since #37 these are split between the CLI (which writes the corpus) and the
+skill (device policy):
+
+1. **The corpus is git-ignored — enforced by `confidant reindex`.**
+   `reindex` probes `git -C <vault> check-ignore -q .confidant/.probe` and
+   refuses with a fix message (`echo '.confidant/' >> .gitignore`) if
+   `.confidant/` isn't ignored. A user's vault is its own git repo and may
+   not ignore `.confidant/` — one `git add -A` must never commit the corpus
+   or the plaintext index. (git absent or the vault not being a repo is a
+   note, not a refusal: there is nothing to commit with.)
+2. **The disk is encrypted — enforced by the skill** (architecture §9b
+   item 4; device policy, not a per-command check). Auto-detected:
    `fdesetup isactive` on macOS, or a `crypt`-type ancestor of the vault's
    backing device in `lsblk` on Linux. If detection is impossible, the
    build refuses unless the operator passes `--i-confirm-encrypted-disk`
    (having verified it themselves). The script prints which path it took.
-3. **QMD's own store stays with the vault, out of backups.** The index DB
-   and collection registry move under `<vault>/.confidant/qmd/` via the
-   `INDEX_PATH` and `QMD_CONFIG_DIR` env vars (both documented qmd
-   overrides); embedding models stay in the default cache (no PII, large).
-   Both directories are created `0700`; on macOS both get
-   `tmutil addexclusion` (best-effort, warns on failure). A `confidant`
-   collection left in qmd's default store by older versions is removed on
-   first run (migration), so no plaintext index lingers in `~/.cache`.
+   Note: calling `confidant reindex` directly bypasses this device-policy
+   gate — see #37's review flag; #37 chose to leave the assertion in the
+   skill.
+3. **Permissions — enforced by `confidant reindex`.** Corpus directories
+   are `0700` and files `0600`, applied recursively after the rebuild.
+4. **QMD's own store stays with the vault, out of backups — enforced by
+   the skill.** The index DB and collection registry move under
+   `<vault>/.confidant/qmd/` via the `INDEX_PATH` and `QMD_CONFIG_DIR` env
+   vars (both documented qmd overrides); embedding models stay in the
+   default cache (no PII, large). Both directories are created `0700`; on
+   macOS both get `tmutil addexclusion` (best-effort, warns on failure). A
+   `confidant` collection left in qmd's default store by older versions is
+   removed on first run (migration), so no plaintext index lingers in
+   `~/.cache`.
 
 `qmd-query` sets the same env vars, so queries always hit the vault-local
 store.
@@ -76,16 +94,30 @@ Computing the cleared set at index time would duplicate the §12
 fixed-point logic (or lean on fragile tricks like `find "e"`), and any
 divergence between the two implementations is a leak.
 
-What changed (#38): the CLI now exposes the cleared set itself
+What changed (#38): the CLI exposes the cleared set itself
 (`confidant allowlist` → cleared record files + cleared ledger lines, no
-content), so `qmd-index` excludes uncleared records *without* duplicating
-any logic — the §12 implementation still lives in exactly one place (the
-Rust CLI). This is defense in depth only: the query-time filter remains
-the authority, and exclusion goes stale the same way the index does (a
-vault change between reindexes can leave newly-uncleared content in the
-corpus — the live check still drops it). A query-path bug now degrades to
-missing results rather than risking a leak. When the CLI is unavailable at
-index time, the full corpus is built with a loud warning.
+content), so index-time exclusion needs no duplicated logic — the §12
+implementation still lives in exactly one place (the Rust CLI). This is
+defense in depth only: the query-time filter remains the authority, and
+exclusion goes stale the same way the index does (a vault change between
+reindexes can leave newly-uncleared content in the corpus — the live check
+still drops it). A query-path bug now degrades to missing results rather
+than risking a leak.
+
+What changed (#37): the corpus build moved *into* the CLI as `confidant
+reindex`, which copies only the §12 cleared set and decrypts cleared
+envelopes through the read path. `no-ai` records are now excluded **by
+construction**: the CLI's `for_agent` decrypt path never decrypts a
+`no-ai` envelope, so their content never enters the corpus, rather than
+being copied and dropped later. `bin/qmd-index.py` shrank to a thin
+wrapper: run `confidant reindex`, assert exit 0, then do QMD collection
+add/embed. The old "CLI unavailable → build the full corpus with a loud
+warning" fallback is gone: `reindex` is now required, and it refuses
+rather than building a corpus that silently omits records.
+
+One deliberate carry-over: the `.cfd` → `.cfd.md` ledger mirror lives in
+`reindex` (QMD collections match `**/*.md` only), which couples the CLI to
+a QMD quirk — flagged in #37's review; #37 chose to leave it in the CLI.
 
 With query-time filtering (unchanged):
 - No duplicated logic to drift. The §12 implementation lives in exactly
@@ -93,12 +125,12 @@ With query-time filtering (unchanged):
 - Index staleness can only *miss* results, never leak: a hit for content
   that has since become uncleared is dropped by the live check.
 - `no-ai` is honored by construction: `no-ai` records are uncleared, so
-  their hits never verify.
+  their hits never verify — and the corpus never contains their content.
 
 The cost is one `find` invocation per distinct hit file (~100–160 ms each
 on a 400-record vault) — acceptable for an interactive search skill, and
-the script dedupes files before verifying. Indexing costs one extra
-`allowlist` run per rebuild (same order as a `find`).
+the script dedupes files before verifying. Indexing costs one `reindex`
+run per rebuild (it decrypts and hashes the cleared set internally).
 
 ## Verification method
 
@@ -119,34 +151,43 @@ Two real-qmd contract details the scripts handle:
   ignored). Snippets carry a leading `@@ -a,b @@ (x before, y after)`
   diff header, which is stripped before probing.
 - qmd collections match `**/*.md` only, so ledger `.cfd` files would be
-  invisible. `qmd-index` mirrors each `ledger/*.cfd` as a sibling
-  `.cfd.md` in the corpus; `qmd-query` maps those hits back to the real
-  `.cfd` path before verification.
+  invisible. `confidant reindex` mirrors each `ledger/*.cfd` as a sibling
+  `.cfd.md` in the corpus (the CLI owns the mirror; see #37's review flag);
+  `qmd-query` maps those hits back to the real `.cfd` path before
+  verification.
 
 ## Encrypted records (post-M2 contract)
 
-`qmd-index` detects post-M2 `enc:` envelopes and **skips those files with a
-warning**. Rationale: indexing ciphertext is useless, and indexing
-wrongly-"decrypted" content would be a leak. When `confidant-crypt` lands
-(PR B), the corpus step must decrypt through the CLI (e.g. a
-`confidant export`/`find --decrypt` path); until then, skipping is the
-fail-closed choice. This is marked in the script, not silently assumed.
+`confidant reindex` decrypts cleared post-M2 `enc:` envelopes through the
+CLI's read path (`for_agent`, so `no-ai` envelopes are never decrypted).
+Unlike `find` — which skips an unreadable envelope and counts it (⚠2) — a
+corpus cannot afford to silently omit records: search would look complete
+while missing most of the vault. So `reindex` **refuses** (writes nothing)
+when any encrypted record could not be decrypted (no device key / key
+absent) or was refused as tampered, printing the counts
+(`skipped_encrypted` / `refused_envelopes`) and pointing at `confidant
+init` / `confidant recover`. The skill's `qmd-index` surfaces that refusal
+and exits.
 
 ## What stays in the CLI
 
 - The §12 allowlist itself (unchanged), plus `confidant allowlist`, which
   exposes the cleared set (cleared record files + cleared ledger lines, no
   content) for index-time exclusion.
+- `confidant reindex` (ADR-6): the corpus build — content, clearance,
+  decryption, the gitignore refusal, and `0700`/`0600` permissions. The
+  skill registers/embeds on top of the corpus it produces.
 - Plain `find` as the fallback: when QMD or the index is missing,
   `qmd-query` delegates to `confidant find --json` and says so on stderr.
-- A future `confidant reindex` (ADR-6, PR C's CLI work) can subsume
-  `qmd-index`; until then the skill owns corpus builds.
 
 ## Non-goals
 
-- No Rust changes in this PR. No QMD dependency in the CLI. No index in
-  git, no syncing the index anywhere, no plaintext leaving the trusted
-  device.
+- No QMD dependency in the CLI: `reindex` only writes the corpus
+  (issue #37); the `qmd` binary stays behind this skill. No index in git,
+  no syncing the index anywhere, no plaintext leaving the trusted device.
+- No encrypted-disk check in `reindex` (the skill keeps it as device
+  policy); calling `confidant reindex` directly bypasses that gate — a
+  flagged, deliberate carry-over from #37's review.
 - No relevance tuning exposed: `qmd search` (BM25) is the default mode
   because it needs no model downloads; `--mode hybrid|vector` covers the
   reranked and semantic-only cases once `qmd embed` has run (hybrid/vector

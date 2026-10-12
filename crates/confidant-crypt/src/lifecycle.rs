@@ -1638,7 +1638,7 @@ impl ShredOutcome {
 fn leftover_warnings() -> Vec<String> {
     vec![
         "Decrypted copies already on devices are not affected by shredding.".to_string(),
-        ".confidant/ caches and search indexes on every device may still hold plaintext."
+        ".confidant/ caches and search indexes on other devices may still hold plaintext (this device's index is deleted by shred)."
             .to_string(),
         "Old private keys may linger in OS keychains or OS backups — destroy them now.".to_string(),
         "Copies outside Confidant entirely (e.g. Drive transcripts) are not affected.".to_string(),

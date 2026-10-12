@@ -107,6 +107,16 @@ enum Command {
     /// The query-time allowlist stays the authority; this only narrows what
     /// an indexer copies into its local corpus.
     Allowlist,
+    /// Rebuild the local QMD search corpus under
+    /// `<vault>/.confidant/qmd-corpus/` (ADR-6).
+    ///
+    /// The CLI owns corpus content, §12 clearance, decryption, and
+    /// permissions; the `qmd-search` skill only registers/embeds on top.
+    /// Cleared records are decrypted through the read path, so `no-ai`
+    /// records stay out by construction. Refuses (writes nothing) when an
+    /// encrypted record cannot be decrypted, or when the corpus path is not
+    /// git-ignored — a corpus that silently omits records is worse than none.
+    Reindex,
     /// Merge the encrypted `inbox` git branch into the current branch.
     ///
     /// Outside tools push age-encrypted items to the `inbox` branch; this
@@ -550,6 +560,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Reindex => {
+            let root = vault_root.unwrap();
+            cmd_reindex(json, &root)
+        }
         Command::Inbox {
             dry_run,
             allow_unsigned,
@@ -861,6 +875,340 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `<vault>/.confidant/qmd-corpus/` — the QMD search corpus (ADR-6).
+const QMD_CORPUS_REL: &str = ".confidant/qmd-corpus";
+/// Sibling temp dir the corpus is built into before an atomic rename into
+/// [`QMD_CORPUS_REL`], so a failed build never leaves a partial corpus.
+const QMD_CORPUS_TMP_REL: &str = ".confidant/qmd-corpus.tmp";
+/// `<vault>/.confidant/qmd/` — the skill's QMD store (index.sqlite holds the
+/// plaintext FTS chunks + embeddings). The CLI does not build it, but `keys
+/// shred` deletes it alongside the corpus so shredded plaintext cannot linger.
+const QMD_STORE_REL: &str = ".confidant/qmd";
+
+/// `confidant reindex` (ADR-6): rebuild the local search corpus from the
+/// §12 cleared set, decrypting through the read path.
+///
+/// The corpus is a plaintext mirror of cleared vault content, so this fails
+/// closed twice: an encrypted record this device cannot decrypt aborts the
+/// whole build (a corpus that silently omits records is worse than none),
+/// and the corpus must be git-ignored in the vault's repo.
+fn cmd_reindex(json: bool, root: &Path) -> anyhow::Result<ExitCode> {
+    let vault = match load_vault_for_reads(root, json) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let vault_path = vault.root.display().to_string();
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        print_error(
+            json,
+            Some(&vault_path),
+            &DomainError::spec_unsupported(&vault.config.spec),
+        )?;
+        return Ok(ExitCode::from(1));
+    }
+    if vault.ledger_unread_count > 0 {
+        let err = DomainError::ledger_unreadable(vault.ledger_unread_count);
+        print_error(json, Some(&vault_path), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
+
+    // B1/B4: refuse rather than build a corpus that silently omits encrypted
+    // records. `find` skips and counts; a corpus cannot afford to.
+    let skipped = vault.skipped_encrypted;
+    let refused = vault.refused_envelopes;
+    if skipped > 0 || refused > 0 {
+        let err = DomainError::reindex_unreadable(skipped, refused);
+        return refuse_reindex(json, &vault_path, &err, skipped, refused);
+    }
+    if let Err(err) = ensure_corpus_gitignored(&vault.root) {
+        return refuse_reindex(json, &vault_path, &err, 0, 0);
+    }
+
+    let stats = match build_reindex_corpus(&vault) {
+        Ok(stats) => stats,
+        Err(err) => return fail_command(json, Some(&vault_path), &err),
+    };
+    let corpus = vault.root.join(QMD_CORPUS_REL);
+    if json {
+        print_json(&ok_envelope(
+            Some(&vault.root),
+            serde_json::json!({
+                "corpus": corpus.display().to_string(),
+                "files_copied": stats.files_copied,
+                "records_copied": stats.records_copied,
+                "records_decrypted": stats.records_decrypted,
+                "ledger_lines_kept": stats.ledger_lines_kept,
+                // Reuse find's count vocabulary so an agent can tell "0
+                // decrypted because refused" from "0 decrypted because
+                // empty" (ADR-7). Both are always zero on success.
+                "skipped_encrypted": 0,
+                "refused_envelopes": 0,
+            }),
+        ))?;
+    } else {
+        println!(
+            "corpus: {} ({} file(s))",
+            corpus.display(),
+            stats.files_copied
+        );
+        println!(
+            "records: {} copied, {} decrypted",
+            stats.records_copied, stats.records_decrypted
+        );
+        println!("ledger lines kept: {}", stats.ledger_lines_kept);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print a reindex refusal. JSON keeps the ADR-7 error envelope and adds the
+/// skip/refuse counts so a caller never has to parse the message.
+fn refuse_reindex(
+    json: bool,
+    vault: &str,
+    err: &DomainError,
+    skipped: u32,
+    refused: u32,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        print_json(&serde_json::json!({
+            "ok": false,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": vault,
+            "error": err.to_json(),
+            "skipped_encrypted": skipped,
+            "refused_envelopes": refused,
+        }))?;
+    } else {
+        writeln!(io::stderr(), "error: {} ({})", err.message(), err.code())?;
+        if let Some(fix) = err.fix() {
+            writeln!(io::stderr(), "  fix: {fix}")?;
+        }
+    }
+    Ok(ExitCode::from(err.exit_code() as u8))
+}
+
+/// Port of the skill's gitignore guardrail (`qmd-index.py`): refuse unless
+/// `.confidant/` is git-ignored (it holds the corpus, the QMD store, and the
+/// build temp dir). git absent or the vault not being a repo is a note, not
+/// a refusal (there is nothing to commit with), matching the skill.
+fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
+    let git_dir = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-dir"])
+        .output();
+    match git_dir {
+        Err(_) => {
+            eprintln!(
+                "warning: git not found; cannot check that `.confidant/` is \
+                 git-ignored. The corpus is a plaintext mirror — add \
+                 `.confidant/` to `.gitignore` before this vault is ever committed."
+            );
+            return Ok(());
+        }
+        Ok(out) if !out.status.success() => {
+            eprintln!(
+                "warning: this vault is not a git repo yet; the `.confidant/` \
+                 gitignore check is skipped. Add `.confidant/` to `.gitignore` \
+                 before initializing a repo and committing."
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+    // Probe `.confidant/` (which contains the corpus, the QMD store, and the
+    // build temp dir) rather than each child separately. `check-ignore -q`
+    // exits 0 when the path is ignored; the probe file need not exist.
+    let ignored = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", ".confidant/.probe"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if ignored {
+        Ok(())
+    } else {
+        Err(DomainError::reindex_not_ignored(
+            &[".confidant/".to_string()],
+            &root.display().to_string(),
+        ))
+    }
+}
+
+/// Corpus build statistics for `reindex --json`.
+struct ReindexStats {
+    files_copied: usize,
+    records_copied: usize,
+    records_decrypted: usize,
+    ledger_lines_kept: usize,
+}
+
+/// Rebuild `<vault>/.confidant/qmd-corpus/` from the §12 cleared set. The
+/// allowlist comes from `cleared_record_paths` / `cleared_ledger_lines`
+/// (never reimplemented here), so `no-ai` records are excluded by
+/// construction. Built into a temp dir and renamed into place atomically.
+fn build_reindex_corpus(vault: &confidant_core::Vault) -> anyhow::Result<ReindexStats> {
+    let corpus = vault.root.join(QMD_CORPUS_REL);
+    // Build into a sibling temp dir on the same filesystem, then rename into
+    // place: the old corpus survives until the rename succeeds, so a failed
+    // build never leaves a partial corpus behind.
+    let tmp = vault.root.join(QMD_CORPUS_TMP_REL);
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+    // The corpus dir is 0700 from the start (not only after the build), so
+    // plaintext never exists in a world-readable directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let cleared_records = confidant_core::cleared_record_paths(vault);
+    let cleared_ledger = confidant_core::cleared_ledger_lines(vault);
+
+    let mut stats = ReindexStats {
+        files_copied: 0,
+        records_copied: 0,
+        records_decrypted: 0,
+        ledger_lines_kept: 0,
+    };
+
+    for rec in vault.records.values() {
+        if !cleared_records.contains(&rec.path) {
+            continue;
+        }
+        let dst = tmp.join(&rec.path);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_corpus_file(&dst, rec.source.as_bytes())?;
+        stats.files_copied += 1;
+        stats.records_copied += 1;
+        if record_file_is_envelope(&vault.root, &rec.path) {
+            stats.records_decrypted += 1;
+        }
+    }
+
+    for (file, lines) in &cleared_ledger {
+        let text = std::fs::read_to_string(vault.root.join(file)).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read ledger file for the corpus: {e}"
+            )))
+        })?;
+        let keep: std::collections::HashSet<u32> = lines.iter().copied().collect();
+        let mut kept = String::new();
+        for (idx, line) in text.split_inclusive('\n').enumerate() {
+            if keep.contains(&(idx as u32 + 1)) {
+                kept.push_str(line);
+                stats.ledger_lines_kept += 1;
+            }
+        }
+        let dst = tmp.join(file);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_corpus_file(&dst, kept.as_bytes())?;
+        stats.files_copied += 1;
+        // QMD collections match `**/*.md` only, so mirror each `.cfd` as a
+        // sibling `.cfd.md` (as the skill did). The query script maps hits
+        // back to the real `.cfd` path for verification.
+        let mirror = tmp.join(format!("{file}.md"));
+        write_corpus_file(&mirror, kept.as_bytes())?;
+        stats.files_copied += 1;
+    }
+
+    harden_corpus_permissions(&tmp)?;
+    if corpus.exists() {
+        std::fs::remove_dir_all(&corpus)?;
+    }
+    std::fs::rename(&tmp, &corpus)?;
+    Ok(stats)
+}
+
+/// True when the on-disk record file is a §14 envelope (i.e. its corpus
+/// entry came from decrypting through the CLI).
+fn record_file_is_envelope(root: &Path, rel: &str) -> bool {
+    let mut head = [0u8; 4096];
+    let Ok(mut file) = std::fs::File::open(root.join(rel)) else {
+        return false;
+    };
+    use std::io::Read;
+    let n = file.read(&mut head).unwrap_or(0);
+    confidant_core::crypto_mode::is_envelope_bytes(&head[..n])
+}
+
+/// Write a corpus file with mode `0600` from the start, so plaintext never
+/// exists with default (world-readable) permissions.
+fn write_corpus_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Corpus dirs `0700`, files `0600` (B3). Applied recursively after the
+/// build as a final sweep over every nested directory created for record
+/// paths (the corpus root and files are already created with their final
+/// mode; this re-asserts it).
+fn harden_corpus_permissions(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                harden_corpus_permissions(&entry.path())?;
+            } else if file_type.is_file() {
+                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Delete this device's local search index (the QMD corpus, the QMD store,
+/// and any leftover build temp dir). Called by `keys shred`: the corpus is a
+/// plaintext mirror that may hold the shredded client's content, and it is
+/// now stale. Best-effort — returns a warning per path that could not be
+/// removed (empty when everything was absent or deleted).
+fn delete_search_index(root: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for rel in [QMD_CORPUS_REL, QMD_CORPUS_TMP_REL, QMD_STORE_REL] {
+        let path = root.join(rel);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warnings.push(format!(
+                "could not delete the local search index at {rel}: {e}; \
+                 delete it manually (it may hold the shredded client's plaintext)"
+            )),
+        }
+    }
+    warnings
 }
 
 fn cmd_inbox(
@@ -3648,6 +3996,13 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // reading the vault.)
     store_rotated_device_key(&fresh_device_key)?;
 
+    // Delete this device's local search index (the QMD corpus + store): it
+    // is a plaintext mirror that may hold the shredded client's content, and
+    // it is now stale. Deleted ASAP so a later fallible step cannot leave it
+    // behind; other devices' indexes are unaffected (see the leftover
+    // warnings). Best-effort: failures become warnings, not errors.
+    let search_index_warnings = delete_search_index(root);
+
     // B5: the CLI re-pins the anchor itself (new recovery halves) BEFORE
     // any other key operation. #99 ordering: anchor re-pinned before the
     // inbox rotation below. Uses atomic temp-and-rename replace (the
@@ -3736,6 +4091,8 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         eprintln!("warning: {w}");
         shred_warnings.push(w);
     }
+    let search_index_deleted = search_index_warnings.is_empty();
+    shred_warnings.extend(search_index_warnings);
 
     if cli.json {
         print_json(&serde_json::json!({
@@ -3747,12 +4104,16 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "warnings": shred_warnings,
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
+            "search_index_deleted": search_index_deleted,
             "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
         }))?;
     } else {
         println!("shredded client {client_id}");
         println!("device key rotated: this device was re-enrolled with a fresh keypair");
         println!("other devices were removed: re-enroll them with `keys device-add`");
+        if search_index_deleted {
+            println!("local search index deleted (re-run `confidant reindex` to rebuild)");
+        }
         if inbox_rotated {
             println!(
                 "inbox key rotated (run `confidant inbox rotate --finish` to destroy the old key)"
