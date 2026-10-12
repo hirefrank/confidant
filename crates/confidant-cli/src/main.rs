@@ -231,6 +231,40 @@ enum KeysAction {
         /// Client id to shred.
         client_id: String,
     },
+    /// Add a new device: two-step ceremony (design §6).
+    ///
+    /// On the new device, `keys device-add --initiate` generates the keypair
+    /// locally and emits a request carrying only the public key + a label —
+    /// the private key never leaves the device. On an already-enrolled
+    /// device, `keys device-add --from-request <file>` verifies the
+    /// fingerprint out of band, re-wraps every client's every retained
+    /// epoch plus the vault lookup key to the new device, and commits.
+    DeviceAdd {
+        /// Generate a device-add request on this (new) device. The request
+        /// carries only the public key + label. Needs no vault.
+        #[arg(long)]
+        initiate: bool,
+        /// Add the device described by the request file (on an enrolled
+        /// device). The request's fingerprint must be verified out of band:
+        /// interactive confirmation, or --fingerprint-verified with
+        /// --no-input.
+        #[arg(long, value_name = "FILE")]
+        from_request: Option<PathBuf>,
+        /// Human label for the new device (with --initiate).
+        #[arg(long)]
+        label: Option<String>,
+        /// Write the request to FILE instead of stdout (with --initiate).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Confirm the request fingerprint was verified out of band.
+        /// Required with --no-input (with --from-request).
+        #[arg(long)]
+        fingerprint_verified: bool,
+        /// Overwrite an already-enrolled device key (with --initiate).
+        /// Without this, --initiate refuses if a device key exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -356,7 +390,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
-    let needs_vault = !matches!(cli.command, Command::Schema | Command::Help { .. });
+    // `device-add --initiate` runs on a brand-new device that has no vault
+    // yet; everything else needs one.
+    let needs_vault = !matches!(
+        cli.command,
+        Command::Schema
+            | Command::Help { .. }
+            | Command::Keys {
+                action: KeysAction::DeviceAdd { initiate: true, .. },
+            }
+    );
     let vault_root: Option<PathBuf>;
     let user_config: Option<UserConfig>;
     match discover(cli.vault.as_deref()) {
@@ -574,16 +617,61 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             cmd_recover(&cli, &root, phrase_file.as_deref())
         }
         Command::Keys { action } => {
-            let root = vault_root.unwrap();
             match action {
-                KeysAction::InitClient { client_id } => {
-                    cmd_keys_init_client(&cli, &root, client_id)
+                // --initiate runs on a new device with no vault; every other
+                // keys action needs the vault.
+                KeysAction::DeviceAdd {
+                    initiate,
+                    from_request,
+                    label,
+                    output,
+                    fingerprint_verified,
+                    force,
+                } => {
+                    // B6: flag combinations are usage errors (exit 2).
+                    if *initiate && from_request.is_some() {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--initiate and --from-request are mutually exclusive",
+                        )));
+                    }
+                    if !initiate && (label.is_some() || output.is_some()) {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--label and --output only make sense with --initiate",
+                        )));
+                    }
+                    if *initiate {
+                        cmd_keys_device_add_initiate(
+                            &cli,
+                            label.as_deref(),
+                            output.as_deref(),
+                            *force,
+                        )
+                    } else {
+                        let root = vault_root.unwrap();
+                        cmd_keys_device_add_from_request(
+                            &cli,
+                            &root,
+                            from_request.as_deref(),
+                            *fingerprint_verified,
+                        )
+                    }
                 }
-                KeysAction::Rotate { client_id } => cmd_keys_rotate(&cli, &root, client_id),
-                KeysAction::Revoke { client_id, key_ids } => {
-                    cmd_keys_revoke(&cli, &root, client_id, key_ids)
+                _ => {
+                    let root = vault_root.unwrap();
+                    match action {
+                        KeysAction::InitClient { client_id } => {
+                            cmd_keys_init_client(&cli, &root, client_id)
+                        }
+                        KeysAction::Rotate { client_id } => cmd_keys_rotate(&cli, &root, client_id),
+                        KeysAction::Revoke { client_id, key_ids } => {
+                            cmd_keys_revoke(&cli, &root, client_id, key_ids)
+                        }
+                        KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
+                        KeysAction::DeviceAdd { .. } => {
+                            unreachable!("handled by the outer match arm")
+                        }
+                    }
                 }
-                KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
             }
         }
         Command::Schema => cmd_schema(&cli, vault_root.as_deref()),
@@ -2364,6 +2452,16 @@ fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
     Ok(Box::new(identity))
 }
 
+/// Derive the recipient key id for a device from its age pubkey.
+///
+/// Stable and unique per device: `device-` + 8 chars from the pubkey.
+/// Char-based (not byte-indexed) so a short/malformed pubkey cannot panic;
+/// callers validate the pubkey parses as an age recipient first.
+fn device_key_id(age_pubkey: &str) -> String {
+    let suffix: String = age_pubkey.chars().skip(8).take(8).collect();
+    format!("device-{suffix}")
+}
+
 /// Build the recipient map from the anchor + device keychain for `keys`
 /// commands. Currently the only recipient is this device; #66 adds more.
 /// Build the recipient map for `keys init-client`: the union of
@@ -2666,6 +2764,351 @@ fn cmd_keys_revoke(
         }))?;
     } else {
         println!("revoked {} from {client_id}", key_ids.join(", "));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Version of the `keys device-add` request document.
+const DEVICE_ADD_REQUEST_VERSION: u32 = 1;
+
+/// A `keys device-add` request: public key + label only. The private key
+/// never leaves the new device, so this document is safe to transfer by
+/// file, paste, or QR (design §6).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DeviceAddRequest {
+    version: u32,
+    pubkey: String,
+    label: String,
+}
+
+/// `keys device-add --initiate`: run on the new device. Generates the
+/// keypair locally, enrolls the device key per the keychain rules, and
+/// emits the request (pubkey + label only). Touches nothing else — no
+/// vault. The fingerprint goes to stderr so the operator can verify it
+/// out of band; the request goes to stdout (or --output).
+/// Validate a device-add request label: restrict charset and length,
+/// strip control characters (it flows into the commit message, manifest,
+/// and stderr — a hand-edited request file must not inject terminal
+/// escapes). Used by both `--initiate` and `--from-request`.
+fn validate_device_label(raw: &str) -> anyhow::Result<String> {
+    // Strip control characters (including newlines) to avoid terminal escapes.
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label must not be empty",
+        )));
+    }
+    if cleaned.len() > 64 {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label must be at most 64 characters",
+        )));
+    }
+    // Allow alphanumerics, spaces, and common punctuation.
+    if !cleaned
+        .chars()
+        .all(|c| c.is_alphanumeric() || " -_.()".contains(c))
+    {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label may contain only letters, numbers, spaces, and -_.()",
+        )));
+    }
+    Ok(cleaned.to_string())
+}
+
+fn cmd_keys_device_add_initiate(
+    cli: &Cli,
+    label: Option<&str>,
+    output: Option<&Path>,
+    force: bool,
+) -> anyhow::Result<ExitCode> {
+    // Refuse to overwrite an already-enrolled device key (same check as
+    // recover's B13): running --initiate on an enrolled device would
+    // replace its keychain entry and lock it out. --force overrides the
+    // refusal, but not the confirmation below.
+    use confidant_crypt::keychain;
+    // Check via the keychain directly (not the env override): if a
+    // device key is enrolled, refuse.
+    let enrolled = match keychain::device_key() {
+        Ok(_) => true,
+        Err(confidant_crypt::error::Error::NoKey(_)) => false,
+        Err(e) => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot check device key: {e}"
+            ))));
+        }
+    };
+    // Also check the env var (headless/test): if set, a key is enrolled.
+    let env_enrolled = std::env::var(keychain::DEVICE_KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let already_enrolled = enrolled || env_enrolled;
+    if already_enrolled && !force {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
+        )));
+    }
+    // Item 5: --force on --initiate replaces the enrolled device key.
+    // Confirm interactively unless --no-input, and say plainly that the
+    // old key's access from this device is lost — worded for the
+    // re-enroll-after-shred case, the main reason to reach for --force.
+    if already_enrolled && force && !cli.no_input {
+        eprintln!("WARNING: a device key is already enrolled on this device.");
+        eprintln!("--force will replace it: the old key will no longer work from here.");
+        eprintln!(
+            "After a `keys shred` dropped this device, re-enrolling with a fresh key is \
+             how it rejoins; the shredded client's history stays unopenable by the old key."
+        );
+        eprint!("Replace the enrolled device key? [y/N] ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "device key replacement not confirmed; refusing",
+            )));
+        }
+    }
+
+    // Item 6: validate the label BEFORE provisioning the key. A bad label
+    // must not store a key and then error — the retry would need --force
+    // to clean up the mess.
+    // (Shared validator with --from-request: a hand-edited request can
+    // inject controls into the commit message/manifest/stderr.)
+    let label = validate_device_label(label.unwrap_or("device"))?;
+    let (_bech32, recipient) = provision_device_key()?;
+    let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&recipient);
+    let key_id = device_key_id(&recipient);
+
+    let request = DeviceAddRequest {
+        version: DEVICE_ADD_REQUEST_VERSION,
+        pubkey: recipient.clone(),
+        label: label.clone(),
+    };
+    let toml_body = toml::to_string(&request).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot serialize device-add request: {e}"
+        )))
+    })?;
+    let document =
+        format!("# confidant device-add request — public key only, safe to transfer\n{toml_body}");
+
+    // Fingerprint on stderr (human channel), always — it is what the
+    // operator compares against on the enrolled device.
+    eprintln!("new device key fingerprint: {fingerprint}");
+    eprintln!(
+        "show this fingerprint on the enrolled device and confirm it matches before approving"
+    );
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": null,
+            "fingerprint": fingerprint,
+            "label": label,
+            "key_id": key_id,
+            "pubkey": recipient,
+            "request": document,
+        }))?;
+    } else if let Some(path) = output {
+        // 0644 explicit: the request carries only the public key + label,
+        // safe to transfer. Deliberate, not a default.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o644)
+                .open(path)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(document.as_bytes())
+                })
+                .map_err(|e| {
+                    anyhow::Error::new(DomainError::invalid(format!(
+                        "cannot write device-add request to {}: {e}",
+                        path.display()
+                    )))
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, &document).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot write device-add request to {}: {e}",
+                    path.display()
+                )))
+            })?;
+        }
+        eprintln!("wrote device-add request to {}", path.display());
+    } else {
+        print!("{document}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `keys device-add --from-request <file>`: run on an already-enrolled
+/// device. Verifies the fingerprint out of band, re-wraps every client's
+/// every retained epoch plus the vault lookup key to the new device, and
+/// commits (one commit, check first, signed by the operator key).
+fn cmd_keys_device_add_from_request(
+    cli: &Cli,
+    root: &Path,
+    from_request: Option<&Path>,
+    fingerprint_verified: bool,
+) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore, manifest::RecipientEntry};
+
+    // B6: exactly one mode; --from-request is required here.
+    let request_path = from_request.ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(
+            "keys device-add needs exactly one of --initiate or --from-request <file>",
+        ))
+    })?;
+
+    // Parse the request. Anything malformed is E_INVALID-class: fail
+    // closed, nothing mutated (B6).
+    let raw = std::fs::read_to_string(request_path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read device-add request {}: {e}",
+            request_path.display()
+        )))
+    })?;
+    let request: DeviceAddRequest = toml::from_str(&raw).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "malformed device-add request {}: {e}",
+            request_path.display()
+        )))
+    })?;
+    if request.version != DEVICE_ADD_REQUEST_VERSION {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "unsupported device-add request version {} (want {})",
+            request.version, DEVICE_ADD_REQUEST_VERSION
+        ))));
+    }
+    request
+        .pubkey
+        .parse::<age::x25519::Recipient>()
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "device-add request has a bad pubkey: {e}"
+            )))
+        })?;
+    let key_id = device_key_id(&request.pubkey);
+    let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&request.pubkey);
+    // Validate the label too: the request file is hand-editable, and the
+    // label flows into the commit message, manifest, and stderr.
+    // Malformed labels are E_INVALID-class (B6): fail closed.
+    let label = validate_device_label(&request.label).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "device-add request has a bad label: {e}"
+        )))
+    })?;
+
+    // Fingerprint verification is mandatory (design §7): the operator
+    // must confirm the fingerprint matches what the new device showed.
+    // No silent trust of a transferred file.
+    if cli.no_input {
+        if !fingerprint_verified {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "--from-request with --no-input requires --fingerprint-verified: \
+                 verify the request fingerprint out of band first",
+            )));
+        }
+    } else {
+        eprintln!("new device request:");
+        eprintln!("  label:       {label}");
+        eprintln!("  pubkey:      {}", request.pubkey);
+        eprintln!("  fingerprint: {fingerprint}");
+        eprint!("Does this fingerprint match the one shown on the new device? [y/N] ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "fingerprint not confirmed; refusing to add the device",
+            )));
+        }
+    }
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let identity = keys_device_identity()?;
+    let operator_sk = load_operator_sk(&anchor)?;
+
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+    let entry = RecipientEntry {
+        age_pubkey: request.pubkey.clone(),
+        label: label.clone(),
+        scope_ref: String::new(),
+    };
+    // B2: every initialized client's every retained epoch + the lookup
+    // key, all through KeyStore; verify-first inside add_recipient.
+    // Item 7: add_recipient writes client-by-client, so an IO failure
+    // mid-write can leave keys/ half-updated and uncommitted. Nothing is
+    // committed on this path, so point at the exact recovery command
+    // instead of attempting an in-code restore (which could clobber the
+    // operator's own uncommitted work).
+    let clients = store
+        .add_recipient(&key_id, &entry, identity.as_ref(), &anchor, &operator_sk)
+        .map_err(|e| {
+            anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "device-add failed; keys/ may be partially updated (nothing was committed): {e}"
+                ))
+                .with_fix(format!(
+                    "inspect with `git -C {} status -- keys/`, then restore tracked files with \
+                     `git -C {} checkout -- keys/` and delete any new untracked {key_id}*.age wrappings",
+                    root.display(),
+                    root.display(),
+                )),
+            )
+        })?;
+
+    // One commit, check first, signed by the operator key (design §6).
+    let no_input = cli.no_input;
+    let vault = load_vault(root)?;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &[
+            "commit",
+            "-m",
+            &format!("keys: device-add {key_id} ({label})"),
+        ],
+        no_input,
+    )?;
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "fingerprint": fingerprint,
+            "label": label,
+            "key_id": key_id,
+            "clients": clients,
+            "client_count": clients.len(),
+        }))?;
+    } else {
+        println!(
+            "added device {key_id} ({label}) to {} client(s)",
+            clients.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

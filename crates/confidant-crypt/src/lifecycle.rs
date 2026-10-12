@@ -44,8 +44,8 @@ use crate::anchor::Anchor;
 use crate::error::Error;
 use crate::keys::{DataKey, LookupKey};
 use crate::manifest::{
-    self, CommitmentEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID, SHARED_CLIENT_ID,
-    VAULT_CLIENT_ID,
+    self, CommitmentEntry, RecipientEntry, RecipientMap, SeqTracker, RECOVERY_KEY_ID,
+    SHARED_CLIENT_ID, VAULT_CLIENT_ID,
 };
 use crate::recovery::Recovery;
 use zeroize::Zeroizing;
@@ -687,6 +687,156 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Add a new device recipient to every initialized client and the vault
+    /// lookup key (#66, design §6).
+    ///
+    /// Re-wraps every initialized client's every retained epoch to include
+    /// the new recipient (only the new recipient's wrapping files are
+    /// added; existing wrappings are untouched), re-wraps the vault lookup
+    /// key so the new device can compute alias HMACs, and re-signs every
+    /// manifest. The lookup key is handed off, never regenerated and never
+    /// recovery-wrapped (#142).
+    ///
+    /// Verify-first: the identity must open every client's every epoch and
+    /// the lookup key before anything is mutated. Returns the ids of the
+    /// clients updated.
+    pub fn add_recipient(
+        &mut self,
+        new_key_id: &str,
+        new_entry: &RecipientEntry,
+        identity: &dyn age::Identity,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<Vec<String>, Error> {
+        manifest::validate_key_id(new_key_id)?;
+        // Parse the new pubkey now: a bad recipient fails before any mutation.
+        let _: age::x25519::Recipient = new_entry
+            .age_pubkey
+            .parse()
+            .map_err(|e| Error::Age(format!("bad new recipient pubkey: {e}")))?;
+
+        // Initialized clients via manifest_clients() (same source as
+        // recover and shred), excluding the vault lookup dir (handled
+        // separately below).
+        let clients: Vec<String> = self
+            .manifest_clients()
+            .into_iter()
+            .filter(|c| c != VAULT_CLIENT_ID)
+            .collect();
+
+        struct VerifiedClient {
+            client: String,
+            epoch: u64,
+            new_map: RecipientMap,
+            epoch_keys: Vec<(u64, DataKey)>,
+            commitments: Vec<CommitmentEntry>,
+        }
+        let mut verified: Vec<VerifiedClient> = Vec::new();
+        for client in &clients {
+            let (epoch, old_map, commitments) = self.verified_recipients(client, anchor)?;
+            if old_map.contains_key(new_key_id) {
+                return Err(Error::Manifest(format!(
+                    "recipient {new_key_id:?} is already enrolled for {client}"
+                )));
+            }
+            if old_map
+                .values()
+                .any(|e| e.age_pubkey == new_entry.age_pubkey)
+            {
+                return Err(Error::Manifest(format!(
+                    "a recipient with this pubkey is already enrolled for {client}"
+                )));
+            }
+            let mut epoch_keys = Vec::new();
+            for e in 1..=epoch {
+                let mut key_opt = None;
+                let mut last_err =
+                    Error::NoKey(format!("identity opens no wrapping for {client} e{e}"));
+                for kid in old_map
+                    .keys()
+                    .chain(std::iter::once(&RECOVERY_KEY_ID.to_string()))
+                {
+                    match self.unwrap_data_key(client, kid, e, identity, anchor) {
+                        Ok(k) => {
+                            key_opt = Some(k);
+                            break;
+                        }
+                        Err(er) => last_err = er,
+                    }
+                }
+                epoch_keys.push((e, key_opt.ok_or(last_err)?));
+            }
+            let mut new_map = old_map;
+            new_map.insert(new_key_id.to_string(), new_entry.clone());
+            verified.push(VerifiedClient {
+                client: client.clone(),
+                epoch,
+                new_map,
+                epoch_keys,
+                commitments,
+            });
+        }
+
+        // Blocker 2 (#151): refuse any pubkey that has EVER been a
+        // recipient — current or historical manifest of any client, the
+        // vault lookup map, or the recovery key (the same set shred's step
+        // 2 builds, shared via ever_seen_pubkeys). A device re-sending its
+        // original request after a shred would otherwise silently undo the
+        // shred: the old private key still opens the shredded client's
+        // wrappings in git history. Compares pubkeys, not just key ids.
+        // Runs before any mutation.
+        let all: Vec<String> = self.manifest_clients();
+        let all_refs: Vec<&str> = all.iter().map(|s| s.as_str()).collect();
+        let ever_seen = self.ever_seen_pubkeys(&all_refs, anchor)?;
+        if ever_seen.contains(&new_entry.age_pubkey) {
+            return Err(Error::Manifest(
+                "this pubkey has already been a recipient of this vault; \
+                 generate a fresh keypair with `keys device-add --initiate`"
+                    .to_string(),
+            ));
+        }
+
+        // Lookup key: read_lookup_key verifies the vault manifest, unwraps
+        // with the identity, and checks the commitment — a planted
+        // lookup.age fails closed here, before any mutation.
+        let (lookup_key, lookup_commitments, lookup_seq) =
+            self.read_lookup_key(identity, anchor)?;
+        let (_, vault_map, _) = self.verified_recipients(VAULT_CLIENT_ID, anchor)?;
+        if vault_map.contains_key(new_key_id) {
+            return Err(Error::Manifest(format!(
+                "recipient {new_key_id:?} is already enrolled for the vault lookup key"
+            )));
+        }
+        let mut new_vault_map = vault_map;
+        new_vault_map.insert(new_key_id.to_string(), new_entry.clone());
+
+        // All checks passed: now mutate.
+        for v in &verified {
+            let wdir = self.wrapped_dir(&v.client);
+            for (e, key) in &v.epoch_keys {
+                let suffix = if *e == v.epoch {
+                    String::new()
+                } else {
+                    format!(".e{e}")
+                };
+                let wrapped = wrap_to_recipient(key.as_bytes(), &new_entry.age_pubkey)?;
+                std::fs::write(wdir.join(format!("{new_key_id}{suffix}.age")), wrapped)?;
+            }
+            // Keys are unchanged by the re-wrap, so commitments carry
+            // forward from the verified buffer.
+            self.write_manifest(&v.client, v.epoch, &v.new_map, &v.commitments, signing_sk)?;
+        }
+        self.write_lookup_raw(
+            lookup_key.as_bytes(),
+            &new_vault_map,
+            &lookup_commitments,
+            lookup_seq,
+            signing_sk,
+        )?;
+
+        Ok(clients)
+    }
+
     /// All historical versions of a client's recipient manifest, oldest
     /// first, from git history. Used by `shred` to build the complete
     /// destroy list: a recipient revoked earlier still has old wrappings in
@@ -758,6 +908,97 @@ impl KeyStore {
             }
         }
         Ok(maps)
+    }
+
+    /// Client ids whose `keys/<dir>/recipients.toml` was deleted in git
+    /// history — i.e. shredded clients. Their tree is gone, so
+    /// [`manifest_clients`](Self::manifest_clients) no longer lists them,
+    /// but their wrappings still exist in git history. Fails open to an
+    /// empty list when git is unavailable (mirroring
+    /// [`historical_recipients`](Self::historical_recipients)): without git
+    /// there is no shredded history to consult.
+    fn shredded_clients(&self) -> Vec<String> {
+        let repo = match self.keys_dir.parent() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let out = std::process::Command::new("git")
+            // Never leak the device key into git/gpg/hooks via the environment.
+            .env_remove("CONFIDANT_DEVICE_KEY")
+            .args([
+                "-C",
+                &repo.to_string_lossy(),
+                "log",
+                "--diff-filter=D",
+                "--name-only",
+                "--format=",
+                "--end-of-options",
+                "--",
+                "keys/",
+            ])
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // Only exact `keys/<dir>/recipients.toml` paths: the shredded
+            // client's manifest. Anything else deleted under keys/ is not
+            // a client tree.
+            let rest = match line.trim().strip_prefix("keys/") {
+                Some(r) => r,
+                None => continue,
+            };
+            let (dir, file) = match rest.split_once('/') {
+                Some((d, f)) if !d.is_empty() && !d.contains('/') => (d, f),
+                _ => continue,
+            };
+            if file != "recipients.toml" {
+                continue;
+            }
+            ids.insert(Self::client_id_for_dir(dir).to_string());
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Every age pubkey that has ever been a recipient: the current and
+    /// historical manifests of each listed client, the historical manifests
+    /// of shredded (deleted-tree) clients, plus the recovery
+    /// recipient. Shared by `shred` (step 2: no new recipient may reuse
+    /// one, or the shredded history stays openable) and `add_recipient`
+    /// (a re-sent device-add request after a shred must not silently undo
+    /// the shred by re-wrapping to a key that still opens the shredded
+    /// client's history). Callers choose the client list: `shred` passes
+    /// its strand-checked `all_clients`; `add_recipient` passes every
+    /// manifest client, including the vault lookup map — and compares
+    /// pubkeys, not just key ids. Shredded clients are always included,
+    /// since their trees are gone from `manifest_clients` but their
+    /// wrappings persist in git history.
+    fn ever_seen_pubkeys(
+        &mut self,
+        clients: &[&str],
+        anchor: &Anchor,
+    ) -> Result<std::collections::BTreeSet<String>, Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        // Shredded clients' trees are deleted, so callers never list them;
+        // their historical pubkeys still forbid reuse.
+        let shredded = self.shredded_clients();
+        let shredded_refs: Vec<&str> = shredded.iter().map(|s| s.as_str()).collect();
+        for client in clients.iter().chain(shredded_refs.iter()) {
+            for map in self.historical_recipients(client)? {
+                seen.extend(map.values().map(|e| e.age_pubkey.clone()));
+            }
+            // A shredded client's tree is gone, so there is no current
+            // manifest to verify; its history is what matters.
+            if shredded_refs.contains(client) {
+                continue;
+            }
+            let (_, map, _) = self.verified_recipients(client, anchor)?;
+            seen.extend(map.values().map(|e| e.age_pubkey.clone()));
+        }
+        seen.insert(anchor.recovery_age.clone());
+        Ok(seen)
     }
 
     /// Crypto-shred a client: key destruction, not deletion.
@@ -888,15 +1129,7 @@ impl KeyStore {
         // recipient (including recovery): reusing a pubkey would keep the
         // old private key able to unwrap the shredded client's history.
         // (B5: do not weaken this check.)
-        let mut old_pubkeys = std::collections::BTreeSet::new();
-        for client in all_clients {
-            for map in self.historical_recipients(client)? {
-                old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
-            }
-            let (_, map, _) = self.verified_recipients(client, anchor)?;
-            old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
-        }
-        old_pubkeys.insert(anchor.recovery_age.clone());
+        let old_pubkeys = self.ever_seen_pubkeys(all_clients, anchor)?;
         for (id, entry) in new_recipients {
             if old_pubkeys.contains(&entry.age_pubkey) {
                 return Err(Error::Manifest(format!(
