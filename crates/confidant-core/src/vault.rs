@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
@@ -13,6 +14,35 @@ use crate::record::{
 };
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes"];
+
+/// Per-file outcome of the read-path content hook (spec 4, issue #148).
+///
+/// Core stays keyless: it never sees key material or `confidant-crypt`
+/// types. The CLI implements the hook with its decryptor; `check` passes
+/// no hook and keeps today's structural behavior.
+#[derive(Debug)]
+pub enum ContentOutcome {
+    /// Bytes for core to parse as the record: plaintext passthrough or
+    /// decrypted inner record.
+    Content(Vec<u8>),
+    /// Envelope with `no-ai: true` in the outer header. Core synthesizes a
+    /// shell record from the header (`id`/`type`/`no-ai: true`, empty body)
+    /// so `context` keeps working and `find` keeps excluding it via the
+    /// existing §12 allowlist rule. Never decrypted.
+    NoAiShell { id: String, record_type: String },
+    /// Encrypted record this device cannot read (no device key, or the data
+    /// key won't unwrap). Not loaded; counted as `skipped_encrypted`.
+    Skipped,
+    /// Envelope failed structural parse or AEAD authentication
+    /// (tampered/corrupt). Not loaded; counted as `refused_envelopes`.
+    /// Never folded into the skip count.
+    Refused,
+}
+
+/// Opaque per-file content provider for the read path: vault-relative path
+/// and raw file bytes in, [`ContentOutcome`] out. `Send + Sync` because
+/// record files load on worker threads.
+pub type ContentHook = Arc<dyn Fn(&str, &[u8]) -> ContentOutcome + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct SourcedEntry {
@@ -50,20 +80,36 @@ pub struct Vault {
     /// Crockford ULIDs taken from visited file/directory names whose windows
     /// are not already a loaded record's own exact name.
     pub path_ulids: BTreeSet<String>,
+    /// Record files skipped as encrypted-but-unreadable by the content hook
+    /// (spec 4). No-ai envelopes are loaded as shells, not counted here.
+    pub skipped_encrypted: u32,
+    /// Envelopes refused as tampered/corrupt by the content hook (spec 4).
+    /// Never folded into `skipped_encrypted`.
+    pub refused_envelopes: u32,
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
+    load_vault_with_hook(root, None)
+}
+
+/// Load a vault, applying `hook` to every record file's raw bytes before
+/// parsing (spec 4). `None` keeps the historical behavior: raw bytes are
+/// parsed as-is (`check` stays keyless and structural).
+pub fn load_vault_with_hook(
+    root: &Path,
+    hook: Option<ContentHook>,
+) -> Result<Vault, crate::error::DomainError> {
     let root = root
         .canonicalize()
         .map_err(|_| crate::error::DomainError::vault_not_found())?;
-    load_vault_inner(&root).map_err(|err| {
+    load_vault_inner(&root, hook.as_ref()).map_err(|err| {
         crate::error::DomainError::of(&err)
             .cloned()
             .unwrap_or_else(|| crate::error::DomainError::invalid(err.to_string()))
     })
 }
 
-fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
+fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<Vault> {
     let cfg_text = paths::read_to_string(root, Path::new("confidant.toml")).map_err(|err| {
         if crate::error::is_missing(&err) {
             anyhow::Error::new(crate::error::DomainError::vault_not_found())
@@ -87,14 +133,18 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
+    let mut skipped_encrypted = 0u32;
+    let mut refused_envelopes = 0u32;
 
     if config.spec == SPEC_VERSION {
         let mut jobs = Vec::new();
         let mut names = Vec::new();
         scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
-        let outs = load_markdown_jobs(root, &jobs);
+        let outs = load_markdown_jobs(root, &jobs, hook);
         for (job, out) in jobs.iter().zip(outs) {
-            merge_markdown_job(job, out, &mut records, &mut findings);
+            skipped_encrypted += out.skipped;
+            refused_envelopes += out.refused;
+            merge_markdown_job(job, (out.record, out.findings), &mut records, &mut findings);
         }
         scan_ledger(
             root,
@@ -118,6 +168,8 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
         ledger_unread_count,
         path_ids,
         path_ulids,
+        skipped_encrypted,
+        refused_envelopes,
     })
 }
 
@@ -722,7 +774,11 @@ struct MarkdownJob {
 
 /// Read, parse and check the jobs on worker threads, preserving job
 /// order in the output so the merge is deterministic.
-fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<(Option<Record>, Vec<Finding>)> {
+fn load_markdown_jobs(
+    root: &Path,
+    jobs: &[MarkdownJob],
+    hook: Option<&ContentHook>,
+) -> Vec<JobOutput> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -737,7 +793,7 @@ fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<(Option<Record>,
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(|| {
                 part.iter()
-                    .map(|job| run_markdown_job(root, job))
+                    .map(|job| run_markdown_job(root, job, hook))
                     .collect::<Vec<_>>()
             }));
         }
@@ -746,6 +802,15 @@ fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<(Option<Record>,
         }
     });
     out
+}
+
+/// One job's result: the parsed record (if any), its findings, and the
+/// spec-4 hook counts.
+struct JobOutput {
+    record: Option<Record>,
+    findings: Vec<Finding>,
+    skipped: u32,
+    refused: u32,
 }
 
 /// Merge one job result: content findings first (walk order is preserved
@@ -792,9 +857,15 @@ fn merge_markdown_job(
     }
 }
 
-fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Finding>) {
+fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) -> JobOutput {
     let mut findings = Vec::new();
     let file = paths::display_relative(&job.relative);
+    let fail = |findings: Vec<Finding>| JobOutput {
+        record: None,
+        findings,
+        skipped: 0,
+        refused: 0,
+    };
     let text = match paths::read_to_string(root, &job.relative) {
         Ok(t) => t,
         Err(_) => {
@@ -807,7 +878,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Find
                 .at_file(&file)
                 .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
-            return (None, findings);
+            return fail(findings);
         }
     };
     if has_conflict_markers(&text) {
@@ -821,6 +892,53 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Find
             .with_fix("Resolve the conflict; check keeps both sides visible until you do"),
         );
     }
+    // Spec 4: the content hook maps raw bytes to the bytes core parses
+    // (decrypted inner record), a no-ai shell, or a skip/refuse decision.
+    // `check` passes no hook and keeps the historical behavior.
+    let bytes: Vec<u8> = match hook {
+        None => text.into_bytes(),
+        Some(hook) => match hook(&file, text.as_bytes()) {
+            ContentOutcome::Content(bytes) => bytes,
+            ContentOutcome::NoAiShell { id, record_type } => {
+                // Synthesize the public shell from the outer header:
+                // id/type/no-ai are plaintext in the envelope, the body
+                // stays empty. The allowlist excludes it via `no_ai()`
+                // exactly like a plaintext no-ai record.
+                format!("---\nid: {id}\ntype: {record_type}\nno-ai: true\n---\n").into_bytes()
+            }
+            ContentOutcome::Skipped => {
+                return JobOutput {
+                    record: None,
+                    findings,
+                    skipped: 1,
+                    refused: 0,
+                }
+            }
+            ContentOutcome::Refused => {
+                return JobOutput {
+                    record: None,
+                    findings,
+                    skipped: 0,
+                    refused: 1,
+                }
+            }
+        },
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            findings.push(
+                Finding::new(
+                    FindingCode::Unreadable,
+                    Severity::Error,
+                    "path is unreadable".to_owned(),
+                )
+                .at_file(&file)
+                .with_fix("Replace the file with valid UTF-8 Markdown"),
+            );
+            return fail(findings);
+        }
+    };
     match parse_record(&text, &file) {
         Err(err) => {
             let mut finding =
@@ -829,7 +947,12 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Find
                 finding = finding.at_line(line);
             }
             findings.push(finding.with_fix(err.fix));
-            (None, findings)
+            JobOutput {
+                record: None,
+                findings,
+                skipped: 0,
+                refused: 0,
+            }
         }
         Ok(mut rec) => {
             rec.path = file.clone();
@@ -880,7 +1003,12 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob) -> (Option<Record>, Vec<Find
             }
             // Duplicate detection and insert happen at merge, in walk
             // order, so parallel results match a serial load exactly.
-            (Some(rec), findings)
+            JobOutput {
+                record: Some(rec),
+                findings,
+                skipped: 0,
+                refused: 0,
+            }
         }
     }
 }

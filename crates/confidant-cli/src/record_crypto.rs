@@ -245,7 +245,7 @@ impl RecordEncryptor {
 /// pubkey against the verified recipient maps (union over all initialized
 /// clients). Fail closed when the device is not enrolled: a write must
 /// never proceed under the wrong key id.
-fn resolve_device_key_id(
+pub(crate) fn resolve_device_key_id(
     store: &mut KeyStore,
     anchor: &anchor::Anchor,
     device_pubkey: &str,

@@ -11,6 +11,7 @@
 
 mod mcp;
 mod record_crypto;
+mod record_decrypt;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -489,7 +490,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
-            let vault = vault_or!(&root, json);
+            // Spec 4: the allowlist is a read path — decrypted records
+            // participate, skipped ones are excluded by omission.
+            let vault = match load_vault_for_reads(&root, json) {
+                Ok(v) => v,
+                Err(code) => return Ok(code),
+            };
             if vault.config.spec != confidant_core::SPEC_VERSION {
                 print_error(
                     json,
@@ -704,6 +710,31 @@ fn load_vault_or(root: &Path, json: bool) -> Result<confidant_core::Vault, ExitC
     }
 }
 
+/// Load the vault for a read command (`find`/`context`, spec 4). Two-phase:
+/// phase 1 loads without the hook to get the vault id for AAD; phase 2
+/// reloads with the decryptor hook so envelopes decrypt (or skip + count).
+/// Reads never fail for a missing key — that is a per-record skip (⚠2).
+fn load_vault_for_reads(root: &Path, json: bool) -> Result<confidant_core::Vault, ExitCode> {
+    let probe = match load_vault(root) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = print_error(json, Some(&root.display().to_string()), &err);
+            return Err(ExitCode::from(err.exit_code() as u8));
+        }
+    };
+    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
+        root,
+        &probe.config.vault_id,
+    ));
+    match confidant_core::load_vault_with_hook(root, Some(decryptor.hook())) {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            let _ = print_error(json, Some(&root.display().to_string()), &err);
+            Err(ExitCode::from(err.exit_code() as u8))
+        }
+    }
+}
+
 fn is_broken_pipe(err: &serde_json::Error) -> bool {
     err.io_error_kind() == Some(io::ErrorKind::BrokenPipe)
 }
@@ -759,7 +790,10 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
             "find requires a non-empty query",
         )));
     }
-    let vault = vault_or!(root, json);
+    let vault = match load_vault_for_reads(root, json) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
     let vault_path = vault.root.display().to_string();
     if vault.config.spec != confidant_core::SPEC_VERSION {
         print_error(
@@ -784,6 +818,8 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
                 "query": query,
                 "matches": hits,
                 "findings": result.findings,
+                "skipped_encrypted": result.skipped_encrypted,
+                "refused_envelopes": result.refused_envelopes,
             }),
         ))?;
     } else {
@@ -807,6 +843,22 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
             )?;
         }
         writeln!(io::stdout(), "{} matches", hits.len())?;
+        // ⚠2a: never silently empty — the skip/refuse counts are always
+        // visible when nonzero.
+        if result.skipped_encrypted > 0 {
+            writeln!(
+                io::stdout(),
+                "skipped_encrypted: {}",
+                result.skipped_encrypted
+            )?;
+        }
+        if result.refused_envelopes > 0 {
+            writeln!(
+                io::stdout(),
+                "refused_envelopes: {}",
+                result.refused_envelopes
+            )?;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1434,18 +1486,36 @@ fn cmd_context(
     person_raw: &str,
     include_private: bool,
 ) -> anyhow::Result<ExitCode> {
-    let vault = vault_or!(root, cli.json);
+    let vault = match load_vault_for_reads(root, cli.json) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
     let person = RecordId::parse(person_raw).map_err(|_| {
         anyhow::Error::new(DomainError::usage(format!("not a record id: {person_raw}"))).context(
             "`context` takes an opaque person id; use `confidant find <name>` to look one up",
         )
     })?;
-    let bundle = build_context(&vault, &person, include_private).ok_or_else(|| {
-        anyhow::Error::new(DomainError::not_found(format!(
-            "no person with id {person_raw}"
-        )))
-        .context("use `confidant find <name>` to look up the id")
-    })?;
+    let bundle = match build_context(&vault, &person, include_private) {
+        Some(b) => b,
+        None => {
+            // ⚠2b: the person's key is absent (their record is an envelope
+            // this device cannot read) is a hard error, not "not found".
+            if record_decrypt::person_has_envelope(&vault.root, &person.to_string()) {
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot decrypt records for {person_raw}: this device has no key for them"
+                    ))
+                    .with_fix(
+                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                    ),
+                ));
+            }
+            return Err(anyhow::Error::new(DomainError::not_found(format!(
+                "no person with id {person_raw}"
+            )))
+            .context("use `confidant find <name>` to look up the id"));
+        }
+    };
     if cli.json {
         let value = serde_json::to_value(&bundle)?;
         print_json(&ok_envelope(Some(root), value))?;
@@ -1468,6 +1538,13 @@ fn cmd_context(
         );
         if !bundle.aliases.is_empty() {
             println!("aliases: {}", bundle.aliases.join(", "));
+        }
+        // ⚠2: the bundle carries what was skipped, never silent.
+        if bundle.skipped_encrypted > 0 {
+            println!("skipped_encrypted: {}", bundle.skipped_encrypted);
+        }
+        if bundle.refused_envelopes > 0 {
+            println!("refused_envelopes: {}", bundle.refused_envelopes);
         }
     }
     Ok(ExitCode::SUCCESS)
