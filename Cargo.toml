@@ -36,6 +36,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 getrandom = "0.2"
 hkdf = "0.12"
 hmac = "0.12"
+hex = "0.4"
 # OS keychain backends (keyring 3.6 has no default features — without these
 # it falls back to an in-memory mock). `dep:`-gated per platform, so all
 # are safe to enable unconditionally: macOS → Keychain Services,

@@ -206,6 +206,8 @@ pub fn replace(
     }
 
     let trust_path = config_dir.join(TRUST_FILE);
+    // Fixed temp-file name is fine for a single operator: any stale copy
+    // from a crashed run is removed first, and the write is create-new.
     let tmp_path = config_dir.join(".trust.toml.tmp");
     // Clean up a stale temp file from a crashed run (best effort).
     let _ = std::fs::remove_file(&tmp_path);

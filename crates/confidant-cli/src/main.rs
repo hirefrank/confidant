@@ -32,6 +32,7 @@ use confidant_core::write::{
 };
 use confidant_core::{check_vault, load_vault, search, CheckOptions};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -153,7 +154,12 @@ enum Command {
         exclude_private: bool,
     },
     /// Vault health checks (the crypto check reports encryption availability).
-    Doctor,
+    Doctor {
+        /// Clear the pending inbox-rotation reminder (written by `keys shred`
+        /// on a non-inbox device). Requires confirmation unless --no-input.
+        #[arg(long)]
+        clear_pending_inbox_rotation: bool,
+    },
     /// Initialize the vault's trust anchor and keys (first device).
     ///
     /// Generates the operator key, a 24-word recovery phrase (shown once on
@@ -174,6 +180,11 @@ enum Command {
         #[arg(long)]
         phrase_file: Option<PathBuf>,
     },
+    /// Manage per-client encryption keys (init-client, rotate, revoke, shred).
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
     /// Print the agent-contract JSON Schema.
     Schema,
     /// Show help (with --json, the machine-readable form).
@@ -191,6 +202,34 @@ enum Command {
         /// Fill note bodies with no-space CJK prose (quadratic-scan guard).
         #[arg(long)]
         cjk: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeysAction {
+    /// Initialize a client's key tree (first epoch, current recipients).
+    InitClient {
+        /// Client id (e.g. a person id, or `vault:shared`).
+        client_id: String,
+    },
+    /// Rotate a client's data key (new epoch, re-wrap to current recipients).
+    Rotate {
+        /// Client id.
+        client_id: String,
+    },
+    /// Revoke recipients from a client (removes wrappings across all epochs).
+    Revoke {
+        /// Client id.
+        client_id: String,
+        /// Recipient key ids to revoke.
+        key_ids: Vec<String>,
+    },
+    /// Crypto-shred a client: destroy its key tree, re-wrap all remaining
+    /// clients to fresh recipients, rotate recovery. The anchor is re-pinned
+    /// before any other key operation.
+    Shred {
+        /// Client id to shred.
+        client_id: String,
     },
 }
 
@@ -520,9 +559,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             cmd_context(&cli, &root, person, !exclude_private)
         }
-        Command::Doctor => {
+        Command::Doctor {
+            clear_pending_inbox_rotation,
+        } => {
             let root = vault_root.unwrap();
-            cmd_doctor(&cli, &root)
+            cmd_doctor(&cli, &root, *clear_pending_inbox_rotation)
         }
         Command::Init { force } => {
             let root = vault_root.unwrap();
@@ -531,6 +572,19 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Recover { phrase_file } => {
             let root = vault_root.unwrap();
             cmd_recover(&cli, &root, phrase_file.as_deref())
+        }
+        Command::Keys { action } => {
+            let root = vault_root.unwrap();
+            match action {
+                KeysAction::InitClient { client_id } => {
+                    cmd_keys_init_client(&cli, &root, client_id)
+                }
+                KeysAction::Rotate { client_id } => cmd_keys_rotate(&cli, &root, client_id),
+                KeysAction::Revoke { client_id, key_ids } => {
+                    cmd_keys_revoke(&cli, &root, client_id, key_ids)
+                }
+                KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
+            }
         }
         Command::Schema => cmd_schema(&cli, vault_root.as_deref()),
         Command::Help { topic } => cmd_help(&cli, vault_root.as_deref(), topic.clone()),
@@ -1304,8 +1358,37 @@ struct DoctorCheck {
     message: String,
 }
 
-fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
+fn cmd_doctor(
+    cli: &Cli,
+    root: &Path,
+    clear_pending_inbox_rotation: bool,
+) -> anyhow::Result<ExitCode> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
+
+    // #105: handle --clear-pending-inbox-rotation first (explicit operator action).
+    if clear_pending_inbox_rotation {
+        let path = pending_inbox_rotation_path()?;
+        if path.exists() {
+            if !cli.no_input {
+                // Require confirmation unless --no-input.
+                eprintln!(
+                    "Clear the pending inbox-rotation reminder at {}? [y/N]",
+                    path.display()
+                );
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("not cleared");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            std::fs::remove_file(&path)?;
+            eprintln!("cleared pending inbox-rotation reminder");
+        } else {
+            eprintln!("no pending inbox-rotation reminder to clear");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
     checks.push(DoctorCheck {
         id: "vault-discovery",
@@ -1493,6 +1576,30 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         });
     }
 
+    // #105: report pending inbox rotation as a warning until explicitly cleared.
+    if let Ok(pending_path) = pending_inbox_rotation_path() {
+        if pending_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pending_path) {
+                // Extract shredded_client for the message (opaque id).
+                let client = content
+                    .lines()
+                    .find(|l| l.starts_with("shredded_client"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                checks.push(DoctorCheck {
+                    id: "inbox-rotation-pending",
+                    status: "warning",
+                    message: format!(
+                        "inbox rotation pending after `keys shred {client}` on a non-inbox device; \
+                         run `confidant inbox rotate --finish` on the inbox device, then \
+                         `confidant doctor --clear-pending-inbox-rotation`"
+                    ),
+                });
+            }
+        }
+    }
+
     let ok = !checks.iter().any(|c| c.status == "error");
     if cli.json {
         let items: Vec<serde_json::Value> = checks
@@ -1565,6 +1672,21 @@ fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> i
 fn provision_device_key() -> anyhow::Result<(String, String)> {
     use age::secrecy::ExposeSecret;
     use std::str::FromStr;
+    // Test keychain dir (test builds only): read the device key from the
+    // file instead of generating/storing. Used by the shred rotation test.
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let bech32 = std::fs::read_to_string(dir.join("device.key")).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read test device key: {e}"
+            )))
+        })?;
+        let id = age::x25519::Identity::from_str(bech32.trim()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad test device key: {e}")))
+        })?;
+        let recipient = id.to_public().to_string();
+        return Ok((bech32.trim().to_string(), recipient));
+    }
     // Test override: provides a key without enrolling (B13 ignores it).
     // Feature-gated so production binaries never honor it.
     #[cfg(feature = "test-overrides")]
@@ -1649,9 +1771,31 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
 
     // B2: generate operator key, recovery phrase, and device keypair.
     // None of this material is ever written into the vault.
+    // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
+    // provides the hex seed.
+    #[cfg(feature = "test-overrides")]
+    let operator_sk = test_operator_key().unwrap_or_else(|| SigningKey::generate(&mut OsRng));
+    #[cfg(not(feature = "test-overrides"))]
     let operator_sk = SigningKey::generate(&mut OsRng);
     let recovery = Recovery::generate();
     let (_device_bech32, device_recipient) = provision_device_key()?;
+
+    // Persist the operator signing key to the OS keychain (needed for
+    // `keys` commands to sign manifests). This is never skipped when
+    // CONFIDANT_DEVICE_KEY is set — the key must be persisted even in
+    // headless/test environments. In tests (CONFIDANT_KEYCHAIN=off),
+    // the keychain write is refused; the test harness provides the key
+    // via CONFIDANT_TEST_OPERATOR_KEY instead.
+    if let Err(e) =
+        confidant_crypt::keychain::store_operator_key(&hex::encode(operator_sk.to_bytes()))
+    {
+        if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
+            != confidant_crypt::keychain::KeychainSwitch::Off
+        {
+            return Err(anyhow::Error::new(e));
+        }
+        // Kill switch set: test mode; the harness provides the key via env.
+    }
 
     // B3: build the anchor in memory. It is persisted atomically only
     // after every fallible key step succeeds (below): if the KeyStore
@@ -2098,6 +2242,21 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
     Ok(ExitCode::SUCCESS)
 }
 
+/// Test-only operator key override (CONFIDANT_TEST_OPERATOR_KEY).
+/// Only compiled with the `test-overrides` feature — never in release
+/// builds. Returns None if the env var is unset or empty.
+#[cfg(feature = "test-overrides")]
+fn test_operator_key() -> Option<ed25519_dalek::SigningKey> {
+    let test_key = std::env::var("CONFIDANT_TEST_OPERATOR_KEY").ok()?;
+    let trimmed = test_key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let seed = Zeroizing::new(hex::decode(trimmed).ok()?);
+    let seed_array: [u8; 32] = seed.as_slice().try_into().ok()?;
+    Some(ed25519_dalek::SigningKey::from_bytes(&seed_array))
+}
+
 /// `~/.config/confidant`: the operator config dir, where `trust.toml` and
 /// the manifest seq tracker live. `None` when `HOME` is unset.
 fn confidant_config_dir() -> Option<PathBuf> {
@@ -2149,6 +2308,603 @@ fn print_check_human(report: &confidant_core::CheckReport) -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Load the operator Ed25519 signing key from the keychain.
+fn load_operator_sk(
+    _anchor: &confidant_crypt::anchor::Anchor,
+) -> anyhow::Result<ed25519_dalek::SigningKey> {
+    use confidant_crypt::keychain;
+    // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
+    // provides the hex seed directly.
+    #[cfg(feature = "test-overrides")]
+    if let Some(sk) = test_operator_key() {
+        return Ok(sk);
+    }
+    let seed_bytes = keychain::operator_key().map_err(|_| {
+        anyhow::Error::new(DomainError::invalid(
+            "no operator key enrolled; run `confidant init` first".to_string(),
+        ))
+    })?;
+    let seed_hex = Zeroizing::new(String::from_utf8_lossy(&seed_bytes).into_owned());
+    let seed =
+        Zeroizing::new(hex::decode(seed_hex.trim()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad operator key: {e}")))
+        })?);
+    let seed_array: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
+        anyhow::Error::new(DomainError::invalid("bad operator key length".to_string()))
+    })?;
+    let seed_array = Zeroizing::new(seed_array);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed_array))
+}
+
+/// Validate a client id at the CLI boundary (B1). Malformed shape is a
+/// usage error (exit 2); reserved-id misuse is E_INVALID.
+fn validate_keys_client_id(client_id: &str) -> anyhow::Result<()> {
+    confidant_crypt::manifest::validate_client_id(client_id).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("reserved") {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "reserved client id {client_id:?}: {msg}"
+            )))
+        } else {
+            anyhow::Error::new(DomainError::usage(format!("bad client id: {msg}")))
+        }
+    })
+}
+
+/// Load the device identity for `keys` commands (B7). Unkeyed runs fail
+/// closed with a message pointing at `init`/`recover`.
+fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
+    let bech32 = device_key_bech32()?;
+    let identity: age::x25519::Identity = bech32
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}"))))?;
+    Ok(Box::new(identity))
+}
+
+/// Build the recipient map from the anchor + device keychain for `keys`
+/// commands. Currently the only recipient is this device; #66 adds more.
+/// Build the recipient map for `keys init-client`: the union of
+/// verified recipients from all initialized clients (every enrolled
+/// device), so a new client is usable from every device. Falls back to
+/// the local device when no client exists yet.
+fn keys_current_recipients(
+    store: &mut confidant_crypt::lifecycle::KeyStore,
+    anchor: &confidant_crypt::anchor::Anchor,
+) -> anyhow::Result<confidant_crypt::manifest::RecipientMap> {
+    use confidant_crypt::manifest::RecipientEntry;
+    let mut map = std::collections::BTreeMap::new();
+    for client in store.manifest_clients() {
+        let (_, recipients, _) = store
+            .verified_recipients(&client, anchor)
+            .map_err(anyhow::Error::new)?;
+        map.extend(recipients);
+    }
+    if map.is_empty() {
+        // No clients yet: the local device is device-0, matching init.
+        let device_bech32 = device_key_bech32()?;
+        let device_identity: age::x25519::Identity = device_bech32.trim().parse().map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}")))
+        })?;
+        let device_recipient = device_identity.to_public().to_string();
+        map.insert(
+            "device-0".to_string(),
+            RecipientEntry {
+                age_pubkey: device_recipient,
+                label: "device-0".to_string(),
+                scope_ref: String::new(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// Test-only keychain directory (with the `test-overrides` feature).
+/// When set, the shred device-key rotation reads/writes
+/// `$DIR/device.key` (0600) instead of the OS keychain, so the rotation
+/// is testable where no Secret Service exists. Never honored in release
+/// builds.
+#[cfg(feature = "test-overrides")]
+fn test_keychain_dir() -> Option<std::path::PathBuf> {
+    std::env::var("CONFIDANT_TEST_KEYCHAIN_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// This device's secret key (Bech32): `$DIR/device.key` when
+/// `CONFIDANT_TEST_KEYCHAIN_DIR` is set (test builds only), else the OS
+/// keychain. Single helper — every `keys` command goes through this so
+/// the test dir is never bypassed.
+fn device_key_bech32() -> anyhow::Result<Zeroizing<String>> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let path = dir.join("device.key");
+        let bech32 = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read test device key at {}: {e}",
+                path.display()
+            )))
+        })?;
+        return Ok(Zeroizing::new(bech32.trim().to_string()));
+    }
+    let bytes = confidant_crypt::keychain::device_key().map_err(|_| {
+        anyhow::Error::new(DomainError::invalid(
+            "no device key enrolled; run `confidant init` (new vault) or `confidant recover` (new device) first".to_string(),
+        ))
+    })?;
+    Ok(Zeroizing::new(
+        String::from_utf8_lossy(&bytes).trim().to_owned(),
+    ))
+}
+
+/// Store the rotated device key: test keychain dir first (test builds
+/// only), then the OS keychain.
+fn store_rotated_device_key(bech32: &Zeroizing<String>) -> anyhow::Result<()> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let path = dir.join("device.key");
+        // 0600; this is the test-only keychain stand-in, so overwrite the
+        // test device key outright (create + truncate).
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut f = opts.open(&path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write test device key at {}: {e}",
+                path.display()
+            )))
+        })?;
+        f.write_all(bech32.as_bytes()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write test device key: {e}"
+            )))
+        })?;
+        return Ok(());
+    }
+    confidant_crypt::keychain::store_device_key(bech32).map_err(anyhow::Error::new)
+}
+
+/// Build the recipient set for re-wrapping after shred: a FRESH keypair
+/// for this device only, generated in memory. Shred re-wraps to fresh
+/// keypairs (the strict pubkey-reuse check in `KeyStore::shred` forbids
+/// any historical pubkey): other devices are NOT carried over — they
+/// must re-enroll via `keys device-add` (surfaced in the output).
+///
+/// Returns the fresh private key (Bech32) alongside the recipient map.
+/// The caller stores it only AFTER `KeyStore::shred` returns Ok: a
+/// refused shred (verify-first) must leave this device's key unchanged.
+/// Fails closed when `CONFIDANT_DEVICE_KEY` is set — an env-var key
+/// cannot be rotated from here (the new private key would have nowhere
+/// to go), so the operator must use the OS keychain for shred.
+fn keys_shred_fresh_recipients(
+) -> anyhow::Result<(Zeroizing<String>, confidant_crypt::manifest::RecipientMap)> {
+    use age::secrecy::ExposeSecret;
+    use confidant_crypt::manifest::{RecipientEntry, RecipientMap};
+    if let Ok(v) = std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
+        if !v.trim().is_empty() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "shred rotates this device's key, but CONFIDANT_DEVICE_KEY is set so the new key cannot be stored; unset it and enroll via the OS keychain first".to_string(),
+            ).with_fix("Unset CONFIDANT_DEVICE_KEY and run `confidant init` or `recover` to enroll this device in the OS keychain, then retry shred")));
+        }
+    }
+    let id = age::x25519::Identity::generate();
+    let bech32 = Zeroizing::new(id.to_string().expose_secret().to_owned());
+    let recipient = id.to_public().to_string();
+    let mut map = RecipientMap::new();
+    // One key-id scheme everywhere: the local device is always device-0,
+    // matching init.
+    map.insert(
+        "device-0".to_string(),
+        RecipientEntry {
+            age_pubkey: recipient,
+            label: "device-0".to_string(),
+            scope_ref: String::new(),
+        },
+    );
+    Ok((bech32, map))
+}
+
+fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    validate_keys_client_id(client_id)?;
+    // B1: init-client accepts vault:shared (routes to keys/shared/).
+    // shred refuses both reserved ids (handled in cmd_keys_shred).
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let _identity = keys_device_identity()?;
+    let operator_sk = load_operator_sk(&anchor)?;
+
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+    let recipients = keys_current_recipients(&mut store, &anchor)?;
+    store
+        .init_client(client_id, &recipients, &anchor, &operator_sk)
+        .map_err(anyhow::Error::new)?;
+
+    // B2: one commit, check first.
+    let no_input = cli.no_input;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &["commit", "-m", &format!("keys: init-client {client_id}")],
+        no_input,
+    )?;
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "client_id": client_id,
+            "epoch": 1,
+        }))?;
+    } else {
+        println!("initialized client {client_id} (epoch 1)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_keys_rotate(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    validate_keys_client_id(client_id)?;
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let _identity = keys_device_identity()?;
+    let operator_sk = load_operator_sk(&anchor)?;
+
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+    let _key = store
+        .rotate(client_id, &anchor, &operator_sk)
+        .map_err(anyhow::Error::new)?;
+    let new_epoch = store.current_epoch(client_id).map_err(anyhow::Error::new)?;
+
+    // B2: one commit, check first.
+    let no_input = cli.no_input;
+    let vault = load_vault(root)?;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &[
+            "commit",
+            "-m",
+            &format!("keys: rotate {client_id} to epoch {new_epoch}"),
+        ],
+        no_input,
+    )?;
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "client_id": client_id,
+            "epoch": new_epoch,
+        }))?;
+    } else {
+        println!("rotated client {client_id} to epoch {new_epoch}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_keys_revoke(
+    cli: &Cli,
+    root: &Path,
+    client_id: &str,
+    key_ids: &[String],
+) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    validate_keys_client_id(client_id)?;
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let _identity = keys_device_identity()?;
+    let operator_sk = load_operator_sk(&anchor)?;
+
+    let key_id_refs: Vec<&str> = key_ids.iter().map(|s| s.as_str()).collect();
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+    store
+        .revoke(client_id, &key_id_refs, &operator_sk, &anchor)
+        .map_err(anyhow::Error::new)?;
+
+    // B2: one commit, check first.
+    let no_input = cli.no_input;
+    let vault = load_vault(root)?;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &[
+            "commit",
+            "-m",
+            &format!("keys: revoke {} from {client_id}", key_ids.join(",")),
+        ],
+        no_input,
+    )?;
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "client_id": client_id,
+            "revoked": key_ids,
+        }))?;
+    } else {
+        println!("revoked {} from {client_id}", key_ids.join(", "));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Path to the pending inbox-rotation reminder file (#105, ⚠5).
+fn pending_inbox_rotation_path() -> anyhow::Result<std::path::PathBuf> {
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    Ok(config_dir.join("inbox-rotation-pending.toml"))
+}
+
+/// Write the pending-rotation reminder (device-local, never in the vault).
+fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow::Result<()> {
+    let path = pending_inbox_rotation_path()?;
+    let recorded_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let content = format!(
+        "# Inbox rotation pending after `keys shred {shredded_client}`.\n\
+         # The inbox key was NOT rotated on this device (it does not hold the inbox key).\n\
+         # Run `confidant inbox rotate --finish` ON THE INBOX DEVICE, then clear this\n\
+         # reminder with `confidant doctor --clear-pending-inbox-rotation`.\n\
+         vault_id = {vault_id:?}\n\
+         shredded_client = {shredded_client:?}\n\
+         recorded_at = {recorded_at:?}\n"
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 0600 from creation: it names the shredded client (opaque id, but still).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, content)?;
+    }
+    Ok(())
+}
+
+fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    validate_keys_client_id(client_id)?;
+    // B1: shred refuses both reserved ids.
+    if client_id == confidant_crypt::manifest::VAULT_CLIENT_ID
+        || client_id == confidant_crypt::manifest::SHARED_CLIENT_ID
+    {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "refusing to shred reserved client id {client_id:?}"
+        ))));
+    }
+
+    // #105 B4: refuse while the inbox rotation window is already open.
+    // Fail closed on keychain errors (but NoKey just means no inbox key,
+    // which is fine — the window is not open).
+    {
+        use confidant_crypt::keychain;
+        match keychain::inbox_keys() {
+            Ok(keys) => {
+                if keys.1.is_some() {
+                    return Err(anyhow::Error::new(DomainError::invalid(
+                        "inbox rotation window is already open (previous inbox key present); run `confidant inbox rotate --finish` first".to_string(),
+                    )));
+                }
+            }
+            Err(confidant_crypt::error::Error::NoKey(_)) => {
+                // No inbox key: window is not open, proceed.
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot check inbox rotation window: {e}"
+                ))));
+            }
+        }
+    }
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let identity = keys_device_identity()?;
+    let operator_sk = load_operator_sk(&anchor)?;
+
+    // Collect all initialized clients for the strand check via
+    // manifest_clients() (not read_dir): it maps keys/shared to
+    // vault:shared correctly and only lists verified manifests.
+    // Skip vault:lookup (keys/vault) — shred handles it separately.
+    let vault = load_vault(root)?;
+    let keys_dir = root.join("keys");
+    let mut store =
+        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
+    let all_clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != confidant_crypt::manifest::VAULT_CLIENT_ID)
+        .collect();
+    let all_refs: Vec<&str> = all_clients.iter().map(|s| s.as_str()).collect();
+
+    // Fresh recipients for the re-wrap: a fresh keypair for THIS device
+    // only, generated in memory. The fresh private key is NOT stored yet:
+    // it is stored only after `KeyStore::shred` returns Ok. A refused
+    // shred (verify-first) must leave this device's key unchanged, or the
+    // device is locked out of the still-unshredded vault.
+    // Other devices are NOT carried over — their old pubkeys would keep
+    // the shredded history openable (strict pubkey-reuse check in
+    // KeyStore::shred). They must re-enroll via `keys device-add`.
+    let (fresh_device_key, new_recipients) = keys_shred_fresh_recipients()?;
+
+    // B5: verify-first, strand check, history-derived destroy list all come
+    // from KeyStore::shred — do not weaken them.
+    let outcome = store
+        .shred(
+            client_id,
+            &all_refs,
+            &new_recipients,
+            &operator_sk,
+            &anchor,
+            identity.as_ref(),
+        )
+        .map_err(anyhow::Error::new)?;
+
+    // Shred's checks passed and the vault was re-wrapped to the fresh
+    // keypair: store the fresh private key now. (If shred had refused,
+    // the old key would still be enrolled and this device could keep
+    // reading the vault.)
+    store_rotated_device_key(&fresh_device_key)?;
+
+    // B5: the CLI re-pins the anchor itself (new recovery halves) BEFORE
+    // any other key operation. #99 ordering: anchor re-pinned before the
+    // inbox rotation below. Uses atomic temp-and-rename replace (the
+    // anchor already exists — save would refuse to overwrite).
+    let no_input = cli.no_input;
+    let new_recovery = outcome.new_recovery();
+    anchor::replace(
+        &config_dir,
+        root,
+        &anchor.operator,
+        &new_recovery.verifying_key(),
+        &new_recovery.age_identity().to_recipient_string(),
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Re-sign the operator certificate with the new recovery key: it was
+    // signed by the OLD recovery key, and without this a fresh-device
+    // recover with the NEW phrase fails verify_operator_cert (silent
+    // lockout). Same staleness bug as #149's recover path.
+    anchor::write_operator_cert(
+        &keys_dir,
+        &vault.config.vault_id,
+        &anchor.operator,
+        new_recovery.signing_key(),
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Show the new phrase BEFORE any further fallible steps (commit,
+    // inbox rotation): if they fail, the operator still has the phrase.
+    let phrase = outcome.recovery_phrase_for_display();
+    display_phrase_once(no_input, &phrase)?;
+
+    // B2: one commit, check first.
+    let vault = load_vault(root)?;
+    let pre = check_vault(&vault, &CheckOptions::default());
+    if !pre.ok {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree",
+        )));
+    }
+    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
+    confidant_core::write::git(
+        root,
+        &["commit", "-m", &format!("keys: shred {client_id}")],
+        no_input,
+    )?;
+
+    // #105 B5: inbox interplay. The CLI decides (not the crypt layer):
+    // if this device holds the inbox key, run the rotation path now
+    // (anchor already re-pinned above). Otherwise write the device-local
+    // reminder.
+    let mut inbox_rotated = false;
+    let new_inbox_required = confidant_crypt::keychain::inbox_key().is_ok();
+    if new_inbox_required {
+        // Run the inbox rotation on this device.
+        let backend = confidant_crypt::keychain::OsKeychain;
+        let vault_config = root.join("confidant.toml");
+        let user_config = config_dir.join("config.toml");
+        let opts = confidant_core::inbox::InboxRotateOptions {
+            finish: false,
+            allow_unsigned: false,
+            trusted_signers: Vec::new(),
+            pinned_pubkey: None,
+        };
+        confidant_core::inbox::run_inbox_rotate(
+            root,
+            &backend,
+            Some(&config_dir),
+            &vault_config,
+            &user_config,
+            &opts,
+        )
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("inbox rotation failed: {e}")))
+        })?;
+        inbox_rotated = true;
+    } else {
+        // Off-inbox device: write the reminder (⚠5, #105 B3).
+        write_pending_inbox_rotation(&vault.config.vault_id, client_id)?;
+    }
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "client_id": client_id,
+            "destroy_key_ids": outcome.destroy_key_ids,
+            "warnings": outcome.warnings,
+            "inbox_rotated": inbox_rotated,
+            "device_key_rotated": true,
+            "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
+        }))?;
+    } else {
+        println!("shredded client {client_id}");
+        println!("device key rotated: this device was re-enrolled with a fresh keypair");
+        println!("other devices were removed: re-enroll them with `keys device-add`");
+        if inbox_rotated {
+            println!(
+                "inbox key rotated (run `confidant inbox rotate --finish` to destroy the old key)"
+            );
+        } else {
+            println!(
+                "inbox rotation pending: this device does not hold the inbox key; reminder written"
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result<()> {

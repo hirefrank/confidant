@@ -886,7 +886,8 @@ impl KeyStore {
         }
         // 2. No new recipient pubkey may match any current or historical
         // recipient (including recovery): reusing a pubkey would keep the
-        // old private key able to unwrap.
+        // old private key able to unwrap the shredded client's history.
+        // (B5: do not weaken this check.)
         let mut old_pubkeys = std::collections::BTreeSet::new();
         for client in all_clients {
             for map in self.historical_recipients(client)? {
