@@ -21,14 +21,26 @@ path = "src/main.rs"
 dist = true
 
 [dependencies]
+age.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 confidant-core.workspace = true
 confidant-crypt.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
+
+[features]
+# Test-only env-var overrides (CONFIDANT_TEST_DEVICE_KEY). Never enabled
+# in release builds: CI's --all-features turns it on for the test suite,
+# and the release binary is built without it, so the override cannot
+# bypass the fresh-device check in production.
+test-overrides = []
 
 [dev-dependencies]
+age.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

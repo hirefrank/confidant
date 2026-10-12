@@ -544,14 +544,18 @@ dependencies = [
 name = "confidant-cli"
 version = "0.1.0"
 dependencies = [
+ "age",
  "anyhow",
  "chrono",
  "clap",
  "confidant-core",
  "confidant-crypt",
+ "ed25519-dalek",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

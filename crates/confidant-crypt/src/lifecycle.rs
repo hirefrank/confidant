@@ -55,6 +55,19 @@ use zeroize::Zeroizing;
 /// [`KeyStore::verified_recipients`]).
 type VerifiedEpochKeys<'a> = (&'a str, u64, Vec<(u64, DataKey)>, Vec<CommitmentEntry>);
 
+/// True if `name` is a retained-epoch wrapping file: `<key-id>.e<digits>.age`.
+/// Matches the `.e<digits>` suffix exactly so key ids that merely contain
+/// ".e" are not mistaken for history files.
+fn is_retained_epoch_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".age") else {
+        return false;
+    };
+    let Some((_, suffix)) = stem.rsplit_once(".e") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Manages the `keys/` tree of one vault.
 #[derive(Debug)]
 pub struct KeyStore {
@@ -568,6 +581,71 @@ impl KeyStore {
         commitments.push(self.commitment_entry(client_id, new_epoch, key.as_bytes()));
         self.write_manifest(client_id, new_epoch, &recipients, &commitments, operator_sk)?;
         Ok(key)
+    }
+
+    /// Re-wrap an existing client data key to a new recipient set, keeping
+    /// the same key and epoch. Used by `recover` (and #66 device add) to
+    /// authorize a new device without rotating the data key: existing
+    /// ciphertext stays decryptable.
+    ///
+    /// The caller must have unwrapped `key` through a trusted path first
+    /// (e.g. the recovery wrapping during `recover`). The manifest is
+    /// re-signed with `signing_sk` (the operator key, or the recovery key —
+    /// both are trust-anchor members). Old wrappings for recipients no
+    /// longer in the set are removed.
+    pub fn rewrap_recipients(
+        &mut self,
+        client_id: &str,
+        key: &DataKey,
+        recipients: &RecipientMap,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<(), Error> {
+        manifest::validate_client_id(client_id)?;
+        let (epoch, _, commitments) = self.verified_recipients(client_id, anchor)?;
+        // Remove wrappings for recipients that are going away, then write
+        // the new set. The recovery wrapping is always rewritten (its
+        // recipient may have rotated).
+        let wdir = self.wrapped_dir(client_id);
+        let mut keep: std::collections::HashSet<String> =
+            recipients.keys().map(|k| format!("{k}.age")).collect();
+        keep.insert(format!("{RECOVERY_KEY_ID}.age"));
+        for entry in std::fs::read_dir(&wdir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Only touch current-epoch wrappings; retained `.e<digits>`
+            // history files are never removed here. Match the suffix
+            // exactly — a loose `.e` substring check would also catch
+            // key ids that merely contain ".e".
+            if name.ends_with(".age") && !is_retained_epoch_file(&name) && !keep.contains(&name) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        self.wrap_current(client_id, key, recipients, anchor)?;
+        // Commitments are unchanged (same key, same epoch); carry them
+        // forward from the verified buffer.
+        self.write_manifest(client_id, epoch, recipients, &commitments, signing_sk)?;
+        Ok(())
+    }
+
+    /// Re-sign a client's manifest with a new key, changing nothing else.
+    ///
+    /// Verifies against `anchor` first (the manifest is still signed by
+    /// the previous trust-anchor member), then writes the same epoch,
+    /// recipients, and commitments with a bumped seq signed by
+    /// `signing_sk`. Used when trust-anchor signing membership rotates:
+    /// after `recover` re-pins the anchor to a new recovery key,
+    /// manifests signed by the old recovery key must become verifiable
+    /// against the new anchor before further key operations.
+    pub fn resign_manifest(
+        &mut self,
+        client_id: &str,
+        anchor: &Anchor,
+        signing_sk: &SigningKey,
+    ) -> Result<(), Error> {
+        let (epoch, recipients, commitments) = self.verified_recipients(client_id, anchor)?;
+        self.write_manifest(client_id, epoch, &recipients, &commitments, signing_sk)?;
+        Ok(())
     }
 
     /// Revoke recipients: delete their wrappings across **all retained
