@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use zeroize::Zeroizing;
+
 use crate::error::DomainError;
 
 /// Inbox decryption key material, loaded once per run.
@@ -64,7 +66,10 @@ impl InboxKeys {
 
     /// Decrypt with the current key, falling back to the previous one
     /// during the rotation window. Fails closed with `E_INBOX_CRYPTO`.
-    pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// Returns [`Zeroizing<Vec<u8>>`] so the decrypted item payload wipes
+    /// itself on drop (#135) — never a bare `Vec<u8>`.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
         match confidant_crypt::age_wrap::unwrap_with_identity(ciphertext, &self.current) {
             Ok(plaintext) => Ok(plaintext),
             Err(first) => {
@@ -93,7 +98,7 @@ impl InboxKeys {
 /// [`InboxKeys`] once and closes over it, so the N+1 key-loading path
 /// can't get wired back in outside tests.
 #[cfg(test)]
-pub fn inbox_decrypt(ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn inbox_decrypt(ciphertext: &[u8]) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     let keys = InboxKeys::load()?;
     keys.decrypt(ciphertext)
 }

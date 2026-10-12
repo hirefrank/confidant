@@ -1186,7 +1186,7 @@ fn device_keypair_recipient_unwraps() {
     assert!(recipient.starts_with("age1"));
     let wrapped = age_wrap::wrap_to_recipient(b"data", &recipient).unwrap();
     let back = age_wrap::unwrap_with_raw_secret(&wrapped, kp.secret_bytes()).unwrap();
-    assert_eq!(back, b"data");
+    assert_eq!(&*back, b"data");
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,7 +1200,7 @@ fn legacy_file_api_round_trip() {
     std::env::set_var("CONFIDANT_DEVICE_KEY", id.to_string().expose_secret());
     let ct = confidant_crypt::encrypt_file(b"file bytes").unwrap();
     let pt = confidant_crypt::decrypt_file(&ct).unwrap();
-    assert_eq!(pt, b"file bytes");
+    assert_eq!(&*pt, b"file bytes");
     std::env::remove_var("CONFIDANT_DEVICE_KEY");
     // Without a key -> fail closed.
     assert!(confidant_crypt::decrypt_file(&ct).is_err());
