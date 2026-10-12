@@ -126,6 +126,7 @@ Spec 0.1 reserves `keys/`; this design fills it in:
 
 ```
 keys/
+├── recovery-recipients.toml # recovery age recipients ever used (append-only, §9)
 ├── vault/
 │   └── lookup.age          # alias-lookup key, age-encrypted to each device/agent
 ├── p-<ULID>/               # one dir per client with encrypted content
@@ -172,6 +173,14 @@ place.
 - `epoch` increments on every data-key rotation. Old epochs' `wrapped/`
   files are kept (renamed `wrapped/<key-id>.e<epoch>.age`) so history stays
   readable; see §8.
+- `recovery-recipients.toml` (spec §14) records every recovery age
+  recipient the vault has ever wrapped to. It is append-only: each
+  recovery rotation (`recover`, `keys shred`) appends the retired and the
+  new recipient, and readers union the working-tree copy with every
+  historical version from git. Reusing a retired recovery recipient as a
+  device is refused (§8, §9). It is unsigned — it only ever enlarges a
+  denylist, so a forged or partially read version can never weaken the
+  check, only over-forbid.
 
 **Key commitment.** The signed manifest also carries a key commitment for
 every retained epoch, so a planted wrapping cannot pass verification:
@@ -534,6 +543,15 @@ vault-wide keypair:
   re-saved atomically, only after the new recovery phrase has been shown.
   Vaults initialized before the certificate existed still require a
   config backup for recovery.
+- **Retired recovery keys cannot be re-enrolled.** Every recovery rotation
+  (`recover`, `keys shred`) appends the retired and the new recovery age
+  recipient to `keys/recovery-recipients.toml` (§4). `recover` and
+  `keys device-add` union that file's working-tree and every historical
+  git version into the "ever a recipient" denylist, so a device-add
+  request that reuses a retired recovery recipient is refused. Without
+  this, re-adding a retired recovery key as a device would re-wrap the
+  vault's remaining keys to a key that still opens a shredded client's
+  history.
 
 ## 10. Alias HMAC
 
@@ -597,6 +615,15 @@ writes.
   *how much*, never *who* or *what*.
 - Rubber-hose / compelled disclosure of the recovery phrase (it reads the
   whole vault — ADR-15).
+- **A history-derived shred check failing open.** `shredded_clients`,
+  `historical_recipients`, and the `keys/recovery-recipients.toml` union
+  consult git history. When `git` is unavailable, the clone is shallow,
+  or the vault sits inside a larger repository (so `keys/` paths and the
+  repo root do not line up), they see only the working tree. A recipient
+  whose only record is in history — a revoked key, a shredded client's
+  old device, a retired recovery recipient — would then not be refused.
+  Run the vault as its own full-history repository for these checks to
+  hold.
 
 ## 12. Test plan
 
@@ -672,6 +699,11 @@ in the repo, tests, or CI.
     `inbox rotate --finish`, the old key is gone from the keychain, the
     shredded client's old form answers in inbox history are unreadable,
     and an item sent to the old key fails closed with `E_INBOX_CRYPTO`.
+19. **Retired recovery recipients:** after a recovery rotation (`recover`
+    or `keys shred`), the retired and new recovery age recipients are
+    recorded in `keys/recovery-recipients.toml`; a device-add request that
+    reuses a retired recipient is refused, and stays refused even after a
+    later commit erases the entry (the union spans git history).
 
 ## 13. What changes in the spec
 
@@ -919,3 +951,44 @@ keeps the shred/recovery re-wrap surface small). §9 notes `confidant
 recover` does not restore the lookup key. §6 makes the add-device handoff
 explicit: a new device must receive the current lookup key re-wrapped from
 an existing device. `init_lookup_key` / `write_lookup_raw` unchanged.
+
+## 25. Follow-ups from #151, #149 review (2026-10-12)
+
+Closes the non-blocking follow-ups on #153 plus the `recover` anchor file
+(#152). No new cryptographic primitive.
+
+- **Retired recovery recipients (#153 nit 7).** New spec §14 file
+  `keys/recovery-recipients.toml` (append-only, unsigned). `shred` and
+  `rotate_recovery` record the retired and new recovery age recipient;
+  `ever_seen_pubkeys` unions the working-tree copy with every historical
+  git version, so a device-add request reusing a retired recovery
+  recipient is refused (it would otherwise re-open a shredded client).
+  Reading the union across history means a later commit cannot erase the
+  entry. Unsigned is deliberate: the set only ever enlarges the denylist.
+- **Re-created client ids (#153 nit 1).** `ever_seen_pubkeys` now skips a
+  shredded client's *current* manifest only when the client is shredded
+  **and absent** from the live set, so a client shredded then
+  re-initialized under the same id still contributes its current
+  recipients.
+- **`--initiate` with `CONFIDANT_DEVICE_KEY` (#153 nit 4).** Fails
+  closed up front: an env-var key cannot be re-generated, so `--initiate`
+  refuses rather than re-emitting the enrolled key for the enrolled
+  device to reject later (mirrors `shred`).
+- **Label validation (#153 nit 6).** `keys device-add` labels now reject
+  control characters (rather than stripping them) and require ASCII
+  alphanumerics plus ` -_.()`.
+- **Pre-commit recovery text (#153 nit 5).** A `--from-request` whose
+  pre-commit `check` fails now prints the `git status` / `git checkout --
+  keys/` fix, matching `add_recipient`'s error path.
+- **`recover --anchor-file <path>` (#152).** Loads the trust anchor from an
+  explicit file (validated before any key operation; refused inside the
+  vault) instead of the config dir or the `keys/`-tree rebuild. The phrase
+  must still match the anchor's recovery key; nothing is written to the
+  config dir until it does.
+- **Threat-model note (#153 nit 3).** §11 states that the history-derived
+  shred checks (`shredded_clients`, `historical_recipients`, the recovery
+  history union) fail open when `git` is unavailable, history is shallow,
+  or the vault is inside a larger repo.
+- **Deferred:** a real-`keys shred` path through the shredded-only-pubkey
+  test (#153 nit 2) needs scoped recipients (#138); tracked separately.
+

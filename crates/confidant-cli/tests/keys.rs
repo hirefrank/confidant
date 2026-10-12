@@ -507,6 +507,333 @@ fn keys_shred_refused_leaves_device_key_untouched() {
     );
 }
 
+// --- #105: shred <-> inbox rotation ---------------------------------------
+
+/// `[inbox].pubkey` from the vault's `confidant.toml` (the advertised pin).
+fn vault_inbox_pubkey(vault: &Path) -> String {
+    let text = std::fs::read_to_string(vault.join("confidant.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    doc["inbox"]["pubkey"]
+        .as_str()
+        .expect("[inbox].pubkey in confidant.toml")
+        .to_string()
+}
+
+/// `[trust].recovery_age_recipient` from the device's `trust.toml`.
+fn recovery_age(home: &Path) -> String {
+    let text = std::fs::read_to_string(home.join(".config/confidant/trust.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    doc["trust"]["recovery_age_recipient"]
+        .as_str()
+        .expect("recovery_age_recipient in trust.toml")
+        .to_string()
+}
+
+#[test]
+fn keys_shred_on_inbox_device_starts_rotation_test18() {
+    // #105 test 18 (B1): on a device that holds the inbox key, `keys shred`
+    // starts the inbox rotation — the new keypair is active, the old key is
+    // still present, and `--finish` is pending.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    assert!(h.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // Seed this device's inbox key. A lost-key `inbox rotate` installs a
+    // fresh keypair without needing an old one. The keychain switch must be
+    // ON (rotation is a keychain write); the file backend stands in for it.
+    let out = h
+        .cmd(&["inbox", "rotate", "--json", "--no-input"])
+        .env_remove("CONFIDANT_KEYCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed inbox rotate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pin_before = vault_inbox_pubkey(&h.vault);
+
+    // Shred client-a. This device holds the inbox key, so the rotation runs
+    // (not the reminder path).
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .env_remove("CONFIDANT_KEYCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["inbox_rotated"], true,
+        "shred must run the inbox rotation on the inbox device"
+    );
+    assert!(
+        !h.home
+            .join(".config/confidant/inbox-rotation-pending.toml")
+            .exists(),
+        "on-device rotation must not write the off-device reminder"
+    );
+
+    // The new inbox keypair is active: the vault's advertised pin changed.
+    let pin_after = vault_inbox_pubkey(&h.vault);
+    assert_ne!(pin_before, pin_after, "inbox key did not rotate");
+
+    // The old key is still present (`--finish` pending): finishing destroys
+    // it. If the previous slot were empty, `--finish` would report
+    // `old_key_destroyed: false`.
+    let out = h
+        .cmd(&["inbox", "rotate", "--finish", "--json", "--no-input"])
+        .env_remove("CONFIDANT_KEYCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "inbox rotate --finish failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["old_key_destroyed"], true,
+        "old inbox key must still be present after shred (--finish pending)"
+    );
+}
+
+#[test]
+fn doctor_reports_and_clears_pending_inbox_rotation() {
+    // #105: on a non-inbox device, `keys shred` writes the device-local
+    // reminder; `doctor` warns until the operator explicitly clears it.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    assert!(h.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // No inbox key here: the reminder is written.
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "shred failed");
+    let pending = h.home.join(".config/confidant/inbox-rotation-pending.toml");
+    assert!(pending.is_file(), "reminder not written");
+
+    // doctor surfaces it as a warning.
+    let out = h.cmd(&["doctor", "--json", "--no-input"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "inbox-rotation-pending" && c["status"] == "warning"),
+        "doctor did not report inbox-rotation-pending: {v}"
+    );
+
+    // Explicit clear removes it.
+    let out = h
+        .cmd(&["doctor", "--clear-pending-inbox-rotation", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "clear failed");
+    assert!(!pending.exists(), "reminder not cleared");
+
+    // ...and doctor no longer warns.
+    let out = h.cmd(&["doctor", "--json", "--no-input"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        !v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "inbox-rotation-pending"),
+        "doctor still reports the cleared reminder: {v}"
+    );
+}
+
+#[test]
+fn device_add_refuses_retired_recovery_recipient() {
+    // #153 nit 7: after a recovery rotation the retired recovery age
+    // recipient is recorded in `keys/recovery-recipients.toml`, so it can
+    // never be re-enrolled as a device (which would undo the shred).
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    assert!(h.init(&[]).status.success());
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    let old_recovery = recovery_age(&h.home);
+
+    // Shred rotates the recovery identity.
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The retired recipient is recorded in the vault history file...
+    let hist = std::fs::read_to_string(h.vault.join("keys/recovery-recipients.toml"))
+        .expect("recovery-recipients.toml written by the rotation");
+    assert!(
+        hist.contains(&old_recovery),
+        "retired recovery recipient not recorded:\n{hist}"
+    );
+
+    // ...and re-adding it as a device is refused.
+    let req = h.home.join("rogue.toml");
+    std::fs::write(
+        &req,
+        format!("version = 1\npubkey = \"{old_recovery}\"\nlabel = \"rogue\"\n"),
+    )
+    .unwrap();
+    let before = snapshot_keys(&h.vault);
+    let out = h
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a retired recovery recipient must be refused as a device"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already been a recipient"),
+        "expected historical-pubkey refusal, got: {stderr}"
+    );
+    assert_eq!(
+        before,
+        snapshot_keys(&h.vault),
+        "refused request mutated keys/"
+    );
+
+    // The union is read across git history: even if a later commit erases
+    // the entry from the file, the retired recipient stays refused.
+    std::fs::write(
+        h.vault.join("keys/recovery-recipients.toml"),
+        "recipients = []\n",
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "erase recovery history"]);
+    let req2 = h.home.join("rogue2.toml");
+    std::fs::write(
+        &req2,
+        format!("version = 1\npubkey = \"{old_recovery}\"\nlabel = \"rogue2\"\n"),
+    )
+    .unwrap();
+    let out = h
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req2.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "erasing the history file must not re-allow the retired recovery recipient"
+    );
+}
+
+#[test]
+fn device_add_check_failure_points_at_recovery() {
+    // #153 nit 5: when the pre-commit `check` fails after keys/ was
+    // re-wrapped, the error must point at the exact recovery commands
+    // (matching add_recipient's own error path), not just say "check
+    // failed".
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A directory under a collection whose name is not a record ID makes
+    // `check` fail deterministically (E_INVALID_FILENAME).
+    std::fs::create_dir_all(h1.vault.join("people/not-a-record-id")).unwrap();
+    std::fs::write(
+        h1.vault.join("people/not-a-record-id/profile.md"),
+        "@id: p-01HZZZZZZZZZZZZZZZZZZZZZ\n@type: person\n",
+    )
+    .unwrap();
+
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "check should block the commit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("git -C") && stderr.contains("checkout -- keys/"),
+        "expected the keys/ recovery fix text, got: {stderr}"
+    );
+}
+
 // --- device-add (#66) -----------------------------------------------------
 
 /// Extract the 24-word recovery phrase from `init`'s stderr.
@@ -541,10 +868,11 @@ fn device_add_setup() -> (Harness, Harness, PathBuf, String, String) {
         .unwrap();
     assert!(out.status.success(), "rotate failed");
 
-    // New device: --initiate (needs no vault). Uses --force because the
-    // test harness sets CONFIDANT_DEVICE_KEY (in production, a new device
-    // has no key yet).
-    let h2 = Harness::new();
+    // New device: --initiate (needs no vault). Uses the test keychain dir
+    // (a device key is "enrolled" there, so --force is required) because
+    // --initiate refuses to re-emit an env-var key (#153 nit 4).
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
     let req_path = h2.home.join("device-add-request.toml");
     let out = h2
         .cmd_no_vault(&[
@@ -690,10 +1018,8 @@ fn device_add_from_request_rejects_bad_label() {
     // just --initiate.
     let (h1, _h2, req_path, _key_id, _init_stderr) = device_add_setup();
 
-    // Note: control chars are STRIPPED (matching --initiate), not
-    // rejected — so test the cases that fail validation outright, plus
-    // an ESC/CR case (stripped to something invalid) asserting keys/ is
-    // untouched.
+    // Note: control characters are now REJECTED outright (#153 nit 6), not
+    // stripped — so the ESC/CR case fails validation directly.
     let before = snapshot_keys(&h1.vault);
     for (name, bad_label) in [
         ("empty", "   "),
@@ -742,8 +1068,9 @@ fn device_add_initiate_refuses_when_device_key_enrolled() {
     // #151 blocker 2: --initiate on an already-enrolled device must
     // refuse (it would overwrite the keychain entry and lock the device
     // out). --force overrides.
-    let h = Harness::new();
-    // h has CONFIDANT_DEVICE_KEY set (enrolled).
+    let mut h = Harness::new();
+    // A device key is "enrolled" in the test keychain dir.
+    h.with_test_keychain();
     let out = h
         .cmd_no_vault(&["keys", "device-add", "--initiate", "--no-input"])
         .output()
@@ -758,7 +1085,7 @@ fn device_add_initiate_refuses_when_device_key_enrolled() {
         "expected 'already enrolled' error, got: {stderr}"
     );
 
-    // With --force, it succeeds (and overwrites).
+    // With --force, it succeeds.
     let out = h
         .cmd_no_vault(&[
             "keys",
@@ -778,8 +1105,32 @@ fn device_add_initiate_refuses_when_device_key_enrolled() {
 }
 
 #[test]
+fn device_add_initiate_refuses_device_key_env() {
+    // #153 nit 4: with CONFIDANT_DEVICE_KEY set, --initiate cannot generate
+    // a fresh keypair (it would re-emit the env key) — it must fail closed
+    // up front (as shred does), not let the enrolled device reject the
+    // request later. The harness sets CONFIDANT_DEVICE_KEY.
+    let h = Harness::new();
+    for extra in [&[][..], &["--force"][..]] {
+        let mut args = vec!["keys", "device-add", "--initiate", "--no-input"];
+        args.extend_from_slice(extra);
+        let out = h.cmd_no_vault(&args).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "--initiate with CONFIDANT_DEVICE_KEY must fail closed ({extra:?})"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("CONFIDANT_DEVICE_KEY"),
+            "expected a CONFIDANT_DEVICE_KEY refusal ({extra:?}), got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn device_add_initiate_output_contains_pubkey_only() {
-    let h2 = Harness::new();
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
     // Bogus vault path: --initiate must neither need nor touch a vault.
     let out = h2
         .cmd_no_vault(&[
@@ -915,7 +1266,8 @@ fn lookup_key_handoff_never_recovery_wrapped() {
 fn device_add_requires_fingerprint_confirmation() {
     let h1 = Harness::new();
     assert!(h1.init(&[]).status.success());
-    let h2 = Harness::new();
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
     let req_path = h2.home.join("request.toml");
     let out = h2
         .cmd_no_vault(&[
@@ -1041,7 +1393,8 @@ fn device_add_then_revoke_removes_new_device_wrappings() {
 #[test]
 fn device_add_json_no_secrets() {
     // B5: --json on both steps carries opaque fields only.
-    let h2 = Harness::new();
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
     let out = h2
         .cmd_no_vault(&[
             "keys",
@@ -1468,8 +1821,10 @@ fn device_add_shred_then_reenroll() {
 fn device_add_initiate_force_prompts_without_no_input() {
     // Item 5 (#151): --force on --initiate must prompt for confirmation
     // unless --no-input, and say plainly the old key's access is lost.
-    let h = Harness::new();
-    // h has CONFIDANT_DEVICE_KEY set (enrolled).
+    let mut h = Harness::new();
+    // A device key is "enrolled" in the test keychain dir, so --initiate
+    // needs --force (and then prompts).
+    h.with_test_keychain();
 
     // Answer "y": proceeds.
     let mut child = h

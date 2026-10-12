@@ -304,16 +304,7 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
             trust_path.display()
         ))
     })?;
-    let file: TrustFile =
-        toml::from_str(&text).map_err(|e| Error::Anchor(format!("bad trust.toml: {e}")))?;
-    let operator = parse_pubkey(&file.trust.operator_pubkey, "operator_pubkey")?;
-    let recovery = parse_pubkey(&file.trust.recovery_pubkey, "recovery_pubkey")?;
-    let recovery_age = file.trust.recovery_age_recipient.trim().to_string();
-    if !recovery_age.starts_with("age1") {
-        return Err(Error::Anchor(
-            "recovery_age_recipient must be an age1… recipient".to_string(),
-        ));
-    }
+    let anchor = anchor_from_text(&text, &trust_path)?;
 
     let mut warnings = Vec::new();
     #[cfg(unix)]
@@ -339,15 +330,68 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
         }
     }
 
-    Ok((
-        Anchor {
-            operator,
-            recovery,
-            recovery_age,
-            source: trust_path,
-        },
-        warnings,
-    ))
+    Ok((anchor, warnings))
+}
+
+/// Parse a trust file's bytes into an [`Anchor`]. Shared by [`load`] and
+/// [`load_from`] so the two never drift: same fields, same validation
+/// (operator + recovery Ed25519 keys, `age1…` recovery recipient).
+fn anchor_from_text(text: &str, source: &Path) -> Result<Anchor, Error> {
+    let file: TrustFile =
+        toml::from_str(text).map_err(|e| Error::Anchor(format!("bad trust.toml: {e}")))?;
+    let operator = parse_pubkey(&file.trust.operator_pubkey, "operator_pubkey")?;
+    let recovery = parse_pubkey(&file.trust.recovery_pubkey, "recovery_pubkey")?;
+    let recovery_age = file.trust.recovery_age_recipient.trim().to_string();
+    if !recovery_age.starts_with("age1") {
+        return Err(Error::Anchor(
+            "recovery_age_recipient must be an age1… recipient".to_string(),
+        ));
+    }
+    Ok(Anchor {
+        operator,
+        recovery,
+        recovery_age,
+        source: source.to_path_buf(),
+    })
+}
+
+/// Load a trust anchor from an explicit file path rather than the default
+/// `~/.config/confidant/trust.toml` (or the `keys/`-tree rebuild). Backs
+/// `confidant recover --anchor-file` (#152) on a fresh device where the
+/// operator keeps a copy of the anchor file.
+///
+/// Same validation as [`load`]: the file is refused when it lives inside
+/// the vault (canonicalized comparison, so a symlink into the vault is
+/// caught), and it must parse with a valid operator key, recovery key, and
+/// `age1…` recovery recipient. Unlike [`load`] it emits no permissions
+/// warnings — the file may legitimately live anywhere the operator keeps a
+/// backup. The caller must still check the anchor's recovery key against
+/// the phrase-derived key before trusting anything; this function only
+/// parses and shape-validates.
+pub fn load_from(trust_path: &Path, vault_path: &Path) -> Result<Anchor, Error> {
+    let vault_canon = vault_path.canonicalize().map_err(|_| {
+        Error::Anchor(format!(
+            "cannot resolve vault path {}",
+            vault_path.display()
+        ))
+    })?;
+    let trust_canon = trust_path
+        .canonicalize()
+        .unwrap_or_else(|_| trust_path.to_path_buf());
+    if trust_canon.starts_with(&vault_canon) {
+        return Err(Error::Anchor(format!(
+            "supplied trust anchor {} is inside the vault {}; refusing",
+            trust_canon.display(),
+            vault_canon.display()
+        )));
+    }
+    let text = std::fs::read_to_string(trust_path).map_err(|e| {
+        Error::Anchor(format!(
+            "cannot read trust anchor at {}: {e}",
+            trust_path.display()
+        ))
+    })?;
+    anchor_from_text(&text, trust_path)
 }
 
 /// Non-fatal anchor observations (loose permissions).

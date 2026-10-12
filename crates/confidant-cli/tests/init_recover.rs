@@ -460,6 +460,121 @@ fn recover_rebuilds_alias_index_fresh_lookup_key() {
 }
 
 #[test]
+fn recover_with_anchor_file_on_fresh_device_succeeds() {
+    // #152: on a fresh device the operator can supply an explicit anchor
+    // file instead of the config dir or the keys/-tree rebuild.
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+
+    // Keep an anchor backup out of the config dir, then lose the device
+    // copy (wipe the config dir).
+    let anchor_backup = h.home.join("anchor-backup.toml");
+    std::fs::copy(h.trust_toml(), &anchor_backup).unwrap();
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    assert!(!h.trust_toml().exists());
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&anchor_backup)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recover --anchor-file failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Trust is re-pinned into the config dir and the phrase rotated.
+    assert!(h.trust_toml().is_file(), "trust.toml not written");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let new_phrase = extract_phrase(&stderr);
+    assert_ne!(new_phrase, phrase, "recovery must rotate the phrase");
+}
+
+#[test]
+fn recover_with_anchor_file_mismatched_phrase_fails_closed() {
+    // #152: a supplied anchor whose recovery key does not match the phrase
+    // is refused, and nothing is written to the config dir.
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let anchor_backup = h1.home.join("anchor-backup.toml");
+    std::fs::copy(h1.trust_toml(), &anchor_backup).unwrap();
+
+    // A phrase for a DIFFERENT vault.
+    let h2 = Harness::new();
+    let out2 = h2.init(&[]);
+    assert!(out2.status.success());
+    let other_phrase = extract_phrase(&String::from_utf8_lossy(&out2.stderr));
+
+    // Wipe h1's config so the supplied anchor is the only source.
+    std::fs::remove_dir_all(h1.home.join(".config")).unwrap();
+    let phrase_file = h1.home.join("phrase");
+    std::fs::write(&phrase_file, &other_phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h1
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&anchor_backup)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "mismatched phrase must fail closed: stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !h1.trust_toml().exists(),
+        "config dir written before the anchor was verified"
+    );
+}
+
+#[test]
+fn recover_with_anchor_file_inside_vault_refused() {
+    // #152: an anchor path inside the vault is refused (nothing in the
+    // vault may point at or override the anchor).
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    // A copy of the anchor planted INSIDE the vault.
+    let planted = h.vault.join("planted-anchor.toml");
+    std::fs::copy(h.trust_toml(), &planted).unwrap();
+
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &phrase).unwrap();
+    let new_device_key = age_generate_bech32();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .arg("--anchor-file")
+        .arg(&planted)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", &new_device_key)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an anchor inside the vault must be refused"
+    );
+}
+
+#[test]
 fn recover_rotates_recovery_and_repins_before_next_op() {
     // B11: after recover, the anchor is re-pinned with the NEW recovery
     // (proves the re-pin happened before further ops).
