@@ -1110,7 +1110,10 @@ fn record_add_after_device_add_uses_enrolled_key_id() {
     let input3 = write_file(
         h3._tmp.path(),
         "person3.md",
-        &person_md(PERSON, "Ada Example", "Bio from a stranger device."),
+        // PERSON2: a fresh path in this vault, so the write reaches the
+        // enrollment check instead of failing on "already exists" (h2
+        // already wrote PERSON's profile above).
+        &person_md(PERSON2, "Ada Example", "Bio from a stranger device."),
     );
     let out = h3
         .cmd(&[
@@ -1125,5 +1128,10 @@ fn record_add_after_device_add_uses_enrolled_key_id() {
     assert!(
         !out.status.success(),
         "never-enrolled device must be refused"
+    );
+    assert!(
+        stderr(&out).contains("not enrolled"),
+        "refusal must be the not-enrolled error, got: {}",
+        stderr(&out)
     );
 }

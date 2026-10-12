@@ -115,7 +115,9 @@ manifest). The `[crypto] mode = "plaintext"` opt-out (`confidant.toml`,
 spec §2) is structural-first and narrowing-only: it permits plaintext
 writes only while the vault is already structurally plaintext, and can
 never downgrade an encrypted vault (`mode = "plaintext"` plus an envelope
-or `keys/` tree is `E_CONFIG`). `writes_encrypted()` and the disclosure
+or `keys/` tree is `E_CONFIG`). `confidant init` hard-refuses a vault whose
+`confidant.toml` declares `[crypto] mode = "plaintext"`; to upgrade such a
+vault, delete the declaration and run `init`. `writes_encrypted()` and the disclosure
 are global and flip once; the opt-out is a per-vault writer override that
 never re-flips them.
 
