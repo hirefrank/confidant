@@ -28,7 +28,6 @@ use sha2::{Digest, Sha256};
 use crate::check::{run as check_vault, CheckOptions, CheckReport};
 use crate::error::{DomainError, ErrorKind};
 use crate::vault::load_vault;
-
 /// Options shared by every write command.
 #[derive(Clone, Debug, Default)]
 pub struct WriteOptions {
@@ -230,11 +229,45 @@ pub fn new_ulid() -> String {
     crate::id::ulid_from_parts(now_ms, random_80())
 }
 
+/// Encrypts one record file's plaintext bytes into the bytes to write.
+///
+/// Called only for `FileChange::WriteFile` targets under record paths
+/// ([`crate::crypto_mode::is_record_path`]). The CLI supplies the real
+/// encryptor (spec 3); commands that do not write records pass no
+/// encryptor and keep today's behavior.
+pub type RecordEncryptor = dyn Fn(&Path, &[u8]) -> anyhow::Result<Vec<u8>>;
+
 /// Apply `pending` to the vault at `root` per the ADR-7 write pipeline.
 pub fn apply_write(
     root: &Path,
     pending: PendingWrite,
     opts: &WriteOptions,
+) -> anyhow::Result<WriteOutcome> {
+    apply_write_inner(root, pending, opts, None)
+}
+
+/// Like [`apply_write`], but record-file contents are transformed through
+/// `encrypt` before anything is written.
+///
+/// The transform runs **after** the dry-run preview (so `--dry-run` shows
+/// the inner plaintext, never ciphertext) and **before** the pre-check, so
+/// a failing encryption leaves the target file untouched and a failing
+/// check rolls back as usual. Ledger appends and non-record files are
+/// never transformed.
+pub fn apply_write_with_encryptor(
+    root: &Path,
+    pending: PendingWrite,
+    opts: &WriteOptions,
+    encrypt: &RecordEncryptor,
+) -> anyhow::Result<WriteOutcome> {
+    apply_write_inner(root, pending, opts, Some(encrypt))
+}
+
+fn apply_write_inner(
+    root: &Path,
+    mut pending: PendingWrite,
+    opts: &WriteOptions,
+    encrypt: Option<&RecordEncryptor>,
 ) -> anyhow::Result<WriteOutcome> {
     if let Some(rid) = &opts.request_id {
         if rid.trim().is_empty() {
@@ -283,6 +316,9 @@ pub fn apply_write(
     }
 
     // 2. Dry run: show the logical change, touch nothing.
+    // The preview is built from the pending contents as given — i.e. the
+    // inner plaintext — because the record-encryption transform below has
+    // not run yet. Dry-run never shows ciphertext (spec 3 B5).
     if opts.dry_run {
         let preview = pending
             .changes
@@ -301,6 +337,29 @@ pub fn apply_write(
             })
             .collect();
         return Ok(WriteOutcome::DryRun { preview });
+    }
+
+    // 2b. Record-encryption transform (spec 3). Only WriteFile changes
+    // under record paths go through the encryptor; ledger appends and
+    // non-record files are untouched. Any failure refuses the whole
+    // write before anything is applied: the target file is left
+    // untouched and no plaintext fallback is written.
+    if let Some(encrypt) = encrypt {
+        for change in &mut pending.changes {
+            if let FileChange::WriteFile { path, contents } = change {
+                if crate::crypto_mode::is_record_path(path) {
+                    // Use context (not format-interpolation) so the
+                    // DomainError chain — code and fix — survives.
+                    let out = encrypt(path, contents.as_bytes()).map_err(|e| {
+                        let path = path.display().to_string();
+                        e.context(format!("cannot encrypt {path}"))
+                    })?;
+                    *contents = String::from_utf8(out).map_err(|_| {
+                        anyhow::anyhow!("encryptor returned non-UTF-8 bytes for {}", path.display())
+                    })?;
+                }
+            }
+        }
     }
 
     // 3. Pre-check: fail fast on an already-broken vault.

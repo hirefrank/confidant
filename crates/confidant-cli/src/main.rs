@@ -10,6 +10,7 @@
 //! [`write`]: confidant_core::write
 
 mod mcp;
+mod record_crypto;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -28,7 +29,8 @@ use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::write::{
-    apply_write, require_git_repo, FileChange, PendingWrite, WriteOptions, WriteOutcome,
+    apply_write, apply_write_with_encryptor, require_git_repo, FileChange, PendingWrite,
+    WriteOptions, WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, CheckOptions};
 use serde_json::Value;
@@ -908,6 +910,27 @@ fn write_options(cli: &Cli) -> WriteOptions {
     }
 }
 
+/// Apply a record write through the encryption transform (spec 3).
+///
+/// Builds the [`record_crypto::RecordEncryptor`] for this vault: on an
+/// encrypted vault the record `WriteFile`s become §14 envelopes; on a
+/// `mode = "plaintext"` vault this is plain [`apply_write`]. Any
+/// fail-closed mode error (unkeyed vault, `[crypto]` contradiction, key
+/// failure) surfaces here, before anything is applied.
+fn apply_record_write(
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    pending: PendingWrite,
+    opts: &WriteOptions,
+) -> anyhow::Result<WriteOutcome> {
+    match record_crypto::RecordEncryptor::for_vault(root, vault)? {
+        Some(enc) => {
+            apply_write_with_encryptor(root, pending, opts, &move |p, b| enc.encrypt_file(p, b))
+        }
+        None => apply_write(root, pending, opts),
+    }
+}
+
 /// Print a [`WriteOutcome`] and return the exit code.
 /// A check-blocked write prints the check report (exit 1): the caller sees
 /// exactly why the commit did not happen.
@@ -1198,8 +1221,9 @@ fn cmd_log_session(
         "session {person} {duration}{}",
         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
     );
-    let outcome = apply_write(
+    let outcome = apply_record_write(
         root,
+        &vault,
         PendingWrite {
             changes,
             summary,
@@ -1319,8 +1343,9 @@ fn cmd_note_add(
         body_start_line: 0,
         field_lines: BTreeMap::new(),
     };
-    let outcome = apply_write(
+    let outcome = apply_record_write(
         root,
+        &vault,
         PendingWrite {
             changes: vec![FileChange::WriteFile {
                 path: rel.clone(),
@@ -1346,6 +1371,7 @@ fn cmd_note_add(
 }
 
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
     let text = std::fs::read_to_string(file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
@@ -1373,8 +1399,9 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     }
     let contents = confidant_core::format_record(&rec);
     let id = rec.id.to_string();
-    let outcome = apply_write(
+    let outcome = apply_record_write(
         root,
+        &vault,
         PendingWrite {
             changes: vec![FileChange::WriteFile {
                 path: rel.clone(),
@@ -1658,14 +1685,31 @@ fn cmd_doctor(
 
     // PR B owns crypto (ADR-13). `is_available()` tells us whether this build
     // can encrypt at all; `writes_encrypted()` tells us whether the CLI write
-    // path actually does. Until the wiring lands, the write path stores
-    // plaintext, so report a warning — an `ok` here would tell the operator
-    // their notes are encrypted when they aren't.
+    // path actually does. Since spec 3, record writes encrypt by default on
+    // encrypted vaults; `mode = "plaintext"` is a per-vault opt-out for
+    // vaults that hold no real data, and never re-flips this global flag.
+    // The check reports the effective mode so the opt-out is always visible.
     if confidant_crypt::writes_encrypted() {
+        let mode_desc = match load_vault(root) {
+            Ok(vault) => {
+                match confidant_core::crypto_mode::resolve_write_mode(root, &vault.config) {
+                    Ok(confidant_core::crypto_mode::WriteMode::Encrypted) => {
+                        "record writes encrypt by default; this vault is encrypted"
+                    }
+                    Ok(confidant_core::crypto_mode::WriteMode::Plaintext) => {
+                        "record writes encrypt by default; this vault opts out (`mode = \"plaintext\"`)"
+                    }
+                    Err(_) => {
+                        "record writes encrypt by default; this vault is unkeyed (writes fail closed)"
+                    }
+                }
+            }
+            Err(_) => "record writes encrypt by default; vault unreadable",
+        };
         checks.push(DoctorCheck {
             id: "crypto",
             status: "ok",
-            message: "encryption available; key health not assessed in this milestone".to_owned(),
+            message: mode_desc.to_owned(),
         });
     } else if confidant_crypt::is_available() {
         checks.push(DoctorCheck {
@@ -1706,6 +1750,19 @@ fn cmd_doctor(
                 });
             }
         }
+    }
+
+    // Spec 3 (⚠1, B6): report the plaintext vs encrypted record-file mix.
+    // Existing plaintext records are never encrypted in place, so a mix is
+    // expected during (and after) the transition — this is informational.
+    // Code + count only; never names or paths.
+    {
+        let (encrypted, plaintext) = confidant_core::crypto_mode::count_record_mix(root);
+        checks.push(DoctorCheck {
+            id: "record-encryption-mix",
+            status: "ok",
+            message: format!("{encrypted} encrypted, {plaintext} plaintext record files"),
+        });
     }
 
     let ok = !checks.iter().any(|c| c.status == "error");
@@ -1919,6 +1976,20 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     // B4 + B6: KeyStore via with_config_dir (mandatory seq tracker).
     // Initialize the vault lookup key and the vault:shared client (⚠6).
     let vault = load_vault(root)?;
+    // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
+    // `init` on a vault declaring `[crypto] mode = "plaintext"` is a hard
+    // error — the opt-out is a pre-`init` declaration only.
+    if vault.config.crypto.mode.as_deref() == Some("plaintext") {
+        return Err(anyhow::Error::new(
+            DomainError::config(
+                "confidant.toml declares [crypto] mode = \"plaintext\", but `init` \
+                 creates vault keys; keys must never coexist with a plaintext declaration",
+            )
+            .with_fix(
+                "Remove the `[crypto] mode = \"plaintext\"` line, or run `init` in a fresh vault",
+            ),
+        ));
+    }
     let keys_dir = root.join("keys");
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
@@ -2439,7 +2510,7 @@ fn test_operator_key() -> Option<ed25519_dalek::SigningKey> {
 
 /// `~/.config/confidant`: the operator config dir, where `trust.toml` and
 /// the manifest seq tracker live. `None` when `HOME` is unset.
-fn confidant_config_dir() -> Option<PathBuf> {
+pub(crate) fn confidant_config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("confidant"))
 }
 
@@ -2535,7 +2606,7 @@ fn validate_keys_client_id(client_id: &str) -> anyhow::Result<()> {
 
 /// Load the device identity for `keys` commands (B7). Unkeyed runs fail
 /// closed with a message pointing at `init`/`recover`.
-fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
+pub(crate) fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
     let bech32 = device_key_bech32()?;
     let identity: age::x25519::Identity = bech32
         .trim()
@@ -2723,7 +2794,7 @@ impl confidant_crypt::keychain::KeychainBackend for FileKeychain {
 /// `CONFIDANT_TEST_KEYCHAIN_DIR` is set (test builds only), else the OS
 /// keychain. Single helper — every `keys` command goes through this so
 /// the test dir is never bypassed.
-fn device_key_bech32() -> anyhow::Result<Zeroizing<String>> {
+pub(crate) fn device_key_bech32() -> anyhow::Result<Zeroizing<String>> {
     #[cfg(feature = "test-overrides")]
     if let Some(dir) = test_keychain_dir() {
         let path = dir.join("device.key");

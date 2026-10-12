@@ -39,7 +39,7 @@ Read before changing behaviour:
 |---|---|
 | `crates/confidant-core/` | Parser, model, derived values, check engine, search allowlist |
 | `crates/confidant-cli/` | The `confidant` binary (package `confidant-cli`) |
-| `crates/confidant-crypt/` | Encryption (milestone 2): per-client keys, envelope, AAD. Publishable as of 2026-10-12 (first publish is the operator's manual step), disclosed as unaudited (see README Status); not yet wired into the CLI write path |
+| `crates/confidant-crypt/` | Encryption (milestone 2): per-client keys, envelope, AAD. Publishable as of 2026-10-12 (first publish is the operator's manual step), disclosed as unaudited (see README Status); wired into the CLI write path since spec 3 (`record add`, `note add`, `log session --note` encrypt; inbox `RecordWrite` fails closed) |
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (coaching first) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |

@@ -21,10 +21,11 @@ it implements is documented in `docs/crypto-design.md` there.
 Two related caveats from the main repository README (which is the
 authoritative project status):
 
-- the Confidant CLI does not encrypt vault content on write yet, so a vault
-  is still plaintext in git despite this crate existing;
+- the Confidant CLI now encrypts record content on write for keyed vaults
+  (`record add`, `note add`, `log session --note`); a vault that opts out
+  with `[crypto] mode = "plaintext"` stays plaintext in git;
 - see [the README status
-  section](https://github.com/hirefrank/confidant#status-two-things-are-not-ready-for-other-peoples-data)
+  section](https://github.com/hirefrank/confidant#status-one-thing-is-not-ready-for-other-peoples-data)
   for the current disclosure.
 
 ## License

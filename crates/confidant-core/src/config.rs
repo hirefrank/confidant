@@ -40,6 +40,11 @@ pub struct VaultConfig {
     /// do not know them, so this is backward compatible (no spec bump).
     #[serde(default)]
     pub inbox: InboxConfig,
+    /// Optional `[crypto]` table (spec §2). Unknown tables are ignored by
+    /// readers that do not know them, so this is backward compatible (no
+    /// spec bump).
+    #[serde(default)]
+    pub crypto: CryptoConfig,
 }
 
 /// Optional `[inbox]` table: the vault's public inbox key (age X25519,
@@ -49,6 +54,32 @@ pub struct VaultConfig {
 pub struct InboxConfig {
     #[serde(default)]
     pub pubkey: Option<String>,
+}
+
+/// Optional `[crypto]` table (spec §2, issue #148).
+///
+/// `mode` is `"encrypted"` (the default when absent) or `"plaintext"`.
+/// `"plaintext"` is ONLY for vaults that hold no real data (demo vault,
+/// fixtures): it permits plaintext writes while the vault is structurally
+/// plaintext, and can never downgrade an encrypted vault (a `mode =
+/// "plaintext"` declaration combined with an `enc:` envelope or any `keys/`
+/// tree is `E_CONFIG`). Unknown keys are `E_CONFIG` (typo detection, same
+/// as `[checks]`).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CryptoConfig {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, toml::Value>,
+}
+
+impl CryptoConfig {
+    /// Unknown `[crypto]` keys, sorted (typo detection).
+    pub fn extra_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.extra.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
 }
 
 /// `[checks]` table. Unknown keys are `E_CONFIG` findings.
@@ -244,6 +275,15 @@ impl VaultConfig {
                 )
                 .at_file("confidant.toml")
                 .with_fix("See spec/0.1.md for the keys defined in 0.1"),
+            );
+        }
+
+        // [crypto] table: unknown keys and bad mode values are E_CONFIG.
+        for problem in crate::crypto_mode::crypto_config_problems(self) {
+            findings.push(
+                Finding::new(FindingCode::Config, Severity::Error, problem)
+                    .at_file("confidant.toml")
+                    .with_fix("See spec/0.1.md §2 for the [crypto] table"),
             );
         }
         findings

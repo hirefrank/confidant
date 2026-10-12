@@ -108,6 +108,17 @@ alias plaintext values (email/phone/handle), and any other PII. Front-matter
 `name:` moves inside the encrypted payload; the outer file carries only
 `id`, `type`, `no-ai`, and envelope headers.
 
+**What counts as an encrypted vault** (spec §14, normative): a vault with
+any `enc:` envelope file or any `keys/` tree at all — including a
+half-initialized `keys/` (e.g. `keys/operator.toml` with no client
+manifest). The `[crypto] mode = "plaintext"` opt-out (`confidant.toml`,
+spec §2) is structural-first and narrowing-only: it permits plaintext
+writes only while the vault is already structurally plaintext, and can
+never downgrade an encrypted vault (`mode = "plaintext"` plus an envelope
+or `keys/` tree is `E_CONFIG`). `writes_encrypted()` and the disclosure
+are global and flip once; the opt-out is a per-vault writer override that
+never re-flips them.
+
 **Never in git, even encrypted-adjacent:** local indexes and caches
 (`.confidant/`, any search index) contain plaintext and embeddings. They
 are sensitive, gitignored, and stay on trusted devices.

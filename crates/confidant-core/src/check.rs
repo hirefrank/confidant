@@ -267,6 +267,26 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         );
     }
 
+    // Spec 3 (§2.2): a `mode = "plaintext"` declaration combined with a
+    // structurally encrypted vault (any `enc:` envelope or any `keys/`
+    // tree) is E_CONFIG — the declaration can never downgrade an
+    // encrypted vault.
+    if vault.config.crypto.mode.as_deref() == Some("plaintext")
+        && crate::crypto_mode::is_structurally_encrypted(&vault.root)
+    {
+        findings.push(
+            Finding::new(
+                FindingCode::Config,
+                Severity::Error,
+                "confidant.toml declares [crypto] mode = \"plaintext\" but the vault \
+                 is structurally encrypted (it has an `enc:` envelope or a `keys/` tree); \
+                 the declaration cannot downgrade an encrypted vault",
+            )
+            .at_file("confidant.toml")
+            .with_fix("Remove the `[crypto] mode = \"plaintext\"` line"),
+        );
+    }
+
     // Key-substitution defense: the vault's advertised inbox key must match
     // the operator's out-of-band pin. Anyone with git write access can change
     // confidant.toml; only the local pin is trustworthy.
