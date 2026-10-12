@@ -1672,6 +1672,21 @@ fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> i
 fn provision_device_key() -> anyhow::Result<(String, String)> {
     use age::secrecy::ExposeSecret;
     use std::str::FromStr;
+    // Test keychain dir (test builds only): read the device key from the
+    // file instead of generating/storing. Used by the shred rotation test.
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let bech32 = std::fs::read_to_string(dir.join("device.key")).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read test device key: {e}"
+            )))
+        })?;
+        let id = age::x25519::Identity::from_str(bech32.trim()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad test device key: {e}")))
+        })?;
+        let recipient = id.to_public().to_string();
+        return Ok((bech32.trim().to_string(), recipient));
+    }
     // Test override: provides a key without enrolling (B13 ignores it).
     // Feature-gated so production binaries never honor it.
     #[cfg(feature = "test-overrides")]
@@ -2342,6 +2357,18 @@ fn validate_keys_client_id(client_id: &str) -> anyhow::Result<()> {
 /// closed with a message pointing at `init`/`recover`.
 fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
     use confidant_crypt::keychain;
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let bech32 = std::fs::read_to_string(dir.join("device.key")).map_err(|_| {
+            anyhow::Error::new(DomainError::invalid(
+                "no device key enrolled; run `confidant init` (new vault) or `confidant recover` (new device) first".to_string(),
+            ))
+        })?;
+        let identity: age::x25519::Identity = bech32.trim().parse().map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}")))
+        })?;
+        return Ok(Box::new(identity));
+    }
     let bech32_bytes = keychain::device_key().map_err(|_| {
         anyhow::Error::new(DomainError::invalid(
             "no device key enrolled; run `confidant init` (new vault) or `confidant recover` (new device) first".to_string(),
@@ -2357,48 +2384,145 @@ fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
 
 /// Build the recipient map from the anchor + device keychain for `keys`
 /// commands. Currently the only recipient is this device; #66 adds more.
+/// Build the recipient map for `keys init-client`: the union of
+/// verified recipients from all initialized clients (every enrolled
+/// device), so a new client is usable from every device. Falls back to
+/// the local device when no client exists yet.
 fn keys_current_recipients(
+    store: &mut confidant_crypt::lifecycle::KeyStore,
     anchor: &confidant_crypt::anchor::Anchor,
 ) -> anyhow::Result<confidant_crypt::manifest::RecipientMap> {
     use confidant_crypt::{keychain, manifest::RecipientEntry};
-    let device_bech32_bytes = keychain::device_key()
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("no device key: {e}"))))?;
-    let device_bech32 = Zeroizing::new(String::from_utf8_lossy(&device_bech32_bytes).into_owned());
-    let device_identity: age::x25519::Identity = device_bech32
-        .trim()
-        .parse()
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}"))))?;
-    let device_recipient = device_identity.to_public().to_string();
     let mut map = std::collections::BTreeMap::new();
+    for client in store.manifest_clients() {
+        let (_, recipients, _) = store
+            .verified_recipients(&client, anchor)
+            .map_err(anyhow::Error::new)?;
+        map.extend(recipients);
+    }
+    if map.is_empty() {
+        // No clients yet: the local device is device-0, matching init.
+        let device_bech32_bytes = keychain::device_key()
+            .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("no device key: {e}"))))?;
+        let device_bech32 =
+            Zeroizing::new(String::from_utf8_lossy(&device_bech32_bytes).into_owned());
+        let device_identity: age::x25519::Identity = device_bech32.trim().parse().map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}")))
+        })?;
+        let device_recipient = device_identity.to_public().to_string();
+        map.insert(
+            "device-0".to_string(),
+            RecipientEntry {
+                age_pubkey: device_recipient,
+                label: "device-0".to_string(),
+                scope_ref: String::new(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// Test-only keychain directory (with the `test-overrides` feature).
+/// When set, the shred device-key rotation reads/writes
+/// `$DIR/device.key` (0600) instead of the OS keychain, so the rotation
+/// is testable where no Secret Service exists. Never honored in release
+/// builds.
+#[cfg(feature = "test-overrides")]
+fn test_keychain_dir() -> Option<std::path::PathBuf> {
+    std::env::var("CONFIDANT_TEST_KEYCHAIN_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Load the device identity for shred: test keychain dir first (test
+/// builds only), then the normal keychain/env resolution.
+fn shred_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let path = dir.join("device.key");
+        let bech32 = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read test device key at {}: {e}",
+                path.display()
+            )))
+        })?;
+        let identity: age::x25519::Identity = bech32.trim().parse().map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!("bad test device key: {e}")))
+        })?;
+        return Ok(Box::new(identity));
+    }
+    keys_device_identity()
+}
+
+/// Store the rotated device key: test keychain dir first (test builds
+/// only), then the OS keychain.
+fn store_rotated_device_key(bech32: &Zeroizing<String>) -> anyhow::Result<()> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        let path = dir.join("device.key");
+        // 0600 via create-new semantics: refuse to overwrite silently.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut f = opts.open(&path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write test device key at {}: {e}",
+                path.display()
+            )))
+        })?;
+        f.write_all(bech32.as_bytes()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write test device key: {e}"
+            )))
+        })?;
+        return Ok(());
+    }
+    confidant_crypt::keychain::store_device_key(bech32).map_err(anyhow::Error::new)
+}
+
+/// Build the recipient set for re-wrapping after shred: a FRESH keypair
+/// for this device only. Shred re-wraps to fresh keypairs (the strict
+/// pubkey-reuse check in `KeyStore::shred` forbids any historical pubkey):
+/// other devices are NOT carried over — they must re-enroll via
+/// `keys device-add` (surfaced in the output).
+///
+/// This rotates this device's key: the fresh private key is stored
+/// BEFORE any mutation, so a store failure leaves the vault untouched.
+/// Fails closed when `CONFIDANT_DEVICE_KEY` is set — an env-var key
+/// cannot be rotated from here (the new private key would have nowhere
+/// to go), so the operator must use the OS keychain for shred.
+fn keys_shred_fresh_recipients() -> anyhow::Result<confidant_crypt::manifest::RecipientMap> {
+    use age::secrecy::ExposeSecret;
+    use confidant_crypt::manifest::{RecipientEntry, RecipientMap};
+    if let Ok(v) = std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
+        if !v.trim().is_empty() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "shred rotates this device's key, but CONFIDANT_DEVICE_KEY is set so the new key cannot be stored; unset it and enroll via the OS keychain first".to_string(),
+            ).with_fix("Unset CONFIDANT_DEVICE_KEY and run `confidant init` or `recover` to enroll this device in the OS keychain, then retry shred")));
+        }
+    }
+    let id = age::x25519::Identity::generate();
+    let bech32 = Zeroizing::new(id.to_string().expose_secret().to_owned());
+    let recipient = id.to_public().to_string();
+    // Store BEFORE any vault mutation.
+    store_rotated_device_key(&bech32)?;
+    let mut map = RecipientMap::new();
     // One key-id scheme everywhere: the local device is always device-0,
-    // matching init. (Pre-#66: single device.)
+    // matching init.
     map.insert(
         "device-0".to_string(),
         RecipientEntry {
-            age_pubkey: device_recipient,
+            age_pubkey: recipient,
             label: "device-0".to_string(),
             scope_ref: String::new(),
         },
     );
-    let _ = anchor;
-    Ok(map)
-}
-
-/// Build the recipient set for re-wrapping after shred: the union of
-/// verified recipients from all remaining clients. This preserves every
-/// enrolled device (not just the local one).
-fn keys_shred_recipients(
-    store: &mut confidant_crypt::lifecycle::KeyStore,
-    anchor: &confidant_crypt::anchor::Anchor,
-    remaining: &[&str],
-) -> anyhow::Result<confidant_crypt::manifest::RecipientMap> {
-    let mut map = std::collections::BTreeMap::new();
-    for client in remaining {
-        let (_, recipients, _) = store
-            .verified_recipients(client, anchor)
-            .map_err(anyhow::Error::new)?;
-        map.extend(recipients);
-    }
     Ok(map)
 }
 
@@ -2413,11 +2537,11 @@ fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Resu
     let _identity = keys_device_identity()?;
     let operator_sk = load_operator_sk(&anchor)?;
 
-    let recipients = keys_current_recipients(&anchor)?;
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
     let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
         .map_err(anyhow::Error::new)?;
+    let recipients = keys_current_recipients(&mut store, &anchor)?;
     store
         .init_client(client_id, &recipients, &anchor, &operator_sk)
         .map_err(anyhow::Error::new)?;
@@ -2639,7 +2763,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
 
     let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
     let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let identity = keys_device_identity()?;
+    let identity = shred_device_identity()?;
     let operator_sk = load_operator_sk(&anchor)?;
 
     // Collect all initialized clients for the strand check via
@@ -2648,8 +2772,9 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // Skip vault:lookup (keys/vault) — shred handles it separately.
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
-    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
+    let mut store =
+        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
     let all_clients: Vec<String> = store
         .manifest_clients()
         .into_iter()
@@ -2657,14 +2782,12 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         .collect();
     let all_refs: Vec<&str> = all_clients.iter().map(|s| s.as_str()).collect();
 
-    // Fresh recipients for the re-wrap: the union of verified recipients
-    // from all remaining clients (preserves every enrolled device).
-    let remaining: Vec<&str> = all_refs
-        .iter()
-        .copied()
-        .filter(|c| *c != client_id)
-        .collect();
-    let new_recipients: RecipientMap = keys_shred_recipients(&mut store, &anchor, &remaining)?;
+    // Fresh recipients for the re-wrap: a fresh keypair for THIS device
+    // only (the device key is rotated and stored before any mutation).
+    // Other devices are NOT carried over — their old pubkeys would keep
+    // the shredded history openable (strict pubkey-reuse check in
+    // KeyStore::shred). They must re-enroll via `keys device-add`.
+    let new_recipients: RecipientMap = keys_shred_fresh_recipients()?;
 
     // B5: verify-first, strand check, history-derived destroy list all come
     // from KeyStore::shred — do not weaken them.
@@ -2691,6 +2814,18 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         &anchor.operator,
         &new_recovery.verifying_key(),
         &new_recovery.age_identity().to_recipient_string(),
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Re-sign the operator certificate with the new recovery key: it was
+    // signed by the OLD recovery key, and without this a fresh-device
+    // recover with the NEW phrase fails verify_operator_cert (silent
+    // lockout). Same staleness bug as #149's recover path.
+    anchor::write_operator_cert(
+        &keys_dir,
+        &vault.config.vault_id,
+        &anchor.operator,
+        new_recovery.signing_key(),
     )
     .map_err(anyhow::Error::new)?;
 
@@ -2757,9 +2892,13 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "destroy_key_ids": outcome.destroy_key_ids,
             "warnings": outcome.warnings,
             "inbox_rotated": inbox_rotated,
+            "device_key_rotated": true,
+            "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
         }))?;
     } else {
         println!("shredded client {client_id}");
+        println!("device key rotated: this device was re-enrolled with a fresh keypair");
+        println!("other devices were removed: re-enroll them with `keys device-add`");
         if inbox_rotated {
             println!(
                 "inbox key rotated (run `confidant inbox rotate --finish` to destroy the old key)"

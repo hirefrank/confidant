@@ -48,6 +48,7 @@ struct Harness {
     vault: PathBuf,
     device_bech32: String,
     operator_hex: String,
+    keychain_dir: Option<PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -78,8 +79,29 @@ impl Harness {
             vault,
             device_bech32,
             operator_hex,
+            keychain_dir: None,
             _tmp: tmp,
         }
+    }
+
+    /// Switch this harness to the test keychain dir (for shred's device-key
+    /// rotation): the device key is read from / written to
+    /// `$DIR/device.key` instead of `CONFIDANT_DEVICE_KEY` / the OS
+    /// keychain. Must be called before `init`.
+    fn with_test_keychain(&mut self) {
+        let dir = self._tmp.path().join("keychain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("device.key"), &self.device_bech32).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("device.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        self.keychain_dir = Some(dir);
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -88,9 +110,18 @@ impl Harness {
             .arg("--vault")
             .arg(&self.vault)
             .env("HOME", &self.home)
-            .env("CONFIDANT_DEVICE_KEY", &self.device_bech32)
             .env("CONFIDANT_TEST_OPERATOR_KEY", &self.operator_hex)
             .env("CONFIDANT_KEYCHAIN", "off");
+        match &self.keychain_dir {
+            Some(dir) => {
+                c.env("CONFIDANT_TEST_KEYCHAIN_DIR", dir);
+                c.env_remove("CONFIDANT_DEVICE_KEY");
+            }
+            None => {
+                c.env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
+                c.env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
+            }
+        }
         c
     }
 
@@ -249,9 +280,16 @@ fn keys_revoke_removes_all_epochs_and_refuses_recovery() {
 
 #[test]
 fn keys_shred_new_phrase_stderr_once() {
-    let h = Harness::new();
+    let mut h = Harness::new();
+    // Shred rotates the device key: use the test keychain dir (the
+    // rotation cannot work with CONFIDANT_DEVICE_KEY, which fails closed).
+    h.with_test_keychain();
     let out = h.init(&[]);
     assert!(out.status.success());
+
+    // Record the anchor's recovery pubkey before shred.
+    let trust_before =
+        std::fs::read_to_string(h.home.join(".config/confidant/trust.toml")).unwrap();
 
     // Init two clients (need at least one remaining after shred).
     for client in ["client-a", "client-b"] {
@@ -299,10 +337,35 @@ fn keys_shred_new_phrase_stderr_once() {
     // Others re-wrapped: client-b manifest still exists and verifies
     // (check passes on the vault).
     assert!(h.vault.join("keys/client-b/recipients.toml").is_file());
-    // Anchor re-pinned: trust.toml exists with new recovery key
-    // (different from the init phrase's key — the phrase rotated).
+    // Anchor re-pinned: trust.toml exists with a CHANGED recovery pubkey
+    // (the phrase rotated; assert the key actually changed, not just that
+    // the file exists).
     let trust = h.home.join(".config/confidant/trust.toml");
     assert!(trust.is_file(), "trust.toml missing after shred");
+    let trust_after = std::fs::read_to_string(&trust).unwrap();
+    let recovery_before: String = trust_before
+        .lines()
+        .find(|l| l.contains("recovery_pubkey"))
+        .unwrap()
+        .to_string();
+    let recovery_after: String = trust_after
+        .lines()
+        .find(|l| l.contains("recovery_pubkey"))
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        recovery_before, recovery_after,
+        "anchor recovery_pubkey did not change across shred"
+    );
+    // The device key was rotated: the test keychain now holds a fresh key
+    // (different from the one the harness wrote).
+    let rotated =
+        std::fs::read_to_string(h.keychain_dir.as_ref().unwrap().join("device.key")).unwrap();
+    assert_ne!(
+        rotated.trim(),
+        h.device_bech32.trim(),
+        "device key was not rotated by shred"
+    );
     // Pending inbox rotation file OR inbox was rotated (test has no inbox
     // key, so the reminder file must exist).
     let pending = h.home.join(".config/confidant/inbox-rotation-pending.toml");
@@ -314,4 +377,65 @@ fn keys_shred_new_phrase_stderr_once() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert!(!v["destroy_key_ids"].as_array().unwrap().is_empty());
+    // The re-enrollment notice is surfaced.
+    assert_eq!(v["device_key_rotated"], true);
+}
+
+#[test]
+fn keys_shred_then_fresh_device_recover_with_new_phrase() {
+    // Blocker B: shred rotates the recovery key, so the operator
+    // certificate must be re-signed — otherwise a fresh-device recover
+    // with the NEW phrase fails verify_operator_cert (silent lockout).
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let new_phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+
+    // Fresh device: wipe config, recover with the post-shred phrase.
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    let phrase_file = h.home.join("phrase");
+    std::fs::write(&phrase_file, &new_phrase).unwrap();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "fresh-device recover after shred failed (stale operator cert?): stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(h.home.join(".config/confidant/trust.toml").is_file());
+}
+
+/// Extract the 24-word phrase from stderr (the display block).
+fn extract_phrase(stderr: &str) -> String {
+    for line in stderr.lines() {
+        if line.split_whitespace().count() == 24 {
+            return line.trim().to_string();
+        }
+    }
+    panic!("no 24-word phrase found on stderr:\n{stderr}");
 }
