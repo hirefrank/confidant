@@ -2461,7 +2461,8 @@ fn store_rotated_device_key(bech32: &Zeroizing<String>) -> anyhow::Result<()> {
     #[cfg(feature = "test-overrides")]
     if let Some(dir) = test_keychain_dir() {
         let path = dir.join("device.key");
-        // 0600 via create-new semantics: refuse to overwrite silently.
+        // 0600; this is the test-only keychain stand-in, so overwrite the
+        // test device key outright (create + truncate).
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -2790,7 +2791,9 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     let new_recipients: RecipientMap = keys_shred_fresh_recipients()?;
 
     // B5: verify-first, strand check, history-derived destroy list all come
-    // from KeyStore::shred — do not weaken them.
+    // from KeyStore::shred — do not weaken them. Note: the fresh device key
+    // is already stored at this point, so if shred fails, run
+    // `confidant recover` with the recovery phrase to re-enroll this device.
     let outcome = store
         .shred(
             client_id,
