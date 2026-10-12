@@ -2786,6 +2786,36 @@ struct DeviceAddRequest {
 /// emits the request (pubkey + label only). Touches nothing else — no
 /// vault. The fingerprint goes to stderr so the operator can verify it
 /// out of band; the request goes to stdout (or --output).
+/// Validate a device-add request label: restrict charset and length,
+/// strip control characters (it flows into the commit message, manifest,
+/// and stderr — a hand-edited request file must not inject terminal
+/// escapes). Used by both `--initiate` and `--from-request`.
+fn validate_device_label(raw: &str) -> anyhow::Result<String> {
+    // Strip control characters (including newlines) to avoid terminal escapes.
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label must not be empty",
+        )));
+    }
+    if cleaned.len() > 64 {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label must be at most 64 characters",
+        )));
+    }
+    // Allow alphanumerics, spaces, and common punctuation.
+    if !cleaned
+        .chars()
+        .all(|c| c.is_alphanumeric() || " -_.()".contains(c))
+    {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "label may contain only letters, numbers, spaces, and -_.()",
+        )));
+    }
+    Ok(cleaned.to_string())
+}
+
 fn cmd_keys_device_add_initiate(
     cli: &Cli,
     label: Option<&str>,
@@ -2822,34 +2852,9 @@ fn cmd_keys_device_add_initiate(
     let (_bech32, recipient) = provision_device_key()?;
     let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&recipient);
     let key_id = device_key_id(&recipient);
-    // Validate the label: restrict charset and length, strip control
-    // characters (it flows into the commit message, manifest, and stderr).
-    let label = {
-        let raw = label.unwrap_or("device");
-        // Strip control characters (including newlines) to avoid terminal escapes.
-        let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-        let cleaned = cleaned.trim();
-        if cleaned.is_empty() {
-            return Err(anyhow::Error::new(DomainError::usage(
-                "label must not be empty",
-            )));
-        }
-        if cleaned.len() > 64 {
-            return Err(anyhow::Error::new(DomainError::usage(
-                "label must be at most 64 characters",
-            )));
-        }
-        // Allow alphanumerics, spaces, and common punctuation.
-        if !cleaned
-            .chars()
-            .all(|c| c.is_alphanumeric() || " -_.()".contains(c))
-        {
-            return Err(anyhow::Error::new(DomainError::usage(
-                "label may contain only letters, numbers, spaces, and -_.()",
-            )));
-        }
-        cleaned.to_string()
-    };
+    // Validate the label (shared with --from-request: a hand-edited
+    // request can inject controls into the commit message/manifest/stderr).
+    let label = validate_device_label(label.unwrap_or("device"))?;
 
     let request = DeviceAddRequest {
         version: DEVICE_ADD_REQUEST_VERSION,
@@ -2970,6 +2975,14 @@ fn cmd_keys_device_add_from_request(
         })?;
     let key_id = device_key_id(&request.pubkey);
     let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&request.pubkey);
+    // Validate the label too: the request file is hand-editable, and the
+    // label flows into the commit message, manifest, and stderr.
+    // Malformed labels are E_INVALID-class (B6): fail closed.
+    let label = validate_device_label(&request.label).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "device-add request has a bad label: {e}"
+        )))
+    })?;
 
     // Fingerprint verification is mandatory (design §7): the operator
     // must confirm the fingerprint matches what the new device showed.
@@ -2983,7 +2996,7 @@ fn cmd_keys_device_add_from_request(
         }
     } else {
         eprintln!("new device request:");
-        eprintln!("  label:       {}", request.label);
+        eprintln!("  label:       {label}");
         eprintln!("  pubkey:      {}", request.pubkey);
         eprintln!("  fingerprint: {fingerprint}");
         eprint!("Does this fingerprint match the one shown on the new device? [y/N] ");
@@ -3009,7 +3022,7 @@ fn cmd_keys_device_add_from_request(
         .map_err(anyhow::Error::new)?;
     let entry = RecipientEntry {
         age_pubkey: request.pubkey.clone(),
-        label: request.label.clone(),
+        label: label.clone(),
         scope_ref: String::new(),
     };
     // B2: every initialized client's every retained epoch + the lookup
@@ -3033,7 +3046,7 @@ fn cmd_keys_device_add_from_request(
         &[
             "commit",
             "-m",
-            &format!("keys: device-add {key_id} ({})", request.label),
+            &format!("keys: device-add {key_id} ({label})"),
         ],
         no_input,
     )?;
@@ -3044,15 +3057,14 @@ fn cmd_keys_device_add_from_request(
             "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
             "vault": root.to_string_lossy(),
             "fingerprint": fingerprint,
-            "label": request.label,
+            "label": label,
             "key_id": key_id,
             "clients": clients,
             "client_count": clients.len(),
         }))?;
     } else {
         println!(
-            "added device {key_id} ({}) to {} client(s)",
-            request.label,
+            "added device {key_id} ({label}) to {} client(s)",
             clients.len()
         );
     }

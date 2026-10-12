@@ -507,16 +507,6 @@ fn keys_shred_refused_leaves_device_key_untouched() {
     );
 }
 
-/// Extract the 24-word phrase from stderr (the display block).
-fn extract_phrase(stderr: &str) -> String {
-    for line in stderr.lines() {
-        if line.split_whitespace().count() == 24 {
-            return line.trim().to_string();
-        }
-    }
-    panic!("no 24-word phrase found on stderr:\n{stderr}");
-}
-
 // --- device-add (#66) -----------------------------------------------------
 
 /// Extract the 24-word recovery phrase from `init`'s stderr.
@@ -605,7 +595,7 @@ fn device_add_then_rotate_new_device_still_enrolled() {
     // #151 blocker 1: after device-add, rotate must keep the new device
     // enrolled (not silently drop it). The new device's key_id must be
     // in the rotated manifest's recipients.
-    let (h1, _h2, _req_path, key_id, _init_stderr) = device_add_setup();
+    let (h1, h2, _req_path, key_id, _init_stderr) = device_add_setup();
 
     // Rotate client-a.
     let out = h1
@@ -629,6 +619,89 @@ fn device_add_then_rotate_new_device_still_enrolled() {
         manifest.contains("device-0"),
         "device-0 dropped from manifest after rotate:\n{manifest}"
     );
+
+    // Stronger: the new device must actually UNWRAP. Decrypt its wrapping
+    // at the current epoch with the new device's identity and check it
+    // yields the same 32-byte data key the old device gets.
+    let new_key = unwrap_wrapping(&h1.vault, "client-a", &key_id, &h2.device_bech32);
+    let old_key = unwrap_wrapping(&h1.vault, "client-a", "device-0", &h1.device_bech32);
+    assert_eq!(new_key.len(), 32, "unwrapped data key must be 32 bytes");
+    assert_eq!(
+        new_key, old_key,
+        "new device unwrapped a different data key than the old device"
+    );
+}
+
+/// Decrypt a client's wrapping file for `key_id` at the current epoch
+/// with the given Bech32 age identity. Returns the raw data-key bytes.
+fn unwrap_wrapping(vault: &std::path::Path, client: &str, key_id: &str, bech32: &str) -> Vec<u8> {
+    // Current epoch: read from the epoch file.
+    let epoch: u64 = std::fs::read_to_string(vault.join(format!("keys/{client}/epoch")))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let wrapping =
+        std::fs::read(vault.join(format!("keys/{client}/wrapped/{key_id}.e{epoch}.age")))
+            .unwrap_or_else(|_| {
+                std::fs::read(vault.join(format!("keys/{client}/wrapped/{key_id}.age"))).unwrap()
+            });
+    let identity: age::x25519::Identity = bech32.trim().parse().unwrap();
+    let decryptor = age::Decryptor::new(&wrapping[..]).unwrap();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .unwrap();
+    let mut out = Vec::new();
+    use std::io::Read;
+    reader.read_to_end(&mut out).unwrap();
+    // The wrapping encrypts the 32-byte data key; expose and return it.
+    // (DataKey zeroizes on drop inside the crypt layer; here we hold raw
+    // bytes only for the assertion.)
+    out
+}
+
+#[test]
+fn device_add_from_request_rejects_bad_label() {
+    // #151 nit 1: a hand-edited request with a bad label (control chars /
+    // overlong / bad charset) must fail closed on --from-request too, not
+    // just --initiate.
+    let (h1, _h2, req_path, _key_id, _init_stderr) = device_add_setup();
+
+    // Note: control chars are STRIPPED (matching --initiate), not
+    // rejected — so test the cases that fail validation outright.
+    for (name, bad_label) in [
+        ("empty", "   "),
+        ("overlong", &"x".repeat(65)),
+        ("charset", "bad;label|here"),
+    ] {
+        let raw = std::fs::read_to_string(&req_path).unwrap();
+        let mut request: toml::Value = toml::from_str(&raw).unwrap();
+        request["label"] = toml::Value::String(bad_label.to_string());
+        let bad_path = h1.home.join(format!("bad-{name}.toml"));
+        std::fs::write(&bad_path, toml::to_string(&request).unwrap()).unwrap();
+
+        let out = h1
+            .cmd(&[
+                "keys",
+                "device-add",
+                "--from-request",
+                bad_path.to_str().unwrap(),
+                "--fingerprint-verified",
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "--from-request accepted bad label ({name}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("label"),
+            "expected label error for {name}, got: {stderr}"
+        );
+    }
 }
 
 #[test]
