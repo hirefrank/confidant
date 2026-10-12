@@ -40,7 +40,11 @@ may opt out (ADR-4).
 ```
 operator signing key (Ed25519) ............ trust anchor, OFF-VAULT (never in git)
   signs recipient manifests and the trusted-signers list (ADR-4, ADR-10);
-  lives in ~/.config/confidant/ (flag or env var also allowed)
+  loads from the OS keychain by default; CONFIDANT_OPERATOR_KEY env var
+  allowed for headless use. There is no file fallback (Frank decision
+  2026-10-12): a plaintext operator.key on disk is never consulted.
+  Test-only overrides (CONFIDANT_TEST_*) are gated behind the
+  `test-overrides` cargo feature and do not exist in release builds.
 
 per-device / per-agent encryption key ..... X25519 (age "age1…" recipient)
   held in OS keychain / agent secret store on trusted devices only

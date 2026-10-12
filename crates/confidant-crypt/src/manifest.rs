@@ -108,7 +108,7 @@ pub fn validate_key_id(key_id: &str) -> Result<(), Error> {
 /// boundary does not re-implement the vault's ULID shape rules (spec §3,
 /// the CLI's job) — it guarantees only that the id is a safe, unambiguous
 /// directory name.
-pub(crate) fn validate_client_id(client_id: &str) -> Result<(), Error> {
+pub fn validate_client_id(client_id: &str) -> Result<(), Error> {
     if client_id.is_empty() {
         return Err(Error::Manifest("empty client id".to_string()));
     }

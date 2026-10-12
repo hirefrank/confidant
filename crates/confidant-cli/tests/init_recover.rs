@@ -61,9 +61,9 @@ impl Harness {
         c.env("HOME", &self.home);
         c.env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
         // The keychain must never be consulted: the env var is the store.
-        // (If a test forgets the var, the OS keychain would be hit — the
-        // kill switch is NOT set here on purpose: writes must work.)
-        c.env_remove("CONFIDANT_KEYCHAIN");
+        // The kill switch IS set: operator key writes are skipped (test
+        // mode), and the device key comes from the env var.
+        c.env("CONFIDANT_KEYCHAIN", "off");
         c
     }
 

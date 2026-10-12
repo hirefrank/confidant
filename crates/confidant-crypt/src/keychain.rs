@@ -299,7 +299,7 @@ pub fn device_key() -> Result<Zeroizing<Vec<u8>>, Error> {
         DEVICE_SERVICE,
         DEVICE_ACCOUNT,
         DEVICE_KEY_ENV,
-        LEGACY_DEVICE_FILE,
+        Some(LEGACY_DEVICE_FILE),
         "device key",
     )
 }
@@ -314,7 +314,7 @@ pub fn inbox_key() -> Result<Zeroizing<Vec<u8>>, Error> {
         INBOX_SERVICE,
         INBOX_ACCOUNT,
         INBOX_KEY_ENV,
-        LEGACY_INBOX_FILE,
+        Some(LEGACY_INBOX_FILE),
         "inbox key",
     )
 }
@@ -338,7 +338,7 @@ fn inbox_keys_with(
         INBOX_SERVICE,
         INBOX_ACCOUNT,
         INBOX_KEY_ENV,
-        LEGACY_INBOX_FILE,
+        Some(LEGACY_INBOX_FILE),
         "inbox key",
     )?;
     let previous = load_key_opt(
@@ -347,7 +347,7 @@ fn inbox_keys_with(
         INBOX_SERVICE,
         INBOX_PREVIOUS_ACCOUNT,
         INBOX_KEY_PREVIOUS_ENV,
-        LEGACY_INBOX_FILE,
+        Some(LEGACY_INBOX_FILE),
         "previous inbox key",
     )?;
     Ok((current, previous))
@@ -396,7 +396,7 @@ fn load_key(
     service: &str,
     account: &str,
     env_var: &str,
-    legacy_file: &str,
+    legacy_file: Option<&str>,
     what: &str,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
     load_key_opt(
@@ -421,13 +421,14 @@ fn load_key_opt(
     service: &str,
     account: &str,
     env_var: &str,
-    legacy_file: &str,
+    legacy_file: Option<&str>,
     what: &str,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
     // A plaintext key file on disk is never used — refuse loudly so the
-    // operator imports it into the keychain and deletes it.
-    if let Some(dir) = config_dir {
-        refuse_if_legacy_file(dir, legacy_file, service, account, what)?;
+    // operator imports it into the keychain and deletes it. (The operator
+    // key has no legacy file: Frank's 2026-10-12 decision dropped it.)
+    if let (Some(dir), Some(legacy)) = (config_dir, legacy_file) {
+        refuse_if_legacy_file(dir, legacy, service, account, what)?;
     }
 
     if let Ok(raw) = std::env::var(env_var) {
@@ -527,6 +528,56 @@ pub fn store_inbox_key_previous(bech32: &str) -> Result<(), Error> {
 /// not there is a no-op.
 pub fn delete_device_key() -> Result<(), Error> {
     delete_key(&OsKeychain, DEVICE_SERVICE, DEVICE_ACCOUNT, "device key")
+}
+
+/// Keychain account name for the operator Ed25519 signing key.
+pub const OPERATOR_ACCOUNT: &str = "operator-key";
+
+/// Store the operator Ed25519 signing key in the OS keychain. `hex` must be
+/// the 64-character hex encoding of the 32-byte seed; anything else is
+/// refused before it touches the keychain.
+pub fn store_operator_key(hex_seed: &str) -> Result<(), Error> {
+    let trimmed = hex_seed.trim();
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Keychain(
+            "operator key must be 64 hex characters".to_string(),
+        ));
+    }
+    store_key(
+        &OsKeychain,
+        DEVICE_SERVICE,
+        OPERATOR_ACCOUNT,
+        trimmed,
+        "operator key",
+    )
+}
+
+/// Load the operator Ed25519 signing key from the OS keychain.
+///
+/// Per Frank's decision (2026-10-12): the OS keychain is the default;
+/// `CONFIDANT_OPERATOR_KEY` is allowed for headless use. The plain
+/// `operator.key` file is not consulted — there is no file fallback.
+pub fn operator_key() -> Result<Zeroizing<Vec<u8>>, Error> {
+    load_key(
+        &OsKeychain,
+        config_dir().as_deref(),
+        DEVICE_SERVICE,
+        OPERATOR_ACCOUNT,
+        "CONFIDANT_OPERATOR_KEY",
+        None,
+        "operator key",
+    )
+}
+
+/// Delete the operator key from the OS keychain. Deleting a key that is
+/// not there is a no-op.
+pub fn delete_operator_key() -> Result<(), Error> {
+    delete_key(
+        &OsKeychain,
+        DEVICE_SERVICE,
+        OPERATOR_ACCOUNT,
+        "operator key",
+    )
 }
 
 /// Delete the inbox key from the OS keychain. Deleting a key that is
@@ -838,7 +889,7 @@ mod tests {
                 DEVICE_SERVICE,
                 DEVICE_ACCOUNT,
                 DEVICE_KEY_ENV,
-                LEGACY_DEVICE_FILE,
+                Some(LEGACY_DEVICE_FILE),
                 "device key",
             )
         }
@@ -849,7 +900,7 @@ mod tests {
                 INBOX_SERVICE,
                 INBOX_ACCOUNT,
                 INBOX_KEY_ENV,
-                LEGACY_INBOX_FILE,
+                Some(LEGACY_INBOX_FILE),
                 "inbox key",
             )
         }

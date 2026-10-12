@@ -884,22 +884,32 @@ impl KeyStore {
             }
             to_rewrap.push((client, epoch, epoch_keys, commitments));
         }
-        // 2. No new recipient pubkey may match any current or historical
-        // recipient (including recovery): reusing a pubkey would keep the
-        // old private key able to unwrap.
-        let mut old_pubkeys = std::collections::BTreeSet::new();
+        // 2. No new recipient pubkey may match a pubkey that is being
+        // destroyed: reusing it would keep the old private key able to
+        // unwrap. A pubkey is destroyed if it was in the shredded client's
+        // history but is NOT in any remaining client's current manifest
+        // (those are legitimate recipients that keep access).
+        let mut shredded_pubkeys = std::collections::BTreeSet::new();
+        for map in self.historical_recipients(shredded_client)? {
+            shredded_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
+        }
+        let (_, shredded_map, _) = self.verified_recipients(shredded_client, anchor)?;
+        shredded_pubkeys.extend(shredded_map.values().map(|e| e.age_pubkey.clone()));
+        shredded_pubkeys.insert(anchor.recovery_age.clone());
+        // Remove pubkeys that remain legitimate (in remaining clients).
         for client in all_clients {
-            for map in self.historical_recipients(client)? {
-                old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
+            if *client == shredded_client {
+                continue;
             }
             let (_, map, _) = self.verified_recipients(client, anchor)?;
-            old_pubkeys.extend(map.values().map(|e| e.age_pubkey.clone()));
+            for pubkey in map.values().map(|e| &e.age_pubkey) {
+                shredded_pubkeys.remove(pubkey);
+            }
         }
-        old_pubkeys.insert(anchor.recovery_age.clone());
         for (id, entry) in new_recipients {
-            if old_pubkeys.contains(&entry.age_pubkey) {
+            if shredded_pubkeys.contains(&entry.age_pubkey) {
                 return Err(Error::Manifest(format!(
-                    "new recipient {id} reuses a pubkey that already appears in history; \
+                    "new recipient {id} reuses a pubkey that is being destroyed; \
                      generate fresh keypairs"
                 )));
             }
