@@ -60,24 +60,35 @@ mode = "plaintext"
 
 **Semantics — structural-first, declaration is narrowing-only.** The real test
 is always spec §14's structural definition: a vault is *encrypted* if it has any
-`enc:` envelope file or any `keys/recipients.toml` manifest; otherwise it is
-*plaintext*. The `mode` declaration can only ever **permit plaintext writes when
-the vault is already structurally plaintext**; it can never downgrade an
-encrypted vault. Concretely, the writer decision tree:
+`enc:` envelope file **or any `keys/` tree at all** (a `recipients.toml` manifest,
+the operator certificate `keys/operator.toml`, or any `epoch` file); otherwise it
+is *plaintext*. A half-initialized `keys/` (operator.toml present but no client
+manifests) is **not** plaintext and must never fall into the plaintext branch.
+The `mode` declaration can only ever **permit plaintext writes when the vault is
+already structurally plaintext**; it can never downgrade an encrypted vault.
+Concretely, the writer decision tree:
 
-1. Vault is **structurally encrypted** (has an envelope or a manifest) → writers
-   encrypt, full stop. `mode = "plaintext"` here is an `E_CONFIG` contradiction
-   (fail closed) — the declaration is non-authoritative against encryption.
-2. Vault is **structurally plaintext** (no envelope, no manifest):
+1. Vault is **structurally encrypted** (has an envelope or any `keys/` tree) →
+   writers encrypt, full stop. `mode = "plaintext"` here is an `E_CONFIG`
+   contradiction (fail closed) — the declaration is non-authoritative against
+   encryption.
+2. Vault is **structurally plaintext** (no envelope and no `keys/` tree at all):
    - `mode = "plaintext"` (explicit) → writers write plaintext (today's
      behavior). The vault is validated under spec §§1–13 exactly.
    - `mode` absent or `"encrypted"` → writers **fail closed** with a fix pointing
      at `confidant init` (or `keys init-client <id>` when the vault is keyed but
      the specific client is not). No silent plaintext.
 
+**`writes_encrypted()` is a global flag, not a per-vault one.** The crate flag
+and the disclosure flip once, in PR 3, and describe the CLI as a whole ("record
+writes encrypt by default"). `mode = "plaintext"` is a **per-vault runtime
+override** at the writer for that vault only — it never re-flips
+`writes_encrypted()` or the disclosure. A plaintext vault's writes staying
+plaintext is the explicit opt-out, not a claim that the CLI writes plaintext.
+
 **Guards (fail closed):**
 
-- `mode = "plaintext"` + any envelope or manifest present → hard `E_CONFIG` on
+- `mode = "plaintext"` + any envelope or `keys/` tree present → hard `E_CONFIG` on
   the write/`init`/`check` path. Opt-out is a pre-`init` declaration; an
   encrypted vault can never be opted out later.
 - `confidant init` on a vault declaring `mode = "plaintext"` → hard error with
@@ -113,8 +124,10 @@ a test bypass.
 `spec/0.1.md` §2 (confidant.toml) gains the optional `[crypto]` table; §14's
 "encrypted vault / plaintext vault" paragraph is amended to note that a
 `mode = "plaintext"` declaration is always a plaintext vault (the structural
-definition still governs), and that a `mode = "plaintext"` + envelope/manifest
-combination is `E_CONFIG`. `docs/crypto-design.md` §3 gains a matching note.
+definition still governs), that "encrypted vault" includes **any `keys/` tree**
+(not only a recipient manifest — so a half-initialized `keys/` is encrypted), and
+that a `mode = "plaintext"` + envelope/`keys/` combination is `E_CONFIG`.
+`docs/crypto-design.md` §3 gains a matching note.
 Do these in the same PR as the flip, or the disclosure is stale.
 
 ---
@@ -243,6 +256,9 @@ plaintext fallback, no partial write.
 - `inbox_recordwrite_fails_closed_on_encrypted_vault`
 - `opt_out_plaintext_mode_writes_plaintext` (a `mode = "plaintext"` vault)
 - `opt_out_with_envelope_is_e_config`
+- `opt_out_with_keys_tree_refuses_plaintext` (a half-initialized `keys/` — e.g.
+  `keys/operator.toml` with no client manifest — must NOT fall into the plaintext
+  branch; write fails closed)
 - `init_refuses_plaintext_declared_vault`
 - `no_secret_material_in_any_output`
 
@@ -360,3 +376,6 @@ The rule-7 opt-out decision is posted on issue #148:
 **structural-first and narrowing-only** — it can permit plaintext writes only
 while the vault is already structurally plaintext, and can never downgrade an
 encrypted vault.
+
+A copy/paste implementer prompt is in `docs/148-flash-prompt.md`.
+
