@@ -56,6 +56,11 @@ pub enum ErrorKind {
     /// `confidant inbox` refused: the inbox branch moved between reading
     /// items and clearing them (TOCTOU).
     InboxRace,
+    /// `confidant reindex` refused to build the search corpus: encrypted
+    /// records this device cannot read, or the corpus path is not
+    /// git-ignored. A corpus that silently omits records is worse than no
+    /// corpus, so this fails closed instead of building a partial one.
+    ReindexRefused,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -81,6 +86,7 @@ impl ErrorKind {
             Self::InboxCheckFailed => "E_INBOX_CHECK_FAILED",
             Self::InboxCrypto => "E_INBOX_CRYPTO",
             Self::InboxRace => "E_INBOX_RACE",
+            Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::Internal => "internal_error",
         }
     }
@@ -161,6 +167,55 @@ impl DomainError {
             .with_fix(
                 "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it",
             )
+    }
+
+    /// `confidant reindex` refused: encrypted records this device cannot
+    /// decrypt would be silently omitted from the corpus (worse than no
+    /// corpus, because search would look complete).
+    pub fn reindex_unreadable(skipped: u32, refused: u32) -> Self {
+        let mut parts = Vec::new();
+        let mut fixes = Vec::new();
+        if skipped > 0 {
+            parts.push(format!(
+                "{skipped} encrypted record(s) could not be decrypted"
+            ));
+            fixes.push(
+                "run `confidant init` (new vault) or `confidant recover` (new device) \
+                 so this device can decrypt the vault",
+            );
+        }
+        if refused > 0 {
+            parts.push(format!(
+                "{refused} envelope(s) were refused as tampered or corrupt"
+            ));
+            fixes.push(
+                "an envelope failed authentication (tampered or corrupt); restore \
+                 the affected record from git history",
+            );
+        }
+        Self::new(
+            ErrorKind::ReindexRefused,
+            format!("refusing to build the search corpus: {}", parts.join(", ")),
+        )
+        .with_fix(format!(
+            "{}; then re-run `confidant reindex`",
+            fixes.join("; ")
+        ))
+    }
+
+    /// `confidant reindex` refused: the corpus path is not git-ignored in
+    /// the vault's repo, so one `git add -A` could commit a plaintext mirror.
+    pub fn reindex_not_ignored(paths: &[String], vault: &str) -> Self {
+        Self::new(
+            ErrorKind::ReindexRefused,
+            format!(
+                "refusing to build the search corpus: not git-ignored in this vault: {}",
+                paths.join(", ")
+            ),
+        )
+        .with_fix(format!(
+            "Add `.confidant/` to the vault's .gitignore, e.g.: (cd {vault} && echo '.confidant/' >> .gitignore), then re-run `confidant reindex`"
+        ))
     }
 
     pub fn inbox_dirty() -> Self {
@@ -380,6 +435,20 @@ mod tests {
         );
         assert_eq!(DomainError::vault_not_found().code(), "E_VAULT_NOT_FOUND");
         assert_eq!(DomainError::vault_not_found().exit_code(), 1);
+        assert_eq!(
+            DomainError::reindex_unreadable(3, 1).code(),
+            "E_REINDEX_REFUSED"
+        );
+        assert_eq!(DomainError::reindex_unreadable(3, 1).exit_code(), 1);
+        assert!(DomainError::reindex_unreadable(3, 1)
+            .message()
+            .contains("3 encrypted record(s)"));
+        // A tampered-only refusal gets a fix that does not suggest
+        // init/recover (re-enrolling the device cannot fix a corrupt
+        // envelope).
+        let refused_only = DomainError::reindex_unreadable(0, 2);
+        assert!(!refused_only.fix().unwrap_or("").contains("init"));
+        assert!(refused_only.fix().unwrap_or("").contains("tampered"));
         assert_eq!(
             DomainError::of(&usage("bad flag")).map(DomainError::exit_code),
             Some(2)

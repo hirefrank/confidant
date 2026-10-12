@@ -3,36 +3,34 @@
 
 Usage: qmd-index.py [--vault PATH] [--cli PATH] [--embed]
 
-- Copies decrypted vault content into <vault>/.confidant/qmd-corpus/
-  (gitignored, trusted devices only), preserving relative paths.
-- Registers it as the `confidant` QMD collection (removing any previous
-  one first, so rebuilds are idempotent).
-- Skips files with an `enc:` envelope (post-M2 encrypted records): indexing
-  ciphertext is useless, and the corpus step must decrypt through the CLI
-  once confidant-crypt lands. Skipped files are reported, never silent.
-- Excludes `no-ai` and otherwise-uncleared records at index time (#38):
-  `confidant allowlist` (the exact §12 cleared set, computed by the CLI —
-  no reimplemented logic) decides which record files are copied and which
-  ledger lines survive. Counts are reported, never silent. The query-time
-  `confidant find` filter remains the authority; this only narrows the
-  blast radius so a query-path bug degrades to missing results. When the
-  CLI is unavailable the full corpus is built with a loud warning.
+The corpus build lives in the CLI (issue #37, ADR-6). This script is the
+QMD integration on top:
+
+- Delegates the corpus to `confidant reindex`, which owns content, the §12
+  cleared set, decryption through the read path, and file permissions. The
+  CLI writes `<vault>/.confidant/qmd-corpus/` (gitignored, trusted devices
+  only), preserving relative paths, and refuses rather than silently
+  omitting encrypted records it cannot decrypt. `no-ai` records stay out
+  by construction (the CLI never decrypts them into the corpus), crediting
+  #38's index-time exclusion — now enforced inside the CLI.
+- Registers the corpus as the `confidant` QMD collection (removing any
+  previous one first, so rebuilds are idempotent).
 - --embed runs `qmd embed` afterwards for vector search (downloads models
   on first run; keyword-only `search` works without it).
 
-Guardrails (the corpus is a plaintext mirror of cleared vault content —
-these are enforced in code, not just docs):
-- REFUSES to build unless `.confidant/qmd-corpus/` AND `.confidant/qmd/`
-  (the QMD store, whose index.sqlite holds plaintext FTS chunks) are
-  git-ignored in the vault's repo (one `git add -A` must never commit
-  the corpus or the index).
-- REFUSES to build unless the disk is encrypted (auto-detected: FileVault
-  on macOS, dm-crypt ancestor in lsblk on Linux) or the operator passes
-  --i-confirm-encrypted-disk.
+Guardrails:
+- The encrypted-disk assertion STAYS HERE (architecture §9b item 4): the
+  corpus and QMD's index hold plaintext chunks, so the script refuses
+  unless the disk is encrypted (auto-detected: FileVault on macOS,
+  dm-crypt ancestor in lsblk on Linux) or the operator passes
+  --i-confirm-encrypted-disk. It is device policy, not a per-command check.
 - QMD's own store is moved under <vault>/.confidant/qmd/ (INDEX_PATH +
-  QMD_CONFIG_DIR env), both directories created 0700; on macOS both are
-  added to the Time Machine exclusion list. A previous default-store
-  `confidant` collection is removed on first run (migration).
+  QMD_CONFIG_DIR env), created 0700; on macOS it is added to the Time
+  Machine exclusion list. A previous default-store `confidant` collection
+  is removed on first run (migration).
+- The corpus gitignore refusal and the 0700/0600 permissions moved into
+  `confidant reindex` (it writes the corpus); this script no longer checks
+  them itself.
 
 Re-run after pulls/merges/writes. A stale index can only miss results:
 query-time allowlist filtering means staleness can never leak.
@@ -46,8 +44,6 @@ import subprocess
 import sys
 
 COLLECTION = "confidant"
-SKIP_DIRS = {".git", ".confidant", "keys"}
-SKIP_FILES = {"confidant.toml", "README.md", "LICENSE"}
 CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 STORE_REL = os.path.join(".confidant", "qmd")
 
@@ -65,70 +61,47 @@ def resolve_vault(explicit):
     return vault
 
 
-def is_encrypted_envelope(path):
-    """True if the file carries a post-M2 `enc:` front-matter envelope."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="strict") as f:
-            head = f.read(2048)
-    except (OSError, UnicodeDecodeError):
-        return False
-    if not head.startswith("---"):
-        return False
-    for line in head.splitlines()[1:12]:
-        if line.strip().startswith("enc:"):
-            return True
-        if line.strip() == "---":
-            break
-    return False
+def run_reindex(vault, cli):
+    """Delegate the corpus build to `confidant reindex`.
 
-
-def is_decodable_text(path):
-    """True if the file reads as UTF-8 text (binaries don't belong in a text corpus)."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="strict") as f:
-            f.read(2048)
-        return True
-    except (OSError, UnicodeDecodeError):
-        return False
-
-
-def ensure_corpus_gitignored(vault):
-    """Refuse unless the corpus AND the QMD store are git-ignored.
-
-    The corpus is a plaintext mirror of the vault (including no-ai
-    records), and the QMD store's index.sqlite holds the plaintext FTS
-    chunks; a single `git add -A` in a vault that doesn't ignore them
-    would commit the whole thing.
+    The CLI owns corpus content, clearance, decryption, and permissions
+    (#37); the skill never walks the vault. Returns the corpus path from
+    the CLI's JSON. Refuses (exits) when reindex refuses — e.g. an
+    encrypted vault this device cannot decrypt, or a corpus path that is
+    not git-ignored.
     """
-    git = shutil.which("git")
-    if git is None:
-        print("note: git not found; skipping gitignore check "
-              "(nothing to commit the corpus with)", file=sys.stderr)
-        return
-    rp = subprocess.run([git, "-C", vault, "rev-parse", "--git-dir"],
-                        capture_output=True, text=True)
-    if rp.returncode != 0:
-        print("note: vault is not a git repo; skipping gitignore check",
-              file=sys.stderr)
-        return
-    # check-ignore -q exits 0 if ANY path is ignored, so probe each path
-    # separately; the probe files need not exist on disk.
-    probes = {os.path.join(CORPUS_REL, ".probe"): ".confidant/qmd-corpus/",
-              os.path.join(STORE_REL, ".probe"): ".confidant/qmd/"}
-    unignored = [label for probe, label in probes.items()
-                 if subprocess.run([git, "-C", vault, "check-ignore", "-q",
-                                    probe], capture_output=True).returncode != 0]
-    if unignored:
-        sys.exit(
-            "error: refusing to build: not git-ignored in this vault: "
-            f"{', '.join(unignored)}\n"
-            "The corpus is a plaintext mirror of the vault (including no-ai "
-            "records), and the QMD store's index.sqlite holds the plaintext "
-            "FTS chunks; one `git add -A` would commit them.\n"
-            "Fix: add `.confidant/` to the vault's .gitignore, e.g.:\n"
-            f"  (cd {vault} && echo '.confidant/' >> .gitignore)\n"
-            "then re-run qmd-index.")
-    print("gitignore: corpus and QMD store paths are ignored — ok")
+    exe = cli or shutil.which("confidant")
+    if exe is None:
+        sys.exit("error: `confidant` not found. Pass --cli PATH or put it on "
+                 "PATH; the corpus build lives in the CLI (ADR-6).")
+    try:
+        p = subprocess.run([exe, "reindex", "--json", "--no-input",
+                            "--vault", vault],
+                           capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"error: `confidant reindex` could not run: {e}")
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        data = None
+    if (p.returncode != 0 or not isinstance(data, dict) or not data.get("ok")
+            or not isinstance(data.get("corpus"), str)):
+        detail = (p.stderr or "").strip() or (p.stdout or "").strip()
+        if isinstance(data, dict) and isinstance(data.get("error"), dict):
+            err = data["error"]
+            detail = f"{err.get('code')}: {err.get('message')}"
+            if err.get("fix"):
+                detail += f"\n  fix: {err['fix']}"
+            if data.get("skipped_encrypted") or data.get("refused_envelopes"):
+                detail += (f"\n  skipped_encrypted={data.get('skipped_encrypted', 0)}, "
+                           f"refused_envelopes={data.get('refused_envelopes', 0)}")
+        sys.exit(f"error: `confidant reindex` failed (exit {p.returncode}):\n{detail}")
+    corpus = data["corpus"]
+    print(f"corpus: {corpus} ({data.get('files_copied', '?')} files)")
+    print(f"  records: {data.get('records_copied', '?')} copied, "
+          f"{data.get('records_decrypted', '?')} decrypted; "
+          f"{data.get('ledger_lines_kept', '?')} ledger lines kept")
+    return corpus
 
 
 def encrypted_disk_detected(vault):
@@ -231,10 +204,11 @@ def ensure_store_dirs(vault):
 def exclude_from_backups(vault):
     """Keep the plaintext corpus and index out of macOS Time Machine backups.
 
-    Must run AFTER the corpus is (re)built: build_corpus wipes and recreates
-    the corpus dir, which would destroy an exclusion set earlier.
-    Best-effort: warns loudly on failure but does not refuse (the primary
-    protections are the gitignore and encrypted-disk gates).
+    Must run AFTER `confidant reindex` (re)builds the corpus: reindex wipes
+    and recreates the corpus dir, which would destroy an exclusion set
+    earlier. Best-effort: warns loudly on failure but does not refuse (the
+    primary protections are the CLI's gitignore refusal and this script's
+    encrypted-disk gate).
     """
     if sys.platform != "darwin" or shutil.which("tmutil") is None:
         return
@@ -282,131 +256,6 @@ def migrate_default_store():
                   file=sys.stderr)
 
 
-def fetch_allowlist(vault, cli):
-    """The §12 cleared set from the CLI: (cleared record relpaths, {ledger rel: {lines}}).
-
-    Returns None when the CLI is unavailable or refuses (spec mismatch,
-    unreadable ledger, ...), with a loud warning: the corpus is then built
-    whole and the query-time `find` filter stays the only protection.
-    Counts only — no content — ever leave this function.
-    """
-    exe = cli or shutil.which("confidant")
-    if exe is None:
-        print("warning: `confidant` not on PATH (--cli not given): building the "
-              "full corpus WITHOUT index-time exclusion. no-ai records will be "
-              "in the local index; the query-time `find` filter still drops "
-              "them before any output.", file=sys.stderr)
-        return None
-    try:
-        p = subprocess.run([exe, "allowlist", "--json", "--no-input",
-                            "--vault", vault],
-                           capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"warning: `confidant allowlist` failed ({e}): building the full "
-              f"corpus WITHOUT index-time exclusion (query-time filter still "
-              f"enforced).", file=sys.stderr)
-        return None
-    try:
-        data = json.loads(p.stdout)
-    except ValueError:
-        data = None
-    if (p.returncode != 0 or not isinstance(data, dict) or not data.get("ok")
-            or not isinstance(data.get("cleared_files"), list)
-            or not isinstance(data.get("cleared_ledger_lines"), list)):
-        print("warning: `confidant allowlist` refused or returned unusable JSON "
-              "(exit %d): building the full corpus WITHOUT index-time "
-              "exclusion (query-time filter still enforced)." % p.returncode,
-              file=sys.stderr)
-        return None
-    files = {f for f in data["cleared_files"] if isinstance(f, str)}
-    lines = {}
-    for entry in data["cleared_ledger_lines"]:
-        if (isinstance(entry, dict) and isinstance(entry.get("file"), str)
-                and isinstance(entry.get("line"), int)):
-            lines.setdefault(entry["file"], set()).add(entry["line"])
-    return files, lines
-
-
-def build_corpus(vault, allow):
-    """Copy cleared vault content into the corpus dir.
-
-    `allow` is None (full corpus; CLI unavailable) or the
-    (cleared_files, cleared_ledger_lines) pair from fetch_allowlist. With
-    the pair: record files are copied only when cleared; ledger files keep
-    only their cleared lines (a ledger file with no cleared lines — e.g. a
-    non-canonical `*.cfd` that `find` never searches — is omitted). Either
-    way the enc:/decodability skips below still apply first.
-    """
-    corpus = os.path.join(vault, CORPUS_REL)
-    if os.path.isdir(corpus):
-        shutil.rmtree(corpus)
-    os.makedirs(corpus, mode=0o700, exist_ok=True)
-    os.chmod(corpus, 0o700)
-    cleared_files, cleared_lines = allow if allow is not None else (None, None)
-    copied, skipped_enc, skipped_other = 0, [], 0
-    excluded_records, excluded_ledger_lines, omitted_ledger = 0, 0, 0
-    for root, dirs, files in os.walk(vault, followlinks=False):
-        # prune skipped dirs in place (also any dot-named dir)
-        dirs[:] = [d for d in dirs
-                   if d not in SKIP_DIRS and not d.startswith(".")
-                   and not os.path.islink(os.path.join(root, d))]
-        for name in files:
-            src = os.path.join(root, name)
-            rel = os.path.relpath(src, vault)
-            if name in SKIP_FILES or name.startswith(".") or os.path.islink(src):
-                skipped_other += 1
-                continue
-            if is_encrypted_envelope(src):
-                skipped_enc.append(rel)
-                continue
-            if not is_decodable_text(src):
-                skipped_other += 1
-                continue
-            lines_to_write = None  # None = whole file; otherwise the kept 1-based lines
-            if cleared_files is not None:
-                if rel.startswith("ledger/"):
-                    kept = cleared_lines.get(rel)
-                    if not kept:
-                        # Never verifiable through `find` (non-canonical ledger
-                        # file, or no cleared line): leave it out entirely.
-                        omitted_ledger += 1
-                        continue
-                    try:
-                        with open(src, "r", encoding="utf-8", errors="strict") as f:
-                            numbered = list(enumerate(f, start=1))
-                    except OSError:
-                        skipped_other += 1
-                        continue
-                    text = [ln for n, ln in numbered if n in kept]
-                    excluded_ledger_lines += len(numbered) - len(text)
-                    lines_to_write = text
-                elif rel not in cleared_files:
-                    excluded_records += 1
-                    continue
-            dst = os.path.join(corpus, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            if lines_to_write is None:
-                shutil.copy2(src, dst)
-            else:
-                with open(dst, "w", encoding="utf-8") as f:
-                    f.writelines(lines_to_write)
-                os.chmod(dst, 0o600)
-            copied += 1
-            # Ledger parity: qmd collections only match **/*.md, so mirror
-            # each .cfd as a sibling .cfd.md for indexing. The query script
-            # maps hits back to the real .cfd path for verification.
-            if name.endswith(".cfd"):
-                mirror = dst + ".md"
-                shutil.copy2(dst, mirror)
-                copied += 1
-    stats = {
-        "excluded_records": excluded_records,
-        "excluded_ledger_lines": excluded_ledger_lines,
-        "omitted_ledger": omitted_ledger,
-    }
-    return corpus, copied, skipped_enc, skipped_other, stats
-
-
 def run_qmd(args, env, check=True):
     if shutil.which("qmd") is None:
         sys.exit("error: `qmd` not found. Install it first: npm install -g @tobilu/qmd")
@@ -422,33 +271,25 @@ def main():
     ap.add_argument("--embed", action="store_true",
                     help="run `qmd embed` after indexing (enables vector search)")
     ap.add_argument("--cli", default=None,
-                    help="path to the confidant binary for index-time exclusion "
-                         "(default: confidant on PATH; without it the full "
-                         "corpus is built)")
+                    help="path to the confidant binary that builds the corpus "
+                         "(default: confidant on PATH)")
     ap.add_argument("--i-confirm-encrypted-disk", action="store_true",
                     help="assert the disk is encrypted (only if you have "
                          "verified it yourself; detection is attempted first)")
     args = ap.parse_args()
 
     vault = resolve_vault(args.vault)
-    ensure_corpus_gitignored(vault)
+    # Device policy stays here (architecture §9b item 4): the corpus and the
+    # QMD store hold plaintext chunks.
     ensure_encrypted_disk(vault, args.i_confirm_encrypted_disk)
     ensure_store_dirs(vault)
     migrate_default_store()
 
     env = qmd_env(vault)
-    allow = fetch_allowlist(vault, args.cli)
-    if allow is not None:
-        print(f"index-time exclusion: {len(allow[0])} cleared record file(s), "
-              f"{sum(len(v) for v in allow[1].values())} cleared ledger line(s)")
-    corpus, copied, skipped_enc, skipped_other, stats = build_corpus(vault, allow)
+    # The CLI owns the corpus build (gitignore refusal, 0700/0600
+    # permissions, §12 clearance, decryption). This script only registers it.
+    corpus = run_reindex(vault, args.cli)
     exclude_from_backups(vault)
-    print(f"corpus: {corpus} ({copied} files)")
-    if allow is not None:
-        print(f"excluded at index time: {stats['excluded_records']} uncleared "
-              f"record file(s), {stats['excluded_ledger_lines']} uncleared "
-              f"ledger line(s), {stats['omitted_ledger']} never-searchable "
-              f"ledger file(s)")
 
     # idempotent collection registration: drop the old one if present
     # (exact name match: a "confidant-backup" collection must not trigger this)
@@ -459,13 +300,6 @@ def main():
     run_qmd(["collection", "add", corpus, "--name", COLLECTION], env)
     print(f"registered '{COLLECTION}' collection")
 
-    if skipped_enc:
-        print(f"warning: skipped {len(skipped_enc)} encrypted file(s) "
-              f"(enc: envelope; decrypt-through-CLI not yet implemented):")
-        for rel in skipped_enc[:10]:
-            print(f"  {rel}")
-        if len(skipped_enc) > 10:
-            print(f"  ... and {len(skipped_enc) - 10} more")
     if args.embed:
         print("embedding (first run downloads models)...")
         run_qmd(["embed"], env)

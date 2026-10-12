@@ -595,3 +595,153 @@ fn no_secret_in_findings() {
     let text = stdout(&out);
     assert!(!text.contains("AGE-SECRET-KEY"), "secret leaked in text");
 }
+
+// ---------------------------------------------------------------------------
+// reindex (#37): the CLI owns the corpus build
+// ---------------------------------------------------------------------------
+
+/// True if any corpus file contains `needle`.
+fn corpus_contains(vault: &Path, needle: &str) -> bool {
+    fn walk(dir: &Path, needle: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if walk(&path, needle) {
+                    return true;
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                if text.contains(needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(&vault.join(".confidant/qmd-corpus"), needle)
+}
+
+/// Cleared encrypted records are decrypted through the CLI into the corpus
+/// (B1); no envelope framing survives.
+#[test]
+fn reindex_decrypts_encrypted_cleared_records() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+    // reindex requires the corpus to be git-ignored; the bare Harness vault
+    // is a repo without a .gitignore.
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+
+    let out = h
+        .cmd(&["reindex", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reindex failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["skipped_encrypted"], 0);
+    assert_eq!(v["refused_envelopes"], 0);
+    assert!(
+        v["records_decrypted"].as_u64().unwrap() >= 2,
+        "expected >= 2 decrypted records: {v}"
+    );
+
+    let corpus = h.vault.join(".confidant/qmd-corpus");
+    let profile =
+        std::fs::read_to_string(corpus.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert!(
+        profile.contains("quantum"),
+        "profile not decrypted: {profile}"
+    );
+    assert!(!profile.contains("enc:"), "envelope header leaked");
+
+    let notes_dir = corpus.join(format!("people/{PERSON}/notes"));
+    let note_path = std::fs::read_dir(&notes_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let note = std::fs::read_to_string(&note_path).unwrap();
+    assert!(note.contains("sourdough"), "note not decrypted: {note}");
+    assert!(!note.contains("enc:"), "envelope header leaked");
+}
+
+/// A `no-ai` record is never decrypted into the corpus, even when this
+/// device holds the key: excluded by construction (B1, #38).
+#[test]
+fn reindex_never_decrypts_no_ai_records() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_no_ai(PERSON, "Ada Example", "Secret no-ai bio with zephyr."),
+    );
+    h.record_add(&input);
+    // A cleared, keyed second person so the corpus is non-empty (a note for
+    // a no-ai person inherits no-ai, so it would not prove anything).
+    let person2 = "p-01J9Z3K4QH0000000000000000";
+    h.init_client(person2);
+    let input2 = write_file(
+        h._tmp.path(),
+        "person2.md",
+        &person_md(person2, "Bo Example", "Cleared bio about sourdough."),
+    );
+    h.record_add(&input2);
+
+    let out = h
+        .cmd(&["reindex", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reindex failed: {}", stderr(&out));
+
+    assert!(
+        !corpus_contains(&h.vault, "zephyr"),
+        "no-ai content entered the corpus"
+    );
+    assert!(
+        !h.vault
+            .join(format!(".confidant/qmd-corpus/people/{PERSON}/profile.md"))
+            .exists(),
+        "no-ai record file present in corpus"
+    );
+    assert!(
+        corpus_contains(&h.vault, "sourdough"),
+        "cleared record missing from corpus"
+    );
+}
+
+/// Unlike `find` (skip + count, ⚠2), reindex refuses to build a corpus that
+/// silently omits encrypted records, naming the counts (B4).
+#[test]
+fn reindex_refuses_unkeyed_on_encrypted_vault_with_counts() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+
+    let out = h
+        .cmd_no_device_key(&["reindex", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_REINDEX_REFUSED");
+    let skipped = v["skipped_encrypted"].as_u64().unwrap();
+    assert!(skipped >= 2, "expected >= 2 skipped: {v}");
+    assert_eq!(v["refused_envelopes"], 0);
+    // Fail closed: nothing is written.
+    assert!(
+        !h.vault.join(".confidant/qmd-corpus").exists(),
+        "refusal must not write a corpus"
+    );
+    let fix = v["error"]["fix"].as_str().unwrap();
+    assert!(
+        fix.contains("init") && fix.contains("recover"),
+        "fix should point at init/recover: {fix}"
+    );
+    // No ciphertext or key material leaks into the refusal.
+    let text = stdout(&out);
+    assert!(!text.contains("enc:"), "envelope header leaked");
+    assert!(!text.contains("AGE-SECRET-KEY"), "secret leaked");
+}
