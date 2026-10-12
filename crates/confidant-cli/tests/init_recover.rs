@@ -778,6 +778,9 @@ fn recover_warns_on_shallow_clone() {
         .status()
         .unwrap();
     assert!(st.success(), "shallow clone failed");
+    // A clone does not inherit the source's identity; commits need one.
+    git(&clone, &["config", "user.name", "Test Operator"]);
+    git(&clone, &["config", "user.email", "test@example.com"]);
 
     let phrase_file = fresh.home.join("phrase");
     std::fs::write(&phrase_file, &phrase).unwrap();

@@ -964,6 +964,9 @@ fn keys_shred_warns_on_shallow_clone() {
         .status()
         .unwrap();
     assert!(st.success(), "shallow clone failed");
+    // A clone does not inherit the source's identity; the shred commits.
+    git(&clone, &["config", "user.name", "Test"]);
+    git(&clone, &["config", "user.email", "test@example.com"]);
 
     let out = h
         .cmd_no_vault(&[
