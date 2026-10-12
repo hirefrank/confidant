@@ -1963,3 +1963,57 @@ fn test_shred_refuses_planted_lookup_age() {
         planted
     );
 }
+
+// ---------------------------------------------------------------------------
+// Design test 9 (drill): recovery rebuilds the alias index with a fresh
+// lookup key. The lookup key is device-only by design (#98): it is never
+// recovery-wrapped, so after full device loss the operator recovers the
+// client keys from the phrase, decrypts the alias values, generates a
+// fresh lookup key, and rebuilds the index. The old key is not needed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recovery_drill_rebuilds_alias_index_with_fresh_lookup_key() {
+    let mut f = Fixture::new();
+    let recipients = f.recipients(&[("laptop", &f.device_recipient)]);
+    f.keys
+        .init_client("p-01ABC", &recipients, &f.anchor, &f.operator_sk)
+        .unwrap();
+
+    // Alias index built with the original device-wrapped lookup key.
+    let (old_key, _) = f.keys.read_lookup_key(&f.device_id, &f.anchor).unwrap();
+    let old_hmac = alias::alias_hmac(&old_key, "Ada Example");
+    assert!(alias::matches(&old_key, "Ada Example", &old_hmac));
+
+    // Full device loss: everything except the recovery phrase is gone.
+    // (The device identity is simply never used again from here on.)
+    let phrase = f.recovery.phrase();
+    let recovered = Recovery::from_phrase(phrase.as_str()).unwrap();
+    let rec_id = recovered.age_identity().to_age_identity().unwrap();
+
+    // From the phrase alone, the client data key unwraps via its recovery
+    // wrapping — so the encrypted alias values are recoverable.
+    let data_key = f
+        .keys
+        .unwrap_data_key("p-01ABC", "recovery", 1, &rec_id, &f.anchor)
+        .unwrap();
+    let expected = f
+        .keys
+        .unwrap_data_key("p-01ABC", "laptop", 1, &f.device_id, &f.anchor)
+        .unwrap();
+    assert_eq!(data_key.as_bytes(), expected.as_bytes());
+
+    // But the lookup key is device-only: the recovery identity cannot
+    // unwrap `keys/vault/lookup.age`.
+    assert!(f.keys.read_lookup_key(&rec_id, &f.anchor).is_err());
+
+    // Recovery rebuilds the alias index with a FRESH lookup key; the old
+    // key is not needed and is never consulted again.
+    let fresh = LookupKey::generate();
+    let new_hmac = alias::alias_hmac(&fresh, "Ada Example");
+    assert!(alias::matches(&fresh, "Ada Example", &new_hmac));
+    // Genuinely fresh: different HMAC, and the old entry does not match
+    // under the new key.
+    assert_ne!(old_hmac, new_hmac);
+    assert!(!alias::matches(&fresh, "Ada Example", &old_hmac));
+}
