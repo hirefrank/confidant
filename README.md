@@ -46,6 +46,15 @@ cargo install confidant-cli
 
 This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli).
 Requires a recent Rust toolchain (MSRV 1.85, see `rust-version` in `Cargo.toml`).
+Prebuilt binaries and shell installers are on the
+[GitHub Releases](https://github.com/hirefrank/confidant/releases) page.
+
+## Agent setup
+
+Agents use the CLI plus the integration skills in [`skills/`](skills/) (imports,
+search). One page covers it all — including a single copy/paste prompt that
+installs everything and a loop for staying current:
+[`docs/agent-setup.md`](docs/agent-setup.md).
 
 ## Privacy (read this)
 
