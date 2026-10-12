@@ -1,6 +1,7 @@
 //! Markdown records with identity-only front matter (ADR-2).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use crate::id::{strip_ignorable, Prefix, RecordId};
 use crate::ledger::parse_strict_date;
@@ -523,6 +524,26 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         body_start_line,
         field_lines: key_lines,
     })
+}
+
+/// Vault-relative path for a main collection record (`people/p-…/profile.md`, …).
+pub fn main_record_path(rec: &Record) -> Result<PathBuf, FrontmatterError> {
+    if rec.id.prefix() != rec.kind.prefix() {
+        return Err(FrontmatterError::new(
+            "id prefix does not match type",
+            "Use an id whose prefix matches type (p- for person, o- for org, …)",
+        ));
+    }
+    let collection =
+        rec.kind.prefix().collection().ok_or_else(|| {
+            FrontmatterError::new("type has no collection path", "Use a record type")
+        })?;
+    let main = rec
+        .kind
+        .prefix()
+        .main_filename()
+        .ok_or_else(|| FrontmatterError::new("type has no main file", "Use a record type"))?;
+    Ok(PathBuf::from(format!("{}/{}/{}", collection, rec.id, main)))
 }
 
 pub fn format_record(record: &Record) -> String {

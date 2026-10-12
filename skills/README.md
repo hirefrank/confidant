@@ -36,10 +36,13 @@ Every skill follows the same shape:
    - Person/deal/interaction records: **pre-M2 only** — hand-create the
      files from the manifest's `records[]`, then `confidant check
      --json` before committing. **Post-M2** (the manifest's
-     `records_blocked` is true): do NOT hand-write records; they need
-     `confidant record add --file`, which does not exist yet. Hand-
-     writing into an encrypted vault would commit plaintext PII to git.
-     The scripts detect this via an `enc:` envelope scan of the vault.
+     `records_blocked` is true — the vault looks encrypted): do NOT
+     hand-write files into the vault tree; apply each record with
+     `confidant record add --file <scratch.md> --request-id <id>
+     --dry-run --json --no-input` first, then the real run (one commit
+     per record). Stage each manifest `records[]` entry to a `0600`
+     scratch file. The scripts set `records_blocked` when they detect
+     an `enc:` envelope in the vault.
 4. **Clean up.** Delete the whole proposal set (manifest, lines file,
    staged note bodies) after a successful apply — all plaintext PII.
    (Lightfield: `--cleanup` takes `--manifest` and deletes the export

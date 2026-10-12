@@ -25,7 +25,7 @@ use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
-use confidant_core::record::{Record, RecordKind};
+use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::write::{
     apply_write, require_git_repo, FileChange, PendingWrite, WriteOptions, WriteOutcome,
@@ -139,6 +139,11 @@ enum Command {
         #[command(subcommand)]
         action: NoteAction,
     },
+    /// Create person/org/deal/interaction records from a file (one commit).
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// Context bundle for one person (honors no-ai).
     Context {
         /// Opaque person id (p-…).
@@ -213,6 +218,15 @@ enum LogAction {
         /// Source token, stored as src:<value>.
         #[arg(long)]
         src: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RecordAction {
+    /// Add a record from a markdown file (front matter must include id and type).
+    Add {
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -473,6 +487,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 } => cmd_note_add(&cli, &root, person, date.clone(), *no_ai, body_file),
             }
         }
+        Command::Record { action } => {
+            let root = vault_root.unwrap();
+            match action {
+                RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
+            }
+        }
         Command::Context {
             person,
             exclude_private,
@@ -702,6 +722,10 @@ fn write_options(cli: &Cli) -> WriteOptions {
         dry_run: cli.dry_run,
         no_input: cli.no_input,
         request_id: cli.request_id.clone(),
+        agent_id: std::env::var("CONFIDANT_AGENT_ID")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
     }
 }
 
@@ -1136,6 +1160,58 @@ fn cmd_note_add(
         outcome,
         serde_json::json!({
             "id": nid.to_string(),
+            "path": rel.display().to_string(),
+        }),
+    )
+}
+
+fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
+    let text = std::fs::read_to_string(file).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            file.display()
+        )))
+    })?;
+    let provisional = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "record.md".to_owned());
+    let rec = confidant_core::parse_record(&text, &provisional)
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    if rec.kind == RecordKind::Note {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "record add does not create notes; use `confidant note add --body-file`",
+        )));
+    }
+    let rel = main_record_path(&rec)
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    if root.join(&rel).exists() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!("{} already exists", rel.display()))
+                .with_fix("Pick a fresh id in the record file, or edit the existing record"),
+        ));
+    }
+    let contents = confidant_core::format_record(&rec);
+    let id = rec.id.to_string();
+    let outcome = apply_write(
+        root,
+        PendingWrite {
+            changes: vec![FileChange::WriteFile {
+                path: rel.clone(),
+                contents,
+            }],
+            summary: format!("record {id}"),
+            canonical_request: format!("record-add/v1\npath={}\nbody={}", rel.display(), text),
+        },
+        &write_options(cli),
+    )?;
+    finish_write(
+        cli,
+        root,
+        "record-add",
+        outcome,
+        serde_json::json!({
+            "id": id,
             "path": rel.display().to_string(),
         }),
     )

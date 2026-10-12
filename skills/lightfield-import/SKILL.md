@@ -94,10 +94,12 @@ rows are warned and skipped):
 6. Person/deal/interaction records: **pre-M2 only**, hand-create the
    files from the manifest's `records[]`, then run
    `confidant check --json` to validate before committing (one commit).
-   **Post-M2** (the manifest's `records_blocked` is true — the vault
-   looks encrypted): do NOT hand-write them; they need
-   `confidant record add --file`, which does not exist yet. Writing them
-   by hand would commit plaintext PII to git.
+   **Post-M2** (`records_blocked` is true): stage each `records[]`
+   entry to a `0600` scratch file and apply with
+   `confidant record add --file <scratch.md> --request-id <ulid>
+   --dry-run --json --no-input`, then the real run (one commit per
+   record). Never hand-write into the vault tree — that would commit
+   plaintext PII to git.
 7. Record the applied IDs in the dedup map (so reruns skip what's
    applied):
    ```sh

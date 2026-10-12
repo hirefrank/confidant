@@ -873,11 +873,12 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn lock() -> Self {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         EnvGuard {
             saved: std::env::var("CONFIDANT_INBOX_KEY").ok(),
             saved_previous: std::env::var("CONFIDANT_INBOX_KEY_PREVIOUS").ok(),
             saved_keychain: std::env::var("CONFIDANT_KEYCHAIN").ok(),
-            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            _lock,
         }
     }
     fn set(&self, val: &str) {
@@ -886,6 +887,9 @@ impl EnvGuard {
     fn unset(&self) {
         std::env::remove_var("CONFIDANT_INBOX_KEY");
         std::env::remove_var("CONFIDANT_INBOX_KEY_PREVIOUS");
+    }
+    fn no_keychain(&self) {
+        std::env::set_var("CONFIDANT_KEYCHAIN", "off");
     }
 }
 
@@ -923,7 +927,7 @@ fn test_bech32(secret: &[u8; 32]) -> String {
 fn use_test_inbox_key() -> EnvGuard {
     let g = EnvGuard::lock();
     g.set(&test_bech32(&TEST_INBOX_SECRET));
-    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
+    g.no_keychain();
     g
 }
 

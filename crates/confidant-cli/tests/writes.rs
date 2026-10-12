@@ -480,6 +480,110 @@ fn note_add_creates_note() {
 }
 
 // ---------------------------------------------------------------------------
+// record add
+// ---------------------------------------------------------------------------
+
+#[test]
+fn record_add_creates_person_profile() {
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let file = scratch.path().join("person.md");
+    std::fs::write(
+        &file,
+        "---\nid: p-01J9Z3K4QF0000000000000001\ntype: person\nname: \"Ada Example\"\n---\n\nBio.\n",
+    )
+    .unwrap();
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "record-add");
+    let path = root.join(v["path"].as_str().unwrap());
+    assert!(path.is_file());
+    assert_eq!(commits(root), 2);
+}
+
+#[test]
+fn record_add_deal_and_dry_run() {
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let file = scratch.path().join("deal.md");
+    std::fs::write(
+        &file,
+        "---\nid: d-01J9Z3K4QF0000000000000002\ntype: deal\nname: \"Example deal\"\nperson: p-01J9Z3K4QF0000000000000000\n---\n\nTerms.\n",
+    )
+    .unwrap();
+    let rid = "01J9Z3K4QF0000000000000099";
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--dry-run",
+        "--request-id",
+        rid,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "record-add");
+    assert_eq!(v["dry_run"], true);
+    assert!(!root
+        .join("deals/d-01J9Z3K4QF0000000000000002/deal.md")
+        .exists());
+    assert_eq!(commits(root), 1);
+}
+
+#[test]
+fn write_commit_includes_agent_trailer_when_set() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Agent note.\n").unwrap();
+    let agent = "agent-01J9Z3K4QF0000000000000999";
+    let out = Command::new(bin())
+        .env("CONFIDANT_AGENT_ID", agent)
+        .args([
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            &body.display().to_string(),
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    let msg = String::from_utf8_lossy(&log.stdout);
+    assert!(msg.contains(&format!("Agent: {agent}")));
+}
+
+// ---------------------------------------------------------------------------
 // context
 // ---------------------------------------------------------------------------
 

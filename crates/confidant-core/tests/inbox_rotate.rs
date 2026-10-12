@@ -130,20 +130,21 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl EnvGuard {
     fn lock() -> Self {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vars = [
             "CONFIDANT_INBOX_KEY",
             "CONFIDANT_INBOX_KEY_PREVIOUS",
             "CONFIDANT_KEYCHAIN",
         ];
         let saved = vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
-        let g = EnvGuard {
-            saved,
-            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
-        };
+        let g = EnvGuard { saved, _lock };
         for v in vars {
             std::env::remove_var(v);
         }
         g
+    }
+    fn keychain_off(&self) {
+        std::env::set_var("CONFIDANT_KEYCHAIN", "off");
     }
 }
 
@@ -421,7 +422,7 @@ fn rotate_refuses_with_kill_switch() {
     keychain::rotate_inbox_key_with(&backend, None, &bech32(&old_id)).unwrap();
     repo.set_vault_pubkey(&old_recipient);
 
-    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
+    _g.keychain_off();
 
     for finish in [false, true] {
         let err = run_inbox_rotate(
@@ -526,4 +527,86 @@ fn rotate_pin_write_fails_closed() {
     // The [trust] table must still be there — nothing was clobbered.
     let text = std::fs::read_to_string(&user_config_file).unwrap();
     assert!(text.contains("[trust]"), "config was clobbered:\n{text}");
+}
+
+/// #106: when the keychain already holds the new key (previous slot occupied)
+/// but the vault pin still advertises the old pubkey, `inbox rotate` resumes
+/// the pin update instead of refusing.
+#[test]
+fn rotate_resumes_when_pins_lag_keychain() {
+    let _g = EnvGuard::lock();
+    let repo = Repo::new();
+    if !require_commit_signing(&repo) {
+        return;
+    }
+
+    let backend = MemoryKeychain::new();
+    let home = TempDir::new().unwrap();
+    let user_config = home.path().join(".config/confidant/config.toml");
+
+    let old_id = age::x25519::Identity::generate();
+    let old_recipient = old_id.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&old_id)).unwrap();
+    repo.set_vault_pubkey(&old_recipient);
+
+    let new_id = age::x25519::Identity::generate();
+    let new_recipient = new_id.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&new_id)).unwrap();
+    assert_eq!(repo.vault_pubkey().as_deref(), Some(old_recipient.as_str()));
+
+    let outcome = run_inbox_rotate(
+        repo.root(),
+        &backend,
+        None,
+        &repo.root().join("confidant.toml"),
+        &user_config,
+        &rotate_opts(false, Some(old_recipient.clone())),
+    )
+    .unwrap();
+    assert!(outcome.drain.is_none());
+    assert_eq!(
+        outcome.new_recipient.as_deref(),
+        Some(new_recipient.as_str())
+    );
+    assert_eq!(repo.vault_pubkey().as_deref(), Some(new_recipient.as_str()));
+    let user_toml = std::fs::read_to_string(&user_config).unwrap();
+    assert!(user_toml.contains(&format!("pubkey = \"{new_recipient}\"")));
+}
+
+/// #106: vault pin already matches the keychain; only the user-config pin lags.
+#[test]
+fn rotate_resumes_user_pin_only() {
+    let _g = EnvGuard::lock();
+    let repo = Repo::new();
+    if !require_commit_signing(&repo) {
+        return;
+    }
+
+    let backend = MemoryKeychain::new();
+    let home = TempDir::new().unwrap();
+    let user_config = home.path().join(".config/confidant/config.toml");
+
+    let old_id = age::x25519::Identity::generate();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&old_id)).unwrap();
+
+    let new_id = age::x25519::Identity::generate();
+    let new_recipient = new_id.to_public().to_string();
+    keychain::rotate_inbox_key_with(&backend, None, &bech32(&new_id)).unwrap();
+    repo.set_vault_pubkey(&new_recipient);
+
+    let outcome = run_inbox_rotate(
+        repo.root(),
+        &backend,
+        None,
+        &repo.root().join("confidant.toml"),
+        &user_config,
+        &rotate_opts(false, Some(new_recipient.clone())),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.new_recipient.as_deref(),
+        Some(new_recipient.as_str())
+    );
+    let user_toml = std::fs::read_to_string(&user_config).unwrap();
+    assert!(user_toml.contains(&format!("pubkey = \"{new_recipient}\"")));
 }
