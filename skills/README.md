@@ -4,6 +4,16 @@ Agent skills and small scripts that pull outside events into the vault (ADR-8).
 There is no plugin system in v0: the **agent** runs these, calling the CLI's
 agent contract (ADR-7).
 
+## Installing (for operators and agents)
+
+Skills ship in this repo and assume a checkout: each skill calls its own
+`bin/` scripts via repo-relative paths, so copying a lone `SKILL.md`
+elsewhere breaks it. The supported setup is [`docs/agent-setup.md`](../docs/agent-setup.md):
+clone the repo, symlink each `skills/<name>/` directory (whole directory,
+not just `SKILL.md`) into the agent's skills dir, set `CONFIDANT_VAULT`.
+That page also holds the single copy/paste install prompt and the update
+loop (`git pull` for skills, `cargo install` for the CLI).
+
 ## The uniform workflow
 
 Every skill follows the same shape:
