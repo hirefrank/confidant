@@ -289,22 +289,27 @@ fn call_tool(
         "check" => cli.push("check".to_owned()),
         "find" => {
             cli.push("find".to_owned());
-            cli.push(get_str(&args, "query")?);
+            // Flags first, then `--` before the agent-supplied positional:
+            // a query of `--packs=…` must be a needle, never a flag
+            // (today it only fails closed via clap's duplicate-flag error).
             if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
                 cli.push("--packs".to_owned());
                 cli.push(packs.join(","));
             }
+            cli.push("--".to_owned());
+            cli.push(get_str(&args, "query")?);
         }
         "context" => {
             cli.push("context".to_owned());
-            cli.push(get_str(&args, "person")?);
-            if context_strips_private(&args) {
-                cli.push("--exclude-private".to_owned());
-            }
             if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
                 cli.push("--packs".to_owned());
                 cli.push(packs.join(","));
             }
+            if context_strips_private(&args) {
+                cli.push("--exclude-private".to_owned());
+            }
+            cli.push("--".to_owned());
+            cli.push(get_str(&args, "person")?);
         }
         "log_session" => {
             cli.push("log".to_owned());

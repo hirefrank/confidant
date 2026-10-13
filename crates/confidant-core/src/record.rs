@@ -416,7 +416,7 @@ fn is_fence_padding(s: &str) -> bool {
     s.bytes().all(|b| b == b' ' || b == b'\t')
 }
 
-fn unquote(s: &str) -> String {
+pub(crate) fn unquote(s: &str) -> String {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         return unescape(&s[1..s.len() - 1]);
     }

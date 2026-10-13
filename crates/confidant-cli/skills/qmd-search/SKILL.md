@@ -109,7 +109,10 @@ Output is JSON on stdout (mirrors `confidant find --json`, plus `score` and
 }
 ```
 
-`dropped_uncleared` counts hits the allowlist filter removed. If QMD or the
+`dropped_uncleared` counts hits the allowlist filter removed — including hits
+dropped only because they are outside the caller's pack scope, so a nonzero
+count tells a scoped agent that out-of-scope matches exist (accepted for
+now). If QMD or the
 index is missing, the script falls back to `confidant find --json` and notes
 it on stderr.
 

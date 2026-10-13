@@ -13,7 +13,7 @@ use crate::id::{
 };
 use crate::ledger::ledger_line_verb;
 use crate::packs::{resolve_enabled, ALL_PACKS};
-use crate::record::{parse_ref_id, FrontmatterRef};
+use crate::record::{parse_ref_id, unquote, FrontmatterRef, RecordKind};
 use crate::scope::{
     note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
 };
@@ -885,6 +885,15 @@ fn scan_record(
     // per-field (#178). Computed once: the body owner set.
     let body_owners = record_owners(rec, &allow.linkage, &allow.enabled);
     let body_visible = allow.scope.allows(&body_owners);
+    // #178 fix round (Silas review on #246): notes and interactions are
+    // visible as whole records only. Per-field front-matter filtering
+    // applies to the core anchors (person/org/deal); an out-of-scope or
+    // unattributed note/interaction contributes no lines at all, front
+    // matter included — otherwise its `id`/`type`/`date`/`person`/`name`
+    // lines would leak its existence through `find`.
+    if matches!(rec.kind, RecordKind::Note | RecordKind::Interaction) && !body_visible {
+        return;
+    }
     let text = rec.source.trim_start_matches('\u{feff}');
     for ((line_no, toks), line) in facts.line_tokens.iter().zip(text.lines()) {
         if !tokens_allowed(toks, allow) {
@@ -894,7 +903,7 @@ fn scan_record(
             // Front matter: one field per line. Fences / comments / blank
             // lines have no key and are core (not content).
             if let Some(key) = front_matter_key(line) {
-                let visible = match owner_of_field(key, &allow.enabled) {
+                let visible = match owner_of_field(&key, &allow.enabled) {
                     Some(owner) => allow.scope.allows(&[owner].into_iter().collect()),
                     None => matches!(allow.scope, PackScope::All),
                 };
@@ -919,15 +928,16 @@ fn scan_record(
 
 /// Front-matter key on one source line, if it is a `key: value` line.
 /// Returns `None` for fences, comments, blank lines, and lines without a
-/// colon. Surrounding quotes on the key are stripped (the parser unquotes
-/// keys the same way).
-fn front_matter_key(line: &str) -> Option<&str> {
+/// colon. The key is unquoted with the parser's `unquote` (one source of
+/// truth — `trim_matches` would strip a lone trailing quote and read
+/// `name"` as core `name`, where the parser reads it as unattributed).
+fn front_matter_key(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
     let (key, _) = trimmed.split_once(':')?;
-    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    let key = unquote(key.trim());
     if key.is_empty() {
         None
     } else {
@@ -1061,8 +1071,7 @@ mod tests {
     fn scoped_search_filters_by_pack_ownership() {
         // Demo vault: "Kickoff" is in the session-linked (coaching) note;
         // "Follow-up" is in the unattributed note; "Fake intro call" is in
-        // the unattributed interaction body; the interaction's `name:`
-        // front-matter line is a core field.
+        // the unattributed interaction body.
         let vault = demo_vault();
         let coaching = coaching_scope();
         let kickoff = search(&vault, "Kickoff", &coaching).unwrap();
@@ -1076,9 +1085,28 @@ mod tests {
 
         let intro_body = search(&vault, "Fake intro call", &coaching).unwrap();
         assert!(intro_body.hits.is_empty());
+        // #246 fix round: the unattributed interaction's `name:` line no
+        // longer leaks through per-field filtering — notes and
+        // interactions contribute no lines at all when out of scope.
         let intro_name = search(&vault, "Intro call", &coaching).unwrap();
-        assert_eq!(intro_name.hits.len(), 1);
-        assert!(intro_name.hits[0].path.contains("0048H0000008"));
+        assert!(intro_name.hits.is_empty());
+
+        // The unattributed note is undiscoverable under a coaching scope:
+        // not by its id, and not via its `type: note` front-matter line.
+        // (`type: note` still matches the in-scope coaching note's own
+        // line — that record is legitimately visible — so assert the
+        // unattributed note's path is absent, not zero hits.)
+        let by_id = search(&vault, "n-01M3TC5H00MPJG0036CR000006", &coaching).unwrap();
+        assert!(by_id.hits.is_empty());
+        let by_type = search(&vault, "type: note", &coaching).unwrap();
+        assert!(
+            by_type
+                .hits
+                .iter()
+                .all(|h| !h.path.contains("0036CR000006")),
+            "unattributed note leaked via its `type:` line: {:?}",
+            by_type.hits
+        );
     }
 
     #[test]
