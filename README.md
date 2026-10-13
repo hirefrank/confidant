@@ -21,6 +21,19 @@ use, in files you can read. Underneath, a ledger of dated facts
 New here? Start with [Agent setup](#agent-setup) for the one-prompt
 install, or [Quickstart](#quickstart) to try the fake-data demo vault.
 
+## Status: one thing is not ready for other people's data
+
+**The encryption has had no outside review.** The design was reviewed
+in-project and the implementation's tests pass, but no independent reviewer
+has audited it. Tracked in
+[#138](https://github.com/hirefrank/confidant/issues/138).
+
+So, today: **keep vaults on trusted devices with encrypted disks, and do not
+put other people's client data in them.** `confidant check`, the privacy
+allowlist, and `no-ai` all work, but they are not a substitute for the
+outside audit. This section will say plainly when the audit lands; until
+then it is the disclosure.
+
 ## Install
 
 **The easiest path:** paste the one-prompt install from
@@ -247,19 +260,6 @@ The roadmap is tracked as open issues on GitHub. The big themes:
   records. [Issue #219](https://github.com/hirefrank/confidant/issues/219).
 - **Ledger query performance** — a rebuildable local index.
   [Issue #188](https://github.com/hirefrank/confidant/issues/188).
-
-## Status: one thing is not ready for other people's data
-
-**The encryption has had no outside review.** The design was reviewed
-in-project and the implementation's tests pass, but no independent reviewer
-has audited it. Tracked in
-[#138](https://github.com/hirefrank/confidant/issues/138).
-
-So, today: **keep vaults on trusted devices with encrypted disks, and do not
-put other people's client data in them.** `confidant check`, the privacy
-allowlist, and `no-ai` all work, but they are not a substitute for the
-outside audit. This section will say plainly when the audit lands; until
-then it is the disclosure.
 
 ## License
 

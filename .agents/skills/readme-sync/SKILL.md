@@ -112,6 +112,7 @@ safety disclosure. It should:
 - Link to the tracking issue.
 - Say what *is* safe to use today (check, find, context, the allowlist).
 - Be honest but not alarmist. The goal is informed consent, not fear.
+- Stay near the top of the README, directly after the intro.
 
 If the limitation has been resolved, say so and remove or update the section.
 
