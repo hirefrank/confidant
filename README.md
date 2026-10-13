@@ -17,6 +17,14 @@ pulls the whole bundle — notes, sessions, deals, balances — through one
 use, in files you can read. Underneath, a ledger of dated facts
 (`ledger/2026/10.cfd`) keeps the record append-only and auditable.
 
+Packs extend it. A pack is a bundle of fields, findings, and rules for
+one domain: the coaching pack adds sessions, balances, and ICF-aligned
+checks. Several packs can share one vault, each owning its own fields.
+The core stays the same private record — packs decide what it tracks and
+verifies. Want CRM-shaped behavior? That's a pack too: deals, pipelines,
+whatever the domain needs, layered on the same memory. The core doesn't
+assume any of it; you choose what your memory is for.
+
 New here? Start with [Agent setup](#agent-setup) for the one-prompt
 install, or [Quickstart](#quickstart) to try the fake-data demo vault.
 
