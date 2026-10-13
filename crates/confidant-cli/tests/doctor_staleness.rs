@@ -291,6 +291,23 @@ fn doctor_offline_disables_check_without_requesting() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn doctor_git_version_reports_detected_version() {
+    // The runner's real git is >= 2.34 (CI images ship 2.39+), so the
+    // check is ok and names the detected version. Below-floor status
+    // rules live in the unit tests (no way to fake the git binary here).
+    let v = run_doctor(Some(&unreachable_url()));
+    let c = check(&v, "git-version").expect("git-version check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with("git 2."),
+        "expected detected version: {msg}"
+    );
+    assert!(msg.contains("2.34.0"), "expected the floor: {msg}");
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+#[test]
 fn doctor_skills_links_no_agents_is_ok() {
     // A HOME with no agent dirs: nothing to link, so ok with a setup hint.
     let home = tempfile::tempdir().unwrap();
