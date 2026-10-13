@@ -34,7 +34,7 @@ silently pick a package-consuming default.
 ## Workflow
 1. Run the proposer (it never writes to the vault):
    ```sh
-   python3 skills/transcript-import/bin/transcript-import.py --vault "$VAULT" \
+   python3 "$(confidant which --skills-dir)"/transcript-import/bin/transcript-import.py --vault "$VAULT" \
        --descriptor t-abc123.json
    ```
    The manifest and the flat ledger-lines file land in

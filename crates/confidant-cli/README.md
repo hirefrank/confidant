@@ -7,14 +7,23 @@ their AI agents. Reads and checks Confidant vaults; there is no server.
 
 ```sh
 cargo install confidant-cli
+confidant setup --agent auto
 ```
+
+`setup` installs the integration skills shipped inside the binary into your
+agent's skills dir — no repo checkout needed.
 
 ## Quickstart
 
 ```sh
 export CONFIDANT_VAULT="/path/to/vault"
 confidant check --json --no-input
-confidant find "Ada Example" --json
+```
+
+With the demo vault (fake data) in a contributor checkout:
+
+```sh
+confidant find "Ada Example" --json --vault examples/demo-vault
 ```
 
 See the [main repository](https://github.com/hirefrank/confidant) for the full

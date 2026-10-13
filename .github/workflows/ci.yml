@@ -59,7 +59,7 @@ jobs:
       - name: build CLI
         run: cargo build -p confidant-cli --locked
       - name: proposer smoke
-        run: python3 skills/bin/smoke-proposers.py --vault examples/demo-vault --cli target/debug/confidant
+        run: python3 crates/confidant-cli/skills/bin/smoke-proposers.py --vault examples/demo-vault --cli target/debug/confidant
 
   deny:
     name: cargo deny

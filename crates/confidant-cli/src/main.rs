@@ -9,9 +9,11 @@
 //!
 //! [`write`]: confidant_core::write
 
+mod embedded;
 mod mcp;
 mod record_crypto;
 mod record_decrypt;
+mod setup;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -210,6 +212,50 @@ enum Command {
     Help { topic: Option<String> },
     /// Thin MCP server over stdio wrapping this CLI.
     Mcp,
+    /// Install embedded skills into agent skill dirs (no vault needed).
+    ///
+    /// Materializes the skills shipped in this binary to a versioned share
+    /// dir and symlinks (or copies) each skill into the target agents.
+    Setup {
+        /// Target agents: auto (default), all, or comma-separated names.
+        #[arg(long, default_value = "auto")]
+        agent: String,
+        /// Replace existing non-symlink skill dirs (older installs).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Copy skills instead of symlinking.
+        #[arg(long, default_value_t = false)]
+        copy: bool,
+        /// Show every path as it is created/linked.
+        #[arg(long, short = 'v', default_value_t = false)]
+        verbose: bool,
+    },
+    /// Update the binary (when an updater is available) and re-link skills.
+    Update {
+        /// Target agents: auto (default), all, or comma-separated names.
+        #[arg(long, default_value = "auto")]
+        agent: String,
+        /// Replace existing non-symlink skill dirs.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Show every path as it is created/linked.
+        #[arg(long, short = 'v', default_value_t = false)]
+        verbose: bool,
+    },
+    /// List supported agents and detection status (no vault needed).
+    Agents {
+        /// Show every path as it is created/linked.
+        #[arg(long, short = 'v', default_value_t = false)]
+        verbose: bool,
+    },
+    /// Print the installed skills location (no vault needed).
+    Which {
+        /// Print only the skills dir path (for `$(…)` use).
+        #[arg(long, default_value_t = false)]
+        skills_dir: bool,
+    },
+    /// Print the optional routing snippet for project instruction files.
+    Routing,
     /// Write a fake vault of N people for search benchmarks (hidden).
     #[command(hide = true)]
     BenchGen {
@@ -411,10 +457,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // Every JSON response still carries the resolved vault (possibly null).
     // `device-add --initiate` runs on a brand-new device that has no vault
     // yet; everything else needs one.
+    // `setup` / `update` / `agents` / `which` / `routing` manage the
+    // installed skills and never touch a vault.
     let needs_vault = !matches!(
         cli.command,
         Command::Schema
             | Command::Help { .. }
+            | Command::Setup { .. }
+            | Command::Update { .. }
+            | Command::Agents { .. }
+            | Command::Which { .. }
+            | Command::Routing
             | Command::Keys {
                 action: KeysAction::DeviceAdd { initiate: true, .. },
             }
@@ -707,6 +760,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Schema => cmd_schema(&cli, vault_root.as_deref()),
         Command::Help { topic } => cmd_help(&cli, vault_root.as_deref(), topic.clone()),
+        Command::Setup {
+            agent,
+            force,
+            copy,
+            verbose,
+        } => cmd_setup(&cli, agent, *force, *copy, *verbose),
+        Command::Update {
+            agent,
+            force,
+            verbose,
+        } => cmd_update(&cli, agent, *force, *verbose),
+        Command::Agents { verbose } => cmd_agents(&cli, *verbose),
+        Command::Which { skills_dir } => cmd_which(&cli, *skills_dir),
+        Command::Routing => cmd_routing(&cli),
         Command::Mcp => {
             let root = vault_root.unwrap();
             mcp::run(&root)
@@ -2022,123 +2089,74 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
     }
 }
 
-/// Build the skills staleness check for the checkout at `repo`, given the
-/// latest release tag (or `None`). Warning-only: a checkout whose HEAD is
-/// behind warns with the update command, a checkout that carries a release
-/// tag but is not sitting on it warns that it is not pinned, and a
-/// directory that is not a pinned git checkout warns that the tag cannot be
-/// determined. Network failures degrade to `ok` "unknown", and `offline`
-/// reports `ok` "disabled" without running git at all.
-fn skills_staleness_check(
-    repo: &str,
-    latest: Option<String>,
-    no_input: bool,
-    offline: bool,
-) -> DoctorCheck {
-    if offline {
+/// Skills link health for `setup`-managed installs. Skills ship in the
+/// binary and are linked into agent skill dirs by `confidant setup`; there
+/// is no checkout to compare against a release tag. Warning-only: missing
+/// links never fail `doctor`.
+///
+/// Only agents `setup` actually targeted (dirs containing at least one
+/// confidant-owned entry) count toward the warning; detected-but-never-
+/// targeted agents are reported, not warned about. Entries sharing one dir
+/// (e.g. `muse`/`agents` both map to `.agents/skills`) are counted once.
+fn skills_links_check() -> DoctorCheck {
+    let home = match setup::home_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            return DoctorCheck {
+                id: "skills-links",
+                status: "warning",
+                message: format!("cannot determine home directory: {e:#}"),
+            };
+        }
+    };
+    let health: Vec<setup::AgentHealth> = match setup::skills_dir_override() {
+        Some(dir) => vec![setup::agent_health_for_dir("custom", &dir)],
+        None => setup::agents_health(&home),
+    };
+    // Dedupe entries that resolve to the same dir.
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut unique: Vec<&setup::AgentHealth> = Vec::new();
+    for h in &health {
+        if seen.iter().any(|d| d == &h.dir) {
+            continue;
+        }
+        seen.push(h.dir.clone());
+        unique.push(h);
+    }
+    let targeted: Vec<_> = unique.iter().filter(|h| h.detected && h.targeted).collect();
+    if targeted.is_empty() {
         return DoctorCheck {
-            id: "skills-staleness",
+            id: "skills-links",
             status: "ok",
-            message: STALENESS_DISABLED.to_owned(),
+            message: "no agents set up; run `confidant setup --agent auto` to install skills"
+                .to_owned(),
         };
     }
-    // #166: the checkout must sit *exactly* on a release tag. A bare
-    // `describe` reports the nearest reachable tag, so a checkout on main
-    // past `v0.1.0` would read as current; `--exact-match` fails unless
-    // HEAD is the tagged commit itself.
-    let describe = confidant_core::write::git(
-        Path::new(repo),
-        &[
-            "describe",
-            "--tags",
-            "--abbrev=0",
-            "--exact-match",
-            "--match",
-            "v[0-9]*",
-            "--exclude",
-            "*-*",
-        ],
-        no_input,
-    );
-    let checkout = match describe {
-        Ok(tag) => tag.trim().to_owned(),
-        Err(_) => {
-            // `--exact-match` failed: HEAD is not on a release tag. Tell
-            // "the operator can pin this" apart from "nothing here can be
-            // pinned": a git work tree carrying at least one release tag is
-            // the former; anything else cannot be determined. These messages
-            // name only the checkout path and fixed commands, never repo or
-            // vault content.
-            let in_work_tree = confidant_core::write::git(
-                Path::new(repo),
-                &["rev-parse", "--is-inside-work-tree"],
-                no_input,
-            )
-            .map(|v| v.trim() == "true")
-            .unwrap_or(false);
-            let has_release_tag = in_work_tree
-                && confidant_core::write::git(
-                    Path::new(repo),
-                    &["tag", "--list", "v[0-9]*"],
-                    no_input,
-                )
-                .map(|v| !v.trim().is_empty())
-                .unwrap_or(false);
-            let message = if has_release_tag {
-                format!(
-                    "skills checkout at {repo} is not pinned to a release tag; \
-                     pin it with `git -C {repo} checkout $(git -C {repo} describe \
-                     --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' origin/main)` \
-                     (see docs/agent-setup.md)"
-                )
-            } else {
-                format!(
-                    "cannot determine the skills checkout version at {repo}; \
-                     re-clone it and pin to a release tag (see docs/agent-setup.md)"
-                )
-            };
-            return DoctorCheck {
-                id: "skills-staleness",
-                status: "warning",
-                message,
-            };
+    let total_expected: usize = targeted.iter().map(|h| h.total).sum();
+    let total_linked: usize = targeted.iter().map(|h| h.linked).sum();
+    if total_linked == total_expected {
+        let names: Vec<_> = targeted.iter().map(|h| h.name.as_str()).collect();
+        DoctorCheck {
+            id: "skills-links",
+            status: "ok",
+            message: format!(
+                "skills linked ({total_linked}/{total_expected}) for {}",
+                names.join(", ")
+            ),
         }
-    };
-    let (status, message) = match latest {
-        None => ("ok", STALENESS_UNKNOWN.to_owned()),
-        Some(latest) => {
-            match (
-                parse_release_version(&checkout),
-                parse_release_version(&latest),
-            ) {
-                (Some(checkout_v), Some(latest_v)) if checkout_v < latest_v => (
-                    "warning",
-                    format!(
-                        "skills checkout is at {checkout} but the latest release is {latest}; \
-                         update with `git -C {repo} fetch --tags` then `git -C {repo} checkout \
-                         $(git -C {repo} describe --tags --abbrev=0 --match 'v[0-9]*' \
-                         --exclude '*-*' origin/main)`"
-                    ),
-                ),
-                (Some(checkout_v), Some(latest_v)) if checkout_v > latest_v => (
-                    "ok",
-                    format!(
-                        "skills checkout {checkout} is ahead of the latest release {latest} \
-                         (dev checkout)"
-                    ),
-                ),
-                (Some(_), Some(_)) => (
-                    "ok",
-                    format!("skills checkout {checkout} matches the latest release"),
-                ),
-                _ => ("ok", STALENESS_UNKNOWN.to_owned()),
-            }
+    } else {
+        let mut parts = Vec::new();
+        for h in targeted {
+            parts.push(format!("{} {}/{}", h.name, h.linked, h.total));
         }
-    };
-    DoctorCheck {
-        id: "skills-staleness",
-        status,
-        message,
+        DoctorCheck {
+            id: "skills-links",
+            status: "warning",
+            message: format!(
+                "skills missing (linked {total_linked}/{total_expected}: {}); run `confidant setup --agent auto`",
+                parts.join(", ")
+            ),
+        }
     }
 }
 
@@ -2425,34 +2443,21 @@ fn cmd_doctor(
     }
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale
-    // install is never an error, so exit-code semantics are unchanged. The
-    // release tag is fetched once and shared by both checks. Any network
-    // failure degrades to `ok` "unknown" (offline-first): staleness is
-    // informational, so `doctor` must not punish offline users.
+    // install is never an error, so exit-code semantics are unchanged. Any
+    // network failure degrades to `ok` "unknown" (offline-first):
+    // staleness is informational, so `doctor` must not punish offline users.
     //
     // `CONFIDANT_OFFLINE=1` opts out entirely: the fetch is skipped before
-    // any request is made and both checks report `ok` "disabled". See the
+    // any request is made and the check reports `ok` "disabled". See the
     // README Privacy section and docs/privacy.md for the disclosure.
+    // Skills ship in the binary and are version-locked to it, so there is
+    // no separate skills checkout to compare — `skills-links` below reports
+    // link health instead.
     {
         let offline = staleness_offline();
         let latest = if offline { None } else { latest_release_tag() };
-        checks.push(cli_staleness_check(latest.clone(), offline));
-
-        // The skills checkout is located via CONFIDANT_REPO. Unset (or
-        // empty) means the CLI does not know where the skills live, so
-        // there is nothing to compare — the check is omitted entirely,
-        // not even noted: absence of configuration is normal.
-        match std::env::var("CONFIDANT_REPO") {
-            Ok(repo) if !repo.trim().is_empty() => {
-                checks.push(skills_staleness_check(
-                    repo.trim(),
-                    latest,
-                    cli.no_input,
-                    offline,
-                ));
-            }
-            _ => {}
-        }
+        checks.push(cli_staleness_check(latest, offline));
+        checks.push(skills_links_check());
     }
 
     let ok = !checks.iter().any(|c| c.status == "error");
@@ -3125,6 +3130,222 @@ fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
         print_json(&ok_envelope(vault, serde_json::json!({"contract": schema})))?;
     } else {
         println!("{}", serde_json::to_string_pretty(&schema)?);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn setup_result_json(result: &setup::SetupResult) -> Value {
+    let agents: Vec<Value> = result
+        .agents
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "dir": a.dir.display().to_string(),
+                "linked": a.links.iter().filter(|l| !matches!(l.outcome, setup::LinkOutcome::SkippedExists)).count(),
+                "skipped": a.links.iter().filter(|l| matches!(l.outcome, setup::LinkOutcome::SkippedExists)).count(),
+                "skills": a.links.iter().map(|l| serde_json::json!({
+                    "skill": l.skill,
+                    "dest": l.dest.display().to_string(),
+                    "outcome": l.outcome.as_str(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "skills_dir": result.skills_dir.display().to_string(),
+        "home": result.home.display().to_string(),
+        "version": result.version,
+        "agents": agents,
+        "unknown_agents": result.unknown_agents,
+        "linked": result.linked_count(),
+        "skipped": result.skipped_count(),
+    })
+}
+
+fn cmd_setup(
+    cli: &Cli,
+    agent: &str,
+    force: bool,
+    copy: bool,
+    verbose: bool,
+) -> anyhow::Result<ExitCode> {
+    match setup::run_setup(agent, force, copy) {
+        Ok(result) => {
+            if cli.json {
+                print_json(&ok_envelope(None, setup_result_json(&result)))?;
+            } else {
+                if verbose {
+                    for line in &result.verbose_lines {
+                        println!("{line}");
+                    }
+                }
+                for unknown in &result.unknown_agents {
+                    eprintln!("warning: unknown agent '{unknown}' — skipped");
+                }
+                let labels = result.agent_labels().join(", ");
+                println!("Confidant skills installed");
+                println!("  skills   {} → {labels}", result.skills_dir.display());
+                println!("  version  {}", result.version);
+                println!(
+                    "  linked   {} ({} skipped)",
+                    result.linked_count(),
+                    result.skipped_count()
+                );
+                if result.skipped_count() > 0 {
+                    println!("  replace existing dirs with: confidant setup --force");
+                }
+                println!();
+                println!("Next:");
+                println!("  1. Set CONFIDANT_VAULT to your vault (or use --vault).");
+                println!("  2. Run `confidant check --json --no-input` against it.");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
+    // Self-update via the cargo-dist updater is not yet wired: `update`
+    // reports the latest release and re-links skills from this binary.
+    // Honor CONFIDANT_OFFLINE=1 like `doctor` (no network at all).
+    let offline = staleness_offline();
+    let latest = if offline { None } else { latest_release_tag() };
+    let local = env!("CARGO_PKG_VERSION");
+    // Behind-ness is computed once and shared by the human and JSON paths.
+    // `None` when the check is disabled or the release couldn't be fetched.
+    let behind: Option<bool> = latest.as_deref().and_then(|tag| {
+        parse_release_version(local)
+            .zip(parse_release_version(tag))
+            .map(|(l, r)| l < r)
+    });
+    let upgrade_cmd =
+        "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup --force`.";
+    if cli.json {
+        let update_info = match &latest {
+            None if offline => {
+                serde_json::json!({"status": "disabled", "message": STALENESS_DISABLED, "behind": Value::Null})
+            }
+            None => {
+                serde_json::json!({"status": "unknown", "message": STALENESS_UNKNOWN, "behind": Value::Null})
+            }
+            Some(tag) => {
+                serde_json::json!({"status": "fetched", "latest": tag, "local": local, "behind": behind})
+            }
+        };
+        if behind == Some(true) {
+            // Never re-link from a behind binary: the installed skills would
+            // be stale on arrival. Tell the operator how to upgrade instead.
+            let value = serde_json::json!({
+                "update": update_info,
+                "message": format!("confidant {local} is behind; {upgrade_cmd}"),
+            });
+            print_json(&ok_envelope(None, value))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        let result = setup::run_setup(agent, force, false)?;
+        let mut value = setup_result_json(&result);
+        if let Value::Object(ref mut obj) = value {
+            obj.insert("update".to_owned(), update_info);
+        }
+        print_json(&ok_envelope(None, value))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if offline {
+        println!("{STALENESS_DISABLED}");
+    } else {
+        match &latest {
+            None => println!("{STALENESS_UNKNOWN}"),
+            Some(tag) => {
+                if behind == Some(true) {
+                    println!("confidant {local} is behind the latest release {tag}; {upgrade_cmd}");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+            }
+        }
+    }
+    // Re-link from this binary. `force` is the operator's own flag: owned
+    // entries are re-pointed regardless, unowned entries need it.
+    let result = setup::run_setup(agent, force, false)?;
+    if verbose {
+        for line in &result.verbose_lines {
+            println!("{line}");
+        }
+    }
+    for unknown in &result.unknown_agents {
+        eprintln!("warning: unknown agent '{unknown}' — skipped");
+    }
+    println!(
+        "re-linked {} skills → {}",
+        result.linked_count(),
+        result.agent_labels().join(", ")
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_agents(cli: &Cli, verbose: bool) -> anyhow::Result<ExitCode> {
+    let home = setup::home_dir()?;
+    let health = setup::agents_health(&home);
+    if cli.json {
+        let agents: Vec<Value> = health
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "name": h.name,
+                    "path": h.dir.display().to_string(),
+                    "detected": h.detected,
+                    "linked": h.linked,
+                    "total": h.total,
+                })
+            })
+            .collect();
+        print_json(&ok_envelope(None, serde_json::json!({"agents": agents})))?;
+    } else {
+        for h in &health {
+            let status = if h.detected { "detected" } else { "" };
+            if verbose || h.detected {
+                println!("{}\t{}\t{status}", h.name, h.dir.display());
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_which(cli: &Cli, skills_dir_only: bool) -> anyhow::Result<ExitCode> {
+    let home = setup::confidant_home()?;
+    let skills_dir = setup::skills_version_dir()?;
+    let version = env!("CARGO_PKG_VERSION").to_owned();
+    if skills_dir_only && !cli.json {
+        println!("{}", skills_dir.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if cli.json {
+        print_json(&ok_envelope(
+            None,
+            serde_json::json!({
+                "skills_dir": skills_dir.display().to_string(),
+                "home": home.display().to_string(),
+                "version": version,
+            }),
+        ))?;
+    } else {
+        println!("skills_dir={}", skills_dir.display());
+        println!("home={}", home.display());
+        println!("version={version}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_routing(cli: &Cli) -> anyhow::Result<ExitCode> {
+    if cli.json {
+        print_json(&ok_envelope(
+            None,
+            serde_json::json!({"snippet": setup::ROUTING_SNIPPET}),
+        ))?;
+    } else {
+        print!("{}", setup::ROUTING_SNIPPET);
     }
     Ok(ExitCode::SUCCESS)
 }

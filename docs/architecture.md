@@ -79,8 +79,8 @@ confidant/
 ├── crates/confidant-core/      # parse, model, derived values, check engine
 ├── crates/confidant-crypt/     # age key wrapping, record-bound XChaCha20-Poly1305 content encryption
 ├── crates/confidant-cli/       # CLI + agent contract + thin MCP server
+│   └── skills/           # agent skills, embedded in the binary by `setup`
 ├── packs/                # schema packs and check packs (coaching first)
-├── skills/               # agent skills + small integration scripts
 ├── examples/demo-vault/  # fake data for tests, docs and agents
 ├── docs/
 └── THIRD_PARTY_LICENSES  # MIT notice for code adapted from cr (ADR-13)
@@ -258,7 +258,7 @@ confidant check --json
 
 **Context.** Integrations (portal, email, transcripts, QMD indexing) are what agents are good at, and they change often. What must *not* be skipped, whoever writes, is validation. Beancount gets this right: its plugins transform and validate entries on every load.
 
-**Decision.** v0 has **no general plugin system for integrations.** Agents handle every integration by calling the agent contract (ADR-7), shipped as agent skills or small scripts in `skills/`. Extensible in v0:
+**Decision.** v0 has **no general plugin system for integrations.** Agents handle every integration by calling the agent contract (ADR-7), shipped as agent skills or small scripts embedded in the CLI binary (`crates/confidant-cli/skills/`, installed by `confidant setup`). Extensible in v0:
 
 1. **Check rules / validators.** Run on every write and in `confidant check`, regardless of who writes (human, agent, script). Example: an `ICF hours` rule that rejects a session without a duration.
 2. **Schema packs.** Define record types, ledger verbs and derived values, declared in `confidant.toml`. Coaching is the first pack: sessions, packages, balances, renewals, ICF hours.
@@ -277,7 +277,7 @@ coaching.balance_nonnegative = "error"
 Integrations are idempotent and record provenance on each entry (`src:portal/evt-…`, `src:transcript/t-…`) so re-running an import adds nothing.
 
 ```sh
-# skills/portal-sync script, run by the agent on a schedule
+# installed portal-sync skill script, run by the agent on a schedule
 confidant import --file portal-events.jsonl --request-id portal-2026-10-07 --json --no-input
 ```
 

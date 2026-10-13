@@ -30,6 +30,7 @@ confidant-core.workspace = true
 confidant-crypt.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+include_dir.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
