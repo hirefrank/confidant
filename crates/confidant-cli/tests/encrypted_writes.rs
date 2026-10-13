@@ -663,6 +663,150 @@ fn ledger_and_import_stay_plaintext() {
 }
 
 #[test]
+fn log_session_without_note_works_without_device_key() {
+    // #176: a note-less session appends only a plaintext ledger line, so
+    // it must not touch the keychain at all.
+    let h = Harness::new();
+    h.keyed(PERSON);
+
+    // Person must exist for log session.
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Needs an open package for the coaching balance check.
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "package"]);
+
+    // No device key: CONFIDANT_KEYCHAIN=off, no env key, no test keychain dir.
+    let mut c = h.cmd_no_device_key(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--date",
+        "2026-10-13",
+        "--no-input",
+    ]);
+    c.env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
+    let out = c.output().unwrap();
+    assert!(out.status.success(), "log session failed: {}", stderr(&out));
+
+    // The session line landed, plaintext, on main.
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("2026-10-13 session {PERSON} 60m paid")),
+        "session line missing:\n{ledger}"
+    );
+    assert!(!ledger.contains("enc:"), "ledger must stay plaintext");
+}
+
+#[test]
+fn log_session_note_fails_closed_without_device_key() {
+    // #176: a session WITH a note cannot be written without the device
+    // key (the note record is encrypted), and the note cannot be queued
+    // to the inbox yet (the drain refuses RecordWrite into encrypted
+    // vaults, B11). Fail closed with a note-specific fix; write nothing.
+    let h = Harness::new();
+    h.keyed(PERSON);
+
+    // Person must exist for log session.
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Needs an open package for the coaching balance check.
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "package"]);
+    let ledger_before = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+
+    // No device key: CONFIDANT_KEYCHAIN=off, no env key, no test keychain dir.
+    let mut c = h.cmd_no_device_key(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--note",
+        "This session note is secret.",
+        "--date",
+        "2026-10-13",
+        "--no-input",
+    ]);
+    c.env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
+    let out = c.output().unwrap();
+    assert!(
+        !out.status.success(),
+        "log session --note must fail without the device key"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("nothing was written"),
+        "error must say nothing was written: {err}"
+    );
+    assert!(
+        err.contains("without --note"),
+        "error must point at logging without --note: {err}"
+    );
+    assert!(
+        err.contains("cannot be queued to the inbox"),
+        "error must explain why the note cannot go to the inbox: {err}"
+    );
+
+    // Nothing was written: ledger unchanged, no note file created.
+    let ledger_after = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    assert_eq!(
+        ledger_after, ledger_before,
+        "ledger changed on a failed write"
+    );
+    assert!(
+        !h.vault.join(format!("people/{PERSON}/notes")).exists(),
+        "note file created on a failed write"
+    );
+}
+
+#[test]
 fn doctor_reports_plaintext_encrypted_mix() {
     let h = Harness::new();
     h.keyed(PERSON);
