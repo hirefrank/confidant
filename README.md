@@ -54,10 +54,13 @@ cargo run -p confidant-cli -- check --json --no-input --vault examples/demo-vaul
 
 ## Quickstart
 
-Once installed, point `CONFIDANT_VAULT` at a vault and check it:
+Once installed, create a vault (or point `CONFIDANT_VAULT` at an existing one)
+and check it:
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"
+mkdir -p "$CONFIDANT_VAULT" && cd "$CONFIDANT_VAULT" && git init
+confidant init   # generates your operator key; shows a 24-word recovery phrase once — store it offline
 confidant check
 confidant check --json --no-input
 ```
@@ -98,16 +101,18 @@ domain.
 - **`coaching@0.1`** ships today, compiled into the binary. It adds sessions,
   packages, ICF hours, balance assertions, and gap rules (a session with no
   notes; a paid client with no session inside a configurable window). If you
-  run a coaching practice, this pack makes Confidant function as a
-  coaching-specific CRM — without the sales-pipeline baggage.
+  run a coaching practice, this pack covers what you'd otherwise need a
+  coaching CRM for — without the sales-pipeline baggage.
 - **`personal@0.1`** is the next pack ([issue #184](https://github.com/hirefrank/confidant/issues/184)):
   birthdays, relationship edges, keep-in-touch cadence, and a `touch` ledger
   verb for lightweight touchpoints. The goal is to prove the core is
   general, not coaching-specific.
 - **Multi-pack vaults** ([issue #173](https://github.com/hirefrank/confidant/issues/173)):
-  one vault, several packs at once, with per-pack access scoping. One person
-  can be a coaching client and a friend; a coaching agent never sees
-  personal notes.
+  a vault can already list several packs at once (`packs = [...]` in
+  `confidant.toml`), though `coaching@0.1` is the only pack that exists to
+  list today. Per-pack access scoping — so one person can be a coaching
+  client and a friend, and a coaching agent never sees personal notes — is
+  still to come.
 - **External packs** ([issue #193](https://github.com/hirefrank/confidant/issues/193)):
   the long-term direction is installable, versioned packs loaded at runtime,
   so third parties can publish packs without opening a PR here. Not yet
