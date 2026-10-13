@@ -4112,3 +4112,116 @@ fn find_keeps_ada_when_only_her_own_filenames_contain_her_id() {
         &load_vault(dir.path()).unwrap()
     ));
 }
+
+#[test]
+fn orphan_coaching_verbs_warn_instead_of_unknown_verb() {
+    // #177 Q2: data owned by a disabled pack warns, never errors.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "orgs/x/profile.md",
+        &format!("---\nid: {ORG}\ntype: org\nname: Org\n---\n\nFake org.\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-10-02 session {ADA} 60m paid\n\
+             2026-10-03 session {ORG} 60m paid\n\
+             2026-10-04 frobnicate {ADA}\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    // Coaching verbs warn as orphans, not E_UNKNOWN_VERB ...
+    assert_eq!(
+        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
+        3,
+        "{c:?}"
+    );
+    // ... but the verb's ID-type rule still fires for the org session.
+    assert!(c.contains(&"E_WRONG_ID_TYPE".to_string()), "{c:?}");
+    // A verb no pack owns is still an unknown-verb error.
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "E_UNKNOWN_VERB" && f["severity"] == "error"),
+        "{c:?}"
+    );
+}
+
+#[test]
+fn orphan_warnings_alone_do_not_fail_check() {
+    // #177 Q2 + #183: warnings never block writes (fail_on error gate).
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-10-02 session {ADA} 60m paid\n\
+             2026-10-03 balance {ADA} sessions_remaining 0\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert_eq!(
+        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
+        3,
+        "{c:?}"
+    );
+    assert!(!c.iter().any(|code| code.starts_with("E_")), "{c:?}");
+    let vault = load_vault(dir.path()).unwrap();
+    let report = check_vault(
+        &vault,
+        &CheckOptions {
+            as_of: None,
+            fail_on: Some(Severity::Error),
+            pinned_inbox_pubkey: None,
+        },
+    );
+    assert!(report.ok, "{:?}", report.findings);
+}
+
+#[test]
+fn orphan_coaching_metrics_warn_instead_of_unknown_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 balance {ADA} sessions_remaining 0\n\
+             2026-10-02 balance {ADA} frobnicate_metric 1\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"W_PACK_ORPHAN".to_string()), "{c:?}");
+    assert_eq!(
+        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
+        1,
+        "{c:?}"
+    );
+    assert!(c.contains(&"E_UNKNOWN_METRIC".to_string()), "{c:?}");
+}

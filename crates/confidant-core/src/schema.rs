@@ -185,7 +185,7 @@ pub fn contract_schema() -> Value {
                 "title": "context --json",
                 "description": "Everything the vault knows about one person. PII fields (name/profile/bodies) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions are omitted entirely, never nulled. --exclude-private strips PII regardless; ledger facts are kept.",
                 "type": "object",
-                "required": ["ok", "schema_version", "vault", "person", "notes", "interactions", "coaching", "aliases"],
+                "required": ["ok", "schema_version", "vault", "person", "notes", "interactions", "coaching", "packs", "aliases"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
@@ -243,6 +243,10 @@ pub fn contract_schema() -> Value {
                                 }
                             }
                         }
+                    },
+                    "packs": {
+                        "type": "object",
+                        "description": "Pack state grouped by pack name (\"coaching@0.1\" today). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
                     },
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Opaque hmac:<hex> values."}
                 }

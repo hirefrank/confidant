@@ -18,6 +18,8 @@ present, for CI users who want the stricter gate.
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
 | `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is not compiled into this CLI. |
+| `E_PACK_CONFLICT` | error | | Two enabled packs claim the same verb, record type, field, or balance metric. The pack set is incoherent: `check` reports the conflict and skips all pack folding (core checks still run). |
+| `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, or balance metric belongs to a registered pack that is not enabled. Warnings never block writes; the operator enables the pack or removes the data. |
 | `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value (including ASCII case variants: `Person:`, `ORG:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
@@ -26,9 +28,9 @@ present, for CI users who want the stricter gate.
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
 | `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not a boolean or is set on a record type that does not allow it; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
-| `E_UNKNOWN_VERB` | error | | A ledger verb is not core and not in an enabled pack. The message does not echo the verb. |
+| `E_UNKNOWN_VERB` | error | | A ledger verb is not core, not in an enabled pack, and not owned by a disabled pack (those are `W_PACK_ORPHAN`). The message does not echo the verb. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
-| `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines. |
+| `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines and no disabled pack owns (those are `W_PACK_ORPHAN`). |
 | `E_LEDGER_PATH` | error | | A file under `ledger/` is not `YYYY/MM.cfd`. |
 | `E_LEDGER_DATE` | error | | An entry's date is not in its file's year/month. |
 | `E_BALANCE_MISMATCH` | error | | A `balance` assertion disagrees with the value computed as of the end of the assertion date. |

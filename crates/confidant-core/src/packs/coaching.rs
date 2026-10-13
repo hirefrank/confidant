@@ -4,12 +4,16 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
 
 use crate::check::{canonical_on, duration_of, Finding, FindingCode, MergeMap, Severity};
+use crate::config::COACHING_PACK;
 use crate::id::{Prefix, RecordId};
-use crate::ledger::{minutes_to_hundredths, parse_strict_date, Arg, LedgerEntry};
+use crate::ledger::LedgerEntry;
+use crate::ledger::{minutes_to_hundredths, parse_decimal_hundredths, parse_strict_date, Arg};
+use crate::packs::{Pack, PackState};
 use crate::record::RecordKind;
-use crate::vault::Vault;
+use crate::vault::{SourcedEntry, Vault};
 
 const MAX_OPEN_N: i64 = 100_000;
 
@@ -84,6 +88,243 @@ pub struct CoachingState {
     people: HashMap<RecordId, PersonCoaching>,
     pub packages: HashSet<RecordId>,
     members_by_root: RefCell<MembersByRoot>,
+}
+
+impl PackState for CoachingState {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The compiled coaching pack. Registered in [`crate::packs::ALL_PACKS`].
+pub struct CoachingPack;
+
+/// One ledger session for the person (context view).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecentSession {
+    pub date: String,
+    pub duration_minutes: Option<u32>,
+    pub tag: Option<String>,
+}
+
+/// Merge-aware coaching facts for the person (context view).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CoachingView {
+    pub sessions_remaining: i64,
+    pub icf_hours: f64,
+    pub recent_sessions: Vec<RecentSession>,
+}
+
+fn billing_tag(entry: &LedgerEntry) -> Option<String> {
+    for tag in ["paid", "pps", "comp"] {
+        if entry.has_token(tag) {
+            return Some(tag.to_owned());
+        }
+    }
+    None
+}
+
+fn format_hundredths(n: i64) -> String {
+    let sign = if n < 0 { "-" } else { "" };
+    let Some(n) = n.checked_abs() else {
+        return n.to_string();
+    };
+    format!("{sign}{}.{:02}", n / 100, n % 100)
+}
+
+impl Pack for CoachingPack {
+    fn name(&self) -> &'static str {
+        COACHING_PACK
+    }
+
+    fn verbs(&self) -> &'static [&'static str] {
+        &["open", "session"]
+    }
+
+    fn record_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn balance_metrics(&self) -> &'static [&'static str] {
+        &["sessions_remaining", "icf_hours"]
+    }
+
+    fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
+        match verb {
+            "open" | "session" => Some(Prefix::Person),
+            _ => None,
+        }
+    }
+
+    fn fold(
+        &self,
+        vault: &Vault,
+        merges: &MergeMap,
+        as_of: NaiveDate,
+        findings: &mut Vec<Finding>,
+    ) -> Box<dyn PackState> {
+        Box::new(fold(vault, merges.clone(), as_of, findings))
+    }
+
+    fn findings(
+        &self,
+        vault: &Vault,
+        state: &dyn PackState,
+        as_of: NaiveDate,
+        findings: &mut Vec<Finding>,
+    ) {
+        let state = state
+            .as_any()
+            .downcast_ref::<CoachingState>()
+            .expect("CoachingPack state");
+        session_note_integrity(vault, state, findings);
+        gap_rules(vault, state, as_of, findings);
+    }
+
+    fn check_balance(
+        &self,
+        _vault: &Vault,
+        state: &dyn PackState,
+        sourced: &SourcedEntry,
+        findings: &mut Vec<Finding>,
+    ) {
+        let state = state
+            .as_any()
+            .downcast_ref::<CoachingState>()
+            .expect("CoachingPack state");
+        check_balance(state, sourced, findings);
+    }
+
+    fn context_view(
+        &self,
+        vault: &Vault,
+        state: &dyn PackState,
+        _person: &RecordId,
+        canonical: &RecordId,
+        as_of: NaiveDate,
+    ) -> Option<serde_json::Value> {
+        let state = state
+            .as_any()
+            .downcast_ref::<CoachingState>()
+            .expect("CoachingPack state");
+        let mut sessions: Vec<RecentSession> = vault
+            .entries
+            .iter()
+            .filter(|s| {
+                s.entry.verb == "session" && state.canonical_on(&s.entry.id, as_of) == *canonical
+            })
+            .map(|s| RecentSession {
+                date: s.entry.date.to_string(),
+                duration_minutes: duration_of(&s.entry),
+                tag: billing_tag(&s.entry),
+            })
+            .collect();
+        sessions.sort_by(|a, b| b.date.cmp(&a.date));
+        sessions.truncate(10);
+        let view = CoachingView {
+            sessions_remaining: state.sessions_remaining_on(canonical, as_of),
+            icf_hours: state.icf_hours_hundredths_on(canonical, as_of) as f64 / 100.0,
+            recent_sessions: sessions,
+        };
+        serde_json::to_value(view).ok()
+    }
+}
+
+/// Verify one `balance` line for a coaching metric. The caller guarantees
+/// the metric is one this pack claims. Messages match the pre-`Pack`-trait
+/// `check_balances` behavior exactly.
+fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut Vec<Finding>) {
+    let e = &sourced.entry;
+    let metric = e.args.first().and_then(Arg::as_token).unwrap_or("");
+    let number = e.args.get(1).and_then(Arg::as_token);
+    let Some(number) = number else {
+        findings.push(
+            Finding::new(
+                FindingCode::Parse,
+                Severity::Error,
+                "balance line is missing a number".to_owned(),
+            )
+            .at_file(&sourced.file)
+            .at_line(sourced.line)
+            .for_id(&e.id),
+        );
+        return;
+    };
+    let person = state.canonical_on(&e.id, e.date);
+    if metric == "sessions_remaining" {
+        let asserted: i64 = match number.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                findings.push(
+                    Finding::new(
+                        FindingCode::Parse,
+                        Severity::Error,
+                        "expected integer".to_owned(),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&e.id)
+                    .with_fix("Use an integer such as 3 for sessions_remaining"),
+                );
+                return;
+            }
+        };
+        let computed = state.sessions_remaining_on(&person, e.date);
+        if asserted != computed {
+            findings.push(
+                Finding::new(
+                    FindingCode::BalanceMismatch,
+                    Severity::Error,
+                    format!("sessions_remaining asserted {asserted}, computed {computed}"),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&person)
+                .with_fix(format!(
+                    "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
+                )),
+            );
+        }
+    } else if metric == "icf_hours" {
+        let Some(asserted) = parse_decimal_hundredths(number) else {
+            findings.push(
+                Finding::new(
+                    FindingCode::Parse,
+                    Severity::Error,
+                    "expected decimal".to_owned(),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&e.id)
+                .with_fix("Use a decimal such as 1.50 for icf_hours"),
+            );
+            return;
+        };
+        let computed = state.icf_hours_hundredths_on(&person, e.date);
+        if asserted != computed {
+            findings.push(
+                Finding::new(
+                    FindingCode::BalanceMismatch,
+                    Severity::Error,
+                    format!(
+                        "icf_hours asserted {}, computed {}",
+                        format_hundredths(asserted),
+                        format_hundredths(computed)
+                    ),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&person)
+                .with_fix(format!(
+                    "Check session durations for {person} or correct the assertion"
+                )),
+            );
+        }
+    }
 }
 
 impl CoachingState {
@@ -161,7 +402,7 @@ impl CoachingState {
     }
 }
 
-pub fn fold(
+fn fold(
     vault: &Vault,
     parent: MergeMap,
     as_of: NaiveDate,
@@ -434,12 +675,7 @@ fn apply_session(
     });
 }
 
-pub fn gap_rules(
-    vault: &Vault,
-    state: &CoachingState,
-    as_of: NaiveDate,
-    findings: &mut Vec<Finding>,
-) {
+fn gap_rules(vault: &Vault, state: &CoachingState, as_of: NaiveDate, findings: &mut Vec<Finding>) {
     apply_duration_off(vault, findings);
     if let Some(sev) = vault
         .config
@@ -473,7 +709,7 @@ pub fn gap_rules(
 }
 
 /// `note:` ID/type/existence/ownership. Always on; ignores `session_notes` and `as_of`.
-pub fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &mut Vec<Finding>) {
+fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &mut Vec<Finding>) {
     for sourced in &vault.entries {
         if sourced.entry.verb != "session" {
             continue;

@@ -19,11 +19,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{Datelike, NaiveDate};
 use serde::Serialize;
 
-use crate::config::{parse_iso_date, VaultConfig, SPEC_VERSION};
+use crate::config::{parse_iso_date, SPEC_VERSION};
 use crate::error::DomainError;
 use crate::id::{scan_id_tokens, Prefix, RecordId};
-use crate::ledger::{parse_decimal_hundredths, parse_duration_minutes, Arg, LedgerEntry};
-use crate::packs::coaching::{self, CoachingState};
+use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
+use crate::packs::{
+    find_conflict, orphan_owners, resolve_enabled, OrphanOwners, Pack, PackState, ALL_PACKS,
+};
 use crate::record::{parse_ref_id, FrontmatterRef};
 use crate::vault::Vault;
 
@@ -71,6 +73,8 @@ pub enum FindingCode {
     Config,
     SpecUnsupported,
     PackUnknown,
+    PackConflict,
+    PackOrphan,
     InvalidId,
     InvalidFilename,
     IdPathMismatch,
@@ -113,6 +117,8 @@ impl FindingCode {
             Self::Config => "E_CONFIG",
             Self::SpecUnsupported => "E_SPEC_UNSUPPORTED",
             Self::PackUnknown => "E_PACK_UNKNOWN",
+            Self::PackConflict => "E_PACK_CONFLICT",
+            Self::PackOrphan => "W_PACK_ORPHAN",
             Self::InvalidId => "E_INVALID_ID",
             Self::InvalidFilename => "E_INVALID_FILENAME",
             Self::IdPathMismatch => "E_ID_PATH_MISMATCH",
@@ -319,18 +325,17 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         }
     }
 
-    for pack in &vault.config.packs {
-        if pack != crate::config::COACHING_PACK {
-            findings.push(
-                Finding::new(
-                    FindingCode::PackUnknown,
-                    Severity::Error,
-                    "unknown pack".to_owned(),
-                )
-                .at_file("confidant.toml")
-                .with_fix("Remove the pack or use a CLI that implements it"),
-            );
-        }
+    let (enabled_packs, unknown_packs) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    for _ in &unknown_packs {
+        findings.push(
+            Finding::new(
+                FindingCode::PackUnknown,
+                Severity::Error,
+                "unknown pack".to_owned(),
+            )
+            .at_file("confidant.toml")
+            .with_fix("Remove the pack or use a CLI that implements it"),
+        );
     }
 
     let spec_ok = vault.config.spec == SPEC_VERSION;
@@ -339,28 +344,55 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         return finish_report(vault, options, findings);
     }
 
-    let known_verbs = known_verbs(&vault.config);
+    // Conflicting pack claims make the pack set incoherent: report the
+    // conflict and skip all pack folding (core checks still run). The
+    // conflicting verbs stay known so this does not cascade into
+    // E_UNKNOWN_VERB noise.
+    let conflict = find_conflict(&enabled_packs);
+    if let Some(conflict) = &conflict {
+        findings.push(
+            Finding::new(
+                FindingCode::PackConflict,
+                Severity::Error,
+                format!(
+                    "packs {} and {} both claim {} '{}'",
+                    conflict.first, conflict.second, conflict.kind, conflict.name
+                ),
+            )
+            .at_file("confidant.toml")
+            .with_fix("Remove one of the packs or resolve the overlap"),
+        );
+    }
+
+    let known_verbs = known_verbs(&enabled_packs);
+    let orphans = orphan_owners(ALL_PACKS, &enabled_packs);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
     let as_of = resolve_as_of(vault, options);
     let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut findings);
-    check_verbs_and_refs(vault, &known_verbs, &known_ids, &mut findings);
+    check_verbs_and_refs(
+        vault,
+        &known_verbs,
+        &orphans,
+        &enabled_packs,
+        &known_ids,
+        &mut findings,
+    );
+    check_orphan_fields_and_types(vault, &orphans, &mut findings);
     check_duplicate_ulids(vault, &mut findings);
     check_dangling_refs(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
 
-    let coaching = if vault.config.coaching_enabled() {
-        Some(coaching::fold(vault, merges, as_of, &mut findings))
-    } else {
-        None
-    };
-
-    check_balances(vault, coaching.as_ref(), &mut findings);
-
-    if let Some(state) = coaching.as_ref() {
-        coaching::session_note_integrity(vault, state, &mut findings);
-        coaching::gap_rules(vault, state, as_of, &mut findings);
+    if conflict.is_none() {
+        let mut states: Vec<(&dyn Pack, Box<dyn PackState>)> = Vec::new();
+        for pack in &enabled_packs {
+            states.push((*pack, pack.fold(vault, &merges, as_of, &mut findings)));
+        }
+        for (pack, state) in &states {
+            pack.findings(vault, state.as_ref(), as_of, &mut findings);
+        }
+        check_balances(vault, &states, &orphans, &mut findings);
     }
 
     sort_findings(&mut findings);
@@ -411,26 +443,33 @@ pub fn resolve_as_of_date(vault: &Vault) -> NaiveDate {
     chrono::Utc::now().date_naive()
 }
 
-/// Best-effort coaching state for read commands (e.g. `context`).
+/// Best-effort pack states for read commands (e.g. `context`).
 ///
 /// Merge/alias problems are still reported by [`run`]; here they are folded
-/// best-effort and the findings discarded. Returns `None` when the coaching
-/// pack is disabled.
-pub fn coaching_snapshot(vault: &Vault, as_of: NaiveDate) -> Option<CoachingState> {
-    if !vault.config.coaching_enabled() {
-        return None;
-    }
+/// best-effort and the findings discarded. One entry per enabled pack, in
+/// config order. Packs with conflicting claims are still folded here —
+/// `run` is the gate that refuses them; read commands degrade gracefully.
+pub fn pack_snapshots(
+    vault: &Vault,
+    as_of: NaiveDate,
+) -> Vec<(&'static dyn Pack, Box<dyn PackState>)> {
+    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut findings = Vec::new();
     let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut findings);
-    Some(coaching::fold(vault, merges, as_of, &mut findings))
+    enabled
+        .into_iter()
+        .map(|pack| {
+            let state = pack.fold(vault, &merges, as_of, &mut findings);
+            (pack as &'static dyn Pack, state)
+        })
+        .collect()
 }
 
-fn known_verbs(config: &VaultConfig) -> HashSet<&'static str> {
+fn known_verbs(enabled_packs: &[&dyn Pack]) -> HashSet<&'static str> {
     let mut verbs = HashSet::from(["alias", "merge", "stage", "balance"]);
-    if config.coaching_enabled() {
-        verbs.insert("open");
-        verbs.insert("session");
+    for pack in enabled_packs {
+        verbs.extend(pack.verbs());
     }
     verbs
 }
@@ -468,28 +507,55 @@ fn parse_ledger_file(file: &str) -> Option<(i32, u32)> {
 fn check_verbs_and_refs(
     vault: &Vault,
     known_verbs: &HashSet<&str>,
+    orphans: &OrphanOwners,
+    enabled_packs: &[&dyn Pack],
     known_ids: &HashSet<RecordId>,
     findings: &mut Vec<Finding>,
 ) {
     for sourced in &vault.entries {
         let e = &sourced.entry;
         if !known_verbs.contains(e.verb.as_str()) {
-            findings.push(
-                Finding::new(
-                    FindingCode::UnknownVerb,
-                    Severity::Error,
-                    "unknown verb".to_owned(),
-                )
-                .at_file(&sourced.file)
-                .at_line(sourced.line)
-                .for_id(&e.id)
-                .with_fix("Use a core verb or enable the pack that defines it"),
-            );
+            if let Some(owner) = orphans.verbs.get(e.verb.as_str()) {
+                // Owned by a registered pack that is not enabled: warn,
+                // never error (#177 Q2, matching the #183 warning rule).
+                // The message does not echo the verb.
+                findings.push(
+                    Finding::new(
+                        FindingCode::PackOrphan,
+                        Severity::Warning,
+                        "ledger verb belongs to a disabled pack".to_owned(),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&e.id)
+                    .with_fix(format!("Enable {owner} or remove the line")),
+                );
+            } else {
+                findings.push(
+                    Finding::new(
+                        FindingCode::UnknownVerb,
+                        Severity::Error,
+                        "unknown verb".to_owned(),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&e.id)
+                    .with_fix("Use a core verb or enable the pack that defines it"),
+                );
+            }
         }
+        // The ID-type rule is a property of the verb's definition, so it
+        // applies for verbs owned by any registered pack, enabled or not.
         let expected = match e.verb.as_str() {
             "stage" => Some(Prefix::Deal),
-            "open" | "session" => Some(Prefix::Person),
-            _ => None,
+            _ => enabled_packs
+                .iter()
+                .find_map(|p| p.verb_id_type(e.verb.as_str()))
+                .or_else(|| {
+                    ALL_PACKS
+                        .iter()
+                        .find_map(|p| p.verb_id_type(e.verb.as_str()))
+                }),
         };
         if let Some(want) = expected {
             if e.id.prefix() != want {
@@ -525,7 +591,7 @@ fn check_verbs_and_refs(
 
 pub(crate) type MergeMap = HashMap<RecordId, (RecordId, NaiveDate)>;
 
-fn check_aliases_and_merges(
+pub(crate) fn check_aliases_and_merges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
     as_of: NaiveDate,
@@ -776,7 +842,55 @@ fn detect_cycle(parent: &MergeMap) -> Option<RecordId> {
     None
 }
 
-fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mut Vec<Finding>) {
+/// `W_PACK_ORPHAN` warnings for record fields and record types owned by a
+/// registered pack that is not enabled (#177 Q2). Messages name no field,
+/// type, or value — the finding's file, line, and ID locate the data.
+fn check_orphan_fields_and_types(
+    vault: &Vault,
+    orphans: &OrphanOwners,
+    findings: &mut Vec<Finding>,
+) {
+    if orphans.fields.is_empty() && orphans.record_types.is_empty() {
+        return;
+    }
+    for rec in vault.records.values() {
+        if let Some(owner) = orphans.record_types.get(rec.kind.as_str()) {
+            findings.push(
+                Finding::new(
+                    FindingCode::PackOrphan,
+                    Severity::Warning,
+                    "record type belongs to a disabled pack".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix(format!("Enable {owner} or remove the record")),
+            );
+        }
+        for key in rec.fields.keys() {
+            if let Some(owner) = orphans.fields.get(key.as_str()) {
+                let mut finding = Finding::new(
+                    FindingCode::PackOrphan,
+                    Severity::Warning,
+                    "record field belongs to a disabled pack".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix(format!("Enable {owner} or remove the field"));
+                if let Some(line) = rec.field_lines.get(key) {
+                    finding = finding.at_line(*line);
+                }
+                findings.push(finding);
+            }
+        }
+    }
+}
+
+fn check_balances(
+    vault: &Vault,
+    states: &[(&dyn Pack, Box<dyn PackState>)],
+    orphans: &OrphanOwners,
+    findings: &mut Vec<Finding>,
+) {
     for sourced in &vault.entries {
         if sourced.entry.verb != "balance" {
             continue;
@@ -795,7 +909,7 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
             );
             continue;
         };
-        let Some(number) = e.args.get(1).and_then(Arg::as_token) else {
+        if e.args.get(1).and_then(Arg::as_token).is_none() {
             findings.push(
                 Finding::new(
                     FindingCode::Parse,
@@ -808,119 +922,41 @@ fn check_balances(vault: &Vault, coaching: Option<&CoachingState>, findings: &mu
             );
             continue;
         };
-        match metric {
-            "sessions_remaining" | "icf_hours" => {
-                if coaching.is_none() {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::UnknownMetric,
-                            Severity::Error,
-                            "metric requires packs = [\"coaching@0.1\"]".to_owned(),
-                        )
-                        .at_file(&sourced.file)
-                        .at_line(sourced.line)
-                        .for_id(&e.id)
-                        .with_fix("Enable the coaching pack or remove the assertion"),
-                    );
-                    continue;
-                }
-            }
-            _ => {
-                findings.push(
-                    Finding::new(
-                        FindingCode::UnknownMetric,
-                        Severity::Error,
-                        "unknown metric".to_owned(),
-                    )
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&e.id)
-                    .with_fix("Use sessions_remaining or icf_hours, or remove the balance line"),
-                );
-                continue;
-            }
+        if let Some((pack, state)) = states
+            .iter()
+            .find(|(pack, _)| pack.balance_metrics().contains(&metric))
+        {
+            pack.check_balance(vault, state.as_ref(), sourced, findings);
+            continue;
         }
-        let Some(state) = coaching else { continue };
-        let person = state.canonical_on(&e.id, e.date);
-        if metric == "sessions_remaining" {
-            let asserted: i64 = match number.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::Parse,
-                            Severity::Error,
-                            "expected integer".to_owned(),
-                        )
-                        .at_file(&sourced.file)
-                        .at_line(sourced.line)
-                        .for_id(&e.id)
-                        .with_fix("Use an integer such as 3 for sessions_remaining"),
-                    );
-                    continue;
-                }
-            };
-            let computed = state.sessions_remaining_on(&person, e.date);
-            if asserted != computed {
-                findings.push(
-                    Finding::new(
-                        FindingCode::BalanceMismatch,
-                        Severity::Error,
-                        format!("sessions_remaining asserted {asserted}, computed {computed}"),
-                    )
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&person)
-                    .with_fix(format!(
-                        "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
-                    )),
-                );
-            }
-        } else if metric == "icf_hours" {
-            let Some(asserted) = parse_decimal_hundredths(number) else {
-                findings.push(
-                    Finding::new(
-                        FindingCode::Parse,
-                        Severity::Error,
-                        "expected decimal".to_owned(),
-                    )
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&e.id)
-                    .with_fix("Use a decimal such as 1.50 for icf_hours"),
-                );
-                continue;
-            };
-            let computed = state.icf_hours_hundredths_on(&person, e.date);
-            if asserted != computed {
-                findings.push(
-                    Finding::new(
-                        FindingCode::BalanceMismatch,
-                        Severity::Error,
-                        format!(
-                            "icf_hours asserted {}, computed {}",
-                            format_hundredths(asserted),
-                            format_hundredths(computed)
-                        ),
-                    )
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&person)
-                    .with_fix(format!(
-                        "Check session durations for {person} or correct the assertion"
-                    )),
-                );
-            }
+        if let Some(owner) = orphans.balance_metrics.get(metric) {
+            // Owned by a registered pack that is not enabled: warn, never
+            // error (#177 Q2). The message does not echo the metric.
+            findings.push(
+                Finding::new(
+                    FindingCode::PackOrphan,
+                    Severity::Warning,
+                    "balance metric belongs to a disabled pack".to_owned(),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&e.id)
+                .with_fix(format!("Enable {owner} or remove the assertion")),
+            );
+            continue;
         }
+        findings.push(
+            Finding::new(
+                FindingCode::UnknownMetric,
+                Severity::Error,
+                "unknown metric".to_owned(),
+            )
+            .at_file(&sourced.file)
+            .at_line(sourced.line)
+            .for_id(&e.id)
+            .with_fix("Use a metric an enabled pack defines, or remove the balance line"),
+        );
     }
-}
-
-fn format_hundredths(n: i64) -> String {
-    let sign = if n < 0 { "-" } else { "" };
-    let Some(n) = n.checked_abs() else {
-        return n.to_string();
-    };
-    format!("{sign}{}.{:02}", n / 100, n % 100)
 }
 
 fn check_duplicate_ulids(vault: &Vault, findings: &mut Vec<Finding>) {
@@ -1080,5 +1116,7 @@ mod tests {
         assert_eq!(FindingCode::InvalidId.as_str(), "E_INVALID_ID");
         assert_eq!(FindingCode::SessionUntagged.as_str(), "W_SESSION_UNTAGGED");
         assert_eq!(FindingCode::SessionTags.as_str(), "E_SESSION_TAGS");
+        assert_eq!(FindingCode::PackConflict.as_str(), "E_PACK_CONFLICT");
+        assert_eq!(FindingCode::PackOrphan.as_str(), "W_PACK_ORPHAN");
     }
 }
