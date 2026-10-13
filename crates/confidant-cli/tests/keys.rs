@@ -774,12 +774,58 @@ fn device_add_refuses_retired_recovery_recipient() {
     );
 }
 
+/// Snapshot a directory tree as sorted (relative path, bytes) pairs,
+/// for byte-identical comparisons of `keys/`.
+fn snapshot_tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else if p.is_file() {
+                out.push((
+                    p.strip_prefix(base).unwrap().to_path_buf(),
+                    std::fs::read(&p).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// Number of commits on HEAD in `vault`.
+fn git_log_count(vault: &Path) -> usize {
+    let out = Command::new("git")
+        .current_dir(vault)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git rev-list failed");
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// No staging leftovers from #175: no stage, no backup tree, no staged
+/// seq tracker.
+fn assert_no_staging_leftovers(h: &Harness) {
+    assert!(!h.vault.join(".confidant/keys.stage").exists());
+    assert!(!h.vault.join(".confidant/keys.old").exists());
+    assert!(!h
+        .home
+        .join(".config/confidant/manifest-seq.stage.toml")
+        .exists());
+}
+
 #[test]
-fn device_add_check_failure_points_at_recovery() {
-    // #153 nit 5: when the pre-commit `check` fails after keys/ was
-    // re-wrapped, the error must point at the exact recovery commands
-    // (matching add_recipient's own error path), not just say "check
-    // failed".
+fn device_add_check_failure_leaves_keys_untouched() {
+    // #175: when the pre-commit `check` fails after the keys/ mutation
+    // ran in the stage, keys/ must be byte-identical (including
+    // pre-existing uncommitted operator work), nothing may be committed,
+    // and no staging leftovers may remain. The old "restore with
+    // `git checkout -- keys/`" fix text is gone.
     let h1 = Harness::new();
     assert!(h1.init(&[]).status.success());
     let out = h1
@@ -811,6 +857,12 @@ fn device_add_check_failure_points_at_recovery() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // Uncommitted operator work inside keys/: an untracked note. The
+    // staged copy must carry it, and a failed op must leave it alone.
+    std::fs::write(h1.vault.join("keys/operator-note.txt"), "do not delete\n").unwrap();
+    let before = snapshot_tree(&h1.vault.join("keys"));
+    let commits_before = git_log_count(&h1.vault);
+
     // A directory under a collection whose name is not a record ID makes
     // `check` fail deterministically (E_INVALID_FILENAME).
     std::fs::create_dir_all(h1.vault.join("people/not-a-record-id")).unwrap();
@@ -834,9 +886,360 @@ fn device_add_check_failure_points_at_recovery() {
     assert!(!out.status.success(), "check should block the commit");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("git -C") && stderr.contains("checkout -- keys/"),
-        "expected the keys/ recovery fix text, got: {stderr}"
+        stderr.contains("keys/ was not modified"),
+        "expected the not-modified message, got: {stderr}"
     );
+    assert!(
+        !stderr.contains("checkout -- keys/"),
+        "the git-checkout recovery hint is gone: {stderr}"
+    );
+    assert_eq!(snapshot_tree(&h1.vault.join("keys")), before);
+    assert_eq!(git_log_count(&h1.vault), commits_before);
+    assert_no_staging_leftovers(&h1);
+    // The operator's uncommitted work outside keys/ is untouched too.
+    assert!(h1.vault.join("people/not-a-record-id/profile.md").is_file());
+}
+
+#[test]
+fn revoke_check_failure_leaves_keys_untouched() {
+    // #175: same guarantee as device-add — a failing pre-commit check
+    // after a revoke mutation leaves keys/ byte-identical.
+    let (h1, _h2, _req, key_id, _stderr) = device_add_setup();
+    let before = snapshot_tree(&h1.vault.join("keys"));
+    let commits_before = git_log_count(&h1.vault);
+
+    std::fs::create_dir_all(h1.vault.join("people/not-a-record-id")).unwrap();
+    std::fs::write(
+        h1.vault.join("people/not-a-record-id/profile.md"),
+        "@id: p-01HZZZZZZZZZZZZZZZZZZZZZ\n@type: person\n",
+    )
+    .unwrap();
+
+    let out = h1
+        .cmd(&[
+            "keys",
+            "revoke",
+            "client-a",
+            &key_id,
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "check should block the commit");
+    // --json renders the error as JSON on stdout, not stderr.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("keys/ was not modified"),
+        "expected the not-modified message, got: {message}"
+    );
+    let rendered = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !rendered.contains("checkout -- keys/"),
+        "the git-checkout recovery hint is gone: {rendered}"
+    );
+    assert_eq!(snapshot_tree(&h1.vault.join("keys")), before);
+    assert_eq!(git_log_count(&h1.vault), commits_before);
+    assert_no_staging_leftovers(&h1);
+}
+
+#[test]
+fn device_add_repairs_leftover_staging_state() {
+    // #175: stale stage / keys.old / staged tracker from a crashed run
+    // are repaired before the mutation starts; the op then succeeds.
+    // Doctor reports the leftovers as a warning while keys/ is intact.
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Fake leftovers from a crashed run.
+    let stage = h1.vault.join(".confidant/keys.stage");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("sentinel"), b"stale").unwrap();
+    let old = h1.vault.join(".confidant/keys.old");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("sentinel"), b"old").unwrap();
+    std::fs::write(
+        h1.home.join(".config/confidant/manifest-seq.stage.toml"),
+        b"stale",
+    )
+    .unwrap();
+
+    let out = h1
+        .cmd(&["doctor", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let staging = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "keys-staging")
+        .expect("keys-staging check missing");
+    assert_eq!(staging["status"], "warning");
+
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_staging_leftovers(&h1);
+
+    let out = h1
+        .cmd(&["doctor", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let staging = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "keys-staging")
+        .expect("keys-staging check missing");
+    assert_eq!(staging["status"], "ok");
+}
+
+#[test]
+fn device_add_repairs_mid_swap_leftover() {
+    // #175: crash after the first rename — keys/ missing, keys.old holds
+    // the old tree. Doctor errors; the next keys op restores keys/ from
+    // the backup and succeeds.
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Simulate the crash: keys/ -> keys.old, stale stage left behind.
+    std::fs::create_dir_all(h1.vault.join(".confidant")).unwrap();
+    std::fs::rename(h1.vault.join("keys"), h1.vault.join(".confidant/keys.old")).unwrap();
+    std::fs::create_dir_all(h1.vault.join(".confidant/keys.stage")).unwrap();
+    std::fs::write(h1.vault.join(".confidant/keys.stage/sentinel"), b"stale").unwrap();
+
+    let out = h1
+        .cmd(&["doctor", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let staging = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "keys-staging")
+        .expect("keys-staging check missing");
+    assert_eq!(staging["status"], "error");
+
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(h1.vault.join("keys/client-a/recipients.toml").is_file());
+    assert_no_staging_leftovers(&h1);
+}
+
+#[test]
+fn device_add_preserves_untracked_file_in_keys() {
+    // #175: an untracked operator file inside keys/ survives the swap
+    // (the staged copy carries it).
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    std::fs::write(h1.vault.join("keys/operator-note.txt"), "do not delete\n").unwrap();
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(h1.vault.join("keys/operator-note.txt")).unwrap(),
+        "do not delete\n"
+    );
+    assert_no_staging_leftovers(&h1);
+}
+
+#[test]
+fn device_add_updates_seq_tracker_through_staged_rename() {
+    // #175: the staged seq tracker must be renamed over the real one on
+    // success. Delete the real tracker; a successful device-add must
+    // recreate it (via the staged rename) with this vault's marks.
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success());
+    let out = h1
+        .cmd(&["keys", "init-client", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client failed");
+
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let tracker = h1.home.join(".config/confidant/manifest-seq.toml");
+    assert!(
+        tracker.is_file(),
+        "init-client should have created the tracker"
+    );
+    std::fs::remove_file(&tracker).unwrap();
+
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "device-add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&tracker).unwrap();
+    assert!(
+        text.contains("01TEST00000000000000000000"),
+        "tracker should carry this vault's marks, got: {text}"
+    );
+    assert!(!h1
+        .home
+        .join(".config/confidant/manifest-seq.stage.toml")
+        .exists());
 }
 
 #[test]

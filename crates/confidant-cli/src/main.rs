@@ -2180,6 +2180,51 @@ fn git_version_check(has_signers: bool) -> DoctorCheck {
     git_version_check_from(version, has_signers)
 }
 
+/// `keys-staging` doctor check (#175): leftover `.confidant/keys.stage`,
+/// `.confidant/keys.old`, or staged seq tracker from an interrupted or
+/// crashed keys operation. Leftovers with `keys/` intact are a warning
+/// (the next keys mutation repairs them); `keys/` missing is an error.
+fn keys_staging_check(root: &Path) -> DoctorCheck {
+    let keys_dir = root.join("keys");
+    let mut leftovers: Vec<&str> = Vec::new();
+    if keys_stage_dir(root).exists() {
+        leftovers.push("keys.stage");
+    }
+    if keys_old_dir(root).exists() {
+        leftovers.push("keys.old");
+    }
+    if let Some(config_dir) = confidant_config_dir() {
+        if keys_staged_tracker_path(&config_dir).exists() {
+            leftovers.push("manifest-seq.stage.toml");
+        }
+    }
+    if leftovers.is_empty() {
+        return DoctorCheck {
+            id: "keys-staging",
+            status: "ok",
+            message: "no leftover keys/ staging state".to_owned(),
+        };
+    }
+    let detail = leftovers.join(", ");
+    if keys_dir.exists() {
+        DoctorCheck {
+            id: "keys-staging",
+            status: "warning",
+            message: format!(
+                "leftover keys/ staging state ({detail}) from an interrupted operation; the next keys device-add or revoke repairs it"
+            ),
+        }
+    } else {
+        DoctorCheck {
+            id: "keys-staging",
+            status: "error",
+            message: format!(
+                "keys/ is missing with leftover staging state ({detail}); re-run the interrupted keys command — it repairs staging leftovers before starting"
+            ),
+        }
+    }
+}
+
 /// Skills link health for `setup`-managed installs. Skills ship in the
 /// binary and are linked into agent skill dirs by `confidant setup`; there
 /// is no checkout to compare against a release tag. Warning-only: missing
@@ -2335,6 +2380,9 @@ fn cmd_doctor(
         .map(|u| !u.trust.signers.is_empty())
         .unwrap_or(false);
     checks.push(git_version_check(has_signers));
+
+    // #175: leftover keys/ staging state from an interrupted swap.
+    checks.push(keys_staging_check(root));
 
     match load_vault(root) {
         Ok(vault) => {
@@ -4009,7 +4057,7 @@ fn cmd_keys_revoke(
     client_id: &str,
     key_ids: &[String],
 ) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    use confidant_crypt::anchor;
     validate_keys_client_id(client_id)?;
 
     let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
@@ -4019,22 +4067,17 @@ fn cmd_keys_revoke(
 
     let key_id_refs: Vec<&str> = key_ids.iter().map(|s| s.as_str()).collect();
     let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-    store
-        .revoke(client_id, &key_id_refs, &operator_sk, &anchor)
-        .map_err(anyhow::Error::new)?;
+    // #175: revoke runs against a staged copy of keys/; the pre-commit
+    // check runs inside staged_keys_mutation before the swap, so a
+    // failure leaves keys/ (and the seq tracker) exactly as they were.
+    staged_keys_mutation(root, &vault, &config_dir, |store| {
+        store
+            .revoke(client_id, &key_id_refs, &operator_sk, &anchor)
+            .map_err(anyhow::Error::new)
+    })?;
 
-    // B2: one commit, check first.
+    // B2: one commit (check already ran before the swap).
     let no_input = cli.no_input;
-    let vault = load_vault(root)?;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree",
-        )));
-    }
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
@@ -4269,7 +4312,7 @@ fn cmd_keys_device_add_from_request(
     from_request: Option<&Path>,
     fingerprint_verified: bool,
 ) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore, manifest::RecipientEntry};
+    use confidant_crypt::{anchor, manifest::RecipientEntry};
 
     // B6: exactly one mode; --from-request is required here.
     let request_path = from_request.ok_or_else(|| {
@@ -4350,65 +4393,41 @@ fn cmd_keys_device_add_from_request(
     let operator_sk = load_operator_sk(&anchor)?;
 
     let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-    // #154 must-fix 4: the retired-recovery / shredded-client denylist is
-    // load-bearing here, so fail closed rather than warn when history is
-    // unreadable (shallow clone, missing git, git log failure).
-    if let Some(reason) = store.history_degraded_reason() {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "refusing device-add: {reason}; the retired-recipient denylist would be \
-             incomplete and could re-open a shredded client"
-        ))));
-    }
-    let entry = RecipientEntry {
-        age_pubkey: request.pubkey.clone(),
-        label: label.clone(),
-        scope_ref: String::new(),
-    };
-    // B2: every initialized client's every retained epoch + the lookup
-    // key, all through KeyStore; verify-first inside add_recipient.
-    // Item 7: add_recipient writes client-by-client, so an IO failure
-    // mid-write can leave keys/ half-updated and uncommitted. Nothing is
-    // committed on this path, so point at the exact recovery command
-    // instead of attempting an in-code restore (which could clobber the
-    // operator's own uncommitted work).
-    let clients = store
-        .add_recipient(&key_id, &entry, identity.as_ref(), &anchor, &operator_sk)
-        .map_err(|e| {
-            anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "device-add failed; keys/ may be partially updated (nothing was committed): {e}"
-                ))
-                .with_fix(format!(
-                    "inspect with `git -C {} status -- keys/`, then restore tracked files with \
-                     `git -C {} checkout -- keys/` and delete any new untracked {key_id}*.age wrappings",
-                    root.display(),
-                    root.display(),
-                )),
-            )
-        })?;
+    // #175: device-add runs against a staged copy of keys/; the
+    // pre-commit check runs inside staged_keys_mutation before the swap,
+    // so a failure leaves keys/ (and the seq tracker) exactly as they
+    // were. No more "restore with git checkout -- keys/" recovery hints.
+    let clients = staged_keys_mutation(root, &vault, &config_dir, |store| {
+        // #154 must-fix 4: the retired-recovery / shredded-client
+        // denylist is load-bearing here, so fail closed rather than warn
+        // when history is unreadable (shallow clone, missing git, git log
+        // failure).
+        if let Some(reason) = store.history_degraded_reason() {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "refusing device-add: {reason}; the retired-recipient denylist would be \
+                 incomplete and could re-open a shredded client"
+            ))));
+        }
+        let entry = RecipientEntry {
+            age_pubkey: request.pubkey.clone(),
+            label: label.clone(),
+            scope_ref: String::new(),
+        };
+        // B2: every initialized client's every retained epoch + the
+        // lookup key, all through KeyStore; verify-first inside
+        // add_recipient.
+        store
+            .add_recipient(&key_id, &entry, identity.as_ref(), &anchor, &operator_sk)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "device-add failed; keys/ was not modified (nothing was committed): {e}"
+                )))
+            })
+    })?;
 
-    // One commit, check first, signed by the operator key (design §6).
+    // One commit, signed by the operator key (design §6). Check already
+    // ran inside staged_keys_mutation, before the swap.
     let no_input = cli.no_input;
-    let vault = load_vault(root)?;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        // keys/ was already re-wrapped above; point at the exact recovery
-        // command (#153 nit 5), matching add_recipient's own error path.
-        return Err(anyhow::Error::new(
-            DomainError::invalid(
-                "check failed before committing keys/ tree; nothing was committed",
-            )
-            .with_fix(format!(
-                "inspect with `git -C {} status -- keys/`, then restore tracked files with \
-                 `git -C {} checkout -- keys/` and delete any new untracked {key_id}*.age wrappings",
-                root.display(),
-                root.display(),
-            )),
-        ));
-    }
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
@@ -4438,6 +4457,218 @@ fn cmd_keys_device_add_from_request(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Staging paths for the atomic `keys/` swap (#175). All scratch lives
+/// under the git-ignored `.confidant/` dir (keys staging) or the config
+/// dir (seq-tracker staging), so a leftover is never committed and never
+/// mistaken for vault content.
+fn keys_stage_dir(root: &Path) -> PathBuf {
+    root.join(".confidant").join("keys.stage")
+}
+
+fn keys_old_dir(root: &Path) -> PathBuf {
+    root.join(".confidant").join("keys.old")
+}
+
+/// Staged copy of the seq tracker: same directory as the real tracker,
+/// so the success-path rename is atomic (same filesystem). The staged
+/// tracker holds the marks for ALL vaults (copied through), not just
+/// this one.
+fn keys_staged_tracker_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("manifest-seq.stage.toml")
+}
+
+/// Remove a file or directory, best-effort. Used for staging cleanup,
+/// where a leftover is repaired on the next run anyway.
+fn remove_path_best_effort(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Copy a directory tree: files via `fs::copy`, subdirectories
+/// recursively. Symlinks are refused (keys/ is CLI-managed and must not
+/// contain them) — fail closed rather than follow or silently drop one.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "unexpected symlink in keys/ tree at {}",
+                entry.path().display()
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// Repair leftover staging state from a crashed or failed keys operation
+/// (#175). Runs before every staged keys mutation. The swap order makes
+/// every window unambiguous:
+///
+/// - `keys.old` + `keys/` both present: the swap completed, `keys/` is the
+///   new tree — delete the old tree.
+/// - `keys.old` present + `keys/` missing: crash mid-swap, before the
+///   stage was renamed in — restore the old tree.
+/// - No `keys.old`: any stage / staged tracker is a leftover from a
+///   failed op (keys/ was never touched) — delete it.
+/// - `keys/` missing + stage present + no `keys.old`: inconsistent (the
+///   copy never deletes keys/) — refuse to guess.
+fn repair_keys_staging(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    let keys_dir = root.join("keys");
+    let old = keys_old_dir(root);
+    let stage = keys_stage_dir(root);
+    let staged_tracker = keys_staged_tracker_path(config_dir);
+    if old.exists() {
+        if keys_dir.exists() {
+            remove_path_best_effort(&old);
+        } else {
+            std::fs::rename(&old, &keys_dir)?;
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Ok(());
+        }
+    } else if !keys_dir.exists() && stage.exists() {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "keys/ is missing but a staging copy exists with no backup; refusing to guess which tree is canonical — inspect .confidant/keys.stage/ and restore keys/ by hand",
+        )));
+    }
+    remove_path_best_effort(&stage);
+    remove_path_best_effort(&staged_tracker);
+    Ok(())
+}
+
+/// Run a `keys/` mutation atomically (#175): stage the tree aside,
+/// mutate the stage, check, then swap the stage into place. A failure
+/// at any point before the swap leaves `keys/` (and the seq tracker)
+/// exactly as they were; on failure only the staging copies are deleted.
+///
+/// The staged `KeyStore` reads git history from the COMMITTED tree
+/// (`with_committed_keys_dir`), so the shredded-pubkey denylist sees the
+/// same history as the unstaged path.
+///
+/// Ordering matters: the keys swap runs BEFORE the tracker rename. A
+/// crash between them leaves the new tree with the old tracker, which is
+/// consistent (manifest seqs are >= the old high-water marks, so the
+/// next operation just picks higher seqs). The reverse order would leave
+/// the old tree with a new tracker, and verification would refuse the
+/// old manifests as stale.
+///
+/// `vault` is the already-loaded vault: `check` runs against it before
+/// the swap. Check never reads `keys/` contents (only whether the tree
+/// exists), so no vault view over the stage is needed.
+fn staged_keys_mutation<T>(
+    root: &Path,
+    vault: &confidant_core::Vault,
+    config_dir: &Path,
+    mutate: impl FnOnce(&mut confidant_crypt::lifecycle::KeyStore) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    use confidant_crypt::{
+        lifecycle::KeyStore,
+        manifest::{self, SeqTracker},
+    };
+    repair_keys_staging(root, config_dir)?;
+    let keys_dir = root.join("keys");
+    let stage = keys_stage_dir(root);
+    let old = keys_old_dir(root);
+    let staged_tracker = keys_staged_tracker_path(config_dir);
+    let real_tracker = manifest::seq_tracker_path(config_dir);
+
+    // Stage the tree (full copy, including any uncommitted operator work)
+    // and the seq tracker. The tracker is staged in the config dir so
+    // the success-path rename is atomic. Any failure here cleans up the
+    // partial stage, so a failed setup leaves no leftovers.
+    let mut store = match (|| -> anyhow::Result<KeyStore> {
+        if keys_dir.exists() {
+            copy_dir_recursive(&keys_dir, &stage)?;
+        } else {
+            std::fs::create_dir_all(&stage)?;
+        }
+        if real_tracker.exists() {
+            std::fs::copy(&real_tracker, &staged_tracker)?;
+        }
+        let seq = SeqTracker::load(&staged_tracker).map_err(anyhow::Error::new)?;
+        Ok(KeyStore::new(stage.clone(), &vault.config.vault_id, seq)
+            .with_committed_keys_dir(keys_dir.clone()))
+    })() {
+        Ok(s) => s,
+        Err(e) => {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Err(e);
+        }
+    };
+
+    // Mutate the stage. On failure the stage + staged tracker are deleted
+    // and keys/ + the real tracker are untouched.
+    let result = match mutate(&mut store) {
+        Ok(v) => v,
+        Err(e) => {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Err(e);
+        }
+    };
+
+    // Pre-commit check before the swap, so a failing check also leaves
+    // keys/ untouched.
+    let pre = check_vault(vault, &CheckOptions::default());
+    if !pre.ok {
+        remove_path_best_effort(&stage);
+        remove_path_best_effort(&staged_tracker);
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree; nothing was committed and keys/ was not modified",
+        )));
+    }
+
+    // Swap: keys/ -> keys.old, stage -> keys/.
+    if keys_dir.exists() {
+        if let Err(e) = std::fs::rename(&keys_dir, &old) {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "keys/ swap failed before anything moved ({e}); keys/ was not modified"
+            ))));
+        }
+    }
+    if let Err(e) = std::fs::rename(&stage, &keys_dir) {
+        // Mid-swap: repair restores keys.old -> keys/.
+        let _ = repair_keys_staging(root, config_dir);
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "keys/ swap failed mid-swap ({e}); staging leftovers were repaired, keys/ was restored"
+        ))));
+    }
+
+    // Tracker rename (same directory, atomic). Keys-swap-first: new tree +
+    // old tracker is consistent (and self-healing — the next operation
+    // re-derives high-water marks from the manifests), so even a failure
+    // here cannot brick the vault. Best-effort rollback, then repair.
+    if staged_tracker.exists() {
+        if let Err(e) = std::fs::rename(&staged_tracker, &real_tracker) {
+            remove_path_best_effort(&keys_dir);
+            if std::fs::rename(&old, &keys_dir).is_ok() {
+                remove_path_best_effort(&staged_tracker);
+            }
+            let _ = repair_keys_staging(root, config_dir);
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "seq tracker update failed ({e}); keys/ was rolled back and nothing was committed"
+            ))));
+        }
+    }
+
+    // Cleanup of the old tree is best-effort; the next run repairs a leftover.
+    remove_path_best_effort(&old);
+    Ok(result)
 }
 
 /// Remove leftover `keys/.confidant-tmp-*` files from a crashed atomic
@@ -4783,5 +5014,182 @@ mod tests {
         // Undetermined version is a warning, never an error.
         let c = git_version_check_from(None, true);
         assert_eq!(c.status, "warning");
+    }
+
+    /// Snapshot a directory tree as sorted (relative path, bytes) pairs,
+    /// for byte-identical comparisons of `keys/`.
+    fn snapshot_tree(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn walk(
+            dir: &std::path::Path,
+            base: &std::path::Path,
+            out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, base, out);
+                } else if p.is_file() {
+                    out.push((
+                        p.strip_prefix(base).unwrap().to_path_buf(),
+                        std::fs::read(&p).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Minimal vault dir (confidant.toml only) + a fake `keys/` tree +
+    /// a seq tracker, for staging-helper tests.
+    fn staging_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("keys/client-a/wrapped")).unwrap();
+        std::fs::write(root.join("keys/client-a/recipients.toml"), "seq = 1\n").unwrap();
+        std::fs::write(root.join("keys/client-a/wrapped/abc.age"), b"wrapped").unwrap();
+        std::fs::write(
+            root.join("keys/recovery-recipients.toml"),
+            "recipients = []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("manifest-seq.toml"),
+            "[01TEST00000000000000000000]\nclient-a = 3\n",
+        )
+        .unwrap();
+        (tmp, root, config_dir)
+    }
+
+    #[test]
+    fn staged_keys_mutation_failure_leaves_keys_and_tracker_untouched() {
+        // #175: a failing mutation must leave keys/ byte-identical, the
+        // real tracker untouched, and no staging leftovers. The helper
+        // cannot distinguish "before" vs "mid" mutation — the cleanup
+        // path is identical — so a failing closure proves the mechanics;
+        // the CLI check-failure tests prove a fully-mutated stage is
+        // discarded too.
+        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, staged_keys_mutation};
+        let (_tmp, root, config_dir) = staging_fixture();
+        let before = snapshot_tree(&root.join("keys"));
+        let vault = confidant_core::load_vault(&root).unwrap();
+        let err =
+            staged_keys_mutation(&root, &vault, &config_dir, |_store| -> anyhow::Result<()> {
+                Err(anyhow::anyhow!("injected failure"))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("injected failure"));
+        assert_eq!(snapshot_tree(&root.join("keys")), before);
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("manifest-seq.toml")).unwrap(),
+            "[01TEST00000000000000000000]\nclient-a = 3\n"
+        );
+        assert!(!keys_stage_dir(&root).exists());
+        assert!(!keys_old_dir(&root).exists());
+        assert!(!keys_staged_tracker_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn repair_keys_staging_restores_mid_swap() {
+        // Crash after the first rename: keys/ missing, keys.old holds
+        // the old tree, stage + staged tracker are stale.
+        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, repair_keys_staging};
+        let (_tmp, root, config_dir) = staging_fixture();
+        std::fs::create_dir_all(root.join(".confidant")).unwrap();
+        std::fs::rename(root.join("keys"), keys_old_dir(&root)).unwrap();
+        std::fs::create_dir_all(keys_stage_dir(&root)).unwrap();
+        std::fs::write(keys_stage_dir(&root).join("sentinel"), b"stale").unwrap();
+        std::fs::write(keys_staged_tracker_path(&config_dir), b"stale").unwrap();
+        repair_keys_staging(&root, &config_dir).unwrap();
+        assert!(root.join("keys/client-a/recipients.toml").is_file());
+        assert!(!keys_old_dir(&root).exists());
+        assert!(!keys_stage_dir(&root).exists());
+        assert!(!keys_staged_tracker_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn repair_keys_staging_cleans_completed_swap() {
+        // Swap completed (keys/ is the new tree), cleanup never ran:
+        // keys.old is deleted, keys/ is untouched.
+        use super::{keys_old_dir, repair_keys_staging};
+        let (_tmp, root, config_dir) = staging_fixture();
+        let before = snapshot_tree(&root.join("keys"));
+        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
+        std::fs::write(keys_old_dir(&root).join("sentinel"), b"old").unwrap();
+        repair_keys_staging(&root, &config_dir).unwrap();
+        assert_eq!(snapshot_tree(&root.join("keys")), before);
+        assert!(!keys_old_dir(&root).exists());
+    }
+
+    #[test]
+    fn repair_keys_staging_refuses_inconsistent_state() {
+        // keys/ missing with a stage but no backup: the copy never
+        // deletes keys/, so this means external interference — refuse
+        // to guess.
+        use super::{keys_stage_dir, repair_keys_staging};
+        let (_tmp, root, config_dir) = staging_fixture();
+        std::fs::remove_dir_all(root.join("keys")).unwrap();
+        std::fs::create_dir_all(keys_stage_dir(&root)).unwrap();
+        assert!(repair_keys_staging(&root, &config_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_keys_mutation_copy_failure_leaves_no_leftovers() {
+        // #175: a symlink in keys/ makes the staged copy fail — the
+        // partial stage must be cleaned up, not left behind.
+        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, staged_keys_mutation};
+        let (_tmp, root, config_dir) = staging_fixture();
+        std::os::unix::fs::symlink(
+            root.join("keys/client-a/recipients.toml"),
+            root.join("keys/link.toml"),
+        )
+        .unwrap();
+        let vault = confidant_core::load_vault(&root).unwrap();
+        let err =
+            staged_keys_mutation(&root, &vault, &config_dir, |_store| -> anyhow::Result<()> {
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert!(root.join("keys/link.toml").exists());
+        assert!(!keys_stage_dir(&root).exists());
+        assert!(!keys_old_dir(&root).exists());
+        assert!(!keys_staged_tracker_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_tree_and_refuses_symlink() {
+        use super::copy_dir_recursive;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"b");
+
+        #[cfg(unix)]
+        {
+            let src2 = tmp.path().join("src2");
+            let dst2 = tmp.path().join("dst2");
+            std::fs::create_dir_all(&src2).unwrap();
+            std::fs::write(src2.join("real.txt"), b"real").unwrap();
+            std::os::unix::fs::symlink(src2.join("real.txt"), src2.join("link.txt")).unwrap();
+            assert!(copy_dir_recursive(&src2, &dst2).is_err());
+        }
     }
 }
