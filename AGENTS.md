@@ -148,6 +148,10 @@ These are blocking. Do not open a PR for review that breaks one.
 - **PR body** has these sections: title, summary, spec changes (or "none"),
   test evidence (commands run and results), and **Decisions I made** (each
   place the spec was silent and what you chose).
+- **Closing lines:** every PR body must include one line per issue it fully
+  resolves: `Fixes #N`, one issue per line (never `Fixes #A, #B`). Use
+  `Part of #N` or `Refs #N` for partial work. References in the title do
+  not count. Reviewers confirm these lines before signing off.
 - **When the spec is silent, choose the simpler option** and record it under
   Decisions I made. Stop and ask only for changes to the file format or the
   privacy model (rules 6 and 7).
