@@ -3,10 +3,10 @@
 **Confidant is relationship memory you own.** Your agents share one memory
 of the people in your life — people, organizations, deals, interactions,
 notes — and every change is proposed by an agent, verified by deterministic
-rules (`confidant check`), and recorded by you. It is not a sales CRM: there
-is no pipeline, no funnel, nothing customer-facing. With the right schema
-pack it can run a coaching practice, track personal relationships, or model
-any other relationship domain — the core stays the same.
+rules (`confidant check`), and recorded by you. It's a private record of
+relationships. With the right schema pack it can run a coaching practice,
+track personal relationships, or model any other relationship domain —
+the core stays the same.
 
 Records live in plain-text files in a git repo (the **vault**). The Rust CLI
 `confidant` reads, checks, and writes them. There is no server.
@@ -20,19 +20,6 @@ use, in files you can read. Underneath, a ledger of dated facts
 
 New here? Start with [Agent setup](#agent-setup) for the one-prompt
 install, or [Quickstart](#quickstart) to try the fake-data demo vault.
-
-## Status: one thing is not ready for other people's data
-
-**The encryption has had no outside review.** The design was reviewed
-in-project and the implementation's tests pass, but no independent reviewer
-has audited it. Tracked in
-[#138](https://github.com/hirefrank/confidant/issues/138).
-
-So, today: **keep vaults on trusted devices with encrypted disks, and do not
-put other people's client data in them.** `confidant check`, the privacy
-allowlist, and `no-ai` all work, but they are not a substitute for the
-outside audit. This section will say plainly when the audit lands; until
-then it is the disclosure.
 
 ## Install
 
@@ -260,6 +247,19 @@ The roadmap is tracked as open issues on GitHub. The big themes:
   records. [Issue #219](https://github.com/hirefrank/confidant/issues/219).
 - **Ledger query performance** — a rebuildable local index.
   [Issue #188](https://github.com/hirefrank/confidant/issues/188).
+
+## Status: one thing is not ready for other people's data
+
+**The encryption has had no outside review.** The design was reviewed
+in-project and the implementation's tests pass, but no independent reviewer
+has audited it. Tracked in
+[#138](https://github.com/hirefrank/confidant/issues/138).
+
+So, today: **keep vaults on trusted devices with encrypted disks, and do not
+put other people's client data in them.** `confidant check`, the privacy
+allowlist, and `no-ai` all work, but they are not a substitute for the
+outside audit. This section will say plainly when the audit lands; until
+then it is the disclosure.
 
 ## License
 
