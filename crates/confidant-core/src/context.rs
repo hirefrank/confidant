@@ -15,7 +15,9 @@ use serde::Serialize;
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
 use crate::id::RecordId;
 use crate::packs::coaching::CoachingView;
+use crate::packs::{resolve_enabled, ALL_PACKS};
 use crate::record::RecordKind;
+use crate::scope::{note_linkage_owners, record_owners, OwnerKey, PackScope};
 use crate::search::cleared_record_ids;
 use crate::vault::Vault;
 
@@ -68,6 +70,9 @@ pub struct PersonContext {
     pub skipped_encrypted: u32,
     /// Envelopes refused as tampered/corrupt while loading (spec 4, ⚠2c).
     pub refused_envelopes: u32,
+    /// Pack names in scope for this bundle, sorted. For an unscoped call,
+    /// every enabled pack — the scope that actually applied (#178).
+    pub scope: Vec<String>,
 }
 
 /// Build the context bundle for `person`.
@@ -75,10 +80,15 @@ pub struct PersonContext {
 /// Returns `None` when no record with that id exists. `include_private`
 /// controls PII; records outside the §12 cleared set never show PII,
 /// and uncleared notes/interactions are omitted entirely (like `find`).
+/// `scope` further filters to the packs in scope (#178): core-owned items
+/// (name, profile, aliases) stay visible, notes/interactions owned by
+/// other packs are omitted, unattributed notes/interactions are omitted,
+/// and other packs' views are dropped from `packs`.
 pub fn build_context(
     vault: &Vault,
     person: &RecordId,
     include_private: bool,
+    scope: &PackScope,
 ) -> Option<PersonContext> {
     let record = vault.records.get(person)?;
     if record.kind != RecordKind::Person {
@@ -104,6 +114,10 @@ pub fn build_context(
     let mut packs: std::collections::BTreeMap<String, serde_json::Value> =
         std::collections::BTreeMap::new();
     for (pack, state) in &snapshots {
+        // #178: a scoped call sees only its packs' views.
+        if !scope.allows(&[OwnerKey::Pack(pack.name())].into_iter().collect()) {
+            continue;
+        }
         if let Some(view) = pack.context_view(vault, state.as_ref(), person, &canonical, as_of) {
             packs.insert(pack.name().to_string(), view);
         }
@@ -117,6 +131,13 @@ pub fn build_context(
 
     let person_dir = format!("people/{person}/notes/");
 
+    // #178: notes/interactions filter by pack ownership. A note is visible
+    // when a pack in scope owns it (field claim or ledger linkage);
+    // unattributed notes are visible only unscoped.
+    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let linkage = note_linkage_owners(vault, &enabled);
+    let scope_names = scope.names(&enabled);
+
     let mut notes: Vec<NoteView> = vault
         .records
         .values()
@@ -124,6 +145,7 @@ pub fn build_context(
             r.kind == RecordKind::Note
                 && cleared.contains(&r.id)
                 && (r.path.starts_with(&person_dir) || r.person().as_ref() == Some(&canonical))
+                && scope.allows(&record_owners(r, &linkage, &enabled))
         })
         .map(|r| NoteView {
             id: r.id.to_string(),
@@ -140,6 +162,7 @@ pub fn build_context(
             r.kind == RecordKind::Interaction
                 && cleared.contains(&r.id)
                 && r.person().as_ref() == Some(&canonical)
+                && scope.allows(&record_owners(r, &linkage, &enabled))
         })
         .map(|r| InteractionView {
             id: r.id.to_string(),
@@ -174,6 +197,7 @@ pub fn build_context(
         aliases,
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
+        scope: scope_names,
     })
 }
 
@@ -192,6 +216,54 @@ mod tests {
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
         let id = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
-        assert!(build_context(&vault, &id, true).is_none());
+        assert!(build_context(&vault, &id, true, &PackScope::All).is_none());
+    }
+
+    fn demo_vault() -> crate::vault::Vault {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+        crate::vault::load_vault(&root).unwrap()
+    }
+
+    fn coaching_scope() -> PackScope {
+        PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+    }
+
+    #[test]
+    fn scoped_context_hides_unattributed_notes_and_interactions() {
+        // Demo vault Ada: one session-linked note (coaching), one
+        // unattributed note, one unattributed interaction.
+        let vault = demo_vault();
+        let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let unscoped = build_context(&vault, &ada, true, &PackScope::All).unwrap();
+        assert_eq!(unscoped.notes.len(), 2);
+        assert_eq!(unscoped.interactions.len(), 1);
+        assert!(unscoped.coaching.is_some());
+
+        let scoped = build_context(&vault, &ada, true, &coaching_scope()).unwrap();
+        // Only the session-linked note survives; the unattributed note and
+        // the interaction are hidden. Core identity stays visible.
+        assert_eq!(scoped.notes.len(), 1);
+        assert_eq!(scoped.notes[0].id, "n-01M3TC5H00MPJG002NAM000005");
+        assert!(scoped.interactions.is_empty());
+        assert!(scoped.coaching.is_some());
+        assert_eq!(scoped.person.name.as_deref(), Some("Ada Example"));
+        assert!(!scoped.aliases.is_empty());
+        assert_eq!(scoped.scope, vec!["coaching@0.1"]);
+    }
+
+    #[test]
+    fn scoped_context_drops_other_packs_views() {
+        // The packs map only carries views for packs in scope.
+        let vault = demo_vault();
+        let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
+        let scoped = build_context(&vault, &ada, true, &coaching_scope()).unwrap();
+        assert!(scoped.packs.contains_key("coaching@0.1"));
+        let empty = PackScope::Only(std::collections::BTreeSet::new());
+        let none = build_context(&vault, &ada, true, &empty).unwrap();
+        assert!(none.packs.is_empty());
+        assert!(none.coaching.is_none());
+        // Core identity is still there even with an empty scope.
+        assert_eq!(none.person.name.as_deref(), Some("Ada Example"));
     }
 }

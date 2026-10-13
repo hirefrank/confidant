@@ -29,8 +29,10 @@ use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
+use confidant_core::packs::{resolve_enabled, ALL_PACKS};
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
+use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
     apply_write, apply_write_with_encryptor, require_git_repo, FileChange, PendingWrite,
     WriteOptions, WriteOutcome,
@@ -78,6 +80,14 @@ struct Cli {
     /// after shredding. Generate a ULID or UUIDv4 once and reuse it on retry.
     #[arg(long, global = true)]
     request_id: Option<String>,
+
+    /// Pack scope for agent-facing reads (`find`, `context`, `allowlist`,
+    /// `mcp`). Comma-separated pack names, e.g. `coaching@0.1`. Unset =
+    /// all enabled packs. Naming an unknown or disabled pack is a hard
+    /// error (#178). Ignored by `check` / `doctor` (always unscoped) and
+    /// by writes.
+    #[arg(long, global = true)]
+    packs: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -549,7 +559,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Find { query, limit } => {
             let root = vault_root.unwrap();
-            cmd_find(json, &root, query, *limit)
+            cmd_find(json, &root, query, *limit, cli.packs.as_deref())
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
@@ -572,14 +582,45 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 print_error(json, Some(&vault.root.display().to_string()), &err)?;
                 return Ok(ExitCode::from(err.exit_code() as u8));
             }
-            let files: Vec<String> = confidant_core::cleared_record_paths(&vault)
-                .into_iter()
-                .collect();
-            let mut ledger: Vec<serde_json::Value> = Vec::new();
-            for (file, lines) in confidant_core::cleared_ledger_lines(&vault) {
-                for line in lines {
-                    ledger.push(serde_json::json!({"file": file, "line": line}));
+            let (scope, _scope_names) = match resolve_cli_scope(&vault, cli.packs.as_deref()) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    print_error(json, Some(&vault.root.display().to_string()), &err)?;
+                    return Ok(ExitCode::from(err.exit_code() as u8));
                 }
+            };
+            // #178: scope the cleared set, and annotate each entry with its
+            // owning packs (for index-time consumers — the QMD index
+            // carries ownership via this output; query-time filtering
+            // stays in `find`). `owning_packs` is [] for unattributed
+            // items, ["core"] for core-owned items.
+            let mut owning_packs: serde_json::Map<String, Value> = serde_json::Map::new();
+            let mut files: Vec<String> = Vec::new();
+            for (path, owners) in confidant_core::cleared_record_owners(&vault) {
+                if !scope.allows(&owners) {
+                    continue;
+                }
+                owning_packs.insert(
+                    path.clone(),
+                    Value::Array(
+                        owner_labels(&owners)
+                            .into_iter()
+                            .map(|s| Value::String(s.to_owned()))
+                            .collect(),
+                    ),
+                );
+                files.push(path);
+            }
+            let mut ledger: Vec<serde_json::Value> = Vec::new();
+            for (file, line, owners) in confidant_core::cleared_ledger_line_owners(&vault) {
+                if !scope.allows(&owners) {
+                    continue;
+                }
+                ledger.push(serde_json::json!({
+                    "file": file,
+                    "line": line,
+                    "owning_packs": owner_labels(&owners),
+                }));
             }
             if json {
                 println!(
@@ -590,6 +631,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         "vault": vault.root.display().to_string(),
                         "cleared_files": files,
                         "cleared_ledger_lines": ledger,
+                        "owning_packs": owning_packs,
+                        "scope": _scope_names,
                     })
                 );
             } else {
@@ -781,7 +824,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Routing => cmd_routing(&cli),
         Command::Mcp => {
             let root = vault_root.unwrap();
-            mcp::run(&root)
+            mcp::run(&root, cli.packs.clone())
         }
     }
 }
@@ -794,6 +837,20 @@ fn load_vault_or(root: &Path, json: bool) -> Result<confidant_core::Vault, ExitC
             Err(ExitCode::from(err.exit_code() as u8))
         }
     }
+}
+
+/// Resolve `--packs` against the vault's enabled packs (#178). Returns
+/// the scope plus the pack names that actually apply (for JSON output).
+/// Naming an unknown or disabled pack is a usage error (exit 2).
+fn resolve_cli_scope(
+    vault: &confidant_core::Vault,
+    raw: Option<&str>,
+) -> Result<(PackScope, Vec<String>), DomainError> {
+    let requested = raw.map(parse_pack_list);
+    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let scope = resolve_scope(requested.as_deref(), &enabled)?;
+    let names = scope.names(&enabled);
+    Ok((scope, names))
 }
 
 /// Load the vault for a read command (`find`/`context`, spec 4). Two-phase:
@@ -870,7 +927,13 @@ fn fail_command(json: bool, vault: Option<&str>, err: &anyhow::Error) -> anyhow:
     Ok(ExitCode::from(domain.exit_code() as u8))
 }
 
-fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Result<ExitCode> {
+fn cmd_find(
+    json: bool,
+    root: &Path,
+    query: &str,
+    limit: usize,
+    packs: Option<&str>,
+) -> anyhow::Result<ExitCode> {
     if query.trim().is_empty() {
         return Err(anyhow::Error::new(DomainError::usage(
             "find requires a non-empty query",
@@ -889,7 +952,14 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
         )?;
         return Ok(ExitCode::from(1));
     }
-    let result = match search(&vault, query) {
+    let (scope, scope_names) = match resolve_cli_scope(&vault, packs) {
+        Ok(pair) => pair,
+        Err(err) => {
+            print_error(json, Some(&vault_path), &err)?;
+            return Ok(ExitCode::from(err.exit_code() as u8));
+        }
+    };
+    let result = match search(&vault, query, &scope) {
         Ok(result) => result,
         Err(err) => {
             print_error(json, Some(&vault_path), &err)?;
@@ -906,6 +976,7 @@ fn cmd_find(json: bool, root: &Path, query: &str, limit: usize) -> anyhow::Resul
                 "findings": result.findings,
                 "skipped_encrypted": result.skipped_encrypted,
                 "refused_envelopes": result.refused_envelopes,
+                "scope": scope_names,
             }),
         ))?;
     } else {
@@ -2105,7 +2176,14 @@ fn cmd_context(
             "`context` takes an opaque person id; use `confidant find <name>` to look one up",
         )
     })?;
-    let bundle = match build_context(&vault, &person, include_private) {
+    let (scope, _scope_names) = match resolve_cli_scope(&vault, cli.packs.as_deref()) {
+        Ok(pair) => pair,
+        Err(err) => {
+            print_error(cli.json, Some(&vault.root.display().to_string()), &err)?;
+            return Ok(ExitCode::from(err.exit_code() as u8));
+        }
+    };
+    let bundle = match build_context(&vault, &person, include_private, &scope) {
         Some(b) => b,
         None => {
             // ⚠2b: the person's key is absent (their record is an envelope
@@ -2137,6 +2215,11 @@ fn cmd_context(
             p.name.as_deref().unwrap_or("(name withheld)"),
             if p.no_ai { " [no-ai]" } else { "" }
         );
+        // #178: show the scope that applied, so a scoped bundle is never
+        // mistaken for the whole record.
+        if !bundle.scope.is_empty() && matches!(scope, PackScope::Only(_)) {
+            println!("scope: {}", bundle.scope.join(", "));
+        }
         if let Some(c) = &bundle.coaching {
             println!("sessions remaining: {}", c.sessions_remaining);
             println!("icf hours: {:.2}", c.icf_hours);

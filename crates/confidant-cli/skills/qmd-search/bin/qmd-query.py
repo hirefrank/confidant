@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Query a vault through the local QMD index, honoring the §12 allowlist.
 
-Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] QUERY
+Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY
 
 - Runs `qmd query|search|vsearch --json` against the `confidant` collection.
 - EVERY hit is verified through `confidant find` before being returned: a
@@ -12,6 +12,11 @@ Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] QUERY
 - If QMD or the index is missing, falls back to plain `confidant find`.
 - Output is JSON on stdout mirroring `find --json` (plus score/via per
   match and a dropped_uncleared count). Diagnostics go to stderr.
+- `--packs` (comma-separated, issue #178) scopes the verification and
+  fallback `find` calls, so a scoped agent never sees hits owned by another
+  pack. The QMD index itself is unscoped; the `find` verification is the
+  enforcement point. `reindex` annotates each cleared file/line with its
+  owning packs (`allowlist --json` `owning_packs`) for index-time consumers.
 
 This keeps the allowlist logic in exactly one place (the Rust CLI): the
 skill never reimplements clearance, so it cannot drift.
@@ -155,6 +160,9 @@ def main():
                     help="bm25 works with no model downloads (default); "
                          "hybrid/vector need `qmd embed` first")
     ap.add_argument("-n", type=int, default=10)
+    ap.add_argument("--packs", default=None, metavar="LIST",
+                    help="comma-separated pack scope (issue #178); passed to "
+                         "the verification and fallback `find` calls")
     ap.add_argument("query", nargs=argparse.REMAINDER)
     args = ap.parse_args()
     query = " ".join(args.query).strip()
@@ -162,6 +170,8 @@ def main():
         ap.error("QUERY is required")
 
     vault = resolve_vault(args.vault)
+    # Extra args for every `confidant find` invocation below.
+    find_extra = ["--packs", args.packs] if args.packs else []
     corpus = os.path.join(vault, ".confidant", "qmd-corpus")
     qmd = shutil.which("qmd")
     env = qmd_env(vault)
@@ -173,7 +183,7 @@ def main():
         exe = shutil.which("confidant")
         if exe is None:
             sys.exit("error: neither qmd nor confidant is on PATH")
-        p = subprocess.run([exe, "--vault", vault, "find", query, "--json"],
+        p = subprocess.run([exe, "--vault", vault, "find", query, "--json", *find_extra],
                            capture_output=True, text=True, timeout=120)
         try:
             data = json.loads(p.stdout)
@@ -230,7 +240,7 @@ def main():
         if not probe:
             dropped += 1  # nothing verifiable: fail closed
             continue
-        res = confidant(vault, "find", probe, "--json")
+        res = confidant(vault, "find", probe, "--json", *find_extra)
         if res is None:
             dropped += 1
             continue

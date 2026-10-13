@@ -598,7 +598,7 @@ fn no_ai_people_are_excluded_from_search() {
         &format!("---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nsecret-token in a note\n"),
     );
     let vault = load_vault(dir.path()).unwrap();
-    let hits = confidant_core::search(&vault, "secret-token")
+    let hits = confidant_core::search(&vault, "secret-token", &confidant_core::PackScope::All)
         .expect("search")
         .hits;
     assert!(hits.is_empty(), "{hits:?}");
@@ -615,9 +615,13 @@ fn unparsable_ledger_lines_are_searchable() {
         "this-unique-garbage-token is not an entry\n",
     );
     let vault = load_vault(dir.path()).unwrap();
-    let hits = confidant_core::search(&vault, "this-unique-garbage-token")
-        .expect("search")
-        .hits;
+    let hits = confidant_core::search(
+        &vault,
+        "this-unique-garbage-token",
+        &confidant_core::PackScope::All,
+    )
+    .expect("search")
+    .hits;
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].line, 1);
 }
@@ -759,7 +763,12 @@ fn symlinks_at_every_level_are_findings() {
 }
 
 fn search_q(root: &Path, q: &str) -> confidant_core::SearchResult {
-    confidant_core::search(&load_vault(root).unwrap(), q).expect("search")
+    confidant_core::search(
+        &load_vault(root).unwrap(),
+        q,
+        &confidant_core::PackScope::All,
+    )
+    .expect("search")
 }
 
 fn person_no_ai(root: &Path, id: &str, name: &str) {
@@ -2174,6 +2183,7 @@ fn find_refuses_when_ledger_file_unreadable() {
     let err = confidant_core::search(
         &load_vault(dir.path()).unwrap(),
         "unread-toplevel-note-token",
+        &confidant_core::PackScope::All,
     )
     .expect_err("find refuses");
     assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
@@ -2361,8 +2371,12 @@ fn find_refuses_outside_vault_symlink_file() {
     let outside = dir.path().parent().unwrap().join("outside.cfd");
     std::fs::write(&outside, "2026-10-01 merge p-x into p-y\n").unwrap();
     std::os::unix::fs::symlink(&outside, dir.path().join("ledger/2026/10.cfd.bak")).unwrap();
-    let err = confidant_core::search(&load_vault(dir.path()).unwrap(), "Ada Example")
-        .expect_err("outside symlink unread");
+    let err = confidant_core::search(
+        &load_vault(dir.path()).unwrap(),
+        "Ada Example",
+        &confidant_core::PackScope::All,
+    )
+    .expect_err("outside symlink unread");
     assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
 }
 
@@ -2402,8 +2416,12 @@ fn find_refuses_outside_vault_symlink_year_dir() {
     std::fs::write(outside.join("10.cfd"), "x\n").unwrap();
     std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
     std::os::unix::fs::symlink(&outside, dir.path().join("ledger/2026")).unwrap();
-    let err = confidant_core::search(&load_vault(dir.path()).unwrap(), "Ada Example")
-        .expect_err("outside year unread");
+    let err = confidant_core::search(
+        &load_vault(dir.path()).unwrap(),
+        "Ada Example",
+        &confidant_core::PackScope::All,
+    )
+    .expect_err("outside year unread");
     assert_eq!(err.code(), "E_LEDGER_UNREADABLE");
 }
 
@@ -4038,7 +4056,7 @@ fn find_open_line_with_thousands_of_ids_is_fast() {
     write(dir.path(), "ledger/2026/10.cfd", &line);
     let vault = load_vault(dir.path()).unwrap();
     let t0 = Instant::now();
-    let _ = confidant_core::search(&vault, "Ada Example").unwrap();
+    let _ = confidant_core::search(&vault, "Ada Example", &confidant_core::PackScope::All).unwrap();
     let elapsed = t0.elapsed();
     let budget = if cfg!(debug_assertions) {
         Duration::from_secs(20)

@@ -118,18 +118,25 @@ pub fn contract_schema() -> Value {
                             }
                         }
                     },
-                    "findings": {"type": "array", "description": "Load findings; raw record text never included."}
+                    "findings": {"type": "array", "description": "Load findings; raw record text never included."},
+                    "scope": {"type": "array", "description": "Resolved pack scope that filtered the results (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}}
                 }
             },
             "allowlistResponse": {
                 "title": "allowlist --json",
-                "description": "Section-12 cleared set for index-time corpus exclusion (issue #38). Opaque paths and line numbers only, never content; no-ai records never appear. The query-time allowlist stays the authority.",
+                "description": "Section-12 cleared set for index-time corpus exclusion (issue #38). Opaque paths and line numbers only, never content; no-ai records never appear. The query-time allowlist stays the authority. With --packs, only in-scope items are listed and each carries its owning packs (issue #178).",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "cleared_files", "cleared_ledger_lines"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
                     "vault": {"type": "string"},
+                    "scope": {"type": "array", "description": "Resolved pack scope that filtered the listing (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
+                    "owning_packs": {
+                        "type": "object",
+                        "description": "Owning pack per cleared file: [] = unattributed (only listed unscoped), [\"core\"] = core-owned.",
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}}
+                    },
                     "cleared_files": {
                         "type": "array",
                         "description": "Vault-relative paths of cleared record files, sorted.",
@@ -143,7 +150,8 @@ pub fn contract_schema() -> Value {
                             "required": ["file", "line"],
                             "properties": {
                                 "file": {"type": "string"},
-                                "line": {"type": "integer"}
+                                "line": {"type": "integer"},
+                                "owning_packs": {"type": "array", "description": "Owning packs of this line: [] = unattributed (only listed unscoped), [\"core\"] = core-owned.", "items": {"type": "string"}}
                             }
                         }
                     }
@@ -248,6 +256,7 @@ pub fn contract_schema() -> Value {
                         "type": "object",
                         "description": "Pack state grouped by pack name (\"coaching@0.1\" today). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
                     },
+                    "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Opaque hmac:<hex> values."}
                 }
             },

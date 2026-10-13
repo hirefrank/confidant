@@ -26,6 +26,7 @@ pub mod vault;
 pub mod write;
 
 pub mod packs;
+pub mod scope;
 
 pub use check::{
     run as check_vault, CheckOptions, CheckReport, Finding, FindingCode, Severity,
@@ -43,8 +44,12 @@ pub use inbox::{
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
+pub use scope::{
+    intersect_scope, note_linkage_owners, owner_labels, owners_of_ledger_text, parse_pack_list,
+    record_owners, resolve_scope, OwnerKey, PackScope,
+};
 pub use search::{
-    allowlist_is_fixed_point, cleared_ledger_lines, cleared_record_ids, cleared_record_paths,
-    search, SearchHit, SearchResult,
+    allowlist_is_fixed_point, cleared_ledger_line_owners, cleared_ledger_lines, cleared_record_ids,
+    cleared_record_owners, cleared_record_paths, search, SearchHit, SearchResult,
 };
 pub use vault::{load_vault, load_vault_with_hook, ContentHook, ContentOutcome, Vault};

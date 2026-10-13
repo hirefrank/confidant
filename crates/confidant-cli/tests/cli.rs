@@ -311,3 +311,163 @@ fn allowlist_unsupported_spec_is_command_error() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "E_SPEC_UNSUPPORTED");
 }
+
+const ADA: &str = "p-01M3TC5H00MPJG000000000000";
+const COACHING: &str = "coaching@0.1";
+
+#[test]
+fn find_scoped_to_coaching_hides_unattributed() {
+    // "Kickoff" is in the session-linked (coaching) note; "Follow-up" is in
+    // the unattributed note. A coaching-scoped find sees only the first.
+    let out = Command::new(bin())
+        .args(["find", "Follow-up", "--json", "--vault"])
+        .arg(demo())
+        .args(["--packs", COACHING])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["matches"], serde_json::json!([]));
+    assert_eq!(v["scope"], serde_json::json!([COACHING]));
+
+    let out = Command::new(bin())
+        .args(["find", "Kickoff", "--json", "--vault"])
+        .arg(demo())
+        .args(["--packs", COACHING])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+
+    // Unscoped still sees the unattributed note.
+    let out = Command::new(bin())
+        .args(["find", "Follow-up", "--json", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(v["scope"], serde_json::json!([COACHING]));
+}
+
+#[test]
+fn find_unknown_pack_is_usage_error() {
+    // #232 acceptance: naming an unknown pack in --packs is a hard error.
+    let out = Command::new(bin())
+        .args(["find", "Ada", "--json", "--vault"])
+        .arg(demo())
+        .args(["--packs", "nope@1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+    assert!(v["error"]["message"].as_str().unwrap().contains("nope@1"));
+}
+
+#[test]
+fn context_scoped_to_coaching_filters_notes_and_interactions() {
+    let out = Command::new(bin())
+        .args(["context", ADA, "--json", "--vault"])
+        .arg(demo())
+        .args(["--packs", COACHING])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    // Only the session-linked note; the unattributed note and the
+    // interaction are hidden. Core identity stays.
+    assert_eq!(v["notes"].as_array().unwrap().len(), 1);
+    assert_eq!(v["notes"][0]["id"], "n-01M3TC5H00MPJG002NAM000005");
+    assert_eq!(v["interactions"], serde_json::json!([]));
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert_eq!(v["scope"], serde_json::json!([COACHING]));
+    assert!(v["coaching"].is_object());
+
+    let out = Command::new(bin())
+        .args(["context", ADA, "--json", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["notes"].as_array().unwrap().len(), 2);
+    assert_eq!(v["interactions"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn allowlist_scoped_annotates_owners() {
+    let out = Command::new(bin())
+        .args(["allowlist", "--json", "--no-input", "--vault"])
+        .arg(demo())
+        .args(["--packs", COACHING])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The unattributed note is out; the session-linked note stays.
+    let files: Vec<&str> = v["cleared_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.contains("0036CR000006")),
+        "{files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.contains("002NAM000005")),
+        "{files:?}"
+    );
+    // Ownership annotations: core profile, coaching note.
+    assert_eq!(
+        v["owning_packs"]["people/p-01M3TC5H00MPJG000000000000/profile.md"],
+        serde_json::json!(["core"])
+    );
+    assert_eq!(
+        v["owning_packs"]
+            ["people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"],
+        serde_json::json!([COACHING])
+    );
+    // Ledger lines: the comment line (line 1, unattributed) is out;
+    // every other cleared line stays, each with owning_packs.
+    let lines: Vec<u64> = v["cleared_ledger_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            assert!(e["owning_packs"].is_array(), "{e}");
+            e["line"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(lines, vec![2, 3, 5, 6, 7, 9, 10, 11, 13], "{lines:?}");
+    let balance = v["cleared_ledger_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["line"] == 10)
+        .unwrap();
+    assert_eq!(balance["owning_packs"], serde_json::json!([COACHING]));
+    let alias = v["cleared_ledger_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["line"] == 5)
+        .unwrap();
+    assert_eq!(alias["owning_packs"], serde_json::json!(["core"]));
+}

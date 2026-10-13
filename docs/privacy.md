@@ -87,6 +87,52 @@ tokens. Near-ULID bare runs are not IDs.
 
 Milestone 3 `context` continues to honour `no-ai`.
 
+## Pack scoping (issue #178)
+
+Every agent-facing read path takes a pack scope: `context`, `find`, MCP
+tools, and `allowlist` / `reindex` outputs. `check` and `doctor` always run
+unscoped — they verify the whole vault. Scoping is a policy filter at read
+time: records, fields, and ledger lines are attributed to an owning pack
+from the pack registry, and out-of-scope items are filtered out. It is NOT
+cryptography — every client still holds the same recipient set, so a
+scoped agent that can read the vault files directly can see everything.
+What scoping stops is an agent over-reaching through the tool surface:
+a coaching-scoped agent never sees personal notes about the same person
+through `context`, `find`, or MCP.
+
+Rules:
+
+- **Default scope: all enabled packs.** An unscoped call sees everything
+  (back-compat for the operator's own CLI).
+- **`--packs LIST` (comma-separated) scopes a call.** On the CLI it scopes
+  that one call. On `confidant mcp --packs LIST` it sets the instance's
+  **ceiling**: a per-call `packs` argument can only narrow, never widen —
+  widening is an error, not a silent fallback.
+- **Unknown or disabled pack in `--packs` is a hard error**
+  (`usage_error`, exit 2), not an empty scope and not a fallback to all
+  packs.
+- **Core identity is visible to every scope**: person name, aliases, and
+  other core-owned fields. Notes and interactions are NOT core-visible —
+  they are attributed to a pack or hidden.
+- **Attribution** (derived at read time from the pack registry, no format
+  change): fields are owned by the pack that claims them; ledger lines are
+  owned by their verb, except core verbs carrying pack data (`balance` on
+  a pack metric) are owned by the metric's pack. A person/org/deal body is
+  core-owned (the identity anchor); pack-claimed fields on those records
+  filter per-field in `find`. **Anything unattributable is visible only
+  unscoped** — when in doubt, it is filtered out.
+- **Search cannot leak around the scope.** `allowlist --json` annotates
+  each cleared file and ledger line with its `owning_packs` (`[]` =
+  unattributed, `["core"]` = core-owned), so index-time consumers can
+  filter by scope. `qmd-query.py --packs LIST` passes the scope to the
+  verification and fallback `find` calls; the QMD index itself is
+  unscoped and the `find` verification is the enforcement point.
+- **Shared interactions**: the pack that wrote an interaction decides
+  its visibility (#179 revisits if this conflicts).
+
+For when per-pack *keys* would be needed, see
+`docs/per-pack-keys-design-note.md`.
+
 ## Error handling
 
 If any ledger file cannot be read, `find` exits non-zero with
