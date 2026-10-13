@@ -12,7 +12,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -29,8 +29,8 @@ bip39 = { version = "3.0", default-features = false, features = ["std", "rand", 
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-confidant-core = { path = "crates/confidant-core", version = "0.1.1" }
-confidant-crypt = { path = "crates/confidant-crypt", version = "0.1.1" }
+confidant-core = { path = "crates/confidant-core", version = "0.2.0" }
+confidant-crypt = { path = "crates/confidant-crypt", version = "0.2.0" }
 age = { version = "0.11", default-features = false, features = ["armor"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 getrandom = "0.2"
