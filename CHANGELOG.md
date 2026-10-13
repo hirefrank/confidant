@@ -8,6 +8,8 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-13
+
 ### Added
 - Skills ship inside the `confidant` binary and install with
   `confidant setup --agent auto` — no repo checkout needed. New commands:
@@ -55,5 +57,7 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/hirefrank/confidant/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/hirefrank/confidant/releases/tag/v0.1.1
 [0.1.0]: https://github.com/hirefrank/confidant/releases/tag/v0.1.0
