@@ -281,10 +281,10 @@ fn setup_marks_all_bin_dirs_executable() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
         for skill in skill_ids() {
             let bin = version_dir.join(skill).join("bin");
             for entry in std::fs::read_dir(&bin).unwrap().flatten() {

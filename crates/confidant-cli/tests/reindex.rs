@@ -41,6 +41,7 @@ fn run(vault: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+#[cfg(unix)] // only used by the unix-only qmd delegation test below
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -116,10 +117,9 @@ fn reindex_corpus_matches_allowlist_exactly() {
     assert_eq!(rv["ok"], true);
     assert_eq!(rv["skipped_encrypted"], 0);
     assert_eq!(rv["refused_envelopes"], 0);
-    assert!(rv["corpus"]
-        .as_str()
-        .unwrap()
-        .ends_with(".confidant/qmd-corpus"));
+    // Path separators differ per platform; normalize before matching.
+    let corpus = rv["corpus"].as_str().unwrap().replace('\\', "/");
+    assert!(corpus.ends_with(".confidant/qmd-corpus"), "{corpus}");
 
     // Expected = cleared record files ∪ cleared ledger files (+ .cfd.md).
     let mut expected: BTreeSet<String> = BTreeSet::new();

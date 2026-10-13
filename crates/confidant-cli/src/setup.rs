@@ -179,9 +179,6 @@ fn set_executable_recursive(dir: &Path) {
     }
 }
 
-#[cfg(not(unix))]
-fn set_executable_recursive(_dir: &Path) {}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkOutcome {
     Linked,
@@ -280,6 +277,21 @@ fn create_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
     ))
 }
 
+/// Remove a symlink without following it. On Windows, `remove_file` cannot
+/// unlink a directory symlink ("Access is denied"); those need `remove_dir`.
+/// (Our skills are always directories, so a bare `remove_file` silently
+/// fails on every Windows re-point, leaving a stale link that breaks the
+/// subsequent create and poisons the copy fallback.) Callers only pass
+/// paths already checked with `is_symlink`.
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if path.is_dir() {
+        // is_dir follows the link, so this is a directory symlink.
+        return std::fs::remove_dir(path);
+    }
+    std::fs::remove_file(path)
+}
+
 fn write_managed_marker(dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join(MANAGED_MARKER), env!("CARGO_PKG_VERSION"))
 }
@@ -349,7 +361,8 @@ fn link_one_skill(
             ));
             return Ok((LinkOutcome::SkippedExists, lines));
         }
-        let _ = std::fs::remove_file(dest);
+        remove_symlink(dest)
+            .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", dest.display()))?;
         return install_skill(src, dest, copy_mode, symlink_target.as_deref(), &mut lines);
     }
     if dest.exists() {

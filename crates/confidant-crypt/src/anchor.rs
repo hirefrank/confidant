@@ -306,29 +306,39 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
     })?;
     let anchor = anchor_from_text(&text, &trust_path)?;
 
-    let mut warnings = Vec::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(config_dir) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                warnings.push(Warning::LooseDirPermissions {
-                    path: config_dir.to_path_buf(),
-                    mode,
-                });
+    // Permission warnings are unix-only: on other platforms there is nothing
+    // to check. Building the vec inside the cfg'd block keeps `mut` from
+    // tripping `-D warnings` (unused_mut) on Windows.
+    let warnings: Vec<Warning> = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut warnings = Vec::new();
+            if let Ok(meta) = std::fs::metadata(config_dir) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o700 {
+                    warnings.push(Warning::LooseDirPermissions {
+                        path: config_dir.to_path_buf(),
+                        mode,
+                    });
+                }
             }
-        }
-        if let Ok(meta) = std::fs::metadata(&trust_path) {
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o600 {
-                warnings.push(Warning::LooseFilePermissions {
-                    path: trust_path.clone(),
-                    mode,
-                });
+            if let Ok(meta) = std::fs::metadata(&trust_path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    warnings.push(Warning::LooseFilePermissions {
+                        path: trust_path.clone(),
+                        mode,
+                    });
+                }
             }
+            warnings
         }
-    }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    };
 
     Ok((anchor, warnings))
 }

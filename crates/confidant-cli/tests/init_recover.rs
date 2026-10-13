@@ -772,7 +772,14 @@ fn recover_warns_on_shallow_clone() {
     let fresh = Harness::new();
     let clone = fresh.home.join("shallow");
     let st = Command::new("git")
-        .args(["clone", "--quiet", "--depth", "1"])
+        .args([
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .arg(format!("file://{}", source.vault.display()))
         .arg(&clone)
         .status()
