@@ -65,8 +65,9 @@ cargo deny check                          # deny.toml sets all-features
 cargo audit
 ```
 
-CI runs the test job on `ubuntu-latest` and `macos-latest`. Keep code
-portable across both.
+CI runs the test job on `ubuntu-latest` for pull requests; `macos-latest`
+and `windows-latest` run on push to `main`, a nightly schedule, and
+`workflow_dispatch`. Keep code portable across all three.
 
 Narrower loops while iterating:
 
