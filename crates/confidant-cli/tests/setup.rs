@@ -281,10 +281,10 @@ fn setup_marks_all_bin_dirs_executable() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
         for skill in skill_ids() {
             let bin = version_dir.join(skill).join("bin");
             for entry in std::fs::read_dir(&bin).unwrap().flatten() {
@@ -330,6 +330,56 @@ fn setup_prunes_old_version_dirs() {
     );
     // Current version untouched.
     assert!(skills_root.join(env!("CARGO_PKG_VERSION")).exists(), "{v}");
+}
+
+#[test]
+#[cfg(unix)]
+fn setup_per_agent_run_keeps_versions_other_agents_link_to() {
+    // #195: `setup --agent cursor` must not prune a version dir that another
+    // detected agent (claude-code) still links into. Without the fix, the
+    // prune below deletes 0.0.0 and claude-code's link dangles.
+    let env = fresh_env();
+    let skills_root = PathBuf::from(env.share.clone()).join("skills");
+
+    // Fake an old version dir with one skill, as a previous install left it.
+    let old_skill = skills_root.join("0.0.0").join("portal-sync");
+    std::fs::create_dir_all(&old_skill).unwrap();
+    std::fs::write(old_skill.join("SKILL.md"), "# portal-sync\n").unwrap();
+
+    // claude-code links into the old version (as a previous
+    // `setup --agent claude-code` from the old binary would have left it).
+    let claude_dir = PathBuf::from(env.home.clone()).join(".claude/skills");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::os::unix::fs::symlink(&old_skill, claude_dir.join("portal-sync")).unwrap();
+
+    // Per-agent setup without the skills-dir override (which would bypass
+    // agent dirs entirely).
+    let mut cmd = Command::new(bin());
+    cmd.args(["setup", "--agent", "cursor", "--json", "--no-input"])
+        .env("HOME", &env.home)
+        .env("CONFIDANT_HOME", &env.share)
+        .env_remove("CONFIDANT_SKILLS_DIR");
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: Value = serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("{out:?}"));
+
+    // The old version dir survives and claude-code's link still resolves.
+    assert!(
+        skills_root.join("0.0.0").exists(),
+        "pruned a version claude-code still links into: {v}"
+    );
+    assert!(
+        claude_dir.join("portal-sync").join("SKILL.md").exists(),
+        "claude-code's link is broken: {v}"
+    );
+    // Cursor got the current version.
+    assert!(
+        PathBuf::from(env.home.clone())
+            .join(".cursor/skills/portal-sync")
+            .is_symlink(),
+        "cursor was not linked: {v}"
+    );
 }
 
 #[test]

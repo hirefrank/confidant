@@ -135,8 +135,14 @@ fn run_doctor_env(releases_url: Option<&str>, env: &DoctorEnv<'_>) -> Value {
     if let Some(url) = releases_url {
         cmd.env("CONFIDANT_TEST_RELEASES_URL", url);
     }
+    // A hermetic HOME: Windows CI runners don't set HOME, and without it
+    // the crypto-manifests check errors (config dir unknown) and flips `ok`.
+    let _tmp_home;
     if let Some(home) = env.home {
         cmd.env("HOME", home);
+    } else {
+        _tmp_home = tempfile::tempdir().unwrap();
+        cmd.env("HOME", _tmp_home.path());
     }
     if let Some(home) = env.confidant_home {
         cmd.env("CONFIDANT_HOME", home);
@@ -164,6 +170,24 @@ fn check<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
         .unwrap()
         .iter()
         .find(|c| c["id"] == id)
+}
+
+/// Remove a skill entry regardless of shape: a file or directory symlink,
+/// or a real directory (the Windows copy fallback when setup can't symlink).
+/// `remove_file` unlinks both symlink kinds on unix, but on Windows a
+/// directory symlink needs `remove_dir` ("Access is denied" otherwise).
+fn remove_skill_entry(link: &std::path::Path) {
+    if link.is_symlink() {
+        #[cfg(windows)]
+        if link.is_dir() {
+            return std::fs::remove_dir(link).unwrap();
+        }
+        std::fs::remove_file(link).unwrap();
+    } else if link.is_dir() {
+        std::fs::remove_dir_all(link).unwrap();
+    } else {
+        std::fs::remove_file(link).unwrap();
+    }
 }
 
 /// Run `setup --agent <spec>` with the given `HOME`/`CONFIDANT_HOME`.
@@ -344,7 +368,7 @@ fn doctor_skills_links_missing_warns() {
     let share_str = share.path().to_str().unwrap().to_owned();
     run_setup(&home_str, &share_str, "claude-code");
     // Break one link: targeted but incomplete.
-    std::fs::remove_file(home.path().join(".claude/skills/portal-sync")).unwrap();
+    remove_skill_entry(&home.path().join(".claude/skills/portal-sync"));
     let v = run_doctor_env(
         Some(&unreachable_url()),
         &DoctorEnv {

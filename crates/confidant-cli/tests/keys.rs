@@ -847,7 +847,14 @@ fn doctor_warns_on_shallow_clone() {
     assert!(h.init(&[]).status.success());
     let clone = h.home.join("shallow");
     let st = std::process::Command::new("git")
-        .args(["clone", "--quiet", "--depth", "1"])
+        .args([
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .arg(format!("file://{}", h.vault.display()))
         .arg(&clone)
         .status()
@@ -909,7 +916,14 @@ fn device_add_fails_closed_on_shallow_clone() {
 
     let clone = h1.home.join("shallow");
     let st = std::process::Command::new("git")
-        .args(["clone", "--quiet", "--depth", "1"])
+        .args([
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .arg(format!("file://{}", h1.vault.display()))
         .arg(&clone)
         .status()
@@ -958,7 +972,14 @@ fn keys_shred_warns_on_shallow_clone() {
 
     let clone = h.home.join("shallow");
     let st = Command::new("git")
-        .args(["clone", "--quiet", "--depth", "1"])
+        .args([
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "-c",
+            "core.autocrlf=false",
+        ])
         .arg(format!("file://{}", h.vault.display()))
         .arg(&clone)
         .status()

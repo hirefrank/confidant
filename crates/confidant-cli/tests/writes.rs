@@ -76,7 +76,15 @@ fn commits(root: &Path) -> usize {
 }
 
 fn run_json(args: &[&str]) -> (bool, Value) {
-    let out = Command::new(bin()).args(args).output().unwrap();
+    // Hermetic HOME: Windows CI runners don't set HOME, and doctor's
+    // crypto-manifests check errors without a config dir. A fresh tempdir
+    // per call is fine — no test here persists anchor state across calls.
+    let tmp_home = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(args)
+        .env("HOME", tmp_home.path())
+        .output()
+        .unwrap();
     let v: Value = match serde_json::from_slice(&out.stdout) {
         Ok(v) => v,
         Err(e) => panic!(
@@ -930,10 +938,13 @@ fn context_json_includes_vault() {
     let vroot = vault_arg(dir.path());
     let (ok, v) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
     assert!(ok, "{v}");
+    // The CLI reports the canonicalized vault path (on Windows that's the
+    // \\?\ extended form), so canonicalize the expectation too.
+    let expected = dir.path().canonicalize().unwrap();
     assert!(v["vault"]
         .as_str()
         .unwrap()
-        .contains(dir.path().to_str().unwrap()));
+        .contains(expected.to_str().unwrap()));
 }
 
 #[test]
@@ -947,10 +958,12 @@ fn doctor_json_includes_vault() {
         &vault_arg(dir.path()),
     ]);
     assert!(ok, "{v}");
+    // Canonicalized on both sides (see context_json_includes_vault).
+    let expected = dir.path().canonicalize().unwrap();
     assert!(v["vault"]
         .as_str()
         .unwrap()
-        .contains(dir.path().to_str().unwrap()));
+        .contains(expected.to_str().unwrap()));
 }
 
 #[test]
