@@ -612,6 +612,8 @@ fn context_bundle_has_coaching_facts() {
         .unwrap()
         .contains("Test bio"));
     assert_eq!(v["coaching"]["sessions_remaining"], 4);
+    // #177: pack state is grouped by pack; `coaching` duplicates the entry.
+    assert_eq!(v["packs"]["coaching@0.1"]["sessions_remaining"], 4);
 }
 
 #[test]

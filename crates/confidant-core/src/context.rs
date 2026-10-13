@@ -12,8 +12,9 @@
 
 use serde::Serialize;
 
-use crate::check::{coaching_snapshot, duration_of, resolve_as_of_date};
+use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
 use crate::id::RecordId;
+use crate::packs::coaching::CoachingView;
 use crate::record::RecordKind;
 use crate::search::cleared_record_ids;
 use crate::vault::Vault;
@@ -44,21 +45,11 @@ pub struct InteractionView {
     pub body: Option<String>,
 }
 
-/// One ledger session for the person.
-#[derive(Clone, Debug, Serialize)]
-pub struct RecentSession {
-    pub date: String,
-    pub duration_minutes: Option<u32>,
-    pub tag: Option<String>,
-}
-
-/// Merge-aware coaching facts for the person.
-#[derive(Clone, Debug, Serialize)]
-pub struct CoachingView {
-    pub sessions_remaining: i64,
-    pub icf_hours: f64,
-    pub recent_sessions: Vec<RecentSession>,
-}
+// CoachingView lives in crate::packs::coaching. Kept for the agent contract
+// (ADR-7): `context` output keeps the `coaching` field with exactly this
+// shape. Pack state is grouped by pack in PersonContext::packs; `coaching`
+// is the coaching pack's entry in that map, deserialized back into this
+// struct.
 
 /// The full bundle returned by `context`.
 #[derive(Clone, Debug, Serialize)]
@@ -67,21 +58,16 @@ pub struct PersonContext {
     pub notes: Vec<NoteView>,
     pub interactions: Vec<InteractionView>,
     pub coaching: Option<CoachingView>,
+    /// Pack state grouped by pack name (`"coaching@0.1"` today). Each pack
+    /// decides its own view shape via `Pack::context_view`. `coaching` above
+    /// duplicates this map's coaching entry for contract stability.
+    pub packs: std::collections::BTreeMap<String, serde_json::Value>,
     /// Opaque `hmac:<hex>` values from ledger `alias` lines.
     pub aliases: Vec<String>,
     /// Envelopes skipped as unreadable while loading (spec 4, ⚠2).
     pub skipped_encrypted: u32,
     /// Envelopes refused as tampered/corrupt while loading (spec 4, ⚠2c).
     pub refused_envelopes: u32,
-}
-
-fn billing_tag(entry: &crate::ledger::LedgerEntry) -> Option<String> {
-    for tag in ["paid", "pps", "comp"] {
-        if entry.has_token(tag) {
-            return Some(tag.to_owned());
-        }
-    }
-    None
 }
 
 /// Build the context bundle for `person`.
@@ -106,11 +92,28 @@ pub fn build_context(
     let show_pii = include_private && cleared.contains(person);
 
     let as_of = resolve_as_of_date(vault);
-    let state = coaching_snapshot(vault, as_of);
-    let canonical = state
-        .as_ref()
-        .map(|s| s.canonical_on(person, as_of))
-        .unwrap_or_else(|| person.clone());
+    // Merge canonicalization is pack-independent: it walks the core merge
+    // map, the same map the pack folds received.
+    let known_ids: std::collections::HashSet<RecordId> = vault.records.keys().cloned().collect();
+    let mut merge_findings = Vec::new();
+    let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut merge_findings);
+    drop(merge_findings);
+    let canonical = canonical_on(person, &merges, as_of);
+
+    let snapshots = pack_snapshots(vault, as_of);
+    let mut packs: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for (pack, state) in &snapshots {
+        if let Some(view) = pack.context_view(vault, state.as_ref(), person, &canonical, as_of) {
+            packs.insert(pack.name().to_string(), view);
+        }
+    }
+    // Legacy contract field: the coaching pack's entry, deserialized back.
+    // `to_value` in the pack produced it from this struct, so this cannot
+    // fail unless the pack's view shape drifts from the struct.
+    let coaching = packs
+        .get(crate::config::COACHING_PACK)
+        .and_then(|v| serde_json::from_value::<CoachingView>(v.clone()).ok());
 
     let person_dir = format!("people/{person}/notes/");
 
@@ -147,40 +150,11 @@ pub fn build_context(
         .collect();
     interactions.sort_by(|a, b| a.date.cmp(&b.date).then(a.id.cmp(&b.id)));
 
-    let mut sessions: Vec<RecentSession> = vault
-        .entries
-        .iter()
-        .filter(|s| {
-            s.entry.verb == "session"
-                && state
-                    .as_ref()
-                    .map(|st| st.canonical_on(&s.entry.id, as_of) == canonical)
-                    .unwrap_or(s.entry.id == canonical)
-        })
-        .map(|s| RecentSession {
-            date: s.entry.date.to_string(),
-            duration_minutes: duration_of(&s.entry),
-            tag: billing_tag(&s.entry),
-        })
-        .collect();
-    sessions.sort_by(|a, b| b.date.cmp(&a.date));
-    sessions.truncate(10);
-
-    let coaching = state.as_ref().map(|s| CoachingView {
-        sessions_remaining: s.sessions_remaining_on(&canonical, as_of),
-        icf_hours: s.icf_hours_hundredths_on(&canonical, as_of) as f64 / 100.0,
-        recent_sessions: sessions,
-    });
-
     let aliases: Vec<String> = vault
         .entries
         .iter()
         .filter(|s| {
-            s.entry.verb == "alias"
-                && state
-                    .as_ref()
-                    .map(|st| st.canonical_on(&s.entry.id, as_of) == canonical)
-                    .unwrap_or(s.entry.id == canonical)
+            s.entry.verb == "alias" && canonical_on(&s.entry.id, &merges, as_of) == canonical
         })
         .filter_map(|s| s.entry.pair("hmac"))
         .map(|h| format!("hmac:{h}"))
@@ -196,6 +170,7 @@ pub fn build_context(
         notes,
         interactions,
         coaching,
+        packs,
         aliases,
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,

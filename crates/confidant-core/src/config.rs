@@ -159,10 +159,6 @@ impl VaultConfig {
         self.packs.iter().any(|p| p == name)
     }
 
-    pub fn coaching_enabled(&self) -> bool {
-        self.has_pack(COACHING_PACK)
-    }
-
     /// Semantic `[checks]` problems as `E_CONFIG` findings. Never panics.
     pub fn config_findings(&mut self) -> Vec<Finding> {
         let mut findings = Vec::new();
