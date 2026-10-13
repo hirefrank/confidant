@@ -1174,3 +1174,128 @@ fn mcp_unknown_tool_is_error_content() {
     );
     assert_eq!(resps[0]["result"]["isError"], true);
 }
+
+// ---------------------------------------------------------------------------
+// #183: warnings never block writes
+// ---------------------------------------------------------------------------
+//
+// The personal pack's cadence/date warnings (W_CADENCE_OVERDUE,
+// W_DATE_UPCOMING) do not exist yet — they arrive with #184. The guarantee
+// below is producer-independent, so it is tested with the warning findings
+// that exist today (coaching warnings). No code change was needed: every
+// gate already thresholds on errors (write.rs pre/post checks and doctor
+// use CheckOptions::default() -> Error; the inbox merge passes
+// fail_on: Error explicitly). These tests lock that in.
+
+/// A vault whose only findings are warnings: one untagged session fires
+/// `W_SESSION_UNTAGGED` (warning) plus the no-notes warning. No errors
+/// can arise from this fixture at any as-of: every rule that can fire
+/// here is warning-severity.
+fn make_warning_vault() -> tempfile::TempDir {
+    let dir = make_vault();
+    let root = dir.path();
+    // Untagged session: consumes a slot, fires W_SESSION_UNTAGGED.
+    let ledger = root.join("ledger/2026/10.cfd");
+    let mut text = std::fs::read_to_string(&ledger).unwrap();
+    text.push_str(&format!("2026-10-02 session {PERSON} 60m\n"));
+    std::fs::write(&ledger, text).unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "untagged session"]);
+    dir
+}
+
+fn check_report(root: &Path, extra: &[&str]) -> (bool, Value) {
+    let vroot = vault_arg(root);
+    let mut args: Vec<&str> = vec!["check", "--json", "--no-input", "--vault", &vroot];
+    args.extend(extra);
+    run_json(&args)
+}
+
+fn finding_codes(v: &Value) -> Vec<String> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn warnings_never_block_writes() {
+    let dir = make_warning_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Precondition: warnings only — no errors.
+    let (ok, v) = check_report(root, &[]);
+    assert!(ok, "{v}");
+    assert_eq!(v["summary"]["errors"], 0);
+    assert!(v["summary"]["warnings"].as_u64().unwrap() >= 1);
+    assert!(
+        finding_codes(&v).contains(&"W_SESSION_UNTAGGED".to_string()),
+        "{v}"
+    );
+    // The write succeeds despite the warnings: exactly one new commit.
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+        "--request-id",
+        "01J9Z3K4QF0000000000000002",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(
+        commits(root),
+        3,
+        "init + untagged session + the new session"
+    );
+}
+
+#[test]
+fn check_fail_on_warning_exits_nonzero_while_default_exits_zero() {
+    let dir = make_warning_vault();
+    let root = dir.path();
+    // Default fail-on (error): warnings do not fail the check.
+    let (ok, v) = check_report(root, &[]);
+    assert!(ok, "{v}");
+    assert_eq!(v["ok"], true);
+    // Stricter gate: --fail-on warning fails on the same vault.
+    let (ok, v) = check_report(root, &["--fail-on", "warning"]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["ok"], false);
+    assert!(v["summary"]["warnings"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn check_as_of_makes_gap_warnings_deterministic() {
+    // Paid client: open 4 sessions + one paid session on 2026-10-01, so
+    // sessions_remaining is 3 and the gap clock starts 2026-10-01.
+    let dir = make_vault();
+    let root = dir.path();
+    let ledger = root.join("ledger/2026/10.cfd");
+    let mut text = std::fs::read_to_string(&ledger).unwrap();
+    text.push_str(&format!("2026-10-01 session {PERSON} 60m paid\n"));
+    std::fs::write(&ledger, text).unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "paid session"]);
+    // 7 days after the last activity: inside the 45-day gap window.
+    let (_, early) = check_report(root, &["--as-of", "2026-10-08"]);
+    assert!(
+        !finding_codes(&early).contains(&"E_PAID_SESSION_GAP".to_string()),
+        "{early}"
+    );
+    // 61 days after: outside the window, the gap warning fires.
+    let (_, late) = check_report(root, &["--as-of", "2026-12-01"]);
+    assert!(
+        finding_codes(&late).contains(&"E_PAID_SESSION_GAP".to_string()),
+        "{late}"
+    );
+    // Same as-of twice: identical findings (deterministic).
+    let (_, late_again) = check_report(root, &["--as-of", "2026-12-01"]);
+    assert_eq!(late["findings"], late_again["findings"]);
+}

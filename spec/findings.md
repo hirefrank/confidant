@@ -6,6 +6,11 @@ text. Codes are stable once published. A new meaning needs a new code.
 Severity listed here is the default. Vault `[checks]` keys can promote,
 demote, or turn a rule `off` where the table says "configurable".
 
+Warning findings never block writes, commits, or inbox merges; only
+errors do. `doctor` reports warnings as warning status, never error.
+`check --fail-on warning` exits non-zero when any warning (or error) is
+present, for CI users who want the stricter gate.
+
 | Code | Default severity | Configurable key | When it fires |
 |---|---|---|---|
 | `E_PARSE` | error | | A ledger line or record file does not match the grammar. |
