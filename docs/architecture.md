@@ -56,6 +56,8 @@ Client notes and PII are encrypted in git by default (ADR-4).
 
 Local indexes and caches (`.confidant/`, any search index) contain plaintext and embeddings. They are sensitive, gitignored, and stay on trusted devices.
 
+Agent-focused threat model — what an MCP-connected agent can and cannot do, and exactly what `no-ai`, the `check` gate, and the inbox guarantee: [`docs/threat-model-agents.md`](threat-model-agents.md).
+
 ## 5. Layouts
 
 ### Vault (user data)

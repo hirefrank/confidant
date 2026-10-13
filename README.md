@@ -78,7 +78,10 @@ nothing; that depends on the provider's terms.
 is searchable only when it parsed cleanly, has no `no-ai` flag, and every ID
 it references is cleared. The full allowlist rules (merge groups, ledger
 lines, package propagation, ID edge cases) are in
-[`docs/privacy.md`](docs/privacy.md).
+[`docs/privacy.md`](docs/privacy.md). What an MCP-connected agent can and
+cannot do — and exactly what `no-ai`, the `check` gate, and the inbox
+guarantee — is in
+[`docs/threat-model-agents.md`](docs/threat-model-agents.md).
 
 `confidant doctor` checks GitHub for the latest release and reports skills
 link health. The release check is one unauthenticated `GET` to
