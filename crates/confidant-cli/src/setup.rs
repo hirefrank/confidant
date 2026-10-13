@@ -465,10 +465,63 @@ fn reject_home_overlap(override_dir: &Path, home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Version dir names under `skills_root` that some agent still links into.
+///
+/// Scans every detected agent's skills dir (plus the `CONFIDANT_SKILLS_DIR`
+/// override when set). A symlink whose canonical target sits under
+/// `skills_root/<version>/…` marks `<version>` as referenced. Copies are
+/// self-contained and never reference a version dir, so they are ignored.
+/// Used to keep `prune_old_versions` from deleting a version another agent
+/// still uses (#195).
+fn referenced_skill_versions(skills_root: &Path, home: &Path) -> std::collections::HashSet<String> {
+    let mut referenced = std::collections::HashSet::new();
+    let Ok(root_canon) = std::fs::canonicalize(skills_root) else {
+        return referenced;
+    };
+    let mut dirs: Vec<PathBuf> = detect_agents(home)
+        .iter()
+        .filter_map(|name| agent_dir(name, home))
+        .collect();
+    if let Some(ov) = skills_dir_override() {
+        dirs.push(ov);
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Only symlinks can reference a version dir.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_symlink() {
+                continue;
+            }
+            // Broken link: its target is already gone, nothing to preserve.
+            let Ok(target) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            let Ok(rel) = target.strip_prefix(&root_canon) else {
+                continue;
+            };
+            if let Some(version) = rel.components().next().and_then(|c| c.as_os_str().to_str()) {
+                referenced.insert(version.to_owned());
+            }
+        }
+    }
+    referenced
+}
+
 /// Remove sibling version dirs under `skills_root` other than `current`.
 /// Only version-looking dir names are touched, symlinks are never followed
-/// (`symlink_metadata`), and this runs only after every link succeeded.
-fn prune_old_versions(skills_root: &Path, current: &str) -> Vec<String> {
+/// (`symlink_metadata`), versions in `referenced` (still linked into by some
+/// agent, #195) are kept, and this runs only after every link succeeded.
+fn prune_old_versions(
+    skills_root: &Path,
+    current: &str,
+    referenced: &std::collections::HashSet<String>,
+) -> Vec<String> {
     fn looks_like_version(s: &str) -> bool {
         !s.is_empty()
             && s.split('.')
@@ -489,6 +542,11 @@ fn prune_old_versions(skills_root: &Path, current: &str) -> Vec<String> {
         let name = entry.file_name();
         let name_str = name.to_str().unwrap_or("");
         if name_str == current || !looks_like_version(name_str) {
+            continue;
+        }
+        // #195: never prune a version another agent still links into, even
+        // when this run only targeted one agent.
+        if referenced.contains(name_str) {
             continue;
         }
         if std::fs::remove_dir_all(&path).is_ok() {
@@ -568,9 +626,11 @@ pub fn run_setup(agent_spec: &str, force: bool, copy_mode: bool) -> anyhow::Resu
 
     // Prune stale version dirs, but only after every link succeeded and at
     // least one skill was actually installed (a fully-skipped run leaves the
-    // old version's links in place, so its dir must stay).
+    // old version's links in place, so its dir must stay). Versions other
+    // agents still link into are never pruned (#195).
     if any_installed {
-        for pruned in prune_old_versions(&skills_root, env!("CARGO_PKG_VERSION")) {
+        let referenced = referenced_skill_versions(&skills_root, &home);
+        for pruned in prune_old_versions(&skills_root, env!("CARGO_PKG_VERSION"), &referenced) {
             verbose_lines.push(format!("pruned old skills version {pruned}"));
         }
     }
