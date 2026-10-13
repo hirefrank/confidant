@@ -54,7 +54,7 @@ sha2 = "0.10"
 tempfile = "3.13"
 thiserror = "2.0"
 toml = "0.8.19"
-toml_edit = "0.22"
+toml_edit = "0.25"
 # Sync HTTP client for the `doctor` staleness check (#165). No async
 # runtime; rustls (ring provider) + webpki roots, and gzip is left off so
 # the tree stays small (GitHub's API returns identity when not asked for
