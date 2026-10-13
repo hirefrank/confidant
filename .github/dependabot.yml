@@ -1,0 +1,34 @@
+# Dependabot keeps Cargo and GitHub Actions dependencies current.
+# CI already runs `cargo audit` and `cargo deny check`; this files the
+# update PRs so known-vulnerable dependencies don't linger. All updates
+# go through the normal PR gate (fmt, clippy, tests, deny, audit) and
+# need the maintainer's explicit approval like any other change.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Group minor/patch updates to keep PR noise down on a solo-maintainer
+    # repo; major version bumps still arrive as separate PRs.
+    groups:
+      minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Actions are pinned to full commit SHAs with `# vX` comments (see the
+    # note at the top of release.yml). Re-apply the SHA pin + comment when
+    # merging a Dependabot PR that bumps an action — a merged mutable tag
+    # would silently undo the pinning.
+    commit-message:
+      prefix: "deps"
