@@ -27,7 +27,7 @@ are skipped with a warning — the skill never invents ledger verbs
 ## Workflow
 1. Run the proposer (it never writes to the vault):
    ```sh
-   python3 skills/portal-sync/bin/portal-sync.py --vault "$VAULT" \
+   python3 "$(confidant which --skills-dir)"/portal-sync/bin/portal-sync.py --vault "$VAULT" \
        --events portal-events.jsonl
    ```
    The manifest and the flat ledger-lines file land in

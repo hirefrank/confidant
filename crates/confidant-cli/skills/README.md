@@ -6,14 +6,15 @@ agent contract (ADR-7).
 
 ## Installing (for operators and agents)
 
-Skills ship in this repo and assume a checkout: each skill calls its own
-`bin/` scripts via repo-relative paths, so copying a lone `SKILL.md`
-elsewhere breaks it. The supported setup is [`docs/agent-setup.md`](../docs/agent-setup.md):
-clone the repo, symlink each `skills/<name>/` directory (whole directory,
-not just `SKILL.md`) into the agent's skills dir, set `CONFIDANT_VAULT`.
-That page also holds the single copy/paste install prompt and the update
-loop (fetch tags + check out the latest release tag for skills,
-`cargo install` for the CLI).
+Skills ship inside the `confidant` binary (embedded at compile time) and are
+installed by `confidant setup --agent auto`: each skill calls its own `bin/`
+scripts via paths under the installed skills dir, so copying a lone `SKILL.md`
+elsewhere breaks it — always link (or copy) the whole skill directory, which
+`setup` does for you. Run `confidant which --skills-dir` to locate the
+installed tree. The supported setup is `docs/agent-setup.md` in the GitHub
+repo: install the binary, run `setup`, set `CONFIDANT_VAULT`. That page also
+holds the single copy/paste install prompt and the update loop (`confidant
+update`, then `confidant setup --force` to re-link).
 
 ## The uniform workflow
 

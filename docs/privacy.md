@@ -97,6 +97,12 @@ If any ledger file cannot be read, `find` exits non-zero with
 `confidant doctor` checks GitHub for the latest release by default: one
 unauthenticated `GET` to `api.github.com/repos/hirefrank/confidant/releases/latest`.
 No vault data, record content, IDs, or paths are sent, and only the `tag_name`
-field is read from the response — the body is discarded. Set
-`CONFIDANT_OFFLINE=1` to skip the request entirely; both staleness checks then
-report `staleness check disabled`.
+field is read from the response — the body is discarded. `doctor` also
+reports local skills link health (no network involved). Set
+`CONFIDANT_OFFLINE=1` to skip the request entirely; the staleness check then
+reports `staleness check disabled`.
+
+`confidant update` makes the same request (same endpoint, same
+`CONFIDANT_OFFLINE=1` opt-out) to decide whether the local binary is behind
+the latest release. When behind, `update` re-links nothing and tells you to
+upgrade the binary first.

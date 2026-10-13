@@ -64,7 +64,7 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 
 # per vault: build the corpus + collection (needs --vault or CONFIDANT_VAULT)
 # (the corpus itself is built by `confidant reindex`, which the script runs first)
-skills/qmd-search/bin/qmd-index --vault /path/to/vault
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-index.py --vault /path/to/vault
 
 # optional: embeddings for vector search (downloads GGUF models on first run)
 qmd embed
@@ -79,15 +79,15 @@ at query time, so staleness can never leak).
 
 ```sh
 # keyword (BM25) — default; works with no model downloads
-skills/qmd-search/bin/qmd-query --vault /path/to/vault "invoice march"
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault "invoice march"
 
 # hybrid (BM25 + vectors + rerank) — best quality, needs `qmd embed` first
 # (first run downloads multi-GB GGUF models; the script refuses hybrid/vector
 #  until vectors exist rather than hanging on a download)
-skills/qmd-search/bin/qmd-query --vault /path/to/vault --mode hybrid "quarterly planning"
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault --mode hybrid "quarterly planning"
 
 # semantic only
-skills/qmd-search/bin/qmd-query --vault /path/to/vault --mode vector "how to deploy"
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-query.py --vault /path/to/vault --mode vector "how to deploy"
 ```
 
 Output is JSON on stdout (mirrors `confidant find --json`, plus `score` and

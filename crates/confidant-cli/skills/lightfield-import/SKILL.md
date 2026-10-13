@@ -18,7 +18,7 @@ The Lightfield export is **plaintext PII**.
   export **and the whole proposal set** (manifest, lines file, staged note
   bodies — all plaintext PII):
   ```sh
-  python3 skills/lightfield-import/bin/lightfield-import.py \
+  python3 "$(confidant which --skills-dir)"/lightfield-import/bin/lightfield-import.py \
       --cleanup --export /path/to/export.json --manifest <manifest path> \
       --i-verified-the-import
   ```
@@ -41,7 +41,7 @@ rows are warned and skipped):
 1. Run the proposer (it never writes to the vault, and never touches the
    export except reading it):
    ```sh
-   python3 skills/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
+   python3 "$(confidant which --skills-dir)"/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
        --export /path/to/export.json
    ```
    The manifest and the flat ledger-lines file land in
@@ -103,14 +103,14 @@ rows are warned and skipped):
 7. Record the applied IDs in the dedup map (so reruns skip what's
    applied):
    ```sh
-   python3 skills/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
+   python3 "$(confidant which --skills-dir)"/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
        --record-applied --manifest <manifest path>
    ```
 8. After `check` passes on the applied import, delete the export **and
    the whole proposal set** (manifest, lines file, staged note bodies —
    all plaintext PII):
    ```sh
-   python3 skills/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
+   python3 "$(confidant which --skills-dir)"/lightfield-import/bin/lightfield-import.py --vault "$VAULT" \
        --cleanup --export /path/to/export.json --manifest <manifest path> \
        --i-verified-the-import
    ```

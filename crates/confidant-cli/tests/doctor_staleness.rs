@@ -1,5 +1,4 @@
-//! #165: `doctor` staleness checks — local CLI + skills checkout vs the
-//! latest GitHub Release.
+//! `doctor` staleness + skills-link checks.
 //!
 //! Only compiled with the `test-overrides` feature (CI's `--all-features`).
 //! That feature is what lets `CONFIDANT_TEST_RELEASES_URL` point the check
@@ -10,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -30,8 +29,8 @@ fn demo() -> PathBuf {
 /// The version the binary reports, used to build deterministic stub tags.
 const LOCAL: &str = env!("CARGO_PKG_VERSION");
 
-/// The `ok` message both checks report when `CONFIDANT_OFFLINE=1` skips the
-/// fetch (kept in sync with `STALENESS_DISABLED` in the CLI).
+/// The `ok` message the staleness check reports when `CONFIDANT_OFFLINE=1`
+/// skips the fetch (kept in sync with `STALENESS_DISABLED` in the CLI).
 const OFFLINE_MESSAGE: &str = "staleness check disabled (CONFIDANT_OFFLINE=1)";
 
 /// A throwaway git identity, supplied to the child through git's
@@ -48,7 +47,7 @@ fn give_child_git_identity(cmd: &mut Command) {
 
 /// One-shot HTTP stub returning `{"tag_name": "<tag>"}`. Returns the base
 /// URL to point `CONFIDANT_TEST_RELEASES_URL` at. It answers exactly one
-/// request (a doctor run fetches the tag once, shared by both checks).
+/// request (a doctor run fetches the tag once).
 fn stub_release_server(tag: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -114,32 +113,35 @@ fn counting_stub_release_server(tag: &str) -> (String, Arc<AtomicUsize>) {
     (format!("http://127.0.0.1:{port}/"), hits)
 }
 
-/// Run `doctor --json` against the demo vault with a clean test environment
-/// plus the given overrides.
-fn run_doctor(releases_url: Option<&str>, repo: Option<&str>) -> Value {
-    run_doctor_offline(releases_url, repo, None)
+/// Extra environment for a doctor child: optional `HOME` (agent detection),
+/// `CONFIDANT_HOME` (share dir), and `CONFIDANT_OFFLINE`.
+#[derive(Default)]
+struct DoctorEnv<'a> {
+    home: Option<&'a str>,
+    confidant_home: Option<&'a str>,
+    offline: Option<&'a str>,
 }
 
-/// As [`run_doctor`], plus an optional `CONFIDANT_OFFLINE` value.
-fn run_doctor_offline(
-    releases_url: Option<&str>,
-    repo: Option<&str>,
-    offline: Option<&str>,
-) -> Value {
+/// Run `doctor --json` against the demo vault with a clean test environment
+/// plus the given overrides.
+fn run_doctor_env(releases_url: Option<&str>, env: &DoctorEnv<'_>) -> Value {
     let mut cmd = Command::new(bin());
     cmd.args(["doctor", "--json", "--no-input", "--vault"])
         .arg(demo())
-        .env_remove("CONFIDANT_REPO")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_OFFLINE");
+        .env_remove("CONFIDANT_OFFLINE")
+        .env_remove("CONFIDANT_SKILLS_DIR");
     give_child_git_identity(&mut cmd);
     if let Some(url) = releases_url {
         cmd.env("CONFIDANT_TEST_RELEASES_URL", url);
     }
-    if let Some(repo) = repo {
-        cmd.env("CONFIDANT_REPO", repo);
+    if let Some(home) = env.home {
+        cmd.env("HOME", home);
     }
-    if let Some(offline) = offline {
+    if let Some(home) = env.confidant_home {
+        cmd.env("CONFIDANT_HOME", home);
+    }
+    if let Some(offline) = env.offline {
         cmd.env("CONFIDANT_OFFLINE", offline);
     }
     let out = cmd.output().unwrap();
@@ -152,6 +154,10 @@ fn run_doctor_offline(
     })
 }
 
+fn run_doctor(releases_url: Option<&str>) -> Value {
+    run_doctor_env(releases_url, &DoctorEnv::default())
+}
+
 fn check<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
     v["checks"]
         .as_array()
@@ -160,46 +166,19 @@ fn check<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
         .find(|c| c["id"] == id)
 }
 
-fn git(root: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .unwrap();
+/// Run `setup --agent <spec>` with the given `HOME`/`CONFIDANT_HOME`.
+fn run_setup(home: &str, confidant_home: &str, agent: &str) {
+    let mut cmd = Command::new(bin());
+    cmd.args(["setup", "--agent", agent, "--no-input"])
+        .env("HOME", home)
+        .env("CONFIDANT_HOME", confidant_home)
+        .env_remove("CONFIDANT_SKILLS_DIR");
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
+        "setup failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-/// A throwaway git checkout carrying one release tag (fake data only).
-fn fake_skills_checkout(tag: &str) -> tempfile::TempDir {
-    fake_skills_checkout_after(tag, 0)
-}
-
-/// As [`fake_skills_checkout`], but adds `commits_after` extra commits on
-/// top of the tagged commit, leaving HEAD past the tag (an unpinned
-/// checkout). Fake data only.
-fn fake_skills_checkout_after(tag: &str, commits_after: usize) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    std::fs::write(root.join("README.md"), "fake skills checkout\n").unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    git(root, &["tag", tag]);
-    for i in 0..commits_after {
-        std::fs::write(root.join("extra.md"), format!("fake commit {i}\n")).unwrap();
-        git(root, &["add", "-A"]);
-        let msg = format!("extra {i}");
-        git(root, &["commit", "-qm", &msg]);
-    }
-    dir
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +188,7 @@ fn fake_skills_checkout_after(tag: &str, commits_after: usize) -> tempfile::Temp
 #[test]
 fn doctor_cli_current_is_ok() {
     let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), None);
+    let v = run_doctor(Some(&url));
     let c = check(&v, "cli-staleness").expect("cli-staleness check missing");
     assert_eq!(c["status"], "ok", "{v}");
     assert!(
@@ -221,7 +200,7 @@ fn doctor_cli_current_is_ok() {
 #[test]
 fn doctor_cli_behind_warns_with_versions() {
     let url = stub_release_server("v999.0.0");
-    let v = run_doctor(Some(&url), None);
+    let v = run_doctor(Some(&url));
     let c = check(&v, "cli-staleness").expect("cli-staleness check missing");
     assert_eq!(c["status"], "warning", "{v}");
     let msg = c["message"].as_str().unwrap();
@@ -239,14 +218,14 @@ fn doctor_cli_behind_warns_with_versions() {
 fn doctor_cli_ahead_is_ok() {
     // A local dev build ahead of the last release is fine, not stale.
     let url = stub_release_server("v0.0.1");
-    let v = run_doctor(Some(&url), None);
+    let v = run_doctor(Some(&url));
     let c = check(&v, "cli-staleness").unwrap();
     assert_eq!(c["status"], "ok", "{v}");
 }
 
 #[test]
 fn doctor_offline_degrades_to_ok_unknown() {
-    let v = run_doctor(Some(&unreachable_url()), None);
+    let v = run_doctor(Some(&unreachable_url()));
     let c = check(&v, "cli-staleness").expect("cli-staleness check missing");
     assert_eq!(c["status"], "ok", "{v}");
     assert_eq!(
@@ -257,24 +236,20 @@ fn doctor_offline_degrades_to_ok_unknown() {
 }
 
 #[test]
-fn doctor_offline_disables_checks_without_requesting() {
-    // A working stub plus a checkout that would warn as behind: with
-    // CONFIDANT_OFFLINE=1 nothing is fetched and both checks are disabled.
+fn doctor_offline_disables_check_without_requesting() {
+    // With CONFIDANT_OFFLINE=1 nothing is fetched and the check is disabled.
     let (url, hits) = counting_stub_release_server("v999.0.0");
-    let checkout = fake_skills_checkout("v0.1.0");
-    let v = run_doctor_offline(
+    let v = run_doctor_env(
         Some(&url),
-        Some(checkout.path().to_str().unwrap()),
-        Some("1"),
+        &DoctorEnv {
+            offline: Some("1"),
+            ..Default::default()
+        },
     );
 
     let cli = check(&v, "cli-staleness").expect("cli-staleness check missing");
     assert_eq!(cli["status"], "ok", "{v}");
     assert_eq!(cli["message"], OFFLINE_MESSAGE, "{cli}");
-
-    let skills = check(&v, "skills-staleness").expect("skills-staleness check missing");
-    assert_eq!(skills["status"], "ok", "{v}");
-    assert_eq!(skills["message"], OFFLINE_MESSAGE, "{skills}");
 
     assert_eq!(v["ok"], true, "{v}");
 
@@ -288,103 +263,105 @@ fn doctor_offline_disables_checks_without_requesting() {
 }
 
 // ---------------------------------------------------------------------------
-// skills staleness
+// skills-links (setup-managed installs; no checkout, no CONFIDANT_REPO)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn doctor_skills_no_env_omits_check() {
-    let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), None);
-    assert!(
-        check(&v, "skills-staleness").is_none(),
-        "skills-staleness must be omitted when CONFIDANT_REPO is unset: {v}"
+fn doctor_skills_links_no_agents_is_ok() {
+    // A HOME with no agent dirs: nothing to link, so ok with a setup hint.
+    let home = tempfile::tempdir().unwrap();
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(home.path().to_str().unwrap()),
+            ..Default::default()
+        },
     );
-}
-
-#[test]
-fn doctor_skills_tag_behind_warns() {
-    let checkout = fake_skills_checkout("v0.1.0");
-    let url = stub_release_server("v999.0.0");
-    let v = run_doctor(Some(&url), Some(checkout.path().to_str().unwrap()));
-    let c = check(&v, "skills-staleness").expect("skills-staleness check missing");
-    assert_eq!(c["status"], "warning", "{v}");
-    let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("v0.1.0"), "missing checkout tag: {msg}");
-    assert!(msg.contains("v999.0.0"), "missing latest tag: {msg}");
-    assert!(
-        msg.contains("fetch --tags"),
-        "missing update command: {msg}"
-    );
-    assert_eq!(v["ok"], true, "{v}");
-}
-
-#[test]
-fn doctor_skills_matching_tag_is_ok() {
-    let checkout = fake_skills_checkout(&format!("v{LOCAL}"));
-    let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), Some(checkout.path().to_str().unwrap()));
-    let c = check(&v, "skills-staleness").expect("skills-staleness check missing");
+    let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "ok", "{v}");
+    assert!(
+        c["message"].as_str().unwrap().contains("setup"),
+        "expected a setup hint: {c}"
+    );
+    assert_eq!(v["ok"], true, "{v}");
 }
 
 #[test]
-fn doctor_skills_unpinned_checkout_warns() {
-    // One commit past v0.1.0: a bare `describe` would report v0.1.0 and read
-    // as current, but HEAD is not on a release tag (#166).
-    let checkout = fake_skills_checkout_after("v0.1.0", 1);
-    let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), Some(checkout.path().to_str().unwrap()));
-    let c = check(&v, "skills-staleness").expect("skills-staleness check missing");
-    assert_eq!(c["status"], "warning", "{v}");
+fn doctor_skills_links_after_setup_is_ok() {
+    // setup --agent claude-code, then doctor: all skills linked.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    let share = home.path().join("share");
+    let share_str = share.to_str().unwrap().to_owned();
+    run_setup(&home_str, &share_str, "claude-code");
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(&home_str),
+            confidant_home: Some(&share_str),
+            ..Default::default()
+        },
+    );
+    let c = check(&v, "skills-links").expect("skills-links check missing");
+    assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("not pinned"), "expected a pin warning: {msg}");
-    assert!(
-        msg.contains("docs/agent-setup.md"),
-        "missing fix pointer: {msg}"
-    );
-    // The message names the checkout path and fixed commands only, never
-    // repo content (the fake files here say "fake ...").
-    assert!(
-        !msg.contains("fake"),
-        "message must not name repo content: {msg}"
-    );
+    assert!(msg.contains("5/5"), "expected 5/5 linked: {msg}");
+    assert!(msg.contains("claude-code"), "expected agent name: {msg}");
     assert_eq!(v["ok"], true, "{v}");
 }
 
 #[test]
-fn doctor_skills_not_a_checkout_warns() {
-    // A directory that is not a git checkout: the tag cannot be determined.
-    let dir = tempfile::tempdir().unwrap();
-    let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), Some(dir.path().to_str().unwrap()));
-    let c = check(&v, "skills-staleness").expect("skills-staleness check missing");
-    assert_eq!(c["status"], "warning", "{v}");
-    assert!(
-        c["message"].as_str().unwrap().contains("cannot determine"),
-        "{c}"
+fn doctor_skills_links_never_targeted_is_ok() {
+    // A detected agent dir that `setup` never targeted is reported, not
+    // warned about: there is nothing stale, just nothing installed.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    std::fs::create_dir_all(home.path().join(".claude/skills")).unwrap();
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(&home_str),
+            ..Default::default()
+        },
     );
-    assert_eq!(v["ok"], true, "{v}");
+    let c = check(&v, "skills-links").expect("skills-links check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    assert!(
+        c["message"]
+            .as_str()
+            .unwrap()
+            .contains("confidant setup --agent auto"),
+        "missing setup hint: {c}"
+    );
 }
 
 #[test]
-fn doctor_skills_work_tree_without_tags_warns_cannot_determine() {
-    // A git work tree with no release tag has nothing to pin to, so it is
-    // "cannot determine", not "not pinned" (fake data only).
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    std::fs::write(root.join("README.md"), "fake skills checkout\n").unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let url = stub_release_server(&format!("v{LOCAL}"));
-    let v = run_doctor(Some(&url), Some(root.to_str().unwrap()));
-    let c = check(&v, "skills-staleness").expect("skills-staleness check missing");
+fn doctor_skills_links_missing_warns() {
+    // A targeted agent with missing links warns with the fix command.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    let share = tempfile::tempdir().unwrap();
+    let share_str = share.path().to_str().unwrap().to_owned();
+    run_setup(&home_str, &share_str, "claude-code");
+    // Break one link: targeted but incomplete.
+    std::fs::remove_file(home.path().join(".claude/skills/portal-sync")).unwrap();
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(&home_str),
+            confidant_home: Some(&share_str),
+            ..Default::default()
+        },
+    );
+    let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "warning", "{v}");
     assert!(
-        c["message"].as_str().unwrap().contains("cannot determine"),
-        "{c}"
+        c["message"]
+            .as_str()
+            .unwrap()
+            .contains("confidant setup --agent auto"),
+        "missing fix command: {c}"
     );
+    // Warning-only: missing links never flip doctor's overall ok.
     assert_eq!(v["ok"], true, "{v}");
 }

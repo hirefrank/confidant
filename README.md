@@ -42,17 +42,24 @@ then it is the disclosure.
 
 ```sh
 cargo install confidant-cli
+confidant setup --agent auto
 ```
 
-This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli).
-Requires a recent Rust toolchain (MSRV 1.85, see `rust-version` in `Cargo.toml`).
+This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli)
+(requires a recent Rust toolchain; MSRV 1.85, see `rust-version` in `Cargo.toml`).
 Prebuilt binaries and shell installers are on the
 [GitHub Releases](https://github.com/hirefrank/confidant/releases) page.
+`confidant update` keeps the install current (re-run the installer or
+`cargo install confidant-cli`, then `confidant setup --force` to re-link).
+
+`setup` installs the integration skills shipped inside the binary into your
+agent's skills dir — no repo checkout needed. See
+[`docs/agent-setup.md`](docs/agent-setup.md) for the one-prompt install.
 
 ## Agent setup
 
-Agents use the CLI plus the integration skills in [`skills/`](skills/) (imports,
-search). One page covers it all — including a single copy/paste prompt that
+Agents use the CLI plus its embedded integration skills (imports, search).
+One page covers it all — including a single copy/paste prompt that
 installs everything and a loop for staying current:
 [`docs/agent-setup.md`](docs/agent-setup.md).
 
@@ -73,26 +80,30 @@ it references is cleared. The full allowlist rules (merge groups, ledger
 lines, package propagation, ID edge cases) are in
 [`docs/privacy.md`](docs/privacy.md).
 
-`confidant doctor` checks GitHub for the latest release. That is one
-unauthenticated `GET` to
+`confidant doctor` checks GitHub for the latest release and reports skills
+link health. The release check is one unauthenticated `GET` to
 `api.github.com/repos/hirefrank/confidant/releases/latest`; no vault data is
 included, and only the `tag_name` is read — the response body is discarded.
-Set `CONFIDANT_OFFLINE=1` to skip the request; the checks then report
+Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 `staleness check disabled`.
 
 ## Quickstart
 
 ```sh
-git clone https://github.com/hirefrank/confidant
-cd confidant
-cargo build -p confidant-cli
-export CONFIDANT_VAULT="$PWD/examples/demo-vault"
-./target/debug/confidant check
-./target/debug/confidant check --json --no-input
-./target/debug/confidant find "Ada Example" --json
+cargo install confidant-cli
+confidant setup --agent auto
+export CONFIDANT_VAULT="$HOME/vault"
+confidant check
+confidant check --json --no-input
 ```
 
-The demo vault is **fake data only**.
+To try it with fake data, point `CONFIDANT_VAULT` at the demo vault in a
+contributor checkout (see [`CONTRIBUTING.md`](CONTRIBUTING.md)) — the demo
+vault is **fake data only**:
+
+```sh
+confidant find "Ada Example" --json --vault examples/demo-vault
+```
 
 `--json` is on every command. `--no-input` never prompts (milestone 1 has
 nothing to prompt for). Discovery order is `--vault`, then `CONFIDANT_VAULT`,

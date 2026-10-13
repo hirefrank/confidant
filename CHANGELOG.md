@@ -8,6 +8,14 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- Skills ship inside the `confidant` binary and install with
+  `confidant setup --agent auto` — no repo checkout needed. New commands:
+  `setup`, `update`, `agents`, `which`, `routing`. `doctor` reports
+  `skills-links` health instead of the old `CONFIDANT_REPO` checkout
+  staleness check (supersedes #164/#166/#167). Skills and CLI are
+  version-locked: one `confidant --version` covers both.
+
 ## [0.1.1] - 2026-10-12
 
 Patch: `confidant doctor` staleness checks, agent-setup docs, and the

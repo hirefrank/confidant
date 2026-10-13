@@ -16,7 +16,7 @@ summary to the operator.
    filters the two gap codes). It writes to stdout by default; never
    point `--out` at `/tmp` (world-readable):
    ```sh
-   python3 skills/capture-gap-summary/bin/capture-gap-summary.py \
+   python3 "$(confidant which --skills-dir)"/capture-gap-summary/bin/capture-gap-summary.py \
        --vault "$VAULT"
    ```
    Options: `--as-of YYYY-MM-DD` to evaluate the gap rules at a date,
