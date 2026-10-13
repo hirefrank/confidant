@@ -17,7 +17,7 @@ these private channels:
    [Security tab](https://github.com/hirefrank/confidant/security) of this
    repo and choose "Report a vulnerability". This keeps the report visible
    only to the maintainer until it is resolved.
-2. **Email:** fcharris@gmail.com with subject line `[confidant-security]`.
+2. **Email:** frank@hirefrank.com with subject line `[confidant-security]`.
 
 A useful report includes: what you think the impact is, steps to reproduce
 (or a proof of concept), and a root-cause analysis if you have one.
