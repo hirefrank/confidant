@@ -3221,7 +3221,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             .map(|(l, r)| l < r)
     });
     let upgrade_cmd =
-        "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup --force`.";
+        "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup`.";
     if cli.json {
         let update_info = match &latest {
             None if offline => {

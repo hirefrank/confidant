@@ -79,7 +79,7 @@ updates with this loop:
 - **CLI:** compare `confidant --version` against the latest GitHub Release
   (https://github.com/hirefrank/confidant/releases), or run
   `confidant update` to be told. If behind, re-run the installer or
-  `cargo install confidant-cli`, then `confidant setup --force` to
+  `cargo install confidant-cli`, then `confidant setup` to
   re-point the skill links at the new version dir.
 - **Skills:** they re-link from the new binary — no separate step, no tag
   to pin. `doctor` warns (`skills-links`) when a detected agent is missing
