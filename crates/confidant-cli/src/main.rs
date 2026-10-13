@@ -1389,12 +1389,25 @@ fn write_options(cli: &Cli) -> WriteOptions {
 /// `mode = "plaintext"` vault this is plain [`apply_write`]. Any
 /// fail-closed mode error (unkeyed vault, `[crypto]` contradiction, key
 /// failure) surfaces here, before anything is applied.
+///
+/// Ledger-only writes (no `WriteFile` changes) skip the encryptor
+/// entirely: ledger lines stay plaintext by design, so no key is ever
+/// needed for them. That keeps a broken keychain from blocking
+/// `log session` with no `--note` (#176). Any write carrying a record
+/// file goes through the encryptor as before.
 fn apply_record_write(
     root: &Path,
     vault: &confidant_core::vault::Vault,
     pending: PendingWrite,
     opts: &WriteOptions,
 ) -> anyhow::Result<WriteOutcome> {
+    let needs_encryptor = pending
+        .changes
+        .iter()
+        .any(|c| matches!(c, FileChange::WriteFile { .. }));
+    if !needs_encryptor {
+        return apply_write(root, pending, opts);
+    }
     match record_crypto::RecordEncryptor::for_vault(root, vault)? {
         Some(enc) => {
             apply_write_with_encryptor(root, pending, opts, &move |p, b| enc.encrypt_file(p, b))
@@ -1693,6 +1706,23 @@ fn cmd_log_session(
         "session {person} {duration}{}",
         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
     );
+    // #176: a session WITH a note needs the device key (the note record
+    // is encrypted). Probe the key early so a keychain failure fails
+    // closed here with a note-specific fix, instead of surfacing the
+    // generic encryptor error ("no device key enrolled") from
+    // `apply_record_write`. The probe is read-only; the encryptor loads
+    // the key again on the normal path. Gated on encrypted vaults: a
+    // plaintext vault needs no key for the note either.
+    // The note cannot be queued to the inbox yet: the drain refuses
+    // RecordWrite into encrypted vaults (B11), so a queued note item
+    // could never drain and would stall the whole inbox.
+    if note_body.is_some() {
+        let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
+            .map_err(anyhow::Error::new)?;
+        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted) {
+            device_key_bech32().map_err(|_| note_keychain_error())?;
+        }
+    }
     let outcome = apply_record_write(
         root,
         &vault,
@@ -1709,6 +1739,29 @@ fn cmd_log_session(
         "log-session",
         outcome,
         serde_json::json!({"lines": [line]}),
+    )
+}
+
+/// Fail-closed error for `log session --note` when the device key cannot
+/// load. The generic encryptor error ("no device key enrolled") misleads
+/// when the keychain is merely broken, so the note case names the real
+/// situation and the way out: log the session without the note now (the
+/// ledger line needs no key), then add the note once the keychain is
+/// back. Nothing was written.
+fn note_keychain_error() -> anyhow::Error {
+    anyhow::Error::new(
+        DomainError::invalid(
+            "cannot load the device key, so the note cannot be encrypted; nothing was written \
+             (the keychain may be unavailable, or this device may not be enrolled)",
+        )
+        .with_fix(
+            "Re-run without --note to log the session now (the ledger line needs no key), \
+             then add the note with `confidant note add` once the keychain is back. \
+             If this device was never enrolled, run `confidant init` (new vault) or \
+             `confidant recover` (new device) instead. \
+             The note cannot be queued to the inbox yet: the inbox drain refuses record \
+             writes into encrypted vaults.",
+        ),
     )
 }
 
