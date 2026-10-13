@@ -402,11 +402,200 @@ fn write_refuses_without_device_key_no_fallback() {
 }
 
 #[test]
-fn write_refuses_uninitialized_client_suggests_keys_init_client() {
+fn deal_for_uninitialized_client_suggests_keys_init_client() {
     let h = Harness::new();
     // Init the vault keys, but do NOT init-client for PERSON.
     let out = h.init();
     assert!(out.status.success());
+
+    // A deal does not create its person, so a deal for a person with no
+    // client key still refuses with the keys init-client suggestion
+    // (#180 auto-creates keys only for `person` records).
+    let deal_id = "d-01J9Z3K4QM0000000000000000";
+    let input = write_file(
+        h._tmp.path(),
+        "deal.md",
+        &format!(
+            "---\nid: {deal_id}\ntype: deal\nperson: {PERSON}\nname: \"Big Deal\"\n---\n\nTerms are secret.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "write should have failed");
+    let target = h.vault.join(format!("deals/{deal_id}/deal.md"));
+    assert!(!target.exists(), "target file must be absent");
+    let err = stderr(&out);
+    assert!(
+        err.contains("keys init-client"),
+        "error should suggest keys init-client, got: {err}"
+    );
+}
+
+#[test]
+fn record_add_new_person_auto_creates_client_key() {
+    let h = Harness::new();
+    // Init the vault keys, but do NOT init-client for PERSON: #180
+    // creates the key in the same commit as the person record.
+    let out = h.init();
+    assert!(out.status.success());
+
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "This bio is secret."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("created key for"),
+        "should print the created-key notice, got: {}",
+        stdout(&out)
+    );
+
+    // One commit holds both the record and the new key dir.
+    let log = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["log", "-1", "--name-only", "--format="])
+        .output()
+        .unwrap();
+    let files = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        files.contains(&format!("people/{PERSON}/profile.md")),
+        "commit should contain the person record, got:\n{files}"
+    );
+    assert!(
+        files.contains(&format!("keys/{PERSON}/recipients.toml")),
+        "commit should contain the new key dir, got:\n{files}"
+    );
+    let count = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "3",
+        "one commit on top of base + init (record + key together)"
+    );
+
+    // The record is an envelope under the new client key, not plaintext.
+    let path = h.vault.join(format!("people/{PERSON}/profile.md"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains(&format!("key_id: {PERSON}/e")),
+        "record should encrypt under the new client key, got:\n{text}"
+    );
+    assert!(
+        !text.contains("This bio is secret."),
+        "bio must not be plaintext"
+    );
+
+    // The key is usable: a note for the new person encrypts.
+    let note_body = write_file(h._tmp.path(), "note.txt", "Secret note.");
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note add failed: {}", stderr(&out));
+
+    // JSON output carries the auto-created key (a second person, so the
+    // union-recipients path is exercised again).
+    let input2 = write_file(
+        h._tmp.path(),
+        "person2.md",
+        &person_md(PERSON2, "Bob Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input2.to_str().unwrap(),
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record add --json failed: {}",
+        stderr(&out)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        value["created_keys"][0].as_str(),
+        Some(PERSON2),
+        "JSON should report the auto-created key, got: {value}"
+    );
+}
+
+#[test]
+fn record_add_dry_run_creates_no_key() {
+    let h = Harness::new();
+    let out = h.init();
+    assert!(out.status.success());
+
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dry run failed: {}", stderr(&out));
+    assert!(
+        !h.vault.join("keys").join(PERSON).exists(),
+        "dry run must not create a key dir"
+    );
+    assert!(
+        !h.vault.join(format!("people/{PERSON}/profile.md")).exists(),
+        "dry run must not write the record"
+    );
+}
+
+#[test]
+fn auto_init_rolls_back_key_dir_when_commit_fails() {
+    let h = Harness::new();
+    let out = h.init();
+    assert!(out.status.success());
+
+    // Break the commit step: no git identity. Files apply, then the
+    // commit fails — the created key dir must be rolled back anyway.
+    git(&h.vault, &["config", "--unset", "user.email"]);
 
     let input = write_file(
         h._tmp.path(),
@@ -424,12 +613,21 @@ fn write_refuses_uninitialized_client_suggests_keys_init_client() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "write should have failed");
-    let target = h.vault.join(format!("people/{PERSON}/profile.md"));
-    assert!(!target.exists(), "target file must be absent");
-    let err = stderr(&out);
     assert!(
-        err.contains("keys init-client"),
-        "error should suggest keys init-client, got: {err}"
+        !h.vault.join("keys").join(PERSON).exists(),
+        "failed write must not leave a key dir"
+    );
+    // init itself commits, so the count is 2 before the failed write —
+    // assert it is unchanged, i.e. the failed write committed nothing.
+    let count = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&count.stdout).trim(),
+        "2",
+        "no commit on failure (base + init only)"
     );
 }
 

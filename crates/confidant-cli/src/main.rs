@@ -1382,6 +1382,112 @@ fn write_options(cli: &Cli) -> WriteOptions {
     }
 }
 
+/// #180: when a pending write creates `person` records in an encrypted
+/// vault, create each missing client key in the same commit.
+///
+/// The key is created with the exact `keys init-client` logic (union of
+/// current recipients, #160 unchanged) via [`staged_keys_mutation`], then
+/// `git add`ed so the record write's commit sweeps it in — `apply_write`
+/// only adds its own pending files. Returns the client ids whose keys
+/// were created, so the caller can roll them back on failure and report
+/// them on success.
+///
+/// Skips are deliberate, and each preserves the pre-#180 error:
+/// - dry run: no mutation at all (the preview shows plaintext, and the
+///   encryptor never runs, so no key is needed);
+/// - unparseable change or routing failure: the encryptor reports the
+///   canonical error later;
+/// - epoch file already exists: the key is there (a re-add, a repair, or
+///   a complete dir left by a crashed earlier attempt — the staged swap
+///   only ever moves whole trees), so nothing is created.
+fn ensure_person_client_keys(
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    pending: &PendingWrite,
+    opts: &WriteOptions,
+) -> anyhow::Result<Vec<String>> {
+    if opts.dry_run {
+        return Ok(Vec::new());
+    }
+    let mut wanted: Vec<String> = Vec::new();
+    for change in &pending.changes {
+        let FileChange::WriteFile { path, contents } = change else {
+            continue;
+        };
+        if !confidant_core::crypto_mode::is_record_path(path) {
+            continue;
+        }
+        let provisional = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("record.md");
+        let Ok(rec) = confidant_core::record::parse_record(contents, provisional) else {
+            continue;
+        };
+        if rec.kind != RecordKind::Person {
+            continue;
+        }
+        let id = rec.id.to_string();
+        let Ok(client_id) = confidant_crypt::client_id_for_record("person", Some(id.as_str()))
+        else {
+            continue;
+        };
+        if !wanted.contains(&client_id) {
+            wanted.push(client_id);
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    // Loaded lazily: a write whose keys already exist must not fail for
+    // want of an operator key (the encryptor path needs only the device
+    // key).
+    let mut key_material: Option<(confidant_crypt::anchor::Anchor, ed25519_dalek::SigningKey)> =
+        None;
+    let mut created = Vec::new();
+    for client_id in wanted {
+        if root.join("keys").join(&client_id).join("epoch").exists() {
+            continue;
+        }
+        if key_material.is_none() {
+            let (anchor, _warnings) =
+                confidant_crypt::anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+            let operator_sk = load_operator_sk(&anchor)?;
+            key_material = Some((anchor, operator_sk));
+        }
+        let (anchor, operator_sk) = key_material.as_ref().unwrap();
+        staged_keys_mutation(root, vault, &config_dir, |store| {
+            let recipients = keys_current_recipients(store, anchor)?;
+            store
+                .init_client(&client_id, &recipients, anchor, operator_sk)
+                .map_err(anyhow::Error::new)
+        })?;
+        // Stage the new tree so the record write's commit (which only
+        // `git add`s its pending files) sweeps it into the same commit.
+        let keys_rel = format!("keys/{client_id}");
+        if let Err(e) = confidant_core::write::git(root, &["add", "--", &keys_rel], opts.no_input) {
+            let _ = std::fs::remove_dir_all(root.join("keys").join(&client_id));
+            return Err(e);
+        }
+        created.push(client_id);
+    }
+    Ok(created)
+}
+
+/// Roll back key dirs created by [`ensure_person_client_keys`] after a
+/// failed write: unstage, then remove. Best-effort — cleanup must not
+/// mask the original failure. Only ever touches dirs this write created
+/// (brand-new client ids), never pre-existing keys.
+fn rollback_created_keys(root: &Path, created: &[String], opts: &WriteOptions) {
+    for client_id in created {
+        let keys_rel = format!("keys/{client_id}");
+        let _ = confidant_core::write::git(root, &["reset", "--", &keys_rel], opts.no_input);
+        let _ = std::fs::remove_dir_all(root.join("keys").join(client_id));
+    }
+}
+
 /// Apply a record write through the encryption transform (spec 3).
 ///
 /// Builds the [`record_crypto::RecordEncryptor`] for this vault: on an
@@ -1389,6 +1495,10 @@ fn write_options(cli: &Cli) -> WriteOptions {
 /// `mode = "plaintext"` vault this is plain [`apply_write`]. Any
 /// fail-closed mode error (unkeyed vault, `[crypto]` contradiction, key
 /// failure) surfaces here, before anything is applied.
+///
+/// Returns the outcome plus the client ids whose keys were auto-created
+/// for new `person` records (#180); the second element is empty unless
+/// a key was created.
 ///
 /// Ledger-only writes (no `WriteFile` changes) skip the encryptor
 /// entirely: ledger lines stay plaintext by design, so no key is ever
@@ -1400,19 +1510,39 @@ fn apply_record_write(
     vault: &confidant_core::vault::Vault,
     pending: PendingWrite,
     opts: &WriteOptions,
-) -> anyhow::Result<WriteOutcome> {
+) -> anyhow::Result<(WriteOutcome, Vec<String>)> {
     let needs_encryptor = pending
         .changes
         .iter()
         .any(|c| matches!(c, FileChange::WriteFile { .. }));
     if !needs_encryptor {
-        return apply_write(root, pending, opts);
+        return Ok((apply_write(root, pending, opts)?, Vec::new()));
     }
     match record_crypto::RecordEncryptor::for_vault(root, vault)? {
         Some(enc) => {
-            apply_write_with_encryptor(root, pending, opts, &move |p, b| enc.encrypt_file(p, b))
+            // #180: create a missing person key in the same commit as
+            // the person record. On any non-Applied outcome the created
+            // key dirs are rolled back, so a failed write keeps nothing:
+            // no orphan keys/<id>/, no person without a key.
+            let created = ensure_person_client_keys(root, vault, &pending, opts)?;
+            let result = apply_write_with_encryptor(root, pending, opts, &move |p, b| {
+                enc.encrypt_file(p, b)
+            });
+            match result {
+                Ok(outcome) if matches!(outcome, WriteOutcome::Applied { .. }) => {
+                    Ok((outcome, created))
+                }
+                Ok(outcome) => {
+                    rollback_created_keys(root, &created, opts);
+                    Ok((outcome, Vec::new()))
+                }
+                Err(e) => {
+                    rollback_created_keys(root, &created, opts);
+                    Err(e)
+                }
+            }
         }
-        None => apply_write(root, pending, opts),
+        None => Ok((apply_write(root, pending, opts)?, Vec::new())),
     }
 }
 
@@ -1723,7 +1853,7 @@ fn cmd_log_session(
             device_key_bech32().map_err(|_| note_keychain_error())?;
         }
     }
-    let outcome = apply_record_write(
+    let (outcome, _) = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -1868,7 +1998,7 @@ fn cmd_note_add(
         body_start_line: 0,
         field_lines: BTreeMap::new(),
     };
-    let outcome = apply_record_write(
+    let (outcome, _) = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -1924,7 +2054,7 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     }
     let contents = confidant_core::format_record(&rec);
     let id = rec.id.to_string();
-    let outcome = apply_record_write(
+    let (outcome, created_keys) = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -1937,16 +2067,23 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
         },
         &write_options(cli),
     )?;
-    finish_write(
-        cli,
-        root,
-        "record-add",
-        outcome,
-        serde_json::json!({
-            "id": id,
-            "path": rel.display().to_string(),
-        }),
-    )
+    // #180: surface the auto-created key. JSON carries it (only when
+    // non-empty, so existing output is unchanged otherwise); human
+    // output prints the notice after the commit line.
+    let mut extra = serde_json::json!({
+        "id": id,
+        "path": rel.display().to_string(),
+    });
+    if !created_keys.is_empty() {
+        extra["created_keys"] = serde_json::json!(created_keys);
+    }
+    let result = finish_write(cli, root, "record-add", outcome, extra);
+    if !cli.json {
+        for key in &created_keys {
+            println!("created key for {key}");
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
