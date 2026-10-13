@@ -248,7 +248,7 @@ The roadmap is tracked as open issues on GitHub. The big themes:
 - **Ledger query performance** — a rebuildable local index.
   [Issue #188](https://github.com/hirefrank/confidant/issues/188).
 
-## Status: one thing is not ready for other people's data
+## Status: not yet audited
 
 **The encryption has had no outside review.** The design was reviewed
 in-project and the implementation's tests pass, but no independent reviewer
