@@ -115,6 +115,14 @@ pub struct KeyStore {
     vault_id: String,
     /// Off-vault seq high-water marks. Required — see [`KeyStore::new`].
     seq: SeqTracker,
+    /// Directory of the COMMITTED `keys/` tree, used for git-history
+    /// lookups (historical manifests, shredded clients, recovery history).
+    /// Defaults to `keys_dir`; the staged-swap flow (#175) points
+    /// `keys_dir` at a staging copy while history must still read the
+    /// committed tree — deriving the git pathspec from the staging path
+    /// would silently return empty history and weaken the
+    /// shredded-pubkey denylist.
+    committed_keys_dir: PathBuf,
 }
 
 /// What `doctor` reports for one client's recipient manifest.
@@ -146,11 +154,23 @@ impl KeyStore {
     /// marks yet" ([`SeqTracker::load`]), which is the normal fresh-device
     /// state — bootstrap needs no special case and no fail-open path.
     pub fn new(keys_dir: PathBuf, vault_id: &str, seq: SeqTracker) -> Self {
+        let committed_keys_dir = keys_dir.clone();
         KeyStore {
             keys_dir,
             vault_id: vault_id.to_string(),
             seq,
+            committed_keys_dir,
         }
+    }
+
+    /// Point git-history lookups at a different committed `keys/` tree
+    /// while `keys_dir` stays the working tree. Used by the staged-swap
+    /// flow (#175): the working tree is a staging copy, but history must
+    /// read the committed tree. All other callers leave the default
+    /// (`committed == working`) untouched.
+    pub fn with_committed_keys_dir(mut self, dir: PathBuf) -> Self {
+        self.committed_keys_dir = dir;
+        self
     }
 
     /// Construct with the tracker loaded from its conventional location
@@ -182,6 +202,19 @@ impl KeyStore {
             self.keys_dir.join("shared")
         } else {
             self.client_dir(client_id)
+        }
+    }
+
+    /// Same as [`manifest_dir`](Self::manifest_dir) but rooted at the
+    /// committed tree: git-history lookups derive their pathspec from
+    /// this, never from the (possibly staged) working tree.
+    fn committed_manifest_dir(&self, client_id: &str) -> PathBuf {
+        if client_id == VAULT_CLIENT_ID {
+            self.committed_keys_dir.join("vault")
+        } else if client_id == SHARED_CLIENT_ID {
+            self.committed_keys_dir.join("shared")
+        } else {
+            self.committed_keys_dir.join(client_id)
         }
     }
 
@@ -882,12 +915,14 @@ impl KeyStore {
     /// destroy list: a recipient revoked earlier still has old wrappings in
     /// history that open the shredded client's historical data keys.
     fn historical_recipients(&self, client_id: &str) -> Result<Vec<RecipientMap>, Error> {
-        // keys_dir is <vault>/keys; the repo root is its parent.
+        // The committed keys dir is <vault>/keys; the repo root is its
+        // parent. History reads use the COMMITTED tree, never the working
+        // tree, which may be a staging copy (#175).
         let repo = self
-            .keys_dir
+            .committed_keys_dir
             .parent()
             .ok_or_else(|| Error::Manifest("keys dir has no parent; not a vault".to_string()))?;
-        // Derive from manifest_dir so reserved ids (vault:lookup,
+        // Derive from committed_manifest_dir so reserved ids (vault:lookup,
         // vault:shared) resolve to their real locations (keys/vault,
         // keys/shared) rather than keys/<client_id>.
         //
@@ -896,7 +931,7 @@ impl KeyStore {
         // `\` on Windows). All components here are ASCII (keys/, the fixed
         // dir names, validated client ids), so this is exact.
         let rel = self
-            .manifest_dir(client_id)
+            .committed_manifest_dir(client_id)
             .strip_prefix(repo)
             .map_err(|_| {
                 Error::Manifest(format!("manifest dir for {client_id} is outside the vault"))
@@ -959,7 +994,8 @@ impl KeyStore {
     /// [`historical_recipients`](Self::historical_recipients)): without git
     /// there is no shredded history to consult.
     fn shredded_clients(&self) -> Vec<String> {
-        let repo = match self.keys_dir.parent() {
+        // History reads use the COMMITTED tree (#175).
+        let repo = match self.committed_keys_dir.parent() {
             Some(r) => r,
             None => return Vec::new(),
         };
@@ -1076,7 +1112,8 @@ impl KeyStore {
         if let Ok(text) = std::fs::read_to_string(&path) {
             out.extend(parse_recovery_recipients(&text));
         }
-        let Some(repo) = self.keys_dir.parent() else {
+        // History reads use the COMMITTED tree (#175).
+        let Some(repo) = self.committed_keys_dir.parent() else {
             return out;
         };
         // Git pathspecs need forward slashes; the file name is fixed ASCII.
@@ -1138,7 +1175,8 @@ impl KeyStore {
     /// refuses (the denylist is load-bearing there), and `keys shred`,
     /// `recover`, and `doctor` warn.
     pub fn history_degraded_reason(&self) -> Option<String> {
-        let repo = self.keys_dir.parent()?;
+        // History reads use the COMMITTED tree (#175).
+        let repo = self.committed_keys_dir.parent()?;
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 // Never leak the device key into git/gpg/hooks via the environment.
