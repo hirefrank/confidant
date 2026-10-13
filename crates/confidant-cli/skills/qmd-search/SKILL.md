@@ -1,5 +1,5 @@
 ---
-name: "qmd_search"
+name: "qmd-search"
 description: "Semantic + keyword search over a Confidant vault via a local QMD index (BM25, vectors, rerank). Honors the spec §12 fail-closed allowlist including no-ai; falls back to `confidant find` when no index exists."
 ---
 

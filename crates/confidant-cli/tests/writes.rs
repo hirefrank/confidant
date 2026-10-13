@@ -866,7 +866,14 @@ fn doctor_reports_expected_checks() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    for expected in ["git-repo", "git-identity", "spec", "check", "crypto"] {
+    for expected in [
+        "git-repo",
+        "git-identity",
+        "git-version",
+        "spec",
+        "check",
+        "crypto",
+    ] {
         assert!(ids.contains(&expected), "missing check {expected}");
     }
     let crypto = v["checks"]

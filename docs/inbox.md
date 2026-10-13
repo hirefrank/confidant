@@ -147,6 +147,13 @@ vault, never inside it. With no signers configured the run **refuses**
 unless `--allow-unsigned` is passed; warn-and-proceed is fail-open and is
 gone.
 
+Signature verification reads `git log --format=%G?/%GK`, and SSH signing
+landed in git 2.34, so verifying signatures needs **git >= 2.34.0**
+when signers are SSH keys (GPG signers work on older git).
+`confidant doctor` reports this as the `git-version` check: below the
+floor it is an error when signers are configured, a warning when none
+are.
+
 ## `confidant inbox`
 
 ```sh

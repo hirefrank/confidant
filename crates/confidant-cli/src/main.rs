@@ -687,7 +687,12 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             clear_pending_inbox_rotation,
         } => {
             let root = vault_root.unwrap();
-            cmd_doctor(&cli, &root, *clear_pending_inbox_rotation)
+            cmd_doctor(
+                &cli,
+                &root,
+                user_config.as_ref(),
+                *clear_pending_inbox_rotation,
+            )
         }
         Command::Init { force } => {
             let root = vault_root.unwrap();
@@ -2089,6 +2094,92 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
     }
 }
 
+/// Minimum git version Confidant relies on. SSH commit signing landed in
+/// git 2.34, and inbox signature checks read
+/// `git log --format=%G?/%GK`, so verifying signatures needs at least
+/// this version when signers are SSH keys. GPG signers work on older
+/// git, but the signer list holds opaque key IDs, so any configured
+/// signer is treated as possibly SSH (see `git_version_check`).
+const MIN_GIT_VERSION: (u64, u64, u64) = (2, 34, 0);
+
+/// Parse `git --version` output into `(major, minor, patch)`. Handles
+/// real-world suffixes: `git version 2.39.3 (Apple Git-145)` and
+/// `git version 2.47.1.windows.1`. Missing minor/patch default to 0.
+/// Returns `None` when no leading version number can be read.
+fn parse_git_version(output: &str) -> Option<(u64, u64, u64)> {
+    let token = output
+        .trim()
+        .strip_prefix("git version ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = token.split('.');
+    let leading_digits = |s: &str| -> Option<u64> {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
+    };
+    let major = leading_digits(parts.next()?)?;
+    let minor = parts.next().and_then(leading_digits).unwrap_or(0);
+    let patch = parts.next().and_then(leading_digits).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Build the `git-version` doctor check from a parsed `git --version`
+/// result. `has_signers` is whether the user config lists `[trust]`
+/// signers: below the floor that means signature verification is in use
+/// and the check is an `error`; with no signers configured it is a
+/// `warning`, since nothing verifies signatures today. `None` (git
+/// missing or unparseable output) is a `warning`: the `git-repo` check
+/// already errors when the vault is not a git repository, and an
+/// unparseable version string is an odd environment, not a known-bad git.
+fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -> DoctorCheck {
+    let floor = format!(
+        "{}.{}.{}",
+        MIN_GIT_VERSION.0, MIN_GIT_VERSION.1, MIN_GIT_VERSION.2
+    );
+    match version {
+        Some(v) if v >= MIN_GIT_VERSION => DoctorCheck {
+            id: "git-version",
+            status: "ok",
+            message: format!(
+                "git {}.{}.{} (>= {floor}; SSH-signed inbox commits supported)",
+                v.0, v.1, v.2
+            ),
+        },
+        Some(v) => DoctorCheck {
+            id: "git-version",
+            status: if has_signers { "error" } else { "warning" },
+            message: format!(
+                "git {}.{}.{} is below the minimum {floor}; upgrade git to >= {floor} for SSH-signed inbox commits",
+                v.0, v.1, v.2
+            ),
+        },
+        None => DoctorCheck {
+            id: "git-version",
+            status: "warning",
+            message: format!(
+                "could not determine git version; SSH-signed inbox commits need git >= {floor}"
+            ),
+        },
+    }
+}
+
+/// The `git-version` doctor check: runs `git --version` and compares
+/// against `MIN_GIT_VERSION`. See `git_version_check_from` for the
+/// status rules.
+fn git_version_check(has_signers: bool) -> DoctorCheck {
+    let version = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_git_version(&String::from_utf8_lossy(&out.stdout)));
+    git_version_check_from(version, has_signers)
+}
+
 /// Skills link health for `setup`-managed installs. Skills ship in the
 /// binary and are linked into agent skill dirs by `confidant setup`; there
 /// is no checkout to compare against a release tag. Warning-only: missing
@@ -2163,6 +2254,7 @@ fn skills_links_check() -> DoctorCheck {
 fn cmd_doctor(
     cli: &Cli,
     root: &Path,
+    user_config: Option<&UserConfig>,
     clear_pending_inbox_rotation: bool,
 ) -> anyhow::Result<ExitCode> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -2232,6 +2324,17 @@ fn cmd_doctor(
             message: "git user.name / user.email are not configured; commits will fail".to_owned(),
         });
     }
+
+    // #174: minimum git version. SSH signing landed in git 2.34, and
+    // inbox signature checks read `%G?`/`%GK`, so signature verification
+    // needs at least that version. Signers are opaque key IDs, so any
+    // configured signer counts as possibly SSH (error below the floor);
+    // with no signers configured nothing verifies signatures, so below
+    // the floor is a warning.
+    let has_signers = user_config
+        .map(|u| !u.trust.signers.is_empty())
+        .unwrap_or(false);
+    checks.push(git_version_check(has_signers));
 
     match load_vault(root) {
         Ok(vault) => {
@@ -4629,4 +4732,56 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{git_version_check_from, parse_git_version, MIN_GIT_VERSION};
+
+    #[test]
+    fn parse_git_version_handles_real_world_strings() {
+        // Apple Git carries a parenthesised suffix.
+        assert_eq!(
+            parse_git_version("git version 2.39.3 (Apple Git-145)"),
+            Some((2, 39, 3))
+        );
+        // Windows appends `.windows.N` after the patch.
+        assert_eq!(
+            parse_git_version("git version 2.47.1.windows.1"),
+            Some((2, 47, 1))
+        );
+        assert_eq!(parse_git_version("git version 2.34.0"), Some((2, 34, 0)));
+        // Missing patch defaults to 0.
+        assert_eq!(parse_git_version("git version 2.34"), Some((2, 34, 0)));
+        // Trailing newline from the real command output.
+        assert_eq!(parse_git_version("git version 2.43.0\n"), Some((2, 43, 0)));
+        // No version number to read.
+        assert_eq!(parse_git_version("git version abc"), None);
+        assert_eq!(parse_git_version("not git output"), None);
+        assert_eq!(parse_git_version(""), None);
+    }
+
+    #[test]
+    fn git_version_check_status_rules() {
+        // At or above the floor is ok either way.
+        let c = git_version_check_from(Some(MIN_GIT_VERSION), true);
+        assert_eq!(c.status, "ok");
+        assert!(c.message.contains("2.34.0"));
+        let c = git_version_check_from(Some((2, 50, 0)), false);
+        assert_eq!(c.status, "ok");
+
+        // Below the floor: error with signers (signature verification in
+        // use), warning without (nothing verifies signatures).
+        let c = git_version_check_from(Some((2, 33, 0)), true);
+        assert_eq!(c.status, "error");
+        assert!(c.message.contains("upgrade git to >= 2.34.0"));
+        assert!(c.message.contains("SSH-signed inbox commits"));
+        let c = git_version_check_from(Some((2, 33, 0)), false);
+        assert_eq!(c.status, "warning");
+        assert!(c.message.contains("upgrade git to >= 2.34.0"));
+
+        // Undetermined version is a warning, never an error.
+        let c = git_version_check_from(None, true);
+        assert_eq!(c.status, "warning");
+    }
 }
