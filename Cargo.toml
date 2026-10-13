@@ -33,7 +33,7 @@ confidant-core = { path = "crates/confidant-core", version = "0.2.0" }
 confidant-crypt = { path = "crates/confidant-crypt", version = "0.2.0" }
 age = { version = "0.11", default-features = false, features = ["armor"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 hex = "0.4"
