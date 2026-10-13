@@ -10,7 +10,9 @@ Set up Confidant (a git-native CRM CLI plus embedded agent skills) on this machi
 
 1. Install the CLI: `cargo install confidant-cli` (needs a Rust
    toolchain 1.85+; check with `rustc --version`). This provides the
-   `confidant` binary. Verify with `confidant --help`.
+   `confidant` binary. Make sure `~/.cargo/bin` is on PATH first
+   (`export PATH="$HOME/.cargo/bin:$PATH"`) or the next step fails with
+   `confidant: command not found`. Verify with `confidant --help`.
    (No Rust toolchain? Download the `confidant` binary + installer from
    the latest GitHub Release at
    https://github.com/hirefrank/confidant/releases instead — and verify
@@ -21,7 +23,10 @@ Set up Confidant (a git-native CRM CLI plus embedded agent skills) on this machi
 2. Install the skills (they ship inside the binary — no repo checkout):
    `confidant setup --agent auto`. This materializes the skills to a
    versioned share dir and links each skill into the detected agent's
-   skills directory. (`confidant doctor` checks GitHub for the latest
+   skills directory. (No vault configured yet? `confidant doctor` exits
+   with `E_VAULT_NOT_FOUND` before reporting skills-link health, so
+   confirm the links with `confidant agents` or
+   `confidant which --skills-dir` instead.) (`confidant doctor` checks GitHub for the latest
    release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
    shell rc too, this session and permanently, only if I want that
    request disabled.)
