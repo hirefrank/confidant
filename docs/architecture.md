@@ -1,10 +1,10 @@
 # Confidant: architecture and decision records
 
-*Name: **Confidant** (CLI `confidant`), chosen 2026-10-07. Draft 2026-10-07, revised the same day with the cr spike findings (ADR-13). Author: Frank Harris. Status: proposal for review.*
+*Name: **Confidant** (CLI `confidant`), chosen 2026-10-07. Category: relationship memory you own (decided 2026-10-13, #186). Draft 2026-10-07, revised the same day with the cr spike findings (ADR-13). Author: Frank Harris. Status: proposal for review.*
 
 ## 1. What this is
 
-`confidant` is an open-source, local-first CRM for **one operator** (a solo entrepreneur or coach) and their AI agents. Records are plain text in a git repo (the **vault**). A Rust CLI reads, writes and validates the vault. It runs on the operator's own computer and has no server.
+`confidant` is open-source, local-first relationship memory for **one operator** (a solo entrepreneur or coach) and their AI agents. Records are plain text in a git repo (the **vault**). A Rust CLI reads, writes and validates the vault. It runs on the operator's own computer and has no server.
 
 It is modeled on beancount and beancount-io: plain text in git, a CLI with a `--file` / `--json` / `--no-input` automation contract, a `check` command, agent skills that confirm before writing, and an MCP server as a thin layer on top.
 

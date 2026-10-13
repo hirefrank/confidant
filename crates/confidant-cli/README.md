@@ -1,7 +1,7 @@
 # confidant-cli
 
-The `confidant` binary — a plain-text, git-native CRM for one operator and
-their AI agents. Reads and checks Confidant vaults; there is no server.
+The `confidant` binary — relationship memory you own, in plain-text files
+in a git repo. Reads and checks Confidant vaults; there is no server.
 
 ## Install
 
