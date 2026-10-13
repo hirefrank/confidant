@@ -11,8 +11,8 @@ this file in the same PR.
 
 ## What this repo is
 
-Confidant is a plain-text, git-native CRM for one operator and their AI
-agents. Records live in a git repo (the vault) and the Rust CLI `confidant`
+Confidant is relationship memory you own: plain-text records in a git repo
+(the vault) for one operator and their AI agents. The Rust CLI `confidant`
 reads, checks, and (from milestone 3) writes them. There is no server.
 Client content is meant to be encrypted at rest in git once milestone 2
 lands, so privacy rules here are hard rules, not style.

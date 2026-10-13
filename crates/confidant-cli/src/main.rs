@@ -1,4 +1,4 @@
-//! `confidant` — local-first, git-backed, encrypted CRM.
+//! `confidant` — local-first, git-backed, encrypted relationship memory.
 //!
 //! Read commands (`check`, `find`, `context`, `doctor`, `schema`, `help`)
 //! never mutate the vault. Write commands (`log session`, `import`,
@@ -44,7 +44,7 @@ use zeroize::Zeroizing;
     name = "confidant",
     version,
     disable_help_subcommand = true,
-    about = "Plain-text, git-native CRM for one operator and their agents.",
+    about = "Relationship memory you own: plain-text records in a git repo.",
     after_help = "Examples:\n  \
         confidant check --vault ./examples/demo-vault\n  \
         confidant log session p-01H… 60m paid --json --no-input\n  \

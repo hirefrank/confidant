@@ -1,8 +1,24 @@
 # Confidant
 
-A plain-text, git-native CRM for **one operator** and their AI agents. Records
-live in a git repo (the **vault**). The Rust CLI `confidant` reads and checks
-them. There is no server.
+**Confidant is relationship memory you own.** Your agents share one memory
+of the people in your life — people, organizations, deals, interactions,
+notes — and every change is proposed by an agent, verified by deterministic
+rules (`confidant check`), and recorded by you. This isn't a CRM: there's
+no pipeline, no funnel, nothing customer-facing. It is a private record
+of relationships.
+
+Records live in plain-text files in a git repo (the **vault**). The Rust
+CLI `confidant` reads, checks, and writes them. There is no server.
+
+The same files serve both sides: open `people/p-<ULID>/profile.md` in any
+editor and it's just Markdown; ask an agent for context on a person and it
+pulls the whole bundle — notes, sessions, deals, balances — through one
+`confidant context` call, gated by the same rules. A memory your agents
+use, in files you can read. Underneath, a ledger of dated facts
+(`ledger/2026/10.cfd`) keeps the record append-only and auditable.
+
+New here? Start with [Agent setup](#agent-setup) for the one-prompt
+install, or [Quickstart](#quickstart) to try the fake-data demo vault.
 
 Milestone 1 is the format spec, parser, generic records, derived values,
 balance assertions, `confidant check`, the coaching schema pack, and a fake
@@ -29,8 +45,9 @@ fails closed rather than writing plaintext. Ledger entries, `import`, and
 "plaintext"` in `confidant.toml` opts out (only for vaults that hold no
 real data, such as the demo vault); the opt-out can never downgrade a
 vault that already has keys. Existing plaintext records are never
-encrypted in place. Encrypted reads (`find`/`context` decrypting) land
-next; until then, `find` and `context` do not decrypt.
+encrypted in place. Encrypted reads work too: `find` and `context`
+decrypt cleared records through the CLI (never `no-ai` records), so
+search and context work on keyed vaults.
 
 So, today: **keep vaults on trusted devices with encrypted disks, and do not
 put other people's client data in them.** `confidant check`, the privacy
@@ -50,7 +67,7 @@ This installs the `confidant` binary from [crates.io](https://crates.io/crates/c
 Prebuilt binaries and shell installers are on the
 [GitHub Releases](https://github.com/hirefrank/confidant/releases) page.
 `confidant update` keeps the install current (re-run the installer or
-`cargo install confidant-cli`, then `confidant setup --force` to re-link).
+`cargo install confidant-cli`, then `confidant setup` to re-link).
 
 `setup` installs the integration skills shipped inside the binary into your
 agent's skills dir — no repo checkout needed. See

@@ -7,7 +7,7 @@
 > client data.
 
 Outside tools (a capture agent, an import script, a second device) deliver new
-CRM material to the vault through a git **`inbox` branch**, not a folder.
+relationship records to the vault through a git **`inbox` branch**, not a folder.
 Each item is an age-encrypted file; `confidant inbox` decrypts the items,
 runs `check` on the merged result, merges into the current branch, and clears
 the inbox.
