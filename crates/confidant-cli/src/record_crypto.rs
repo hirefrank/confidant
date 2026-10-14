@@ -205,9 +205,14 @@ impl RecordEncryptor {
         Ok(out)
     }
 
-    /// Decrypt an existing envelope for the B3 stability comparison.
-    /// `for_agent = false`: this is a byte comparison, not agent output.
-    fn decrypt_existing(&self, path: &Path, envelope_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    /// Decrypt an existing envelope for the B3 stability comparison and
+    /// the inbox retry idempotency check (#213). `for_agent = false`:
+    /// this is a byte comparison, not agent output.
+    pub(crate) fn decrypt_existing(
+        &self,
+        path: &Path,
+        envelope_bytes: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let env = envelope::parse(envelope_bytes).map_err(anyhow::Error::new)?;
         let client_id = env
             .key_id

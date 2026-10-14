@@ -45,8 +45,11 @@ mod keys;
 mod merge;
 mod plan;
 mod preflight;
+mod queue;
 mod rotate;
 mod trust;
+
+pub use queue::{queue_items, QueueItem};
 
 use git::clear_inbox;
 use item::describe_target;
@@ -65,6 +68,22 @@ pub const INBOX_BRANCH: &str = "inbox";
 /// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
 /// (the real `confidant-crypt` age path); tests inject a fake.
 pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>;
+
+/// Encrypts one record file's plaintext into the bytes to write — a §14
+/// envelope on structurally encrypted vaults. The drain passes a closure
+/// over the CLI's `RecordEncryptor`; tests inject a fake. `None` keeps the
+/// B11 fail-closed refusal for `RecordWrite` items into encrypted vaults.
+pub type EncryptFn = dyn Fn(&Path, &[u8]) -> anyhow::Result<Vec<u8>>;
+
+/// Decrypts an existing record envelope back to plaintext, for the retry
+/// idempotency check (#213 follow-up). The drain passes a closure over the
+/// CLI's `RecordEncryptor` (same lazy construction as `encrypt`); tests
+/// inject a fake. `None` keeps the fail-closed behaviour: an existing
+/// envelope never equals the plaintext item content, so a retry after a
+/// failed clear still conflicts instead of silently skipping. The return
+/// is `Zeroizing` because it is decrypted client content — compare it,
+/// never log it.
+pub type DecryptExistingFn = dyn Fn(&Path, &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>;
 
 /// Options for [`run_inbox`].
 #[derive(Clone, Debug, Default)]
@@ -113,6 +132,15 @@ pub struct InboxReport {
     pub empty: bool,
 }
 
+/// Whether the queue's commit-signing gate passes for this vault: the
+/// queue refuses (`E_INBOX_UNTRUSTED`) without signing configured. The CLI
+/// `--dry-run` fallback path checks this so a dry run reports the refusal
+/// the real run would hit instead of a `would queue` that can never happen.
+pub fn queue_signing_configured(vault_root: &Path) -> anyhow::Result<bool> {
+    let repo = git::toplevel(vault_root)?;
+    git::commit_signing_configured(&repo)
+}
+
 /// Run the inbox: decrypt items on the `inbox` branch, `check` the merged
 /// vault, merge into the current branch, and clear the inbox.
 ///
@@ -124,11 +152,27 @@ pub struct InboxReport {
 /// recipient. Pass `None` when no key is enrolled — the comparison is
 /// skipped and decryption fails closed later. Tests that inject a fake
 /// `decrypt` pass `None`.
+///
+/// `encrypt` supplies the record encryptor for `RecordWrite` items into
+/// structurally encrypted vaults (B11, #213). Pass `None` to keep the
+/// fail-closed refusal; the rotate drain passes `None` (rotate is a
+/// keychain operation and cannot build the CLI's `RecordEncryptor` —
+/// drain record items with plain `confidant inbox` before rotating).
+///
+/// `decrypt_existing` supplies the record decryptor for the retry
+/// idempotency check: on a structurally encrypted vault, when a record
+/// path already exists, the existing envelope is decrypted and its
+/// plaintext compared to the item content (equal means already merged —
+/// skip; different or undecryptable means `E_INBOX_CONFLICT`). Pass `None`
+/// to keep the fail-closed behaviour (an existing envelope never equals
+/// plaintext); the rotate drain passes `None` alongside `encrypt`.
 pub fn run_inbox(
     vault_root: &Path,
     opts: &InboxOptions,
     decrypt: &DecryptFn,
     inbox_keys: Option<&InboxKeys>,
+    encrypt: Option<&EncryptFn>,
+    decrypt_existing: Option<&DecryptExistingFn>,
 ) -> anyhow::Result<InboxReport> {
     let ready = match preflight(vault_root, opts, decrypt, inbox_keys)? {
         PreflightOutcome::Report(report) => return Ok(report),
@@ -147,21 +191,40 @@ pub fn run_inbox(
     let mut ledger_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut outcomes = Vec::new();
     let mut applied: Vec<AppliedChange> = Vec::new();
-    for item in &items {
-        match plan_item(vault_root, item, &existing_srcs, &mut ledger_cache)? {
-            Some((outcome, writes)) => {
-                if !opts.dry_run {
-                    apply_writes(vault_root, &writes, &mut applied)?;
+    // A mid-loop failure must not leave the tree dirty: plan and apply
+    // inside a closure so any error reverts what was applied so far.
+    // Without this, a mid-run `E_INBOX_CONFLICT` — or a newly failing
+    // encryptor — stranded already-applied ledger appends and the next run
+    // stopped at `E_INBOX_DIRTY`. (The `check`-failure and commit-failure
+    // paths below already revert.)
+    let planned: anyhow::Result<()> = (|| {
+        for item in &items {
+            match plan_item(
+                vault_root,
+                item,
+                &existing_srcs,
+                &mut ledger_cache,
+                decrypt_existing,
+            )? {
+                Some((outcome, writes)) => {
+                    if !opts.dry_run {
+                        apply_writes(vault_root, &writes, &mut applied, encrypt)?;
+                    }
+                    outcomes.push(outcome);
                 }
-                outcomes.push(outcome);
+                None => outcomes.push(ItemOutcome {
+                    name: item.name.clone(),
+                    kind: item.kind.as_str().to_string(),
+                    target: describe_target(item),
+                    action: "skip".to_string(),
+                }),
             }
-            None => outcomes.push(ItemOutcome {
-                name: item.name.clone(),
-                kind: item.kind.as_str().to_string(),
-                target: describe_target(item),
-                action: "skip".to_string(),
-            }),
         }
+        Ok(())
+    })();
+    if let Err(e) = planned {
+        revert_applied(&applied);
+        return Err(e);
     }
 
     if !opts.dry_run {
@@ -546,7 +609,7 @@ mod tests {
         item: &ParsedItem,
         srcs: &BTreeSet<String>,
     ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
-        plan_item(root, item, srcs, &mut HashMap::new())
+        plan_item(root, item, srcs, &mut HashMap::new(), None)
     }
 
     #[test]

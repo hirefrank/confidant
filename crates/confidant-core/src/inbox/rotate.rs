@@ -242,6 +242,14 @@ fn drain_for_rotate(
         },
         &decrypt,
         Some(keys.as_ref()),
+        // Rotate is a keychain operation: it cannot build the CLI's
+        // RecordEncryptor, so a record item into an encrypted vault keeps
+        // the B11 fail-closed refusal. Drain record items with plain
+        // `confidant inbox` before rotating.
+        None,
+        // Same for the retry idempotency check: without a decryptor an
+        // existing envelope still conflicts rather than skipping.
+        None,
     )
 }
 /// Read `[inbox].pubkey` from a TOML pin file. Missing file → `None`.

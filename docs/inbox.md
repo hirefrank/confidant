@@ -186,7 +186,16 @@ The run, in order:
    Importing twice adds nothing: lines whose `src:` already exists in the
    vault, exact-duplicate lines, and records identical to the target are
    skipped; a record path that exists with different content is
-   `E_INBOX_CONFLICT`.
+   `E_INBOX_CONFLICT`. On a structurally encrypted vault the drain cannot
+   compare an existing envelope to an incoming record (bytes always
+   differ), so a record item whose path already exists conflicts — even
+   when the envelope holds the same record. Record items into an
+   encrypted vault are encrypted at drain time with the vault's device
+   key (B11, #213); without a record encryptor the run fails closed
+   rather than writing plaintext. The rotate drain passes no encryptor
+   (rotation is a keychain operation), so it keeps the fail-closed
+   refusal — drain record items with plain `confidant inbox` before
+   rotating.
 7. Apply the merge, then run `check` (fail on error). If `check` fails,
    everything is reverted and nothing is committed (`E_INBOX_CHECK_FAILED`).
 8. Commit the merge — **one commit per run**, message `inbox: merge N item(s)`
@@ -210,5 +219,37 @@ leaves both branches untouched. If the merge commit lands and the clear
 then refuses — the tip moved (`E_INBOX_RACE`), or the clear commit failed
 to sign — main keeps the merge and the inbox keeps its items. Re-running
 is safe: already-merged items are skipped as duplicates (idempotent), and
-the clear is retried against the new tip.
+the clear is retried against the new tip. On structurally encrypted
+vaults the retry decrypts an existing record envelope and compares
+plaintext, so a record item the first run merged is recognized as already
+merged rather than conflicting.
 `--dry-run` decrypts and plans without committing or clearing.
+
+## Fallback queue (`log session --note --fallback-inbox`, #213)
+
+When the keychain is unavailable, `log session --note` cannot encrypt
+the note — but it can queue the session instead of failing closed. With
+`--fallback-inbox` (or an interactive `y` at the prompt; `--no-input`
+and `--json` fail closed with a fix pointing at the flag), the command
+queues two items to the `inbox` branch and prints `queued to inbox; run
+confidant inbox when the keychain is back`:
+
+- a ledger item: the session line plus a `src:fallback/<ulid>`
+  provenance token (in addition to any operator `--src`);
+- a record item: the note record, with the exact bytes a normal write
+  would have produced, so the drained result matches a normal write.
+
+Both items are age-encrypted to the vault's inbox pubkey and committed
+with one signed commit (`inbox: queue 2 item(s)`), via plumbing only —
+the `inbox` branch is never checked out and nothing is written to main,
+so no plaintext ever lands on the main branch. The queue refuses when
+the vault's `[inbox].pubkey` does not match the operator's pin in
+`~/.config/confidant/config.toml` (`E_INBOX_UNTRUSTED` — stricter than
+the drain, which only warns on a missing pin), when commit signing is
+not configured, or when a stem already exists on the branch. The next
+`confidant inbox` run merges the queued items like any other intake.
+
+Edge case: if the session was logged with `--src X` and the vault
+already contains `src:X`, the drain skips the fallback ledger line as a
+duplicate while still merging the note record — the note then has no
+session line pointing at it.

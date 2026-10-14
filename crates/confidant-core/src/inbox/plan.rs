@@ -43,11 +43,16 @@ fn month_file(date: &chrono::NaiveDate) -> PathBuf {
 
 /// Plan one item. Returns `None` when everything it carries is already
 /// present (idempotent re-import adds nothing).
+///
+/// `decrypt_existing` decrypts an existing record envelope for the retry
+/// idempotency check on structurally encrypted vaults (see
+/// [`DecryptExistingFn`]); `None` keeps the fail-closed byte comparison.
 pub(crate) fn plan_item(
     vault_root: &Path,
     item: &ParsedItem,
     existing_srcs: &BTreeSet<String>,
     ledger_cache: &mut HashMap<PathBuf, String>,
+    decrypt_existing: Option<&super::DecryptExistingFn>,
 ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
     match item.kind {
         ItemKind::Ledger => {
@@ -129,7 +134,27 @@ pub(crate) fn plan_item(
             let rel = item.path.as_ref().expect("record items have a path");
             match paths::read_to_string(vault_root, rel) {
                 Ok(current) if current == item.content => return Ok(None),
-                Ok(_) => {
+                Ok(current) => {
+                    // Retry idempotency on structurally encrypted vaults
+                    // (#213): the first run's merge wrote an envelope, so a
+                    // byte comparison against the plaintext item always
+                    // mismatches and a retry after a failed clear would
+                    // wedge the inbox on `E_INBOX_CONFLICT` forever.
+                    // Decrypt the existing envelope and compare plaintext
+                    // instead: equal means the item already merged (skip).
+                    // Anything else — a real difference, an undecryptable
+                    // file, or no decryptor — fails closed as a conflict.
+                    let already_merged = crate::crypto_mode::is_structurally_encrypted(vault_root)
+                        && decrypt_existing
+                            .map(|dec| {
+                                dec(rel, current.as_bytes())
+                                    .map(|pt| pt.as_slice() == item.content.as_bytes())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    if already_merged {
+                        return Ok(None);
+                    }
                     return Err(anyhow::Error::new(DomainError::inbox_conflict(
                         rel.display().to_string(),
                     )));

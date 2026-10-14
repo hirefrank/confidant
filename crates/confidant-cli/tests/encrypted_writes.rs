@@ -982,9 +982,10 @@ fn log_session_without_note_works_without_device_key() {
 #[test]
 fn log_session_note_fails_closed_without_device_key() {
     // #176: a session WITH a note cannot be written without the device
-    // key (the note record is encrypted), and the note cannot be queued
-    // to the inbox yet (the drain refuses RecordWrite into encrypted
-    // vaults, B11). Fail closed with a note-specific fix; write nothing.
+    // key (the note record is encrypted). Fail closed with a
+    // note-specific fix pointing at --fallback-inbox; write nothing.
+    // (#213: the note CAN now be queued with --fallback-inbox — see the
+    // fallback tests below.)
     let h = Harness::new();
     h.keyed(PERSON);
 
@@ -1047,8 +1048,8 @@ fn log_session_note_fails_closed_without_device_key() {
         "error must point at logging without --note: {err}"
     );
     assert!(
-        err.contains("cannot be queued to the inbox"),
-        "error must explain why the note cannot go to the inbox: {err}"
+        err.contains("--fallback-inbox"),
+        "error must point at the --fallback-inbox way out: {err}"
     );
 
     // Nothing was written: ledger unchanged, no note file created.
@@ -1700,4 +1701,441 @@ fn record_add_interaction_with_validates_shape() {
     // Nothing was written: no interaction file, no ledger lines.
     assert!(!h.vault.join(format!("interactions/{IXN}")).exists());
     assert!(!h.vault.join("ledger/2026/10.cfd").exists());
+}
+
+// ---------------------------------------------------------------------------
+// #213: `log session --note --fallback-inbox`
+// ---------------------------------------------------------------------------
+
+/// Recipient (`age1…`) for an inbox bech32 secret.
+fn age_recipient(bech32: &str) -> String {
+    let identity: age::x25519::Identity = bech32.trim().parse().unwrap();
+    identity.to_public().to_string()
+}
+
+/// Pin the vault's inbox pubkey in the harness HOME user config.
+fn write_user_config_pin(home: &Path, pubkey: &str) {
+    let dir = home.join(".config/confidant");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("[inbox]\npubkey = \"{pubkey}\"\n"),
+    )
+    .unwrap();
+}
+
+/// Advertise an `[inbox].pubkey` in the vault config (committed).
+fn advertise_vault_inbox_pubkey(h: &Harness, pubkey: &str) {
+    let path = h.vault.join("confidant.toml");
+    let mut toml = std::fs::read_to_string(&path).unwrap();
+    toml.push_str(&format!("\n[inbox]\npubkey = \"{pubkey}\"\n"));
+    std::fs::write(&path, toml).unwrap();
+    git(&h.vault, &["add", "confidant.toml"]);
+    git(&h.vault, &["commit", "-qm", "advertise inbox pubkey"]);
+}
+
+/// Configure SSH commit signing on the vault repo so the fallback queue
+/// commit and the drain's merge/clear commits can be signed (-S).
+/// Returns the TempDir that must stay alive, or `None` (skip the test)
+/// when ssh-keygen is unavailable.
+fn ssh_signing(h: &Harness) -> Option<tempfile::TempDir> {
+    let keydir = tempfile::tempdir().ok()?;
+    let key = keydir.path().join("key");
+    let gen = Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-q",
+            "-C",
+            "fallback-e2e",
+            "-f",
+            key.to_str()?,
+        ])
+        .output()
+        .ok()?;
+    if !gen.status.success() {
+        return None;
+    }
+    let pubkey = std::fs::read_to_string(key.with_extension("pub")).ok()?;
+    let allowed = keydir.path().join("allowed_signers");
+    std::fs::write(
+        &allowed,
+        format!("test@example.com namespaces=\"git\" {pubkey}"),
+    )
+    .ok()?;
+    for (k, v) in [
+        ("gpg.format", "ssh"),
+        ("user.signingkey", key.to_str()?),
+        ("gpg.ssh.allowedSignersFile", allowed.to_str()?),
+        ("commit.gpgsign", "true"),
+    ] {
+        git(&h.vault, &["config", k, v]);
+    }
+    Some(keydir)
+}
+
+/// Shared setup for the fallback tests: keyed vault + person + open
+/// package, returning the ledger dir.
+fn fallback_setup(h: &Harness) -> PathBuf {
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "package"]);
+    ledger_dir
+}
+
+/// Run `log session --note` with no device key.
+fn log_session_no_key(h: &Harness, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--note",
+        "This session note is secret.",
+        "--date",
+        "2026-10-13",
+        "--no-input",
+    ];
+    args.extend_from_slice(extra);
+    let mut c = h.cmd_no_device_key(&args);
+    c.env_remove("CONFIDANT_TEST_KEYCHAIN_DIR");
+    c.output().unwrap()
+}
+
+#[test]
+fn log_session_note_fallback_inbox_queues_and_drains() {
+    // #213: with --fallback-inbox, a keychain failure queues the session
+    // (ledger line + note) to the inbox, encrypted to the pinned inbox
+    // pubkey, signed; `confidant inbox` later merges it with the same
+    // result as a normal write. Nothing plaintext lands on main.
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let ledger_before = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let main_before = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(main_before.status.success());
+
+    // Queue: no device key.
+    let out = log_session_no_key(&h, &["--fallback-inbox"]);
+    assert!(
+        out.status.success(),
+        "fallback queue failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("queued to inbox; run `confidant inbox` when the keychain is back"),
+        "missing queued message: {}",
+        stdout(&out)
+    );
+
+    // Main is untouched: ledger unchanged, no note file, HEAD unmoved.
+    assert_eq!(
+        std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap(),
+        ledger_before
+    );
+    assert!(!h.vault.join(format!("people/{PERSON}/notes")).exists());
+    let main_after = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(main_before.stdout, main_after.stdout, "main must not move");
+
+    // Inbox branch: two items, queue commit signed, no plaintext in blobs.
+    let inbox_tree = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .output()
+        .unwrap();
+    let inbox_tree = String::from_utf8_lossy(&inbox_tree.stdout).into_owned();
+    let stems: Vec<&str> = inbox_tree.lines().collect();
+    assert_eq!(stems.len(), 2, "inbox tree:\n{inbox_tree}");
+    assert!(
+        stems.iter().all(|s| s.ends_with(".age")),
+        "inbox tree:\n{inbox_tree}"
+    );
+    let sig = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["log", "--format=%G?", "-n", "1", "inbox"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&sig.stdout).trim(), "G");
+    for stem in &stems {
+        let blob = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["show", &format!("inbox:{stem}")])
+            .output()
+            .unwrap();
+        assert!(
+            !blob
+                .stdout
+                .windows(b"This session note is secret.".len())
+                .any(|w| w == b"This session note is secret."),
+            "plaintext note in queued blob {stem}"
+        );
+    }
+
+    // Drain: device key back + inbox key + --allow-unsigned (no signers
+    // configured in the user config).
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+
+    // The ledger line landed with its src:fallback provenance token.
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let session_line = ledger
+        .lines()
+        .find(|l| l.contains("2026-10-13 session") && l.contains("note:"))
+        .expect("session line missing after drain");
+    assert!(
+        session_line.contains("src:fallback/"),
+        "session line lacks src:fallback: {session_line}"
+    );
+    // The note id in the line matches the drained record file.
+    let note_id = session_line
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("note:"))
+        .expect("note: token missing");
+    let note_path = h.vault.join(format!("people/{PERSON}/notes/{note_id}.md"));
+    let note_bytes = std::fs::read(&note_path).unwrap();
+    let note_text = String::from_utf8_lossy(&note_bytes);
+    assert!(note_text.starts_with("---\nid:"), "note is not an envelope");
+    assert!(note_text.contains("\nenc: "), "note lacks enc header");
+    assert!(
+        !note_text.contains("This session note is secret."),
+        "plaintext note in drained file"
+    );
+
+    // The drained note decrypts (via find) to the original text: the
+    // drained result matches a normal write.
+    let out = h
+        .cmd(&["find", "secret", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let excerpts: Vec<&str> = v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["excerpt"].as_str().unwrap())
+        .collect();
+    assert!(
+        excerpts
+            .iter()
+            .any(|e| e.contains("This session note is secret.")),
+        "decrypted note body not in excerpts: {excerpts:?}"
+    );
+
+    // Idempotency: a second drain merges nothing (the inbox is cleared).
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(
+        out.status.success(),
+        "second drain failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        stdout(&out).contains("0 item(s) merged"),
+        "second drain should merge nothing: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn log_session_note_fallback_refuses_pin_mismatch() {
+    // #213: the fallback refuses when the vault pubkey does not match
+    // the user-config pin — encrypting to an unverified key would be
+    // key substitution.
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+
+    let vault_bech32 = age_generate_bech32();
+    let vault_recipient = age_recipient(&vault_bech32);
+    let pinned_bech32 = age_generate_bech32();
+    let pinned_recipient = age_recipient(&pinned_bech32);
+    assert_ne!(vault_recipient, pinned_recipient);
+    advertise_vault_inbox_pubkey(&h, &vault_recipient);
+    write_user_config_pin(&h.home, &pinned_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let out = log_session_no_key(&h, &["--fallback-inbox"]);
+    assert!(!out.status.success(), "pin mismatch must refuse");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "pin mismatch must be E_INBOX_UNTRUSTED: {err}"
+    );
+    // Nothing queued: no inbox branch.
+    let branches = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["branch", "--list", "inbox"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+        "inbox branch must not exist after a refused fallback"
+    );
+}
+
+#[test]
+fn log_session_note_fallback_refuses_without_pin() {
+    // #213: with no pin at all the fallback refuses — it cannot verify
+    // which key it would encrypt to (stricter than the drain, which
+    // only warns on a missing pin).
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    // No user-config pin written.
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let out = log_session_no_key(&h, &["--fallback-inbox"]);
+    assert!(!out.status.success(), "missing pin must refuse");
+    assert!(
+        stderr(&out).contains("E_INBOX_UNTRUSTED"),
+        "missing pin must be E_INBOX_UNTRUSTED: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn log_session_note_fallback_refuses_without_signing() {
+    // #213: the queue commit is signed (-S); with no signing configured
+    // the fallback refuses rather than queueing an item the drain
+    // would never trust.
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    // No signing configured.
+
+    let out = log_session_no_key(&h, &["--fallback-inbox"]);
+    assert!(!out.status.success(), "unsigned queue must refuse");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "unsigned queue must be E_INBOX_UNTRUSTED: {err}"
+    );
+    assert!(
+        err.contains("commit signing"),
+        "unsigned queue must point at commit signing: {err}"
+    );
+}
+
+#[test]
+fn log_session_note_fallback_dry_run_checks_signing_gate() {
+    // #213 follow-up: --dry-run reports `would queue` only when the real
+    // run could proceed — without commit signing configured it refuses
+    // with the same E_INBOX_UNTRUSTED the queue would hit, instead of a
+    // `would queue` that can never happen.
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    // No signing configured.
+
+    let out = log_session_no_key(&h, &["--fallback-inbox", "--dry-run"]);
+    assert!(!out.status.success(), "unsigned dry run must refuse");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "unsigned dry run must be E_INBOX_UNTRUSTED: {err}"
+    );
+
+    // With signing configured the dry run reports `would queue` and
+    // queues nothing.
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let out = log_session_no_key(&h, &["--fallback-inbox", "--dry-run"]);
+    assert!(out.status.success(), "dry run failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("would queue 2 item(s)"),
+        "dry run must report would queue: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn log_session_note_fallback_json_envelope() {
+    // #213 + ADR-7: the fallback speaks JSON like every other command.
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let out = log_session_no_key(&h, &["--fallback-inbox", "--json"]);
+    assert!(
+        out.status.success(),
+        "fallback queue failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["queued"], true);
+    assert_eq!(v["fallback_inbox"], true);
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    assert_eq!(v["tip"].as_str().unwrap().len(), 40);
+    assert!(v["vault"].is_string(), "envelope must carry vault: {v}");
 }
