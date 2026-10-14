@@ -388,6 +388,7 @@ confidant import --file portal-events.jsonl --request-id portal-2026-10-07 --jso
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Portal sync + transcript import skills.** Agent skills that pull portal events and transcripts (with duration) into the vault, with dry runs and safe retries.
 5. **QMD search (right after v0).** On trusted devices with encrypted disks only, and the index never goes in git (section 9b).
+6. **Terminal UI (`crates/confidant-tui`, after v0).** Reference second consumer of the ADR-7 CLI contract: invokes `confidant <subcommand> --json --no-input` as a child process without linking `confidant-core`, keeping plaintext on the alternate screen only (#205, #210).
 
 Out of v0: hosted version, integration plugin system, GUI.
 

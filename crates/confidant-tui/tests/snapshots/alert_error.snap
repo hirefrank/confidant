@@ -1,0 +1,24 @@
+┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
+│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] | Tab/1-4:view /:find j/k:move Enter:context r:r│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ CLI Error (exit 1) ──────────────────────────────────────────────────────────────────────────────┐
+│code: E_LEDGER_UNREADABLE                                                                         │
+│message: 1 items                                                                                  │
+│fix: Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate  │
+│it                                                                                                │
+│                                                                                                  │
+│Press Esc to dismiss, r to retry, or q to quit.                                                   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

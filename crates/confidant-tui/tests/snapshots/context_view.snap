@@ -1,0 +1,24 @@
+┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
+│[ 1:Check ] [ 2:Find ] [*3:Context*] [ 4:Doctor ] | Tab/1-4:view /:find j/k:move Enter:context r:r│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Person Context ──────────────────────────────────────────────────────────────────────────────────┐
+│person: p-01M3TC5H00MPJG000000000000 | name: Ada Example                                          │
+│scope: coaching@0.1                                                                               │
+│profile: Fake executive coaching client at Acme Corp.                                             │
+│coaching: sessions_remaining: 5 | icf_hours: 1.00                                                 │
+│  session 2026-10-01 (60m, paid)                                                                  │
+│notes (1):                                                                                        │
+│  n-01M3TC5H00MPJG002NAM000005 [2026-10-01]: Kickoff session notes for Ada Example.               │
+│interactions (1):                                                                                 │
+│  i-01M3TC5H00MPJG0048H0000008 [2026-09-25] Intro call: Fake intro call transcript.               │
+│touchpoints (1):                                                                                  │
+│  2026-10-05 (kind: call)                                                                         │
+│aliases (1): hmac:0123456789abcdef0123456789abcdef                                                │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘

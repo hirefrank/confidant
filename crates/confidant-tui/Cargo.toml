@@ -1,0 +1,23 @@
+[package]
+name = "confidant-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Read-only TUI for Confidant, consuming the ADR-7 CLI JSON contract."
+publish = false
+
+[[bin]]
+name = "confidant-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
