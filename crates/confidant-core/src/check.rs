@@ -1121,6 +1121,18 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
 /// looked up over enabled packs, core, and all registered packs (a kind
 /// owned by a disabled pack is still a known kind for duplicate
 /// detection; the edge itself warns as `W_PACK_ORPHAN`).
+/// The closed edge-kind list for this vault: core kinds plus every enabled
+/// pack's kinds, sorted and deduped (#299).
+fn edge_kind_names(enabled_packs: &[&dyn Pack]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = CORE_EDGE_KINDS.iter().map(|k| k.name).collect();
+    for pack in enabled_packs {
+        names.extend(pack.edge_kinds().iter().map(|k| k.name));
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 fn check_edges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
@@ -1243,7 +1255,10 @@ fn check_edges(
                 )
                 .at_file(&rec.path)
                 .for_id(&rec.id)
-                .with_fix("Add kind: married, introduced, or colleague"),
+                .with_fix(format!(
+                    "Add kind: {}",
+                    edge_kind_names(enabled_packs).join(", ")
+                )),
             ),
             Some(kind) => {
                 let in_enabled = enabled_packs

@@ -4464,6 +4464,39 @@ fn edge_missing_kind_is_rejected() {
 }
 
 #[test]
+fn edge_missing_kind_fix_lists_pack_kinds() {
+    // #299: the missing-kind fix message must list the closed kind list —
+    // core kinds plus every enabled pack's kinds — not just core.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = [\"personal@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Demo");
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+    let fix = json["findings"][0]["fix"].as_str().unwrap();
+    // Core kinds plus personal's kinds are all named.
+    for want in [
+        "married",
+        "introduced",
+        "colleague",
+        "friend",
+        "family",
+        "mentor",
+    ] {
+        assert!(fix.contains(want), "fix must name {want}: {fix}");
+    }
+}
+
+#[test]
 fn edge_wrong_type_end_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     two_people(dir.path());
