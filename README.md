@@ -1,5 +1,7 @@
 # Confidant
 
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/hirefrank/confidant/badge)](https://securityscorecards.dev/viewer/?uri=github.com/hirefrank/confidant)
+
 **Confidant is relationship memory you own.** Your agents share one memory
 of the people in your life — people, organizations, deals, interactions,
 notes — and every change is proposed by an agent, verified by deterministic
