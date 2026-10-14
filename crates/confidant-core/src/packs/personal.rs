@@ -53,7 +53,8 @@ pub fn is_valid_touch_kind(kind: &str) -> bool {
 
 /// Extract the touchpoint kind from either a positional `KIND` token
 /// (`2026-10-12 touch p-… call`) or a `kind:KIND` pair (`2026-10-12 touch p-… kind:call`).
-pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
+/// Pack-internal; core reaches it through [`Pack::verb_kind`] (#185/#296).
+fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
     if let Some(k) = entry.pair("kind") {
         return Some(k.to_owned());
     }
@@ -65,13 +66,27 @@ pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
     None
 }
 
-/// True when `entry` is a `touch` line using the `personal@0.1` positional-kind
-/// syntax (`DATE touch P-ID call|text|coffee|gift|meet [note:…] [src:…]`).
-/// Used by `check` when `personal@0.1` is disabled so valid personal `touch`
-/// lines emit `W_PACK_ORPHAN` (#177 Q2) while mirrored core touchpoints
-/// (`DATE touch P-ID [kind:…]`) remain valid without the pack.
-pub fn is_personal_touch_shape(entry: &LedgerEntry) -> bool {
-    parse_personal_touch_args(&entry.args).is_some()
+/// Validate a `touch` line's arguments when `personal@0.1` is enabled.
+/// Accepts either:
+/// - `DATE touch P-ID` (mirrored touchpoint with no kind)
+/// - `DATE touch P-ID kind:<call|text|coffee|gift|meet>` (mirrored touchpoint with kind)
+/// - `DATE touch P-ID <call|text|coffee|gift|meet> [note:N-ID] [src:…]` (`log touch` syntax)
+///
+/// Pack-internal; core reaches it through [`Pack::validate_verb_args`]
+/// (#185/#296). On non-mirrored inputs this agrees with the shape core
+/// used to ask `is_personal_touch_shape` about, so the disabled-pack
+/// branch of `check` can use it as the pack-shape check behind
+/// `W_PACK_ORPHAN`.
+fn validate_touch_args_enabled(args: &[Arg]) -> bool {
+    match args {
+        [] => true,
+        [arg] => match arg.pair() {
+            Some(("kind", k)) => is_valid_touch_kind(k),
+            None => arg.as_token().is_some_and(is_valid_touch_kind),
+            _ => false,
+        },
+        _ => parse_personal_touch_args(args).is_some(),
+    }
 }
 
 fn parse_personal_touch_args(args: &[Arg]) -> Option<&str> {
@@ -89,23 +104,6 @@ fn parse_personal_touch_args(args: &[Arg]) -> Option<&str> {
         }
     }
     Some(first)
-}
-
-/// Validate a `touch` line's arguments when `personal@0.1` is enabled.
-/// Accepts either:
-/// - `DATE touch P-ID` (mirrored touchpoint with no kind)
-/// - `DATE touch P-ID kind:<call|text|coffee|gift|meet>` (mirrored touchpoint with kind)
-/// - `DATE touch P-ID <call|text|coffee|gift|meet> [note:N-ID] [src:…]` (`log touch` syntax)
-pub fn validate_touch_args_enabled(args: &[Arg]) -> bool {
-    match args {
-        [] => true,
-        [arg] => match arg.pair() {
-            Some(("kind", k)) => is_valid_touch_kind(k),
-            None => arg.as_token().is_some_and(is_valid_touch_kind),
-            _ => false,
-        },
-        _ => parse_personal_touch_args(args).is_some(),
-    }
 }
 
 /// Parsed calendar month/day with optional year (`YYYY-MM-DD` or `--MM-DD`).
@@ -390,6 +388,20 @@ impl Pack for PersonalPack {
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
         match verb {
             "touch" => Some(Prefix::Person),
+            _ => None,
+        }
+    }
+
+    fn validate_verb_args(&self, verb: &str, entry: &LedgerEntry) -> Option<bool> {
+        match verb {
+            "touch" => Some(validate_touch_args_enabled(&entry.args)),
+            _ => None,
+        }
+    }
+
+    fn verb_kind(&self, verb: &str, entry: &LedgerEntry) -> Option<String> {
+        match verb {
+            "touch" => extract_touch_kind(entry),
             _ => None,
         }
     }

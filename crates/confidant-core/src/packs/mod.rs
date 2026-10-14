@@ -18,6 +18,7 @@ use chrono::NaiveDate;
 
 use crate::check::{Finding, MergeMap};
 use crate::id::{Prefix, RecordId};
+use crate::ledger::LedgerEntry;
 use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
@@ -100,6 +101,26 @@ pub trait Pack: Send + Sync {
     /// it (e.g. `open` / `session` require a person ID). `None` means the
     /// verb constrains nothing. Defaults to `None`.
     fn verb_id_type(&self, _verb: &str) -> Option<Prefix> {
+        None
+    }
+    /// Validate the argument grammar of a ledger entry for a verb this pack
+    /// owns. Returns `None` when the pack does not own `verb` or does not
+    /// constrain its args; `Some(valid)` otherwise. Core routes verb-arg
+    /// validation through this instead of reaching into pack internals
+    /// (#185/#296). Defaults to no opinion.
+    ///
+    /// When the owning pack is disabled, core applies its own shape rule
+    /// first (e.g. the #179 mirrored touchpoint); only lines that fail it
+    /// reach the pack, so this doubles as the pack-shape check behind
+    /// `W_PACK_ORPHAN` vs malformed-verb findings.
+    fn validate_verb_args(&self, _verb: &str, _entry: &LedgerEntry) -> Option<bool> {
+        None
+    }
+    /// Extract the pack's display kind for a ledger entry of a verb it owns
+    /// (e.g. the touchpoint kind of a `touch` line), used by `context`.
+    /// Returns `None` when the pack does not own `verb` or the entry
+    /// carries no kind (#185/#296). Defaults to none.
+    fn verb_kind(&self, _verb: &str, _entry: &LedgerEntry) -> Option<String> {
         None
     }
     /// Fold the vault's ledger entries into pack state. Appends fold-time

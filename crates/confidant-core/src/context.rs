@@ -223,7 +223,12 @@ pub fn build_context(
         })
         .map(|s| TouchpointView {
             date: s.entry.date.to_string(),
-            kind: crate::packs::personal::extract_touch_kind(&s.entry),
+            // The touchpoint kind is the claiming pack's grammar (#185/#296):
+            // ask the registered pack through the trait, not `packs::personal`.
+            kind: ALL_PACKS
+                .iter()
+                .find(|p| p.verbs().contains(&s.entry.verb.as_str()))
+                .and_then(|p| p.verb_kind(&s.entry.verb, &s.entry)),
         })
         .collect();
     touchpoints.sort_by(|a, b| a.date.cmp(&b.date).then(a.kind.cmp(&b.kind)));
