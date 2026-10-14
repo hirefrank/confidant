@@ -29,6 +29,7 @@ Read before changing behaviour:
 - [`docs/crypto-design.md`](docs/crypto-design.md): milestone 2 encryption
   design (key hierarchy, envelope, AAD, recovery, test plan).
 - [`packs/coaching/0.1.md`](packs/coaching/0.1.md): the coaching schema pack.
+- [`packs/personal/0.1.md`](packs/personal/0.1.md): the personal relationships pack.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and
   [`docs/borrowing.md`](docs/borrowing.md): contributor setup, and what was
   adapted from `cr`.
@@ -42,7 +43,7 @@ Read before changing behaviour:
 | `crates/confidant-crypt/` | Encryption (milestone 2): per-client keys, envelope, AAD. Publishable as of 2026-10-12 (first publish is the operator's manual step), disclosed as unaudited (see README Status); wired into the CLI write path since spec 3 (`record add`, `note add`, `log session --note` encrypt; inbox `RecordWrite` encrypts at drain time, #213) |
 | `crates/confidant-tui/` | Read-only TUI (`confidant-tui`, workspace-only with `publish = false` until #218): reference second consumer of the ADR-7 `--json --no-input` CLI contract |
 | `spec/` | Format spec and finding codes |
-| `packs/` | Schema packs (coaching first) |
+| `packs/` | Schema packs (coaching and personal) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, crypto design, benchmarks, research |

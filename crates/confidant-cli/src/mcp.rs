@@ -184,6 +184,22 @@ fn tools() -> Vec<Value> {
             ),
         ),
         tool(
+            "log_touch",
+            "Append a personal touchpoint ledger line (call, text, coffee, gift, or meet). One commit; check-gated.",
+            obj(
+                &["person", "kind"],
+                json!({
+                    "person": str_prop("Opaque person id (p-…)."),
+                    "kind": str_prop("Touchpoint kind: call, text, coffee, gift, or meet."),
+                    "date": str_prop("YYYY-MM-DD; default today."),
+                    "note": str_prop("Touchpoint note text; creates a note record."),
+                    "src": str_prop("Source token."),
+                    "request_id": str_prop("Idempotency key."),
+                    "dry_run": {"type": "boolean", "description": "Show the logical change only."},
+                }),
+            ),
+        ),
+        tool(
             "import_ledger",
             "Bulk-append ledger lines from a file. One commit; check-gated.",
             obj(
@@ -337,6 +353,18 @@ fn call_tool(
                 }
             }
         }
+        "log_touch" => {
+            cli.push("log".to_owned());
+            cli.push("touch".to_owned());
+            cli.push(get_str(&args, "person")?);
+            cli.push(get_str(&args, "kind")?);
+            for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
+                if let Some(v) = opt_str(&args, key) {
+                    cli.push(flag.to_owned());
+                    cli.push(v);
+                }
+            }
+        }
         "import_ledger" => {
             cli.push("import".to_owned());
             cli.push("--file".to_owned());
@@ -440,6 +468,7 @@ mod tests {
             "find",
             "context",
             "log_session",
+            "log_touch",
             "import_ledger",
             "note_add",
             "schema",

@@ -395,6 +395,27 @@ enum LogAction {
         #[arg(long)]
         fallback_inbox: bool,
     },
+    /// Append a personal touchpoint ledger line, e.g. `log touch p-… coffee`.
+    Touch {
+        /// Opaque person id (p-…).
+        person: String,
+        /// Touchpoint kind: call, text, coffee, gift, or meet.
+        kind: String,
+        /// Touchpoint date YYYY-MM-DD (default today).
+        #[arg(long)]
+        date: Option<String>,
+        /// Touchpoint note text (creates a note record).
+        #[arg(long)]
+        note: Option<String>,
+        /// Source token, stored as src:<value>.
+        #[arg(long)]
+        src: Option<String>,
+        /// On keychain failure with --note, encrypt the note to the
+        /// pinned inbox pubkey and queue it to the `inbox` branch
+        /// instead of failing closed (#213).
+        #[arg(long)]
+        fallback_inbox: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -702,6 +723,24 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     person,
                     duration,
                     tag.clone(),
+                    date.clone(),
+                    note.clone(),
+                    src.clone(),
+                    *fallback_inbox,
+                ),
+                LogAction::Touch {
+                    person,
+                    kind,
+                    date,
+                    note,
+                    src,
+                    fallback_inbox,
+                } => cmd_log_touch(
+                    &cli,
+                    &root,
+                    user_config.as_ref(),
+                    person,
+                    kind,
                     date.clone(),
                     note.clone(),
                     src.clone(),
@@ -2035,6 +2074,141 @@ fn cmd_log_session(
         cli,
         root,
         "log-session",
+        outcome,
+        serde_json::json!({"lines": [line]}),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_log_touch(
+    cli: &Cli,
+    root: &Path,
+    user_config: Option<&UserConfig>,
+    person_raw: &str,
+    kind: &str,
+    date_raw: Option<String>,
+    note: Option<String>,
+    src: Option<String>,
+    fallback_inbox: bool,
+) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    if !enabled
+        .iter()
+        .any(|p| p.name() == confidant_core::config::PERSONAL_PACK)
+    {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("log touch requires pack personal@0.1")
+                .with_fix("Add \"personal@0.1\" to packs in confidant.toml"),
+        ));
+    }
+    let person = parse_person_arg(&vault, person_raw)?;
+    if !confidant_core::packs::personal::is_valid_touch_kind(kind) {
+        return Err(anyhow::Error::new(DomainError::usage(format!(
+            "bad touch kind '{kind}'; use one of: call, text, coffee, gift, meet"
+        ))));
+    }
+    let date = parse_date_arg(&date_raw)?;
+
+    let mut changes = Vec::new();
+    let mut note_arg: Option<String> = None;
+    let mut note_body: Option<String> = None;
+    let mut note_write: Option<(PathBuf, String)> = None;
+    if let Some(text) = note {
+        let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
+            .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
+        let rel = PathBuf::from(format!("people/{person}/notes/{nid}.md"));
+        let rec = Record {
+            id: nid.clone(),
+            kind: RecordKind::Note,
+            path: rel.display().to_string(),
+            name: None,
+            fields: BTreeMap::from([
+                ("person".to_owned(), person.to_string()),
+                ("date".to_owned(), date.to_string()),
+            ]),
+            body: text.clone(),
+            source: String::new(),
+            body_start_line: 0,
+            field_lines: BTreeMap::new(),
+        };
+        let contents = confidant_core::format_record(&rec);
+        note_write = Some((rel.clone(), contents.clone()));
+        changes.push(FileChange::WriteFile {
+            path: rel,
+            contents,
+        });
+        note_arg = Some(format!("note:{nid}"));
+        note_body = Some(text);
+    }
+
+    let mut parts = vec![
+        date.to_string(),
+        "touch".to_owned(),
+        person.to_string(),
+        kind.to_owned(),
+    ];
+    if let Some(n) = &note_arg {
+        parts.push(n.clone());
+    }
+    if let Some(s) = &src {
+        parts.push(format!("src:{s}"));
+    }
+    let line = parts.join(" ");
+    changes.push(FileChange::AppendLines {
+        path: month_path(&date),
+        lines: vec![line.clone()],
+    });
+
+    let canonical = format!(
+        "log-touch/v1\nperson={person}\ndate={date}\nkind={kind}\nnote={}\nsrc={}\n",
+        note_body.as_deref().unwrap_or(""),
+        src.as_deref().unwrap_or(""),
+    );
+    let summary = format!("touch {person} {kind}");
+    if note_body.is_some() {
+        let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
+            .map_err(anyhow::Error::new)?;
+        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted)
+            && device_key_bech32().is_err()
+        {
+            let queue = if fallback_inbox {
+                true
+            } else if cli.no_input || cli.json {
+                false
+            } else {
+                prompt_fallback_inbox()?
+            };
+            if queue {
+                let (note_rel, note_contents) =
+                    note_write.expect("note write present when a note was given");
+                return queue_session_note_to_inbox(
+                    cli,
+                    root,
+                    &vault,
+                    user_config,
+                    &line,
+                    &note_rel,
+                    &note_contents,
+                );
+            }
+            return Err(note_keychain_error());
+        }
+    }
+    let (outcome, _) = apply_record_write(
+        root,
+        &vault,
+        PendingWrite {
+            changes,
+            summary,
+            canonical_request: canonical,
+        },
+        &write_options(cli),
+    )?;
+    finish_write(
+        cli,
+        root,
+        "log-touch",
         outcome,
         serde_json::json!({"lines": [line]}),
     )

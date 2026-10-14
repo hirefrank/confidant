@@ -1375,3 +1375,100 @@ fn plaintext_vault_note_add_under_notes_mode_person_is_hidden_from_find_and_cont
     assert_eq!(ctx["person"]["name"], "Ada Example");
     assert_eq!(ctx["notes"].as_array().unwrap().len(), 0, "{ctx}");
 }
+
+#[test]
+fn log_touch_requires_personal_pack() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // make_vault only enables coaching@0.1; `log touch` must refuse.
+    let (ok, v) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "call",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("personal@0.1"));
+}
+
+#[test]
+fn log_touch_writes_one_commit_and_appears_in_context() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Enable personal@0.1.
+    let toml_path = root.join("confidant.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    std::fs::write(
+        &toml_path,
+        toml.replace(
+            "packs = [\"coaching@0.1\"]",
+            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "enable personal"]);
+
+    let (ok, added) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "coffee",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{added}");
+    assert_eq!(commits(root), 3, "init + enable personal + log touch");
+
+    // The touchpoint shows up in `context` for the person.
+    let (ok, ctx) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{ctx}");
+    assert_eq!(ctx["touchpoints"].as_array().unwrap().len(), 1, "{ctx}");
+    assert_eq!(ctx["touchpoints"][0]["kind"], "coffee");
+}
+
+#[test]
+fn log_touch_bad_kind_is_usage_error() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let toml_path = root.join("confidant.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    std::fs::write(
+        &toml_path,
+        toml.replace(
+            "packs = [\"coaching@0.1\"]",
+            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "enable personal"]);
+
+    let (ok, v) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "smoke",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "usage_error");
+}

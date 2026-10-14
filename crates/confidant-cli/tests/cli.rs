@@ -352,7 +352,7 @@ fn find_scoped_to_coaching_hides_unattributed() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(v["scope"], serde_json::json!([COACHING]));
+    assert_eq!(v["scope"], serde_json::json!([COACHING, "personal@0.1"]));
 }
 
 #[test]

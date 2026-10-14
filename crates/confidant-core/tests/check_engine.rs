@@ -4617,6 +4617,177 @@ fn edge_with_three_people_is_independent() {
     assert!(codes(&json).is_empty(), "{json}");
 }
 
+// ---------------------------------------------------------------------------
+// #184 + #182: personal@0.1 pack and the `touch` verb.
+// ---------------------------------------------------------------------------
+
+const PERSONAL_TOML: &str = r#"spec = "0.1"
+packs = ["personal@0.1"]
+vault_id = "test-vault"
+
+[checks]
+as_of = "2026-10-08"
+"#;
+
+fn personal_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    dir
+}
+
+#[test]
+fn personal_touch_accepts_positional_and_mirrored_forms_when_enabled() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 touch {ADA} call\n\
+             2026-10-02 touch {ADA} kind:coffee\n\
+             2026-10-03 touch {ADA} text src:zoom/t-01\n\
+             2026-10-04 touch {ADA}\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn personal_touch_unknown_kind_is_malformed_when_enabled() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} smoke\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_TOUCH_MALFORMED"]);
+}
+
+#[test]
+fn personal_touch_positional_form_orphan_when_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n");
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n"),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"W_PACK_ORPHAN".to_string()), "{c:?}");
+    assert!(!c.iter().any(|code| code.starts_with("E_")), "{c:?}");
+}
+
+#[test]
+fn personal_cadence_overdue_fires_when_no_touchpoint() {
+    let dir = personal_vault();
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["W_CADENCE_OVERDUE"]);
+
+    // A touchpoint inside the window clears the warning.
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn personal_cadence_counts_sessions_as_touchpoints() {
+    // #227 Q2: a coaching session counts as a touchpoint, so a coaching
+    // client who is also a friend does not get a false overdue.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\", \"personal@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n2026-10-01 session {ADA} 60m paid\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    // The session (a touchpoint per #227 Q2) suppresses the cadence nudge.
+    assert!(!c.contains(&"W_CADENCE_OVERDUE".to_string()), "{c:?}");
+}
+
+#[test]
+fn personal_date_upcoming_fires_for_yearless_birthday() {
+    let dir = personal_vault();
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: --10-10\n---\n\nFake person.\n"),
+    );
+    // as_of 2026-10-08; birthday --10-10 is 2 days away.
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["W_DATE_UPCOMING"]);
+}
+
+#[test]
+fn personal_field_validation_rejects_malformed_values() {
+    let dir = personal_vault();
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: 05-14\ncadence: 30\nrelationship_to_me: \"\"\ndates: [bad]\n---\n\nFake person.\n"),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    let count = c.iter().filter(|code| *code == "E_FRONTMATTER").count();
+    assert_eq!(count, 4, "{c:?}");
+}
+
+#[test]
+fn personal_edge_kind_is_valid_when_enabled() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Demo");
+    edge(dir.path(), EDGE1, ADA, BEA, "friend");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn personal_touch_note_integrity_checks_note_owner() {
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Demo");
+    note(dir.path(), NOTE, BEA, "2026-10-01");
+    // `touch` names a note that belongs to Bea, not Ada.
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_UNKNOWN_RECORD"]);
+}
+
 #[test]
 fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_and_context() {
     use confidant_core::context::build_context;

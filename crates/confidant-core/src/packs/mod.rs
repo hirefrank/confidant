@@ -21,6 +21,7 @@ use crate::id::{Prefix, RecordId};
 use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
+pub mod personal;
 
 /// One edge kind a pack owns (#179). `name` is the `kind` front-matter
 /// value on an edge record; `symmetric` declares whether the relation
@@ -141,7 +142,7 @@ pub trait Pack: Send + Sync {
 }
 
 /// Every pack compiled into this binary, in registry order.
-pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack];
+pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack, &personal::PersonalPack];
 
 /// The enabled packs for a vault's `packs = [...]` list, each at most once
 /// (a duplicated listing folds once), plus the listed names no compiled pack
