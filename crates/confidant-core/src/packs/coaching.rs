@@ -1,12 +1,11 @@
 //! Coaching schema pack 0.1: sessions, packages, ICF hours, gap rules.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use crate::check::{canonical_on, duration_of, Finding, FindingCode, MergeMap, Severity};
+use crate::check::{duration_of, Finding, FindingCode, MergeMap, Severity};
 use crate::config::COACHING_PACK;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
@@ -80,14 +79,11 @@ impl PersonCoaching {
     }
 }
 
-type MembersByRoot = HashMap<NaiveDate, HashMap<RecordId, Vec<RecordId>>>;
-
 #[derive(Clone, Debug, Default)]
 pub struct CoachingState {
-    pub parent: MergeMap,
+    merge: crate::packs::groups::MergeGroups,
     people: HashMap<RecordId, PersonCoaching>,
     pub packages: HashSet<RecordId>,
-    members_by_root: RefCell<MembersByRoot>,
 }
 
 impl PackState for CoachingState {
@@ -346,22 +342,11 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
 
 impl CoachingState {
     pub fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
-        canonical_on(id, &self.parent, on)
+        self.merge.canonical_on(id, on)
     }
 
     fn ensure_members(&self, on: NaiveDate) {
-        if self.members_by_root.borrow().contains_key(&on) {
-            return;
-        }
-        let mut map: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-        for pid in self.people.keys() {
-            let root = canonical_on(pid, &self.parent, on);
-            map.entry(root).or_default().push(pid.clone());
-        }
-        for members in map.values_mut() {
-            members.sort();
-        }
-        self.members_by_root.borrow_mut().insert(on, map);
+        self.merge.ensure_members(self.people.keys().cloned(), on);
     }
 
     fn group_people<'a>(
@@ -370,7 +355,7 @@ impl CoachingState {
         id: &RecordId,
         on: NaiveDate,
     ) -> impl Iterator<Item = &'a PersonCoaching> {
-        let root = canonical_on(id, &self.parent, on);
+        let root = self.merge.canonical_on(id, on);
         let members = groups.get(&root).map(Vec::as_slice).unwrap_or(&[]);
         members.iter().filter_map(|pid| self.people.get(pid))
     }
@@ -400,7 +385,7 @@ impl CoachingState {
 
     pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
         self.ensure_members(on);
-        let groups = self.members_by_root.borrow();
+        let groups = self.merge.groups();
         self.remaining_with(groups.get(&on).expect("members cached"), id, on)
     }
 
@@ -410,7 +395,7 @@ impl CoachingState {
 
     pub fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
         self.ensure_members(on);
-        let groups = self.members_by_root.borrow();
+        let groups = self.merge.groups();
         let mut minutes: u32 = 0;
         for person in self.group_people(groups.get(&on).expect("members cached"), id, on) {
             minutes = minutes.saturating_add(person.minutes_on(on));
@@ -426,10 +411,9 @@ fn fold(
     findings: &mut Vec<Finding>,
 ) -> CoachingState {
     let mut state = CoachingState {
-        parent,
+        merge: crate::packs::groups::MergeGroups::new(parent),
         people: HashMap::new(),
         packages: HashSet::new(),
-        members_by_root: RefCell::new(HashMap::new()),
     };
 
     let mut events: Vec<_> = vault
@@ -466,7 +450,7 @@ fn fold(
         .severity("coaching.balance_nonnegative", Severity::Error);
     if let Some(sev) = nonnegative {
         state.ensure_members(as_of);
-        let groups = state.members_by_root.borrow();
+        let groups = state.merge.groups();
         let groups = groups.get(&as_of).expect("members cached");
         let mut roots: Vec<_> = groups.keys().cloned().collect();
         roots.sort();
@@ -881,7 +865,7 @@ fn paid_session_gap(
     let window = chrono::Duration::days(days_i);
     let lookback_window = chrono::Duration::days(lookback_i);
     state.ensure_members(as_of);
-    let groups = state.members_by_root.borrow();
+    let groups = state.merge.groups();
     let groups = groups.get(&as_of).expect("members cached");
     let mut ids: Vec<_> = groups.keys().cloned().collect();
     ids.sort();

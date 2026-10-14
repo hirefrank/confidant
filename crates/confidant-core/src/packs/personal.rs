@@ -2,13 +2,12 @@
 //! dates, relationship edge kinds, keep-in-touch cadence, and the `touch`
 //! ledger verb.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::check::{canonical_on, Finding, FindingCode, MergeMap, Severity};
+use crate::check::{Finding, FindingCode, MergeMap, Severity};
 use crate::config::{MAX_GAP_DAYS, PERSONAL_PACK};
 use crate::id::{Prefix, RecordId};
 use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
@@ -253,13 +252,10 @@ impl PersonPersonal {
     }
 }
 
-type MembersByRoot = HashMap<NaiveDate, HashMap<RecordId, Vec<RecordId>>>;
-
 #[derive(Clone, Debug, Default)]
 pub struct PersonalState {
-    pub parent: MergeMap,
+    merge: crate::packs::groups::MergeGroups,
     people: HashMap<RecordId, PersonPersonal>,
-    members_by_root: RefCell<MembersByRoot>,
 }
 
 impl PackState for PersonalState {
@@ -270,31 +266,11 @@ impl PackState for PersonalState {
 
 impl PersonalState {
     pub fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
-        canonical_on(id, &self.parent, on)
+        self.merge.canonical_on(id, on)
     }
 
     fn ensure_members(&self, on: NaiveDate) {
-        if self.members_by_root.borrow().contains_key(&on) {
-            return;
-        }
-        let mut by_root: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
-        let mut all_ids: HashSet<RecordId> = self.people.keys().cloned().collect();
-        for (from, (to, _)) in &self.parent {
-            all_ids.insert(from.clone());
-            all_ids.insert(to.clone());
-        }
-        for id in all_ids {
-            if id.prefix() != Prefix::Person {
-                continue;
-            }
-            let root = self.canonical_on(&id, on);
-            by_root.entry(root).or_default().push(id);
-        }
-        for members in by_root.values_mut() {
-            members.sort();
-            members.dedup();
-        }
-        self.members_by_root.borrow_mut().insert(on, by_root);
+        self.merge.ensure_members(self.people.keys().cloned(), on);
     }
 
     fn group_people<'a>(
@@ -311,7 +287,7 @@ impl PersonalState {
 
     pub fn last_touch_on(&self, canonical: &RecordId, on: NaiveDate) -> Option<NaiveDate> {
         self.ensure_members(on);
-        let groups = self.members_by_root.borrow();
+        let groups = self.merge.groups();
         let groups = groups.get(&on).expect("members cached");
         self.group_people(groups, canonical)
             .filter_map(|p| p.last_touch_on(on))
@@ -323,7 +299,7 @@ impl PersonalState {
             return Some(days);
         }
         self.ensure_members(on);
-        let borrow = self.members_by_root.borrow();
+        let borrow = self.merge.groups();
         let groups = borrow.get(&on).expect("members cached");
         let members = groups.get(canonical)?;
         for m in members {
@@ -537,7 +513,7 @@ fn fold(
     findings: &mut Vec<Finding>,
 ) -> PersonalState {
     let mut state = PersonalState {
-        parent: merges,
+        merge: crate::packs::groups::MergeGroups::new(merges),
         ..Default::default()
     };
 
