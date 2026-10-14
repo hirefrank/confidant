@@ -9,23 +9,28 @@
 //! Ownership rules (Silas, #232):
 //! - A front-matter field is owned by the enabled pack claiming it, else
 //!   core if it is a spec key (`id`, `type`, `name`, `date`, `person`,
-//!   `org`, `deal`, `session`, `no-ai`, plus case-variant ref keys), else
-//!   unattributed.
+//!   `org`, `deal`, `session`, `no-ai`, `a`, `b`, `kind`, `since`, `until`,
+//!   `with`, plus case-variant ref keys), else unattributed.
 //! - A ledger line is owned by its verb's pack; a `balance` line by its
-//!   metric's pack; `alias` / `merge` / `stage` are core. Anything else
-//!   (unknown verb, unknown metric, unparseable) is unattributed.
+//!   metric's pack; `alias` / `merge` / `stage` / `touch` are core.
+//!   Anything else (unknown verb, unknown metric, unparseable) is
+//!   unattributed.
 //! - A note is owned by the packs claiming its fields plus the packs
 //!   owning a ledger line that references it (e.g. a coaching `session`
 //!   line's `note:` pair). An interaction is owned by the packs claiming
 //!   its fields. A person / org / deal record is core-owned (the identity
 //!   anchor); pack-claimed fields on it filter per-field in `find`.
+//! - An edge is owned by its kind's pack (#179); a core kind is
+//!   core-owned; an edge with an unknown or missing kind is unattributed.
+//!   The edge's own front matter has no pack-owned fields to filter —
+//!   edges are visible as whole records only, like notes/interactions.
 
 use std::collections::{BTreeSet, HashMap};
 
 use crate::error::DomainError;
 use crate::id::RecordId;
 use crate::ledger::{parse_line, LedgerEntry};
-use crate::packs::Pack;
+use crate::packs::{EdgeKind, Pack, CORE_EDGE_KINDS};
 use crate::record::{canonical_ref_key, is_spec_key, Record, RecordKind};
 use crate::vault::Vault;
 
@@ -156,8 +161,12 @@ pub fn owner_of_field(field: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
     }
 }
 
-/// Core ledger verbs: owned by core, visible to every scope.
-pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage"];
+/// Core ledger verbs: owned by core, visible to every scope. `touch` is
+/// core because a mirrored touchpoint (#179) carries only a date and the
+/// participant's own id — no pack data. A pack that claims `touch`
+/// (#184) owns touch lines when enabled: [`owner_of_verb`] checks pack
+/// claims first.
+pub const CORE_VERBS: &[&str] = &["alias", "merge", "stage", "touch"];
 
 /// Owner of a ledger verb: the enabled pack claiming it, core for
 /// [`CORE_VERBS`], else unattributed.
@@ -183,6 +192,22 @@ pub fn owner_of_metric(metric: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> 
         }
     }
     None
+}
+
+/// Owner of an edge kind (#179): the enabled pack claiming the kind,
+/// core for [`CORE_EDGE_KINDS`], else unattributed (unknown kind —
+/// `check` flags it anyway, and the edge is hidden when scoped).
+pub fn owner_of_edge_kind(kind: &str, enabled: &[&dyn Pack]) -> Option<OwnerKey> {
+    for pack in enabled {
+        if pack.edge_kinds().iter().any(|k: &EdgeKind| k.name == kind) {
+            return Some(OwnerKey::Pack(pack.name()));
+        }
+    }
+    if CORE_EDGE_KINDS.iter().any(|k| k.name == kind) {
+        Some(OwnerKey::Core)
+    } else {
+        None
+    }
 }
 
 /// Owners of one parsed ledger entry. A `balance` line is owned by its
@@ -244,8 +269,8 @@ pub fn note_linkage_owners(
 /// Owners of a record for scoping. Person / org / deal records are the
 /// core identity anchor (`Core` — always visible; pack-claimed fields on
 /// them filter per-field in `find`). Notes add field claims + ledger
-/// linkage; interactions add field claims. An empty set means
-/// unattributed: hidden when scoped.
+/// linkage; interactions add field claims; edges are owned by their
+/// kind's pack. An empty set means unattributed: hidden when scoped.
 pub fn record_owners(
     record: &Record,
     linkage: &HashMap<RecordId, BTreeSet<OwnerKey>>,
@@ -276,6 +301,14 @@ pub fn record_owners(
             }
             owners
         }
+        // #179: an edge is visible exactly when its kind's pack is in
+        // scope. The edge's front matter has no pack-owned fields to
+        // filter, so kind ownership is the whole story; a missing or
+        // unknown kind is unattributed (fail closed).
+        RecordKind::Edge => match record.field("kind") {
+            Some(kind) => owner_of_edge_kind(kind, enabled).into_iter().collect(),
+            None => BTreeSet::new(),
+        },
     }
 }
 
@@ -291,7 +324,7 @@ mod tests {
     use crate::check::{Finding, MergeMap};
     use crate::id::Prefix;
     use crate::ledger::parse_line;
-    use crate::packs::{Pack, PackState};
+    use crate::packs::{EdgeKind, Pack, PackState};
     use crate::vault::SourcedEntry;
     use chrono::NaiveDate;
 
@@ -316,13 +349,20 @@ mod tests {
             &["touch"]
         }
         fn record_types(&self) -> &'static [&'static str] {
-            &["edge"]
+            // "edge" is a core record type (#179) and is never claimed.
+            &["testtype"]
         }
         fn fields(&self) -> &'static [&'static str] {
             &["birthday"]
         }
         fn balance_metrics(&self) -> &'static [&'static str] {
             &["test_metric"]
+        }
+        fn edge_kinds(&self) -> &'static [EdgeKind] {
+            &[EdgeKind {
+                name: "mentor",
+                symmetric: false,
+            }]
         }
         fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
             if verb == "touch" {
@@ -504,6 +544,56 @@ mod tests {
         let person_owners = record_owners(&person, &HashMap::new(), &enabled);
         assert_eq!(person_owners, [OwnerKey::Core].into_iter().collect());
         assert!(coaching.allows(&person_owners));
+    }
+
+    #[test]
+    fn edge_owners_follow_kind_pack() {
+        use crate::record::parse_record;
+        let enabled = registry();
+        // A core-kind edge (married) is core-owned: visible to every scope.
+        let married = parse_record(
+            "---\nid: e-01M3TC5H00MPJG00000000000A\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\n---\n",
+            "edges/e-01M3TC5H00MPJG00000000000A/edge.md",
+        )
+        .unwrap();
+        let owners = record_owners(&married, &HashMap::new(), &enabled);
+        assert_eq!(owners, [OwnerKey::Core].into_iter().collect());
+        // A pack-kind edge (mentor, claimed by testpack) is owned by that
+        // pack: visible to a testpack scope, hidden from a coaching scope.
+        let mentor = parse_record(
+            "---\nid: e-01M3TC5H00MPJG00000000000B\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: mentor\n---\n",
+            "edges/e-01M3TC5H00MPJG00000000000B/edge.md",
+        )
+        .unwrap();
+        let mentor_owners = record_owners(&mentor, &HashMap::new(), &enabled);
+        assert_eq!(
+            mentor_owners,
+            [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
+        );
+        let coaching = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
+        assert!(!coaching.allows(&mentor_owners));
+        let testpack = PackScope::Only(["testpack@0.1".to_string()].into_iter().collect());
+        assert!(testpack.allows(&mentor_owners));
+        // An unknown kind is unattributed: visible only unscoped.
+        let mystery = parse_record(
+            "---\nid: e-01M3TC5H00MPJG00000000000C\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: nemesis\n---\n",
+            "edges/e-01M3TC5H00MPJG00000000000C/edge.md",
+        )
+        .unwrap();
+        let mystery_owners = record_owners(&mystery, &HashMap::new(), &enabled);
+        assert!(mystery_owners.is_empty());
+        assert!(!coaching.allows(&mystery_owners));
+        assert!(PackScope::All.allows(&mystery_owners));
+        // `owner_of_edge_kind` directly: core kind, pack kind, unknown.
+        assert_eq!(
+            owner_of_edge_kind("married", &enabled),
+            Some(OwnerKey::Core)
+        );
+        assert_eq!(
+            owner_of_edge_kind("mentor", &enabled),
+            Some(OwnerKey::Pack("testpack@0.1"))
+        );
+        assert_eq!(owner_of_edge_kind("nemesis", &enabled), None);
     }
 
     #[test]

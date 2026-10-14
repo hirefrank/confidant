@@ -51,6 +51,7 @@ pub fn purpose_for_type(record_type: &str) -> Option<&'static str> {
         "interaction" => Some("interaction"),
         "org" => Some("org"),
         "deal" => Some("deal"),
+        "edge" => Some("edge"),
         _ => None,
     }
 }

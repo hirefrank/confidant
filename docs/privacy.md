@@ -128,7 +128,30 @@ Rules:
   verification and fallback `find` calls; the QMD index itself is
   unscoped and the `find` verification is the enforcement point.
 - **Shared interactions**: the pack that wrote an interaction decides
-  its visibility (#179 revisits if this conflicts).
+  its visibility (#179 settled the mechanics).
+- **Edges**: an edge is visible exactly when its kind's pack is in scope
+  (core kinds are visible to every scope). An edge whose kind belongs to
+  a disabled pack warns `W_PACK_ORPHAN`; an edge whose kind has no owner
+  is visible only unscoped and is `E_UNKNOWN_EDGE_KIND`. The edge's own
+  front matter has no pack-owned fields to filter.
+
+## Edges and shred (issue #179)
+
+An edge record carries only ids, kind, and dates — no body, no note.
+Sensitive context belongs in a note on one of the edge's people, which
+does get crypto-shredded. Edges live under the shared key
+(`vault:shared`), so destroying one person's client key cannot shred
+them. Instead, `keys shred p-A` deletes every edge file naming A from
+the working tree in the same signed commit, and states plainly in its
+output:
+
+> Edges that named this person were deleted from the working tree, but
+> earlier versions in git history remain readable with the shared key.
+
+A shredded participant's own touchpoints stay in the ledger as
+opaque-id lines — the ledger is not rewritten by shred, and a `touch`
+line carries no other participant's id, so it does not re-identify
+anyone by itself.
 
 For when per-pack *keys* would be needed, see
 `docs/per-pack-keys-design-note.md`.

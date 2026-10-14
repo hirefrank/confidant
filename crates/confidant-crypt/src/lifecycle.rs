@@ -1682,5 +1682,8 @@ fn leftover_warnings() -> Vec<String> {
         "Copies outside Confidant entirely (e.g. Drive transcripts) are not affected.".to_string(),
         "This shred issued a new recovery phrase. Destroy every copy of the old recovery phrase (paper, 1Password); until you do, it still opens history.".to_string(),
         "Inbox rotation is pending: this shred is not complete until `confidant inbox rotate --finish` has run on the inbox device; until then old form answers in history remain readable.".to_string(),
+        // #179: edges live under the shared key, which survives shred, so
+        // deletion only removes the working-tree copies.
+        "Edges that named this person were deleted from the working tree, but earlier versions in git history remain readable with the shared key.".to_string(),
     ]
 }

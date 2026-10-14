@@ -2538,3 +2538,143 @@ fn device_add_initiate_validates_label_before_provisioning() {
         "expected label validation error, got: {stderr}"
     );
 }
+
+#[test]
+fn keys_shred_deletes_edges_naming_shredded_person() {
+    // #179 Q1: `keys shred p-A` deletes edges naming A from the working
+    // tree in the SAME signed commit, and says earlier git-history
+    // versions stay readable under the shared key. Edges not naming A
+    // survive.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    const PERSON_A: &str = "p-01J9Z3K4QF0000000000000000";
+    const PERSON_B: &str = "p-01J9Z3K4QG0000000000000000";
+    const PERSON_C: &str = "p-01J9Z3K4QH0000000000000000";
+    const EDGE_AB: &str = "e-01M3TC5H00MPJG00E100000000";
+    const EDGE_BC: &str = "e-01M3TC5H00MPJG00E200000000";
+    for client in [PERSON_A, PERSON_B, PERSON_C] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    // Person records, so the edges' ends exist (writes run check).
+    for (id, name) in [
+        (PERSON_A, "Ada Example"),
+        (PERSON_B, "Bea Demo"),
+        (PERSON_C, "Cam Sample"),
+    ] {
+        let file = h._tmp.path().join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\nBio.\n"),
+        )
+        .unwrap();
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                file.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "record add {id} failed");
+    }
+    // Two edges: AB names the to-be-shredded A, BC does not.
+    for (id, a, b, kind) in [
+        (EDGE_AB, PERSON_A, PERSON_B, "married"),
+        (EDGE_BC, PERSON_B, PERSON_C, "colleague"),
+    ] {
+        let file = h._tmp.path().join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nid: {id}\ntype: edge\na: {a}\nb: {b}\nkind: {kind}\n---\n"),
+        )
+        .unwrap();
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                file.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "record add {id} failed");
+    }
+    let edge_ab = h.vault.join(format!("edges/{EDGE_AB}/edge.md"));
+    let edge_bc = h.vault.join(format!("edges/{EDGE_BC}/edge.md"));
+    assert!(edge_ab.is_file());
+    assert!(edge_bc.is_file());
+
+    // Shred A.
+    let out = h
+        .cmd(&["keys", "shred", PERSON_A, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    // The AB edge is gone from the working tree; BC survives.
+    assert!(
+        !edge_ab.exists(),
+        "edge naming the shredded person survived"
+    );
+    assert!(edge_bc.is_file(), "edge not naming them must survive");
+    // The deletion is reported, with the history-readability warning.
+    let deleted = v["deleted_edges"].as_array().unwrap();
+    assert_eq!(deleted.len(), 1, "{v}");
+    assert_eq!(deleted[0], format!("edges/{EDGE_AB}/edge.md"));
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("earlier versions in git history remain readable with the shared key")),
+        "shred must warn that history versions stay readable: {warnings:?}"
+    );
+    // The deletion is in the SAME commit as the shred (HEAD is the shred
+    // commit and it deletes the edge file).
+    let log = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        format!("keys: shred {PERSON_A}")
+    );
+    let show = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["show", "--name-status", "--format=", "HEAD"])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        status.contains(&format!("D\tedges/{EDGE_AB}/edge.md")),
+        "shred commit must delete the edge file, got:\n{status}"
+    );
+    // The history version is still there (readable under the shared key):
+    // the edge file exists in the parent commit.
+    let parent = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["show", &format!("HEAD~1:edges/{EDGE_AB}/edge.md")])
+        .output()
+        .unwrap();
+    assert!(
+        parent.status.success(),
+        "edge must still exist in git history"
+    );
+}
