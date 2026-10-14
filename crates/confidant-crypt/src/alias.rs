@@ -14,7 +14,7 @@
 //! Normalization: NFC, then trim surrounding whitespace and lowercase
 //! (Unicode lowercase). Documented here; importers must apply the same rule.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use unicode_normalization::UnicodeNormalization;
 
