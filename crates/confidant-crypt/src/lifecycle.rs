@@ -1312,6 +1312,7 @@ impl KeyStore {
         anchor: &Anchor,
         identity: &dyn age::Identity,
         deleted_edges: usize,
+        stripped_interactions: usize,
     ) -> Result<ShredOutcome, Error> {
         // Validate every id this call will join under `keys/` before doing
         // anything: the shredded client, and each remaining client (the
@@ -1473,7 +1474,7 @@ impl KeyStore {
         Ok(ShredOutcome {
             new_recovery,
             destroy_key_ids,
-            warnings: leftover_warnings(deleted_edges),
+            warnings: leftover_warnings(deleted_edges, stripped_interactions),
         })
     }
 
@@ -1678,7 +1679,7 @@ impl ShredOutcome {
 }
 
 /// Leftover limits of crypto-shredding (design §8). Shredding cannot reach:
-fn leftover_warnings(deleted_edges: usize) -> Vec<String> {
+fn leftover_warnings(deleted_edges: usize, stripped_interactions: usize) -> Vec<String> {
     let mut warnings = vec![
         "Decrypted copies already on devices are not affected by shredding.".to_string(),
         ".confidant/ caches and search indexes on other devices may still hold plaintext (this device's index is deleted by shred)."
@@ -1701,6 +1702,14 @@ fn leftover_warnings(deleted_edges: usize) -> Vec<String> {
             "No edges named this person, so none were deleted from the working tree. Note: edge versions already in git history remain readable with the shared key."
                 .to_string(),
         );
+    }
+    // #258: interactions naming the shredded person were re-encrypted to
+    // drop them from the `with:` list, but earlier versions still list
+    // their id under the surviving primary's key.
+    if stripped_interactions > 0 {
+        warnings.push(format!(
+            "{stripped_interactions} interaction(s) were re-encrypted to remove this person from their participant lists, but earlier versions in git history still list their id under the primary person's key."
+        ));
     }
     warnings
 }

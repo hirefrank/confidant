@@ -15,7 +15,7 @@ mod record_crypto;
 mod record_decrypt;
 mod setup;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -5705,6 +5705,167 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
     Ok(deleted)
 }
 
+/// #258: remove a shredded person from every interaction's `with:` list,
+/// re-encrypting each affected interaction through the normal write path
+/// (`record_crypto`), before any key destruction. Returns the count of
+/// interactions rewritten.
+///
+/// Mirrors [`delete_edges_naming`]: discovery decrypts with the pre-shred
+/// device key, and a tampered / unparseable / genuinely-undecryptable
+/// interaction fails closed before shred touches a key. The rewritten
+/// envelopes stage into the same signed shred commit (their paths are
+/// already tracked).
+///
+/// An interaction envelope that is `Skipped` (this device can't unwrap its
+/// data key) is treated one of two ways: if its primary is still a live
+/// client, that is a real failure and shred refuses; if the primary was
+/// shredded earlier, its `with:` list is unreachable and nothing is lost by
+/// skipping it (the history-residue warning already covers it). This keeps a
+/// later shred from being blocked by a previous shred's leftovers (#259's
+/// edge fix, applied to interactions).
+fn strip_participant_from_interactions(
+    root: &Path,
+    client_id: &str,
+    live_clients: &HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    // Keyed load: decrypts interaction envelopes via the current device key.
+    let probe = load_vault(root)?;
+    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
+        root,
+        &probe.config.vault_id,
+    ));
+    let ixn_skipped = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let ixn_refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let inner = decryptor.hook();
+    let hook: ContentHook = std::sync::Arc::new({
+        let ixn_skipped = std::sync::Arc::clone(&ixn_skipped);
+        let ixn_refused = std::sync::Arc::clone(&ixn_refused);
+        move |path: &str, bytes: &[u8]| {
+            let outcome = inner(path, bytes);
+            if path.starts_with("interactions/") {
+                match outcome {
+                    ContentOutcome::Skipped => {
+                        ixn_skipped.lock().unwrap().push(path.to_string());
+                    }
+                    ContentOutcome::Refused => {
+                        ixn_refused.lock().unwrap().push(path.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            outcome
+        }
+    });
+    let vault =
+        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
+    // A `Skipped` interaction whose primary is still live is a real failure:
+    // this device should be able to decrypt every live client (the strand
+    // check below enforces it), so a live-but-undecryptable interaction means
+    // we cannot tell whether its `with:` names `client_id`. A `Skipped`
+    // interaction whose primary was already shredded is unreachable — skip.
+    let ixn_skipped = ixn_skipped.lock().unwrap();
+    let mut live_undecryptable: Vec<String> = Vec::new();
+    for path in ixn_skipped.iter() {
+        if let Ok(bytes) = std::fs::read(root.join(path)) {
+            if let Ok(env) = confidant_crypt::envelope::parse(&bytes) {
+                let client = env.key_id.rsplit_once("/e").map(|(c, _)| c).unwrap_or("");
+                if live_clients.contains(client) {
+                    live_undecryptable.push(path.clone());
+                }
+            }
+        }
+    }
+    if !live_undecryptable.is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) under a live primary could not be decrypted on this device; refusing to shred",
+            live_undecryptable.len()
+        )).with_fix(
+            "Run shred from a device enrolled for every live client, or resolve the undecryptable interaction files first",
+        )));
+    }
+    let ixn_refused = ixn_refused.lock().unwrap();
+    if !ixn_refused.is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) were refused as tampered or corrupt; refusing to shred",
+            ixn_refused.len()
+        )).with_fix(
+            "Resolve the refused interaction envelopes first (check reports them as unreadable)",
+        )));
+    }
+    if let Some(bad) = vault.load_findings.iter().find(|f| {
+        f.file
+            .as_deref()
+            .is_some_and(|p| p.starts_with("interactions/"))
+    }) {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every interaction naming {client_id}: an interaction file could not be parsed ({}); refusing to shred",
+            bad.file.as_deref().unwrap_or("interactions/")
+        )).with_fix(
+            "Fix or remove the unparseable interaction file, then re-run shred",
+        )));
+    }
+
+    // Shred requires a keyed vault; the encryptor is the same write path an
+    // ordinary `record edit` uses (epoch selection + outer no-ai stamping).
+    let encryptor = record_crypto::RecordEncryptor::for_vault(root, &vault)?.ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid("shred requires an encrypted vault"))
+    })?;
+
+    let mut rewritten = Vec::new();
+    for rec in vault.records.values() {
+        if rec.kind != RecordKind::Interaction {
+            continue;
+        }
+        let Some(raw_with) = rec.field("with") else {
+            continue;
+        };
+        let Some(mut with) = confidant_core::record::parse_with_list(raw_with) else {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot determine whether interaction {} names {client_id}: its `with:` list is malformed; refusing to shred",
+                rec.id
+            )).with_fix(
+                "Fix the interaction's `with:` list, then re-run shred",
+            )));
+        };
+        let before = with.len();
+        with.retain(|id| id.to_string() != client_id);
+        if with.len() == before {
+            continue;
+        }
+        let mut edited = rec.clone();
+        edited
+            .fields
+            .insert("with".to_owned(), format_with_list(&with));
+        let plaintext = confidant_core::format_record(&edited);
+        let envelope = encryptor
+            .encrypt_file(std::path::Path::new(&rec.path), plaintext.as_bytes())
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot re-encrypt interaction {}: {e}",
+                    rec.id
+                )))
+            })?;
+        std::fs::write(root.join(&rec.path), &envelope).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write re-encrypted interaction {}: {e}",
+                rec.id
+            )))
+        })?;
+        rewritten.push(rec.path.clone());
+    }
+    Ok(rewritten)
+}
+
+/// Serialize a participant list as a `with:` value (`[p-A, p-B]`).
+fn format_with_list(ids: &[confidant_core::id::RecordId]) -> String {
+    let inner = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
+}
+
 fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{anchor, lifecycle::KeyStore};
     validate_keys_client_id(client_id)?;
@@ -5749,19 +5910,28 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // Skip vault:lookup (keys/vault) — shred handles it separately.
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
-    // #179: delete edges naming the shredded person BEFORE destroying
-    // keys — discovery needs decryption, and a failure must abort before
-    // any irreversible key destruction. The deletions stage into the same
-    // signed shred commit below.
-    let deleted_edges = delete_edges_naming(root, client_id)?;
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
             .map_err(anyhow::Error::new)?;
+    // Live clients (for the interaction-with: check below): every client
+    // whose key still exists, minus the reserved lookup id. An interaction
+    // under a client NOT in this set was shredded earlier and is skipped.
     let all_clients: Vec<String> = store
         .manifest_clients()
         .into_iter()
         .filter(|c| c != confidant_crypt::manifest::VAULT_CLIENT_ID)
         .collect();
+    let live_clients: std::collections::HashSet<String> = all_clients.iter().cloned().collect();
+    // #179: delete edges naming the shredded person BEFORE destroying
+    // keys — discovery needs decryption, and a failure must abort before
+    // any irreversible key destruction. The deletions stage into the same
+    // signed shred commit below.
+    let deleted_edges = delete_edges_naming(root, client_id)?;
+    // #258: strip the shredded person from every interaction `with:` list
+    // the same way — before key destruction, through the normal write path,
+    // staged into the same shred commit.
+    let stripped_interactions =
+        strip_participant_from_interactions(root, client_id, &live_clients)?;
     let all_refs: Vec<&str> = all_clients.iter().map(|s| s.as_str()).collect();
 
     // Fresh recipients for the re-wrap: a fresh keypair for THIS device
@@ -5785,6 +5955,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             &anchor,
             identity.as_ref(),
             deleted_edges.len(),
+            stripped_interactions.len(),
         )
         .map_err(anyhow::Error::new)?;
 
@@ -5857,6 +6028,15 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             confidant_core::write::git(root, &add_args, no_input)?;
         }
     }
+    // #258: stage the re-encrypted interaction files (modifications only,
+    // exact paths) so they land in the same signed shred commit. They are
+    // tracked (the interactions existed before the shred), so a plain
+    // `git add` stages the modification without sweeping unrelated files.
+    if !stripped_interactions.is_empty() {
+        let mut add_args: Vec<&str> = vec!["add", "--"];
+        add_args.extend(stripped_interactions.iter().map(String::as_str));
+        confidant_core::write::git(root, &add_args, no_input)?;
+    }
     confidant_core::write::git(
         root,
         &["commit", "-m", &format!("keys: shred {client_id}")],
@@ -5916,6 +6096,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "destroy_key_ids": outcome.destroy_key_ids,
             "warnings": shred_warnings,
             "deleted_edges": deleted_edges,
+            "stripped_interactions": stripped_interactions.len(),
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
             "search_index_deleted": search_index_deleted,
@@ -5929,6 +6110,12 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             println!(
                 "deleted {} edge(s) naming {client_id} (same commit)",
                 deleted_edges.len()
+            );
+        }
+        if !stripped_interactions.is_empty() {
+            println!(
+                "re-encrypted {} interaction(s) to remove {client_id} from their participant lists (same commit)",
+                stripped_interactions.len()
             );
         }
         if search_index_deleted {
