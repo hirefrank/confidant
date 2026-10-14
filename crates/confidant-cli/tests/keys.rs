@@ -2680,6 +2680,132 @@ fn keys_shred_deletes_edges_naming_shredded_person() {
 }
 
 #[test]
+fn keys_shred_strips_shredded_person_from_with_lists() {
+    // #258: `keys shred p-A` re-encrypts any interaction whose `with:`
+    // names A, dropping A from the list, in the SAME signed commit — and
+    // warns that earlier git-history versions still list A under the
+    // surviving primary's key.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const PERSON_A: &str = "p-01J9Z3K4QF0000000000000000";
+    const PERSON_B: &str = "p-01J9Z3K4QG0000000000000000";
+    const PERSON_C: &str = "p-01J9Z3K4QH0000000000000000";
+    const IXN_BC: &str = "i-01M3TC5H00MPJG0048H0000008";
+    for client in [PERSON_A, PERSON_B, PERSON_C] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    for (id, name) in [
+        (PERSON_A, "Ada Example"),
+        (PERSON_B, "Bea Demo"),
+        (PERSON_C, "Cam Sample"),
+    ] {
+        let file = h._tmp.path().join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\nBio.\n"),
+        )
+        .unwrap();
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                file.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "record add {id} failed");
+    }
+    // A multi-person interaction: primary B, participants A and C.
+    let file = h._tmp.path().join(format!("{IXN_BC}.md"));
+    std::fs::write(
+        &file,
+        format!(
+            "---\nid: {IXN_BC}\ntype: interaction\nname: Dinner\ndate: 2026-10-06\nperson: {PERSON_B}\nwith: [{PERSON_A}, {PERSON_C}]\n---\n\nDinner with the group.\n"
+        ),
+    )
+    .unwrap();
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            file.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add interaction failed");
+
+    let ixn_path = h
+        .vault
+        .join(format!("interactions/{IXN_BC}/interaction.md"));
+    assert!(ixn_path.is_file());
+    let before = std::fs::read(&ixn_path).unwrap();
+
+    // Shred A.
+    let out = h
+        .cmd(&["keys", "shred", PERSON_A, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    // Exactly one interaction was re-encrypted.
+    assert_eq!(v["stripped_interactions"], 1, "{v}");
+    // The warning names the history-residue limit.
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("re-encrypted to remove this person from their participant lists")),
+        "shred must warn about with:-list history residue: {warnings:?}"
+    );
+    // The interaction envelope was re-encrypted (fresh nonce → new bytes),
+    // and it still decrypts under the surviving primary B's key.
+    let after = std::fs::read(&ixn_path).unwrap();
+    assert_ne!(before, after, "interaction envelope must be re-encrypted");
+    // The re-encryption is in the SAME commit as the shred.
+    let log = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).trim(),
+        format!("keys: shred {PERSON_A}")
+    );
+    let show = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["show", "--name-status", "--format=", "HEAD"])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&show.stdout);
+    assert!(
+        status.contains(&format!("M\tinteractions/{IXN_BC}/interaction.md")),
+        "shred commit must re-encrypt the interaction, got:\n{status}"
+    );
+}
+
+#[test]
 fn keys_shred_second_person_proceeds_despite_first_persons_leftover_envelopes() {
     // #179 review: shred fail-closed is edge-scoped, not vault-wide.
     // After `keys shred p-A`, A's leftover record envelopes stay in the

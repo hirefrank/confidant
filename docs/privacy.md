@@ -182,6 +182,17 @@ opaque-id lines — the ledger is not rewritten by shred, and a `touch`
 line carries no other participant's id, so it does not re-identify
 anyone by itself.
 
+Multi-person interactions are encrypted to their *primary* person's key
+and list other participants in `with:` inside the ciphertext. `keys shred
+p-A` re-encrypts every interaction naming A in its `with:` list, dropping
+A, in the same signed commit — through the normal write path, so it only
+needs the primary's key (which shred never destroys). Earlier versions in
+git history still list A's opaque id under the primary's key, which
+survives A's shred; shred says so in its output. The reverse case — A is
+the *primary* and someone else is only in `with:` — loses the whole
+interaction from the participant's view, because it is under A's destroyed
+key; that is the #179 design.
+
 For when per-pack *keys* would be needed, see
 `docs/per-pack-keys-design-note.md`.
 

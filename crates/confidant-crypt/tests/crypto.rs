@@ -470,6 +470,7 @@ fn test8_shredding() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .unwrap();
 
@@ -626,6 +627,7 @@ fn shred_records_recovery_recipients_and_forbids_their_reuse() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .unwrap();
     let new_recovery = outcome.new_recovery().age_identity().to_recipient_string();
@@ -709,6 +711,7 @@ fn test_shred_destroy_list_covers_history() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
             0,
         )
         .unwrap();
@@ -1751,6 +1754,7 @@ fn test_shred_client_preserves_shared() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .unwrap();
 
@@ -1806,6 +1810,7 @@ fn test_shred_refuses_reserved_lookup_id() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .unwrap_err();
     assert!(
@@ -1842,6 +1847,7 @@ fn test_shred_refuses_reserved_shared_id() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
             0,
         )
         .unwrap_err();
@@ -1900,6 +1906,7 @@ fn test_shred_omitting_shared_errors_before_mutation() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .unwrap_err();
     assert!(
@@ -1938,6 +1945,7 @@ fn test_shred_repin_anchor_before_next_key_op() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
             0,
         )
         .unwrap();
@@ -2054,6 +2062,7 @@ fn test_shred_refuses_planted_lookup_age() {
         &f.operator_sk,
         &f.anchor,
         &f.device_id,
+        0,
         0,
     ) {
         Err(Error::Manifest(_)) => {}
@@ -2206,6 +2215,7 @@ fn shred_rejects_unsafe_client_ids() {
             &f.anchor,
             &f.device_id,
             0,
+            0,
         )
         .is_err());
     // A bad id in all_clients is refused too.
@@ -2218,6 +2228,7 @@ fn shred_rejects_unsafe_client_ids() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
             0,
         )
         .is_err());
