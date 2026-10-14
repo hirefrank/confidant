@@ -41,9 +41,12 @@
 //! hosts the keychain is unreachable (keyring reports no storage access)
 //! — use the env-var overrides there. macOS always has a keychain.
 //!
-//! Everything is stored as the age identity's Bech32 encoding
+//! Device and inbox keys are stored as the age identity's Bech32 encoding
 //! (`AGE-SECRET-KEY-1…`), the same format the env vars take, so keychain
-//! and env var are interchangeable.
+//! and env var are interchangeable. The operator signing key is the odd
+//! one out: it is the Ed25519 seed as 64 hex characters (what `init`
+//! writes and `load_operator_sk` hex-decodes), so it is validated as hex
+//! — never as age Bech32 — on both the store and load paths (issue #254).
 //!
 //! ## Not-yet-wired public entry points (audit note, #136 item 2)
 //!
@@ -155,6 +158,18 @@ const LEGACY_INBOX_FILE: &str = "inbox.key";
 /// The inbox keypair's private half as `(current, previous)`. `previous`
 /// is `Some` only during the rotation window (§8a.3).
 pub type InboxKeys = (Zeroizing<Vec<u8>>, Option<Zeroizing<Vec<u8>>>);
+
+/// Key format for validation on the keychain load/store paths. Device
+/// and inbox keys are age identities; the operator key is an Ed25519
+/// seed in hex. The format travels with the slot so a hex value is
+/// never validated as age Bech32 and vice versa (issue #254).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyFormat {
+    /// Age X25519 identity, `AGE-SECRET-KEY-1…` Bech32.
+    AgeBech32,
+    /// Operator Ed25519 seed as 64 hex characters.
+    OperatorHex,
+}
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -301,6 +316,7 @@ pub fn device_key() -> Result<Zeroizing<Vec<u8>>, Error> {
         DEVICE_KEY_ENV,
         Some(LEGACY_DEVICE_FILE),
         "device key",
+        KeyFormat::AgeBech32,
     )
 }
 
@@ -316,6 +332,7 @@ pub fn inbox_key() -> Result<Zeroizing<Vec<u8>>, Error> {
         INBOX_KEY_ENV,
         Some(LEGACY_INBOX_FILE),
         "inbox key",
+        KeyFormat::AgeBech32,
     )
 }
 
@@ -340,6 +357,7 @@ fn inbox_keys_with(
         INBOX_KEY_ENV,
         Some(LEGACY_INBOX_FILE),
         "inbox key",
+        KeyFormat::AgeBech32,
     )?;
     let previous = load_key_opt(
         backend,
@@ -349,6 +367,7 @@ fn inbox_keys_with(
         INBOX_KEY_PREVIOUS_ENV,
         Some(LEGACY_INBOX_FILE),
         "previous inbox key",
+        KeyFormat::AgeBech32,
     )?;
     Ok((current, previous))
 }
@@ -410,6 +429,11 @@ pub fn inbox_identities_with(
     Ok((current, previous))
 }
 
+// Private helper: the parameter list describes one keychain slot.
+// `#[allow]` instead of bundling into a struct: every call site passes
+// the same eight values positionally, and a struct would churn them all
+// without changing behavior.
+#[allow(clippy::too_many_arguments)]
 fn load_key(
     backend: &dyn KeychainBackend,
     config_dir: Option<&Path>,
@@ -418,6 +442,7 @@ fn load_key(
     env_var: &str,
     legacy_file: Option<&str>,
     what: &str,
+    format: KeyFormat,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
     load_key_opt(
         backend,
@@ -427,6 +452,7 @@ fn load_key(
         env_var,
         legacy_file,
         what,
+        format,
     )?
     .ok_or_else(|| {
         Error::NoKey(format!(
@@ -435,6 +461,8 @@ fn load_key(
     })
 }
 
+// Same slot-descriptor shape as `load_key` above; see the note there.
+#[allow(clippy::too_many_arguments)]
 fn load_key_opt(
     backend: &dyn KeychainBackend,
     config_dir: Option<&Path>,
@@ -443,6 +471,7 @@ fn load_key_opt(
     env_var: &str,
     legacy_file: Option<&str>,
     what: &str,
+    format: KeyFormat,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
     // A plaintext key file on disk is never used — refuse loudly so the
     // operator imports it into the keychain and deletes it. (The operator
@@ -458,7 +487,7 @@ fn load_key_opt(
         let raw = Zeroizing::new(raw);
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            validate_bech32(trimmed, what, env_var)?;
+            validate_key_format(trimmed, what, env_var, format)?;
             return Ok(Some(Zeroizing::new(trimmed.as_bytes().to_vec())));
         }
     }
@@ -466,7 +495,12 @@ fn load_key_opt(
     match backend_password(backend, service, account)? {
         Some(raw) => {
             let trimmed = raw.trim();
-            validate_bech32(trimmed, what, &format!("keychain {service}/{account}"))?;
+            validate_key_format(
+                trimmed,
+                what,
+                &format!("keychain {service}/{account}"),
+                format,
+            )?;
             Ok(Some(Zeroizing::new(trimmed.as_bytes().to_vec())))
         }
         None => Ok(None),
@@ -501,6 +535,28 @@ fn validate_bech32(s: &str, what: &str, source: &str) -> Result<(), Error> {
     age::x25519::Identity::from_str(s)
         .map(|_| ())
         .map_err(|e| Error::Age(format!("bad {what} from {source}: {e}")))
+}
+
+/// Check that `s` is the 64-character hex encoding of the 32-byte
+/// operator seed before we store or trust it. `source` names where the
+/// value came from, for errors.
+fn validate_operator_hex(s: &str, what: &str, source: &str) -> Result<(), Error> {
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(Error::Keychain(format!(
+            "bad {what} from {source}: expected 64 hex characters"
+        )))
+    }
+}
+
+/// Check that `s` parses in the slot's [`KeyFormat`] before we store or
+/// trust it. `source` names where the value came from, for errors.
+fn validate_key_format(s: &str, what: &str, source: &str, format: KeyFormat) -> Result<(), Error> {
+    match format {
+        KeyFormat::AgeBech32 => validate_bech32(s, what, source),
+        KeyFormat::OperatorHex => validate_operator_hex(s, what, source),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,18 +609,21 @@ pub fn delete_device_key() -> Result<(), Error> {
 /// Keychain account name for the operator Ed25519 signing key.
 pub const OPERATOR_ACCOUNT: &str = "operator-key";
 
-/// Store the operator Ed25519 signing key in the OS keychain. `hex` must be
-/// the 64-character hex encoding of the 32-byte seed; anything else is
-/// refused before it touches the keychain.
+/// Store the operator Ed25519 signing key in the OS keychain. `hex_seed`
+/// must be the 64-character hex encoding of the 32-byte seed; anything
+/// else is refused before it touches the keychain. Validated as hex —
+/// never as age Bech32 (issue #254).
 pub fn store_operator_key(hex_seed: &str) -> Result<(), Error> {
+    store_operator_key_with(&OsKeychain, hex_seed)
+}
+
+/// Backend-parameterized [`store_operator_key`], for tests: the OS
+/// keychain is never touched in unit tests.
+fn store_operator_key_with(backend: &dyn KeychainBackend, hex_seed: &str) -> Result<(), Error> {
     let trimmed = hex_seed.trim();
-    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(Error::Keychain(
-            "operator key must be 64 hex characters".to_string(),
-        ));
-    }
-    store_key(
-        &OsKeychain,
+    validate_operator_hex(trimmed, "operator key", "caller")?;
+    store_key_raw(
+        backend,
         DEVICE_SERVICE,
         OPERATOR_ACCOUNT,
         trimmed,
@@ -577,15 +636,27 @@ pub fn store_operator_key(hex_seed: &str) -> Result<(), Error> {
 /// Per Frank's decision (2026-10-12): the OS keychain is the default;
 /// `CONFIDANT_OPERATOR_KEY` is allowed for headless use. The plain
 /// `operator.key` file is not consulted — there is no file fallback.
+///
+/// The stored value is the 64-char hex seed, validated as hex — never as
+/// age Bech32 (issue #254).
 pub fn operator_key() -> Result<Zeroizing<Vec<u8>>, Error> {
+    operator_key_with(&OsKeychain, config_dir().as_deref())
+}
+
+/// Backend-parameterized [`operator_key`], for tests.
+fn operator_key_with(
+    backend: &dyn KeychainBackend,
+    config_dir: Option<&Path>,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
     load_key(
-        &OsKeychain,
-        config_dir().as_deref(),
+        backend,
+        config_dir,
         DEVICE_SERVICE,
         OPERATOR_ACCOUNT,
         "CONFIDANT_OPERATOR_KEY",
         None,
         "operator key",
+        KeyFormat::OperatorHex,
     )
 }
 
@@ -741,6 +812,21 @@ fn store_key(
     bech32: &str,
     what: &str,
 ) -> Result<(), Error> {
+    validate_bech32(bech32, what, "caller")?;
+    store_key_raw(backend, service, account, bech32, what)
+}
+
+/// Write an already-validated key to the backend. The caller must have
+/// validated the value's format first ([`validate_bech32`] for age keys,
+/// [`validate_operator_hex`] for the operator key) — this function only
+/// enforces the test-only kill switch and performs the write.
+fn store_key_raw(
+    backend: &dyn KeychainBackend,
+    service: &str,
+    account: &str,
+    value: &str,
+    what: &str,
+) -> Result<(), Error> {
     // Writes refuse while the test-only kill switch is set: a test that
     // sets CONFIDANT_KEYCHAIN=off must never touch the operator's real
     // keychain, whichever write path it takes.
@@ -750,9 +836,8 @@ fn store_key(
              unset it to write to the OS keychain (it is a test-only switch)"
         )));
     }
-    validate_bech32(bech32, what, "caller")?;
     backend
-        .set_password(service, account, bech32)
+        .set_password(service, account, value)
         .map_err(|e| match e {
             Error::Keychain(msg) => Error::Keychain(format!("{what}: {msg}")),
             other => other,
@@ -911,6 +996,7 @@ mod tests {
                 DEVICE_KEY_ENV,
                 Some(LEGACY_DEVICE_FILE),
                 "device key",
+                KeyFormat::AgeBech32,
             )
         }
         fn load_inbox(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
@@ -922,6 +1008,7 @@ mod tests {
                 INBOX_KEY_ENV,
                 Some(LEGACY_INBOX_FILE),
                 "inbox key",
+                KeyFormat::AgeBech32,
             )
         }
         fn load_inbox_keys(&self) -> Result<InboxKeys, Error> {
@@ -1272,6 +1359,130 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Age(_)), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn operator_key_store_and_load_round_trip() {
+        // Issue #254: `store_operator_key` validated the 64-char hex seed
+        // as age Bech32, so `init` aborted on every normal install. The
+        // operator path must validate as hex on store AND load.
+        let hex = fresh_operator_hex();
+        let h = Harness::new();
+        // Same env-lock rationale as `store_load_delete_round_trip`.
+        let mut _g = EnvGuard::lock();
+        _g.unset("CONFIDANT_OPERATOR_KEY");
+
+        store_operator_key_with(&h.backend, &hex).expect("valid hex stores");
+        let raw = operator_key_with(&h.backend, h.dir()).expect("valid hex loads");
+        assert_eq!(raw.as_slice(), hex.as_bytes());
+
+        // The stored bytes are exactly what was given (trimmed) — no
+        // re-encoding, no Bech32 anywhere on this path.
+        let stored = h
+            .backend
+            .get_password(DEVICE_SERVICE, OPERATOR_ACCOUNT)
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.as_str(), hex);
+    }
+
+    #[test]
+    fn operator_key_rejects_bad_hex() {
+        // Wrong length, non-hex characters, empty, and whitespace-only
+        // are all refused before any keychain write is attempted.
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset("CONFIDANT_OPERATOR_KEY");
+        let good = fresh_operator_hex();
+        let cases: Vec<String> = vec![
+            "".to_string(),
+            "   ".to_string(),
+            "abc".to_string(),
+            "ab".repeat(31),                             // 62 chars: too short
+            "ab".repeat(32)[..63].to_string(),           // 63 chars: too short
+            format!("{good}00"),                         // 66 chars: too long
+            format!("{}zz{}", &good[..32], &good[34..]), // non-hex chars
+            fresh_identity_bech32(),                     // age Bech32 is NOT valid here
+        ];
+        for bad in &cases {
+            let err = store_operator_key_with(&h.backend, bad).unwrap_err();
+            assert!(
+                matches!(err, Error::Keychain(_)),
+                "{bad:?}: unexpected {err:?}"
+            );
+        }
+        // Nothing was written by any of the rejections.
+        assert!(h
+            .backend
+            .get_password(DEVICE_SERVICE, OPERATOR_ACCOUNT)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn operator_key_load_rejects_bad_hex() {
+        // A corrupt entry (written past validation, e.g. by hand) fails
+        // closed on load — from the keychain and from the env var.
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset("CONFIDANT_OPERATOR_KEY");
+        store_key_raw(
+            &h.backend,
+            DEVICE_SERVICE,
+            OPERATOR_ACCOUNT,
+            "not-hex",
+            "operator key",
+        )
+        .unwrap();
+        let err = operator_key_with(&h.backend, h.dir()).unwrap_err();
+        assert!(matches!(err, Error::Keychain(_)), "unexpected: {err:?}");
+
+        // Env var with bad hex fails closed too (and wins over the backend).
+        _g.set("CONFIDANT_OPERATOR_KEY", "xyz");
+        let err = operator_key_with(&h.backend, h.dir()).unwrap_err();
+        assert!(matches!(err, Error::Keychain(_)), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn operator_key_loads_from_env() {
+        // `CONFIDANT_OPERATOR_KEY` (headless use) takes valid hex and
+        // validates it the same way as the keychain path.
+        let hex = fresh_operator_hex();
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.set("CONFIDANT_OPERATOR_KEY", &hex);
+        let raw = operator_key_with(&h.backend, h.dir()).expect("env hex loads");
+        assert_eq!(raw.as_slice(), hex.as_bytes());
+    }
+
+    #[test]
+    fn age_key_paths_still_validate_bech32() {
+        // The fix is scoped to the operator path: device/inbox store and
+        // load still reject non-Bech32, including 64-char hex.
+        let hex = fresh_operator_hex();
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
+
+        let err = store_key(
+            &h.backend,
+            DEVICE_SERVICE,
+            DEVICE_ACCOUNT,
+            &hex,
+            "device key",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Age(_)), "unexpected: {err:?}");
+
+        _g.set(DEVICE_KEY_ENV, &hex);
+        let err = h.load_device().unwrap_err();
+        assert!(matches!(err, Error::Age(_)), "unexpected: {err:?}");
+    }
+
+    fn fresh_operator_hex() -> String {
+        use rand::rngs::OsRng;
+        let sk = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        crate::hex::encode(&sk.to_bytes())
     }
 
     #[test]
