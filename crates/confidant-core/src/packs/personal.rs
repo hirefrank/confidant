@@ -524,6 +524,13 @@ impl Pack for PersonalPack {
         };
         serde_json::to_value(view).ok()
     }
+
+    fn private_context_fields(&self) -> &'static [&'static str] {
+        // `birthday`, `relationship_to_me`, and `dates` are the person's own
+        // PII; `context` strips them when private data is excluded. The
+        // cadence/touch fields are derived metadata and stay.
+        &["birthday", "relationship_to_me", "dates"]
+    }
 }
 
 fn person_mut<'a>(state: &'a mut PersonalState, id: &RecordId) -> &'a mut PersonPersonal {

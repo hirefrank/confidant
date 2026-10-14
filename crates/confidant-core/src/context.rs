@@ -135,11 +135,14 @@ pub fn build_context(
         }
         if let Some(mut view) = pack.context_view(vault, state.as_ref(), person, &canonical, as_of)
         {
-            if !show_pii && pack.name() == crate::config::PERSONAL_PACK {
+            // #185/#302: a pack declares its own PII fields rather than core
+            // hardcoding pack names. Strip them when private data is excluded.
+            let private = pack.private_context_fields();
+            if !show_pii && !private.is_empty() {
                 if let Some(obj) = view.as_object_mut() {
-                    obj.remove("birthday");
-                    obj.remove("relationship_to_me");
-                    obj.remove("dates");
+                    for field in private {
+                        obj.remove(*field);
+                    }
                 }
             }
             packs.insert(pack.name().to_string(), view);
