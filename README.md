@@ -54,18 +54,33 @@ cargo run -p confidant-cli -- check --json --no-input --vault examples/demo-vaul
 
 ## Quickstart
 
-Once installed, create a vault (or point `CONFIDANT_VAULT` at an existing one)
+When creating or connecting a vault, choose **encrypted** (real data) or
+**plaintext** (demo/fixtures only) up front — see
+[`docs/agent-setup.md`](docs/agent-setup.md#encrypted-vault-vs-plaintext-demo):
+
+- **Real relationship data (encrypted, default):** ensure `confidant.toml`
+  does **not** set `[crypto] mode = "plaintext"` (never copy the demo vault's
+  opt-out into a real vault) and the git working tree is clean (`git status`),
+  then run `confidant init`. Record bodies are encrypted in git; ledger lines
+  stay structural plaintext.
+- **Demo / learning / fixtures only (plaintext opt-out):** set
+  `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the
+  vault is structurally plaintext) and do **not** run `confidant init`. Never
+  use for real PII — `git clone` exposes all record content.
+
+Create an encrypted vault (or point `CONFIDANT_VAULT` at an existing one)
 and check it:
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"
 mkdir -p "$CONFIDANT_VAULT" && cd "$CONFIDANT_VAULT" && git init
+# Commit confidant.toml (without mode = "plaintext") so git status is clean, then:
 confidant init   # generates your operator key; shows a 24-word recovery phrase once — store it offline
 confidant check
 confidant check --json --no-input
 ```
 
-To try it with fake data, use the demo vault — **fake data only**:
+To try it with fake data, use the demo vault (`[crypto] mode = "plaintext"` — **fake data only**):
 
 ```sh
 confidant find "Ada Example" --json --vault examples/demo-vault

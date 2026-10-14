@@ -32,18 +32,46 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    request disabled.)
 3. Ask me where my vault is and set `CONFIDANT_VAULT` to it (export it for
    this session and tell me what to add to my shell rc to keep it). If I
-   have no vault yet, say so and stop — do not invent one.
-4. Verify: run `confidant check --json --no-input` against the vault and
+   have no vault yet, ask whether to create one at a path I choose or
+   stop — do not invent a path.
+4. Ask me whether this vault is for **real relationship data** (encrypted
+   mode, the production default) or **demo / learning / fixtures only**
+   (plaintext opt-out), and explain the consequences before editing
+   `confidant.toml` or running `confidant init`:
+   - **Encrypted (real data):** `confidant init` creates vault keys and
+     shows a 24-word recovery phrase once (store offline); record bodies
+     are encrypted in git while ledger lines stay structural plaintext.
+     Ensure `confidant.toml` does **not** set `[crypto] mode = "plaintext"`
+     (never silently copy the demo vault's `mode = "plaintext"` into a
+     vault I described as real) and the working tree is clean
+     (`git status`), then guide `confidant init` and recovery-phrase
+     handling (never echo the phrase into chat logs).
+   - **Plaintext (demo / learning / fixtures only):** set or keep
+     `[crypto]\nmode = "plaintext"` in `confidant.toml` (only valid while
+     the vault is structurally plaintext; never for real PII), do **not**
+     run `confidant init`, and warn that `git clone` exposes all record
+     content.
+5. Verify: run `confidant check --json --no-input` against the vault and
    report the error/warning counts.
-5. Read the routing snippet (`confidant routing`) for the propose →
+6. Read the routing snippet (`confidant routing`) for the propose →
    confirm → apply workflow every skill follows, and the Privacy rules
    (trusted devices with encrypted disks only; `.confidant/` is never
    committed; `no-ai` records stay out of agent output — see the README
    Privacy section and `docs/privacy.md` in the GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
-the `check` result, and any `confidant doctor` warnings.
+vault crypto mode (encrypted vs. plaintext opt-out), the `check` result,
+and any `confidant doctor` warnings.
 ```
+
+## Encrypted vault vs. plaintext (demo)
+
+Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2.2 and §14):
+
+| Mode | Use for | Consequences | Agent behavior |
+|---|---|---|---|
+| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and prints a 24-word recovery phrase once (store offline). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | Ensure `mode` is not `"plaintext"` in `confidant.toml` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then guide `confidant init` and offline phrase storage. |
+| **Plaintext opt-out** | Demo, learning, fixtures only (`examples/demo-vault`) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Never use for real PII: `git clone` exposes all record content. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, and warn that `git clone` exposes all record content. |
 
 ## Commands
 
