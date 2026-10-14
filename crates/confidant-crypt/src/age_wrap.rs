@@ -51,11 +51,14 @@ impl RawX25519Identity {
     }
 }
 
-/// Bech32-encode bytes with the given HRP (via the `bech32` crate — the
-/// same one `age` uses, so recipients interoperate with the age CLI).
+/// Bech32-encode bytes with the given HRP (via `bech32` 0.12).
+///
+/// Output is byte-identical to the bech32 0.9 encoding the `age` crate
+/// uses internally, so recipients interoperate with the age CLI (locked
+/// by `bech32_encode_matches_age_crate`).
 pub(crate) fn bech32_encode(hrp: &str, data: &[u8]) -> String {
-    use bech32::{ToBase32, Variant};
-    bech32::encode(hrp, data.to_base32(), Variant::Bech32).expect("HRP is valid")
+    bech32::encode::<bech32::Bech32>(bech32::Hrp::parse(hrp).expect("HRP is valid"), data)
+        .expect("HRP is valid")
 }
 
 /// Unwrap with a raw 32-byte X25519 secret (via Bech32 conversion).
@@ -137,6 +140,41 @@ pub fn unwrap_with_bech32(data: &[u8], identity: &str) -> Result<Zeroizing<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bech32_encode_matches_age_crate() {
+        // Golden vectors generated with bech32 0.9 (the version the `age`
+        // crate still uses internally). The 0.12 port must produce
+        // byte-identical output — any difference breaks every `age1…`
+        // recipient and `AGE-SECRET-KEY-1…` string.
+        let seq: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            bech32_encode("age", &[0u8; 32]),
+            "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5cu47z"
+        );
+        assert_eq!(
+            bech32_encode("age", &[7u8; 32]),
+            "age1qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurs95jt69"
+        );
+        assert_eq!(
+            bech32_encode("age", &[9u8; 32]),
+            "age1pyysjzgfpyysjzgfpyysjzgfpyysjzgfpyysjzgfpyysjzgfpyyscxl7ka"
+        );
+        assert_eq!(
+            bech32_encode("age", &seq),
+            "age1qqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0savhh7m"
+        );
+        assert_eq!(
+            bech32_encode("age-secret-key-", &[7u8; 32]),
+            "age-secret-key-1qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurskmp32k"
+        );
+        // Full secret-key path: uppercase of the lowercase encoding.
+        let id = RawX25519Identity::new([7u8; 32]);
+        assert_eq!(
+            &*id.to_bech32(),
+            "AGE-SECRET-KEY-1QURSWPC8QURSWPC8QURSWPC8QURSWPC8QURSWPC8QURSWPC8QURSKMP32K"
+        );
+    }
 
     #[test]
     fn wrap_unwrap_round_trip() {
