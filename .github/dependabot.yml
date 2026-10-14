@@ -32,6 +32,12 @@ updates:
     # Rust 1.86, above the workspace MSRV of 1.85.
     ignore:
       - dependency-name: "lru"
+      # crossterm and ratatui are held together: crossterm stays at 0.28 to
+      # match ratatui 0.29 (see #271). Bumping one alone leaves two crossterm
+      # copies in the TUI. Both upgrade together, with the MSRV bump, under
+      # #275. Remove these two entries as part of that work.
+      - dependency-name: "crossterm"
+      - dependency-name: "ratatui"
 
   - package-ecosystem: "github-actions"
     directory: "/"
