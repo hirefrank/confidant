@@ -96,7 +96,7 @@ rows are warned and skipped):
    `confidant check --json` to validate before committing (one commit).
    **Post-M2** (`records_blocked` is true): stage each `records[]`
    entry to a `0600` scratch file and apply with
-   `confidant record add --file <scratch.md> --request-id <ulid>
+   `confidant record add --file <scratch.md> --request-id <record.request_id from the manifest>
    --dry-run --json --no-input`, then the real run (one commit per
    record). Never hand-write into the vault tree — that would commit
    plaintext PII to git.

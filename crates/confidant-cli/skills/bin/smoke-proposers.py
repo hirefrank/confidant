@@ -73,6 +73,28 @@ def check_manifest(manifest_path: str, skill: str) -> list[str]:
     for key in ("lines_file", "request_id"):
         if key in manifest and not manifest[key]:
             problems.append(f"{skill}: manifest key {key!r} is empty")
+    # #215: every proposed record carries its own request_id, so the apply
+    # step can retry each `record add --request-id` idempotently. portal-sync
+    # emits `records: []` (ledger lines only), which passes vacuously.
+    records = manifest.get("records")
+    if records is not None:
+        if not isinstance(records, list):
+            problems.append(f"{skill}: manifest 'records' is not a list")
+        else:
+            seen = set()
+            for i, rec in enumerate(records):
+                if not isinstance(rec, dict):
+                    problems.append(f"{skill}: records[{i}] is not an object")
+                    continue
+                rid = rec.get("request_id")
+                if not isinstance(rid, str) or len(rid) < 22:
+                    problems.append(
+                        f"{skill}: records[{i}] lacks a request_id string of at least 22 characters"
+                    )
+                    continue
+                if rid in seen:
+                    problems.append(f"{skill}: duplicate request_id {rid!r} across records")
+                seen.add(rid)
     return problems
 
 

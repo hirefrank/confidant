@@ -171,7 +171,8 @@ def main(argv=None) -> int:
     # through `confidant import --file`, which encrypts on write), but the
     # interaction record must wait for `confidant record add --file`.
     encrypted = common.vault_looks_encrypted(vault)
-    records = [{"path": record_path, "content": record_body}]
+    records = [{"path": record_path, "content": record_body,
+                "request_id": common.new_request_id()}]
     if encrypted:
         warnings.append(
             "vault looks encrypted: the interaction record below is PROPOSED ONLY — "
