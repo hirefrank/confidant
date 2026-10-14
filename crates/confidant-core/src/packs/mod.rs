@@ -140,6 +140,14 @@ pub trait Pack: Send + Sync {
     ) -> Option<serde_json::Value> {
         None
     }
+    /// Top-level field names in [`Pack::context_view`]'s returned object that
+    /// carry PII (e.g. a birthday, a relationship label). `context` strips
+    /// these when private data is excluded, so core stays pack-agnostic —
+    /// a pack declares its own sensitive fields instead of `context`
+    /// hardcoding pack names (#185/#302). Defaults to none.
+    fn private_context_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Every pack compiled into this binary, in registry order.
