@@ -4370,6 +4370,31 @@ fn edge_directed_reversed_is_not_a_duplicate() {
 }
 
 #[test]
+fn edge_same_pair_different_kinds_is_not_a_duplicate() {
+    // #179 review: two edges on the SAME pair with different kinds
+    // (married + colleague) are different relations, not duplicates.
+    // The pair key must include the kind.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    edge(dir.path(), EDGE2, ADA, BEA, "colleague");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_same_pair_same_kind_reversed_is_rejected() {
+    // Same pair, same kind, reversed ends: still a duplicate (control for
+    // the test above — the kind key must not mask real duplicates).
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "colleague");
+    edge(dir.path(), EDGE2, BEA, ADA, "colleague");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"]);
+}
+
+#[test]
 fn edge_dangling_end_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     two_people(dir.path());

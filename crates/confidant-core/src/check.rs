@@ -1091,11 +1091,14 @@ fn check_edges(
     orphans: &OrphanOwners,
     findings: &mut Vec<Finding>,
 ) {
-    // Canonical pair for duplicate detection: sorted for symmetric kinds
-    // (so (a, b) and (b, a) collide), as written for directed kinds —
-    // plus the first record's as-written ends, to tell an exact duplicate
-    // from a reversed one.
-    let mut seen_pairs: HashMap<(RecordId, RecordId), (RecordId, RecordId)> = HashMap::new();
+    // Canonical key for duplicate detection: the pair plus the kind.
+    // Sorted ends for symmetric kinds (so (a, b) and (b, a) collide),
+    // as-written ends for directed kinds — plus the first record's
+    // as-written ends, to tell an exact duplicate from a reversed one.
+    // Two edges on the same pair with different kinds are different
+    // relations, not duplicates (#179 review).
+    let mut seen_pairs: HashMap<(RecordId, RecordId, String), (RecordId, RecordId)> =
+        HashMap::new();
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Edge {
             continue;
@@ -1246,17 +1249,22 @@ fn check_edges(
                 }
             }
         }
-        // Reversed / exact duplicates. Only for valid person ends: a
-        // wrong-type or missing end is already flagged above.
+        // Reversed / exact duplicates, per kind. Only for valid person ends:
+        // a wrong-type or missing end is already flagged above. The kind
+        // joins the key: two edges on the same pair with different kinds
+        // are different relations, not duplicates. A missing or unknown
+        // kind already errors above; it still keys separately here so the
+        // duplicate rule stays total.
         if ends.len() == 2 && ends.iter().all(|id| id.prefix() == Prefix::Person) {
+            let kind_key = rec.field("kind").unwrap_or("").to_string();
             let pair = if symmetric == Some(true) {
                 if ends[0] <= ends[1] {
-                    (ends[0].clone(), ends[1].clone())
+                    (ends[0].clone(), ends[1].clone(), kind_key)
                 } else {
-                    (ends[1].clone(), ends[0].clone())
+                    (ends[1].clone(), ends[0].clone(), kind_key)
                 }
             } else {
-                (ends[0].clone(), ends[1].clone())
+                (ends[0].clone(), ends[1].clone(), kind_key)
             };
             if let Some(first) = seen_pairs.get(&pair) {
                 let reversed = first.0 != ends[0] || first.1 != ends[1];

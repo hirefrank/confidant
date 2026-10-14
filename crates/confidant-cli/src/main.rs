@@ -38,6 +38,7 @@ use confidant_core::write::{
     WriteOptions, WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, CheckOptions};
+use confidant_core::{ContentHook, ContentOutcome};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -5084,10 +5085,14 @@ fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow
 /// abort before any irreversible key destruction. Returns the deleted
 /// vault-relative paths, for staging into the same signed shred commit.
 ///
-/// Fail-closed: refuses when any edge's ends cannot be determined —
-/// an undecryptable or tampered envelope, a `no-ai` shell, a malformed
-/// edge file, or an edge with a missing/malformed end — because an
-/// unseen edge might name the shredded person.
+/// Fail-closed, edge-scoped: refuses when any *edge's* ends cannot be
+/// determined — an undecryptable or tampered edge envelope, a `no-ai`
+/// shell, a malformed edge file, or an edge with a missing/malformed
+/// end — because an unseen edge might name the shredded person.
+/// Skipped or refused envelopes *outside* `edges/` do not block shred:
+/// after `keys shred` of person A, A's leftover envelopes stay in the
+/// tree and become undecryptable, and shredding B must still proceed
+/// when every edge reads fine.
 fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<String>> {
     // Keyed load: decrypts edge envelopes via the current device key.
     // (Same probe-then-keyed pattern as `load_vault_for_reads`.)
@@ -5096,22 +5101,48 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
         root,
         &probe.config.vault_id,
     ));
-    let vault = confidant_core::load_vault_with_hook(root, Some(decryptor.hook()))
-        .map_err(anyhow::Error::new)?;
-    if vault.skipped_encrypted > 0 {
+    // Wrap the decrypt hook to record per-path outcomes under `edges/`.
+    // Record files load on worker threads, hence the mutexes.
+    let edge_skipped = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let edge_refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let inner = decryptor.hook();
+    let hook: ContentHook = std::sync::Arc::new({
+        let edge_skipped = std::sync::Arc::clone(&edge_skipped);
+        let edge_refused = std::sync::Arc::clone(&edge_refused);
+        move |path: &str, bytes: &[u8]| {
+            let outcome = inner(path, bytes);
+            if path.starts_with("edges/") {
+                match outcome {
+                    ContentOutcome::Skipped => {
+                        edge_skipped.lock().unwrap().push(path.to_string());
+                    }
+                    ContentOutcome::Refused => {
+                        edge_refused.lock().unwrap().push(path.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            outcome
+        }
+    });
+    let vault =
+        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
+    let edge_skipped = edge_skipped.lock().unwrap();
+    if !edge_skipped.is_empty() {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every edge naming {client_id}: {} envelope(s) could not be decrypted on this device; refusing to shred",
-            vault.skipped_encrypted
+            "cannot determine every edge naming {client_id}: {} edge envelope(s) could not be decrypted on this device; refusing to shred",
+            edge_skipped.len()
         )).with_fix(
-            "Run shred from a device that can decrypt the whole vault, or resolve the undecryptable records first",
+            "Run shred from a device that can decrypt every edge, or resolve the undecryptable edge files first",
         )));
     }
-    if vault.refused_envelopes > 0 {
+    let edge_refused = edge_refused.lock().unwrap();
+    if !edge_refused.is_empty() {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every edge naming {client_id}: {} envelope(s) were refused as tampered or corrupt; refusing to shred",
-            vault.refused_envelopes
+            "cannot determine every edge naming {client_id}: {} edge envelope(s) were refused as tampered or corrupt; refusing to shred",
+            edge_refused.len()
         )).with_fix(
-            "Resolve the refused envelopes first (check reports them as unreadable)",
+            "Resolve the refused edge envelopes first (check reports them as unreadable)",
         )));
     }
     // A load finding on an edge file means an edge record could not be
@@ -5238,6 +5269,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             &operator_sk,
             &anchor,
             identity.as_ref(),
+            deleted_edges.len(),
         )
         .map_err(anyhow::Error::new)?;
 
