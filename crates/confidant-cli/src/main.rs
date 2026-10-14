@@ -1414,6 +1414,36 @@ fn cmd_inbox(
             .expect("record encryptor initialised above")
             .encrypt_file(path, plaintext)
     };
+    // Same lazy construction for the retry idempotency check (#213
+    // follow-up): the decryptor is only built when a record path already
+    // exists on an encrypted vault, so the common path never touches the
+    // device key. Decrypted bytes are compared in core, never logged
+    // (AGENTS.md rule 4).
+    let decryptor: std::cell::RefCell<Option<record_crypto::RecordEncryptor>> =
+        std::cell::RefCell::new(None);
+    let root_owned_for_decrypt = root.to_path_buf();
+    let decrypt_existing = move |path: &std::path::Path,
+                                 envelope: &[u8]|
+          -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        let mut slot = decryptor.borrow_mut();
+        if slot.is_none() {
+            let vault = confidant_core::load_vault(&root_owned_for_decrypt)?;
+            *slot =
+                match record_crypto::RecordEncryptor::for_vault(&root_owned_for_decrypt, &vault)? {
+                    Some(enc) => Some(enc),
+                    None => {
+                        return Err(anyhow::Error::new(DomainError::invalid(
+                            "vault holds an encrypted record, but no record encryptor is available",
+                        )));
+                    }
+                };
+        }
+        let plaintext = slot
+            .as_ref()
+            .expect("record encryptor initialised above")
+            .decrypt_existing(path, envelope)?;
+        Ok(Zeroizing::new(plaintext))
+    };
     let report = match confidant_core::run_inbox(
         root,
         &confidant_core::InboxOptions {
@@ -1425,6 +1455,7 @@ fn cmd_inbox(
         &decrypt,
         inbox_keys.as_deref(),
         Some(&encrypt),
+        Some(&decrypt_existing),
     ) {
         Ok(report) => report,
         Err(err) => return fail_command(json, Some(&vault_path), &err),
@@ -2108,6 +2139,18 @@ fn queue_session_note_to_inbox(
     let stems: Vec<&str> = items.iter().map(|i| i.stem.as_str()).collect();
 
     if cli.dry_run {
+        // The real run refuses without commit signing configured
+        // (E_INBOX_UNTRUSTED from the queue gate); the dry run must
+        // report the same refusal rather than a `would queue` the real
+        // run could never satisfy.
+        if !confidant_core::inbox::queue_signing_configured(root)? {
+            return Err(anyhow::Error::new(
+                DomainError::inbox_signing_unconfigured().with_fix(
+                    "Configure commit signing (`git config commit.gpgsign true` and a \
+                     `user.signingkey`), then re-run with --fallback-inbox",
+                ),
+            ));
+        }
         if cli.json {
             print_json(&ok_envelope(
                 Some(root),

@@ -1851,6 +1851,44 @@ fn log_session_note_fallback_refuses_without_signing() {
 }
 
 #[test]
+fn log_session_note_fallback_dry_run_checks_signing_gate() {
+    // #213 follow-up: --dry-run reports `would queue` only when the real
+    // run could proceed — without commit signing configured it refuses
+    // with the same E_INBOX_UNTRUSTED the queue would hit, instead of a
+    // `would queue` that can never happen.
+    let h = Harness::new();
+    let _ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    // No signing configured.
+
+    let out = log_session_no_key(&h, &["--fallback-inbox", "--dry-run"]);
+    assert!(!out.status.success(), "unsigned dry run must refuse");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "unsigned dry run must be E_INBOX_UNTRUSTED: {err}"
+    );
+
+    // With signing configured the dry run reports `would queue` and
+    // queues nothing.
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let out = log_session_no_key(&h, &["--fallback-inbox", "--dry-run"]);
+    assert!(out.status.success(), "dry run failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("would queue 2 item(s)"),
+        "dry run must report would queue: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn log_session_note_fallback_json_envelope() {
     // #213 + ADR-7: the fallback speaks JSON like every other command.
     let h = Harness::new();

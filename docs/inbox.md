@@ -219,7 +219,10 @@ leaves both branches untouched. If the merge commit lands and the clear
 then refuses — the tip moved (`E_INBOX_RACE`), or the clear commit failed
 to sign — main keeps the merge and the inbox keeps its items. Re-running
 is safe: already-merged items are skipped as duplicates (idempotent), and
-the clear is retried against the new tip.
+the clear is retried against the new tip. On structurally encrypted
+vaults the retry decrypts an existing record envelope and compares
+plaintext, so a record item the first run merged is recognized as already
+merged rather than conflicting.
 `--dry-run` decrypts and plans without committing or clearing.
 
 ## Fallback queue (`log session --note --fallback-inbox`, #213)
@@ -245,3 +248,8 @@ the vault's `[inbox].pubkey` does not match the operator's pin in
 the drain, which only warns on a missing pin), when commit signing is
 not configured, or when a stem already exists on the branch. The next
 `confidant inbox` run merges the queued items like any other intake.
+
+Edge case: if the session was logged with `--src X` and the vault
+already contains `src:X`, the drain skips the fallback ledger line as a
+duplicate while still merging the note record — the note then has no
+session line pointing at it.

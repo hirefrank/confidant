@@ -356,6 +356,7 @@ fn rotate_drain_then_destroy() {
         &decrypt,
         Some(&keys),
         None,
+        None,
     )
     .unwrap_err();
     let code = confidant_core::DomainError::of(&err).map(|d| d.code().to_string());

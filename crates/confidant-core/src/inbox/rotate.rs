@@ -247,6 +247,9 @@ fn drain_for_rotate(
         // the B11 fail-closed refusal. Drain record items with plain
         // `confidant inbox` before rotating.
         None,
+        // Same for the retry idempotency check: without a decryptor an
+        // existing envelope still conflicts rather than skipping.
+        None,
     )
 }
 /// Read `[inbox].pubkey` from a TOML pin file. Missing file → `None`.

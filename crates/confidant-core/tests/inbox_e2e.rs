@@ -6,7 +6,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use confidant_core::{queue_items, run_inbox, DecryptFn, DomainError, InboxOptions, QueueItem};
+use confidant_core::{
+    queue_items, run_inbox, DecryptExistingFn, DecryptFn, DomainError, InboxOptions, QueueItem,
+};
 use tempfile::TempDir;
 
 const PID: &str = "p-01M3TC5H00MPJG000000000000";
@@ -108,6 +110,7 @@ impl Repo {
                 pinned_pubkey: None,
             },
             identity,
+            None,
             None,
             None,
         )
@@ -299,6 +302,7 @@ fn symlinked_vault_root_merges() {
         identity,
         None,
         None,
+        None,
     )
     .expect("inbox run via symlinked root failed");
     assert_eq!(report.merged, 2);
@@ -355,6 +359,7 @@ fn run_with(
             pinned_pubkey,
         },
         identity,
+        None,
         None,
         None,
     )
@@ -498,6 +503,7 @@ fn push_between_verify_and_read_refuses() {
         evil,
         None,
         None,
+        None,
     )
     .expect_err("expected E_INBOX_RACE");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
@@ -556,6 +562,7 @@ fn push_after_pin_is_neither_verified_nor_read() {
             pinned_pubkey: None,
         },
         evil,
+        None,
         None,
         None,
     )
@@ -994,6 +1001,7 @@ fn run_real(r: &Repo) -> anyhow::Result<confidant_core::InboxReport> {
         &decrypt,
         Some(&keys),
         None,
+        None,
     )
 }
 
@@ -1122,6 +1130,41 @@ fn fake_envelope_encryptor(path: &Path, plaintext: &[u8]) -> anyhow::Result<Vec<
     Ok(format!("{header}{body}").into_bytes())
 }
 
+/// Inverse of `fake_envelope_encryptor` for the retry idempotency check:
+/// hex-decode the body after the outer header. Anything that is not a
+/// fake envelope fails — fail closed, like the real decryptor.
+fn fake_envelope_decryptor(
+    path: &Path,
+    envelope: &[u8],
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    assert_eq!(
+        path,
+        Path::new("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG000000000001.md")
+    );
+    let text = std::str::from_utf8(envelope).map_err(|_| anyhow::anyhow!("not a fake envelope"))?;
+    let mut parts = text.split("---\n");
+    parts.next(); // leading empty before the opening marker
+    let header = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("not a fake envelope"))?;
+    if !header.contains("enc: fake") {
+        return Err(anyhow::anyhow!("not a fake envelope"));
+    }
+    let body = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("not a fake envelope"))?
+        .trim();
+    if body.len() % 2 != 0 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!("not a fake envelope"));
+    }
+    let bytes: Vec<u8> = (0..body.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&body[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("not a fake envelope"))?;
+    Ok(zeroize::Zeroizing::new(bytes))
+}
+
 /// Make the fixture vault structurally encrypted (a committed `keys/`
 /// tree), the way a real encrypted vault looks to the drain.
 fn make_structurally_encrypted(r: &Repo) {
@@ -1152,6 +1195,7 @@ fn drain_encrypts_record_item_on_encrypted_vault() {
         identity,
         None,
         Some(&fake_envelope_encryptor),
+        None,
     )
     .expect("drain with an encryptor must merge the record item");
     assert_eq!(report.merged, 1);
@@ -1172,9 +1216,9 @@ fn drain_encrypts_record_item_on_encrypted_vault() {
 
 #[test]
 fn drain_conflicts_on_existing_envelope() {
-    // The drain compares bytes, so it cannot tell an existing envelope
-    // from a different record: fail closed with E_INBOX_CONFLICT rather
-    // than overwriting or leaking.
+    // Without a decryptor the drain compares bytes, so it cannot tell an
+    // existing envelope from a different record: fail closed with
+    // E_INBOX_CONFLICT rather than overwriting or leaking.
     let r = Repo::new();
     make_structurally_encrypted(&r);
     let note_path = r
@@ -1206,6 +1250,7 @@ fn drain_conflicts_on_existing_envelope() {
         identity,
         None,
         Some(&fake_envelope_encryptor),
+        None,
     )
     .expect_err("expected E_INBOX_CONFLICT");
     assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CONFLICT");
@@ -1213,6 +1258,119 @@ fn drain_conflicts_on_existing_envelope() {
         std::fs::read_to_string(&note_path).unwrap(),
         "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nenc: fake\n---\ndeadbeef\n"
     );
+}
+
+#[test]
+fn retry_after_failed_clear_skips_merged_record_on_encrypted_vault() {
+    // #213 follow-up: the merge commit lands but the clear fails (tip
+    // race). On re-run the record path holds the envelope the first run
+    // wrote; the drain decrypts it and compares plaintext, so the item is
+    // skipped as already merged instead of wedging the inbox on
+    // E_INBOX_CONFLICT forever.
+    let r = Repo::new();
+    make_structurally_encrypted(&r);
+    r.with_inbox(&[("01JAAB.age", RECORD_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
+    let decrypt_existing: &DecryptExistingFn = &fake_envelope_decryptor;
+    let opts = InboxOptions {
+        dry_run: false,
+        trusted_signers: Vec::new(),
+        allow_unsigned: true,
+        pinned_pubkey: None,
+    };
+    // First run: merge + clear succeed.
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+    let report = run_inbox(
+        r.root(),
+        &opts,
+        identity,
+        None,
+        Some(&fake_envelope_encryptor),
+        Some(decrypt_existing),
+    )
+    .expect("first drain must merge the record item");
+    assert_eq!(report.merged, 1);
+    assert_eq!(report.cleared, 1);
+    // Simulate the failed clear: the merge commit is on main, but the
+    // inbox still holds its items.
+    git(r.root(), &["update-ref", "refs/heads/inbox", &tip_before]);
+    // Re-run: the record item is recognized as already merged (decrypted
+    // plaintext comparison), merged 0, and the clear goes through.
+    let report = run_inbox(
+        r.root(),
+        &opts,
+        identity,
+        None,
+        Some(&fake_envelope_encryptor),
+        Some(decrypt_existing),
+    )
+    .expect("retry after a failed clear must not wedge on E_INBOX_CONFLICT");
+    assert_eq!(report.merged, 0);
+    assert_eq!(report.cleared, 1);
+    // The tree is clean: the retry stranded nothing.
+    assert_eq!(git_out(r.root(), &["status", "--porcelain"]), "");
+    // The envelope from the first run is untouched — the retry merged
+    // nothing over it.
+    let note_path = r
+        .root()
+        .join("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG000000000001.md");
+    let written = std::fs::read_to_string(&note_path).unwrap();
+    assert!(written.contains("enc: fake"), "written:\n{written}");
+}
+
+#[test]
+fn failed_run_reverts_applied_writes() {
+    // #213 follow-up (should-fix): a mid-loop failure must not leave the
+    // tree dirty. The ledger item applies, then the record item conflicts;
+    // the run fails and the ledger append is reverted.
+    let r = Repo::new();
+    make_structurally_encrypted(&r);
+    let note_path = r
+        .root()
+        .join("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG000000000001.md");
+    std::fs::create_dir_all(note_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &note_path,
+        "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nenc: fake\n---\ndeadbeef\n",
+    )
+    .unwrap();
+    git(r.root(), &["add", "."]);
+    git(r.root(), &["commit", "-q", "-m", "existing envelope"]);
+
+    // The ledger item sorts before the record item, so its append lands
+    // before the conflict hits.
+    r.with_inbox(&[("01JAAB.age", LEDGER_ITEM), ("01JAAC.age", RECORD_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
+    let err = run_inbox(
+        r.root(),
+        &InboxOptions {
+            dry_run: false,
+            trusted_signers: Vec::new(),
+            allow_unsigned: true,
+            pinned_pubkey: None,
+        },
+        identity,
+        None,
+        Some(&fake_envelope_encryptor),
+        None,
+    )
+    .expect_err("expected E_INBOX_CONFLICT");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_CONFLICT");
+    // The ledger append was reverted: no stranded line, tree clean.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        !ledger.contains("src:e2e-1"),
+        "applied ledger append was not reverted:\n{ledger}"
+    );
+    assert_eq!(git_out(r.root(), &["status", "--porcelain"]), "");
 }
 
 fn queued_plaintext(repo: &Repo, stem: &str, secret: &[u8; 32]) -> String {
