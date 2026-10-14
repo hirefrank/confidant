@@ -82,6 +82,11 @@ jobs:
         # --all-features: the CLI test suite needs the `test-overrides`
         # feature (test-only env-var key overrides), like the unix test job.
         run: cargo test -p confidant-cli --all-features --locked
+      - name: build confidant-tui
+        # #315: the release workflow ships a Windows `confidant-tui` binary
+        # (#307), so CI must catch Windows build breakage. Build only —
+        # the TUI test suite runs on the unix test job.
+        run: cargo build -p confidant-tui --locked
 
   skills-smoke:
     name: skills smoke
