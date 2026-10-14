@@ -100,7 +100,7 @@ pub struct RecordCtx {
     /// `key_id` header.
     pub client_id: String,
     pub path: String,
-    /// AAD purpose: `profile`, `note`, `interaction`, `org`, `deal`.
+    /// AAD purpose: `profile`, `note`, `interaction`, `org`, `deal`, `edge`.
     pub purpose: String,
     pub epoch: u64,
 }
@@ -109,9 +109,13 @@ pub struct RecordCtx {
 ///
 /// - `person`, `note`, and `interaction` records — and `deal` records whose
 ///   `person` field is set — encrypt under that person's data key.
-/// - `org` records, and `deal` records with no `person` (`None`), encrypt
-///   under the reserved [`manifest::SHARED_CLIENT_ID`] (`vault:shared`)
-///   vault key.
+/// - `org` records, `deal` records with no `person` (`None`), and `edge`
+///   records encrypt under the reserved [`manifest::SHARED_CLIENT_ID`]
+///   (`vault:shared`) vault key. Edges are shared + delete (#179): they
+///   carry only ids, kind, and dates, and `keys shred` deletes edges
+///   naming the shredded person from the working tree in the same commit
+///   — earlier versions in git history stay readable under the shared key
+///   (see §8 and [`leftover_warnings`]).
 ///
 /// A blank `person` (`Some` but empty/whitespace) is an error for every
 /// record type: only `None` routes to `vault:shared`, so a writer bug that
@@ -142,7 +146,7 @@ pub fn client_id_for_record(record_type: &str, person: Option<&str>) -> Result<S
         "deal" => Ok(person
             .map(str::to_string)
             .unwrap_or_else(|| manifest::SHARED_CLIENT_ID.to_string())),
-        "org" => Ok(manifest::SHARED_CLIENT_ID.to_string()),
+        "org" | "edge" => Ok(manifest::SHARED_CLIENT_ID.to_string()),
         _ => Err(Error::Header(format!(
             "unknown record type {record_type:?}"
         ))),

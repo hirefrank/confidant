@@ -17,7 +17,9 @@ use crate::id::RecordId;
 use crate::packs::coaching::CoachingView;
 use crate::packs::{resolve_enabled, ALL_PACKS};
 use crate::record::RecordKind;
-use crate::scope::{note_linkage_owners, record_owners, OwnerKey, PackScope};
+use crate::scope::{
+    note_linkage_owners, owners_of_ledger_entry, record_owners, OwnerKey, PackScope,
+};
 use crate::search::cleared_record_ids;
 use crate::vault::Vault;
 
@@ -36,6 +38,15 @@ pub struct NoteView {
     pub id: String,
     pub date: Option<String>,
     pub body: Option<String>,
+}
+
+/// One mirrored touchpoint for the person: a ledger `touch` line carrying
+/// only a date and the participant's own id, plus a kind when a pack needs
+/// one (#179). No other participant ids, no primary id, no interaction id.
+#[derive(Clone, Debug, Serialize)]
+pub struct TouchpointView {
+    pub date: String,
+    pub kind: Option<String>,
 }
 
 /// One interaction record linked to the person.
@@ -59,6 +70,10 @@ pub struct PersonContext {
     pub person: PersonView,
     pub notes: Vec<NoteView>,
     pub interactions: Vec<InteractionView>,
+    /// Mirrored touchpoints for this person (#179): their own `touch`
+    /// ledger lines. Participants in a multi-person interaction see their
+    /// touchpoint here, not the interaction content.
+    pub touchpoints: Vec<TouchpointView>,
     pub coaching: Option<CoachingView>,
     /// Pack state grouped by pack name (`"coaching@0.1"` today). Each pack
     /// decides its own view shape via `Pack::context_view`. `coaching` above
@@ -183,6 +198,25 @@ pub fn build_context(
         .map(|h| format!("hmac:{h}"))
         .collect();
 
+    // #179: mirrored touchpoints — the participant's own `touch` lines.
+    // Like aliases, these are ledger-derived metadata (not record PII),
+    // so they carry no cleared-set gate; scope-filtered by verb ownership
+    // (core for kind-less touchpoints).
+    let mut touchpoints: Vec<TouchpointView> = vault
+        .entries
+        .iter()
+        .filter(|s| {
+            s.entry.verb == "touch"
+                && canonical_on(&s.entry.id, &merges, as_of) == canonical
+                && scope.allows(&owners_of_ledger_entry(&s.entry, &enabled))
+        })
+        .map(|s| TouchpointView {
+            date: s.entry.date.to_string(),
+            kind: s.entry.pair("kind").map(str::to_owned),
+        })
+        .collect();
+    touchpoints.sort_by(|a, b| a.date.cmp(&b.date).then(a.kind.cmp(&b.kind)));
+
     Some(PersonContext {
         person: PersonView {
             id: person.to_string(),
@@ -192,6 +226,7 @@ pub fn build_context(
         },
         notes,
         interactions,
+        touchpoints,
         coaching,
         packs,
         aliases,
@@ -250,6 +285,51 @@ mod tests {
         assert_eq!(scoped.person.name.as_deref(), Some("Ada Example"));
         assert!(!scoped.aliases.is_empty());
         assert_eq!(scoped.scope, vec!["coaching@0.1"]);
+    }
+
+    #[test]
+    fn context_shows_own_touchpoints_only() {
+        // #179: a participant sees their own mirrored touchpoints in
+        // `context` — date + optional kind, no other ids — and nothing
+        // from another participant's touchpoints.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let ada = "p-01M3TC5H00MPJG000000000000";
+        let bea = "p-01M3TC5H00MPJG000H24000001";
+        for (id, name) in [(ada, "Ada Example"), (bea, "Bea Demo")] {
+            let d = dir.path().join(format!("people/{id}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("profile.md"),
+                format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\nFake person.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!(
+                "2026-10-06 touch {bea}\n2026-10-07 touch {bea} kind:call\n2026-10-06 touch {ada}\n"
+            ),
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let bea_id = RecordId::parse(bea).unwrap();
+        let bea_ctx = build_context(&vault, &bea_id, true, &PackScope::All).unwrap();
+        assert_eq!(bea_ctx.touchpoints.len(), 2);
+        assert_eq!(bea_ctx.touchpoints[0].date, "2026-10-06");
+        assert_eq!(bea_ctx.touchpoints[0].kind, None);
+        assert_eq!(bea_ctx.touchpoints[1].date, "2026-10-07");
+        assert_eq!(bea_ctx.touchpoints[1].kind.as_deref(), Some("call"));
+        // Ada sees only her own touchpoint, not Bea's.
+        let ada_id = RecordId::parse(ada).unwrap();
+        let ada_ctx = build_context(&vault, &ada_id, true, &PackScope::All).unwrap();
+        assert_eq!(ada_ctx.touchpoints.len(), 1);
+        assert_eq!(ada_ctx.touchpoints[0].date, "2026-10-06");
     }
 
     #[test]

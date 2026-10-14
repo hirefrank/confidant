@@ -1,10 +1,11 @@
 //! Schema packs compiled into the binary (ADR-8).
 //!
-//! A pack owns ledger verbs, record types, front-matter fields, and balance
-//! metrics. `check` resolves the vault's `packs = [...]` list against the
-//! static registry, refuses conflicting claims (`E_PACK_CONFLICT`), folds
-//! each enabled pack independently, and warns — never errors — on data
-//! owned by a pack that is not enabled (`W_PACK_ORPHAN`, #177 Q2).
+//! A pack owns ledger verbs, record types, front-matter fields, balance
+//! metrics, and edge kinds. `check` resolves the vault's `packs = [...]`
+//! list against the static registry, refuses conflicting claims
+//! (`E_PACK_CONFLICT`), folds each enabled pack independently, and warns
+//! — never errors — on data owned by a pack that is not enabled
+//! (`W_PACK_ORPHAN`, #177 Q2).
 //!
 //! Calculations stay compiled in Rust (the #173 decision). There is no
 //! plugin ABI in this slice; external pack discovery (#193) is a later cut
@@ -20,6 +21,34 @@ use crate::id::{Prefix, RecordId};
 use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
+
+/// One edge kind a pack owns (#179). `name` is the `kind` front-matter
+/// value on an edge record; `symmetric` declares whether the relation
+/// reads the same in both directions (`married` is symmetric, `introduced`
+/// is directed). The kind list is closed: an edge whose kind no core or
+/// enabled pack claims is a `check` error, not free text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EdgeKind {
+    pub name: &'static str,
+    pub symmetric: bool,
+}
+
+/// Edge kinds core ships (#179). Packs add their own via
+/// [`Pack::edge_kinds`].
+pub const CORE_EDGE_KINDS: &[EdgeKind] = &[
+    EdgeKind {
+        name: "married",
+        symmetric: true,
+    },
+    EdgeKind {
+        name: "introduced",
+        symmetric: false,
+    },
+    EdgeKind {
+        name: "colleague",
+        symmetric: true,
+    },
+];
 
 /// Pack-owned state produced by [`Pack::fold`].
 ///
@@ -44,14 +73,20 @@ pub trait Pack: Send + Sync {
     /// Ledger verbs this pack defines (e.g. `open`, `session`).
     fn verbs(&self) -> &'static [&'static str];
     /// Record types this pack owns (kind strings, e.g. `"package"`).
-    /// Core kinds (`person`, `org`, `deal`, `interaction`, `note`) are
-    /// never claimed; a pack that introduces a new kind claims it here.
+    /// Core kinds (`person`, `org`, `deal`, `interaction`, `note`, `edge`)
+    /// are never claimed; a pack that introduces a new kind claims it here.
     fn record_types(&self) -> &'static [&'static str];
     /// Front-matter fields this pack owns on shared records (flat names,
     /// e.g. `birthday`). Namespace only on conflict (#177 Q1).
     fn fields(&self) -> &'static [&'static str];
     /// Balance metrics this pack verifies on `balance` lines.
     fn balance_metrics(&self) -> &'static [&'static str];
+    /// Edge kinds this pack owns (#179). Core ships
+    /// [`CORE_EDGE_KINDS`]; a pack that introduces a kind claims it here.
+    /// Defaults to none.
+    fn edge_kinds(&self) -> &'static [EdgeKind] {
+        &[]
+    }
     /// The record type a verb's ledger ID must have, if the verb constrains
     /// it (e.g. `open` / `session` require a person ID). `None` means the
     /// verb constrains nothing. Defaults to `None`.
@@ -124,9 +159,9 @@ pub fn resolve_enabled<'a>(
     (found, unknown)
 }
 
-/// A claim two packs make on the same verb, record type, field, or balance
-/// metric. `kind` is one of `"verb"`, `"record type"`, `"field"`,
-/// `"balance metric"`.
+/// A claim two packs make on the same verb, record type, field, balance
+/// metric, or edge kind. `kind` is one of `"verb"`, `"record type"`,
+/// `"field"`, `"balance metric"`, `"edge kind"`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackConflict {
     pub kind: &'static str,
@@ -143,6 +178,7 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
     let mut seen_types: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_fields: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_metrics: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_edge_kinds: HashMap<&'static str, &'static str> = HashMap::new();
     for pack in packs {
         for (kind, claims, seen) in [
             ("verb", pack.verbs(), &mut seen_verbs),
@@ -162,6 +198,19 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
                 seen.insert(claim, pack.name());
             }
         }
+        // #179: edge kinds are claimed the same way, checked in the same
+        // per-pack pass so ordering matches the other claim kinds.
+        for edge_kind in pack.edge_kinds() {
+            if let Some(first) = seen_edge_kinds.get(edge_kind.name) {
+                return Some(PackConflict {
+                    kind: "edge kind",
+                    name: edge_kind.name,
+                    first,
+                    second: pack.name(),
+                });
+            }
+            seen_edge_kinds.insert(edge_kind.name, pack.name());
+        }
     }
     None
 }
@@ -175,6 +224,7 @@ pub struct OrphanOwners {
     pub record_types: BTreeMap<&'static str, &'static str>,
     pub fields: BTreeMap<&'static str, &'static str>,
     pub balance_metrics: BTreeMap<&'static str, &'static str>,
+    pub edge_kinds: BTreeMap<&'static str, &'static str>,
 }
 
 pub fn orphan_owners(registry: &[&dyn Pack], enabled: &[&dyn Pack]) -> OrphanOwners {
@@ -196,6 +246,9 @@ pub fn orphan_owners(registry: &[&dyn Pack], enabled: &[&dyn Pack]) -> OrphanOwn
         for claim in pack.balance_metrics() {
             out.balance_metrics.entry(claim).or_insert(pack.name());
         }
+        for claim in pack.edge_kinds() {
+            out.edge_kinds.entry(claim.name).or_insert(pack.name());
+        }
     }
     out
 }
@@ -206,7 +259,8 @@ mod tests {
     use crate::id::Prefix;
 
     /// A minimal second pack for registry-mechanics tests. Claims one verb,
-    /// one field, one record type, and one metric; folds to empty state.
+    /// one field, one record type, one metric, and one edge kind; folds to
+    /// empty state.
     struct TestPack;
 
     struct TestState;
@@ -225,13 +279,20 @@ mod tests {
             &["touch"]
         }
         fn record_types(&self) -> &'static [&'static str] {
-            &["edge"]
+            // "edge" is a core record type (#179) and is never claimed.
+            &["testtype"]
         }
         fn fields(&self) -> &'static [&'static str] {
             &["birthday"]
         }
         fn balance_metrics(&self) -> &'static [&'static str] {
             &["test_metric"]
+        }
+        fn edge_kinds(&self) -> &'static [EdgeKind] {
+            &[EdgeKind {
+                name: "mentor",
+                symmetric: false,
+            }]
         }
         fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
             if verb == "touch" {
@@ -343,18 +404,80 @@ mod tests {
     }
 
     #[test]
+    fn conflict_detects_shared_edge_kind() {
+        struct Clashing;
+        impl Pack for Clashing {
+            fn name(&self) -> &'static str {
+                "clash@0.1"
+            }
+            fn verbs(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn record_types(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn fields(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn balance_metrics(&self) -> &'static [&'static str] {
+                &[]
+            }
+            fn edge_kinds(&self) -> &'static [EdgeKind] {
+                &[EdgeKind {
+                    name: "mentor",
+                    symmetric: false,
+                }]
+            }
+            fn fold(
+                &self,
+                _vault: &Vault,
+                _merges: &MergeMap,
+                _as_of: NaiveDate,
+                _findings: &mut Vec<Finding>,
+            ) -> Box<dyn PackState> {
+                Box::new(TestState)
+            }
+            fn findings(
+                &self,
+                _vault: &Vault,
+                _state: &dyn PackState,
+                _as_of: NaiveDate,
+                _findings: &mut Vec<Finding>,
+            ) {
+            }
+            fn check_balance(
+                &self,
+                _vault: &Vault,
+                _state: &dyn PackState,
+                _sourced: &SourcedEntry,
+                _findings: &mut Vec<Finding>,
+            ) {
+            }
+        }
+        static CLASH: Clashing = Clashing;
+        let packs: Vec<&dyn Pack> = vec![&TEST_PACK, &CLASH];
+        let conflict = find_conflict(&packs).unwrap();
+        assert_eq!(conflict.kind, "edge kind");
+        assert_eq!(conflict.name, "mentor");
+        assert_eq!(conflict.first, "testpack@0.1");
+        assert_eq!(conflict.second, "clash@0.1");
+    }
+
+    #[test]
     fn orphan_owners_cover_disabled_packs_only() {
         let owners = orphan_owners(&registry(), &[&COACHING]);
         assert_eq!(owners.verbs.get("touch"), Some(&"testpack@0.1"));
         assert_eq!(owners.fields.get("birthday"), Some(&"testpack@0.1"));
-        assert_eq!(owners.record_types.get("edge"), Some(&"testpack@0.1"));
+        assert_eq!(owners.record_types.get("testtype"), Some(&"testpack@0.1"));
         assert_eq!(
             owners.balance_metrics.get("test_metric"),
             Some(&"testpack@0.1")
         );
+        assert_eq!(owners.edge_kinds.get("mentor"), Some(&"testpack@0.1"));
         assert!(!owners.verbs.contains_key("session"));
         let none = orphan_owners(&registry(), &[&COACHING, &TEST_PACK]);
         assert!(none.verbs.is_empty());
         assert!(none.fields.is_empty());
+        assert!(none.edge_kinds.is_empty());
     }
 }

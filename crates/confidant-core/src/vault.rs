@@ -13,7 +13,7 @@ use crate::record::{
     frontmatter_line_spec_key, has_conflict_markers, parse_record, Record, RecordKind,
 };
 
-const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes"];
+const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
 
 /// Per-file outcome of the read-path content hook (spec 4, issue #148).
 ///
@@ -400,6 +400,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
         "deals",
         "interactions",
         "notes",
+        "edges",
         "ledger",
         "keys",
         "README.md",
