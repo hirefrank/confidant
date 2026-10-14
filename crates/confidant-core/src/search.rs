@@ -446,9 +446,10 @@ fn still_cleared(
 
 /// True when `rec` is a note or interaction with no explicit `no-ai` flag of
 /// its own whose person (via `person:`, `people/<id>/` path parent, `with:`
-/// participant list, or a merge-group peer of any of those) has
-/// `no-ai: notes` (#181). Explicit `no-ai: false` on the child still
-/// overrides `notes` mode (`rec.no_ai_mode()` is `Some(NoAi::False)`).
+/// participant list, any other front-matter field holding the person's ID,
+/// or a merge-group peer of any of those) has `no-ai: notes` (#181, #270).
+/// Explicit `no-ai: false` on the child still overrides `notes` mode
+/// (`rec.no_ai_mode()` is `Some(NoAi::False)`).
 fn inherits_notes_no_ai(
     rec: &crate::record::Record,
     allow: &Allowlist<'_>,
@@ -496,6 +497,21 @@ fn inherits_notes_no_ai(
                 if with_ids.iter().any(person_has_notes_mode) {
                     return true;
                 }
+            }
+        }
+    }
+    // #270: any other front-matter field whose value parses as a record ID
+    // resolving to a notes-mode person (or a merge-group peer) also
+    // triggers inheritance. Fail-closed for a privacy feature: when in
+    // doubt, hide. Only values that parse as genuine record IDs via the
+    // same `parse_ref_id` used for `person:` count, and only when the
+    // referenced record is actually a person in `notes` mode — so free-text
+    // fields never trigger this. Explicit `no-ai: false` on the child still
+    // overrides (checked above).
+    for value in rec.fields.values() {
+        if let crate::record::FrontmatterRef::Id(id) = crate::record::parse_ref_id(value) {
+            if person_has_notes_mode(&id) {
+                return true;
             }
         }
     }

@@ -32,7 +32,12 @@ only). There are no field-level flags — the record is the unit.
 - **`no-ai: notes`** on a person keeps the person visible — name, birthday,
   cadence and other pack fields reach `find`, `context`, and MCP — while
   their notes and interactions default to hidden. Findings may name the
-  person and give dates, but never note bodies.
+  person and give dates, but never note bodies. The default is inherited
+  through any front-matter reference to the person, not just `person:`:
+  the folder path, `with:` participants, and any other field whose value
+  is the person's ID all count (#270). This is fail-closed on purpose —
+  a note that mentions a notes-mode person is hidden unless it carries an
+  explicit `no-ai: false`.
 - **Per-note `no-ai: true`** on an otherwise visible person already works:
   "any `true` wins", so the note is excluded from `find`/`allowlist`/
   `reindex` while the person stays visible. Use this for one-off sensitive

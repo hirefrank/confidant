@@ -805,6 +805,82 @@ fn notes_mode_person_envelope_carries_mode_and_note_defaults_hidden() {
 }
 
 #[test]
+fn encrypted_vault_inherits_notes_mode_via_non_person_field() {
+    // Issue #270: on an encrypted vault, `no-ai: notes` inheritance also
+    // follows any front-matter reference to the person.
+    //
+    // We verify via the allowlist directly: the test writes a top-level
+    // note (plaintext file, like the plaintext-vault test) into the
+    // encrypted vault. The note references a notes-mode person (whose
+    // `no-ai: notes` rides the encrypted outer header) only through a
+    // non-`person:` field, and must not be cleared.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    // Bob needs a client key too, so his notes-mode person record decrypts.
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+
+    // Bob: notes-mode person (mode on the encrypted outer header).
+    let bob = PERSON2;
+    let input = write_file(
+        h._tmp.path(),
+        "bob.md",
+        &format!(
+            "---\nid: {bob}\ntype: person\nname: \"Bob Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // Top-level note referencing Bob only via `related:`. Written directly
+    // (plaintext) like the plaintext-vault test; the allowlist operates on
+    // the parsed record regardless of envelope.
+    let note_id = "n-01J9Z3K4QF6000000000000000";
+    let note_dir = h.vault.join(format!("notes/{note_id}"));
+    std::fs::create_dir_all(&note_dir).unwrap();
+    std::fs::write(
+        note_dir.join("note.md"),
+        format!(
+            "---\nid: {note_id}\ntype: note\nrelated: {bob}\n---\nSecret detail xylophone272.\n"
+        ),
+    )
+    .unwrap();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&h.vault)
+        .args(["add", "-A"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&h.vault)
+        .args(["commit", "-qm", "top-level note"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // `find` on the note's token returns 0 hits: the note inherits hidden
+    // via the `related:` field.
+    let out = h
+        .cmd(&["find", "xylophone272", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 0, "{v}");
+}
+
+#[test]
 fn dry_run_shows_plaintext_never_ciphertext() {
     let h = Harness::new();
     h.keyed(PERSON);
