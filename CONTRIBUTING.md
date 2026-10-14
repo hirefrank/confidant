@@ -29,6 +29,13 @@ cargo deny check --all-features
 cargo audit
 ```
 
+Fuzz the untrusted-input parsers manually (not in CI; needs a nightly toolchain):
+
+```sh
+cd fuzz && cargo +nightly fuzz run ledger_line -- -max_len=4096 -rss_limit_mb=1024 -max_total_time=300
+cd fuzz && cargo +nightly fuzz run envelope_decode -- -max_len=65536 -rss_limit_mb=2048 -max_total_time=300
+```
+
 Regenerate golden check JSON after an intentional finding-message change:
 
 ```sh

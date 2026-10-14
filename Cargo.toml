@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# fuzz/ is its own cargo-fuzz workspace (see fuzz/Cargo.toml); keep
+# libfuzzer-sys/arbitrary out of the main dependency graph (MSRV/deny).
+exclude = ["fuzz"]
 members = [
     "crates/confidant-core",
     "crates/confidant-cli",

@@ -1,0 +1,32 @@
+[package]
+name = "confidant-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = "1"
+
+[dependencies.confidant-crypt]
+path = "../crates/confidant-crypt"
+[dependencies.confidant-core]
+path = "../crates/confidant-core"
+
+# Prevent this from interfering with workspaces
+[workspace]
+
+[[bin]]
+name = "ledger_line"
+path = "fuzz_targets/ledger_line.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
