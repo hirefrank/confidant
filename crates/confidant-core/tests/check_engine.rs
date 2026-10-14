@@ -4277,3 +4277,342 @@ fn orphan_coaching_metrics_warn_instead_of_unknown_metric() {
     );
     assert!(c.contains(&"E_UNKNOWN_METRIC".to_string()), "{c:?}");
 }
+
+// ---------------------------------------------------------------------------
+// #179: relationship edges, `with:` lists, touchpoints.
+// ---------------------------------------------------------------------------
+
+const EDGE1: &str = "e-01M3TC5H00MPJG00E100000000";
+const EDGE2: &str = "e-01M3TC5H00MPJG00E200000000";
+const EDGE3: &str = "e-01M3TC5H00MPJG00E300000000";
+const IXN2: &str = "i-01M3TC5H00MPJG00F100000000";
+
+fn edge(root: &Path, id: &str, a: &str, b: &str, kind: &str) {
+    write(
+        root,
+        &format!("edges/{id}/edge.md"),
+        &format!("---\nid: {id}\ntype: edge\na: {a}\nb: {b}\nkind: {kind}\n---\n"),
+    );
+}
+
+fn edge_with_body(root: &Path, id: &str, a: &str, b: &str, kind: &str) {
+    write(
+        root,
+        &format!("edges/{id}/edge.md"),
+        &format!("---\nid: {id}\ntype: edge\na: {a}\nb: {b}\nkind: {kind}\n---\n\nThis body must not be here.\n"),
+    );
+}
+
+fn interaction_with(root: &Path, id: &str, person: &str, date: &str, with: &str) {
+    write(
+        root,
+        &format!("interactions/{id}/interaction.md"),
+        &format!("---\nid: {id}\ntype: interaction\nname: Group dinner\ndate: {date}\nperson: {person}\nwith: {with}\n---\n\nFake group dinner.\n"),
+    );
+}
+
+fn two_people(dir: &Path) {
+    vault_toml(dir, DEFAULT_CHECKS);
+    person(dir, ADA, "Ada Example");
+    person(dir, BEA, "Bea Demo");
+}
+
+#[test]
+fn edge_valid_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_body_is_rejected() {
+    // #179 Q1.1: edges carry only ids, kind, and dates — no body.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge_with_body(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn edge_no_ai_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!(
+            "---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\nkind: married\nno-ai: true\n---\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn edge_self_edge_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, ADA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_SELF_EDGE"]);
+}
+
+#[test]
+fn edge_unknown_kind_is_rejected() {
+    // The kind list is closed: an unknown kind is an error, not free text.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "nemesis");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_UNKNOWN_EDGE_KIND"]);
+}
+
+#[test]
+fn edge_symmetric_reversed_duplicate_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    edge(dir.path(), EDGE2, BEA, ADA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"]);
+    // The finding names the second edge (the reversed duplicate).
+    assert_eq!(json["findings"][0]["id"], EDGE2);
+}
+
+#[test]
+fn edge_symmetric_exact_duplicate_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    edge(dir.path(), EDGE2, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"]);
+}
+
+#[test]
+fn edge_directed_reversed_is_not_a_duplicate() {
+    // `introduced` is directed: (A, B) and (B, A) are different relations.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "introduced");
+    edge(dir.path(), EDGE2, BEA, ADA, "introduced");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_same_pair_different_kinds_is_not_a_duplicate() {
+    // #179 review: two edges on the SAME pair with different kinds
+    // (married + colleague) are different relations, not duplicates.
+    // The pair key must include the kind.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    edge(dir.path(), EDGE2, ADA, BEA, "colleague");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_same_pair_same_kind_reversed_is_rejected() {
+    // Same pair, same kind, reversed ends: still a duplicate (control for
+    // the test above — the kind key must not mask real duplicates).
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, BEA, "colleague");
+    edge(dir.path(), EDGE2, BEA, ADA, "colleague");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"]);
+}
+
+#[test]
+fn edge_dangling_end_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, GHOST, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DANGLING_REF"]);
+}
+
+#[test]
+fn edge_missing_end_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nkind: married\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn edge_missing_kind_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn edge_wrong_type_end_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    edge(dir.path(), EDGE1, ADA, ORG, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"]);
+}
+
+#[test]
+fn edge_bad_since_date_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\nkind: married\nsince: 2026-13-01\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn with_list_valid_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    interaction_with(
+        dir.path(),
+        IXN2,
+        ADA,
+        "2026-10-06",
+        &format!("[{BEA}, {CAM}]"),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn with_list_self_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(dir.path(), IXN2, ADA, "2026-10-06", &format!("[{ADA}]"));
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn with_list_duplicate_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(
+        dir.path(),
+        IXN2,
+        ADA,
+        "2026-10-06",
+        &format!("[{BEA}, {BEA}]"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn with_list_dangling_is_rejected() {
+    // Existence is a keyed check: it runs on records check can read.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(dir.path(), IXN2, ADA, "2026-10-06", &format!("[{GHOST}]"));
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DANGLING_REF"]);
+}
+
+#[test]
+fn with_list_wrong_type_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(dir.path(), IXN2, ADA, "2026-10-06", &format!("[{ORG}]"));
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"]);
+}
+
+#[test]
+fn with_list_malformed_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(dir.path(), IXN2, ADA, "2026-10-06", BEA);
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"]);
+}
+
+#[test]
+fn with_list_empty_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    interaction_with(dir.path(), IXN2, ADA, "2026-10-06", "[]");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn touch_line_shape_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    // Minimal: date + verb + own id only. With an optional kind:.
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-06 touch {BEA}\n2026-10-07 touch {BEA} kind:call\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn touch_line_with_extra_arg_is_rejected() {
+    // Q3: no other participant ids, no primary id, no interaction id.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-06 touch {BEA} {ADA}\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_TOUCH_MALFORMED"]);
+}
+
+#[test]
+fn touch_line_on_non_person_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-06 touch {ORG}\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"]);
+}
+
+#[test]
+fn edge_with_three_people_is_independent() {
+    // A third edge (Cam–Ada, colleague) alongside a married edge: no
+    // cross-kind duplicate, no interference.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    edge(dir.path(), EDGE2, CAM, ADA, "colleague");
+    edge(dir.path(), EDGE3, BEA, CAM, "introduced");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}

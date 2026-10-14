@@ -469,6 +469,7 @@ fn test8_shredding() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap();
 
@@ -624,6 +625,7 @@ fn shred_records_recovery_recipients_and_forbids_their_reuse() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap();
     let new_recovery = outcome.new_recovery().age_identity().to_recipient_string();
@@ -707,6 +709,7 @@ fn test_shred_destroy_list_covers_history() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap();
     // phone was revoked before the shred but must still be named: its old
@@ -1747,6 +1750,7 @@ fn test_shred_client_preserves_shared() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap();
 
@@ -1801,6 +1805,7 @@ fn test_shred_refuses_reserved_lookup_id() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap_err();
     assert!(
@@ -1837,6 +1842,7 @@ fn test_shred_refuses_reserved_shared_id() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap_err();
     assert!(
@@ -1893,6 +1899,7 @@ fn test_shred_omitting_shared_errors_before_mutation() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap_err();
     assert!(
@@ -1931,6 +1938,7 @@ fn test_shred_repin_anchor_before_next_key_op() {
             &f.operator_sk,
             &f.anchor,
             &f.device_id,
+            0,
         )
         .unwrap();
     let new_recovery = outcome.new_recovery();
@@ -2046,6 +2054,7 @@ fn test_shred_refuses_planted_lookup_age() {
         &f.operator_sk,
         &f.anchor,
         &f.device_id,
+        0,
     ) {
         Err(Error::Manifest(_)) => {}
         Err(e) => panic!("expected Manifest error, got: {e:?}"),
@@ -2195,7 +2204,8 @@ fn shred_rejects_unsafe_client_ids() {
             &new_recipients,
             &f.operator_sk,
             &f.anchor,
-            &f.device_id
+            &f.device_id,
+            0,
         )
         .is_err());
     // A bad id in all_clients is refused too.
@@ -2207,7 +2217,8 @@ fn shred_rejects_unsafe_client_ids() {
             &new_recipients,
             &f.operator_sk,
             &f.anchor,
-            &f.device_id
+            &f.device_id,
+            0,
         )
         .is_err());
     // The client's key tree is untouched.

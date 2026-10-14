@@ -451,6 +451,15 @@ expires = "2026-11-08"
   Shredding cannot reach any of these. (The exception is this device's
   search index — `keys shred` deletes `.confidant/qmd-corpus/` and the QMD
   store locally.)
+- **Edges (issue #179)**: edge records live under the shared key
+  (`vault:shared`), so destroying one person's client key cannot shred
+  them. `keys shred` deletes every edge file naming the shredded person
+  from the working tree in the same signed commit, and states in its
+  output: "Edges that named this person were deleted from the working
+  tree, but earlier versions in git history remain readable with the
+  shared key." Earlier git versions stay readable to anyone holding the
+  shared key — this is the honest limit of shared-plus-delete, not a
+  history rewrite.
 
 ## 8a. Inbox key (issue #36)
 

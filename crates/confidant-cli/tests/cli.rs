@@ -471,3 +471,63 @@ fn allowlist_scoped_annotates_owners() {
         .unwrap();
     assert_eq!(alias["owning_packs"], serde_json::json!(["core"]));
 }
+
+#[test]
+fn find_edge_scoping_follows_kind() {
+    // #179: an edge is visible exactly when its kind's pack is in scope.
+    // A core-kind edge (married) is core-owned: visible to every scope.
+    // An unknown-kind edge is unattributed: visible only unscoped.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"x\"\n",
+    )
+    .unwrap();
+    let ada = "p-01M3TC5H00MPJG000000000000";
+    let bea = "p-01M3TC5H00MPJG000H24000001";
+    for (id, name) in [(ada, "Ada Example"), (bea, "Bea Demo")] {
+        let d = dir.path().join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    let married = "e-01M3TC5H00MPJG00E100000000";
+    let nemesis = "e-01M3TC5H00MPJG00E200000000";
+    for (id, kind) in [(married, "married"), (nemesis, "nemesis")] {
+        let d = dir.path().join(format!("edges/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("edge.md"),
+            format!("---\nid: {id}\ntype: edge\na: {ada}\nb: {bea}\nkind: {kind}\n---\n"),
+        )
+        .unwrap();
+    }
+    let find = |needle: &str, packs: Option<&str>| {
+        let mut cmd = Command::new(bin());
+        cmd.args(["find", needle, "--json", "--vault"])
+            .arg(dir.path());
+        if let Some(p) = packs {
+            cmd.args(["--packs", p]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "stderr {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    // Core kind: visible unscoped and under a coaching scope.
+    let v = find("married", None);
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    let v = find("married", Some(COACHING));
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    // Unknown kind: visible unscoped, hidden when scoped (fail closed).
+    let v = find("nemesis", None);
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+    let v = find("nemesis", Some(COACHING));
+    assert_eq!(v["matches"], serde_json::json!([]));
+}

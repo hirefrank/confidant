@@ -38,6 +38,7 @@ pub enum Prefix {
     Deal,
     Interaction,
     Note,
+    Edge,
     Package,
 }
 
@@ -49,6 +50,7 @@ impl Prefix {
             Self::Deal => "d",
             Self::Interaction => "i",
             Self::Note => "n",
+            Self::Edge => "e",
             Self::Package => "pkg",
         }
     }
@@ -60,6 +62,7 @@ impl Prefix {
             Self::Deal => Some("deal"),
             Self::Interaction => Some("interaction"),
             Self::Note => Some("note"),
+            Self::Edge => Some("edge"),
             Self::Package => None,
         }
     }
@@ -71,6 +74,7 @@ impl Prefix {
             Self::Deal => Some("deals"),
             Self::Interaction => Some("interactions"),
             Self::Note => Some("notes"),
+            Self::Edge => Some("edges"),
             Self::Package => None,
         }
     }
@@ -82,6 +86,7 @@ impl Prefix {
             Self::Deal => Some("deal.md"),
             Self::Interaction => Some("interaction.md"),
             Self::Note => Some("note.md"),
+            Self::Edge => Some("edge.md"),
             Self::Package => None,
         }
     }
@@ -93,6 +98,7 @@ impl Prefix {
             "d" => Some(Self::Deal),
             "i" => Some(Self::Interaction),
             "n" => Some(Self::Note),
+            "e" => Some(Self::Edge),
             "pkg" => Some(Self::Package),
             _ => None,
         }
@@ -105,6 +111,7 @@ impl Prefix {
             "deals" => Some(Self::Deal),
             "interactions" => Some(Self::Interaction),
             "notes" => Some(Self::Note),
+            "edges" => Some(Self::Edge),
             _ => None,
         }
     }
@@ -116,6 +123,7 @@ impl Prefix {
             "deal" => Some(Self::Deal),
             "interaction" => Some(Self::Interaction),
             "note" => Some(Self::Note),
+            "edge" => Some(Self::Edge),
             _ => None,
         }
     }
@@ -439,7 +447,7 @@ fn map_soft_hyphen_after_prefix(s: &str) -> Cow<'_, str> {
 }
 
 fn prefix_len_before_soft_hyphen(s: &str) -> Option<usize> {
-    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
+    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n", "e"];
     for pref in PREFIXES {
         let plen = pref.len();
         let Some(head) = s.get(..plen) else {
@@ -504,7 +512,7 @@ pub(crate) fn strip_ignorable(s: &str) -> Cow<'_, str> {
 fn starts_id_prefix(s: &str) -> bool {
     matches!(
         s.as_bytes().first(),
-        Some(b'p' | b'P' | b'o' | b'O' | b'd' | b'D' | b'i' | b'I' | b'n' | b'N')
+        Some(b'p' | b'P' | b'o' | b'O' | b'd' | b'D' | b'i' | b'I' | b'n' | b'N' | b'e' | b'E')
     )
 }
 
@@ -594,7 +602,7 @@ pub fn scan_ids(text: &str) -> Vec<RecordId> {
 }
 
 fn match_id_token_at(s: &str, glued: bool) -> Option<(IdToken, usize)> {
-    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n"];
+    const PREFIXES: &[&str] = &["pkg", "p", "o", "d", "i", "n", "e"];
     for pref in PREFIXES {
         let plen = pref.len();
         let Some(head) = s.get(..plen) else {
