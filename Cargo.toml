@@ -28,7 +28,7 @@ anyhow = "1.0"
 base64 = "0.23"
 bech32 = "0.12"
 bip39 = { version = "3.0", default-features = false, features = ["std", "rand", "zeroize"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 confidant-core = { path = "crates/confidant-core", version = "0.2.0" }
