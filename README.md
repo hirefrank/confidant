@@ -244,6 +244,19 @@ than one is `E_SESSION_TAGS`. A merge between different record types is
 confidant check --json --fail-on warning --as-of 2026-10-08
 ```
 
+## TUI (preview)
+
+`confidant-tui` (`crates/confidant-tui`, workspace-only until
+[#218](https://github.com/hirefrank/confidant/issues/218)) is a read-only
+terminal UI for `check`, `find`, `context`, and `doctor`. It consumes only
+the ADR-7 CLI JSON contract (`confidant <subcommand> --json --no-input`),
+never opens vault files directly, and keeps plaintext on the alternate
+screen only.
+
+```sh
+cargo run -p confidant-tui -- --vault examples/demo-vault
+```
+
 ## Where we're going
 
 The roadmap is tracked as open issues on GitHub. The big themes:

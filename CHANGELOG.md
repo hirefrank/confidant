@@ -8,6 +8,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- Read-only TUI (`crates/confidant-tui`, binary `confidant-tui`, workspace-only
+  preview) with `Check`, `Find`, `Context`, and `Doctor` views consuming only
+  the ADR-7 CLI `--json --no-input` contract (#210, part of #205).
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
