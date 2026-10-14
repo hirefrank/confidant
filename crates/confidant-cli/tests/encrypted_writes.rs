@@ -805,6 +805,131 @@ fn notes_mode_person_envelope_carries_mode_and_note_defaults_hidden() {
 }
 
 #[test]
+fn encrypted_vault_inherits_notes_mode_via_non_person_field() {
+    // Issue #270: on an encrypted vault, `no-ai: notes` inheritance also
+    // follows any front-matter reference to the person — and it has to be
+    // stamped into the envelope's outer `no-ai` header at write time,
+    // because `find`/`context` never see the decrypted `with:` field.
+    //
+    // The interaction goes through the real `record add` encrypted write
+    // path (`record add` does not create notes; `note add` takes no extra
+    // fields — but both funnel through the same stamp code): `person:` is
+    // a visible person, `with:` names the notes-mode person. Without the
+    // stamp-time fix the outer header reads `no-ai: false` and the
+    // interaction leaks; with it the interaction is hidden from both
+    // `find` and `context`.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    // Bob needs a client key too, so his notes-mode person record decrypts.
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    // Ada: visible person. Her profile must exist: stamp time fails
+    // closed (#181) when the `person:` target has no readable profile.
+    let input = write_file(
+        h._tmp.path(),
+        "ada.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    // Carol: second visible person, for the control interaction's `with:`.
+    let carol = "p-01J9Z3K4QH0000000000000000";
+    let out = h.init_client(carol);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    let input = write_file(
+        h._tmp.path(),
+        "carol.md",
+        &format!("---\nid: {carol}\ntype: person\nname: \"Carol Example\"\n---\n\nBio.\n"),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // Bob: notes-mode person (mode on the encrypted outer header).
+    let bob = PERSON2;
+    let input = write_file(
+        h._tmp.path(),
+        "bob.md",
+        &format!(
+            "---\nid: {bob}\ntype: person\nname: \"Bob Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // Interaction filed under visible Ada, with notes-mode Bob as the
+    // only participant. Really encrypted via `record add`.
+    let ixn_id = "i-01J9Z3K4QF6000000000000000";
+    let input = write_file(
+        h._tmp.path(),
+        "ixn.md",
+        &format!(
+            "---\nid: {ixn_id}\ntype: interaction\nname: Coffee\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{bob}]\n---\n\nSecret detail xylophone272.\n"
+        ),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // The outer envelope header carries the inherited hidden flag.
+    let path = h
+        .vault
+        .join(format!("interactions/{ixn_id}/interaction.md"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("\nno-ai: true\n"),
+        "outer header must stamp the inherited hidden flag:\n{text}"
+    );
+
+    // Control interaction: same shape, but `with:` names visible Carol, so
+    // it must stay visible (no over-hiding).
+    let ixn2_id = "i-01J9Z3K4QF7000000000000000";
+    let input = write_file(
+        h._tmp.path(),
+        "ixn2.md",
+        &format!(
+            "---\nid: {ixn2_id}\ntype: interaction\nname: Coffee\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{carol}]\n---\n\nVisible detail xylophone273.\n"
+        ),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // `find` on the hidden interaction's token returns 0 hits.
+    let out = h
+        .cmd(&["find", "xylophone272", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 0, "{v}");
+
+    // `find` on the control interaction's token returns 1 hit.
+    let out = h
+        .cmd(&["find", "xylophone273", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["matches"].as_array().unwrap().len(), 1, "{v}");
+
+    // `context` for Ada never carries the hidden interaction's body, but
+    // does carry the control interaction.
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "context failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let text = serde_json::to_string(&v).unwrap();
+    assert!(
+        !text.contains("xylophone272"),
+        "hidden interaction leaked into context: {v}"
+    );
+    assert!(
+        text.contains("xylophone273"),
+        "control interaction missing from context: {v}"
+    );
+}
+
+#[test]
 fn dry_run_shows_plaintext_never_ciphertext() {
     let h = Harness::new();
     h.keyed(PERSON);

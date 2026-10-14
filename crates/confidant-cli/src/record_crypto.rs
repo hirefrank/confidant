@@ -134,13 +134,16 @@ impl RecordEncryptor {
         })?;
         let record_type = rec.kind.as_str();
         let person = rec.field("person");
-        // #181: tri-state no-ai stamping. The record's own explicit flag
-        // wins; otherwise the person's mode supplies the default.
+        // #181/#270: tri-state no-ai stamping. The record's own explicit
+        // flag wins; otherwise the inherited default comes from every
+        // person the front matter references — `person:`, `with:`, or any
+        // other ID-valued (or ID-list) field. This must happen here: the
+        // outer envelope header is all `find`/`context` ever see on an
+        // encrypted record, so the read path's `inherits_notes_no_ai`
+        // never sees the decrypted `related:`/`with:` fields.
         let own_mode = rec.no_ai_mode();
-        let person_mode: envelope::NoAi = person
-            .map(|p| person_no_ai_mode(&self.root, p))
-            .unwrap_or(envelope::NoAi::False);
-        let outer_no_ai = stamp_no_ai(record_type, own_mode, person_mode);
+        let inherited = inherited_no_ai_mode(&self.root, &rec);
+        let outer_no_ai = stamp_no_ai(record_type, own_mode, inherited);
         // Route to the client key. A person record encrypts under its own
         // id (it has no `person` field); notes, interactions, and deals
         // with a person use the `person` field.
@@ -353,6 +356,72 @@ fn person_no_ai_mode(root: &Path, person: &str) -> envelope::NoAi {
     envelope::NoAi::True
 }
 
+/// #270: the `no-ai` default a record inherits from the people its front
+/// matter references, for stamping the encrypted envelope's outer header.
+///
+/// The `person:` field keeps the #181 fail-closed lookup (a missing
+/// profile hides). Any other field whose value is a record ID — or a
+/// bracketed ID list like `with:`/`related:` — contributes `Notes` when it
+/// resolves to an actual notes-mode person profile, and is ignored
+/// otherwise: non-person IDs and dangling references never hide, mirroring
+/// the read path's `inherits_notes_no_ai`. `True` is inherited only through
+/// `person:`, matching `compute_cleared`'s taint filter, so a plaintext
+/// vault and an encrypted vault clear the same records.
+///
+/// Merge-group peers are read-path only: stamp time sees the vault root,
+/// not the merge components.
+fn inherited_no_ai_mode(root: &Path, rec: &confidant_core::record::Record) -> envelope::NoAi {
+    use confidant_core::record::{parse_ref_id, parse_with_list, FrontmatterRef};
+    use envelope::NoAi::{False, Notes, True};
+    if let Some(person) = rec.field("person") {
+        match person_no_ai_mode(root, person) {
+            True => return True,
+            Notes => return Notes,
+            False => {}
+        }
+    }
+    let notes_ref = rec.fields.iter().any(|(key, value)| {
+        if key == "person" || key == "no-ai" {
+            return false;
+        }
+        match parse_ref_id(value) {
+            FrontmatterRef::Id(id) => referenced_person_mode(root, &id) == Some(Notes),
+            _ => parse_with_list(value).is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| referenced_person_mode(root, id) == Some(Notes))
+            }),
+        }
+    });
+    if notes_ref {
+        Notes
+    } else {
+        False
+    }
+}
+
+/// `no-ai` mode of the person record `id`, or `None` when no person
+/// profile exists for `id` — the reference points at a non-person record
+/// or a dangling ID, and is ignored. A profile that exists but is
+/// unreadable fails closed to `True` (#181).
+fn referenced_person_mode(
+    root: &Path,
+    id: &confidant_core::id::RecordId,
+) -> Option<envelope::NoAi> {
+    let id = id.to_string();
+    let bytes = [format!("people/{id}/profile.md"), format!("people/{id}.md")]
+        .into_iter()
+        .find_map(|candidate| std::fs::read(root.join(candidate)).ok())?;
+    if let Ok(env) = envelope::parse(&bytes) {
+        return Some(env.no_ai);
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if let Ok(rec) = confidant_core::record::parse_record(text, "profile.md") {
+            return Some(rec.no_ai_mode().unwrap_or(envelope::NoAi::False));
+        }
+    }
+    Some(envelope::NoAi::True)
+}
+
 /// B3 stability decision for one existing file. `decrypt` maps envelope
 /// bytes to inner plaintext. Returns:
 /// - `Reuse`: existing is an envelope decrypting to exactly `plaintext`
@@ -413,6 +482,71 @@ mod tests {
         assert_eq!(stamp_no_ai("deal", None, Notes), False);
         assert_eq!(stamp_no_ai("deal", None, True), True);
         assert_eq!(stamp_no_ai("deal", None, False), False);
+    }
+
+    #[test]
+    fn inherited_no_ai_mode_follows_any_person_reference() {
+        // #270: stamp-time inheritance covers `person:`, `with:`, and any
+        // other ID-valued or ID-list field — but only references that
+        // resolve to an actual person profile.
+        use confidant_core::record::parse_record;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ada = "p-01J9Z3K4QG1000000000000000"; // notes mode
+        let bob = "p-01J9Z3K4QG2000000000000000"; // visible
+        for (id, mode) in [(ada, "no-ai: notes\n"), (bob, "")] {
+            let dir = root.join(format!("people/{id}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("profile.md"),
+                format!("---\nid: {id}\ntype: person\nname: X\n{mode}---\nBio.\n"),
+            )
+            .unwrap();
+        }
+        let note = |fm: &str| {
+            parse_record(
+                &format!("---\nid: n-01J9Z3K4QF1000000000000000\ntype: note\n{fm}---\nBody.\n"),
+                "note.md",
+            )
+            .unwrap()
+        };
+        // `person:` keeps the #181 behavior.
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("person: {ada}\n"))),
+            Notes
+        );
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("person: {bob}\n"))),
+            False
+        );
+        // Any other single-ID field counts.
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("related: {ada}\n"))),
+            Notes
+        );
+        // Bracketed ID lists count, on notes as well as interactions.
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("related: [{bob}, {ada}]\n"))),
+            Notes
+        );
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("with: [{ada}]\n"))),
+            Notes
+        );
+        // Non-person IDs and dangling references never hide.
+        assert_eq!(
+            inherited_no_ai_mode(root, &note("related: d-01J9Z3K4QD1000000000000000\n")),
+            False
+        );
+        assert_eq!(
+            inherited_no_ai_mode(root, &note("related: p-01J9Z3K4QG9000000000000000\n")),
+            False
+        );
+        // A visible `person:` plus a notes-mode `related:` still hides.
+        assert_eq!(
+            inherited_no_ai_mode(root, &note(&format!("person: {bob}\nrelated: {ada}\n"))),
+            Notes
+        );
     }
 
     fn envelope_bytes() -> Vec<u8> {

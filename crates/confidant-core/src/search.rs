@@ -13,7 +13,7 @@ use crate::id::{
 };
 use crate::ledger::ledger_line_verb;
 use crate::packs::{resolve_enabled, ALL_PACKS};
-use crate::record::{parse_ref_id, unquote, FrontmatterRef, RecordKind};
+use crate::record::{parse_ref_id, parse_with_list, unquote, FrontmatterRef, RecordKind};
 use crate::scope::{
     note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
 };
@@ -446,9 +446,10 @@ fn still_cleared(
 
 /// True when `rec` is a note or interaction with no explicit `no-ai` flag of
 /// its own whose person (via `person:`, `people/<id>/` path parent, `with:`
-/// participant list, or a merge-group peer of any of those) has
-/// `no-ai: notes` (#181). Explicit `no-ai: false` on the child still
-/// overrides `notes` mode (`rec.no_ai_mode()` is `Some(NoAi::False)`).
+/// participant list, any other front-matter field holding the person's ID
+/// or a list of IDs containing it, or a merge-group peer of any of those)
+/// has `no-ai: notes` (#181, #270). Explicit `no-ai: false` on the child
+/// still overrides `notes` mode (`rec.no_ai_mode()` is `Some(NoAi::False)`).
 fn inherits_notes_no_ai(
     rec: &crate::record::Record,
     allow: &Allowlist<'_>,
@@ -490,10 +491,28 @@ fn inherits_notes_no_ai(
             }
         }
     }
-    if rec.kind == RecordKind::Interaction {
-        if let Some(raw_with) = rec.field("with") {
-            if let Some(with_ids) = crate::record::parse_with_list(raw_with) {
-                if with_ids.iter().any(person_has_notes_mode) {
+    // #270: any other front-matter field whose value parses as a record ID
+    // — or a bracketed list of IDs, as in `with:` — resolving to a
+    // notes-mode person (or a merge-group peer) also triggers inheritance.
+    // This covers `with:` on notes as well as interactions (no kind gate).
+    // Fail-closed for a privacy feature: when in doubt, hide. Only values
+    // that parse as genuine record IDs via the same `parse_ref_id` /
+    // `parse_with_list` used for `person:` / `with:` count, and only when
+    // a referenced record is actually a person in `notes` mode — so
+    // free-text fields never trigger this. Explicit `no-ai: false` on the
+    // child still overrides (checked above).
+    for (key, value) in &rec.fields {
+        if key == "person" {
+            continue; // handled above
+        }
+        match parse_ref_id(value) {
+            FrontmatterRef::Id(id) => {
+                if person_has_notes_mode(&id) {
+                    return true;
+                }
+            }
+            _ => {
+                if parse_with_list(value).is_some_and(|ids| ids.iter().any(person_has_notes_mode)) {
                     return true;
                 }
             }

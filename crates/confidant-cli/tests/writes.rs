@@ -1377,6 +1377,181 @@ fn plaintext_vault_note_add_under_notes_mode_person_is_hidden_from_find_and_cont
 }
 
 #[test]
+fn plaintext_vault_note_inherits_notes_mode_via_non_person_field() {
+    // Issue #270: `no-ai: notes` inheritance follows ANY front-matter
+    // reference to the person, not just `person:` or the folder path.
+    // A top-level note (not under people/<id>/) that references a
+    // notes-mode person only through another ID field is hidden from
+    // `find`.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Switch Ada to `no-ai: notes`.
+    let profile = root.join(format!("people/{PERSON}/profile.md"));
+    std::fs::write(
+        &profile,
+        format!(
+            "---\nid: {PERSON}\ntype: person\nname: Ada Example\nno-ai: notes\n---\nAda profile body.\n"
+        ),
+    )
+    .unwrap();
+
+    // Control: Bob stays visible.
+    let bob = "p-01J9Z3K4QG0000000000000000";
+    let bob_dir = root.join(format!("people/{bob}"));
+    std::fs::create_dir_all(&bob_dir).unwrap();
+    std::fs::write(
+        bob_dir.join("profile.md"),
+        format!("---\nid: {bob}\ntype: person\nname: \"Bob Example\"\n---\nBob bio.\n"),
+    )
+    .unwrap();
+
+    // Top-level note referencing Ada (notes mode) only via `related:`.
+    let note_id = "n-01J9Z3K4QF2000000000000000";
+    let note_dir = root.join(format!("notes/{note_id}"));
+    std::fs::create_dir_all(&note_dir).unwrap();
+    std::fs::write(
+        note_dir.join("note.md"),
+        format!(
+            "---\nid: {note_id}\ntype: note\nrelated: {PERSON}\n---\nSecret detail xylophone270.\n"
+        ),
+    )
+    .unwrap();
+
+    // Control note referencing Bob (visible) via the same field.
+    let note2_id = "n-01J9Z3K4QF3000000000000000";
+    let note2_dir = root.join(format!("notes/{note2_id}"));
+    std::fs::create_dir_all(&note2_dir).unwrap();
+    std::fs::write(
+        note2_dir.join("note.md"),
+        format!(
+            "---\nid: {note2_id}\ntype: note\nrelated: {bob}\n---\nVisible detail xylophone271.\n"
+        ),
+    )
+    .unwrap();
+
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["commit", "-qm", "notes-mode person + top-level notes"],
+    );
+
+    // `find` on the hidden note's token returns 0 hits.
+    let (ok, found) = run_json(&[
+        "find",
+        "xylophone270",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 0, "{found}");
+
+    // `find` on the control note's token returns 1 hit.
+    let (ok, found) = run_json(&[
+        "find",
+        "xylophone271",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+}
+
+#[test]
+fn plaintext_vault_note_inherits_notes_mode_via_id_list_field() {
+    // Issue #270 follow-up: list-valued fields fail open without
+    // `parse_with_list`. A note whose `related:` is a bracketed list
+    // containing a notes-mode person is hidden; `with:` on a note (not
+    // just an interaction) counts too. A list of only visible people
+    // stays visible.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Switch Ada to `no-ai: notes`.
+    let profile = root.join(format!("people/{PERSON}/profile.md"));
+    std::fs::write(
+        &profile,
+        format!(
+            "---\nid: {PERSON}\ntype: person\nname: Ada Example\nno-ai: notes\n---\nAda profile body.\n"
+        ),
+    )
+    .unwrap();
+
+    // Control: Bob stays visible.
+    let bob = "p-01J9Z3K4QG0000000000000000";
+    let bob_dir = root.join(format!("people/{bob}"));
+    std::fs::create_dir_all(&bob_dir).unwrap();
+    std::fs::write(
+        bob_dir.join("profile.md"),
+        format!("---\nid: {bob}\ntype: person\nname: \"Bob Example\"\n---\nBob bio.\n"),
+    )
+    .unwrap();
+
+    // Note with a flow-list `related:` containing the notes-mode person.
+    let note_id = "n-01J9Z3K4QF4000000000000000";
+    let note_dir = root.join(format!("notes/{note_id}"));
+    std::fs::create_dir_all(&note_dir).unwrap();
+    std::fs::write(
+        note_dir.join("note.md"),
+        format!(
+            "---\nid: {note_id}\ntype: note\nrelated: [{bob}, {PERSON}]\n---\nSecret detail xylophone274.\n"
+        ),
+    )
+    .unwrap();
+
+    // Note with `with:` (participant list) on a note, not an interaction.
+    let note2_id = "n-01J9Z3K4QF5000000000000000";
+    let note2_dir = root.join(format!("notes/{note2_id}"));
+    std::fs::create_dir_all(&note2_dir).unwrap();
+    std::fs::write(
+        note2_dir.join("note.md"),
+        format!(
+            "---\nid: {note2_id}\ntype: note\nwith: [{PERSON}]\n---\nSecret detail xylophone275.\n"
+        ),
+    )
+    .unwrap();
+
+    // Control note: flow list of only visible people stays visible.
+    let note3_id = "n-01J9Z3K4QF6000000000000000";
+    let note3_dir = root.join(format!("notes/{note3_id}"));
+    std::fs::create_dir_all(&note3_dir).unwrap();
+    std::fs::write(
+        note3_dir.join("note.md"),
+        format!(
+            "---\nid: {note3_id}\ntype: note\nrelated: [{bob}]\n---\nVisible detail xylophone276.\n"
+        ),
+    )
+    .unwrap();
+
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["commit", "-qm", "notes-mode person + list-reference notes"],
+    );
+
+    for token in ["xylophone274", "xylophone275"] {
+        let (ok, found) = run_json(&["find", token, "--json", "--no-input", "--vault", &vroot]);
+        assert!(ok, "{found}");
+        assert_eq!(found["matches"].as_array().unwrap().len(), 0, "{found}");
+    }
+
+    let (ok, found) = run_json(&[
+        "find",
+        "xylophone276",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{found}");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+}
+
+#[test]
 fn log_touch_requires_personal_pack() {
     let dir = make_vault();
     let root = dir.path();
