@@ -223,7 +223,7 @@ pub(crate) fn canonical_ref_key(key: &str) -> Option<&'static str> {
 /// return `None` so callers can name the line without echoing it.
 /// Result of parsing a `person` / `org` / `deal` front-matter value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FrontmatterRef {
+pub enum FrontmatterRef {
     /// Missing, empty, YAML `~`, or YAML `null`.
     Absent,
     Id(RecordId),
@@ -235,7 +235,7 @@ pub(crate) enum FrontmatterRef {
 /// introduced by one or more spaces or tabs then `#` (including after a
 /// closing quote), and `[[id|Alias]]` only inside `[[…]]`. Empty, `~`, and
 /// YAML `null` are [`FrontmatterRef::Absent`].
-pub(crate) fn parse_ref_id(raw: &str) -> FrontmatterRef {
+pub fn parse_ref_id(raw: &str) -> FrontmatterRef {
     let stripped = strip_ignorable(raw);
     let trimmed = strip_comment_after_quoted(stripped.trim());
     let unquoted = unquote(trimmed.trim());
