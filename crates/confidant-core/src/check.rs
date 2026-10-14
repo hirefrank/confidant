@@ -565,12 +565,19 @@ fn check_verbs_and_refs(
         // an association. It carries at most one `kind:` pair and nothing
         // else — no other participant ids, no primary id, no interaction
         // id. Anything else is E_TOUCH_MALFORMED.
+        //
+        // Validation lives on the pack that owns the verb (#185/#296):
+        // when the owning pack is enabled it validates the args; when it
+        // is disabled, core applies the mirrored shape above and asks the
+        // registered pack whether a non-mirrored line is the pack's shape
+        // (`W_PACK_ORPHAN`) or malformed (`E_TOUCH_MALFORMED`).
         if e.verb == "touch" {
-            let personal_enabled = enabled_packs
+            if let Some(owner) = enabled_packs
                 .iter()
-                .any(|p| p.name() == crate::config::PERSONAL_PACK);
-            if personal_enabled {
-                if !crate::packs::personal::validate_touch_args_enabled(&e.args) {
+                .find(|p| p.verbs().contains(&e.verb.as_str()))
+            {
+                let valid = owner.validate_verb_args(&e.verb, e).unwrap_or(true);
+                if !valid {
                     findings.push(
                         Finding::new(
                             FindingCode::TouchMalformed,
@@ -590,7 +597,11 @@ fn check_verbs_and_refs(
                     _ => false,
                 };
                 if !mirrored_ok {
-                    if crate::packs::personal::is_personal_touch_shape(e) {
+                    let pack_shape = ALL_PACKS
+                        .iter()
+                        .find(|p| p.verbs().contains(&e.verb.as_str()))
+                        .and_then(|p| p.validate_verb_args(&e.verb, e));
+                    if pack_shape == Some(true) {
                         findings.push(
                             Finding::new(
                                 FindingCode::PackOrphan,
