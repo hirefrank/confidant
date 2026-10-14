@@ -5471,6 +5471,17 @@ fn staged_keys_mutation<T>(
 
     // Pre-commit check before the swap, so a failing check also leaves
     // keys/ untouched.
+    //
+    // #209: this check runs against the pre-loaded `vault`, which reflects
+    // the LIVE keys/ tree, not the staged copy. That is correct today
+    // because `check` reads keys/ only for crypto-mode detection — whether
+    // keys/ *exists* (`crypto_mode::is_structurally_encrypted`), which a
+    // staged swap never changes (it replaces keys/ contents, not its
+    // presence). If `check` ever starts reading the *contents* of keys/
+    // (manifests, the seq tracker, wrapping files), it must be re-pointed
+    // at the staged tree here so a bad staged tree fails the check before
+    // the swap. Do not "fix" this today by making `check` read the stage:
+    // there is nothing for it to read there yet.
     let pre = check_vault(vault, &CheckOptions::default());
     if !pre.ok {
         remove_path_best_effort(&stage);
