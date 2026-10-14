@@ -15,7 +15,7 @@ mod record_crypto;
 mod record_decrypt;
 mod setup;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -5711,12 +5711,22 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
 /// interactions rewritten.
 ///
 /// Mirrors [`delete_edges_naming`]: discovery decrypts with the pre-shred
-/// device key, and any undecryptable / tampered / unparseable interaction
-/// fails closed before shred touches a key. The rewritten envelopes stage
-/// into the same signed shred commit (their paths are already tracked).
+/// device key, and a tampered / unparseable / genuinely-undecryptable
+/// interaction fails closed before shred touches a key. The rewritten
+/// envelopes stage into the same signed shred commit (their paths are
+/// already tracked).
+///
+/// An interaction envelope that is `Skipped` (this device can't unwrap its
+/// data key) is treated one of two ways: if its primary is still a live
+/// client, that is a real failure and shred refuses; if the primary was
+/// shredded earlier, its `with:` list is unreachable and nothing is lost by
+/// skipping it (the history-residue warning already covers it). This keeps a
+/// later shred from being blocked by a previous shred's leftovers (#259's
+/// edge fix, applied to interactions).
 fn strip_participant_from_interactions(
     root: &Path,
     client_id: &str,
+    live_clients: &HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
     // Keyed load: decrypts interaction envelopes via the current device key.
     let probe = load_vault(root)?;
@@ -5748,13 +5758,29 @@ fn strip_participant_from_interactions(
     });
     let vault =
         confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
+    // A `Skipped` interaction whose primary is still live is a real failure:
+    // this device should be able to decrypt every live client (the strand
+    // check below enforces it), so a live-but-undecryptable interaction means
+    // we cannot tell whether its `with:` names `client_id`. A `Skipped`
+    // interaction whose primary was already shredded is unreachable — skip.
     let ixn_skipped = ixn_skipped.lock().unwrap();
-    if !ixn_skipped.is_empty() {
+    let mut live_undecryptable: Vec<String> = Vec::new();
+    for path in ixn_skipped.iter() {
+        if let Ok(bytes) = std::fs::read(root.join(path)) {
+            if let Ok(env) = confidant_crypt::envelope::parse(&bytes) {
+                let client = env.key_id.rsplit_once("/e").map(|(c, _)| c).unwrap_or("");
+                if live_clients.contains(client) {
+                    live_undecryptable.push(path.clone());
+                }
+            }
+        }
+    }
+    if !live_undecryptable.is_empty() {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) could not be decrypted on this device; refusing to shred",
-            ixn_skipped.len()
+            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) under a live primary could not be decrypted on this device; refusing to shred",
+            live_undecryptable.len()
         )).with_fix(
-            "Run shred from a device that can decrypt every interaction, or resolve the undecryptable interaction files first",
+            "Run shred from a device enrolled for every live client, or resolve the undecryptable interaction files first",
         )));
     }
     let ixn_refused = ixn_refused.lock().unwrap();
@@ -5884,6 +5910,18 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // Skip vault:lookup (keys/vault) — shred handles it separately.
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
+    let mut store =
+        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
+    // Live clients (for the interaction-with: check below): every client
+    // whose key still exists, minus the reserved lookup id. An interaction
+    // under a client NOT in this set was shredded earlier and is skipped.
+    let all_clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != confidant_crypt::manifest::VAULT_CLIENT_ID)
+        .collect();
+    let live_clients: std::collections::HashSet<String> = all_clients.iter().cloned().collect();
     // #179: delete edges naming the shredded person BEFORE destroying
     // keys — discovery needs decryption, and a failure must abort before
     // any irreversible key destruction. The deletions stage into the same
@@ -5892,15 +5930,8 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // #258: strip the shredded person from every interaction `with:` list
     // the same way — before key destruction, through the normal write path,
     // staged into the same shred commit.
-    let stripped_interactions = strip_participant_from_interactions(root, client_id)?;
-    let mut store =
-        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-            .map_err(anyhow::Error::new)?;
-    let all_clients: Vec<String> = store
-        .manifest_clients()
-        .into_iter()
-        .filter(|c| c != confidant_crypt::manifest::VAULT_CLIENT_ID)
-        .collect();
+    let stripped_interactions =
+        strip_participant_from_interactions(root, client_id, &live_clients)?;
     let all_refs: Vec<&str> = all_clients.iter().map(|s| s.as_str()).collect();
 
     // Fresh recipients for the re-wrap: a fresh keypair for THIS device

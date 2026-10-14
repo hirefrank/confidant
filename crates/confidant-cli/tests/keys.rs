@@ -2803,6 +2803,127 @@ fn keys_shred_strips_shredded_person_from_with_lists() {
         status.contains(&format!("M\tinteractions/{IXN_BC}/interaction.md")),
         "shred commit must re-encrypt the interaction, got:\n{status}"
     );
+    // Keyed read: the interaction still decrypts under B's surviving key,
+    // and its `with:` now lists only C (A is gone).
+    let find = h
+        .cmd(&["find", "with:", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        find.status.success(),
+        "find failed: {}",
+        String::from_utf8_lossy(&find.stderr)
+    );
+    let fv: serde_json::Value = serde_json::from_slice(&find.stdout).unwrap();
+    let with_lines: Vec<String> = fv["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["excerpt"].as_str().map(str::to_owned))
+        .filter(|e| e.contains("with:"))
+        .collect();
+    assert_eq!(
+        with_lines.len(),
+        1,
+        "expected one with: line: {with_lines:?}"
+    );
+    assert!(
+        with_lines[0].contains(PERSON_C),
+        "with: must list C: {with_lines:?}"
+    );
+    assert!(
+        !with_lines[0].contains(PERSON_A),
+        "with: must not list A: {with_lines:?}"
+    );
+}
+
+#[test]
+fn keys_shred_primary_then_another_participant_proceeds() {
+    // #258 review: after shredding a PRIMARY, their interaction (now under a
+    // destroyed key) must not block shredding someone else. A is the primary
+    // of an interaction listing C; shred A, then shred C still succeeds.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const PERSON_A: &str = "p-01J9Z3K4QF0000000000000000";
+    const PERSON_C: &str = "p-01J9Z3K4QH0000000000000000";
+    const IXN_AC: &str = "i-01M3TC5H00MPJG0048H0000009";
+    for client in [PERSON_A, PERSON_C] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    for (id, name) in [(PERSON_A, "Ada Example"), (PERSON_C, "Cam Sample")] {
+        let file = h._tmp.path().join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\nBio.\n"),
+        )
+        .unwrap();
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                file.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "record add {id} failed");
+    }
+    // Interaction: primary A, participant C.
+    let file = h._tmp.path().join(format!("{IXN_AC}.md"));
+    std::fs::write(
+        &file,
+        format!(
+            "---\nid: {IXN_AC}\ntype: interaction\nname: Lunch\ndate: 2026-10-06\nperson: {PERSON_A}\nwith: [{PERSON_C}]\n---\n\nLunch.\n"
+        ),
+    )
+    .unwrap();
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            file.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add interaction failed");
+
+    // Shred A (the primary).
+    let out = h
+        .cmd(&["keys", "shred", PERSON_A, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred A failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Shred C: A's leftover interaction (under A's destroyed key) is skipped,
+    // not a blocker.
+    let out = h
+        .cmd(&["keys", "shred", PERSON_C, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "shred C must proceed despite A's leftover interaction: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
