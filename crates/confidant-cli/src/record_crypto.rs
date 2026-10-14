@@ -191,7 +191,12 @@ impl RecordEncryptor {
             vault_id: self.vault_id.clone(),
             ulid: rec.id.to_string(),
             client_id: client_id.clone(),
-            path: path.display().to_string(),
+            // #285: the AAD binds this path byte-for-byte, and the read
+            // path rebuilds it from `paths::display_relative` (forward
+            // slashes). `Path::display()` renders backslashes on Windows,
+            // so encrypt must normalize the same way or AEAD auth fails
+            // on every Windows write.
+            path: confidant_core::paths::display_relative(path),
             purpose: purpose.to_string(),
             epoch,
         };
@@ -236,7 +241,9 @@ impl RecordEncryptor {
             vault_id: self.vault_id.clone(),
             ulid: env.id.clone(),
             client_id: client_id.to_string(),
-            path: path.display().to_string(),
+            // #285: same normalization as `encrypt_file` — the AAD path
+            // must match the encrypt-time spelling exactly.
+            path: confidant_core::paths::display_relative(path),
             purpose: purpose.to_string(),
             epoch: env.epoch,
         };
