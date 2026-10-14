@@ -44,6 +44,10 @@ only). There are no field-level flags — the record is the unit.
 On encrypted vaults the mode rides the envelope's plaintext outer header
 (`no-ai: notes`), so `find`/`context` fail closed without keys; readers
 that only know `true`/`false` reject `notes` rather than misreading it.
+Unreadable or missing person headers fail closed when stamping children
+(stamped `no-ai: true`). Mixed-version writers (CLI builds from before
+`no-ai: notes` landed) must not rewrite `notes`-mode people or write
+children under them.
 
 ## Ledger lines
 

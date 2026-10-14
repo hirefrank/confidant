@@ -4616,3 +4616,104 @@ fn edge_with_three_people_is_independent() {
     let json = report_json(dir.path(), None);
     assert!(codes(&json).is_empty(), "{json}");
 }
+
+#[test]
+fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_and_context() {
+    use confidant_core::context::build_context;
+    use confidant_core::scope::PackScope;
+    use confidant_core::search::{allowlist_is_fixed_point, search};
+
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[crypto]\nmode = \"plaintext\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: notes\n---\nAda profile prose searchabletoken\n"
+        ),
+    );
+    // Un-flagged note under a no-ai: notes person -> uncleared on plaintext vault.
+    let note_default = "n-01M3TC5H00MPJG000000000021";
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{note_default}.md"),
+        &format!(
+            "---\nid: {note_default}\ntype: note\ndate: 2026-10-01\nperson: {ADA}\n---\nhidden_default_note_token searchabletoken\n"
+        ),
+    );
+    // Explicit no-ai: false note under a no-ai: notes person -> cleared override.
+    let note_explicit_false = "n-01M3TC5H00MPJG000000000022";
+    write(
+        dir.path(),
+        &format!("people/{ADA}/notes/{note_explicit_false}.md"),
+        &format!(
+            "---\nid: {note_explicit_false}\ntype: note\ndate: 2026-10-02\nperson: {ADA}\nno-ai: false\n---\nvisible_override_note_token searchabletoken\n"
+        ),
+    );
+    // Un-flagged interaction under a no-ai: notes person -> uncleared.
+    let ixn_default = "i-01M3TC5H00MPJG000000000023";
+    write(
+        dir.path(),
+        &format!("interactions/{ixn_default}/interaction.md"),
+        &format!(
+            "---\nid: {ixn_default}\ntype: interaction\nname: Kickoff\ndate: 2026-10-03\nperson: {ADA}\n---\nhidden_default_ixn_token searchabletoken\n"
+        ),
+    );
+    // Un-flagged deal under a no-ai: notes person -> stays cleared (notes mode scopes to notes + interactions).
+    let deal_id = "d-01M3TC5H00MPJG000000000024";
+    write(
+        dir.path(),
+        &format!("deals/{deal_id}/deal.md"),
+        &format!(
+            "---\nid: {deal_id}\ntype: deal\nname: Renewal\nperson: {ADA}\n---\nvisible_deal_token searchabletoken\n"
+        ),
+    );
+
+    let vault = load_vault(dir.path()).unwrap();
+    assert!(allowlist_is_fixed_point(&vault));
+
+    // find: person profile, explicit-false note, and deal match; un-flagged note and interaction do not.
+    let hits = search(&vault, "searchabletoken", &PackScope::All)
+        .unwrap()
+        .hits;
+    let hit_ids: Vec<&str> = hits.iter().filter_map(|h| h.id.as_deref()).collect();
+    assert!(
+        hit_ids.contains(&ADA),
+        "person profile must stay searchable: {hit_ids:?}"
+    );
+    assert!(
+        hit_ids.contains(&note_explicit_false),
+        "explicit no-ai: false note must override notes default: {hit_ids:?}"
+    );
+    assert!(
+        hit_ids.contains(&deal_id),
+        "deal must stay searchable under notes-mode person: {hit_ids:?}"
+    );
+    assert!(
+        !hit_ids.contains(&note_default),
+        "un-flagged note under notes-mode person leaked in find: {hit_ids:?}"
+    );
+    assert!(
+        !hit_ids.contains(&ixn_default),
+        "un-flagged interaction under notes-mode person leaked in find: {hit_ids:?}"
+    );
+
+    // context: person name and profile are shown; only the explicit-false note is included.
+    let ada_id = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let ctx = build_context(&vault, &ada_id, true, &PackScope::All).unwrap();
+    assert_eq!(ctx.person.name.as_deref(), Some("Ada Example"));
+    assert!(!ctx.person.no_ai);
+    assert!(ctx
+        .person
+        .profile
+        .as_deref()
+        .unwrap_or("")
+        .contains("Ada profile prose"));
+    let ctx_note_ids: Vec<&str> = ctx.notes.iter().map(|n| n.id.as_str()).collect();
+    assert_eq!(ctx_note_ids, vec![note_explicit_false]);
+    assert!(ctx.interactions.is_empty(), "{:?}", ctx.interactions);
+}

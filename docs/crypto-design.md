@@ -272,18 +272,20 @@ that operator commits are signed (§4).
 ### no-ai per client
 
 The outer header carries the tri-state `no-ai` value (`true`/`false`/`notes`;
-`notes` only on person records — issue #181), but the rule is per client:
+`notes` only on person records — issue #181):
 
-- Every record for a client carries the person record's `no-ai` value in
-  its header.
-- `check` flags a mismatch between a record's header value and the
-  person record's value (new finding code in the milestone 2 spec
-  update).
-- Any `true` on that client wins: if the person record or any of the
-  client's records says `no-ai: true`, the client is treated as opted
-  out.
-- When the header says `true`, `find` and `context` skip the record for
-  agent output without decrypting at all — the plaintext is never
+- A `no-ai: true` person record stamps `no-ai: true` onto every child
+  record (notes, interactions, deals) for that client ("any `true` wins":
+  an explicit `true` on the person or on the child itself always wins).
+- A `no-ai: notes` person record carries `no-ai: notes` in its own outer
+  header (and decrypts for agent output so identity and pack fields stay
+  visible), while its notes and interactions are stamped `no-ai: true`
+  by default unless the child explicitly sets `no-ai: false`. Deals keep
+  `no-ai: false` unless explicitly marked `true`.
+- A single note or interaction can carry `no-ai: true` on an otherwise
+  visible person without opting out the whole client.
+- When an outer header says `true`, `find` and `context` skip that record
+  for agent output without decrypting at all — the plaintext is never
   unwrapped for an agent path.
 
 Header consistency is enforced alongside the AAD check: `id` must equal

@@ -59,8 +59,22 @@ import common  # noqa: E402
 
 _NAME_RE = re.compile(r"^name:\s*(.+)$", re.MULTILINE)
 # Quoted "no-ai" / 'no-ai' are the same flag (spec section 13); anything
-# else that normalises to noai is a typo. Bare `true` only (#47).
-_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*true\s*$""", re.MULTILINE)
+# else that normalises to noai is a typo. `true` or `notes` on a person
+# hides proposed notes and interactions (#47, #181).
+_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*(?:true|notes)\s*$""", re.MULTILINE)
+
+
+def _person_hides_notes(vault: str, person: str) -> bool:
+    """True when the target person's record has `no-ai: true` or `no-ai: notes`."""
+    base = os.path.join(vault, "people", person)
+    for cand in (os.path.join(base, "profile.md"), base + ".md"):
+        try:
+            with open(cand, encoding="utf-8") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        return _NO_AI_RE.search(head) is not None
+    return False
 
 
 def is_no_ai(row: dict) -> bool:
@@ -381,9 +395,13 @@ def main(argv=None) -> int:
         else:
             path = f"notes/{note_id}.md"
             warnings.append(f"note {nid}: no person link; top-level note {note_id}")
-        # no-ai on the row, or inherited from a no-ai contact: the note
-        # belongs to that client either way.
-        no_ai = is_no_ai(n) or contact_no_ai.get(n.get("contact_id", ""), False)
+        # no-ai on the row, or inherited from a no-ai / notes-mode contact:
+        # the note belongs to that client either way.
+        no_ai = (
+            is_no_ai(n)
+            or contact_no_ai.get(n.get("contact_id", ""), False)
+            or (bool(pid) and _person_hides_notes(vault, pid))
+        )
         if no_ai:
             front.append("no-ai: true")
         text = (n.get("text") or "").strip()
@@ -432,7 +450,7 @@ def main(argv=None) -> int:
         text = (t.get("text") or "").strip()
         front = [f"id: {iid}", "type: interaction",
                  f"name: Session {date}", f"date: {date}", f"person: {pid}"]
-        if contact_no_ai.get(t.get("contact_id", ""), False):
+        if contact_no_ai.get(t.get("contact_id", ""), False) or _person_hides_notes(vault, pid):
             front.append("no-ai: true")
         records.append({
             "path": f"interactions/{iid}/interaction.md",
