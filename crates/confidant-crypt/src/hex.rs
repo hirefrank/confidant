@@ -31,7 +31,7 @@ pub fn decode(s: &str) -> Result<Vec<u8>, &'static str> {
     if !s.is_ascii() {
         return Err("non-ASCII hex");
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex");
     }
     (0..s.len())

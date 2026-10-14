@@ -55,7 +55,7 @@ Verify before pushing (matches CI, run from repo root):
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-features --locked
   cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
-  cargo +1.85 check --workspace --locked
+  cargo +1.88 check --workspace --locked
 The demo vault must stay clean under `confidant check`. CI stays green.
 
 PR body format (AGENTS.md): title, summary, spec changes (or "none"), test

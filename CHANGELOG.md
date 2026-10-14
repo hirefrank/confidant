@@ -18,6 +18,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   verb (with `confidant log touch`), and two warning-level nudges that never
   block writes: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING` (#184, #182).
 
+### Changed
+- Bumped the workspace MSRV from 1.85 to **1.88** and upgraded the TUI stack
+  to `ratatui 0.30` + `crossterm 0.29`, which drops the unmaintained `paste`
+  proc-macro and moves `lru` past the fixed `0.16.3` release — clearing the
+  temporary `lru`/`crossterm`/`ratatui` Dependabot ignores and the
+  `RUSTSEC-2024-0436` deny-ignore (#275).
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

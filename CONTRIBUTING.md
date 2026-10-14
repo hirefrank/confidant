@@ -6,7 +6,7 @@ spec edit, tests, and usually a finding-code update in `spec/findings.md`.
 
 ## Setup
 
-Rust 1.85 or newer (`rust-toolchain.toml` pins 1.99.0). From the repo root:
+Rust 1.88 or newer (`rust-toolchain.toml` pins 1.99.0). From the repo root:
 
 Optional but recommended (blocks AI agent co-author trailers on commit):
 
@@ -18,7 +18,7 @@ git config core.hooksPath .githooks
 cargo fmt --all
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-cargo +1.85 check --workspace --locked
+cargo +1.88 check --workspace --locked
 cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
 ```
 

@@ -52,7 +52,7 @@ Read before changing behaviour:
 ## Commands
 
 Toolchain: `rust-toolchain.toml` pins Rust 1.99.0 (with rustfmt and clippy).
-MSRV is **1.85** (`rust-version` in `Cargo.toml`). CI sets
+MSRV is **1.88** (`rust-version` in `Cargo.toml`). CI sets
 `RUSTFLAGS="-D warnings"`, so any compiler warning fails the build.
 
 Run these from the repo root before you push. They match CI exactly:
@@ -62,7 +62,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
-cargo +1.85 check --workspace --locked   # MSRV job
+cargo +1.88 check --workspace --locked   # MSRV job
 cargo deny check                          # deny.toml sets all-features
 cargo audit
 ```

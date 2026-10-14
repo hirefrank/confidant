@@ -21,23 +21,6 @@ updates:
           - "patch"
     commit-message:
       prefix: "deps"
-    # lru takes no security update. It is transitive, from the ratatui 0.29 pin
-    # in crates/confidant-tui, and the fix for RUSTSEC-2026-0002 and
-    # RUSTSEC-2026-0253 (lru 0.16.3) is outside ratatui 0.29's `lru ^0.12`
-    # requirement, so every attempt ends `security_update_not_possible` and
-    # fails the run on main. `cargo audit` still lists both advisories as
-    # allowed warnings on every run, and deny.toml records the sibling
-    # ratatui-pin advisory (RUSTSEC-2024-0436, paste).
-    # Revisit when ratatui moves to 0.30, which drops lru and paste but needs
-    # Rust 1.86, above the workspace MSRV of 1.85.
-    ignore:
-      - dependency-name: "lru"
-      # crossterm and ratatui are held together: crossterm stays at 0.28 to
-      # match ratatui 0.29 (see #271). Bumping one alone leaves two crossterm
-      # copies in the TUI. Both upgrade together, with the MSRV bump, under
-      # #275. Remove these two entries as part of that work.
-      - dependency-name: "crossterm"
-      - dependency-name: "ratatui"
 
   - package-ecosystem: "github-actions"
     directory: "/"
