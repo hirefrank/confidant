@@ -139,7 +139,7 @@ pub(crate) fn unstage_applied(repo: &Path, applied: &[AppliedChange]) {
     let mut any = false;
     for change in applied {
         let AppliedChange::Modified { abs, .. } = change;
-        if let Ok(rel) = abs.strip_prefix(repo) {
+        if let Some(rel) = relative_to_repo(repo, abs) {
             cmd.arg(rel);
             any = true;
         }
@@ -147,6 +147,19 @@ pub(crate) fn unstage_applied(repo: &Path, applied: &[AppliedChange]) {
     if any {
         let _ = cmd.output();
     }
+}
+
+/// `abs` relative to `repo` for git pathspecs, canonicalizing both sides so
+/// a Windows verbatim path (`\\?\C:\...`) or a macOS `/private/...` path
+/// agrees with the git toplevel (which git reports in normal form). `None`
+/// when `abs` is not under `repo`.
+fn relative_to_repo(repo: &Path, abs: &Path) -> Option<PathBuf> {
+    let canon_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let canon_abs = abs.canonicalize().unwrap_or_else(|_| abs.to_path_buf());
+    canon_abs
+        .strip_prefix(&canon_repo)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// Commit the applied writes on the current branch. Commit messages carry
@@ -160,7 +173,7 @@ pub(crate) fn commit_applied(
 ) -> anyhow::Result<()> {
     for change in applied {
         let AppliedChange::Modified { abs, .. } = change;
-        let rel = abs.strip_prefix(repo).map_err(|_| {
+        let rel = relative_to_repo(repo, abs).ok_or_else(|| {
             anyhow::anyhow!("vault path escapes the git repository: {}", abs.display())
         })?;
         git(repo, &["add", "--", &rel.to_string_lossy()])?;
@@ -283,5 +296,38 @@ mod tests {
         let mut applied = Vec::new();
         apply_writes(root, &writes, &mut applied, Some(&encrypt)).unwrap();
         assert!(root.join("people/p-01ABC/profile.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_to_repo_canonicalizes_both_sides() {
+        // Windows `canonicalize` returns a verbatim `\\?\C:\...` path while
+        // `git rev-parse --show-toplevel` returns the normal form, so a
+        // plain `strip_prefix` fails even for a path inside the repo. On
+        // Unix the same class of mismatch appears when the vault is reached
+        // through a symlink (or macOS `/private/var` vs `/var`). The fix
+        // canonicalizes both sides before stripping.
+        use std::os::unix::fs::symlink;
+
+        let dir = vault_dir();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("ledger/2026")).unwrap();
+        std::fs::write(real.join("ledger/2026/10.cfd"), "").unwrap();
+
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+        let abs = link.join("ledger/2026/10.cfd");
+
+        // `abs` and `real` differ in string form (via the symlink), so a
+        // bare strip_prefix would fail; canonicalizing both succeeds.
+        assert!(abs.strip_prefix(&real).is_err());
+        assert_eq!(
+            relative_to_repo(&real, &abs).map(|p| p.to_string_lossy().into_owned()),
+            Some("ledger/2026/10.cfd".to_string())
+        );
+        // A path genuinely outside the repo is still refused.
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "").unwrap();
+        assert!(relative_to_repo(&real, &outside).is_none());
     }
 }
