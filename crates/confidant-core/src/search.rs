@@ -12,7 +12,11 @@ use crate::id::{
     PrefixedScan, RecordId,
 };
 use crate::ledger::ledger_line_verb;
-use crate::record::{parse_ref_id, FrontmatterRef};
+use crate::packs::{resolve_enabled, ALL_PACKS};
+use crate::record::{parse_ref_id, unquote, FrontmatterRef, RecordKind};
+use crate::scope::{
+    note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
+};
 use crate::vault::Vault;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -60,19 +64,27 @@ struct Allowlist<'a> {
     ledger_tokens: Vec<Vec<IdToken>>,
     named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
+    /// Pack scope this search applies (#178). [`PackScope::All`] for the
+    /// unscoped §12 allowlist.
+    scope: PackScope,
+    /// Enabled packs for this vault (for attribution).
+    enabled: Vec<&'a dyn crate::packs::Pack>,
+    /// Note id → packs owning a ledger line that references it.
+    linkage: HashMap<RecordId, BTreeSet<OwnerKey>>,
 }
 
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
 /// Line numbers are 1-based positions in the original file.
 /// Returns content only from the cleared allowlist (spec section 12).
 /// If any ledger file was unreadable, returns [`DomainError`] `E_LEDGER_UNREADABLE`
-/// and no hits.
-pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
+/// and no hits. `scope` further filters hits to the packs in scope (#178):
+/// core-owned items stay visible, unattributed items are hidden.
+pub fn search(vault: &Vault, query: &str, scope: &PackScope) -> Result<SearchResult, DomainError> {
     if vault.ledger_unread_count > 0 {
         return Err(DomainError::ledger_unreadable(vault.ledger_unread_count));
     }
     let needle = case_fold(query);
-    let allow = Allowlist::build(vault);
+    let allow = Allowlist::build(vault, scope);
     let findings = findings_for_find(&allow);
     if needle.is_empty() {
         return Ok(SearchResult {
@@ -91,6 +103,12 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
     }
     for (idx, line) in vault.ledger_lines.iter().enumerate() {
         if !allow.ledger_ok.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        if !allow
+            .scope
+            .allows(&owners_of_ledger_text(&line.text, &allow.enabled))
+        {
             continue;
         }
         let folded = case_fold(&line.text);
@@ -113,8 +131,9 @@ pub fn search(vault: &Vault, query: &str) -> Result<SearchResult, DomainError> {
 }
 
 /// Record IDs in the section 12 cleared set. Used by tests to assert a fixed point.
+/// Unscoped: the §12 allowlist is scope-independent; scoping applies on top.
 pub fn cleared_record_ids(vault: &Vault) -> HashSet<RecordId> {
-    Allowlist::build(vault).cleared
+    Allowlist::build(vault, &PackScope::All).cleared
 }
 
 /// Vault-relative paths of the records in the section 12 cleared set.
@@ -124,7 +143,7 @@ pub fn cleared_record_ids(vault: &Vault) -> HashSet<RecordId> {
 /// (issue #38). The query-time allowlist stays the authority; this only
 /// narrows what is copied into the local corpus.
 pub fn cleared_record_paths(vault: &Vault) -> BTreeSet<String> {
-    let allow = Allowlist::build(vault);
+    let allow = Allowlist::build(vault, &PackScope::All);
     allow
         .vault
         .records
@@ -140,7 +159,7 @@ pub fn cleared_record_paths(vault: &Vault) -> BTreeSet<String> {
 /// nothing and are left out of an index-time corpus entirely). Same
 /// fail-closed posture as [`cleared_record_paths`].
 pub fn cleared_ledger_lines(vault: &Vault) -> BTreeMap<String, Vec<u32>> {
-    let allow = Allowlist::build(vault);
+    let allow = Allowlist::build(vault, &PackScope::All);
     let mut out: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for (idx, line) in allow.vault.ledger_lines.iter().enumerate() {
         if allow.ledger_ok.get(idx).copied().unwrap_or(false) {
@@ -150,10 +169,46 @@ pub fn cleared_ledger_lines(vault: &Vault) -> BTreeMap<String, Vec<u32>> {
     out
 }
 
+/// Owners of every cleared record path, for `allowlist --json` ownership
+/// annotations (#178). Core records map to `{Core}`; notes/interactions
+/// to their pack owners (empty = unattributed).
+pub fn cleared_record_owners(vault: &Vault) -> BTreeMap<String, BTreeSet<OwnerKey>> {
+    let allow = Allowlist::build(vault, &PackScope::All);
+    let mut out = BTreeMap::new();
+    for rec in vault.records.values() {
+        if allow.cleared.contains(&rec.id) {
+            out.insert(
+                rec.path.clone(),
+                record_owners(rec, &allow.linkage, &allow.enabled),
+            );
+        }
+    }
+    out
+}
+
+/// Owners of every cleared ledger line, for `allowlist --json` ownership
+/// annotations (#178). Same set and order as [`cleared_ledger_lines`].
+pub fn cleared_ledger_line_owners(vault: &Vault) -> Vec<(String, u32, BTreeSet<OwnerKey>)> {
+    let allow = Allowlist::build(vault, &PackScope::All);
+    let mut out = Vec::new();
+    for (idx, line) in vault.ledger_lines.iter().enumerate() {
+        if allow.ledger_ok.get(idx).copied().unwrap_or(false) {
+            out.push((
+                line.file.clone(),
+                line.line,
+                owners_of_ledger_text(&line.text, &allow.enabled),
+            ));
+        }
+    }
+    // Same order as `cleared_ledger_lines`: file, then line.
+    out.sort();
+    out
+}
+
 /// True when every cleared id still satisfies every allowlist rule (merge
 /// peers, package openers, front matter, path parent, named ledger lines).
 pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
-    let allow = Allowlist::build(vault);
+    let allow = Allowlist::build(vault, &PackScope::All);
     let tainted = tainted_ids(vault);
     let components = merge_components(&allow);
     let open_lines = pkg_open_lines(&allow);
@@ -170,7 +225,9 @@ pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
 }
 
 impl<'a> Allowlist<'a> {
-    fn build(vault: &'a Vault) -> Self {
+    fn build(vault: &'a Vault, scope: &PackScope) -> Self {
+        let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+        let linkage = note_linkage_owners(vault, &enabled);
         let mut by_path = BTreeMap::new();
         for rec in vault.records.values() {
             by_path.insert(rec.path.as_str(), &rec.id);
@@ -266,6 +323,9 @@ impl<'a> Allowlist<'a> {
             ledger_tokens,
             named_ledger_lines,
             ledger_ok: Vec::new(),
+            scope: scope.clone(),
+            enabled,
+            linkage,
         };
         allow.cleared = compute_cleared(&allow);
         allow.ledger_ok = allow
@@ -776,18 +836,37 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
     }
     if let (Some(file), Some(line)) = (finding.file.as_deref(), finding.line) {
         if let Some(&idx) = allow.ledger_at.get(&(file, line)) {
-            return allow.ledger_ok.get(idx).copied().unwrap_or(false);
+            if !allow.ledger_ok.get(idx).copied().unwrap_or(false) {
+                return false;
+            }
+            // #178: a finding on an out-of-scope ledger line is redacted
+            // to code + count like any other non-verbatim finding.
+            let text = &allow.vault.ledger_lines[idx].text;
+            return allow
+                .scope
+                .allows(&owners_of_ledger_text(text, &allow.enabled));
         }
     }
     if let Some(file) = finding.file.as_deref() {
         if let Some(id) = allow.by_path.get(file) {
-            return allow.cleared.contains(id);
+            if !allow.cleared.contains(id) {
+                return false;
+            }
+            let rec = &allow.vault.records[id];
+            return allow
+                .scope
+                .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
         }
         return false;
     }
     if let Some(raw) = finding.id.as_deref() {
         if let Ok(id) = RecordId::parse(raw) {
-            return allow.vault.records.contains_key(&id) && allow.cleared.contains(&id);
+            if let Some(rec) = allow.vault.records.get(&id) {
+                return allow.cleared.contains(&id)
+                    && allow
+                        .scope
+                        .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
+            }
         }
     }
     false
@@ -802,9 +881,37 @@ fn scan_record(
     let Some(facts) = allow.facts.get(&rec.id) else {
         return;
     };
+    // Body lines share the record's owners; front-matter lines filter
+    // per-field (#178). Computed once: the body owner set.
+    let body_owners = record_owners(rec, &allow.linkage, &allow.enabled);
+    let body_visible = allow.scope.allows(&body_owners);
+    // #178 fix round (Silas review on #246): notes and interactions are
+    // visible as whole records only. Per-field front-matter filtering
+    // applies to the core anchors (person/org/deal); an out-of-scope or
+    // unattributed note/interaction contributes no lines at all, front
+    // matter included — otherwise its `id`/`type`/`date`/`person`/`name`
+    // lines would leak its existence through `find`.
+    if matches!(rec.kind, RecordKind::Note | RecordKind::Interaction) && !body_visible {
+        return;
+    }
     let text = rec.source.trim_start_matches('\u{feff}');
     for ((line_no, toks), line) in facts.line_tokens.iter().zip(text.lines()) {
         if !tokens_allowed(toks, allow) {
+            continue;
+        }
+        if *line_no < facts.body_start_line {
+            // Front matter: one field per line. Fences / comments / blank
+            // lines have no key and are core (not content).
+            if let Some(key) = front_matter_key(line) {
+                let visible = match owner_of_field(&key, &allow.enabled) {
+                    Some(owner) => allow.scope.allows(&[owner].into_iter().collect()),
+                    None => matches!(allow.scope, PackScope::All),
+                };
+                if !visible {
+                    continue;
+                }
+            }
+        } else if !body_visible {
             continue;
         }
         let folded = case_fold(line);
@@ -816,6 +923,25 @@ fn scan_record(
                 excerpt: excerpt(line.trim(), 200),
             });
         }
+    }
+}
+
+/// Front-matter key on one source line, if it is a `key: value` line.
+/// Returns `None` for fences, comments, blank lines, and lines without a
+/// colon. The key is unquoted with the parser's `unquote` (one source of
+/// truth — `trim_matches` would strip a lone trailing quote and read
+/// `name"` as core `name`, where the parser reads it as unattributed).
+fn front_matter_key(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, _) = trimmed.split_once(':')?;
+    let key = unquote(key.trim());
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
     }
 }
 
@@ -846,6 +972,8 @@ fn excerpt(line: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{case_fold, excerpt, still_cleared, Allowlist};
+    use crate::{cleared_ledger_line_owners, cleared_record_owners, search, OwnerKey, PackScope};
+    use std::collections::BTreeSet;
 
     #[test]
     fn excerpt_truncates() {
@@ -862,7 +990,7 @@ mod tests {
     }
 
     fn assert_fixed_point(vault: &crate::vault::Vault) {
-        let allow = Allowlist::build(vault);
+        let allow = Allowlist::build(vault, &PackScope::All);
         let tainted = super::tainted_ids(vault);
         let components = super::merge_components(&allow);
         let open_lines = super::pkg_open_lines(&allow);
@@ -927,5 +1055,98 @@ mod tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
         let vault = crate::vault::load_vault(&root).unwrap();
         assert_fixed_point(&vault);
+    }
+
+    fn demo_vault() -> crate::vault::Vault {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+        crate::vault::load_vault(&root).unwrap()
+    }
+
+    fn coaching_scope() -> PackScope {
+        PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+    }
+
+    #[test]
+    fn scoped_search_filters_by_pack_ownership() {
+        // Demo vault: "Kickoff" is in the session-linked (coaching) note;
+        // "Follow-up" is in the unattributed note; "Fake intro call" is in
+        // the unattributed interaction body.
+        let vault = demo_vault();
+        let coaching = coaching_scope();
+        let kickoff = search(&vault, "Kickoff", &coaching).unwrap();
+        assert_eq!(kickoff.hits.len(), 1);
+        assert!(kickoff.hits[0].path.contains("002NAM000005"));
+
+        let followup = search(&vault, "Follow-up", &coaching).unwrap();
+        assert!(followup.hits.is_empty());
+        let followup_all = search(&vault, "Follow-up", &PackScope::All).unwrap();
+        assert_eq!(followup_all.hits.len(), 1);
+
+        let intro_body = search(&vault, "Fake intro call", &coaching).unwrap();
+        assert!(intro_body.hits.is_empty());
+        // #246 fix round: the unattributed interaction's `name:` line no
+        // longer leaks through per-field filtering — notes and
+        // interactions contribute no lines at all when out of scope.
+        let intro_name = search(&vault, "Intro call", &coaching).unwrap();
+        assert!(intro_name.hits.is_empty());
+
+        // The unattributed note is undiscoverable under a coaching scope:
+        // not by its id, and not via its `type: note` front-matter line.
+        // (`type: note` still matches the in-scope coaching note's own
+        // line — that record is legitimately visible — so assert the
+        // unattributed note's path is absent, not zero hits.)
+        let by_id = search(&vault, "n-01M3TC5H00MPJG0036CR000006", &coaching).unwrap();
+        assert!(by_id.hits.is_empty());
+        let by_type = search(&vault, "type: note", &coaching).unwrap();
+        assert!(
+            by_type
+                .hits
+                .iter()
+                .all(|h| !h.path.contains("0036CR000006")),
+            "unattributed note leaked via its `type:` line: {:?}",
+            by_type.hits
+        );
+    }
+
+    #[test]
+    fn scoped_search_keeps_coaching_and_core_ledger_lines() {
+        // Balance lines are owned by their metric's pack; `stage` is core.
+        let vault = demo_vault();
+        let coaching = coaching_scope();
+        let balance = search(&vault, "sessions_remaining", &coaching).unwrap();
+        assert!(!balance.hits.is_empty());
+        assert!(balance.hits.iter().all(|h| h.path.contains("10.cfd")));
+        let stage = search(&vault, "proposal", &coaching).unwrap();
+        assert!(!stage.hits.is_empty());
+    }
+
+    #[test]
+    fn allowlist_owners_cover_records_and_ledger_lines() {
+        let vault = demo_vault();
+        let records = cleared_record_owners(&vault);
+        // Ada's profile is core; the session-linked note is coaching;
+        // the unattributed note has no owners.
+        assert_eq!(
+            records.get("people/p-01M3TC5H00MPJG000000000000/profile.md"),
+            Some(&[OwnerKey::Core].into_iter().collect())
+        );
+        assert_eq!(
+            records
+                .get("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"),
+            Some(&[OwnerKey::Pack("coaching@0.1")].into_iter().collect())
+        );
+        assert_eq!(
+            records
+                .get("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG0036CR000006.md"),
+            Some(&BTreeSet::new())
+        );
+        let lines = cleared_ledger_line_owners(&vault);
+        // The balance line is coaching; the alias line is core.
+        assert!(lines.iter().any(|(f, _, o)| f.contains("10.cfd")
+            && o == &[OwnerKey::Pack("coaching@0.1")].into_iter().collect()));
+        assert!(lines
+            .iter()
+            .any(|(f, _, o)| f.contains("10.cfd") && o == &[OwnerKey::Core].into_iter().collect()));
     }
 }

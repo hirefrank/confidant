@@ -109,7 +109,10 @@ Output is JSON on stdout (mirrors `confidant find --json`, plus `score` and
 }
 ```
 
-`dropped_uncleared` counts hits the allowlist filter removed. If QMD or the
+`dropped_uncleared` counts hits the allowlist filter removed — including hits
+dropped only because they are outside the caller's pack scope, so a nonzero
+count tells a scoped agent that out-of-scope matches exist (accepted for
+now). If QMD or the
 index is missing, the script falls back to `confidant find --json` and notes
 it on stderr.
 
@@ -127,9 +130,11 @@ it on stderr.
   the CLI with a sibling `.cfd.md` so QMD's `**/*.md` collection pattern
   covers ledger facts too (hits map back to the real `.cfd` path). `--embed`
   runs `qmd embed` afterwards.
-- `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] QUERY`
+- `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY`
   — queries QMD, allowlist-filters every hit through `confidant find`, and
-  emits the JSON above. Falls back to plain `find` when QMD/index is absent.
+  emits the JSON above. `--packs` scopes the verification `find` calls, so a
+  scoped agent never sees hits owned by another pack (issue #178). Falls back
+  to plain `find` when QMD/index is absent.
 
 ## Operating rules
 

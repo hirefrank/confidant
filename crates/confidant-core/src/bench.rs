@@ -191,8 +191,20 @@ mod tests {
         let (unique, common) = generate_realistic_vault(dir.path(), 3, 2, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
-        assert_eq!(search(&vault, &unique).expect("search").hits.len(), 1);
-        assert!(search(&vault, &common).expect("search").hits.len() >= 3);
+        assert_eq!(
+            search(&vault, &unique, &crate::PackScope::All)
+                .expect("search")
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            search(&vault, &common, &crate::PackScope::All)
+                .expect("search")
+                .hits
+                .len()
+                >= 3
+        );
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());
         assert!(
             report.findings.is_empty(),
@@ -272,14 +284,14 @@ mod tests {
 
         // Functional asserts (kept out of the timed rounds).
         assert_eq!(
-            search(&small_vault, &small_unique)
+            search(&small_vault, &small_unique, &crate::PackScope::All)
                 .expect("search")
                 .hits
                 .len(),
             1
         );
         assert!(
-            search(&small_vault, &small_common)
+            search(&small_vault, &small_common, &crate::PackScope::All)
                 .expect("search")
                 .hits
                 .len()
@@ -291,8 +303,20 @@ mod tests {
             "generated vault should check clean: {:?}",
             small_report.findings
         );
-        assert_eq!(search(&vault, &unique).expect("search").hits.len(), 1);
-        assert!(search(&vault, &common).expect("search").hits.len() >= 400);
+        assert_eq!(
+            search(&vault, &unique, &crate::PackScope::All)
+                .expect("search")
+                .hits
+                .len(),
+            1
+        );
+        assert!(
+            search(&vault, &common, &crate::PackScope::All)
+                .expect("search")
+                .hits
+                .len()
+                >= 400
+        );
         let report = crate::check_vault(&vault, &crate::CheckOptions::default());
         assert!(
             report.findings.is_empty(),
@@ -303,15 +327,15 @@ mod tests {
         assert_linear(
             "find unique 1200→2400 records",
             min_scaling_ratio(
-                || search(&small_vault, &small_unique).expect("search"),
-                || search(&vault, &unique).expect("search"),
+                || search(&small_vault, &small_unique, &crate::PackScope::All).expect("search"),
+                || search(&vault, &unique, &crate::PackScope::All).expect("search"),
             ),
         );
         assert_linear(
             "find common 1200→2400 records",
             min_scaling_ratio(
-                || search(&small_vault, &small_common).expect("search"),
-                || search(&vault, &common).expect("search"),
+                || search(&small_vault, &small_common, &crate::PackScope::All).expect("search"),
+                || search(&vault, &common, &crate::PackScope::All).expect("search"),
             ),
         );
         assert_linear(

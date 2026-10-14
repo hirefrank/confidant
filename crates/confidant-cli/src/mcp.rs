@@ -6,9 +6,17 @@
 //! so the MCP surface can never diverge from it (ADR-7: thin MCP server
 //! wrapping the CLI, never a second way in).
 //!
+//! Pack scope (#178, #232): the server instance may be configured with a
+//! ceiling (`confidant mcp --packs coaching@0.1`). Every `find` / `context`
+//! call runs under that ceiling; a per-call `packs` argument can only
+//! narrow it, never widen it. The ceiling is validated by the CLI
+//! sub-invocation (unknown / disabled pack = hard error); the widen check
+//! here is a string-subset check, so it holds even for unvalidated names.
+//!
 //! Supported: `initialize`, `notifications/initialized`, `tools/list`,
 //! `tools/call`. Everything else is `-32601`.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -17,7 +25,14 @@ use serde_json::{json, Value};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-pub fn run(vault: &Path) -> anyhow::Result<ExitCode> {
+pub fn run(vault: &Path, ceiling: Option<String>) -> anyhow::Result<ExitCode> {
+    let ceiling_set: Option<BTreeSet<String>> = ceiling.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -25,7 +40,7 @@ pub fn run(vault: &Path) -> anyhow::Result<ExitCode> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(resp) = handle(&line, vault) {
+        if let Some(resp) = handle(&line, vault, &ceiling_set) {
             let mut out = stdout.lock();
             writeln!(out, "{}", serde_json::to_string(&resp)?)?;
             out.flush()?;
@@ -34,7 +49,29 @@ pub fn run(vault: &Path) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn handle(line: &str, vault: &Path) -> Option<Value> {
+/// Effective `packs` for one tool call under a ceiling: `None` means
+/// unscoped (no `--packs` flag). A per-call list must be a subset of the
+/// ceiling, else it is an error (never widen, #232 Q1).
+fn effective_packs(
+    ceiling: &Option<BTreeSet<String>>,
+    per_call: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(names) = per_call else {
+        return Ok(ceiling.as_ref().map(|c| c.iter().cloned().collect()));
+    };
+    if let Some(allowed) = ceiling {
+        for name in &names {
+            if !allowed.contains(name) {
+                return Err(format!(
+                    "per-call scope {name} is outside the connection's pack scope"
+                ));
+            }
+        }
+    }
+    Ok(Some(names))
+}
+
+fn handle(line: &str, vault: &Path, ceiling: &Option<BTreeSet<String>>) -> Option<Value> {
     let msg: Value = match serde_json::from_str(line) {
         Ok(m) => m,
         Err(_) => {
@@ -66,7 +103,7 @@ fn handle(line: &str, vault: &Path) -> Option<Value> {
         "tools/list" => respond(json!({ "tools": tools() })),
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or(json!({}));
-            match call_tool(&params, vault) {
+            match call_tool(&params, vault, ceiling) {
                 Ok(text) => respond(json!({ "content": [{"type": "text", "text": text}] })),
                 Err(e) => respond(json!({
                     "content": [{"type": "text", "text": e}],
@@ -110,20 +147,22 @@ fn tools() -> Vec<Value> {
         tool("check", "Run the vault check engine.", obj(&[], json!({}))),
         tool(
             "find",
-            "Search records and ledger lines.",
+            "Search records and ledger lines. Honors the connection's pack scope; an optional packs list can only narrow it.",
             obj(
                 &["query"],
-                json!({"query": str_prop("Case-insensitive substring.")}),
+                json!({"query": str_prop("Case-insensitive substring."),
+                    "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."}}),
             ),
         ),
         tool(
             "context",
-            "Context bundle for one person. Honors no-ai; private data is stripped by default.",
+            "Context bundle for one person. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
             obj(
                 &["person"],
                 json!({
                     "person": str_prop("Opaque person id (p-…)."),
                     "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies. Default true: private data is stripped unless explicitly set to false."},
+                    "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
                 }),
             ),
         ),
@@ -210,8 +249,20 @@ fn context_strips_private(args: &Value) -> bool {
     )
 }
 
+fn opt_packs(args: &Value) -> Option<Vec<String>> {
+    args.get("packs").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    })
+}
+
 /// Build the CLI argv for a tool call and run it via `current_exe`.
-fn call_tool(params: &Value, vault: &Path) -> Result<String, String> {
+fn call_tool(
+    params: &Value,
+    vault: &Path,
+    ceiling: &Option<BTreeSet<String>>,
+) -> Result<String, String> {
     let name = params
         .get("name")
         .and_then(|n| n.as_str())
@@ -238,14 +289,27 @@ fn call_tool(params: &Value, vault: &Path) -> Result<String, String> {
         "check" => cli.push("check".to_owned()),
         "find" => {
             cli.push("find".to_owned());
+            // Flags first, then `--` before the agent-supplied positional:
+            // a query of `--packs=…` must be a needle, never a flag
+            // (today it only fails closed via clap's duplicate-flag error).
+            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+                cli.push("--packs".to_owned());
+                cli.push(packs.join(","));
+            }
+            cli.push("--".to_owned());
             cli.push(get_str(&args, "query")?);
         }
         "context" => {
             cli.push("context".to_owned());
-            cli.push(get_str(&args, "person")?);
+            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+                cli.push("--packs".to_owned());
+                cli.push(packs.join(","));
+            }
             if context_strips_private(&args) {
                 cli.push("--exclude-private".to_owned());
             }
+            cli.push("--".to_owned());
+            cli.push(get_str(&args, "person")?);
         }
         "log_session" => {
             cli.push("log".to_owned());
@@ -318,6 +382,7 @@ mod tests {
         let resp = handle(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             Path::new("/tmp"),
+            &None,
         )
         .unwrap();
         assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
@@ -329,6 +394,7 @@ mod tests {
         assert!(handle(
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             Path::new("/tmp"),
+            &None,
         )
         .is_none());
     }
@@ -338,6 +404,7 @@ mod tests {
         let resp = handle(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
             Path::new("/tmp"),
+            &None,
         )
         .unwrap();
         let names: Vec<&str> = resp["result"]["tools"]
@@ -365,6 +432,7 @@ mod tests {
         let resp = handle(
             r#"{"jsonrpc":"2.0","id":3,"method":"nope"}"#,
             Path::new("/tmp"),
+            &None,
         )
         .unwrap();
         assert_eq!(resp["error"]["code"], -32601);
@@ -372,7 +440,7 @@ mod tests {
 
     #[test]
     fn parse_error_has_null_id() {
-        let resp = handle("not json", Path::new("/tmp")).unwrap();
+        let resp = handle("not json", Path::new("/tmp"), &None).unwrap();
         assert_eq!(resp["error"]["code"], -32700);
         assert!(resp["id"].is_null());
     }
@@ -401,5 +469,52 @@ mod tests {
         // Non-boolean values fail closed toward stripping.
         assert!(context_strips_private(&json!({"exclude_private": "yes"})));
         assert!(context_strips_private(&json!({"exclude_private": 1})));
+    }
+
+    #[test]
+    fn effective_packs_narrows_never_widens() {
+        let ceiling: Option<BTreeSet<String>> =
+            Some(["coaching@0.1".to_string()].into_iter().collect());
+        // No per-call scope: the ceiling.
+        assert_eq!(
+            effective_packs(&ceiling, None).unwrap(),
+            Some(vec!["coaching@0.1".to_string()])
+        );
+        // Narrowing to a subset of the ceiling is fine.
+        assert_eq!(
+            effective_packs(&ceiling, Some(vec!["coaching@0.1".to_string()])).unwrap(),
+            Some(vec!["coaching@0.1".to_string()])
+        );
+        // Widening past the ceiling is an error (#232 acceptance).
+        let err = effective_packs(
+            &ceiling,
+            Some(vec!["coaching@0.1".to_string(), "testpack@0.1".to_string()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("outside"));
+        // No ceiling: per-call resolves as-is; none stays unscoped.
+        assert_eq!(
+            effective_packs(&None, Some(vec!["testpack@0.1".to_string()])).unwrap(),
+            Some(vec!["testpack@0.1".to_string()])
+        );
+        assert_eq!(effective_packs(&None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn per_call_widening_is_an_mcp_error() {
+        // #232 acceptance: a scoped call never widens past the ceiling.
+        let ceiling: Option<BTreeSet<String>> =
+            Some(["coaching@0.1".to_string()].into_iter().collect());
+        let resp = handle(
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find","arguments":{"query":"Ada","packs":["coaching@0.1","testpack@0.1"]}}}"#,
+            Path::new("/tmp"),
+            &ceiling,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside"));
     }
 }
