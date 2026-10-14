@@ -870,7 +870,9 @@ fn encrypted_vault_inherits_notes_mode_via_non_person_field() {
     assert!(out.status.success(), "record add failed: {}", stderr(&out));
 
     // The outer envelope header carries the inherited hidden flag.
-    let path = h.vault.join(format!("interactions/{ixn_id}/interaction.md"));
+    let path = h
+        .vault
+        .join(format!("interactions/{ixn_id}/interaction.md"));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
         text.contains("\nno-ai: true\n"),
