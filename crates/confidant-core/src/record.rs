@@ -116,6 +116,20 @@ impl Record {
     pub fn no_ai(&self) -> bool {
         self.field("no-ai") == Some("true")
     }
+
+    /// Tri-state `no-ai` mode (`None` when the field is absent). A `notes`
+    /// value here is only valid on person records — `parse_record`
+    /// validates that — so callers can rely on the parse. Anything
+    /// unrecognized maps to hidden (fail closed); unreachable in practice.
+    pub fn no_ai_mode(&self) -> Option<confidant_crypt::envelope::NoAi> {
+        let v = self.field("no-ai")?;
+        match v {
+            "true" => Some(confidant_crypt::envelope::NoAi::True),
+            "false" => Some(confidant_crypt::envelope::NoAi::False),
+            "notes" => Some(confidant_crypt::envelope::NoAi::Notes),
+            _ => Some(confidant_crypt::envelope::NoAi::True),
+        }
+    }
 }
 
 /// Parse a `with:` front-matter value: a bracketed, comma-separated list
@@ -543,12 +557,19 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             ));
         }
         let v = fields.get("no-ai").map(String::as_str).unwrap_or("");
-        if v != "true" && v != "false" {
+        // Issue #181: `notes` is a third value, valid only on person
+        // records (their notes/interactions default hidden). Anything else
+        // is E_FRONTMATTER, as before.
+        let valid = match kind {
+            RecordKind::Person => v == "true" || v == "false" || v == "notes",
+            _ => v == "true" || v == "false",
+        };
+        if !valid {
             return Err(FrontmatterError::key_at(
                 line,
                 "no-ai",
-                "is not a boolean",
-                "Use no-ai: true or no-ai: false",
+                "is not a valid no-ai value",
+                "Use no-ai: true or no-ai: false (no-ai: notes is only valid on person records)",
             ));
         }
     }
@@ -748,6 +769,39 @@ mod tests {
             let rec = parse_record(&src, "x.md").unwrap();
             assert!(rec.no_ai(), "{key}");
         }
+    }
+
+    // Issue #181: tri-state no-ai front matter.
+    #[test]
+    fn notes_mode_valid_on_person_only() {
+        let person = "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nno-ai: notes\n---\n";
+        let rec = parse_record(person, "x.md").unwrap();
+        assert!(!rec.no_ai(), "notes-mode person stays visible");
+        assert_eq!(
+            rec.no_ai_mode(),
+            Some(confidant_crypt::envelope::NoAi::Notes)
+        );
+
+        let note =
+            "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\nno-ai: notes\n---\n"
+            .to_string();
+        let err = parse_record(&note, "x.md").unwrap_err();
+        assert!(err.message.contains("no-ai"), "got: {}", err.message);
+
+        // true/false still validate everywhere they are allowed.
+        let note_ok = "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\nno-ai: false\n---\n";
+        let rec = parse_record(note_ok, "x.md").unwrap();
+        assert!(!rec.no_ai());
+        assert_eq!(
+            rec.no_ai_mode(),
+            Some(confidant_crypt::envelope::NoAi::False)
+        );
+        let rec_none = parse_record(
+            "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\n---\n",
+            "x.md",
+        )
+        .unwrap();
+        assert_eq!(rec_none.no_ai_mode(), None);
     }
 
     #[test]

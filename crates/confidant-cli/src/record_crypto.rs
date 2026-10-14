@@ -134,14 +134,13 @@ impl RecordEncryptor {
         })?;
         let record_type = rec.kind.as_str();
         let person = rec.field("person");
-        let own_no_ai = rec
-            .field("no-ai")
-            .map(|v| v.trim().eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        // B2: any `true` wins — the record's own flag or the person's flag
-        // read from its plaintext outer header (no decryption needed).
-        let outer_no_ai = own_no_ai || person.map(|p| person_no_ai(&self.root, p)).unwrap_or(false);
-
+        // #181: tri-state no-ai stamping. The record's own explicit flag
+        // wins; otherwise the person's mode supplies the default.
+        let own_mode = rec.no_ai_mode();
+        let person_mode: envelope::NoAi = person
+            .map(|p| person_no_ai_mode(&self.root, p))
+            .unwrap_or(envelope::NoAi::False);
+        let outer_no_ai = stamp_no_ai(record_type, own_mode, person_mode);
         // Route to the client key. A person record encrypts under its own
         // id (it has no `person` field); notes, interactions, and deals
         // with a person use the `person` field.
@@ -267,10 +266,57 @@ pub(crate) fn resolve_device_key_id(
     ))
 }
 
-/// Read a person's `no-ai` flag from its plaintext outer header — the
-/// envelope header when the profile is encrypted, the record frontmatter
-/// otherwise. Never decrypts. Missing/unreadable → false.
-fn person_no_ai(root: &Path, person: &str) -> bool {
+/// #181: compute the envelope `no-ai` for a record being encrypted.
+///
+/// Pure decision function (unit-tested below); `encrypt_file` supplies the
+/// inputs. Precedence (Q4):
+/// - a `person` record carries its own mode on the envelope;
+/// - a child's explicit `true` always hides;
+/// - a child's explicit `false` overrides a `notes` default but never a
+///   fully-hidden (`true`) person (B2 all-or-nothing preserved);
+/// - otherwise the person's mode supplies the default: `true` hides all
+///   children, `notes` hides notes/interactions, `false` hides nothing.
+fn stamp_no_ai(
+    record_type: &str,
+    own_mode: Option<envelope::NoAi>,
+    person_mode: envelope::NoAi,
+) -> envelope::NoAi {
+    use envelope::NoAi::{False, Notes, True};
+    if record_type == "person" {
+        return own_mode.unwrap_or(False);
+    }
+    match own_mode {
+        Some(True) => True,
+        Some(False) => {
+            if person_mode == True {
+                True
+            } else {
+                False
+            }
+        }
+        // `notes` on a child is rejected by parse_record; fail closed if
+        // one ever arrives here.
+        Some(Notes) => True,
+        None => {
+            let inherits = person_mode == True
+                || (person_mode == Notes && matches!(record_type, "note" | "interaction"));
+            if inherits {
+                True
+            } else {
+                False
+            }
+        }
+    }
+}
+
+/// Read a person's `no-ai` mode from its plaintext outer header — the
+/// envelope header when the profile is encrypted, the record front matter
+/// otherwise. Never decrypts.
+///
+/// #181 version-skew rule: an unreadable or missing person header fails
+/// closed — children are stamped hidden rather than visible. (The old
+/// code returned `false` here.)
+fn person_no_ai_mode(root: &Path, person: &str) -> envelope::NoAi {
     for candidate in [
         format!("people/{person}/profile.md"),
         format!("people/{person}.md"),
@@ -283,17 +329,16 @@ fn person_no_ai(root: &Path, person: &str) -> bool {
         }
         if let Ok(text) = std::str::from_utf8(&bytes) {
             if let Ok(rec) = confidant_core::record::parse_record(text, &candidate) {
-                return rec
-                    .field("no-ai")
-                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
+                return rec.no_ai_mode().unwrap_or(envelope::NoAi::False);
             }
         }
-        // Not a parseable envelope or record: fall through to the next
-        // candidate path instead of giving up (a `people/{id}/profile.md`
-        // may be absent while `people/{id}.md` exists).
+        // The file exists but is neither a parseable envelope nor a
+        // parseable record: fail closed instead of trying the next
+        // candidate path (a corrupt profile must not read as visible).
+        return envelope::NoAi::True;
     }
-    false
+    // No candidate file found at all: fail closed.
+    envelope::NoAi::True
 }
 
 /// B3 stability decision for one existing file. `decrypt` maps envelope
@@ -328,6 +373,35 @@ fn stability_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envelope::NoAi::{False, Notes, True};
+
+    #[test]
+    fn stamp_no_ai_precedence() {
+        // Persons carry their own mode.
+        assert_eq!(stamp_no_ai("person", Some(Notes), False), Notes);
+        assert_eq!(stamp_no_ai("person", Some(True), False), True);
+        assert_eq!(stamp_no_ai("person", None, False), False);
+        // Explicit child true always hides.
+        assert_eq!(stamp_no_ai("note", Some(True), False), True);
+        assert_eq!(stamp_no_ai("note", Some(True), Notes), True);
+        assert_eq!(stamp_no_ai("note", Some(True), True), True);
+        // Explicit child false overrides the notes default, but never a
+        // fully-hidden person.
+        assert_eq!(stamp_no_ai("note", Some(False), Notes), False);
+        assert_eq!(stamp_no_ai("note", Some(False), False), False);
+        assert_eq!(stamp_no_ai("note", Some(False), True), True);
+        // Inherited defaults.
+        assert_eq!(stamp_no_ai("note", None, True), True);
+        assert_eq!(stamp_no_ai("interaction", None, True), True);
+        assert_eq!(stamp_no_ai("note", None, Notes), True);
+        assert_eq!(stamp_no_ai("interaction", None, Notes), True);
+        assert_eq!(stamp_no_ai("note", None, False), False);
+        // The notes default covers notes/interactions only — deals keep
+        // the old behavior (only a true-mode person hides them).
+        assert_eq!(stamp_no_ai("deal", None, Notes), False);
+        assert_eq!(stamp_no_ai("deal", None, True), True);
+        assert_eq!(stamp_no_ai("deal", None, False), False);
+    }
 
     fn envelope_bytes() -> Vec<u8> {
         b"---\nid: p-01ABC\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: p-01ABC/e0\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n".to_vec()

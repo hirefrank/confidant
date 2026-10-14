@@ -46,12 +46,13 @@ import common  # noqa: E402
 BILLING_TAGS = ("paid", "pps", "comp")
 
 # Quoted "no-ai" / 'no-ai' are the same flag (spec section 13); anything
-# else that normalises to noai is a typo. Bare `true` only (#47).
-_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*true\s*$""", re.MULTILINE)
+# else that normalises to noai is a typo. `true` or `notes` on a person
+# hides proposed interactions (#47, #181).
+_NO_AI_RE = re.compile(r"""^['"]?no-ai['"]?:\s*(?:true|notes)\s*$""", re.MULTILINE)
 
 
 def _person_is_no_ai(vault: str, person: str) -> bool:
-    """True when the target person's record has `no-ai: true` in front matter."""
+    """True when the target person's record has `no-ai: true` or `no-ai: notes` in front matter."""
     base = os.path.join(vault, "people", person)
     for cand in (os.path.join(base, "profile.md"), base + ".md"):
         try:

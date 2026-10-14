@@ -76,7 +76,7 @@ impl RecordDecryptor {
             Ok(env) => env,
             Err(_) => return ContentOutcome::Refused,
         };
-        if env.no_ai {
+        if env.no_ai.hidden_from_agents() {
             return ContentOutcome::NoAiShell {
                 id: env.id,
                 record_type: env.record_type,

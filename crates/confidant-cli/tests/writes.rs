@@ -1301,3 +1301,77 @@ fn check_as_of_makes_gap_warnings_deterministic() {
     let (_, late_again) = check_report(root, &["--as-of", "2026-12-01"]);
     assert_eq!(late["findings"], late_again["findings"]);
 }
+
+#[test]
+fn plaintext_vault_note_add_under_notes_mode_person_is_hidden_from_find_and_context() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Switch Ada to `no-ai: notes` on this plaintext vault.
+    let profile = root.join(format!("people/{PERSON}/profile.md"));
+    std::fs::write(
+        &profile,
+        format!(
+            "---\nid: {PERSON}\ntype: person\nname: Ada Example\nno-ai: notes\n---\nAda profile body.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "set Ada to no-ai: notes"]);
+
+    let body_path = root.join(".confidant-test-note.md");
+    std::fs::write(&body_path, "Plaintext secret medical detail xylophone42.\n").unwrap();
+    let (ok, added) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--date",
+        "2026-10-05",
+        "--body-file",
+        body_path.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    let _ = std::fs::remove_file(&body_path);
+    assert!(ok, "{added}");
+
+    // `find` on the note's token returns 0 hits, while `find` on the person's name still finds the person.
+    let (ok, found_note) = run_json(&[
+        "find",
+        "xylophone42",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{found_note}");
+    assert_eq!(
+        found_note["matches"].as_array().unwrap().len(),
+        0,
+        "{found_note}"
+    );
+
+    let (ok, found_person) = run_json(&[
+        "find",
+        "Ada Example",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{found_person}");
+    assert_eq!(
+        found_person["matches"].as_array().unwrap().len(),
+        1,
+        "{found_person}"
+    );
+
+    // `context` returns the person's name and profile, and omits the un-flagged note.
+    let (ok, ctx) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{ctx}");
+    assert_eq!(ctx["person"]["name"], "Ada Example");
+    assert_eq!(ctx["notes"].as_array().unwrap().len(), 0, "{ctx}");
+}

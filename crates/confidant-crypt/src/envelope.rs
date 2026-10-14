@@ -29,7 +29,7 @@ pub struct Envelope {
     /// Record type: `person`, `note`, `interaction`, `org`, `deal`.
     pub record_type: String,
     /// AI opt-out flag. Plaintext so `find`/`context` fail closed without keys.
-    pub no_ai: bool,
+    pub no_ai: NoAi,
     /// AEAD algorithm; must be [`ALG`].
     pub enc: String,
     /// Key id: `<client-id>/e<epoch>`.
@@ -56,11 +56,60 @@ pub fn purpose_for_type(record_type: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_bool(v: &str) -> Result<bool, Error> {
-    match v.trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(Error::Envelope(format!("bad no-ai value: {other}"))),
+/// Tri-state AI opt-out for the envelope outer header (issue #181).
+///
+/// - `False` (`no-ai: false`): the record is visible to agents.
+/// - `True` (`no-ai: true`): the record is hidden from agents — never
+///   decrypted on agent paths, loaded as a shell, excluded from the
+///   allowlist.
+/// - `Notes` (`no-ai: notes`): only valid on `person` records. The person
+///   record itself stays visible to agents, but their notes and
+///   interactions default to hidden unless a child sets an explicit
+///   `no-ai: true`/`false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoAi {
+    False,
+    True,
+    Notes,
+}
+
+impl NoAi {
+    /// Parse a header value. Anything else fails closed — in particular,
+    /// readers that only know `true`/`false` reject `notes`, so a
+    /// `notes`-mode person can never be misread as a plain visible bool.
+    pub fn parse(v: &str) -> Result<NoAi, Error> {
+        match v.trim() {
+            "true" => Ok(NoAi::True),
+            "false" => Ok(NoAi::False),
+            "notes" => Ok(NoAi::Notes),
+            other => Err(Error::Envelope(format!("bad no-ai value: {other}"))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoAi::True => "true",
+            NoAi::False => "false",
+            NoAi::Notes => "notes",
+        }
+    }
+
+    /// Is this record itself hidden from agents? Only `True` — a `Notes`
+    /// person stays visible (their children default hidden instead).
+    pub fn hidden_from_agents(self) -> bool {
+        matches!(self, NoAi::True)
+    }
+
+    /// Should children of a person with this mode default to hidden at
+    /// encrypt time? `True` for both `True` and `Notes`.
+    pub fn default_child_hidden(self) -> bool {
+        matches!(self, NoAi::True | NoAi::Notes)
+    }
+}
+
+impl std::fmt::Display for NoAi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -114,7 +163,7 @@ pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
         match key {
             "id" => id = Some(v.trim().to_string()),
             "type" => record_type = Some(v.trim().to_string()),
-            "no-ai" => no_ai = Some(parse_bool(v)?),
+            "no-ai" => no_ai = Some(NoAi::parse(v)?),
             "enc" => enc = Some(v.trim().to_string()),
             "key_id" => key_id = Some(v.trim().to_string()),
             "nonce" => {
@@ -233,7 +282,7 @@ mod tests {
         Envelope {
             id: "p-01ABC".to_string(),
             record_type: "person".to_string(),
-            no_ai: false,
+            no_ai: NoAi::False,
             enc: ALG.to_string(),
             key_id: "p-01ABC/e3".to_string(),
             epoch: 3,
@@ -248,6 +297,33 @@ mod tests {
         let bytes = serialize(&env);
         let back = parse(&bytes).unwrap();
         assert_eq!(env, back);
+    }
+
+    // Issue #181: tri-state no-ai.
+    #[test]
+    fn notes_mode_round_trip() {
+        let mut env = sample();
+        env.no_ai = NoAi::Notes;
+        let bytes = serialize(&env);
+        let back = parse(&bytes).unwrap();
+        assert_eq!(back.no_ai, NoAi::Notes);
+        assert!(!back.no_ai.hidden_from_agents());
+        assert!(back.no_ai.default_child_hidden());
+        // Only `true` hides the record itself.
+        assert!(NoAi::True.hidden_from_agents());
+        assert!(!NoAi::False.hidden_from_agents());
+    }
+
+    #[test]
+    fn rejects_bad_no_ai_value() {
+        // Readers fail closed on unknown values — in particular, old
+        // readers that only know `true`/`false` reject `notes`, so a
+        // `notes`-mode person can never be misread as a plain visible bool.
+        let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: sometimes\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
+        match parse(bytes) {
+            Err(Error::Envelope(m)) if m.contains("bad no-ai value") => {}
+            other => panic!("expected bad-no-ai Envelope error, got: {other:?}"),
+        }
     }
 
     #[test]

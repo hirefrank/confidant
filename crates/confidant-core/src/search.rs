@@ -351,6 +351,7 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
         .values()
         .filter(|rec| !rec.no_ai() && !tainted.contains(&rec.id))
         .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
+        .filter(|rec| !inherits_notes_no_ai(rec, allow, &components))
         .map(|rec| rec.id.clone())
         .collect();
 
@@ -417,6 +418,11 @@ fn still_cleared(
     }) {
         return false;
     }
+    if let Some(rec) = allow.vault.records.get(id) {
+        if inherits_notes_no_ai(rec, allow, components) {
+            return false;
+        }
+    }
     if let Some(person) = &facts.path_person {
         if !cleared.contains(person) {
             return false;
@@ -436,6 +442,64 @@ fn still_cleared(
         }
     }
     true
+}
+
+/// True when `rec` is a note or interaction with no explicit `no-ai` flag of
+/// its own whose person (via `person:`, `people/<id>/` path parent, `with:`
+/// participant list, or a merge-group peer of any of those) has
+/// `no-ai: notes` (#181). Explicit `no-ai: false` on the child still
+/// overrides `notes` mode (`rec.no_ai_mode()` is `Some(NoAi::False)`).
+fn inherits_notes_no_ai(
+    rec: &crate::record::Record,
+    allow: &Allowlist<'_>,
+    components: &MergeComponents,
+) -> bool {
+    if !matches!(rec.kind, RecordKind::Note | RecordKind::Interaction) {
+        return false;
+    }
+    if rec.no_ai_mode().is_some() {
+        return false;
+    }
+    let person_has_notes_mode = |pid: &RecordId| -> bool {
+        let check_one = |id: &RecordId| -> bool {
+            allow
+                .vault
+                .records
+                .get(id)
+                .is_some_and(|p| p.no_ai_mode() == Some(confidant_crypt::envelope::NoAi::Notes))
+        };
+        if check_one(pid) {
+            return true;
+        }
+        if let Some(members) = components.members_of(pid) {
+            if members.iter().any(check_one) {
+                return true;
+            }
+        }
+        false
+    };
+    if let Some(ref person) = rec.person() {
+        if person_has_notes_mode(person) {
+            return true;
+        }
+    }
+    if let Some(facts) = allow.facts.get(&rec.id) {
+        if let Some(ref person) = facts.path_person {
+            if person_has_notes_mode(person) {
+                return true;
+            }
+        }
+    }
+    if rec.kind == RecordKind::Interaction {
+        if let Some(raw_with) = rec.field("with") {
+            if let Some(with_ids) = crate::record::parse_with_list(raw_with) {
+                if with_ids.iter().any(person_has_notes_mode) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn drop_from_cleared(

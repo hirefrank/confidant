@@ -59,7 +59,7 @@ pub struct AadHeader<'a> {
     /// Envelope `type` header.
     pub header_type: &'a str,
     /// Envelope `no-ai` header.
-    pub no_ai: bool,
+    pub no_ai: crate::envelope::NoAi,
     /// Envelope `enc` header.
     pub enc: &'a str,
     /// Envelope `key_id` header.
@@ -84,7 +84,7 @@ pub fn build_aad(h: &AadHeader<'_>) -> Vec<u8> {
     push_component(&mut aad, h.epoch.to_string().as_bytes());
     push_component(&mut aad, h.header_id.as_bytes());
     push_component(&mut aad, h.header_type.as_bytes());
-    push_component(&mut aad, if h.no_ai { b"true" } else { b"false" });
+    push_component(&mut aad, h.no_ai.as_str().as_bytes());
     push_component(&mut aad, h.enc.as_bytes());
     push_component(&mut aad, h.key_id.as_bytes());
     aad
@@ -150,7 +150,7 @@ mod tests {
             epoch: 3,
             header_id: "p-01ABC",
             header_type: "person",
-            no_ai: false,
+            no_ai: crate::envelope::NoAi::False,
             enc: ALG,
             key_id: "p-01ABC/e3",
         })

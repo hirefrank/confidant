@@ -12,7 +12,7 @@ use confidant_crypt::{
     aead, age_wrap, alias,
     anchor::{self, Anchor},
     client_id_for_record, decrypt_record, encrypt_record,
-    envelope::{self, purpose_for_type},
+    envelope::{self, purpose_for_type, NoAi},
     error::Error,
     history::{verify_history, SignerChecker},
     keys::{DataKey, DeviceKeypair, LookupKey},
@@ -134,7 +134,7 @@ fn test1_aad_binding() {
     let f = Fixture::new();
     let key = DataKey::generate();
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 3);
-    let bytes = encrypt_record(&ctx, &key, "person", false, b"secret").unwrap();
+    let bytes = encrypt_record(&ctx, &key, "person", NoAi::False, b"secret").unwrap();
 
     // Baseline decrypts.
     assert!(decrypt_record(&ctx, &key, &bytes, false).is_ok());
@@ -206,7 +206,7 @@ fn test3_wrong_key_tampered() {
     let key = DataKey::generate();
     let wrong = DataKey::generate();
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
-    let bytes = encrypt_record(&ctx, &key, "person", false, b"top secret").unwrap();
+    let bytes = encrypt_record(&ctx, &key, "person", NoAi::False, b"top secret").unwrap();
 
     // Wrong key -> auth failure, no plaintext.
     assert!(matches!(
@@ -268,7 +268,7 @@ fn test4_age_wrap_round_trip() {
 
     // Full record encrypt/decrypt with the unwrapped key.
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
-    let bytes = encrypt_record(&ctx, &back, "person", false, b"profile body").unwrap();
+    let bytes = encrypt_record(&ctx, &back, "person", NoAi::False, b"profile body").unwrap();
     let pt = decrypt_record(&ctx, &back, &bytes, false).unwrap();
     assert_eq!(pt, b"profile body");
 }
@@ -446,8 +446,8 @@ fn test8_shredding() {
     // Encrypt a record for each client.
     let ctx_a = f.ctx("p-AAAA", "p-AAAA", "profile", 1);
     let ctx_b = f.ctx("p-BBBB", "p-BBBB", "profile", 2);
-    let env_a = encrypt_record(&ctx_a, &key_a, "person", false, b"A secret").unwrap();
-    let env_b = encrypt_record(&ctx_b, &key_b, "person", false, b"B secret").unwrap();
+    let env_a = encrypt_record(&ctx_a, &key_a, "person", NoAi::False, b"A secret").unwrap();
+    let env_b = encrypt_record(&ctx_b, &key_b, "person", NoAi::False, b"B secret").unwrap();
     assert!(decrypt_record(&ctx_a, &key_a, &env_a, false).is_ok());
 
     // New recipient set (fresh device key, like onboarding after shred).
@@ -747,7 +747,7 @@ fn test9_recovery_drill() {
 
     // Encrypt/decrypt works with the recovered key.
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
-    let bytes = encrypt_record(&ctx, &back, "person", false, b"after recovery").unwrap();
+    let bytes = encrypt_record(&ctx, &back, "person", NoAi::False, b"after recovery").unwrap();
     assert_eq!(
         decrypt_record(&ctx, &back, &bytes, false).unwrap(),
         b"after recovery"
@@ -805,12 +805,12 @@ fn test10_envelope_without_keys() {
     let f = Fixture::new();
     let key = DataKey::generate();
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
-    let bytes = encrypt_record(&ctx, &key, "person", true, b"secret").unwrap();
+    let bytes = encrypt_record(&ctx, &key, "person", NoAi::True, b"secret").unwrap();
 
     // Structural validation needs no keys: parse + header checks only.
     let env = envelope::parse(&bytes).unwrap();
     assert_eq!(env.id, "p-01ABC");
-    assert!(env.no_ai);
+    assert_eq!(env.no_ai, NoAi::True);
     assert!(envelope::check_header(&env, "p-01ABC", "p-01ABC", "profile", 1).is_ok());
     assert_eq!(purpose_for_type("person"), Some("profile"));
     assert_eq!(purpose_for_type("bogus"), None);
@@ -831,8 +831,8 @@ fn test11_reencrypt_produces_new_ciphertext() {
     let f = Fixture::new();
     let key = DataKey::generate();
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 1);
-    let a = encrypt_record(&ctx, &key, "person", false, b"same").unwrap();
-    let b = encrypt_record(&ctx, &key, "person", false, b"same").unwrap();
+    let a = encrypt_record(&ctx, &key, "person", NoAi::False, b"same").unwrap();
+    let b = encrypt_record(&ctx, &key, "person", NoAi::False, b"same").unwrap();
     assert_ne!(a, b, "fresh nonce per write");
     // Both decrypt to the same plaintext.
     assert_eq!(decrypt_record(&ctx, &key, &a, false).unwrap(), b"same");
@@ -870,7 +870,7 @@ fn test14_header_flip() {
     let f = Fixture::new();
     let key = DataKey::generate();
     let ctx = f.ctx("p-01ABC", "p-01ABC", "profile", 3);
-    let bytes = encrypt_record(&ctx, &key, "person", true, b"secret").unwrap();
+    let bytes = encrypt_record(&ctx, &key, "person", NoAi::True, b"secret").unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
 
     // Flip no-ai true -> false: decrypt must fail (header is in the AAD).
@@ -1484,7 +1484,7 @@ fn test_note_round_trip_under_person_key() {
         .unwrap();
 
     let ctx = f.ctx("n-01NOTE", "p-01ABC", "note", 1);
-    let bytes = encrypt_record(&ctx, &key, "note", false, b"note body").unwrap();
+    let bytes = encrypt_record(&ctx, &key, "note", NoAi::False, b"note body").unwrap();
 
     // The key_id header names the person's key, not the note's id.
     let env = envelope::parse(&bytes).unwrap();
@@ -1512,7 +1512,7 @@ fn test_note_under_a_key_fails_as_b() {
         .unwrap();
 
     let ctx_a = f.ctx("n-01NOTE", "p-AAAA", "note", 1);
-    let bytes = encrypt_record(&ctx_a, &key_a, "note", false, b"note body").unwrap();
+    let bytes = encrypt_record(&ctx_a, &key_a, "note", NoAi::False, b"note body").unwrap();
 
     // As client B: header check fails (key_id client != ctx client).
     let ctx_b = f.ctx("n-01NOTE", "p-BBBB", "note", 1);
@@ -1710,13 +1710,21 @@ fn test_shred_client_preserves_shared() {
 
     // A deal with a person encrypts under the person's key...
     let deal_ctx = f.ctx("d-01DEAL", "p-CLI1", "deal", 1);
-    let deal_env = encrypt_record(&deal_ctx, &client_key, "deal", false, b"deal terms").unwrap();
+    let deal_env =
+        encrypt_record(&deal_ctx, &client_key, "deal", NoAi::False, b"deal terms").unwrap();
     // ...an org record and a person-less deal under vault:shared.
     let org_ctx = f.ctx("o-01ORG", SHARED_CLIENT_ID, "org", 1);
-    let org_env = encrypt_record(&org_ctx, &shared_key, "org", false, b"org profile").unwrap();
+    let org_env =
+        encrypt_record(&org_ctx, &shared_key, "org", NoAi::False, b"org profile").unwrap();
     let pld_ctx = f.ctx("d-02NODEAL", SHARED_CLIENT_ID, "deal", 1);
-    let pld_env =
-        encrypt_record(&pld_ctx, &shared_key, "deal", false, b"person-less deal").unwrap();
+    let pld_env = encrypt_record(
+        &pld_ctx,
+        &shared_key,
+        "deal",
+        NoAi::False,
+        b"person-less deal",
+    )
+    .unwrap();
     assert_eq!(
         decrypt_record(&deal_ctx, &client_key, &deal_env, false).unwrap(),
         b"deal terms"
