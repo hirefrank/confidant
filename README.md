@@ -74,7 +74,9 @@ and check it:
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"
 mkdir -p "$CONFIDANT_VAULT" && cd "$CONFIDANT_VAULT" && git init
-# Commit confidant.toml (without mode = "plaintext") so git status is clean, then:
+# confidant.toml is optional — encrypted is the default and `confidant init`
+# does not write it. Create it by hand only if you need [crypto] settings or
+# packs, then commit it so `git status` stays clean:
 confidant init   # generates your operator key; shows a 24-word recovery phrase once — store it offline
 confidant check
 confidant check --json --no-input
