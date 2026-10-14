@@ -335,4 +335,33 @@ mod tests {
             b"visible profile"
         );
     }
+
+    #[test]
+    fn aad_path_spelling_must_match_exactly() {
+        // Issue #285: the AAD binds the record path byte-for-byte, so the
+        // encrypt and decrypt sides must use the same spelling. On Windows,
+        // `Path::display()` renders `people/p-../notes/n-...md` with
+        // backslashes while the read path normalizes to forward slashes —
+        // that mismatch fails AEAD auth and the record is refused.
+        let key = keys::DataKey::generate();
+        let ctx_enc = RecordCtx {
+            vault_id: "v1".to_string(),
+            ulid: "n-01ABC".to_string(),
+            client_id: "p-01ABC".to_string(),
+            path: "people\\p-01ABC\\notes\\n-01ABC.md".to_string(),
+            purpose: "note".to_string(),
+            epoch: 1,
+        };
+        let bytes =
+            encrypt_record(&ctx_enc, &key, "note", envelope::NoAi::False, b"secret").unwrap();
+        // Forward-slash spelling (what the read path uses) fails to decrypt.
+        let mut ctx_dec = ctx_enc.clone();
+        ctx_dec.path = "people/p-01ABC/notes/n-01ABC.md".to_string();
+        assert!(decrypt_record(&ctx_dec, &key, &bytes, false).is_err());
+        // Identical spelling decrypts.
+        assert_eq!(
+            decrypt_record(&ctx_enc, &key, &bytes, false).unwrap(),
+            b"secret"
+        );
+    }
 }
