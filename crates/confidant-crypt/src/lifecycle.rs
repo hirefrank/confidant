@@ -1300,9 +1300,9 @@ impl KeyStore {
     /// key + X25519 age recipient) into the trust anchor immediately, then
     /// confirm the new phrase was written down.
     #[allow(clippy::too_many_arguments)] // 7-arg internal API; the edge
-    // count rides along because the shred warnings must reflect the actual
-    // deletion outcome. A params struct would churn all callers for no
-    // behavioral gain.
+                                         // count rides along because the shred warnings must reflect the actual
+                                         // deletion outcome. A params struct would churn all callers for no
+                                         // behavioral gain.
     pub fn shred(
         &mut self,
         shredded_client: &str,
