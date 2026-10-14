@@ -4961,6 +4961,6 @@ fn pack_emitted_codes_are_all_declared() {
         );
     }
     // Sanity: the registry holds exactly the packs this fixture covers.
-    assert_eq!(ALL_PACKS.len(), 1);
+    assert_eq!(ALL_PACKS.len(), 2);
     assert_eq!(ALL_PACKS[0].name(), "coaching@0.1");
 }

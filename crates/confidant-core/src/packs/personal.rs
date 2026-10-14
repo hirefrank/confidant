@@ -393,6 +393,20 @@ impl Pack for PersonalPack {
         &[]
     }
 
+    fn finding_codes(&self) -> &'static [&'static str] {
+        // Codes this pack's `fold` / `findings` emit. `E_TOUCH_MALFORMED`
+        // is a core code (emitted by `check`, not this pack), so it is not
+        // listed here; it is documented in `spec/findings.md`.
+        &[
+            "E_FRONTMATTER",
+            "E_INVALID_ID",
+            "E_WRONG_ID_TYPE",
+            "E_UNKNOWN_RECORD",
+            "W_CADENCE_OVERDUE",
+            "W_DATE_UPCOMING",
+        ]
+    }
+
     fn edge_kinds(&self) -> &'static [EdgeKind] {
         PERSONAL_EDGE_KINDS
     }
