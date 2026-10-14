@@ -50,7 +50,8 @@ Every skill follows the same shape:
      --json` before committing. **Post-M2** (the manifest's
      `records_blocked` is true — the vault looks encrypted): do NOT
      hand-write files into the vault tree; apply each record with
-     `confidant record add --file <scratch.md> --request-id <id>
+     `confidant record add --file <scratch.md> --request-id
+      <record.request_id from the manifest>
      --dry-run --json --no-input` first, then the real run (one commit
      per record). Stage each manifest `records[]` entry to a `0600`
      scratch file. The scripts set `records_blocked` when they detect

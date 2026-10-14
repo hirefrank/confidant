@@ -317,6 +317,7 @@ def main(argv=None) -> int:
             records.append({
                 "path": f"people/{pid}/profile.md",
                 "content": "---\n" + "\n".join(front) + f"\n---\n\n{body}\n",
+                "request_id": common.new_request_id(),
             })
             warnings.append(f"contact {cid} ({name}): no vault match; new person {pid} "
                             f"(merge duplicates later if needed)")
@@ -362,6 +363,7 @@ def main(argv=None) -> int:
         records.append({
             "path": f"deals/{deal_id}/deal.md",
             "content": "---\n" + "\n".join(front) + f"\n---\n\n{notes}\n",
+            "request_id": common.new_request_id(),
         })
         import_map_additions[f"deal:{did}"] = deal_id
         stage = str(stage_raw).strip().lower().replace(" ", "_")
@@ -455,6 +457,7 @@ def main(argv=None) -> int:
         records.append({
             "path": f"interactions/{iid}/interaction.md",
             "content": "---\n" + "\n".join(front) + f"\n---\n\n{text}\n",
+            "request_id": common.new_request_id(),
         })
         import_map_additions[f"transcript:{tid}"] = iid
         add_line(date, f"{date} session {pid} {common.format_duration(minutes)} {billing} "

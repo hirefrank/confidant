@@ -60,7 +60,7 @@ silently pick a package-consuming default.
    manifest's `records[]`, then run `confidant check --json` to validate
    before committing (one commit). **Post-M2** (`records_blocked` is true):
    stage the record to a `0600` scratch file and apply with
-   `confidant record add --file <scratch.md> --request-id <ulid>
+   `confidant record add --file <scratch.md> --request-id <record.request_id from the manifest>
    --dry-run --json --no-input`, then the real run. Never hand-write into
    the vault tree.
 6. Delete the manifest after a successful apply — it is plaintext PII:
