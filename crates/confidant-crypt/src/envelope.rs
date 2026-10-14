@@ -315,8 +315,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_no_ai_value() {
-        // Old readers fail closed on `notes` (parse_bool rejects it); new
-        // readers fail closed on anything else the same way.
+        // Readers fail closed on unknown values — in particular, old
+        // readers that only know `true`/`false` reject `notes`, so a
+        // `notes`-mode person can never be misread as a plain visible bool.
         let bytes = b"---\nid: p-01ABC\ntype: person\nno-ai: sometimes\nenc: xchacha20poly1305\nkey_id: p-01ABC/e3\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n";
         match parse(bytes) {
             Err(Error::Envelope(m)) if m.contains("bad no-ai value") => {}
