@@ -12,6 +12,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Read-only TUI (`crates/confidant-tui`, binary `confidant-tui`, workspace-only
   preview) with `Check`, `Find`, `Context`, and `Doctor` views consuming only
   the ADR-7 CLI `--json --no-input` contract (#210, part of #205).
+- `personal@0.1` schema pack: `birthday` / `cadence` / `relationship_to_me`
+  / `dates` person fields, personal relationship edge kinds (`friend`,
+  `family`, `sibling`, `partner`, `parent`, `mentor`), the `touch` ledger
+  verb (with `confidant log touch`), and two warning-level nudges that never
+  block writes: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING` (#184, #182).
 
 ## [0.2.0] - 2026-10-13
 

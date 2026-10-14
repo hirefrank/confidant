@@ -112,6 +112,8 @@ pub enum FindingCode {
     DuplicateEdge,
     UnknownEdgeKind,
     TouchMalformed,
+    CadenceOverdue,
+    DateUpcoming,
 }
 
 impl FindingCode {
@@ -160,6 +162,8 @@ impl FindingCode {
             Self::DuplicateEdge => "E_DUPLICATE_EDGE",
             Self::UnknownEdgeKind => "E_UNKNOWN_EDGE_KIND",
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
+            Self::CadenceOverdue => "W_CADENCE_OVERDUE",
+            Self::DateUpcoming => "W_DATE_UPCOMING",
         }
     }
 }
@@ -562,23 +566,56 @@ fn check_verbs_and_refs(
         // else — no other participant ids, no primary id, no interaction
         // id. Anything else is E_TOUCH_MALFORMED.
         if e.verb == "touch" {
-            let shape_ok = match e.args.as_slice() {
-                [] => true,
-                [arg] => matches!(arg.pair(), Some(("kind", _))),
-                _ => false,
-            };
-            if !shape_ok {
-                findings.push(
-                    Finding::new(
-                        FindingCode::TouchMalformed,
-                        Severity::Error,
-                        "touch line must be: DATE touch ID [kind:NAME]".to_owned(),
-                    )
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&e.id)
-                    .with_fix("Remove every argument except an optional kind:NAME"),
-                );
+            let personal_enabled = enabled_packs
+                .iter()
+                .any(|p| p.name() == crate::config::PERSONAL_PACK);
+            if personal_enabled {
+                if !crate::packs::personal::validate_touch_args_enabled(&e.args) {
+                    findings.push(
+                        Finding::new(
+                            FindingCode::TouchMalformed,
+                            Severity::Error,
+                            "touch line must be: DATE touch ID <call|text|coffee|gift|meet> [note:N-ID] [src:…]".to_owned(),
+                        )
+                        .at_file(&sourced.file)
+                        .at_line(sourced.line)
+                        .for_id(&e.id)
+                        .with_fix("Use one of call, text, coffee, gift, or meet (plus optional note: and src:)"),
+                    );
+                }
+            } else {
+                let mirrored_ok = match e.args.as_slice() {
+                    [] => true,
+                    [arg] => matches!(arg.pair(), Some(("kind", _))),
+                    _ => false,
+                };
+                if !mirrored_ok {
+                    if crate::packs::personal::is_personal_touch_shape(e) {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::PackOrphan,
+                                Severity::Warning,
+                                "ledger verb belongs to a disabled pack".to_owned(),
+                            )
+                            .at_file(&sourced.file)
+                            .at_line(sourced.line)
+                            .for_id(&e.id)
+                            .with_fix("Enable personal@0.1 or remove the line"),
+                        );
+                    } else {
+                        findings.push(
+                            Finding::new(
+                                FindingCode::TouchMalformed,
+                                Severity::Error,
+                                "touch line must be: DATE touch ID [kind:NAME]".to_owned(),
+                            )
+                            .at_file(&sourced.file)
+                            .at_line(sourced.line)
+                            .for_id(&e.id)
+                            .with_fix("Remove every argument except an optional kind:NAME"),
+                        );
+                    }
+                }
             }
         }
         // The ID-type rule is a property of the verb's definition, so it

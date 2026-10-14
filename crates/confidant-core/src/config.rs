@@ -11,19 +11,24 @@ use crate::ledger::parse_strict_date;
 
 pub const SPEC_VERSION: &str = "0.1";
 pub const COACHING_PACK: &str = "coaching@0.1";
+pub const PERSONAL_PACK: &str = "personal@0.1";
 pub const MAX_GAP_DAYS: u64 = 3650;
 pub const DEFAULT_GAP_DAYS: u64 = 45;
 pub const DEFAULT_PPS_LOOKBACK_DAYS: u64 = 180;
+pub const DEFAULT_DATE_UPCOMING_DAYS: u64 = 7;
 
 const KNOWN_SEVERITY_KEYS: &[&str] = &[
     "coaching.require_duration",
     "coaching.balance_nonnegative",
     "coaching.session_notes",
     "coaching.paid_session_gap",
+    "personal.cadence_overdue",
+    "personal.date_upcoming",
 ];
 const KNOWN_INT_KEYS: &[&str] = &[
     "coaching.paid_session_gap_days",
     "coaching.pps_lookback_days",
+    "personal.date_upcoming_days",
 ];
 const KNOWN_TOP_LEVEL: &[&str] = &["as_of"];
 
@@ -92,6 +97,8 @@ pub struct ChecksConfig {
     pub gap_days: u64,
     #[serde(skip)]
     pub pps_lookback_days: u64,
+    #[serde(skip)]
+    pub date_upcoming_days: u64,
 }
 
 impl ChecksConfig {
@@ -126,6 +133,10 @@ impl ChecksConfig {
     pub fn pps_lookback_days(&self) -> u64 {
         self.pps_lookback_days
     }
+
+    pub fn date_upcoming_days(&self) -> u64 {
+        self.date_upcoming_days
+    }
 }
 
 fn parse_severity_token(s: &str) -> Result<Option<Severity>, ()> {
@@ -152,6 +163,7 @@ impl VaultConfig {
         }
         cfg.checks.gap_days = DEFAULT_GAP_DAYS;
         cfg.checks.pps_lookback_days = DEFAULT_PPS_LOOKBACK_DAYS;
+        cfg.checks.date_upcoming_days = DEFAULT_DATE_UPCOMING_DAYS;
         Ok(cfg)
     }
 
@@ -260,7 +272,7 @@ impl VaultConfig {
                 }
                 continue;
             }
-            if key == "coaching" {
+            if key == "coaching" || key == "personal" {
                 continue;
             }
             findings.push(
@@ -287,18 +299,18 @@ impl VaultConfig {
 }
 
 fn int_key_default(key: &str) -> u64 {
-    if key == "coaching.pps_lookback_days" {
-        DEFAULT_PPS_LOOKBACK_DAYS
-    } else {
-        DEFAULT_GAP_DAYS
+    match key {
+        "coaching.pps_lookback_days" => DEFAULT_PPS_LOOKBACK_DAYS,
+        "personal.date_upcoming_days" => DEFAULT_DATE_UPCOMING_DAYS,
+        _ => DEFAULT_GAP_DAYS,
     }
 }
 
 fn int_key_dest<'a>(checks: &'a mut ChecksConfig, key: &str) -> &'a mut u64 {
-    if key == "coaching.pps_lookback_days" {
-        &mut checks.pps_lookback_days
-    } else {
-        &mut checks.gap_days
+    match key {
+        "coaching.pps_lookback_days" => &mut checks.pps_lookback_days,
+        "personal.date_upcoming_days" => &mut checks.date_upcoming_days,
+        _ => &mut checks.gap_days,
     }
 }
 
