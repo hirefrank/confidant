@@ -38,7 +38,7 @@ age = { version = "0.11", default-features = false, features = ["armor"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 getrandom = "0.4"
 hkdf = "0.12"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 include_dir = "0.7"
 # OS keychain backends (keyring 3.6 has no default features — without these
