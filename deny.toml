@@ -19,11 +19,6 @@ ignore = [
     # localized error messages; it has no effect on runtime crypto.
     # No safe upgrade exists (age 0.11 pins it); re-evaluate on age 0.12.
     "RUSTSEC-2026-0173",
-    # RUSTSEC-2024-0436: paste (via ratatui) is unmaintained. paste is a
-    # compile-time-only proc-macro pulled in by ratatui 0.29 for the
-    # unpublished confidant-tui (publish = false); revisit when ratatui
-    # drops it.
-    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

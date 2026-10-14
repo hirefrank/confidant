@@ -27,7 +27,7 @@ install, or [Quickstart](#quickstart) to try the fake-data demo vault.
 [`docs/agent-setup.md`](docs/agent-setup.md) into your agent. It handles
 everything — binary, skills, config.
 
-**Manual install** (requires a recent Rust toolchain; MSRV 1.85, see
+**Manual install** (requires a recent Rust toolchain; MSRV 1.88, see
 `rust-version` in `Cargo.toml`):
 
 ```sh

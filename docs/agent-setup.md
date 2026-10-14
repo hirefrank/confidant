@@ -9,7 +9,7 @@ whole install — drop it into an agent and it does the rest.
 Set up Confidant (relationship memory you own — a CLI plus embedded agent skills) on this machine:
 
 1. Install the CLI: `cargo install confidant-cli` (needs a Rust
-   toolchain 1.85+; check with `rustc --version`). This provides the
+   toolchain 1.88+; check with `rustc --version`). This provides the
    `confidant` binary. Make sure `~/.cargo/bin` is on PATH first
    (`export PATH="$HOME/.cargo/bin:$PATH"`) or the next step fails with
    `confidant: command not found`. Verify with `confidant --help`.

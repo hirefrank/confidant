@@ -16,7 +16,7 @@ default-members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/hirefrank/confidant"
 homepage = "https://github.com/hirefrank/confidant"
@@ -33,7 +33,7 @@ chrono = { version = "0.4.38", default-features = false, features = ["alloc", "s
 clap = { version = "4.5", features = ["derive", "env"] }
 confidant-core = { path = "crates/confidant-core", version = "0.2.0" }
 confidant-crypt = { path = "crates/confidant-crypt", version = "0.2.0" }
-crossterm = "0.28"
+crossterm = "0.29"
 age = { version = "0.12", default-features = false, features = ["armor"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 getrandom = "0.4"
@@ -51,7 +51,7 @@ include_dir = "0.7"
 # when `async-secret-service` is used.
 keyring = { version = "3.6", features = ["apple-native", "async-io", "async-secret-service", "crypto-rust"] }
 rand = "0.8"
-ratatui = "0.29"
+ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
@@ -62,7 +62,7 @@ toml_edit = "0.25"
 # Sync HTTP client for the `doctor` staleness check (#165). No async
 # runtime; rustls (ring provider) + webpki roots, and gzip is left off so
 # the tree stays small (GitHub's API returns identity when not asked for
-# compression). MSRV 1.85, matching the workspace.
+# compression). MSRV 1.88, matching the workspace.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 unicode-normalization = "0.1"
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
