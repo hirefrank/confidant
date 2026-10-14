@@ -364,6 +364,9 @@ mod tests {
                 symmetric: false,
             }]
         }
+        fn finding_codes(&self) -> &'static [&'static str] {
+            &[]
+        }
         fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
             if verb == "touch" {
                 Some(Prefix::Person)

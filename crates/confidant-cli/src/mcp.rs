@@ -216,6 +216,17 @@ fn tools() -> Vec<Value> {
             obj(&[], json!({})),
         ),
         tool("doctor", "Vault health checks.", obj(&[], json!({}))),
+        tool(
+            "pack_skill",
+            "Agent-facing skill text for the vault's packs: fields, verbs, findings and what to do about them. Honors the connection's pack scope; an optional packs list can only narrow it.",
+            obj(
+                &[],
+                json!({
+                    "pack": {"type": "string", "description": "Pack name, e.g. coaching@0.1. Unset = combined skill generated from the effective scope."},
+                    "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
+                }),
+            ),
+        ),
     ]
 }
 
@@ -348,6 +359,17 @@ fn call_tool(
         }
         "schema" => cli.push("schema".to_owned()),
         "doctor" => cli.push("doctor".to_owned()),
+        "pack_skill" => {
+            cli.push("help".to_owned());
+            match opt_str(&args, "pack") {
+                Some(p) => cli.push(format!("pack:{p}")),
+                None => cli.push("pack".to_owned()),
+            }
+            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+                cli.push("--packs".to_owned());
+                cli.push(packs.join(","));
+            }
+        }
         _ => return Err(format!("unknown tool: {name}")),
     }
 
@@ -422,6 +444,7 @@ mod tests {
             "note_add",
             "schema",
             "doctor",
+            "pack_skill",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
