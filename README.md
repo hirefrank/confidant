@@ -154,7 +154,9 @@ computer acting for you). A git remote must not hold client notes in
 plaintext. On a keyed vault the write path encrypts record content:
 `record add`, `note add`, and `log session --note` write §14 envelopes
 (per-client data keys; `name:` lives only inside the ciphertext), and inbox
-`RecordWrite` fails closed rather than writing plaintext. Ledger entries,
+`RecordWrite` items are encrypted at drain time with the vault's device
+key (without a record encryptor the drain fails closed rather than
+writing plaintext). Ledger entries,
 `import`, and `confidant.toml` stay plaintext by design. A vault with
 `[crypto] mode = "plaintext"` in `confidant.toml` opts out (only for vaults
 that hold no real data, such as the demo vault); the opt-out can never

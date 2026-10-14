@@ -386,6 +386,13 @@ enum LogAction {
         /// Source token, stored as src:<value>.
         #[arg(long)]
         src: Option<String>,
+        /// On keychain failure with --note, encrypt the note to the
+        /// pinned inbox pubkey and queue it to the `inbox` branch
+        /// instead of failing closed (#213). Without the flag the
+        /// command prompts, unless --no-input/--json (then it fails
+        /// closed).
+        #[arg(long)]
+        fallback_inbox: bool,
     },
 }
 
@@ -686,15 +693,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     date,
                     note,
                     src,
+                    fallback_inbox,
                 } => cmd_log_session(
                     &cli,
                     &root,
+                    user_config.as_ref(),
                     person,
                     duration,
                     tag.clone(),
                     date.clone(),
                     note.clone(),
                     src.clone(),
+                    *fallback_inbox,
                 ),
             }
         }
@@ -1380,6 +1390,30 @@ fn cmd_inbox(
             ))),
         }
     };
+    // Lazily built on the first RecordWrite into an encrypted vault, so
+    // ledger-only drains still work without the device key (#213). The
+    // encryptor is cached across items in one run. The closure is `move`
+    // (owns its captures) because `EncryptFn` is `dyn Fn + 'static`.
+    let encryptor: std::cell::RefCell<Option<record_crypto::RecordEncryptor>> =
+        std::cell::RefCell::new(None);
+    let root_owned = root.to_path_buf();
+    let encrypt = move |path: &std::path::Path, plaintext: &[u8]| -> anyhow::Result<Vec<u8>> {
+        let mut slot = encryptor.borrow_mut();
+        if slot.is_none() {
+            let vault = confidant_core::load_vault(&root_owned)?;
+            *slot = match record_crypto::RecordEncryptor::for_vault(&root_owned, &vault)? {
+                Some(enc) => Some(enc),
+                None => {
+                    return Err(anyhow::Error::new(DomainError::invalid(
+                        "vault declares plaintext, but the drain expected a record encryptor",
+                    )));
+                }
+            };
+        }
+        slot.as_ref()
+            .expect("record encryptor initialised above")
+            .encrypt_file(path, plaintext)
+    };
     let report = match confidant_core::run_inbox(
         root,
         &confidant_core::InboxOptions {
@@ -1390,6 +1424,7 @@ fn cmd_inbox(
         },
         &decrypt,
         inbox_keys.as_deref(),
+        Some(&encrypt),
     ) {
         Ok(report) => report,
         Err(err) => return fail_command(json, Some(&vault_path), &err),
@@ -1830,12 +1865,14 @@ fn cmd_inbox_rotate(
 fn cmd_log_session(
     cli: &Cli,
     root: &Path,
+    user_config: Option<&UserConfig>,
     person_raw: &str,
     duration: &str,
     tag: Option<String>,
     date_raw: Option<String>,
     note: Option<String>,
     src: Option<String>,
+    fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let person = parse_person_arg(&vault, person_raw)?;
@@ -1850,6 +1887,7 @@ fn cmd_log_session(
     let mut changes = Vec::new();
     let mut note_arg: Option<String> = None;
     let mut note_body: Option<String> = None;
+    let mut note_write: Option<(PathBuf, String)> = None;
     if let Some(text) = note {
         let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
@@ -1868,9 +1906,12 @@ fn cmd_log_session(
             body_start_line: 0,
             field_lines: BTreeMap::new(),
         };
+        let contents = confidant_core::format_record(&rec);
+        // The #213 fallback queues this same pair as an inbox record item.
+        note_write = Some((rel.clone(), contents.clone()));
         changes.push(FileChange::WriteFile {
             path: rel,
-            contents: confidant_core::format_record(&rec),
+            contents,
         });
         note_arg = Some(format!("note:{nid}"));
         note_body = Some(text);
@@ -1914,14 +1955,38 @@ fn cmd_log_session(
     // `apply_record_write`. The probe is read-only; the encryptor loads
     // the key again on the normal path. Gated on encrypted vaults: a
     // plaintext vault needs no key for the note either.
-    // The note cannot be queued to the inbox yet: the drain refuses
-    // RecordWrite into encrypted vaults (B11), so a queued note item
-    // could never drain and would stall the whole inbox.
+    //
+    // #213: on probe failure the note can go to the inbox instead — the
+    // drain now encrypts record items. `--fallback-inbox` queues it
+    // without asking; interactively the command prompts; under
+    // --no-input/--json it fails closed with a fix pointing at the flag.
     if note_body.is_some() {
         let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
             .map_err(anyhow::Error::new)?;
-        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted) {
-            device_key_bech32().map_err(|_| note_keychain_error())?;
+        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted)
+            && device_key_bech32().is_err()
+        {
+            let queue = if fallback_inbox {
+                true
+            } else if cli.no_input || cli.json {
+                false
+            } else {
+                prompt_fallback_inbox()?
+            };
+            if queue {
+                let (note_rel, note_contents) =
+                    note_write.expect("note write present when a note was given");
+                return queue_session_note_to_inbox(
+                    cli,
+                    root,
+                    &vault,
+                    user_config,
+                    &line,
+                    &note_rel,
+                    &note_contents,
+                );
+            }
+            return Err(note_keychain_error());
         }
     }
     let (outcome, _) = apply_record_write(
@@ -1943,6 +2008,156 @@ fn cmd_log_session(
     )
 }
 
+/// Interactive prompt for the #213 fallback: queue the note to the inbox
+/// instead of failing closed. Only an explicit `y`/`yes` queues; anything
+/// else (including EOF) fails closed.
+fn prompt_fallback_inbox() -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!(
+        "The device key cannot be loaded, so the note cannot be encrypted. \
+         Queue the session (ledger line + note) to the inbox instead? \
+         It will merge once the keychain is back. [y/N] "
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Queue a session's ledger line + note record to the `inbox` branch
+/// (#213 fallback): both items are age-encrypted to the pinned inbox
+/// pubkey and committed with a signed commit. Nothing is written to
+/// main, so no plaintext ever lands on the main branch.
+///
+/// The ledger line carries `src:fallback/<ulid>` as its provenance
+/// token (in addition to any operator `--src`), so the drain's
+/// idempotency skips it on re-import. The note record item carries the
+/// exact bytes a normal write would have produced, so the drained
+/// result matches a normal write.
+#[allow(clippy::too_many_arguments)]
+fn queue_session_note_to_inbox(
+    cli: &Cli,
+    root: &Path,
+    vault: &confidant_core::Vault,
+    user_config: Option<&UserConfig>,
+    line: &str,
+    note_rel: &Path,
+    note_contents: &str,
+) -> anyhow::Result<ExitCode> {
+    use confidant_core::QueueItem;
+    // The pin is the verification: the fallback encrypts to the pinned
+    // key, never to the vault-advertised copy alone. A missing pin, or a
+    // mismatch, refuses (E_INBOX_UNTRUSTED) — stricter than the drain,
+    // which only warns on a missing pin.
+    let pinned = user_config
+        .and_then(|u| u.inbox.pubkey.clone())
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    let vault_pubkey = vault
+        .config
+        .inbox
+        .pubkey
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let recipient = match pinned {
+        None => {
+            return Err(anyhow::Error::new(
+                DomainError::inbox_untrusted(
+                    "no [inbox].pubkey pinned in ~/.config/confidant/config.toml; \
+                     the fallback cannot verify which key it would encrypt to",
+                )
+                .with_fix(
+                    "Pin the vault's inbox key in ~/.config/confidant/config.toml \
+                     [inbox] pubkey, then re-run with --fallback-inbox",
+                ),
+            ));
+        }
+        Some(pinned) if pinned == vault_pubkey => pinned,
+        Some(_) => {
+            return Err(anyhow::Error::new(
+                DomainError::inbox_untrusted(
+                    "vault [inbox].pubkey does not match the pinned key in user config; \
+                     refusing — possible key substitution",
+                )
+                .with_fix(
+                    "Check which key is right (the pin in ~/.config/confidant/config.toml \
+                     is the operator's out-of-band copy), fix the wrong one, then re-run \
+                     with --fallback-inbox",
+                ),
+            ));
+        }
+    };
+
+    let batch = confidant_core::write::new_ulid();
+    let ledger_line = format!("{line} src:fallback/{batch}");
+    let items = vec![
+        QueueItem {
+            stem: batch.clone(),
+            plaintext: format!("confidant-inbox/1\nkind: ledger\n---\n{ledger_line}\n"),
+        },
+        QueueItem {
+            stem: format!("{batch}-note"),
+            plaintext: format!(
+                "confidant-inbox/1\nkind: record\npath: {}\n---\n{note_contents}",
+                note_rel.display()
+            ),
+        },
+    ];
+    let stems: Vec<&str> = items.iter().map(|i| i.stem.as_str()).collect();
+
+    if cli.dry_run {
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "dry_run": true,
+                    "queued": false,
+                    "fallback_inbox": true,
+                    "items": stems,
+                }),
+            ))?;
+        } else {
+            println!(
+                "dry run — would queue {} item(s) to inbox: {}",
+                items.len(),
+                stems.join(", ")
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let tip = match confidant_core::queue_items(root, &items, &recipient) {
+        Ok(tip) => tip,
+        Err(err) if DomainError::of(&err).map(|d| d.code()) == Some("E_INBOX_UNTRUSTED") => {
+            // The only E_INBOX_UNTRUSTED `queue_items` produces is the
+            // commit-signing gate; re-point its fix at this command.
+            return Err(anyhow::Error::new(
+                DomainError::inbox_signing_unconfigured().with_fix(
+                    "Configure commit signing (`git config commit.gpgsign true` and a \
+                     `user.signingkey`), then re-run with --fallback-inbox",
+                ),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "queued": true,
+                "fallback_inbox": true,
+                "items": stems,
+                "tip": tip,
+            }),
+        ))?;
+    } else {
+        println!("queued to inbox; run `confidant inbox` when the keychain is back");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Fail-closed error for `log session --note` when the device key cannot
 /// load. The generic encryptor error ("no device key enrolled") misleads
 /// when the keychain is merely broken, so the note case names the real
@@ -1956,12 +2171,11 @@ fn note_keychain_error() -> anyhow::Error {
              (the keychain may be unavailable, or this device may not be enrolled)",
         )
         .with_fix(
-            "Re-run without --note to log the session now (the ledger line needs no key), \
-             then add the note with `confidant note add` once the keychain is back. \
-             If this device was never enrolled, run `confidant init` (new vault) or \
-             `confidant recover` (new device) instead. \
-             The note cannot be queued to the inbox yet: the inbox drain refuses record \
-             writes into encrypted vaults.",
+            "Re-run with --fallback-inbox to queue the note to the inbox (it drains once \
+             the keychain is back), or re-run without --note to log the session now (the \
+             ledger line needs no key), then add the note with `confidant note add` once \
+             the keychain is back. If this device was never enrolled, run \
+             `confidant init` (new vault) or `confidant recover` (new device) instead.",
         ),
     )
 }

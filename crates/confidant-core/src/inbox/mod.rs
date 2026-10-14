@@ -45,8 +45,11 @@ mod keys;
 mod merge;
 mod plan;
 mod preflight;
+mod queue;
 mod rotate;
 mod trust;
+
+pub use queue::{queue_items, QueueItem};
 
 use git::clear_inbox;
 use item::describe_target;
@@ -65,6 +68,12 @@ pub const INBOX_BRANCH: &str = "inbox";
 /// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
 /// (the real `confidant-crypt` age path); tests inject a fake.
 pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>;
+
+/// Encrypts one record file's plaintext into the bytes to write — a §14
+/// envelope on structurally encrypted vaults. The drain passes a closure
+/// over the CLI's `RecordEncryptor`; tests inject a fake. `None` keeps the
+/// B11 fail-closed refusal for `RecordWrite` items into encrypted vaults.
+pub type EncryptFn = dyn Fn(&Path, &[u8]) -> anyhow::Result<Vec<u8>>;
 
 /// Options for [`run_inbox`].
 #[derive(Clone, Debug, Default)]
@@ -124,11 +133,18 @@ pub struct InboxReport {
 /// recipient. Pass `None` when no key is enrolled — the comparison is
 /// skipped and decryption fails closed later. Tests that inject a fake
 /// `decrypt` pass `None`.
+///
+/// `encrypt` supplies the record encryptor for `RecordWrite` items into
+/// structurally encrypted vaults (B11, #213). Pass `None` to keep the
+/// fail-closed refusal; the rotate drain passes `None` (rotate is a
+/// keychain operation and cannot build the CLI's `RecordEncryptor` —
+/// drain record items with plain `confidant inbox` before rotating).
 pub fn run_inbox(
     vault_root: &Path,
     opts: &InboxOptions,
     decrypt: &DecryptFn,
     inbox_keys: Option<&InboxKeys>,
+    encrypt: Option<&EncryptFn>,
 ) -> anyhow::Result<InboxReport> {
     let ready = match preflight(vault_root, opts, decrypt, inbox_keys)? {
         PreflightOutcome::Report(report) => return Ok(report),
@@ -151,7 +167,7 @@ pub fn run_inbox(
         match plan_item(vault_root, item, &existing_srcs, &mut ledger_cache)? {
             Some((outcome, writes)) => {
                 if !opts.dry_run {
-                    apply_writes(vault_root, &writes, &mut applied)?;
+                    apply_writes(vault_root, &writes, &mut applied, encrypt)?;
                 }
                 outcomes.push(outcome);
             }
