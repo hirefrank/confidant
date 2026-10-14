@@ -13,6 +13,45 @@ use std::path::Path;
 /// `SKILL.md`.
 pub static SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
+/// Embedded pack skill texts (`packs/<name>/SKILL.md` at the repo root,
+/// #189). One file per pack name; the binary serves the version it was
+/// compiled with. When packs go external (#193), the same per-pack file
+/// ships inside the external pack and this embedded copy remains the
+/// fallback for compiled-in packs.
+pub static PACK_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../packs");
+
+/// Agent-facing skill text for a compiled pack (`coaching@0.1` reads
+/// `coaching/SKILL.md`). `None` when the pack ships no skill text.
+pub fn pack_skill_text(pack_name: &str) -> Option<&'static str> {
+    let dir = pack_name.split('@').next()?;
+    PACK_SKILLS
+        .get_file(format!("{dir}/SKILL.md"))
+        .and_then(|f| f.contents_utf8())
+}
+
+/// Combined skill text for packs in scope, in the order given: one
+/// section per pack, generated at serve time from the enabled packs
+/// (#189). `None` when any pack ships no skill text.
+pub fn combined_pack_skill(pack_names: &[&str]) -> Option<String> {
+    let mut out = String::from("# Pack skills for this vault\n\n");
+    out.push_str(&format!(
+        "Packs in scope: {}\n",
+        if pack_names.is_empty() {
+            "(none)".to_owned()
+        } else {
+            pack_names.join(", ")
+        }
+    ));
+    for name in pack_names {
+        let text = pack_skill_text(name)?;
+        out.push_str("\n---\n\n## ");
+        out.push_str(name);
+        out.push_str("\n\n");
+        out.push_str(text);
+    }
+    Some(out)
+}
+
 /// Skill ids: subdirectories of the embedded tree containing a `SKILL.md`.
 pub fn skill_ids() -> Vec<&'static str> {
     // NOTE: `Dir::get_file` matches on the entry path relative to the
@@ -88,5 +127,46 @@ mod tests {
             ]
         );
         assert!(SKILLS.get_dir("bin").is_some());
+    }
+
+    #[test]
+    fn embedded_packs_tree_has_skill_per_pack() {
+        for pack in confidant_core::packs::ALL_PACKS {
+            assert!(
+                pack_skill_text(pack.name()).is_some(),
+                "pack {} ships no SKILL.md",
+                pack.name()
+            );
+        }
+    }
+
+    /// Drift test (#189): every finding code a pack declares it can emit
+    /// must be documented in its skill text ("what it means, what to do"),
+    /// so the docs stay honest as rules change.
+    #[test]
+    fn pack_skills_document_all_declared_finding_codes() {
+        for pack in confidant_core::packs::ALL_PACKS {
+            let text = pack_skill_text(pack.name())
+                .unwrap_or_else(|| panic!("pack {} ships no SKILL.md", pack.name()));
+            for code in pack.finding_codes() {
+                assert!(
+                    text.contains(code),
+                    "pack {} can emit {code} but its SKILL.md does not document it",
+                    pack.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn combined_pack_skill_lists_packs_in_scope() {
+        let combined = combined_pack_skill(&["coaching@0.1"]).unwrap();
+        assert!(combined.contains("Packs in scope: coaching@0.1"));
+        assert!(combined.contains("## coaching@0.1"));
+        // The embedded copy is the served copy: spot-check content.
+        assert!(combined.contains("E_OPEN_MALFORMED"));
+        assert!(combined_pack_skill(&["nope@9.9"]).is_none());
+        let empty = combined_pack_skill(&[]).unwrap();
+        assert!(empty.contains("Packs in scope: (none)"));
     }
 }

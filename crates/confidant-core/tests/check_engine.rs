@@ -4717,3 +4717,79 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     assert_eq!(ctx_note_ids, vec![note_explicit_false]);
     assert!(ctx.interactions.is_empty(), "{:?}", ctx.interactions);
 }
+
+/// Drift test (#189, behavioral half): every finding code the coaching
+/// pack's rules actually emit over a violations fixture must be declared
+/// in `CoachingPack::finding_codes()`. Together with the SKILL.md
+/// documentation test (cli `embedded` tests) this gives:
+/// emitted ⊆ declared ⊆ documented, so the skill text stays honest.
+#[test]
+fn pack_emitted_codes_are_all_declared() {
+    use confidant_core::packs::{coaching::CoachingPack, Pack, ALL_PACKS};
+    use std::collections::HashSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    person(dir.path(), BEA, "Bea Example");
+    // BEA: paid client (package opened 68 days before as-of, balance > 0)
+    // with no sessions in the gap window -> E_PAID_SESSION_GAP only.
+    write(
+        dir.path(),
+        "ledger/2026/08.cfd",
+        &format!("2026-08-01 open {BEA} package {PKG2} 6 sessions\n"),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 1 sessions\n\
+             2026-10-01 open {ADA} package {PKG} 100001 sessions\n\
+             2026-10-01 open {ADA} package bad-pkg-id 6 sessions\n\
+             2026-10-02 session {ADA} paid\n\
+             2026-10-02 session {ADA} 60m paid pps\n\
+             2026-10-02 session {ADA} 60m\n\
+             2026-10-02 session {ADA} 60m paid note:not-an-id\n\
+             2026-10-02 session {ADA} 60m paid note:{ADA}\n\
+             2026-10-02 session {ADA} 60m paid note:{NOTE2}\n\
+             2026-10-03 session {ADA} 60m paid\n\
+             2026-10-04 session {ADA} 60m paid\n\
+             2026-10-05 session {ADA} 60m paid\n\
+             2026-10-06 session {ADA} 60m paid\n\
+             2026-10-08 balance {ADA} sessions_remaining 999\n\
+             2026-10-08 balance {ADA} sessions_remaining abc\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let emitted = codes(&json);
+    // Sanity: the fixture really does exercise every declared code.
+    for want in [
+        "E_PARSE",
+        "E_BALANCE_MISMATCH",
+        "E_NEGATIVE_BALANCE",
+        "E_OPEN_MALFORMED",
+        "E_INVALID_ID",
+        "E_WRONG_ID_TYPE",
+        "E_MISSING_DURATION",
+        "E_SESSION_TAGS",
+        "W_SESSION_UNTAGGED",
+        "E_UNKNOWN_RECORD",
+        "E_SESSION_WITHOUT_NOTES",
+        "E_PAID_SESSION_GAP",
+    ] {
+        assert!(
+            emitted.contains(&want.to_string()),
+            "fixture did not emit {want}: {emitted:?}"
+        );
+    }
+    let declared: HashSet<&str> = CoachingPack.finding_codes().iter().copied().collect();
+    for code in &emitted {
+        assert!(
+            declared.contains(code.as_str()),
+            "pack emitted {code} but finding_codes() does not declare it: {emitted:?}"
+        );
+    }
+    // Sanity: the registry holds exactly the packs this fixture covers.
+    assert_eq!(ALL_PACKS.len(), 1);
+    assert_eq!(ALL_PACKS[0].name(), "coaching@0.1");
+}

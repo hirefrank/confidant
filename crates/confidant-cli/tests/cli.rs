@@ -531,3 +531,100 @@ fn find_edge_scoping_follows_kind() {
     let v = find("nemesis", Some(COACHING));
     assert_eq!(v["matches"], serde_json::json!([]));
 }
+#[test]
+fn help_pack_coaching_serves_skill_text() {
+    let out = Command::new(bin())
+        .args(["help", "pack:coaching@0.1", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("# Coaching pack (coaching@0.1)"), "{text}");
+    assert!(text.contains("E_OPEN_MALFORMED"), "{text}");
+    assert!(text.contains("W_SESSION_UNTAGGED"), "{text}");
+}
+
+#[test]
+fn help_pack_coaching_json_envelope() {
+    let out = Command::new(bin())
+        .args(["help", "pack:coaching@0.1", "--json", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["packs"], serde_json::json!(["coaching@0.1"]));
+    assert!(v["skill"].as_str().unwrap().contains("E_PAID_SESSION_GAP"));
+}
+
+#[test]
+fn help_pack_bare_serves_combined_skill() {
+    let out = Command::new(bin())
+        .args(["help", "pack", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Packs in scope: coaching@0.1"), "{text}");
+    assert!(text.contains("## coaching@0.1"), "{text}");
+}
+
+#[test]
+fn help_pack_unknown_pack_is_not_found() {
+    let out = Command::new(bin())
+        .args(["help", "pack:nope@9.9", "--json", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+}
+
+#[test]
+fn help_pack_outside_scope_is_not_found() {
+    // --packs names a disabled pack -> usage error before we get there.
+    let out = Command::new(bin())
+        .args([
+            "help",
+            "pack:coaching@0.1",
+            "--packs",
+            "nope@9.9",
+            "--vault",
+        ])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn help_pack_needs_a_vault() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["help", "pack:coaching@0.1"])
+        .current_dir(tmp.path())
+        .env_remove("CONFIDANT_VAULT")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("need a vault"), "{stderr}");
+}

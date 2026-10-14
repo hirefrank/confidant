@@ -153,6 +153,23 @@ impl Pack for CoachingPack {
         &["sessions_remaining", "icf_hours"]
     }
 
+    fn finding_codes(&self) -> &'static [&'static str] {
+        &[
+            "E_PARSE",
+            "E_BALANCE_MISMATCH",
+            "E_NEGATIVE_BALANCE",
+            "E_OPEN_MALFORMED",
+            "E_INVALID_ID",
+            "E_WRONG_ID_TYPE",
+            "E_MISSING_DURATION",
+            "E_SESSION_TAGS",
+            "W_SESSION_UNTAGGED",
+            "E_UNKNOWN_RECORD",
+            "E_SESSION_WITHOUT_NOTES",
+            "E_PAID_SESSION_GAP",
+        ]
+    }
+
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
         match verb {
             "open" | "session" => Some(Prefix::Person),

@@ -87,6 +87,13 @@ pub trait Pack: Send + Sync {
     fn edge_kinds(&self) -> &'static [EdgeKind] {
         &[]
     }
+    /// Finding codes this pack's rules can emit (its `fold`, `findings`,
+    /// and `check_balance` implementations). Every code listed here must
+    /// be documented in the pack's `SKILL.md` ("what it means, what to do")
+    /// — a drift test enforces it. Codes outside this list that fire on
+    /// the pack's verbs or metrics are core codes, documented in
+    /// `spec/findings.md`.
+    fn finding_codes(&self) -> &'static [&'static str];
     /// The record type a verb's ledger ID must have, if the verb constrains
     /// it (e.g. `open` / `session` require a person ID). `None` means the
     /// verb constrains nothing. Defaults to `None`.
@@ -294,6 +301,9 @@ mod tests {
                 symmetric: false,
             }]
         }
+        fn finding_codes(&self) -> &'static [&'static str] {
+            &[]
+        }
         fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
             if verb == "touch" {
                 Some(Prefix::Person)
@@ -367,6 +377,9 @@ mod tests {
             fn balance_metrics(&self) -> &'static [&'static str] {
                 &[]
             }
+            fn finding_codes(&self) -> &'static [&'static str] {
+                &[]
+            }
             fn fold(
                 &self,
                 _vault: &Vault,
@@ -427,6 +440,9 @@ mod tests {
                     name: "mentor",
                     symmetric: false,
                 }]
+            }
+            fn finding_codes(&self) -> &'static [&'static str] {
+                &[]
             }
             fn fold(
                 &self,

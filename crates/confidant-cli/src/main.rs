@@ -4125,6 +4125,15 @@ fn help_json_value() -> serde_json::Value {
 }
 
 fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::Result<ExitCode> {
+    // Pack skill topics (#189) are served from the embedded pack SKILL.md
+    // files, filtered to enabled packs in scope. They need the vault (to
+    // resolve enablement) and their own JSON shape, so they run before the
+    // generic clap-help paths below.
+    if let Some(t) = topic.as_deref() {
+        if t == "pack" || t.starts_with("pack:") {
+            return cmd_help_pack(cli, vault, t);
+        }
+    }
     if cli.json {
         // Generated from the live clap definitions, so it cannot drift.
         print_json(&ok_envelope(vault, help_json_value()))?;
@@ -4153,6 +4162,70 @@ fn cmd_help(cli: &Cli, vault: Option<&Path>, topic: Option<String>) -> anyhow::R
                 }
             }
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Serve pack skill text (#189): `help pack` prints the combined skill
+/// generated from the enabled packs in scope; `help pack:<name>` prints
+/// one pack's skill. Only enabled packs are shown, and the `--packs`
+/// scope applies (#178): unscoped shows all enabled packs, and naming an
+/// unknown or disabled pack is a usage error.
+fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result<ExitCode> {
+    let root = vault.ok_or_else(|| {
+        anyhow::Error::new(
+            DomainError::not_found("pack skills need a vault to resolve enabled packs")
+                .with_fix("Pass --vault, set CONFIDANT_VAULT, or run inside a vault directory"),
+        )
+    })?;
+    let v = vault_or!(root, cli.json);
+    let (_scope, names) =
+        resolve_cli_scope(&v, cli.packs.as_deref()).map_err(anyhow::Error::new)?;
+
+    let (packs, text) = match topic.strip_prefix("pack:") {
+        Some(name) => {
+            if name.is_empty() {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "empty pack name: use `help pack:<name>`, e.g. `help pack:coaching@0.1`",
+                )));
+            }
+            if !names.iter().any(|n| n == name) {
+                let known = ALL_PACKS.iter().any(|p| p.name() == name);
+                return Err(anyhow::Error::new(
+                    DomainError::not_found(if known {
+                        format!(
+                        "pack `{name}` is not enabled in this vault or is outside the --packs scope"
+                    )
+                    } else {
+                        format!("unknown pack `{name}`")
+                    })
+                    .with_fix("Enable it in confidant.toml `packs = [...]` or widen --packs"),
+                ));
+            }
+            let text = embedded::pack_skill_text(name).ok_or_else(|| {
+                anyhow::Error::new(DomainError::internal(format!(
+                    "pack `{name}` is enabled but ships no SKILL.md"
+                )))
+            })?;
+            (vec![name.to_owned()], text.to_owned())
+        }
+        None => {
+            debug_assert_eq!(topic, "pack");
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let text = embedded::combined_pack_skill(&refs).ok_or_else(|| {
+                anyhow::Error::new(DomainError::internal("an enabled pack ships no SKILL.md"))
+            })?;
+            (names.clone(), text)
+        }
+    };
+
+    if cli.json {
+        print_json(&ok_envelope(
+            vault,
+            serde_json::json!({ "topic": topic, "packs": packs, "skill": text }),
+        ))?;
+    } else {
+        println!("{text}");
     }
     Ok(ExitCode::SUCCESS)
 }
