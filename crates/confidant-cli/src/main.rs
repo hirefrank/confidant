@@ -38,6 +38,7 @@ use confidant_core::write::{
     WriteOptions, WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, CheckOptions};
+use confidant_core::{ContentHook, ContentOutcome};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -2382,14 +2383,80 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     }
     let contents = confidant_core::format_record(&rec);
     let id = rec.id.to_string();
+    // #179: a multi-person interaction mirrors one minimal touchpoint per
+    // `with:` participant (date + own id, nothing else) so each
+    // participant's cadence updates. The touchpoints land in the same
+    // write (same commit) as the interaction record. The writer validates
+    // shape (parse, person prefix, not the primary, no duplicates);
+    // existence is `check`'s job (keyed check), like every other
+    // front-matter reference.
+    let mut touch_lines: Vec<String> = Vec::new();
+    let mut touch_change: Option<FileChange> = None;
+    if rec.kind == RecordKind::Interaction {
+        if let Some(raw) = rec.field("with") {
+            let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
+                anyhow::Error::new(
+                    DomainError::invalid(
+                        "front matter key 'with' is not a bracketed list of person IDs",
+                    )
+                    .with_fix("Use with: [p-<ULID>, p-<ULID>]"),
+                )
+            })?;
+            if !with.is_empty() {
+                let date_raw = rec.field("date").ok_or_else(|| {
+                    anyhow::Error::new(
+                        DomainError::invalid(
+                            "interaction with with: needs a date (touchpoints are dated)",
+                        )
+                        .with_fix("Add date: YYYY-MM-DD to the interaction"),
+                    )
+                })?;
+                let date = parse_strict_date(date_raw).ok_or_else(|| {
+                    anyhow::Error::new(DomainError::invalid("interaction date is not YYYY-MM-DD"))
+                })?;
+                let primary = rec.person();
+                let mut seen: Vec<RecordId> = Vec::new();
+                for participant in &with {
+                    if participant.prefix() != Prefix::Person {
+                        return Err(anyhow::Error::new(
+                            DomainError::invalid("with: entries must be person ids")
+                                .with_fix("Use p-<ULID> ids in with:"),
+                        ));
+                    }
+                    if Some(participant) == primary.as_ref() {
+                        return Err(anyhow::Error::new(
+                            DomainError::invalid("with: lists the interaction's own person")
+                                .with_fix("Remove the primary person from with:"),
+                        ));
+                    }
+                    if seen.contains(participant) {
+                        return Err(anyhow::Error::new(
+                            DomainError::invalid("with: lists the same participant twice")
+                                .with_fix("List each participant once in with:"),
+                        ));
+                    }
+                    seen.push(participant.clone());
+                    touch_lines.push(format!("{date} touch {participant}"));
+                }
+                touch_change = Some(FileChange::AppendLines {
+                    path: month_path(&date),
+                    lines: touch_lines.clone(),
+                });
+            }
+        }
+    }
+    let mut changes = vec![FileChange::WriteFile {
+        path: rel.clone(),
+        contents,
+    }];
+    if let Some(change) = touch_change {
+        changes.push(change);
+    }
     let (outcome, created_keys) = apply_record_write(
         root,
         &vault,
         PendingWrite {
-            changes: vec![FileChange::WriteFile {
-                path: rel.clone(),
-                contents,
-            }],
+            changes,
             summary: format!("record {id}"),
             canonical_request: format!("record-add/v1\npath={}\nbody={}", rel.display(), text),
         },
@@ -2404,6 +2471,10 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     });
     if !created_keys.is_empty() {
         extra["created_keys"] = serde_json::json!(created_keys);
+    }
+    // #179: the mirrored touchpoints, only when any were written.
+    if !touch_lines.is_empty() {
+        extra["touchpoints"] = serde_json::json!(touch_lines);
     }
     let result = finish_write(cli, root, "record-add", outcome, extra);
     if !cli.json {
@@ -2482,9 +2553,10 @@ fn cmd_context(
             println!("icf hours: {:.2}", c.icf_hours);
         }
         println!(
-            "notes: {}, interactions: {}",
+            "notes: {}, interactions: {}, touchpoints: {}",
             bundle.notes.len(),
-            bundle.interactions.len()
+            bundle.interactions.len(),
+            bundle.touchpoints.len()
         );
         if !bundle.aliases.is_empty() {
             println!("aliases: {}", bundle.aliases.join(", "));
@@ -5263,6 +5335,118 @@ fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow
     Ok(())
 }
 
+/// Delete every edge record naming `client_id` from the working tree
+/// (#179). Runs BEFORE `KeyStore::shred` destroys keys: edge discovery
+/// needs decryption (edges live under `vault:shared`, so `a` / `b` sit
+/// inside the ciphertext in encrypted vaults), and a failure here must
+/// abort before any irreversible key destruction. Returns the deleted
+/// vault-relative paths, for staging into the same signed shred commit.
+///
+/// Fail-closed, edge-scoped: refuses when any *edge's* ends cannot be
+/// determined — an undecryptable or tampered edge envelope, a `no-ai`
+/// shell, a malformed edge file, or an edge with a missing/malformed
+/// end — because an unseen edge might name the shredded person.
+/// Skipped or refused envelopes *outside* `edges/` do not block shred:
+/// after `keys shred` of person A, A's leftover envelopes stay in the
+/// tree and become undecryptable, and shredding B must still proceed
+/// when every edge reads fine.
+fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<String>> {
+    // Keyed load: decrypts edge envelopes via the current device key.
+    // (Same probe-then-keyed pattern as `load_vault_for_reads`.)
+    let probe = load_vault(root)?;
+    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
+        root,
+        &probe.config.vault_id,
+    ));
+    // Wrap the decrypt hook to record per-path outcomes under `edges/`.
+    // Record files load on worker threads, hence the mutexes.
+    let edge_skipped = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let edge_refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let inner = decryptor.hook();
+    let hook: ContentHook = std::sync::Arc::new({
+        let edge_skipped = std::sync::Arc::clone(&edge_skipped);
+        let edge_refused = std::sync::Arc::clone(&edge_refused);
+        move |path: &str, bytes: &[u8]| {
+            let outcome = inner(path, bytes);
+            if path.starts_with("edges/") {
+                match outcome {
+                    ContentOutcome::Skipped => {
+                        edge_skipped.lock().unwrap().push(path.to_string());
+                    }
+                    ContentOutcome::Refused => {
+                        edge_refused.lock().unwrap().push(path.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            outcome
+        }
+    });
+    let vault =
+        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
+    let edge_skipped = edge_skipped.lock().unwrap();
+    if !edge_skipped.is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every edge naming {client_id}: {} edge envelope(s) could not be decrypted on this device; refusing to shred",
+            edge_skipped.len()
+        )).with_fix(
+            "Run shred from a device that can decrypt every edge, or resolve the undecryptable edge files first",
+        )));
+    }
+    let edge_refused = edge_refused.lock().unwrap();
+    if !edge_refused.is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every edge naming {client_id}: {} edge envelope(s) were refused as tampered or corrupt; refusing to shred",
+            edge_refused.len()
+        )).with_fix(
+            "Resolve the refused edge envelopes first (check reports them as unreadable)",
+        )));
+    }
+    // A load finding on an edge file means an edge record could not be
+    // parsed — its ends are unknown.
+    if let Some(bad) = vault
+        .load_findings
+        .iter()
+        .find(|f| f.file.as_deref().is_some_and(|p| p.starts_with("edges/")))
+    {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot determine every edge naming {client_id}: an edge file could not be parsed ({}); refusing to shred",
+            bad.file.as_deref().unwrap_or("edges/")
+        )).with_fix(
+            "Fix or remove the unparseable edge file, then re-run shred",
+        )));
+    }
+    let mut deleted = Vec::new();
+    for rec in vault.records.values() {
+        if rec.kind != RecordKind::Edge {
+            continue;
+        }
+        let (Some(a), Some(b)) = (rec.edge_end("a"), rec.edge_end("b")) else {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot determine every edge naming {client_id}: edge {} has a missing or malformed end; refusing to shred",
+                rec.id
+            )).with_fix(
+                "Fix the edge's a/b ends, then re-run shred",
+            )));
+        };
+        if a.to_string() == client_id || b.to_string() == client_id {
+            let path = root.join(&rec.path);
+            std::fs::remove_file(&path).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot delete edge file {}: {e}",
+                    rec.path
+                )))
+            })?;
+            // Best-effort: drop the now-empty edge directory.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            deleted.push(rec.path.clone());
+        }
+    }
+    Ok(deleted)
+}
+
 fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{anchor, lifecycle::KeyStore};
     validate_keys_client_id(client_id)?;
@@ -5307,6 +5491,11 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // Skip vault:lookup (keys/vault) — shred handles it separately.
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
+    // #179: delete edges naming the shredded person BEFORE destroying
+    // keys — discovery needs decryption, and a failure must abort before
+    // any irreversible key destruction. The deletions stage into the same
+    // signed shred commit below.
+    let deleted_edges = delete_edges_naming(root, client_id)?;
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
             .map_err(anyhow::Error::new)?;
@@ -5337,6 +5526,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             &operator_sk,
             &anchor,
             identity.as_ref(),
+            deleted_edges.len(),
         )
         .map_err(anyhow::Error::new)?;
 
@@ -5394,6 +5584,21 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         )));
     }
     stage_keys(root, no_input)?;
+    // #179: stage the deleted edge files (deletions only, exact paths) so
+    // they land in the same signed shred commit. Only tracked paths: an
+    // edge file that was never committed has nothing to stage. Per-path,
+    // so unrelated unstaged changes under edges/ are not swept in.
+    if !deleted_edges.is_empty() {
+        let mut ls_args: Vec<&str> = vec!["ls-files", "-z", "--"];
+        ls_args.extend(deleted_edges.iter().map(String::as_str));
+        let listed = confidant_core::write::git(root, &ls_args, no_input)?;
+        let tracked: Vec<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
+        if !tracked.is_empty() {
+            let mut add_args: Vec<&str> = vec!["add", "--"];
+            add_args.extend(tracked);
+            confidant_core::write::git(root, &add_args, no_input)?;
+        }
+    }
     confidant_core::write::git(
         root,
         &["commit", "-m", &format!("keys: shred {client_id}")],
@@ -5452,6 +5657,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "client_id": client_id,
             "destroy_key_ids": outcome.destroy_key_ids,
             "warnings": shred_warnings,
+            "deleted_edges": deleted_edges,
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
             "search_index_deleted": search_index_deleted,
@@ -5461,6 +5667,12 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         println!("shredded client {client_id}");
         println!("device key rotated: this device was re-enrolled with a fresh keypair");
         println!("other devices were removed: re-enroll them with `keys device-add`");
+        if !deleted_edges.is_empty() {
+            println!(
+                "deleted {} edge(s) naming {client_id} (same commit)",
+                deleted_edges.len()
+            );
+        }
         if search_index_deleted {
             println!("local search index deleted (re-run `confidant reindex` to rebuild)");
         }

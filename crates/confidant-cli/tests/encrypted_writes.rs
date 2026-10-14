@@ -1479,6 +1479,171 @@ fn record_add_after_device_add_uses_enrolled_key_id() {
     );
 }
 
+const EDGE: &str = "e-01M3TC5H00MPJG00E100000000";
+const IXN: &str = "i-01M3TC5H00MPJG00F100000000";
+
+fn edge_md(id: &str, a: &str, b: &str, kind: &str) -> String {
+    format!("---\nid: {id}\ntype: edge\na: {a}\nb: {b}\nkind: {kind}\n---\n")
+}
+
+fn record_add(h: &Harness, file: &Path) -> Output {
+    h.cmd(&[
+        "record",
+        "add",
+        "--file",
+        file.to_str().unwrap(),
+        "--no-input",
+    ])
+    .output()
+    .unwrap()
+}
+
+#[test]
+fn record_add_edge_encrypts_under_shared_key() {
+    // #179: edges live under vault:shared — the envelope's key_id names
+    // the shared client, and a/b/kind never appear outside the ciphertext.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    for (id, name) in [(PERSON, "Ada Example"), (PERSON2, "Bea Demo")] {
+        let input = write_file(
+            h._tmp.path(),
+            &format!("{id}.md"),
+            &person_md(id, name, "Bio."),
+        );
+        let out = record_add(&h, &input);
+        assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    }
+
+    let input = write_file(
+        h._tmp.path(),
+        "edge.md",
+        &edge_md(EDGE, PERSON, PERSON2, "married"),
+    );
+    let out = record_add(&h, &input);
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    let path = h.vault.join(format!("edges/{EDGE}/edge.md"));
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.starts_with("---\nid:"), "not an envelope:\n{text}");
+    assert!(text.contains("\nenc: xchacha20poly1305\n"), "no enc header");
+    assert!(
+        text.contains("key_id: vault:shared/"),
+        "edge must encrypt under vault:shared, got:\n{text}"
+    );
+    assert!(!text.contains(PERSON), "edge end leaked to outer header");
+    assert!(
+        !text.contains("married"),
+        "edge kind leaked to outer header"
+    );
+}
+
+#[test]
+fn record_add_interaction_with_mirrors_touchpoints() {
+    // #179 Q3: one minimal touchpoint per `with:` participant — date +
+    // own id only, no other participant ids, no primary id, no
+    // interaction id — in the same write as the interaction record.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+
+    for (id, name) in [(PERSON, "Ada Example"), (PERSON2, "Bea Demo")] {
+        let input = write_file(
+            h._tmp.path(),
+            &format!("{id}.md"),
+            &person_md(id, name, "Bio."),
+        );
+        let out = record_add(&h, &input);
+        assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    }
+
+    let ixn = format!(
+        "---\nid: {IXN}\ntype: interaction\nname: Group dinner\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{PERSON2}]\n---\n\nFake group dinner.\n"
+    );
+    let input = write_file(h._tmp.path(), "ixn.md", &ixn);
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["touchpoints"],
+        serde_json::json!([format!("2026-10-06 touch {PERSON2}")]),
+        "{v}"
+    );
+
+    // The interaction record itself went to the primary's key.
+    let path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains(&format!("key_id: {PERSON}/")),
+        "interaction must encrypt under the primary's key:\n{text}"
+    );
+    assert!(!text.contains(PERSON2), "with: list leaked to outer header");
+
+    // The ledger carries exactly one touchpoint line for the participant.
+    let ledger = std::fs::read_to_string(h.vault.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("2026-10-06 touch {PERSON2}\n")),
+        "touchpoint missing from ledger:\n{ledger}"
+    );
+    assert!(
+        !ledger.contains(IXN),
+        "touchpoint must not carry the interaction id:\n{ledger}"
+    );
+    assert!(
+        !ledger.contains(&format!("touch {PERSON} ")),
+        "touchpoint must not carry the primary id:\n{ledger}"
+    );
+}
+
+#[test]
+fn record_add_interaction_with_validates_shape() {
+    // The writer refuses what `check` would reject: a self entry, a
+    // duplicate, a malformed list, and a `with:` without a date.
+    let h = Harness::new();
+    h.keyed(PERSON);
+
+    let cases = [
+        // Self: the primary is in with:.
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Dinner\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{PERSON}]\n---\n\nBody.\n"
+        ),
+        // Duplicate participant.
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Dinner\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{PERSON2}, {PERSON2}]\n---\n\nBody.\n"
+        ),
+        // Malformed: not a bracketed list.
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Dinner\ndate: 2026-10-06\nperson: {PERSON}\nwith: {PERSON2}\n---\n\nBody.\n"
+        ),
+        // No date: touchpoints are dated, so the write fails closed.
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Dinner\nperson: {PERSON}\nwith: [{PERSON2}]\n---\n\nBody.\n"
+        ),
+    ];
+    for body in &cases {
+        let input = write_file(h._tmp.path(), "ixn.md", body);
+        let out = record_add(&h, &input);
+        assert!(!out.status.success(), "write should have failed: {body}");
+    }
+    // Nothing was written: no interaction file, no ledger lines.
+    assert!(!h.vault.join(format!("interactions/{IXN}")).exists());
+    assert!(!h.vault.join("ledger/2026/10.cfd").exists());
+}
+
 // ---------------------------------------------------------------------------
 // #213: `log session --note --fallback-inbox`
 // ---------------------------------------------------------------------------

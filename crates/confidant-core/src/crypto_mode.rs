@@ -18,7 +18,7 @@ use crate::error::DomainError;
 /// these are record content and go through the encryption transform;
 /// everything else (ledger, `confidant.toml`, inbox) stays plaintext by
 /// design.
-const RECORD_COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes"];
+const RECORD_COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
 
 /// True when `path` (vault-relative) is a record file. Used by the write
 /// layer so a future command that writes records cannot bypass encryption.

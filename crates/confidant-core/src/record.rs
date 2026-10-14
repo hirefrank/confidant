@@ -13,6 +13,7 @@ pub enum RecordKind {
     Deal,
     Interaction,
     Note,
+    Edge,
 }
 
 impl RecordKind {
@@ -23,6 +24,7 @@ impl RecordKind {
             Self::Deal => "deal",
             Self::Interaction => "interaction",
             Self::Note => "note",
+            Self::Edge => "edge",
         }
     }
 
@@ -33,6 +35,7 @@ impl RecordKind {
             Self::Deal => Prefix::Deal,
             Self::Interaction => Prefix::Interaction,
             Self::Note => Prefix::Note,
+            Self::Edge => Prefix::Edge,
         }
     }
 
@@ -43,6 +46,7 @@ impl RecordKind {
             "deal" => Some(Self::Deal),
             "interaction" => Some(Self::Interaction),
             "note" => Some(Self::Note),
+            "edge" => Some(Self::Edge),
             _ => None,
         }
     }
@@ -50,7 +54,10 @@ impl RecordKind {
     pub fn allows_no_ai(self) -> bool {
         match self {
             Self::Person | Self::Note | Self::Deal | Self::Interaction => true,
-            Self::Org => false,
+            // Org has no no-ai; an edge is ids + kind + dates only, and
+            // its content is never agent-facing prose, so no-ai is
+            // meaningless on it too.
+            Self::Org | Self::Edge => false,
         }
     }
 }
@@ -95,9 +102,45 @@ impl Record {
         }
     }
 
+    /// One end of an edge (`a` / `b`): a person ID parsed with the same
+    /// wikilink / quote / comment tolerance as `person` / `org` / `deal`.
+    /// `None` when the key is absent, empty, or malformed — `check`
+    /// distinguishes those cases.
+    pub fn edge_end(&self, key: &str) -> Option<RecordId> {
+        match parse_ref_id(self.field(key)?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
+    }
+
     pub fn no_ai(&self) -> bool {
         self.field("no-ai") == Some("true")
     }
+}
+
+/// Parse a `with:` front-matter value: a bracketed, comma-separated list
+/// of record IDs, `[p-…, p-…]`. Returns `None` when the value is not a
+/// bracketed list, an entry is not a record ID, or an entry is empty
+/// (`[p-A,]`). `[]` is an empty list. The whole value is one front-matter
+/// scalar (spec 0.1 has no nested YAML); entries are plain IDs, not
+/// wikilinks.
+pub fn parse_with_list(raw: &str) -> Option<Vec<RecordId>> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for part in inner.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            return None;
+        }
+        out.push(RecordId::parse(token).ok()?);
+    }
+    Some(out)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +180,10 @@ impl FrontmatterError {
 
 const SPEC_KEYS: &[&str] = &[
     "id", "type", "name", "date", "person", "org", "deal", "session", "no-ai",
+    // Edge (#179): `a` / `b` are person IDs, `kind` is a closed-list kind
+    // name, `since` / `until` are dates. `with` is the participant list on
+    // an interaction (`[p-…, p-…]`).
+    "a", "b", "kind", "since", "until", "with",
 ];
 
 pub(crate) fn is_spec_key(key: &str) -> bool {
@@ -458,7 +505,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
     let type_raw = fields.get("type").ok_or_else(|| {
         FrontmatterError::new(
             "front matter is missing key 'type'",
-            "Add type: person | org | deal | interaction | note",
+            "Add type: person | org | deal | interaction | note | edge",
         )
     })?;
     let kind = RecordKind::parse(type_raw).ok_or_else(|| {
@@ -467,7 +514,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             line,
             "type",
             "has an unknown value",
-            "Use type: person, org, deal, interaction, or note",
+            "Use type: person, org, deal, interaction, note, or edge",
         )
     })?;
     let id = RecordId::parse(id_raw).map_err(|_| {
@@ -479,9 +526,15 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             "Use a prefixed 26-character Crockford ULID",
         )
     })?;
+    // An envelope shell (`enc:` present) carries the outer header's
+    // `no-ai` and a base64 ciphertext body — neither is the inner
+    // record's front matter. The inner no-ai / body rules do not apply
+    // to the shell: the outer `no-ai` is honoured by the allowlist, and
+    // the body is ciphertext, not prose.
+    let is_envelope = fields.contains_key("enc");
     if fields.contains_key("no-ai") {
         let line = line_of("no-ai").unwrap_or(1);
-        if !kind.allows_no_ai() {
+        if !is_envelope && !kind.allows_no_ai() {
             return Err(FrontmatterError::key_at(
                 line,
                 "no-ai",
@@ -499,7 +552,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             ));
         }
     }
-    for key in ["date", "session"] {
+    for key in ["date", "session", "since", "until"] {
         if let Some(v) = fields.get(key) {
             if parse_strict_date(v).is_none() {
                 let line = line_of(key).unwrap_or(1);
@@ -511,6 +564,17 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
                 ));
             }
         }
+    }
+    // #179: an edge carries only ids, kind, and dates — no body. Sensitive
+    // context belongs in a note on one of the edge's people, which does
+    // get crypto-shredded; an edge body would survive shred as shared-key
+    // residue. `check` reports this as a Frontmatter error. Envelope
+    // shells are exempt: their body is ciphertext, not prose.
+    if kind == RecordKind::Edge && !is_envelope && !body.trim().is_empty() {
+        return Err(FrontmatterError::new(
+            "edge records carry no body",
+            "Move the context into a note on one of the edge's people",
+        ));
     }
     let name = fields.get("name").cloned().filter(|s| !s.is_empty());
     Ok(Record {

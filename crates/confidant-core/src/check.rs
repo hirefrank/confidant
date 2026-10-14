@@ -25,8 +25,9 @@ use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
 use crate::packs::{
     find_conflict, orphan_owners, resolve_enabled, OrphanOwners, Pack, PackState, ALL_PACKS,
+    CORE_EDGE_KINDS,
 };
-use crate::record::{parse_ref_id, FrontmatterRef};
+use crate::record::{parse_ref_id, parse_with_list, FrontmatterRef, RecordKind};
 use crate::vault::Vault;
 
 /// How serious a finding is.
@@ -107,6 +108,10 @@ pub enum FindingCode {
     SessionUntagged,
     SessionTags,
     InboxKeyMismatch,
+    SelfEdge,
+    DuplicateEdge,
+    UnknownEdgeKind,
+    TouchMalformed,
 }
 
 impl FindingCode {
@@ -151,6 +156,10 @@ impl FindingCode {
             Self::SessionUntagged => "W_SESSION_UNTAGGED",
             Self::SessionTags => "E_SESSION_TAGS",
             Self::InboxKeyMismatch => "E_INBOX_KEY_MISMATCH",
+            Self::SelfEdge => "E_SELF_EDGE",
+            Self::DuplicateEdge => "E_DUPLICATE_EDGE",
+            Self::UnknownEdgeKind => "E_UNKNOWN_EDGE_KIND",
+            Self::TouchMalformed => "E_TOUCH_MALFORMED",
         }
     }
 }
@@ -382,6 +391,8 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     check_orphan_fields_and_types(vault, &orphans, &mut findings);
     check_duplicate_ulids(vault, &mut findings);
     check_dangling_refs(vault, &known_ids, &mut findings);
+    check_edges(vault, &known_ids, &enabled_packs, &orphans, &mut findings);
+    check_with_lists(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
 
     if conflict.is_none() {
@@ -467,7 +478,9 @@ pub fn pack_snapshots(
 }
 
 fn known_verbs(enabled_packs: &[&dyn Pack]) -> HashSet<&'static str> {
-    let mut verbs = HashSet::from(["alias", "merge", "stage", "balance"]);
+    // `touch` is core (#179): a mirrored touchpoint carries only a date
+    // and the participant's own id, no pack data.
+    let mut verbs = HashSet::from(["alias", "merge", "stage", "balance", "touch"]);
     for pack in enabled_packs {
         verbs.extend(pack.verbs());
     }
@@ -544,10 +557,35 @@ fn check_verbs_and_refs(
                 );
             }
         }
+        // #179: a touchpoint is a mirrored cadence marker, not a record of
+        // an association. It carries at most one `kind:` pair and nothing
+        // else — no other participant ids, no primary id, no interaction
+        // id. Anything else is E_TOUCH_MALFORMED.
+        if e.verb == "touch" {
+            let shape_ok = match e.args.as_slice() {
+                [] => true,
+                [arg] => matches!(arg.pair(), Some(("kind", _))),
+                _ => false,
+            };
+            if !shape_ok {
+                findings.push(
+                    Finding::new(
+                        FindingCode::TouchMalformed,
+                        Severity::Error,
+                        "touch line must be: DATE touch ID [kind:NAME]".to_owned(),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&e.id)
+                    .with_fix("Remove every argument except an optional kind:NAME"),
+                );
+            }
+        }
         // The ID-type rule is a property of the verb's definition, so it
         // applies for verbs owned by any registered pack, enabled or not.
         let expected = match e.verb.as_str() {
             "stage" => Some(Prefix::Deal),
+            "touch" => Some(Prefix::Person),
             _ => enabled_packs
                 .iter()
                 .find_map(|p| p.verb_id_type(e.verb.as_str()))
@@ -1035,6 +1073,303 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                     findings.push(finding);
                 }
                 FrontmatterRef::Id(_) => {}
+            }
+        }
+    }
+}
+
+/// Edge rules (#179). Runs on records `check` can read: in an encrypted
+/// vault an edge is an envelope, so these rules do not run there — the
+/// same visibility limit as every other record rule. Kind symmetry is
+/// looked up over enabled packs, core, and all registered packs (a kind
+/// owned by a disabled pack is still a known kind for duplicate
+/// detection; the edge itself warns as `W_PACK_ORPHAN`).
+fn check_edges(
+    vault: &Vault,
+    known_ids: &HashSet<RecordId>,
+    enabled_packs: &[&dyn Pack],
+    orphans: &OrphanOwners,
+    findings: &mut Vec<Finding>,
+) {
+    // Canonical key for duplicate detection: the pair plus the kind.
+    // Sorted ends for symmetric kinds (so (a, b) and (b, a) collide),
+    // as-written ends for directed kinds — plus the first record's
+    // as-written ends, to tell an exact duplicate from a reversed one.
+    // Two edges on the same pair with different kinds are different
+    // relations, not duplicates (#179 review).
+    let mut seen_pairs: HashMap<(RecordId, RecordId, String), (RecordId, RecordId)> =
+        HashMap::new();
+    for rec in vault.records.values() {
+        if rec.kind != RecordKind::Edge {
+            continue;
+        }
+        // Envelope shells (`enc:` present) carry no inner fields
+        // keylessly: `a` / `b` / `kind` sit inside the ciphertext, so
+        // the missing-field rules would false-positive on every edge
+        // envelope. Edge rules run on visible records only.
+        if rec.field("enc").is_some() {
+            continue;
+        }
+        let mut ends: Vec<RecordId> = Vec::new();
+        for key in ["a", "b"] {
+            match rec.field(key) {
+                None => findings.push(
+                    Finding::new(
+                        FindingCode::Frontmatter,
+                        Severity::Error,
+                        format!("front matter key '{key}' is missing"),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix(format!("Add {key}: p-<ULID>")),
+                ),
+                Some(raw) => match parse_ref_id(raw) {
+                    FrontmatterRef::Absent => findings.push(
+                        Finding::new(
+                            FindingCode::Frontmatter,
+                            Severity::Error,
+                            format!("front matter key '{key}' is missing"),
+                        )
+                        .at_file(&rec.path)
+                        .for_id(&rec.id)
+                        .with_fix(format!("Add {key}: p-<ULID>")),
+                    ),
+                    FrontmatterRef::Invalid => {
+                        // A malformed ID token is already flagged at load
+                        // time; skip to avoid double-reporting (#5).
+                        if scan_id_tokens(raw).iter().any(|tok| tok.is_malformed()) {
+                            continue;
+                        }
+                        findings.push(
+                            Finding::new(
+                                FindingCode::InvalidId,
+                                Severity::Error,
+                                format!("front matter key '{key}' is not a record ID"),
+                            )
+                            .at_file(&rec.path)
+                            .for_id(&rec.id)
+                            .with_fix("Use a prefixed 26-character Crockford ULID"),
+                        );
+                    }
+                    FrontmatterRef::Id(id) => {
+                        if id.prefix() != Prefix::Person {
+                            findings.push(
+                                Finding::new(
+                                    FindingCode::WrongIdType,
+                                    Severity::Error,
+                                    format!("edge end '{key}' must be a person id"),
+                                )
+                                .at_file(&rec.path)
+                                .for_id(&rec.id)
+                                .with_fix("Use a p-<ULID> id"),
+                            );
+                        } else if !known_ids.contains(&id) {
+                            let mut finding = Finding::new(
+                                FindingCode::DanglingRef,
+                                Severity::Error,
+                                format!("front matter key '{key}' has no record"),
+                            )
+                            .at_file(&rec.path)
+                            .for_id(&rec.id)
+                            .with_fix("Create the record or fix the reference");
+                            if let Some(line) = rec.field_lines.get(key) {
+                                finding = finding.at_line(*line);
+                            }
+                            findings.push(finding);
+                        }
+                        ends.push(id);
+                    }
+                },
+            }
+        }
+        if ends.len() == 2 && ends[0] == ends[1] {
+            findings.push(
+                Finding::new(
+                    FindingCode::SelfEdge,
+                    Severity::Error,
+                    "edge links a person to themself".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix("Remove the edge or link two different people"),
+            );
+        }
+        // Kind: closed list (core + enabled packs). A kind owned by a
+        // disabled pack is W_PACK_ORPHAN, never an unknown-kind error.
+        let mut symmetric: Option<bool> = None;
+        match rec.field("kind") {
+            None => findings.push(
+                Finding::new(
+                    FindingCode::Frontmatter,
+                    Severity::Error,
+                    "front matter key 'kind' is missing".to_owned(),
+                )
+                .at_file(&rec.path)
+                .for_id(&rec.id)
+                .with_fix("Add kind: married, introduced, or colleague"),
+            ),
+            Some(kind) => {
+                let in_enabled = enabled_packs
+                    .iter()
+                    .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind));
+                let in_core = CORE_EDGE_KINDS.iter().find(|k| k.name == kind);
+                if let Some(k) = in_enabled.or(in_core) {
+                    symmetric = Some(k.symmetric);
+                } else if let Some(owner) = orphans.edge_kinds.get(kind) {
+                    // Owned by a registered pack that is not enabled:
+                    // warn, never error (#177 Q2). Symmetry still comes
+                    // from the registry for duplicate detection.
+                    findings.push(
+                        Finding::new(
+                            FindingCode::PackOrphan,
+                            Severity::Warning,
+                            "edge kind belongs to a disabled pack".to_owned(),
+                        )
+                        .at_file(&rec.path)
+                        .for_id(&rec.id)
+                        .with_fix(format!("Enable {owner} or remove the edge")),
+                    );
+                    symmetric = ALL_PACKS
+                        .iter()
+                        .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind))
+                        .map(|k| k.symmetric);
+                } else {
+                    let mut finding = Finding::new(
+                        FindingCode::UnknownEdgeKind,
+                        Severity::Error,
+                        "edge kind is not in the closed kind list".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Use a core kind or enable the pack that defines it");
+                    if let Some(line) = rec.field_lines.get("kind") {
+                        finding = finding.at_line(*line);
+                    }
+                    findings.push(finding);
+                }
+            }
+        }
+        // Reversed / exact duplicates, per kind. Only for valid person ends:
+        // a wrong-type or missing end is already flagged above. The kind
+        // joins the key: two edges on the same pair with different kinds
+        // are different relations, not duplicates. A missing or unknown
+        // kind already errors above; it still keys separately here so the
+        // duplicate rule stays total.
+        if ends.len() == 2 && ends.iter().all(|id| id.prefix() == Prefix::Person) {
+            let kind_key = rec.field("kind").unwrap_or("").to_string();
+            let pair = if symmetric == Some(true) {
+                if ends[0] <= ends[1] {
+                    (ends[0].clone(), ends[1].clone(), kind_key)
+                } else {
+                    (ends[1].clone(), ends[0].clone(), kind_key)
+                }
+            } else {
+                (ends[0].clone(), ends[1].clone(), kind_key)
+            };
+            if let Some(first) = seen_pairs.get(&pair) {
+                let reversed = first.0 != ends[0] || first.1 != ends[1];
+                findings.push(
+                    Finding::new(
+                        FindingCode::DuplicateEdge,
+                        Severity::Error,
+                        if reversed {
+                            "reversed duplicate edge for a symmetric kind".to_owned()
+                        } else {
+                            "duplicate edge".to_owned()
+                        },
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Keep one edge for the relation"),
+                );
+            } else {
+                seen_pairs.insert(pair, (ends[0].clone(), ends[1].clone()));
+            }
+        }
+    }
+}
+
+/// `with:` rules (#179) on interactions. Existence is a keyed check: it
+/// runs on records `check` can read. In an encrypted vault the interaction
+/// is an envelope with `with:` inside the ciphertext, so these rules do
+/// not run there.
+fn check_with_lists(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut Vec<Finding>) {
+    for rec in vault.records.values() {
+        if rec.kind != RecordKind::Interaction {
+            continue;
+        }
+        let Some(raw) = rec.field("with") else {
+            continue;
+        };
+        let list = match parse_with_list(raw) {
+            Some(list) => list,
+            None => {
+                findings.push(
+                    Finding::new(
+                        FindingCode::Frontmatter,
+                        Severity::Error,
+                        "front matter key 'with' is not a bracketed list of person IDs".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Use with: [p-<ULID>, p-<ULID>]"),
+                );
+                continue;
+            }
+        };
+        let primary = rec.person();
+        let mut seen: HashSet<RecordId> = HashSet::new();
+        for id in &list {
+            if id.prefix() != Prefix::Person {
+                findings.push(
+                    Finding::new(
+                        FindingCode::WrongIdType,
+                        Severity::Error,
+                        "with: entries must be person ids".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Use p-<ULID> ids in with:"),
+                );
+                continue;
+            }
+            if Some(id) == primary.as_ref() {
+                findings.push(
+                    Finding::new(
+                        FindingCode::Frontmatter,
+                        Severity::Error,
+                        "with: lists the interaction's own person".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Remove the primary person from with:"),
+                );
+                continue;
+            }
+            if !seen.insert(id.clone()) {
+                findings.push(
+                    Finding::new(
+                        FindingCode::Frontmatter,
+                        Severity::Error,
+                        "with: lists the same participant twice".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("List each participant once in with:"),
+                );
+                continue;
+            }
+            if !known_ids.contains(id) {
+                findings.push(
+                    Finding::new(
+                        FindingCode::DanglingRef,
+                        Severity::Error,
+                        "with: entry has no record".to_owned(),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(&rec.id)
+                    .with_fix("Create the record or fix the reference"),
+                );
             }
         }
     }

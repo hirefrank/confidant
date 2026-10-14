@@ -622,7 +622,7 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
                 Prefix::Package => {
                     pkgs.insert(id.clone());
                 }
-                Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note => {}
+                Prefix::Org | Prefix::Deal | Prefix::Interaction | Prefix::Note | Prefix::Edge => {}
             }
         }
         if !people.is_empty() || !pkgs.is_empty() {
@@ -727,7 +727,10 @@ fn record_facts(
 fn ledger_named_prefix(prefix: Prefix) -> bool {
     match prefix {
         Prefix::Note | Prefix::Interaction | Prefix::Deal => true,
-        Prefix::Person | Prefix::Org | Prefix::Package => false,
+        // An edge id named in a ledger line does not uncleared the edge:
+        // §12's named-line rule covers notes, interactions, and deals
+        // only. Edge linkage lives in front matter (`a` / `b`).
+        Prefix::Person | Prefix::Org | Prefix::Package | Prefix::Edge => false,
     }
 }
 
@@ -890,8 +893,15 @@ fn scan_record(
     // applies to the core anchors (person/org/deal); an out-of-scope or
     // unattributed note/interaction contributes no lines at all, front
     // matter included — otherwise its `id`/`type`/`date`/`person`/`name`
-    // lines would leak its existence through `find`.
-    if matches!(rec.kind, RecordKind::Note | RecordKind::Interaction) && !body_visible {
+    // lines would leak its existence through `find`. Edges (#179) are
+    // whole records the same way: their visibility is decided entirely
+    // by the kind's pack, and the front matter has no pack-owned fields
+    // to filter.
+    if matches!(
+        rec.kind,
+        RecordKind::Note | RecordKind::Interaction | RecordKind::Edge
+    ) && !body_visible
+    {
         return;
     }
     let text = rec.source.trim_start_matches('\u{feff}');

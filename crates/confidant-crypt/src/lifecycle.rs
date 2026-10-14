@@ -1299,6 +1299,10 @@ impl KeyStore {
     /// Pin [`ShredOutcome::new_recovery`]'s public halves (Ed25519 verifying
     /// key + X25519 age recipient) into the trust anchor immediately, then
     /// confirm the new phrase was written down.
+    #[allow(clippy::too_many_arguments)] // 7-arg internal API; the edge
+                                         // count rides along because the shred warnings must reflect the actual
+                                         // deletion outcome. A params struct would churn all callers for no
+                                         // behavioral gain.
     pub fn shred(
         &mut self,
         shredded_client: &str,
@@ -1307,6 +1311,7 @@ impl KeyStore {
         operator_sk: &SigningKey,
         anchor: &Anchor,
         identity: &dyn age::Identity,
+        deleted_edges: usize,
     ) -> Result<ShredOutcome, Error> {
         // Validate every id this call will join under `keys/` before doing
         // anything: the shredded client, and each remaining client (the
@@ -1468,7 +1473,7 @@ impl KeyStore {
         Ok(ShredOutcome {
             new_recovery,
             destroy_key_ids,
-            warnings: leftover_warnings(),
+            warnings: leftover_warnings(deleted_edges),
         })
     }
 
@@ -1673,8 +1678,8 @@ impl ShredOutcome {
 }
 
 /// Leftover limits of crypto-shredding (design §8). Shredding cannot reach:
-fn leftover_warnings() -> Vec<String> {
-    vec![
+fn leftover_warnings(deleted_edges: usize) -> Vec<String> {
+    let mut warnings = vec![
         "Decrypted copies already on devices are not affected by shredding.".to_string(),
         ".confidant/ caches and search indexes on other devices may still hold plaintext (this device's index is deleted by shred)."
             .to_string(),
@@ -1682,5 +1687,20 @@ fn leftover_warnings() -> Vec<String> {
         "Copies outside Confidant entirely (e.g. Drive transcripts) are not affected.".to_string(),
         "This shred issued a new recovery phrase. Destroy every copy of the old recovery phrase (paper, 1Password); until you do, it still opens history.".to_string(),
         "Inbox rotation is pending: this shred is not complete until `confidant inbox rotate --finish` has run on the inbox device; until then old form answers in history remain readable.".to_string(),
-    ]
+    ];
+    // #179: edges live under the shared key, which survives shred, so
+    // deletion only removes the working-tree copies. Say what actually
+    // happened: the old static text claimed deletions even when none
+    // existed (#179 review).
+    if deleted_edges > 0 {
+        warnings.push(format!(
+            "{deleted_edges} edge(s) naming this person were deleted from the working tree, but earlier versions in git history remain readable with the shared key."
+        ));
+    } else {
+        warnings.push(
+            "No edges named this person, so none were deleted from the working tree. Note: edge versions already in git history remain readable with the shared key."
+                .to_string(),
+        );
+    }
+    warnings
 }
