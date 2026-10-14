@@ -25,7 +25,7 @@ description = "Relationship memory you own: plain-text records in a git repo, fo
 
 [workspace.dependencies]
 anyhow = "1.0"
-base64 = "0.22"
+base64 = "0.23"
 bech32 = "0.12"
 bip39 = { version = "3.0", default-features = false, features = ["std", "rand", "zeroize"] }
 chacha20poly1305 = "0.10"
