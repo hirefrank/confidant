@@ -249,12 +249,15 @@ confidant check --json --fail-on warning --as-of 2026-10-08
 
 ## TUI (preview)
 
-`confidant-tui` (`crates/confidant-tui`, workspace-only until
-[#218](https://github.com/hirefrank/confidant/issues/218)) is a read-only
-terminal UI for `check`, `find`, `context`, and `doctor`. It consumes only
-the ADR-7 CLI JSON contract (`confidant <subcommand> --json --no-input`),
-never opens vault files directly, and keeps plaintext on the alternate
-screen only.
+`confidant-tui` is a read-only terminal UI for `check`, `find`, `context`,
+and `doctor`. It consumes only the ADR-7 CLI JSON contract
+(`confidant <subcommand> --json --no-input`), never opens vault files
+directly, and keeps plaintext on the alternate screen only.
+
+It ships as a GitHub Releases binary (next to `confidant`), and is not on
+crates.io yet. It needs a `confidant` on `PATH` that speaks the same agent
+contract (`schema_version == "1"`) — it shells out to it rather than
+bundling its own copy. From a checkout:
 
 ```sh
 cargo run -p confidant-tui -- --vault examples/demo-vault

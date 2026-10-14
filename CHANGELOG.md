@@ -9,9 +9,10 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Added
-- Read-only TUI (`crates/confidant-tui`, binary `confidant-tui`, workspace-only
-  preview) with `Check`, `Find`, `Context`, and `Doctor` views consuming only
-  the ADR-7 CLI `--json --no-input` contract (#210, part of #205).
+- Read-only TUI (`crates/confidant-tui`, binary `confidant-tui`) with
+  `Check`, `Find`, `Context`, and `Doctor` views consuming only the ADR-7
+  CLI `--json --no-input` contract (#210, part of #205). Ships as a
+  GitHub Releases binary (#218); not on crates.io.
 - `personal@0.1` schema pack: `birthday` / `cadence` / `relationship_to_me`
   / `dates` person fields, personal relationship edge kinds (`friend`,
   `family`, `sibling`, `partner`, `parent`, `mentor`), the `touch` ledger
