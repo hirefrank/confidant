@@ -289,4 +289,74 @@ mod tests {
         let b = Recovery::from_phrase(&phrase).unwrap();
         assert_eq!(a.x25519_secret(), b.x25519_secret());
     }
+
+    /// Golden-output test for the hkdf 0.12 -> 0.13 move (#245): HKDF-SHA256
+    /// must produce byte-identical output across the version bump, or every
+    /// recovery phrase ever written would derive different keys.
+    /// Vectors are RFC 5869 §A.1–A.2 (SHA-256), cross-checked against an
+    /// independent Python implementation of the RFC.
+    #[test]
+    fn hkdf_matches_rfc5869_vectors() {
+        fn expand(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], len: usize) -> Vec<u8> {
+            let hk = Hkdf::<Sha256>::new(salt, ikm);
+            let mut out = vec![0u8; len];
+            hk.expand(info, &mut out).expect("valid HKDF params");
+            out
+        }
+        // Case 1: IKM = 0x0b * 22, salt = 0x00..0x0c, info = 0xf0..0xf9.
+        let ikm = vec![0x0bu8; 22];
+        let salt: Vec<u8> = (0x00u8..=0x0c).collect();
+        let info: Vec<u8> = (0xf0u8..=0xf9).collect();
+        assert_eq!(
+            expand(&ikm, Some(&salt), &info, 42),
+            crate::hex::decode(
+                "3cb25f25faacd57a90434f64d0362f2a\
+                 2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+            )
+            .unwrap()
+        );
+        // Case 2: 80-octet IKM/salt/info.
+        let ikm: Vec<u8> = (0x00u8..0x50).collect();
+        let salt: Vec<u8> = (0x60u8..0xb0).collect();
+        let info: Vec<u8> = (0xb0u8..=0xff).collect();
+        assert_eq!(
+            expand(&ikm, Some(&salt), &info, 82),
+            crate::hex::decode(
+                "b11e398dc80327a1c8e7f78c596a4934\
+                 4f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590\
+                 e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c\
+                 1f3434f1d87"
+            )
+            .unwrap()
+        );
+        // Case 3: empty salt and info (salt defaults to HashLen zeros).
+        let ikm = vec![0x0bu8; 22];
+        assert_eq!(
+            expand(&ikm, None, &[], 42),
+            crate::hex::decode(
+                "8da4e775a563c18f715f802a063c5a31\
+                 b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+            )
+            .unwrap()
+        );
+    }
+
+    /// Golden-output test for the recovery derivation path itself (#245):
+    /// fixed entropy through `hkdf_32` with the production salt/info
+    /// strings must give byte-identical keys. Expected values generated
+    /// with an independent Python HKDF-SHA256 implementation.
+    #[test]
+    fn hkdf_32_matches_golden() {
+        let entropy: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            hkdf_32(&entropy, INFO_X25519),
+            crate::hex::decode("6f89990fe2b1217b9447c9ac7ef22bbe01f886b0852efbe2fc2d3e045eed23ef")
+                .unwrap()[..]
+        );
+        assert_eq!(
+            hkdf_32(&entropy, INFO_ED25519),
+            crate::hex::decode("04e7cf793a94d69c73c43dabb7b4b8c9d3eadbec2373b8ba7171f897bd1f9da4")
+                .unwrap()[..]
+        );
+    }
 }

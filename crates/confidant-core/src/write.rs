@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::check::{run as check_vault, CheckOptions, CheckReport};
