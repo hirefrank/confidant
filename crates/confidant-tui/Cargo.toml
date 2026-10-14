@@ -14,6 +14,15 @@ publish = false
 name = "confidant-tui"
 path = "src/main.rs"
 
+[package.metadata.dist]
+# #218: the TUI ships as a GitHub-Releases binary only — it stays a preview
+# (`publish = false`, no crates.io yet, and it deliberately never links
+# confidant-core so it remains the second consumer of the ADR-7 --json
+# contract). `dist = true` opts the binary into cargo-dist despite
+# `publish = false`, so the release workflow produces `confidant-tui`
+# alongside `confidant`. Flip to crates.io when Phase 2 (write flows) lands.
+dist = true
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
