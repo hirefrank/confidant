@@ -47,10 +47,10 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      (`git status`), then guide `confidant init` and recovery-phrase
      handling (never echo the phrase into chat logs).
    - **Plaintext (demo / learning / fixtures only):** set or keep
-     `[crypto]\nmode = "plaintext"` in `confidant.toml` (only valid while
-     the vault is structurally plaintext; never for real PII), do **not**
-     run `confidant init`, and warn that `git clone` exposes all record
-     content.
+     `mode = "plaintext"` under `[crypto]` in `confidant.toml` (only valid
+     while the vault is structurally plaintext; never for real PII), do
+     **not** run `confidant init`, and warn that `git clone` exposes all
+     record content.
 5. Verify: run `confidant check --json --no-input` against the vault and
    report the error/warning counts.
 6. Read the routing snippet (`confidant routing`) for the propose →
