@@ -178,7 +178,7 @@ pub fn encrypt_record(
     ctx: &RecordCtx,
     key: &keys::DataKey,
     record_type: &str,
-    no_ai: bool,
+    no_ai: envelope::NoAi,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     // Fail fast: type must map to exactly one purpose (design §5).
@@ -225,6 +225,7 @@ pub fn encrypt_record(
 /// Any failure (bad header, AAD mismatch, wrong key, tampered ciphertext)
 /// fails closed with no plaintext. When `for_agent` is true and the header
 /// says `no-ai: true`, the record is refused *without decrypting at all*.
+/// A `notes`-mode person is visible to agents, so only `true` refuses.
 pub fn decrypt_record(
     ctx: &RecordCtx,
     key: &keys::DataKey,
@@ -233,7 +234,7 @@ pub fn decrypt_record(
 ) -> Result<Vec<u8>, Error> {
     let env = envelope::parse(envelope_bytes)?;
     envelope::check_header(&env, &ctx.ulid, &ctx.client_id, &ctx.purpose, ctx.epoch)?;
-    if for_agent && env.no_ai {
+    if for_agent && env.no_ai.hidden_from_agents() {
         return Err(Error::Header(
             "no-ai: refusing to decrypt for agent output".to_string(),
         ));
@@ -274,7 +275,14 @@ mod tests {
             purpose: "profile".to_string(),
             epoch: 3,
         };
-        let bytes = encrypt_record(&ctx, &key, "person", false, b"secret profile").unwrap();
+        let bytes = encrypt_record(
+            &ctx,
+            &key,
+            "person",
+            envelope::NoAi::False,
+            b"secret profile",
+        )
+        .unwrap();
         let back = decrypt_record(&ctx, &key, &bytes, false).unwrap();
         assert_eq!(back, b"secret profile");
     }
@@ -290,10 +298,37 @@ mod tests {
             purpose: "profile".to_string(),
             epoch: 3,
         };
-        let bytes = encrypt_record(&ctx, &key, "person", true, b"secret").unwrap();
+        let bytes = encrypt_record(&ctx, &key, "person", envelope::NoAi::True, b"secret").unwrap();
         // Even with the right key, agent paths refuse before decrypting.
         assert!(decrypt_record(&ctx, &key, &bytes, true).is_err());
         // Non-agent paths still work.
         assert!(decrypt_record(&ctx, &key, &bytes, false).is_ok());
+    }
+
+    #[test]
+    fn notes_mode_person_decrypts_for_agent() {
+        // Issue #181: a `notes`-mode person is visible to agents — only
+        // `no-ai: true` refuses on the agent path.
+        let key = keys::DataKey::generate();
+        let ctx = RecordCtx {
+            vault_id: "v1".to_string(),
+            ulid: "p-01ABC".to_string(),
+            client_id: "p-01ABC".to_string(),
+            path: "people/p-01ABC.cfd".to_string(),
+            purpose: "profile".to_string(),
+            epoch: 3,
+        };
+        let bytes = encrypt_record(
+            &ctx,
+            &key,
+            "person",
+            envelope::NoAi::Notes,
+            b"visible profile",
+        )
+        .unwrap();
+        assert_eq!(
+            decrypt_record(&ctx, &key, &bytes, true).unwrap(),
+            b"visible profile"
+        );
     }
 }

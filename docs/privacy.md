@@ -20,6 +20,31 @@ short version, see the README's [Privacy](../README.md#read-this) section.
 A path mismatch on a note, interaction, or deal unclears only that record; a
 mismatch or duplicate on a person's profile unclears that whole person.
 
+## Finer `no-ai` granularity (issue #181)
+
+`no-ai` has three values: `true`, `false`, and `notes` (person records
+only). There are no field-level flags — the record is the unit.
+
+- **`no-ai: true`** hides everything about the person (or record) from
+  agents: the all-or-nothing guarantee. Findings about such a person never
+  carry their name or other PII to agents — the warning is suppressed or
+  reduced to a code and a count.
+- **`no-ai: notes`** on a person keeps the person visible — name, birthday,
+  cadence and other pack fields reach `find`, `context`, and MCP — while
+  their notes and interactions default to hidden. Findings may name the
+  person and give dates, but never note bodies.
+- **Per-note `no-ai: true`** on an otherwise visible person already works:
+  "any `true` wins", so the note is excluded from `find`/`allowlist`/
+  `reindex` while the person stays visible. Use this for one-off sensitive
+  detail (a medical note); use `notes` mode when most notes should be
+  hidden. A note's explicit `no-ai: false` overrides the `notes` default
+  (set it in front matter; `note add` has no flag for it), but can never
+  un-hide a `no-ai: true` person.
+
+On encrypted vaults the mode rides the envelope's plaintext outer header
+(`no-ai: notes`), so `find`/`context` fail closed without keys; readers
+that only know `true`/`false` reject `notes` rather than misreading it.
+
 ## Ledger lines
 
 Ledger lines are searchable only when every ID on the line is cleared. A note,

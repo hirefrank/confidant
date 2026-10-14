@@ -214,6 +214,10 @@ fn person_md_no_ai(id: &str, name: &str, bio: &str) -> String {
     format!("---\nid: {id}\ntype: person\nname: \"{name}\"\nno-ai: true\n---\n\n{bio}\n")
 }
 
+fn person_md_notes_mode(id: &str, name: &str, bio: &str) -> String {
+    format!("---\nid: {id}\ntype: person\nname: \"{name}\"\nno-ai: notes\n---\n\n{bio}\n")
+}
+
 /// Keyed vault with an encrypted person (bio contains `bio_marker`) and one
 /// encrypted note (body contains `note_marker`). Returns the harness.
 fn keyed_vault_with_records(bio_marker: &str, note_marker: &str) -> Harness {
@@ -307,6 +311,79 @@ fn find_excludes_no_ai_without_decrypting_even_when_keyed() {
     assert!(v["matches"].as_array().unwrap().is_empty());
     assert_eq!(v["skipped_encrypted"], 0, "no-ai must not be a skip");
     assert_eq!(v["refused_envelopes"], 0, "no-ai must not be a refusal");
+}
+
+// Issue #181 acceptance: a notes-mode person stays visible to agents
+// (pack fields like name/bio reach find) while their notes default hidden.
+#[test]
+fn notes_mode_person_visible_in_find_but_note_hidden() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_notes_mode(PERSON, "Ada Example", "Bio with zephyr marker."),
+    );
+    h.record_add(&input);
+    h.note_add(PERSON, "Note about quux marker.", false);
+
+    // The person's own content is searchable.
+    let out = h
+        .cmd(&["find", "zephyr", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        !v["matches"].as_array().unwrap().is_empty(),
+        "notes-mode person must stay searchable"
+    );
+
+    // The note that defaulted to hidden is not.
+    let out = h
+        .cmd(&["find", "quux", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["matches"].as_array().unwrap().is_empty(),
+        "notes-mode note must be hidden from find"
+    );
+}
+
+#[test]
+fn notes_mode_context_shows_person_hides_notes() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_notes_mode(PERSON, "Ada Example", "Bio with zephyr marker."),
+    );
+    h.record_add(&input);
+    h.note_add(PERSON, "Note about quux marker.", false);
+
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "context failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The person is visible: name and profile decrypt for the agent.
+    assert!(
+        v["person"]["name"].as_str().unwrap().contains("Ada"),
+        "notes-mode person name must be visible"
+    );
+    assert!(
+        v["person"]["profile"].as_str().unwrap().contains("zephyr"),
+        "notes-mode person profile must be visible"
+    );
+    // Their notes default hidden: omitted, not nulled.
+    assert!(
+        v["notes"].as_array().unwrap().is_empty(),
+        "notes-mode notes must be omitted from context"
+    );
 }
 
 #[test]

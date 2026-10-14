@@ -127,7 +127,8 @@ There are two search paths, and the CLI is the source of truth for both.
 
 **`confidant find`** scans the vault directly. It is exact, deterministic,
 and fail-closed: it returns content only from the **cleared allowlist** — a
-record is searchable only when it parsed cleanly, has no `no-ai` flag, and
+record is searchable only when it parsed cleanly, has no `no-ai: true` flag
+(a `no-ai: notes` person stays searchable; their notes don't), and
 every ID it references is cleared. If a record is uncleared, it is omitted
 from results entirely (not redacted — omitted). This is enough for a few
 hundred clients; numbers are in

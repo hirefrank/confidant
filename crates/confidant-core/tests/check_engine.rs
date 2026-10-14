@@ -1032,6 +1032,40 @@ fn untagged_session_consumes_and_warns() {
     assert_eq!(codes(&json), vec!["W_SESSION_UNTAGGED"], "{json}");
 }
 
+// Issue #181 Q3: agent-facing findings must never surface a no-ai person's
+// name (or other PII) — suppress the warning or reduce it to code + count.
+#[test]
+fn findings_never_name_no_ai_person() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    // Distinctive fake name: must not appear anywhere in the report.
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: \"Zephyr Hiddenperson\"\nno-ai: true\n---\n\nFake person.\n",
+    );
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 session {ADA} 60m note:{NOTE}\n\
+             2026-10-01 balance {ADA} sessions_remaining 5\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"W_SESSION_UNTAGGED".to_string()),
+        "{json}"
+    );
+    let text = serde_json::to_string(&json).unwrap();
+    assert!(
+        !text.contains("Zephyr"),
+        "no-ai person's name leaked into findings: {text}"
+    );
+}
+
 #[test]
 fn double_tagged_session_is_e_session_tags() {
     let dir = tempfile::tempdir().unwrap();

@@ -746,6 +746,65 @@ fn no_ai_header_carries_person_flag_any_true_wins() {
 }
 
 #[test]
+fn notes_mode_person_envelope_carries_mode_and_note_defaults_hidden() {
+    // Issue #181: a person with `no-ai: notes` keeps their own envelope
+    // visible (mode on the outer header); their notes default hidden.
+    let h = Harness::new();
+    h.keyed(PERSON);
+
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    let profile =
+        std::fs::read_to_string(h.vault.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert!(
+        profile.contains("\nno-ai: notes\n"),
+        "person envelope must carry no-ai: notes, got:\n{profile}"
+    );
+
+    // Note WITHOUT --no-ai: the notes default must hide it.
+    let body = write_file(h._tmp.path(), "body.md", "Note body.");
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note add failed: {}", stderr(&out));
+
+    let notes_dir = h.vault.join(format!("people/{PERSON}/notes"));
+    let entries: Vec<_> = std::fs::read_dir(&notes_dir).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let text = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    assert!(
+        text.contains("\nno-ai: true\n"),
+        "note envelope must default to no-ai: true under a notes-mode person, got:\n{text}"
+    );
+}
+
+#[test]
 fn dry_run_shows_plaintext_never_ciphertext() {
     let h = Harness::new();
     h.keyed(PERSON);

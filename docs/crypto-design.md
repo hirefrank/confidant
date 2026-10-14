@@ -271,7 +271,8 @@ that operator commits are signed (§4).
 
 ### no-ai per client
 
-The outer header carries one boolean, but the rule is per client:
+The outer header carries the tri-state `no-ai` value (`true`/`false`/`notes`;
+`notes` only on person records — issue #181), but the rule is per client:
 
 - Every record for a client carries the person record's `no-ai` value in
   its header.
