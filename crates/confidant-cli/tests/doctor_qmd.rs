@@ -21,6 +21,7 @@ fn demo() -> PathBuf {
 }
 
 /// Copy `src` into `dst` recursively (a throwaway vault a test may write to).
+#[cfg(unix)]
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
