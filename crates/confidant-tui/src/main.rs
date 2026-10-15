@@ -23,7 +23,8 @@ use confidant_tui::{install_panic_hook, restore_terminal};
 #[command(name = "confidant-tui", version, about)]
 struct Cli {
     /// Path to the vault directory (forwarded as `--vault` to `confidant`).
-    #[arg(long)]
+    /// Falls back to the `CONFIDANT_VAULT` environment variable.
+    #[arg(long, env = "CONFIDANT_VAULT")]
     vault: Option<PathBuf>,
 
     /// Path to the `confidant` binary (defaults to `CONFIDANT_BIN` or `confidant` on PATH).
@@ -82,4 +83,52 @@ fn run_event_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-var manipulation: `CONFIDANT_VAULT` is process-wide.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_vault_env(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("CONFIDANT_VAULT");
+        match value {
+            Some(v) => std::env::set_var("CONFIDANT_VAULT", v),
+            None => std::env::remove_var("CONFIDANT_VAULT"),
+        }
+        f();
+        match old {
+            Some(v) => std::env::set_var("CONFIDANT_VAULT", v),
+            None => std::env::remove_var("CONFIDANT_VAULT"),
+        }
+    }
+
+    #[test]
+    fn vault_falls_back_to_confidant_vault_env() {
+        with_vault_env(Some("/tmp/fake-vault"), || {
+            let cli = Cli::try_parse_from(["confidant-tui"]).expect("parse succeeds");
+            assert_eq!(cli.vault, Some(PathBuf::from("/tmp/fake-vault")));
+        });
+    }
+
+    #[test]
+    fn vault_flag_beats_confidant_vault_env() {
+        with_vault_env(Some("/tmp/env-vault"), || {
+            let cli = Cli::try_parse_from(["confidant-tui", "--vault", "/tmp/flag-vault"])
+                .expect("parse succeeds");
+            assert_eq!(cli.vault, Some(PathBuf::from("/tmp/flag-vault")));
+        });
+    }
+
+    #[test]
+    fn vault_is_none_without_flag_or_env() {
+        with_vault_env(None, || {
+            let cli = Cli::try_parse_from(["confidant-tui"]).expect("parse succeeds");
+            assert_eq!(cli.vault, None);
+        });
+    }
 }

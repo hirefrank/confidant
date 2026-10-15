@@ -277,6 +277,10 @@ bundling its own copy. From a checkout:
 cargo run -p confidant-tui -- --vault examples/demo-vault
 ```
 
+`--vault` falls back to the `CONFIDANT_VAULT` environment variable when it
+isn't passed, so the vault path doesn't have to be given on every command
+line — same as the `confidant` CLI itself.
+
 ## Where we're going
 
 The roadmap is tracked as open issues on GitHub. The big themes:
