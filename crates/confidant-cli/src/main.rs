@@ -5736,8 +5736,7 @@ fn shred_restore(guard: &mut ShredTreeGuard, err: anyhow::Error) -> anyhow::Erro
 /// needs decryption (edges live under `vault:shared`, so `a` / `b` sit
 /// inside the ciphertext in encrypted vaults), and a failure here must
 /// abort before any irreversible key destruction. Returns the deleted
-/// vault-relative paths paired with their pre-delete bytes, for staging
-/// into the same signed shred commit.
+/// vault-relative paths, for staging into the same signed shred commit.
 ///
 /// Plan-then-apply (#320): every refusal check and every read happens
 /// before the first deletion; each deletion is recorded in `guard` so a
@@ -5755,7 +5754,7 @@ fn delete_edges_naming(
     root: &Path,
     client_id: &str,
     guard: &mut ShredTreeGuard,
-) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+) -> anyhow::Result<Vec<String>> {
     // Keyed load: decrypts edge envelopes via the current device key.
     // (Same probe-then-keyed pattern as `load_vault_for_reads`.)
     let probe = load_vault(root)?;
@@ -5853,7 +5852,7 @@ fn delete_edges_naming(
     let mut deleted = Vec::new();
     for (path, bytes) in plan {
         let full = root.join(&path);
-        guard.record(path.clone(), bytes.clone());
+        guard.record(path.clone(), bytes);
         std::fs::remove_file(&full).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "cannot delete edge file {path}: {e}"
@@ -5863,7 +5862,7 @@ fn delete_edges_naming(
         if let Some(parent) = full.parent() {
             let _ = std::fs::remove_dir(parent);
         }
-        deleted.push((path, bytes));
+        deleted.push(path);
     }
     Ok(deleted)
 }
@@ -5871,8 +5870,7 @@ fn delete_edges_naming(
 /// #258: remove a shredded person from every interaction's `with:` list,
 /// re-encrypting each affected interaction through the normal write path
 /// (`record_crypto`), before any key destruction. Returns the rewritten
-/// vault-relative paths paired with their pre-rewrite bytes, for staging
-/// into the same signed shred commit.
+/// vault-relative paths, for staging into the same signed shred commit.
 ///
 /// Plan-then-apply (#320): every refusal check, every `with:` parse, every
 /// encryption, and every pre-rewrite read happens before the first write;
@@ -5899,7 +5897,7 @@ fn strip_participant_from_interactions(
     client_id: &str,
     live_clients: &HashSet<String>,
     guard: &mut ShredTreeGuard,
-) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+) -> anyhow::Result<Vec<String>> {
     // Keyed load: decrypts interaction envelopes via the current device key.
     let probe = load_vault(root)?;
     let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
@@ -6059,14 +6057,14 @@ fn strip_participant_from_interactions(
     let mut rewritten = Vec::new();
     for r in plan {
         let full = root.join(&r.path);
-        guard.record(r.path.clone(), r.original.clone());
+        guard.record(r.path.clone(), r.original);
         std::fs::write(&full, &r.envelope).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "cannot write re-encrypted interaction {}: {e}",
                 r.path
             )))
         })?;
-        rewritten.push((r.path, r.original));
+        rewritten.push(r.path);
     }
     Ok(rewritten)
 }
@@ -6388,7 +6386,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // so unrelated unstaged changes under edges/ are not swept in.
     if !deleted_edges.is_empty() {
         let mut ls_args: Vec<&str> = vec!["ls-files", "-z", "--"];
-        ls_args.extend(deleted_edges.iter().map(|(p, _)| p.as_str()));
+        ls_args.extend(deleted_edges.iter().map(String::as_str));
         let listed = confidant_core::write::git(root, &ls_args, no_input)?;
         let tracked: Vec<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
         if !tracked.is_empty() {
@@ -6403,7 +6401,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // `git add` stages the modification without sweeping unrelated files.
     if !stripped_interactions.is_empty() {
         let mut add_args: Vec<&str> = vec!["add", "--"];
-        add_args.extend(stripped_interactions.iter().map(|(p, _)| p.as_str()));
+        add_args.extend(stripped_interactions.iter().map(String::as_str));
         confidant_core::write::git(root, &add_args, no_input)?;
     }
     confidant_core::write::git(
@@ -6464,7 +6462,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "client_id": client_id,
             "destroy_key_ids": outcome.destroy_key_ids,
             "warnings": shred_warnings,
-            "deleted_edges": deleted_edges.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            "deleted_edges": &deleted_edges,
             "stripped_interactions": stripped_interactions.len(),
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
