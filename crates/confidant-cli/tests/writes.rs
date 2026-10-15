@@ -1647,3 +1647,210 @@ fn log_touch_bad_kind_is_usage_error() {
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "usage_error");
 }
+
+// ---------------------------------------------------------------------------
+// #216: `record edit` / `record show --for-edit`
+// ---------------------------------------------------------------------------
+
+/// Input files live outside the vault: `check` flags any unexpected entry.
+fn person_record_md(id: &str, name: &str, bio: &str) -> String {
+    format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\n{bio}\n")
+}
+
+fn edit_args<'a>(id: &'a str, file: &'a str, vroot: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "record",
+        "edit",
+        id,
+        "--file",
+        file,
+        "--json",
+        "--no-input",
+        "--vault",
+        vroot,
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn record_edit_replaces_the_file_in_one_commit() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let before = commits(root);
+
+    let edited = inputs.path().join("edited.md");
+    std::fs::write(&edited, person_record_md(PERSON, "Ada Renamed", "New bio.")).unwrap();
+    let (ok, v) = run_json(&edit_args(PERSON, edited.to_str().unwrap(), &vroot, &[]));
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "record-edit", "{v}");
+    assert_eq!(v["id"], PERSON, "{v}");
+    assert_eq!(commits(root), before + 1, "expected exactly one commit");
+
+    let on_disk =
+        std::fs::read_to_string(root.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert!(on_disk.contains("Ada Renamed"), "{on_disk}");
+    assert!(on_disk.contains("New bio."), "{on_disk}");
+}
+
+#[test]
+fn record_edit_with_identical_content_is_a_no_op() {
+    // #389 Q1: the write layer has no empty changeset, so an unchanged edit
+    // reports `unchanged` rather than failing on `git commit`.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let edited = inputs.path().join("edited.md");
+    std::fs::write(&edited, person_record_md(PERSON, "Ada Renamed", "New bio.")).unwrap();
+    let args = edit_args(PERSON, edited.to_str().unwrap(), &vroot, &[]);
+
+    let (ok, v) = run_json(&args);
+    assert!(ok, "first edit failed: {v}");
+    let after_first = commits(root);
+
+    let (ok, v) = run_json(&args);
+    assert!(ok, "no-op edit failed: {v}");
+    assert_eq!(v["unchanged"], true, "{v}");
+    assert!(
+        v.get("commit").is_none(),
+        "no-op edit reported a commit: {v}"
+    );
+    assert_eq!(commits(root), after_first, "a no-op edit committed");
+}
+
+#[test]
+fn record_edit_is_idempotent_for_a_repeated_request_id() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let edited = inputs.path().join("edited.md");
+    std::fs::write(&edited, person_record_md(PERSON, "Ada Renamed", "New bio.")).unwrap();
+    const RID: &str = "01J9Z3K4QF000000000000REQ1";
+    let args = edit_args(
+        PERSON,
+        edited.to_str().unwrap(),
+        &vroot,
+        &["--request-id", RID],
+    );
+
+    let (ok, v) = run_json(&args);
+    assert!(ok, "{v}");
+    let commit = v["commit"].as_str().unwrap().to_owned();
+    let after_first = commits(root);
+
+    let (ok, v) = run_json(&args);
+    assert!(ok, "{v}");
+    assert_eq!(v["idempotent"], true, "{v}");
+    assert_eq!(v["commit"], commit, "{v}");
+    assert_eq!(commits(root), after_first, "the replay committed again");
+}
+
+#[test]
+fn record_show_requires_the_for_edit_flag() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "record",
+        "show",
+        PERSON,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "usage_error", "{v}");
+}
+
+#[test]
+fn record_edit_rejects_a_file_naming_another_id() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let other = inputs.path().join("other.md");
+    std::fs::write(
+        &other,
+        person_record_md("p-01J9Z3K4QG0000000000000000", "Bea", "bio"),
+    )
+    .unwrap();
+    let (ok, v) = run_json(&edit_args(PERSON, other.to_str().unwrap(), &vroot, &[]));
+    assert!(!ok, "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("not"),
+        "{v}"
+    );
+}
+
+#[test]
+fn record_edit_unknown_record_suggests_add() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    let missing = "p-01J9Z3K4QG0000000000000000";
+    let file = inputs.path().join("new.md");
+    std::fs::write(&file, person_record_md(missing, "Bea", "bio")).unwrap();
+    let (ok, v) = run_json(&edit_args(missing, file.to_str().unwrap(), &vroot, &[]));
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND", "{v}");
+    assert!(
+        v["error"]["fix"].as_str().unwrap().contains("record add"),
+        "{v}"
+    );
+}
+
+#[test]
+fn record_self_edge_edit_is_blocked_by_check_and_commits_nothing() {
+    // The edited record parses, so this exercises the post-check rollback
+    // rather than the parser — `check` gates an edit like any other write.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let inputs = tempfile::tempdir().unwrap();
+    const BEA: &str = "p-01J9Z3K4QG0000000000000000";
+    // A distinct ULID body: E_DUPLICATE_ULID fires when two records share one.
+    const EDGE: &str = "e-01J9Z3K4QH0000000000000000";
+    std::fs::create_dir_all(root.join(format!("people/{BEA}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{BEA}/profile.md")),
+        person_record_md(BEA, "Bea", "bio"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("edges/{EDGE}"))).unwrap();
+    std::fs::write(
+        root.join(format!("edges/{EDGE}/edge.md")),
+        format!("---\nid: {EDGE}\ntype: edge\na: {PERSON}\nb: {BEA}\nkind: married\n---\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "edge"]);
+    let before = commits(root);
+
+    let self_edge = inputs.path().join("self.md");
+    std::fs::write(
+        &self_edge,
+        format!("---\nid: {EDGE}\ntype: edge\na: {PERSON}\nb: {PERSON}\nkind: married\n---\n"),
+    )
+    .unwrap();
+    let (ok, v) = run_json(&edit_args(EDGE, self_edge.to_str().unwrap(), &vroot, &[]));
+    assert!(!ok, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .expect("check report")
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"E_SELF_EDGE"), "{codes:?}");
+    assert_eq!(commits(root), before, "nothing committed");
+    let on_disk = std::fs::read_to_string(root.join(format!("edges/{EDGE}/edge.md"))).unwrap();
+    assert!(
+        on_disk.contains(BEA),
+        "the file was not rolled back: {on_disk}"
+    );
+}

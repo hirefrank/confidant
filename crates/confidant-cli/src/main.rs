@@ -444,6 +444,26 @@ enum RecordAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Replace an existing main record's file from a markdown file.
+    Edit {
+        /// Opaque record id (p-…, o-…, d-…, i-…). Must match `id:` in the file.
+        id: String,
+        /// Markdown file holding the new version of the record.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Print one record's decrypted text, to prepare an edit.
+    ///
+    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
+    /// a fixed tool whitelist), and `--for-edit` is required so a bare
+    /// invocation cannot print a decrypted record body.
+    Show {
+        /// Opaque record id (p-…, o-…, d-…, i-…, e-…).
+        id: String,
+        /// Acknowledge the operator-only edit read. Required.
+        #[arg(long)]
+        for_edit: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -621,7 +641,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             // Spec 4: the allowlist is a read path — decrypted records
             // participate, skipped ones are excluded by omission.
-            let vault = match load_vault_for_reads(&root, json) {
+            let vault = match load_vault_for_reads(&root, json, false) {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
             };
@@ -810,6 +830,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             match action {
                 RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
+                RecordAction::Edit { id, file } => cmd_record_edit(&cli, &root, id, file),
+                RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
             }
         }
         Command::Context {
@@ -951,7 +973,16 @@ fn resolve_cli_scope(
 /// phase 1 loads without the hook to get the vault id for AAD; phase 2
 /// reloads with the decryptor hook so envelopes decrypt (or skip + count).
 /// Reads never fail for a missing key — that is a per-record skip (⚠2).
-fn load_vault_for_reads(root: &Path, json: bool) -> Result<confidant_core::Vault, ExitCode> {
+/// Load the vault for a read command, decrypting record envelopes.
+///
+/// `operator` selects the reader mode: `false` is the agent read path
+/// (`no-ai` records come back as keyless shells), `true` is the operator
+/// edit path, used only by `record show --for-edit` (#216).
+fn load_vault_for_reads(
+    root: &Path,
+    json: bool,
+    operator: bool,
+) -> Result<confidant_core::Vault, ExitCode> {
     let probe = match load_vault(root) {
         Ok(v) => v,
         Err(err) => {
@@ -959,10 +990,11 @@ fn load_vault_for_reads(root: &Path, json: bool) -> Result<confidant_core::Vault
             return Err(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
-        root,
-        &probe.config.vault_id,
-    ));
+    let decryptor = std::sync::Arc::new(if operator {
+        record_decrypt::RecordDecryptor::for_edit(root, &probe.config.vault_id)
+    } else {
+        record_decrypt::RecordDecryptor::for_reads(root, &probe.config.vault_id)
+    });
     match confidant_core::load_vault_with_hook(root, Some(decryptor.hook())) {
         Ok(v) => Ok(v),
         Err(err) => {
@@ -1033,7 +1065,7 @@ fn cmd_find(
             "find requires a non-empty query",
         )));
     }
-    let vault = match load_vault_for_reads(root, json) {
+    let vault = match load_vault_for_reads(root, json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
@@ -1132,7 +1164,7 @@ const QMD_STORE_REL: &str = ".confidant/qmd";
 /// whole build (a corpus that silently omits records is worse than none),
 /// and the corpus must be git-ignored in the vault's repo.
 fn cmd_reindex(json: bool, root: &Path) -> anyhow::Result<ExitCode> {
-    let vault = match load_vault_for_reads(root, json) {
+    let vault = match load_vault_for_reads(root, json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
@@ -1862,6 +1894,18 @@ fn finish_write(
                     "already applied (commit {})",
                     &commit[..8.min(commit.len())]
                 );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        WriteOutcome::Unchanged => {
+            if cli.json {
+                let mut obj = serde_json::json!({ "command": command, "unchanged": true });
+                if let serde_json::Value::Object(e) = extra {
+                    obj.as_object_mut().unwrap().extend(e);
+                }
+                print_json(&ok_envelope(Some(root), obj))?;
+            } else {
+                println!("no changes; nothing committed");
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -2885,6 +2929,263 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     result
 }
 
+/// Vault-relative main file path for a record id, derived from its prefix.
+///
+/// `None` for the prefixes this pair of commands does not handle: a note's
+/// file lives at `people/<person>/notes/<id>.md` (not the collection/main
+/// layout), and a package has no record file at all.
+fn main_path_for(id: &RecordId) -> Option<PathBuf> {
+    let prefix = id.prefix();
+    if matches!(prefix, Prefix::Note | Prefix::Package) {
+        return None;
+    }
+    Some(PathBuf::from(format!(
+        "{}/{}/{}",
+        prefix.collection()?,
+        id,
+        prefix.main_filename()?
+    )))
+}
+
+/// Ids `record show` / `record edit` do not handle, refused as usage errors
+/// (exit 2, ADR-7) rather than looked up and reported as missing.
+fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
+    match id.prefix() {
+        Prefix::Note => Err(anyhow::Error::new(DomainError::usage(
+            "notes are not read or edited by `record`; their files live under people/<person>/notes/",
+        ))),
+        Prefix::Package => Err(anyhow::Error::new(DomainError::usage(
+            "a package is a ledger id, not a record; use `confidant balance <person>`",
+        ))),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// record show (operator-only) / record edit (#216)
+// ---------------------------------------------------------------------------
+
+/// #216: print one record's decrypted text so the operator can edit it.
+///
+/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
+/// argv and this command is not in it, so no agent connection can reach it.
+/// `--for-edit` is required rather than optional so that a bare invocation
+/// can never print a decrypted record body — the flag is the operator
+/// stating the intent to edit. Unlike the agent read path, `no-ai` records
+/// are decrypted in full (`RecordDecryptor::for_edit`), because the
+/// operator may edit them (spec §12 is unchanged for agents).
+fn cmd_record_show(
+    cli: &Cli,
+    root: &Path,
+    id_raw: &str,
+    for_edit: bool,
+) -> anyhow::Result<ExitCode> {
+    if !for_edit {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "record show is operator-only and exists to prepare an edit; pass --for-edit",
+        )));
+    }
+    let vault = match load_vault_for_reads(root, cli.json, true) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
+    }
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
+            "`record show` takes an opaque record id; use `confidant find <name>` to look one up",
+        )
+    })?;
+    reject_unsupported_prefix(&id)?;
+    let Some(rec) = vault.records.get(&id) else {
+        // A file that is on disk but did not load is a problem with that
+        // file. Only claim a decryption failure when the file really is an
+        // envelope: a plaintext record that failed to parse is a different
+        // error, and `check` already reports it (⚠2b, as in `context`).
+        if let Some(rel) = main_path_for(&id) {
+            if let Ok(bytes) = std::fs::read(root.join(&rel)) {
+                if confidant_core::crypto_mode::is_envelope_bytes(&bytes) {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid(format!(
+                            "cannot read {id_raw}: this device cannot decrypt it"
+                        ))
+                        .with_fix(
+                            "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                        ),
+                    ));
+                }
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot read {id_raw}: {} is not a readable record",
+                        rel.display()
+                    ))
+                    .with_fix("Run `confidant check` for the finding on that file"),
+                ));
+            }
+        }
+        return Err(anyhow::Error::new(DomainError::not_found(format!(
+            "no record with id {id_raw}"
+        )))
+        .context("use `confidant find <name>` to look up the id"));
+    };
+    let text = rec.source.clone();
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "id": id.to_string(),
+                "type": rec.kind.as_str(),
+                "path": rec.path,
+                "no_ai": rec.no_ai(),
+                "for_edit": true,
+                "text": text,
+            }),
+        ))?;
+    } else {
+        // Byte-for-byte on stdout, so it can be redirected into an editor
+        // or a file and edited in place.
+        print!("{text}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// #216: replace an existing main record's file from a markdown file.
+///
+/// The write goes through [`apply_record_write`], so in an encrypted vault
+/// it encrypts, runs `check` before the commit, and makes one commit —
+/// exactly like `record add`. The target path is derived from the record's
+/// id, never from the path the caller passed, and the file's own `id:` must
+/// match the id argument so a wrong file cannot silently clobber a record.
+fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    // Parse the id the same way every other positional record id is parsed:
+    // a malformed argument is a usage error (exit 2, ADR-7), and parsing
+    // canonicalises a lowercase ULID instead of rejecting it.
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
+            "`record edit` takes an opaque record id; use `confidant find <name>` to look one up",
+        )
+    })?;
+    reject_unsupported_prefix(&id)?;
+    let text = std::fs::read_to_string(file).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            file.display()
+        )))
+    })?;
+    let provisional = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "record.md".to_owned());
+    let rec = confidant_core::parse_record(&text, &provisional)
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    if rec.id != id {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
+                .with_fix("Edit the record the file names, or fix `id:` in the file"),
+        ));
+    }
+    // `record add` validates `with:` shape before encrypting, and an edit
+    // must too: in an encrypted vault the post-write `check` cannot see
+    // inside the envelope, so a malformed list would be committed and later
+    // block `keys shred` (which refuses when an interaction's `with:` will
+    // not parse). Touchpoints are not mirrored on an edit — see the PR notes.
+    if rec.kind == RecordKind::Interaction {
+        if let Some(raw) = rec.field("with") {
+            let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
+                anyhow::Error::new(
+                    DomainError::invalid(
+                        "front matter key 'with' is not a bracketed list of person IDs",
+                    )
+                    .with_fix("Use with: [p-<ULID>, p-<ULID>]"),
+                )
+            })?;
+            let primary = rec.person();
+            let mut seen: Vec<RecordId> = Vec::new();
+            for participant in &with {
+                if participant.prefix() != Prefix::Person {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: entries must be person ids")
+                            .with_fix("Use p-<ULID> ids in with:"),
+                    ));
+                }
+                if Some(participant) == primary.as_ref() {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the interaction's own person")
+                            .with_fix("Remove the primary person from with:"),
+                    ));
+                }
+                if seen.contains(participant) {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the same participant twice")
+                            .with_fix("List each participant once in with:"),
+                    ));
+                }
+                seen.push(participant.clone());
+            }
+        }
+    }
+    let rel = main_record_path(&rec)
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    if !root.join(&rel).exists() {
+        return Err(anyhow::Error::new(
+            DomainError::not_found(format!("no record file at {}", rel.display()))
+                .with_fix("Use `confidant record add --file` to create a new record"),
+        ));
+    }
+    // The path was checked above, so a read error here is a real failure and
+    // must not be swallowed by a fail-closed guard.
+    let existing = std::fs::read(root.join(&rel)).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            rel.display()
+        )))
+    })?;
+    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
+        if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
+            enc.decrypt_existing(&rel, &existing).map_err(|_| {
+                anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot edit {}: this device cannot decrypt the record",
+                        rel.display()
+                    ))
+                    .with_fix(
+                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                    ),
+                )
+            })?;
+        }
+    }
+    let id = rec.id.to_string();
+    let contents = confidant_core::format_record(&rec);
+    let (outcome, _created) = apply_record_write(
+        root,
+        &vault,
+        PendingWrite {
+            changes: vec![FileChange::WriteFile {
+                path: rel.clone(),
+                contents,
+            }],
+            summary: format!("record {id}"),
+            canonical_request: format!("record-edit/v1\npath={}\nbody={}", rel.display(), text),
+        },
+        &write_options(cli),
+    )?;
+    finish_write(
+        cli,
+        root,
+        "record-edit",
+        outcome,
+        serde_json::json!({
+            "id": id,
+            "path": rel.display().to_string(),
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // context
 // ---------------------------------------------------------------------------
@@ -2895,7 +3196,7 @@ fn cmd_context(
     person_raw: &str,
     include_private: bool,
 ) -> anyhow::Result<ExitCode> {
-    let vault = match load_vault_for_reads(root, cli.json) {
+    let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };

@@ -39,7 +39,9 @@ pub enum WriteOutcome {
     },
     /// Applied: one commit.
     Applied { command: String, commit: String },
-    /// The request id was already applied: counts as done.
+    /// The request id was already applied, or the write would not change
+    /// anything (`unchanged`): the desired state already holds, so it
+    /// counts as done.
     Idempotent { command: String, commit: String },
     /// `check` blocked the write (exit 1 with a bare `CheckReport`).
     CheckBlocked { report: CheckReport },
@@ -63,6 +65,10 @@ struct WriteEnvelope {
     changes: Vec<DryRunChange>,
     #[serde(default)]
     idempotent: bool,
+    /// The write changed nothing: the content already matches (ADR-7
+    /// `unchanged`). No commit is reported with it.
+    #[serde(default)]
+    unchanged: bool,
 }
 
 /// Run one CLI write command and classify its JSON output.
@@ -106,7 +112,7 @@ pub fn classify_write_output(raw: &RawOutput) -> WriteOutcome {
                     changes: data.changes,
                 };
             }
-            if data.idempotent {
+            if data.idempotent || data.unchanged {
                 return WriteOutcome::Idempotent {
                     command,
                     commit: data.commit.unwrap_or_default(),
