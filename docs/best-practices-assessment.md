@@ -63,10 +63,10 @@ they are the ones to double-check wording on before submitting.
 | 15 | `repo_track` — tracks what/who/when | MUST | Met | Git history; every commit has author + date. |
 | 16 | `repo_interim` — interim versions for review, not only releases | MUST | Met | 100 merged PRs; many commits between tags. |
 | 17 | `repo_distributed` — common distributed VCS | SUGGESTED | Met | git. |
-| 18 | `version_unique` — unique version per release | MUST | Met | Tags `v0.1.0`, `v0.1.1`, `v0.2.0`; `version = "0.2.0"` in `Cargo.toml`. |
+| 18 | `version_unique` — unique version per release | MUST | Met | Tags `v0.1.0`, `v0.1.1`, `v0.2.0`, `v0.3.0`; `version = "0.3.0"` in `Cargo.toml`. |
 | 19 | `version_semver` — SemVer or CalVer | SUGGESTED | Met | `CHANGELOG.md` states SemVer; pre-1.0 policy documented. |
 | 20 | `version_tags` — releases identified in the VCS | SUGGESTED | Met | Git tags per release. |
-| 21 | `release_notes` — human-readable release notes | MUST | Met | `CHANGELOG.md` (Keep a Changelog) + per-release GitHub Release bodies generated from the changelog (e.g. `v0.2.0`). |
+| 21 | `release_notes` — human-readable release notes | MUST | Met | `CHANGELOG.md` (Keep a Changelog) + per-release GitHub Release bodies generated from the changelog (e.g. `v0.3.0`). |
 | 22 | `release_notes_vulns` — every fixed known vuln listed | MUST | **N/A** | No CVE-numbered (or similar) vulnerability has ever been fixed in a release; the project is ~1 week old and no vulnerabilities have been reported. |
 
 ## Reporting

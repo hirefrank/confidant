@@ -10,6 +10,10 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [0.3.0] - 2026-10-15
 
+**Disclosure:** the milestone 2 encryption has had no outside review
+([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
+other people's client data in a vault until the audit lands.
+
 ### Added
 - Multi-pack loading: shared `Pack` trait, conflict and orphan handling, and
   per-pack access scoping for agent-facing reads (#177, #178).
