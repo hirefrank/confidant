@@ -586,6 +586,25 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             }
         }
     }
+    // #390: an edge carries only ids, kind, and dates, so a front-matter key
+    // outside that set is rejected rather than ignored like unknown keys
+    // elsewhere (spec §4). An extra key is the same shared-key residue as a
+    // body: its value would be encrypted under `vault:shared` and survive a
+    // shred. Envelope shells are exempt — their outer header is the
+    // envelope's (id/type/no-ai/enc/key_id/nonce), not the record's.
+    if kind == RecordKind::Edge && !is_envelope {
+        const ALLOWED: [&str; 7] = ["id", "type", "a", "b", "kind", "since", "until"];
+        let disallowed = fields.keys().find(|k| !ALLOWED.contains(&k.as_str()));
+        if let Some(key) = disallowed {
+            let line = line_of(key).unwrap_or(1);
+            return Err(FrontmatterError::new(
+                "edge record has a front matter key that is not allowed",
+                "Edge records allow only id, type, a, b, kind, since, and until; \
+                 move the context into a note on one of the edge's people",
+            )
+            .at_line(line));
+        }
+    }
     // #179: an edge carries only ids, kind, and dates — no body. Sensitive
     // context belongs in a note on one of the edge's people, which does
     // get crypto-shredded; an edge body would survive shred as shared-key
