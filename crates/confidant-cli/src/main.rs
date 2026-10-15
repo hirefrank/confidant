@@ -28,7 +28,7 @@ use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
-use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
+use confidant_core::ledger::{parse_duration_minutes, parse_strict_date, Arg, LedgerEntry};
 use confidant_core::packs::{resolve_enabled, ALL_PACKS};
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
@@ -2129,17 +2129,27 @@ fn cmd_log_touch(
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
-    if !enabled
-        .iter()
-        .any(|p| p.name() == confidant_core::config::PERSONAL_PACK)
-    {
+    // Find the pack that owns the `touch` verb (#185/#323) — the same routing
+    // `check` uses — instead of gating on a hardcoded pack name.
+    let Some(owner) = enabled.iter().find(|p| p.verbs().contains(&"touch")) else {
         return Err(anyhow::Error::new(
             DomainError::invalid("log touch requires pack personal@0.1")
                 .with_fix("Add \"personal@0.1\" to packs in confidant.toml"),
         ));
-    }
+    };
     let person = parse_person_arg(&vault, person_raw)?;
-    if !confidant_core::packs::personal::is_valid_touch_kind(kind) {
+    // Validate the kind through the owning pack's trait. A synthetic
+    // single-token entry exercises exactly the `log touch` kind grammar:
+    // `validate_touch_args_enabled` on one token is `is_valid_touch_kind`.
+    let probe = LedgerEntry {
+        date: chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("probe date"),
+        verb: "touch".to_owned(),
+        id: RecordId::new(Prefix::Person, confidant_core::write::new_ulid())
+            .map_err(|e| anyhow::anyhow!("generated bad probe id: {e}"))?,
+        args: vec![Arg::Token(kind.to_owned())],
+        comment: None,
+    };
+    if !owner.validate_verb_args("touch", &probe).unwrap_or(true) {
         return Err(anyhow::Error::new(DomainError::usage(format!(
             "bad touch kind '{kind}'; use one of: call, text, coffee, gift, meet"
         ))));
