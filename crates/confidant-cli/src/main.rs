@@ -265,6 +265,19 @@ enum Command {
     },
     /// Print the optional routing snippet for project instruction files.
     Routing,
+    /// Launch the terminal UI (`confidant-tui` on PATH).
+    ///
+    /// Finds `confidant-tui` on PATH and runs it with any extra arguments;
+    /// the environment is inherited, so `CONFIDANT_VAULT` and `CONFIDANT_BIN`
+    /// pass through. An explicit `--vault` on this command is forwarded to
+    /// the TUI the same way. Needs a `confidant` binary on PATH that speaks
+    /// the same agent contract — install both with
+    /// `cargo install confidant-cli confidant-tui`.
+    Tui {
+        /// Arguments passed through verbatim to `confidant-tui`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Write a fake vault of N people for search benchmarks (hidden).
     #[command(hide = true)]
     BenchGen {
@@ -500,7 +513,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // Every JSON response still carries the resolved vault (possibly null).
     // `device-add --initiate` runs on a brand-new device that has no vault
     // yet; everything else needs one.
-    // `setup` / `update` / `agents` / `which` / `routing` manage the
+    // `setup` / `update` / `agents` / `which` / `routing` / `tui` manage the
     // installed skills and never touch a vault.
     let needs_vault = !matches!(
         cli.command,
@@ -511,6 +524,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Agents { .. }
             | Command::Which { .. }
             | Command::Routing
+            | Command::Tui { .. }
             | Command::BenchGen { .. }
             | Command::Keys {
                 action: KeysAction::DeviceAdd { initiate: true, .. },
@@ -899,6 +913,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Agents { verbose } => cmd_agents(&cli, *verbose),
         Command::Which { skills_dir } => cmd_which(&cli, *skills_dir),
         Command::Routing => cmd_routing(&cli),
+        Command::Tui { args } => cmd_tui(&cli, args),
         Command::Mcp => {
             let root = vault_root.unwrap();
             mcp::run(&root, cli.packs.clone())
@@ -4327,6 +4342,61 @@ fn cmd_routing(cli: &Cli) -> anyhow::Result<ExitCode> {
         print!("{}", setup::ROUTING_SNIPPET);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Find `name` on `PATH`, returning the full path of the first match.
+/// Checks the platform executable suffix on Windows (`.exe`).
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
+    const HINT: &str =
+        "confidant-tui not found on PATH; install it with: cargo install confidant-tui";
+    let bin = match find_on_path("confidant-tui") {
+        Some(path) => path,
+        None => {
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": false,
+                    "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                    "vault": vault_json(None),
+                    "error": {"code": "E_TUI_NOT_FOUND", "message": HINT},
+                }))?;
+            } else {
+                eprintln!("{HINT}");
+            }
+            return Ok(ExitCode::from(1));
+        }
+    };
+    // The child inherits this process's environment, so CONFIDANT_VAULT and
+    // CONFIDANT_BIN pass through untouched. An explicit `--vault` on this
+    // command is forwarded the same way the TUI already reads it.
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(args);
+    if let Some(vault) = cli.vault.as_deref() {
+        cmd.env("CONFIDANT_VAULT", vault);
+    }
+    let status = cmd.status()?;
+    Ok(match status.code() {
+        Some(code) => ExitCode::from(code as u8),
+        // Killed by a signal: no exit code to propagate.
+        None => ExitCode::FAILURE,
+    })
 }
 
 fn help_json_value() -> serde_json::Value {

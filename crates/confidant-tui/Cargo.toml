@@ -8,20 +8,18 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Terminal UI for Confidant, consuming the ADR-7 CLI JSON contract."
-publish = false
+readme = "README.md"
 
 [[bin]]
 name = "confidant-tui"
 path = "src/main.rs"
 
 [package.metadata.dist]
-# #218: the TUI ships as a GitHub-Releases binary only — it stays a preview
-# (`publish = false`, no crates.io yet, and it deliberately never links
-# confidant-core so it remains the second consumer of the ADR-7 --json
-# contract). `dist = true` opts the binary into cargo-dist despite
-# `publish = false`, so the release workflow produces `confidant-tui`
-# alongside `confidant`. Phase 2 (write flows) landed in #211; flipping to
-# crates.io still tracks #218.
+# The TUI ships both as a GitHub-Releases binary (cargo-dist) and on
+# crates.io (#363). It deliberately never links confidant-core so it
+# remains the second consumer of the ADR-7 --json contract. `dist = true`
+# opts the binary into cargo-dist, so the release workflow produces
+# `confidant-tui` alongside `confidant`.
 dist = true
 
 [dependencies]
