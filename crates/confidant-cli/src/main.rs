@@ -5634,7 +5634,10 @@ fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow
 /// needs decryption (edges live under `vault:shared`, so `a` / `b` sit
 /// inside the ciphertext in encrypted vaults), and a failure here must
 /// abort before any irreversible key destruction. Returns the deleted
-/// vault-relative paths, for staging into the same signed shred commit.
+/// vault-relative paths paired with their pre-delete bytes, for staging
+/// into the same signed shred commit — and for restoring the working tree
+/// if `KeyStore::shred` later refuses (#320: a failed shred must not leave
+/// orphaned deletions a re-run cannot rediscover).
 ///
 /// Fail-closed, edge-scoped: refuses when any *edge's* ends cannot be
 /// determined — an undecryptable or tampered edge envelope, a `no-ai`
@@ -5644,7 +5647,7 @@ fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow
 /// after `keys shred` of person A, A's leftover envelopes stay in the
 /// tree and become undecryptable, and shredding B must still proceed
 /// when every edge reads fine.
-fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<String>> {
+fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     // Keyed load: decrypts edge envelopes via the current device key.
     // (Same probe-then-keyed pattern as `load_vault_for_reads`.)
     let probe = load_vault(root)?;
@@ -5725,6 +5728,14 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
         };
         if a.to_string() == client_id || b.to_string() == client_id {
             let path = root.join(&rec.path);
+            // #320: snapshot the bytes before deleting, so a later
+            // `KeyStore::shred` refusal can restore the working tree.
+            let bytes = std::fs::read(&path).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot read edge file {}: {e}",
+                    rec.path
+                )))
+            })?;
             std::fs::remove_file(&path).map_err(|e| {
                 anyhow::Error::new(DomainError::invalid(format!(
                     "cannot delete edge file {}: {e}",
@@ -5735,7 +5746,7 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
             if let Some(parent) = path.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
-            deleted.push(rec.path.clone());
+            deleted.push((rec.path.clone(), bytes));
         }
     }
     Ok(deleted)
@@ -5743,8 +5754,10 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
 
 /// #258: remove a shredded person from every interaction's `with:` list,
 /// re-encrypting each affected interaction through the normal write path
-/// (`record_crypto`), before any key destruction. Returns the count of
-/// interactions rewritten.
+/// (`record_crypto`), before any key destruction. Returns the rewritten
+/// vault-relative paths paired with their pre-rewrite bytes — for staging
+/// into the same signed shred commit, and for restoring the working tree
+/// if `KeyStore::shred` later refuses (#320).
 ///
 /// Mirrors [`delete_edges_naming`]: discovery decrypts with the pre-shred
 /// device key, and a tampered / unparseable / genuinely-undecryptable
@@ -5758,12 +5771,14 @@ fn delete_edges_naming(root: &Path, client_id: &str) -> anyhow::Result<Vec<Strin
 /// shredded earlier, its `with:` list is unreachable and nothing is lost by
 /// skipping it (the history-residue warning already covers it). This keeps a
 /// later shred from being blocked by a previous shred's leftovers (#259's
-/// edge fix, applied to interactions).
+/// edge fix, applied to interactions). A skipped envelope whose bytes
+/// cannot be read or parsed, or whose key id does not name a determinable
+/// client, fails closed: an unseen primary might be live.
 fn strip_participant_from_interactions(
     root: &Path,
     client_id: &str,
     live_clients: &HashSet<String>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     // Keyed load: decrypts interaction envelopes via the current device key.
     let probe = load_vault(root)?;
     let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
@@ -5799,16 +5814,32 @@ fn strip_participant_from_interactions(
     // check below enforces it), so a live-but-undecryptable interaction means
     // we cannot tell whether its `with:` names `client_id`. A `Skipped`
     // interaction whose primary was already shredded is unreachable — skip.
+    // Anything we cannot read or parse fails closed (#320): an unseen
+    // primary might be live, and silently skipping would risk leaving a
+    // `with:` entry naming the shredded person behind.
     let ixn_skipped = ixn_skipped.lock().unwrap();
     let mut live_undecryptable: Vec<String> = Vec::new();
     for path in ixn_skipped.iter() {
-        if let Ok(bytes) = std::fs::read(root.join(path)) {
-            if let Ok(env) = confidant_crypt::envelope::parse(&bytes) {
-                let client = env.key_id.rsplit_once("/e").map(|(c, _)| c).unwrap_or("");
-                if live_clients.contains(client) {
-                    live_undecryptable.push(path.clone());
-                }
-            }
+        let bytes = std::fs::read(root.join(path)).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot determine every interaction naming {client_id}: cannot re-read skipped envelope {path}: {e}"
+            )))
+        })?;
+        let env = confidant_crypt::envelope::parse(&bytes).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot determine every interaction naming {client_id}: skipped envelope {path} does not parse: {e}"
+            )))
+        })?;
+        // `envelope::parse` already validated the key id shape
+        // (`<client>/e<epoch>`); failure here is unreachable, but fail
+        // closed rather than silently defaulting to an empty client.
+        let (client, _) = env.key_id.rsplit_once("/e").ok_or_else(|| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot determine every interaction naming {client_id}: skipped envelope {path} has an undeterminable client"
+            )))
+        })?;
+        if live_clients.contains(client) {
+            live_undecryptable.push(path.clone());
         }
     }
     if !live_undecryptable.is_empty() {
@@ -5881,13 +5912,22 @@ fn strip_participant_from_interactions(
                     rec.id
                 )))
             })?;
-        std::fs::write(root.join(&rec.path), &envelope).map_err(|e| {
+        // #320: snapshot the pre-rewrite bytes before overwriting, so a
+        // later `KeyStore::shred` refusal can restore the working tree.
+        let full_path = root.join(&rec.path);
+        let original = std::fs::read(&full_path).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot re-read interaction {} before rewrite: {e}",
+                rec.id
+            )))
+        })?;
+        std::fs::write(&full_path, &envelope).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "cannot write re-encrypted interaction {}: {e}",
                 rec.id
             )))
         })?;
-        rewritten.push(rec.path.clone());
+        rewritten.push((rec.path.clone(), original));
     }
     Ok(rewritten)
 }
@@ -5982,18 +6022,33 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
 
     // B5: verify-first, strand check, history-derived destroy list all come
     // from KeyStore::shred — do not weaken them.
-    let outcome = store
-        .shred(
-            client_id,
-            &all_refs,
-            &new_recipients,
-            &operator_sk,
-            &anchor,
-            identity.as_ref(),
-            deleted_edges.len(),
-            stripped_interactions.len(),
-        )
-        .map_err(anyhow::Error::new)?;
+    // #320: the edge deletions and interaction rewrites above already hit
+    // the working tree. If shred refuses, restore every mutated file from
+    // its pre-shred snapshot so the tree is exactly as before: a re-run
+    // then rediscovers everything from a clean state instead of finding
+    // nothing to strip and leaving the changes unstaged forever.
+    let outcome = match store.shred(
+        client_id,
+        &all_refs,
+        &new_recipients,
+        &operator_sk,
+        &anchor,
+        identity.as_ref(),
+        deleted_edges.len(),
+        stripped_interactions.len(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            for (path, bytes) in deleted_edges.iter().chain(stripped_interactions.iter()) {
+                let full = root.join(path);
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&full, bytes);
+            }
+            return Err(anyhow::Error::new(e));
+        }
+    };
 
     // Shred's checks passed and the vault was re-wrapped to the fresh
     // keypair: store the fresh private key now. (If shred had refused,
@@ -6055,7 +6110,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // so unrelated unstaged changes under edges/ are not swept in.
     if !deleted_edges.is_empty() {
         let mut ls_args: Vec<&str> = vec!["ls-files", "-z", "--"];
-        ls_args.extend(deleted_edges.iter().map(String::as_str));
+        ls_args.extend(deleted_edges.iter().map(|(p, _)| p.as_str()));
         let listed = confidant_core::write::git(root, &ls_args, no_input)?;
         let tracked: Vec<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
         if !tracked.is_empty() {
@@ -6070,7 +6125,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // `git add` stages the modification without sweeping unrelated files.
     if !stripped_interactions.is_empty() {
         let mut add_args: Vec<&str> = vec!["add", "--"];
-        add_args.extend(stripped_interactions.iter().map(String::as_str));
+        add_args.extend(stripped_interactions.iter().map(|(p, _)| p.as_str()));
         confidant_core::write::git(root, &add_args, no_input)?;
     }
     confidant_core::write::git(
@@ -6131,7 +6186,7 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
             "client_id": client_id,
             "destroy_key_ids": outcome.destroy_key_ids,
             "warnings": shred_warnings,
-            "deleted_edges": deleted_edges,
+            "deleted_edges": deleted_edges.iter().map(|(p, _)| p).collect::<Vec<_>>(),
             "stripped_interactions": stripped_interactions.len(),
             "inbox_rotated": inbox_rotated,
             "device_key_rotated": true,
