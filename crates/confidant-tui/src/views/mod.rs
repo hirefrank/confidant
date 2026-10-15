@@ -10,3 +10,4 @@ pub mod diff;
 pub mod doctor;
 pub mod find;
 pub mod proposals;
+pub mod search;
