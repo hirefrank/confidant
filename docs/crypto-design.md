@@ -414,7 +414,10 @@ expires = "2026-11-08"
   (so a rotation after a revocation also clears the revoked party's
   old-epoch wrappings from the working tree). New writes use the new
   epoch. Old-epoch ciphertext stays decryptable by still-authorized
-  parties — rotation does not re-encrypt content.
+  parties — rotation does not re-encrypt content. The same holds for a
+  rewrite (`record edit`, #216): the edit re-encrypts under the current
+  epoch, and the replaced envelope stays readable in git history with the
+  epoch that wrote it, until that client is shredded (above).
 - **Revoke device/agent**: §6. Re-wrap excludes the revoked party across
   all retained epochs; optional rotation afterwards so future writes use
   new keys.

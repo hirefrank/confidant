@@ -152,7 +152,11 @@ impl RecordEncryptor {
                 self.decrypt_existing(path, b)
             }) {
                 StabilityOutcome::Reuse => return Ok(existing.clone()),
-                StabilityOutcome::Reencrypt => {}
+                // #389 Q4: `record edit` refuses an undecryptable envelope
+                // (its own precheck, before any write). The remaining
+                // callers — the shred path — keep treating it as changed,
+                // so the re-encrypt fall-through below decides.
+                StabilityOutcome::Reencrypt | StabilityOutcome::Undecryptable => {}
                 StabilityOutcome::PlaintextExists => {
                     // ⚠1: never encrypt a plaintext record in place, never
                     // rewrite it as plaintext — fail closed.
@@ -483,14 +487,18 @@ fn referenced_person_mode(
 /// bytes to inner plaintext. Returns:
 /// - `Reuse`: existing is an envelope decrypting to exactly `plaintext`
 ///   \u2014 keep the bytes byte-for-byte (no new nonce, no diff);
-/// - `Reencrypt`: envelope with different content, or undecryptable
-///   (a failed decrypt counts as changed);
+/// - `Reencrypt`: envelope with different content \u2014 re-encrypt;
+/// - `Undecryptable`: envelope this device cannot decrypt (missing key,
+///   shredded client, or tampered body) \u2014 #389 Q4. `record edit` fails
+///   closed on this (its own precheck refuses first); writers that may
+///   proceed, such as the shred path, treat it as changed;
 /// - `PlaintextExists`: existing is not an envelope \u2014 the caller
 ///   fails closed (\u26a01: never encrypt in place).
 #[derive(Debug, PartialEq, Eq)]
 enum StabilityOutcome {
     Reuse,
     Reencrypt,
+    Undecryptable,
     PlaintextExists,
 }
 
@@ -512,7 +520,11 @@ fn stability_decision(
     }
     match decrypt(existing) {
         Ok(inner) if inner == plaintext => StabilityOutcome::Reuse,
-        _ => StabilityOutcome::Reencrypt,
+        Ok(_) => StabilityOutcome::Reencrypt,
+        // #389 Q4: a decrypt failure is its own outcome, not "changed" —
+        // it may mean a shredded or missing client key, which `record
+        // edit` must refuse rather than re-encrypt blindly.
+        Err(_) => StabilityOutcome::Undecryptable,
     }
 }
 
@@ -649,8 +661,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_decrypt_counts_as_changed() {
-        // A failed decrypt never reuses: it counts as changed.
+    fn failed_decrypt_is_undecryptable() {
+        // #389 Q4: a failed decrypt is its own outcome, so callers can
+        // fail closed (`record edit`) instead of silently re-encrypting a
+        // record they cannot read.
         let existing = envelope_bytes();
         let out = stability_decision(
             existing.as_slice(),
@@ -658,7 +672,7 @@ mod tests {
             envelope::NoAi::False,
             &|_| anyhow::bail!("tampered"),
         );
-        assert_eq!(out, StabilityOutcome::Reencrypt);
+        assert_eq!(out, StabilityOutcome::Undecryptable);
     }
 
     #[test]
