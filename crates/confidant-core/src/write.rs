@@ -83,7 +83,10 @@ pub struct DryRunFile {
 /// What [`apply_write`] did.
 #[derive(Clone, Debug)]
 pub enum WriteOutcome {
-    /// Files applied and committed. `commit` is the full SHA.
+    /// Files applied and committed. `commit` is the full SHA; `files`
+    /// lists only the paths this write actually rewrote — a change whose
+    /// bytes already matched the file on disk (a reused envelope, #406)
+    /// is not listed, so the list and the commit diff agree (#425).
     Applied { commit: String, files: Vec<String> },
     /// Nothing touched; the logical change is in `preview`.
     DryRun { preview: Vec<DryRunFile> },
@@ -392,8 +395,13 @@ fn apply_write_inner(
         return Ok(WriteOutcome::Unchanged);
     }
 
-    // 4. Fail closed on conflict markers; snapshot for rollback.
+    // 4. Fail closed on conflict markers; snapshot for rollback. Along the
+    // way, record which files this changeset actually rewrites (#425): a
+    // reused envelope (#406) keeps its ciphertext byte-for-byte, and the
+    // `files` list names only real rewrites, so the JSON `files` and the
+    // commit diff (`git show --stat`) agree.
     let mut snapshots: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
     for change in &pending.changes {
         let rel = change.path();
         let existing = crate::paths::read_to_string(root, rel).ok();
@@ -410,6 +418,16 @@ fn apply_write_inner(
                     .with_fix("Resolve the conflict markers (git mergetool), then retry"),
                 ));
             }
+        }
+        let rewrites = match change {
+            FileChange::WriteFile { contents, .. } => {
+                existing.as_deref() != Some(contents.as_str())
+            }
+            // An append always changes its file (same rule as step 3b).
+            FileChange::AppendLines { .. } => true,
+        };
+        if rewrites {
+            changed.push(rel.display().to_string());
         }
         snapshots.push((rel.to_path_buf(), existing));
     }
@@ -494,11 +512,7 @@ fn apply_write_inner(
         }
         message.push_str(&format!("\n\nAgent: {agent}"));
     }
-    let files: Vec<String> = pending
-        .changes
-        .iter()
-        .map(|c| c.path().display().to_string())
-        .collect();
+    let files: Vec<String> = changed;
     let mut add_args: Vec<&str> = vec!["add", "--"];
     add_args.extend(files.iter().map(|s| s.as_str()));
     git(root, &add_args, opts.no_input)?;

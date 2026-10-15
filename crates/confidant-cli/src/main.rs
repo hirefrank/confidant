@@ -3377,10 +3377,17 @@ fn plan_no_ai_restamp(
         confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
     let mut unreadable = unreadable.lock().unwrap().clone();
     // A load finding on a record file means it could not be parsed — its
-    // references are unknown, same as an undecryptable envelope.
+    // references are unknown, same as an undecryptable envelope. Findings
+    // on other files (ledger, `confidant.toml`, stray top-level entries)
+    // say nothing about who references this person, so they stay out of
+    // the refusal list (#424): naming them under "record file(s)" would
+    // be misleading, and the write path's own pre-check still fails
+    // closed on any error-severity finding. `check` reports them all.
     for finding in &scanned.load_findings {
         if let Some(path) = &finding.file {
-            unreadable.push(path.clone());
+            if confidant_core::crypto_mode::is_record_path(std::path::Path::new(path)) {
+                unreadable.push(path.clone());
+            }
         }
     }
     if !unreadable.is_empty() {
