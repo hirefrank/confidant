@@ -5,9 +5,13 @@
 //! rendering is pure: the apply flow lives in [`crate::apply`].
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+
+use crate::theme;
+use crate::theme::palette;
 
 /// One row in the proposals list.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -45,6 +49,18 @@ pub struct ProposalDetailState {
     pub hint: String,
 }
 
+/// Status icon for a step, colored by state. Text is unchanged from before;
+/// only styling is added.
+fn step_status_span(status: &str) -> Span<'_> {
+    let style = match status {
+        "[x]" => Style::default().fg(palette::SUCCESS).bold(),
+        "[!]" => Style::default().fg(palette::WARNING).bold(),
+        "[E]" => Style::default().fg(palette::ERROR).bold(),
+        _ => Style::default().fg(palette::MUTED),
+    };
+    Span::styled(status, style)
+}
+
 /// Pure renderer for the proposals list.
 pub fn render_list(state: &ProposalsListState, frame: &mut Frame<'_>, area: Rect) {
     let chunks = Layout::default()
@@ -53,19 +69,24 @@ pub fn render_list(state: &ProposalsListState, frame: &mut Frame<'_>, area: Rect
         .split(area);
 
     let header = if state.vault_note.is_empty() {
-        "Proposal manifests awaiting review".to_owned()
+        Line::from("Proposal manifests awaiting review".dark_gray())
     } else {
-        format!("Proposal manifests ({})", state.vault_note)
+        Line::from(vec![
+            theme::label("Proposal manifests "),
+            Span::styled(state.vault_note.clone(), Color::White),
+        ])
     };
     frame.render_widget(
-        Paragraph::new(header).block(Block::bordered().title(" Proposals ")),
+        Paragraph::new(header).block(theme::block(" Proposals ")),
         chunks[0],
     );
 
     if state.entries.is_empty() {
         frame.render_widget(
-            Paragraph::new("No proposal manifests in .confidant/proposals/.")
-                .block(Block::bordered()),
+            Paragraph::new(Line::from(
+                "No proposal manifests in .confidant/proposals/.".dark_gray(),
+            ))
+            .block(theme::block("")),
             chunks[1],
         );
         return;
@@ -74,19 +95,34 @@ pub fn render_list(state: &ProposalsListState, frame: &mut Frame<'_>, area: Rect
     let items: Vec<ListItem<'_>> = state
         .entries
         .iter()
-        .enumerate()
-        .map(|(idx, e)| {
-            let marker = if idx == state.selected { ">" } else { " " };
-            let status = e.error.as_deref().unwrap_or(&e.progress);
-            ListItem::new(Line::from(format!(
-                "{marker} {:<28} {:<18} {} | {}",
-                e.name, e.skill, e.detail, status
-            )))
+        .map(|e| {
+            let status = e.error.clone().unwrap_or_else(|| e.progress.clone());
+            let status_style = if e.error.is_some() {
+                Style::default().fg(palette::ERROR)
+            } else {
+                Style::default().fg(palette::MUTED)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(e.name.clone(), Color::White),
+                Span::raw("  "),
+                Span::styled(e.skill.clone(), Style::default().fg(palette::ACCENT)),
+                Span::raw("  "),
+                Span::styled(e.detail.clone(), Style::default().fg(palette::MUTED)),
+                Span::raw("  "),
+                Span::styled(status, status_style),
+            ]))
         })
         .collect();
-    frame.render_widget(
-        List::new(items).block(Block::bordered().title(" Enter: open | a: apply | r: refresh ")),
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(theme::block(" Enter: open   a: apply   r: refresh "))
+            .highlight_style(Style::default().fg(palette::ACCENT).bold())
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always),
         chunks[1],
+        &mut list_state,
     );
 }
 
@@ -102,36 +138,57 @@ pub fn render_detail(state: &ProposalDetailState, frame: &mut Frame<'_>, area: R
         .split(area);
 
     let mut header_lines = vec![
-        Line::from(format!("manifest: {}", state.name)),
-        Line::from(format!("skill:    {}", state.skill)),
+        Line::from(vec![
+            theme::label("manifest "),
+            Span::styled(state.name.clone(), Color::White),
+        ]),
+        Line::from(vec![
+            theme::label("skill    "),
+            Span::styled(state.skill.clone(), Style::default().fg(palette::ACCENT)),
+        ]),
     ];
     if !state.summary.is_empty() {
-        header_lines.push(Line::from(format!("summary:  {}", state.summary)));
+        header_lines.push(Line::from(vec![
+            theme::label("summary  "),
+            Span::raw(state.summary.clone()),
+        ]));
     }
     for warning in &state.warnings {
-        header_lines.push(Line::from(format!("warning:  {warning}")));
+        header_lines.push(Line::from(vec![
+            Span::styled("⚠ warning ", Style::default().fg(palette::WARNING).bold()),
+            Span::raw(warning.clone()),
+        ]));
     }
     frame.render_widget(
-        Paragraph::new(header_lines).block(Block::bordered().title(" Proposal ")),
+        Paragraph::new(header_lines).block(theme::block(" Proposal ")),
         chunks[0],
     );
 
     let items: Vec<ListItem<'_>> = state
         .steps
         .iter()
-        .map(|s| ListItem::new(Line::from(format!("{}  {}", s.status, s.label))))
+        .map(|s| {
+            ListItem::new(Line::from(vec![
+                step_status_span(&s.status),
+                Span::raw("  "),
+                Span::raw(s.label.clone()),
+            ]))
+        })
         .collect();
     let list_block = if items.is_empty() {
-        Block::bordered().title(" Steps (nothing to apply) ")
+        theme::block(" Steps (nothing to apply) ")
     } else {
-        Block::bordered().title(" Steps ")
+        theme::block(" Steps ")
     };
     frame.render_widget(List::new(items).block(list_block), chunks[1]);
 
     frame.render_widget(
-        Paragraph::new(state.hint.clone())
-            .block(Block::bordered())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Line::from(Span::styled(
+            state.hint.clone(),
+            Style::default().fg(palette::MUTED),
+        )))
+        .block(theme::block(""))
+        .wrap(Wrap { trim: false }),
         chunks[2],
     );
 }

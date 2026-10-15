@@ -1,24 +1,24 @@
-┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Search ] [ 7:Inbox ] | Tab/1│
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Check Summary ───────────────────────────────────────────────────────────────────────────────────┐
-│status: FAILED | spec: 0.1 | records: 2 | ledger: 3 | errors: 1 | warnings: 0 | 1 findings        │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Findings ────────────────────────────────────────────────────────────────────────────────────────┐
-│> [error  ] E_BALANCE_MISMATCH        p-01M3TC5H00MPJG000000000000 sessions_remaining asserted 4, │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Finding Detail (Enter on p-… opens Context) ─────────────────────────────────────────────────────┐
-│code: E_BALANCE_MISMATCH | severity: error | id: p-01M3TC5H00MPJG000000000000 | location:         │
-│ledger/2026/10.cfd:3                                                                              │
-│message: sessions_remaining asserted 4, computed 5                                                │
-│fix: Check for a missing 'open' entry or a duplicated 'session' entry for                         │
-│p-01M3TC5H00MPJG000000000000                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+╭ Check Summary ───────────────────────────────────────────────────────────────────────────────────╮
+│  FAILED   spec 0.1  •  records 2  •  ledger 3  •  errors 1  •  warnings 0  •  findings 1         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
+│ › [error] E_BALANCE_MISMATCH p-01M3TC5H00MPJG000000 ││ code      E_BALANCE_MISMATCH              │
+│                                                     ││ severity  [error]                         │
+│                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
+│                                                     ││ location  ledger/2026/10.cfd:3            │
+│                                                     ││ message   sessions_remaining asserted 4,  │
+│                                                     ││ computed 5                                │
+│                                                     ││ fix       Check for a missing 'open'      │
+│                                                     ││ entry or a duplicated 'session' entry for │
+│                                                     ││ p-01M3TC5H00MPJG000000000000              │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+ Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit
