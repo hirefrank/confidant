@@ -47,7 +47,7 @@ pub const PERSONAL_EDGE_KINDS: &[EdgeKind] = &[
     },
 ];
 
-pub fn is_valid_touch_kind(kind: &str) -> bool {
+fn is_valid_touch_kind(kind: &str) -> bool {
     TOUCH_KINDS.contains(&kind)
 }
 
