@@ -180,3 +180,17 @@ jobs:
       - name: cargo audit
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo audit
+
+  package-paths:
+    name: crate path check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check crate paths
+        # Pure-Python, no toolchain: always runs, even for docs-only PRs.
+        # Catches build-time paths that escape the crate directory
+        # (include_dir!/include_str! with ../..), which break `cargo publish`
+        # because the packaged tarball only contains the crate's own files
+        # (#367; `cargo package` can't catch this in CI pre-release because
+        # it resolves sibling crates against the crates.io index).
+        run: python3 .github/scripts/check-crate-paths.py

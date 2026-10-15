@@ -66,6 +66,7 @@ cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/
 cargo +1.88 check --workspace --locked   # MSRV job
 cargo deny check                          # deny.toml sets all-features
 cargo audit
+python3 .github/scripts/check-crate-paths.py   # crate path check job
 ```
 
 CI runs the test job on `ubuntu-latest` for pull requests; `macos-latest`
