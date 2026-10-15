@@ -1061,18 +1061,25 @@ fn cmd_find(
         }
     };
     let hits: Vec<_> = result.hits.into_iter().take(limit).collect();
+    // #386: optional ranked-search hint. Present only when qmd is on PATH
+    // and the corpus exists; never changes matches, ordering, or exit status.
+    let qmd_hint = qmd_hint_for_find(&vault.root);
     if json {
-        print_json(&ok_envelope(
-            Some(&vault.root),
-            serde_json::json!({
+        let mut data = serde_json::json!({
                 "query": query,
                 "matches": hits,
                 "findings": result.findings,
                 "skipped_encrypted": result.skipped_encrypted,
                 "refused_envelopes": result.refused_envelopes,
                 "scope": scope_names,
-            }),
-        ))?;
+        });
+        if let (Some(hint), Some(obj)) = (qmd_hint.as_deref(), data.as_object_mut()) {
+            obj.insert(
+                "hint".to_owned(),
+                serde_json::Value::String(hint.to_owned()),
+            );
+        }
+        print_json(&ok_envelope(Some(&vault.root), data))?;
     } else {
         for f in &result.findings {
             writeln!(
@@ -1110,8 +1117,36 @@ fn cmd_find(
                 result.refused_envelopes
             )?;
         }
+        if let Some(hint) = qmd_hint.as_deref() {
+            eprintln!("{hint}");
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// #386: optional `find` ranked-search hint. `Some` only when `qmd` is on
+/// PATH and `<vault>/.confidant/qmd-corpus/` exists; otherwise `None`
+/// (the install suggestion stays in `doctor` and `setup`).
+fn qmd_hint_for_find(root: &Path) -> Option<String> {
+    find_on_path("qmd")?;
+    if !root.join(QMD_CORPUS_REL).is_dir() {
+        return None;
+    }
+    Some("qmd index available; use the qmd-search skill for ranked results".to_owned())
+}
+
+/// #386: optional `setup` note when `qmd` is not on PATH. Informational
+/// only: no prompt, no failure, no exit-status change. Search falls back
+/// to `confidant find` without qmd.
+fn qmd_setup_note() -> Option<String> {
+    if find_on_path("qmd").is_some() {
+        return None;
+    }
+    Some(
+        "Note: `qmd` not found on PATH — search falls back to `confidant find`. \
+         For ranked search, install with `npm install -g @tobilu/qmd` (optional)."
+            .to_owned(),
+    )
 }
 
 /// `<vault>/.confidant/qmd-corpus/` — the QMD search corpus (ADR-6).
@@ -3329,9 +3364,17 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
     }
     match qmd_embedded_vectors(root, &qmd) {
         Some(n) if n > 0 => ok(format!("qmd search available ({n} embedded vectors)")),
-        _ => ok(
+        Some(_) => ok(
             "qmd index has no embedded vectors; hybrid/vector search needs \
              `qmd embed` (bm25 keyword search works without it)"
+                .to_owned(),
+        ),
+        // The probe itself could not report (status failed or timed out):
+        // do not point at `qmd embed`, which would not fix a broken status.
+        None => ok(
+            "qmd status did not report embedded vectors; run `qmd status` \
+             with INDEX_PATH=<vault>/.confidant/qmd/index.sqlite to diagnose \
+             (search falls back to `confidant find`)"
                 .to_owned(),
         ),
     }
@@ -3339,19 +3382,52 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
 
 /// Probe the vault-local qmd store for embedded vectors, mirroring
 /// `qmd-query.py`'s `vectors_available` (same env, same `status` parse).
-/// Returns `None` when qmd cannot report (missing store, failing status).
+/// Returns `None` when qmd cannot report (missing store, failing status,
+/// timeout). Never creates the store: when `index.sqlite` is absent the
+/// probe is skipped, because some `qmd` versions create an empty index
+/// file as a side effect of `status`.
 fn qmd_embedded_vectors(root: &Path, qmd: &Path) -> Option<u64> {
     let store = root.join(QMD_STORE_REL);
-    let out = std::process::Command::new(qmd)
+    if !store.join("index.sqlite").is_file() {
+        return Some(0);
+    }
+    let mut child = std::process::Command::new(qmd)
         .arg("status")
         .env("INDEX_PATH", store.join("index.sqlite"))
         .env("QMD_CONFIG_DIR", store.join("config"))
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    // `qmd status` has no built-in timeout (unlike `qmd-query.py`, which
+    // uses timeout=30); a hung qmd must not hang `doctor` or the TUI
+    // Doctor tab. Poll with try_wait and kill after the grace period.
+    const QMD_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let out = loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                let mut stdout = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read as _;
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                break (status, stdout);
+            }
+            None => {
+                if start.elapsed() >= QMD_STATUS_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    if !out.0.success() {
         return None;
     }
-    parse_embedded_vectors(&String::from_utf8_lossy(&out.stdout))
+    parse_embedded_vectors(&out.1)
 }
 
 /// Parse `qmd status` output for a `Vectors: <n> embedded` line.
@@ -4457,9 +4533,12 @@ fn vault_export_line(cli: &Cli) -> String {
 
 /// Additive `next_steps` entry for the `setup` JSON envelope (#376): the
 /// check command to run, whether `CONFIDANT_VAULT` is set, and the exact
-/// export line when it is not. Never probes the vault.
+/// export line when it is not. Never probes the vault. #386 adds the
+/// informational qmd availability (`qmd_available`, plus `qmd_note` only
+/// when qmd is missing): qmd is optional and never changes exit status.
 fn setup_next_steps_json(cli: &Cli) -> Value {
     let set = vault_env_set();
+    let qmd_note = qmd_setup_note();
     serde_json::json!({
         "check_command": "confidant check",
         "vault_set": set,
@@ -4468,6 +4547,8 @@ fn setup_next_steps_json(cli: &Cli) -> Value {
         } else {
             Value::String(vault_export_line(cli))
         },
+        "qmd_available": qmd_note.is_none(),
+        "qmd_note": qmd_note.map(Value::String).unwrap_or(Value::Null),
     })
 }
 
@@ -4491,6 +4572,11 @@ fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
     } else {
         println!("  {}", vault_export_line(cli));
         println!("  Then run `confidant check`.");
+    }
+    // #386: informational qmd note. Optional, never prompts, never fails,
+    // never changes exit status.
+    if let Some(note) = qmd_setup_note() {
+        println!("  {note}");
     }
     Ok(())
 }
@@ -4701,9 +4787,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         }
         #[cfg(windows)]
         {
-            let exe = dir.join(format!("{name}.exe"));
-            if exe.is_file() {
-                return Some(exe);
+            // npm shims install as `.cmd`/`.bat` (and `.exe` for some
+            // packages): `qmd` on Windows is typically `qmd.cmd`.
+            for ext in ["exe", "cmd", "bat"] {
+                let shim = dir.join(format!("{name}.{ext}"));
+                if shim.is_file() {
+                    return Some(shim);
+                }
             }
         }
     }

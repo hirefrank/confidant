@@ -1117,3 +1117,39 @@ fn setup_json_next_steps_unset_carries_export_line() {
         "{v}"
     );
 }
+
+// #386: `setup` mentions qmd as optional when it is not on PATH.
+// Informational only: setup still succeeds and the exit status is unchanged.
+#[test]
+fn setup_without_qmd_mentions_fallback_and_still_succeeds() {
+    let env = fresh_env();
+    let empty = tempfile::tempdir().unwrap();
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let both = format!("{}{}", r.stdout, r.stderr);
+    assert!(both.contains("confidant find"), "{both}");
+    assert!(both.contains("npm install -g @tobilu/qmd"), "{both}");
+}
+
+#[test]
+fn setup_json_reports_qmd_availability_additively() {
+    let env = fresh_env();
+    // qmd absent: additive fields report the fallback without failing.
+    let empty = tempfile::tempdir().unwrap();
+    let (ok, v, _) = run(
+        &["setup", "--agent", "all", "--json"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["next_steps"]["qmd_available"], false, "{v}");
+    let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
+    assert!(note.contains("confidant find"), "{v}");
+    assert_eq!(v["linked"], 5, "{v}");
+}
