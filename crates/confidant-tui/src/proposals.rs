@@ -250,8 +250,6 @@ impl TuiProgress {
     }
 }
 
-/// Read the progress file; a missing or corrupt file yields empty progress
-/// (the request ids make re-running safe).
 /// Read the progress file. A missing file means a fresh proposal; a corrupt
 /// file is also treated as fresh, but silently — callers that need to tell
 /// the operator use [`progress_file_corrupt`], which surfaces it in-UI
