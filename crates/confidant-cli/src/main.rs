@@ -55,7 +55,7 @@ use zeroize::Zeroizing;
         CONFIDANT_VAULT=./examples/demo-vault confidant find goals --json"
 )]
 struct Cli {
-    /// Vault directory (ADR-11, first).
+    /// Vault directory.
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
 
@@ -63,7 +63,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Never prompt; fail instead (ADR-7).
+    /// Never prompt; fail instead.
     #[arg(long, global = true)]
     no_input: bool,
 
@@ -71,21 +71,17 @@ struct Cli {
     #[arg(long, global = true)]
     dry_run: bool,
 
-    /// Idempotency key for this write (HMAC idempotency, ADR-7).
+    /// Idempotency key for this write.
     ///
-    /// Must be unguessable and at least 22 characters (use a ULID or
-    /// UUIDv4 — a ULID carries 80 random bits plus a timestamp):
-    /// the Request-Hash trailer HMACs the canonical request with the raw id
-    /// as key, and trailers are permanent, so a guessable id lets anyone with
-    /// repo read access confirm guesses about note contents offline, even
-    /// after shredding. Generate a ULID or UUIDv4 once and reuse it on retry.
+    /// Must be unguessable and at least 22 characters — use a ULID or
+    /// UUIDv4. Generate once and reuse it on retry.
     #[arg(long, global = true)]
     request_id: Option<String>,
 
     /// Pack scope for agent-facing reads (`find`, `context`, `allowlist`,
     /// `mcp`). Comma-separated pack names, e.g. `coaching@0.1`. Unset =
     /// all enabled packs. Naming an unknown or disabled pack is a hard
-    /// error (#178). Ignored by `check` / `doctor` (always unscoped) and
+    /// error. Ignored by `check` / `doctor` (always unscoped) and
     /// by writes.
     #[arg(long, global = true)]
     packs: Option<String>,
@@ -113,18 +109,15 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Print the section-12 cleared set (cleared record files and ledger
-    /// lines) for index-time corpus exclusion (issue #38).
+    /// Print the cleared set (cleared record files and ledger lines)
+    /// for index-time corpus exclusion.
     ///
     /// Read-only: emits opaque paths and line numbers only, never content.
     /// The query-time allowlist stays the authority; this only narrows what
     /// an indexer copies into its local corpus.
     Allowlist,
-    /// Rebuild the local QMD search corpus under
-    /// `<vault>/.confidant/qmd-corpus/` (ADR-6).
+    /// Rebuild the local search corpus under `<vault>/.confidant/qmd-corpus/`.
     ///
-    /// The CLI owns corpus content, §12 clearance, decryption, and
-    /// permissions; the `qmd-search` skill only registers/embeds on top.
     /// Cleared records are decrypted through the read path, so `no-ai`
     /// records stay out by construction. Refuses (writes nothing) when an
     /// encrypted record cannot be decrypted, or when the corpus path is not
@@ -151,7 +144,7 @@ enum Command {
         /// Refused during `inbox rotate`.
         #[arg(long)]
         skip: Vec<String>,
-        /// Rotate the inbox encryption key (drain-then-destroy, §8a.3).
+        /// Rotate the inbox encryption key (drain-then-destroy).
         #[command(subcommand)]
         action: Option<InboxAction>,
     },
@@ -312,7 +305,7 @@ enum KeysAction {
         /// Client id to shred.
         client_id: String,
     },
-    /// Add a new device: two-step ceremony (design §6).
+    /// Add a new device: two-step ceremony.
     ///
     /// On the new device, `keys device-add --initiate` generates the keypair
     /// locally and emits a request carrying only the public key + a label —
@@ -350,7 +343,7 @@ enum KeysAction {
 
 #[derive(Subcommand, Debug)]
 enum InboxAction {
-    /// Rotate the inbox encryption key (drain-then-destroy, §8a.3).
+    /// Rotate the inbox encryption key (drain-then-destroy).
     ///
     /// Drains the inbox with a normal run, generates a new X25519 keypair
     /// in the OS keychain, and updates `confidant.toml [inbox].pubkey` and
@@ -360,7 +353,7 @@ enum InboxAction {
     /// When the old key is unavailable (lost, compromised, or revoked
     /// inbox device), the drain is skipped and there is no `--finish` to
     /// run: old-key items fail closed with `E_INBOX_CRYPTO` and the tools
-    /// drop them again from source (§8a.2).
+    /// drop them again from source.
     Rotate {
         /// Finish a pending rotation: drain anything still encrypted to
         /// the old key, then destroy the old private key from the keychain.
@@ -394,7 +387,7 @@ enum LogAction {
         src: Option<String>,
         /// On keychain failure with --note, encrypt the note to the
         /// pinned inbox pubkey and queue it to the `inbox` branch
-        /// instead of failing closed (#213). Without the flag the
+        /// instead of failing closed. Without the flag the
         /// command prompts, unless --no-input/--json (then it fails
         /// closed).
         #[arg(long)]
@@ -417,7 +410,7 @@ enum LogAction {
         src: Option<String>,
         /// On keychain failure with --note, encrypt the note to the
         /// pinned inbox pubkey and queue it to the `inbox` branch
-        /// instead of failing closed (#213).
+        /// instead of failing closed.
         #[arg(long)]
         fallback_inbox: bool,
     },
