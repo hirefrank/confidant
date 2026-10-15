@@ -448,6 +448,10 @@ fn inbox_drain_new_person_without_client_key_refuses() {
     // no key dir is created, the item stays queued, and nothing is
     // committed.
     let h = Harness::new();
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     // Init the vault keys, but do NOT init-client for the new person.
     let out = h.init();
     assert!(out.status.success(), "init failed: {}", stderr(&out));
@@ -458,10 +462,6 @@ fn inbox_drain_new_person_without_client_key_refuses() {
     let inbox_recipient = age_recipient(&inbox_bech32);
     advertise_vault_inbox_pubkey(&h, &inbox_recipient);
     write_user_config_pin(&h.home, &inbox_recipient);
-    let Some(_signing) = ssh_signing(&h) else {
-        eprintln!("SKIP: ssh-keygen unavailable");
-        return;
-    };
 
     // Queue a person record for a NEW person (no client key exists).
     let new_person = "p-01J9Z3K4QH0000000000000000";
@@ -514,6 +514,10 @@ fn inbox_drain_new_person_without_client_key_refuses() {
             .exists(),
         "refused record must be absent"
     );
+    assert!(
+        !h.vault.join(format!("people/{new_person}")).exists(),
+        "refused drain must not leave an empty record directory (#401)"
+    );
 
     // The item is still queued on the inbox branch.
     let out = Command::new("git")
@@ -533,6 +537,24 @@ fn inbox_drain_new_person_without_client_key_refuses() {
         main_before,
         "drain must not commit on refusal"
     );
+
+    // After init-client, drain succeeds and the vault is not wedged.
+    let out = h.init_client(new_person);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(
+        out.status.success(),
+        "drain after init-client failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        h.vault
+            .join(format!("people/{new_person}/profile.md"))
+            .exists(),
+        "profile must exist after successful drain"
+    );
 }
 
 #[test]
@@ -542,6 +564,10 @@ fn inbox_drain_skip_holds_keyless_person() {
     // no key, and leaves the item queued. (That other items still merge
     // alongside a skip is covered by `skip_flag_defers_item_in_json_dry_run`.)
     let h = Harness::new();
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
     let out = h.init();
     assert!(out.status.success(), "init failed: {}", stderr(&out));
 
@@ -549,10 +575,6 @@ fn inbox_drain_skip_holds_keyless_person() {
     let inbox_recipient = age_recipient(&inbox_bech32);
     advertise_vault_inbox_pubkey(&h, &inbox_recipient);
     write_user_config_pin(&h.home, &inbox_recipient);
-    let Some(_signing) = ssh_signing(&h) else {
-        eprintln!("SKIP: ssh-keygen unavailable");
-        return;
-    };
 
     let new_person = "p-01J9Z3K4QH0000000000000000";
     let payload = format!(
@@ -2048,7 +2070,7 @@ fn advertise_vault_inbox_pubkey(h: &Harness, pubkey: &str) {
 fn ssh_signing(h: &Harness) -> Option<tempfile::TempDir> {
     let keydir = tempfile::tempdir().ok()?;
     let key = keydir.path().join("key");
-    let gen = Command::new("ssh-keygen")
+    let gen = match Command::new("ssh-keygen")
         .args([
             "-t",
             "ed25519",
@@ -2061,7 +2083,16 @@ fn ssh_signing(h: &Harness) -> Option<tempfile::TempDir> {
             key.to_str()?,
         ])
         .output()
-        .ok()?;
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::env::var_os("CI").is_some() {
+                panic!("ssh-keygen is not installed and CI is set: signing tests must not skip");
+            }
+            return None;
+        }
+        Err(_) => return None,
+    };
     if !gen.status.success() {
         return None;
     }

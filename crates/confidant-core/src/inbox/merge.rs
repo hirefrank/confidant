@@ -86,13 +86,8 @@ pub(crate) fn apply_writes(
                 let previous = paths::read_to_string(vault_root, path)
                     .ok()
                     .map(|s| s.into_bytes());
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        paths::ensure_directory(vault_root, parent).map_err(|e| {
-                            anyhow::anyhow!("could not create {}: {e:#}", parent.display())
-                        })?;
-                    }
-                }
+                // Encrypt (or copy plaintext) before creating parent dirs so a
+                // refused write cannot leave an empty record directory (#401).
                 let bytes = if crate::crypto_mode::is_structurally_encrypted(vault_root) {
                     // SAFETY: the B11 gate above returned early when
                     // `encrypt` is None and a RecordWrite is present.
@@ -103,6 +98,13 @@ pub(crate) fn apply_writes(
                 } else {
                     content.as_bytes().to_vec()
                 };
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        paths::ensure_directory(vault_root, parent).map_err(|e| {
+                            anyhow::anyhow!("could not create {}: {e:#}", parent.display())
+                        })?;
+                    }
+                }
                 paths::write_replace(vault_root, path, &bytes)
                     .map_err(|e| anyhow::anyhow!("could not write {}: {e:#}", path.display()))?;
                 applied.push(AppliedChange::Modified { abs, previous });
@@ -288,6 +290,34 @@ mod tests {
             !written.windows(plaintext.len()).any(|w| w == plaintext),
             "plaintext must not appear in the written bytes"
         );
+    }
+
+    #[test]
+    fn inbox_recordwrite_encrypt_failure_leaves_no_directory() {
+        // #401: a failing encryptor must not leave people/<id>/ behind.
+        let dir = vault_dir();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/operator.toml"), "# placeholder\n").unwrap();
+
+        let encrypt = |_path: &Path, _plaintext: &[u8]| -> anyhow::Result<Vec<u8>> {
+            Err(anyhow::anyhow!("no client key for person"))
+        };
+        let writes = vec![PlannedWrite::RecordWrite {
+            path: PathBuf::from("people/p-01ABC/profile.md"),
+            content: "---\nid: p-01ABC\ntype: person\n---\n".to_string(),
+        }];
+        let mut applied = Vec::new();
+        let err = apply_writes(root, &writes, &mut applied, Some(&encrypt)).unwrap_err();
+        assert!(
+            err.to_string().contains("no client key"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !root.join("people/p-01ABC").exists(),
+            "record directory must not be created on encrypt failure"
+        );
+        assert!(applied.is_empty());
     }
 
     #[test]
