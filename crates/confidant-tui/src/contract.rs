@@ -235,6 +235,58 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
+/// One item in an `inbox --dry-run` report.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct InboxItem {
+    #[serde(default)]
+    pub name: String,
+    /// `"ledger"` or `"record"`.
+    #[serde(default)]
+    pub kind: String,
+    /// Vault-relative merge target.
+    #[serde(default)]
+    pub target: String,
+    /// `"merge"` or `"skip"` (already present / idempotent no-op).
+    #[serde(default)]
+    pub action: String,
+}
+
+/// One operator-deferred item in an `inbox --dry-run` report (`--skip`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct InboxSkipped {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub target: String,
+}
+
+/// Output of `confidant inbox --dry-run --json --no-input`.
+///
+/// The same envelope shape is returned by the real (applying) run, with
+/// `dry_run: false`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct InboxReport {
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// True when there is no inbox branch: nothing to do.
+    #[serde(default)]
+    pub empty: bool,
+    #[serde(default)]
+    pub merged: usize,
+    #[serde(default)]
+    pub cleared: usize,
+    #[serde(default)]
+    pub items: Vec<InboxItem>,
+    #[serde(default)]
+    pub skipped: Vec<InboxSkipped>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 /// Parsed outcome of a CLI invocation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContractOutcome<T> {
