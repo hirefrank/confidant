@@ -13,12 +13,13 @@ use std::path::Path;
 /// `SKILL.md`.
 pub static SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
-/// Embedded pack skill texts (`packs/<name>/SKILL.md` at the repo root,
-/// #189). One file per pack name; the binary serves the version it was
-/// compiled with. When packs go external (#193), the same per-pack file
-/// ships inside the external pack and this embedded copy remains the
-/// fallback for compiled-in packs.
-pub static PACK_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../packs");
+/// Embedded pack skill texts (`pack-skills/<name>/SKILL.md` in this crate,
+/// vendored from `packs/<name>/SKILL.md` at the repo root, #189). The
+/// path must stay inside the crate so `cargo publish` / `cargo install`
+/// can compile; workspace builds use the same tree. When packs go external
+/// (#193), the external pack ships its own `SKILL.md` and this embedded
+/// copy remains the fallback for compiled-in packs.
+pub static PACK_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/pack-skills");
 
 /// Agent-facing skill text for a compiled pack (`coaching@0.1` reads
 /// `coaching/SKILL.md`). `None` when the pack ships no skill text.

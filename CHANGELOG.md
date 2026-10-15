@@ -8,6 +8,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-15
+
+### Fixed
+- `cargo install confidant-cli` / crates.io publish: vendor pack `SKILL.md`
+  files under `crates/confidant-cli/pack-skills/` so `include_dir!` compiles
+  inside the published tarball (the repo-root `packs/` tree is not shipped).
+
 ## [0.3.0] - 2026-10-15
 
 **Disclosure:** the milestone 2 encryption has had no outside review
@@ -110,7 +117,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/hirefrank/confidant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hirefrank/confidant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hirefrank/confidant/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/hirefrank/confidant/releases/tag/v0.1.1
