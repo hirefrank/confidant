@@ -882,7 +882,11 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
             return fail(findings);
         }
     };
-    if has_conflict_markers(&text) {
+    // #391: conflict markers are detected from the raw bytes, before any
+    // decrypt. The finding is pushed here so it also survives the
+    // skip/refuse paths below.
+    let conflicted = has_conflict_markers(&text);
+    if conflicted {
         findings.push(
             Finding::new(
                 FindingCode::MergeConflict,
@@ -940,6 +944,12 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
             return fail(findings);
         }
     };
+    if conflicted {
+        // #391: the markers make the file unparseable by construction, so
+        // parsing on would only add a derived E_FRONTMATTER pointing at the
+        // marker lines themselves. Report the conflict and stop.
+        return fail(findings);
+    }
     match parse_record(&text, &file) {
         Err(err) => {
             let mut finding =
