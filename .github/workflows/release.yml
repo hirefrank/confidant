@@ -32,6 +32,10 @@
 #     not curl|sh. The `matrix.install_dist.run` snippet in
 #     build-local-artifacts is dist-generated per runner and is left as
 #     generated (see the #42 decision in the publish PR).
+#  6. The container rustup bootstrap (`curl https://sh.rustup.rs | sh`,
+#     build-local-artifacts) is dist-generated per runner and left as
+#     generated: pinning rustup-init by hash per platform would not
+#     survive `dist init` regeneration. Same standing decision as item 5.
 
 name: Release
 # Least privilege (2026-10-08, Silas review): this workflow ships binaries
