@@ -3211,13 +3211,15 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
                     rec.kind.as_str()
                 ))
                 .with_fix(
-                    "The stored record and its path disagree; remove the file and create the record again with `confidant record add --file`",
+                    "The stored record and its path disagree; move the file back to the path for the record it holds (or restore this path from git history), then re-run the edit",
                 ),
             ));
         }
         // Report a re-key rather than doing it silently: which client owns a
         // record is a consequential difference, and `deal` edits move it.
-        let from_client = env.key_id.rsplit_once("/e").map(|(c, _)| c.to_owned());
+        // `envelope::parse` already validated the key id shape; failure here
+        // is unreachable, but fail closed rather than reporting a wrong client.
+        let from_client = confidant_crypt::envelope::key_id_client(&env.key_id).ok();
         if let (Some(from), Ok(to)) = (from_client, record_client_id(&rec)) {
             if from != to {
                 rekeyed = Some((from, to));
@@ -7337,12 +7339,13 @@ fn strip_participant_from_interactions(
         // `envelope::parse` already validated the key id shape
         // (`<client>/e<epoch>`); failure here is unreachable, but fail
         // closed rather than silently defaulting to an empty client.
-        let (client, _) = env.key_id.rsplit_once("/e").ok_or_else(|| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot determine every interaction naming {client_id}: skipped envelope {path} has an undeterminable client"
-            )))
-        })?;
-        if live_clients.contains(client) {
+        let client =
+            confidant_crypt::envelope::key_id_client(&env.key_id).map_err(|_| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot determine every interaction naming {client_id}: skipped envelope {path} has an undeterminable client"
+                )))
+            })?;
+        if live_clients.contains(client.as_str()) {
             live_undecryptable.push(path.clone());
         }
     }

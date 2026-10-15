@@ -3313,8 +3313,8 @@ fn record_edit_refuses_when_the_stored_file_holds_another_record() {
         "the message should name both records: {v}"
     );
     assert!(
-        v["error"]["fix"].as_str().unwrap().contains("record add"),
-        "{v}"
+        v["error"]["fix"].as_str().unwrap().contains("git history"),
+        "the fix must not tell the operator to delete the other record's only copy: {v}"
     );
     assert_eq!(
         std::fs::read(&b_path).unwrap(),
