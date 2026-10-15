@@ -1,17 +1,13 @@
 name: CI
 
+# No paths-ignore: this workflow must run on every PR and push to main so
+# the required status checks (#326) always report. Docs-only changes are
+# detected by the `changes` job below; required jobs then skip their heavy
+# steps but still succeed.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE*"
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE*"
   schedule:
     - cron: "17 7 * * *"
   workflow_dispatch:
@@ -28,21 +24,62 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  changes:
+    name: detect changed files
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: detect docs-only change
+        id: detect
+        run: |
+          # No `set -e`: any failure below falls through to docs_only=false
+          # (fail open = run the full suite) so required checks always report.
+          # Docs patterns mirror the old paths-ignore: **.md, docs/**, LICENSE*.
+          docs_only=false
+          range=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}...HEAD"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            range="${{ github.event.before }}...HEAD"
+          fi
+          if [ -n "$range" ]; then
+            files="$(git diff --name-only "$range" 2>/dev/null || true)"
+            if [ -n "$files" ]; then
+              docs_only=true
+              while IFS= read -r f; do
+                case "$f" in
+                  *.md|docs/*|LICENSE*) ;;
+                  *) docs_only=false; break ;;
+                esac
+              done <<< "$files"
+            fi
+          fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
+    needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.docs_only != 'true'
       - name: check
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo +1.88 check --workspace --locked
 
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: [changes]
     strategy:
       fail-fast: false
       matrix:
@@ -55,17 +92,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           toolchain: "1.99.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.docs_only != 'true'
       - name: fmt
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo fmt --all -- --check
       - name: clippy
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: test
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --workspace --all-features --locked
       - name: confidant check demo vault
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
 
   test-windows:
@@ -91,37 +134,49 @@ jobs:
   skills-smoke:
     name: skills smoke
     runs-on: ubuntu-latest
+    needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.docs_only != 'true'
       - name: build CLI
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo build -p confidant-cli --locked
       - name: proposer smoke
+        if: needs.changes.outputs.docs_only != 'true'
         run: python3 crates/confidant-cli/skills/bin/smoke-proposers.py --vault examples/demo-vault --cli target/debug/confidant
 
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           command: check
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.docs_only != 'true'
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           tool: cargo-audit
       - name: cargo audit
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo audit
