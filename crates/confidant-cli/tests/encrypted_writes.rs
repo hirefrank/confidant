@@ -593,9 +593,21 @@ fn auto_init_rolls_back_key_dir_when_commit_fails() {
     let out = h.init();
     assert!(out.status.success());
 
-    // Break the commit step: no git identity. Files apply, then the
-    // commit fails — the created key dir must be rolled back anyway.
-    git(&h.vault, &["config", "--unset", "user.email"]);
+    // Break the commit step deterministically (not via identity: parallel
+    // tests and CI can set GIT_AUTHOR_* / system config).
+    let hooks = h._tmp.path().join("git-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let pre_commit = hooks.join("pre-commit");
+    std::fs::write(&pre_commit, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(
+        &h.vault,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
 
     let input = write_file(
         h._tmp.path(),
