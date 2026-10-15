@@ -122,9 +122,11 @@ What it does: a `no-ai` record never appears in `find` (filter in
 cleared records), in the `allowlist` response ("no-ai records never appear",
 `crates/confidant-core/src/schema.rs`), or in the reindex corpus (built
 from the cleared set, `crates/confidant-cli/src/main.rs`
-`build_reindex_corpus`). The read path never decrypts a `no-ai` envelope:
-the decrypt hook returns a shell with the id and type, never the content
-(`crates/confidant-cli/src/record_decrypt.rs`).
+`build_reindex_corpus`). The agent read path never decrypts a `no-ai`
+envelope: its decrypt hook returns a shell with the id and type, never the
+content (`crates/confidant-cli/src/record_decrypt.rs`). The one read that
+does decrypt is the operator's own `confidant record show <id> --for-edit`,
+covered below.
 
 What it does not do:
 
@@ -135,6 +137,14 @@ What it does not do:
   the read surfaces (raw bytes from git, decrypted with the operator's own
   key material). `no-ai` keeps a record out of agent flows; it is not
   access control against the owner.
+- **It does not stop an agent that already has a shell on this device.**
+  MCP dispatches from a fixed tool whitelist
+  (`crates/confidant-cli/src/mcp.rs`) that omits `record show --for-edit`,
+  so a tool call cannot reach it. An agent that can run commands on this
+  machine, with this device's key material in reach, can invoke it directly
+  — exactly as it could decrypt the file itself, or shell out to the CLI at
+  all. `--for-edit` is a boundary in the CLI's surface, not access control
+  against a caller that already holds the device key.
 - **The flag itself is visible.** `no-ai: true` sits in the envelope's
   plaintext outer header, so anyone who can read the file learns that the
   record is marked — though not its content.
