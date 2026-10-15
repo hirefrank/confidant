@@ -1,21 +1,28 @@
 //! Application state machine for `confidant-tui`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult,
 };
+use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
 use crate::views::alert::{self, AlertState};
 use crate::views::check::{self, CheckViewState};
+use crate::views::confirm::{self, ConfirmState};
 use crate::views::context::{self, ContextViewState};
+use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
 use crate::views::find::{self, FindViewState};
+use crate::views::proposals::{
+    self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
+};
 
-/// The four read-only views in Phase 1.
+/// The five views: four Phase 1 views plus proposal review (Phase 2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
@@ -23,6 +30,7 @@ pub enum ActiveView {
     Find,
     Context,
     Doctor,
+    Proposals,
 }
 
 impl ActiveView {
@@ -31,16 +39,18 @@ impl ActiveView {
             Self::Check => Self::Find,
             Self::Find => Self::Context,
             Self::Context => Self::Doctor,
-            Self::Doctor => Self::Check,
+            Self::Doctor => Self::Proposals,
+            Self::Proposals => Self::Check,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Check => Self::Doctor,
+            Self::Check => Self::Proposals,
             Self::Find => Self::Check,
             Self::Context => Self::Find,
             Self::Doctor => Self::Context,
+            Self::Proposals => Self::Doctor,
         }
     }
 
@@ -50,8 +60,20 @@ impl ActiveView {
             Self::Find => "2:Find",
             Self::Context => "3:Context",
             Self::Doctor => "4:Doctor",
+            Self::Proposals => "5:Proposals",
         }
     }
+}
+
+/// State for the proposals tab: the discovered manifests and the open flow.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProposalsTab {
+    pub vault_root: Option<std::path::PathBuf>,
+    pub entries: Vec<ProposalListEntry>,
+    pub selected: usize,
+    pub opened: Option<ApplyFlow>,
+    pub load_error: Option<String>,
+    loaded: bool,
 }
 
 /// Keyboard input mode.
@@ -75,6 +97,8 @@ pub struct App<R: Runner> {
     pub alert: Option<AlertState>,
     pub blocking_alert: Option<AlertState>,
     pub should_quit: bool,
+    pub proposals: ProposalsTab,
+    vault_root_override: Option<std::path::PathBuf>,
 }
 
 impl<R: Runner> App<R> {
@@ -92,7 +116,14 @@ impl<R: Runner> App<R> {
             alert: None,
             blocking_alert: None,
             should_quit: false,
+            proposals: ProposalsTab::default(),
+            vault_root_override: None,
         }
+    }
+
+    /// Set an explicit vault root (from `--vault`) for proposal discovery.
+    pub fn set_vault_root(&mut self, root: std::path::PathBuf) {
+        self.vault_root_override = Some(root);
     }
 
     /// Run `confidant check --json --no-input` and update the Check view state.
@@ -183,6 +214,179 @@ impl<R: Runner> App<R> {
                 }
             }
             ActiveView::Doctor => self.load_doctor(),
+            ActiveView::Proposals => self.load_proposals(),
+        }
+    }
+
+    /// Discover proposal manifests under `.confidant/proposals/` and rebuild
+    /// the list entries.
+    pub fn load_proposals(&mut self) {
+        let root = resolve_vault_root(self.vault_root_override.as_deref());
+        self.proposals.vault_root = root.clone();
+        self.proposals.load_error = None;
+        let Some(root) = root else {
+            self.proposals.load_error = Some(
+                "no vault found: pass --vault, set CONFIDANT_VAULT, or run inside a vault"
+                    .to_owned(),
+            );
+            self.proposals.entries.clear();
+            return;
+        };
+        let discovered = discover_proposals(&root);
+        let mut entries = Vec::with_capacity(discovered.len());
+        for d in discovered {
+            entries.push(self.proposal_entry(&d, &root));
+        }
+        if self.proposals.selected >= entries.len() {
+            self.proposals.selected = 0;
+        }
+        self.proposals.entries = entries;
+        self.proposals.loaded = true;
+        // If a proposal is open, re-open it: progress may have changed on
+        // disk, and any in-flight step returns to Browsing.
+        if self.proposals.opened.is_some() {
+            let path = self
+                .proposals
+                .opened
+                .as_ref()
+                .map(|f| f.manifest_path.clone());
+            match path.map(|p| ApplyFlow::open(&p, &root)) {
+                Some(Ok(flow)) => self.proposals.opened = Some(flow),
+                _ => self.proposals.opened = None,
+            }
+        }
+    }
+
+    fn proposal_entry(
+        &self,
+        discovered: &DiscoveredProposal,
+        root: &std::path::Path,
+    ) -> ProposalListEntry {
+        match &discovered.manifest {
+            Err(e) => ProposalListEntry {
+                name: discovered.name.clone(),
+                skill: "-".to_owned(),
+                detail: "invalid manifest".to_owned(),
+                progress: String::new(),
+                error: Some(e.clone()),
+            },
+            Ok(manifest) => {
+                let notes = manifest
+                    .records
+                    .iter()
+                    .filter(|r| r.note_id.is_some())
+                    .count();
+                let records = manifest.records.len() - notes;
+                let ledger_lines = manifest
+                    .lines_file
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|lf| std::fs::read_to_string(lf).ok())
+                    .map(|t| t.lines().count())
+                    .unwrap_or(0);
+                let detail =
+                    format!("{notes} notes, {records} records, {ledger_lines} ledger lines");
+                // Count planned steps for progress.
+                let planned = crate::apply::plan_manifest(manifest, &discovered.path, root);
+                let (total, done) = match planned {
+                    Ok(steps) => {
+                        let progress = crate::proposals::read_progress(&discovered.path);
+                        let total = steps.iter().filter(|s| s.blocked.is_none()).count();
+                        let done = steps
+                            .iter()
+                            .filter(|s| s.blocked.is_none() && progress.is_done(&s.key))
+                            .count();
+                        (total, done)
+                    }
+                    Err(_) => (0, 0),
+                };
+                ProposalListEntry {
+                    name: discovered.name.clone(),
+                    skill: manifest.skill.clone(),
+                    detail,
+                    progress: format!("{done}/{total} steps done"),
+                    error: None,
+                }
+            }
+        }
+    }
+
+    /// Open the selected proposal's detail view.
+    pub fn open_selected_proposal(&mut self) {
+        let (Some(root), Some(entry)) = (
+            self.proposals.vault_root.clone(),
+            self.proposals.entries.get(self.proposals.selected).cloned(),
+        ) else {
+            return;
+        };
+        if let Some(err) = entry.error {
+            self.alert = Some(AlertState {
+                title: "Invalid Proposal Manifest".to_owned(),
+                code: Some("invalid_manifest".to_owned()),
+                message: format!("{}: {err}", entry.name),
+                fix: Some("Re-run the proposer to regenerate the manifest".to_owned()),
+                blocking: false,
+            });
+            return;
+        }
+        let path = root.join(".confidant").join("proposals").join(&entry.name);
+        match ApplyFlow::open(&path, &root) {
+            Ok(flow) => self.proposals.opened = Some(flow),
+            Err(e) => {
+                self.alert = Some(AlertState {
+                    title: "Cannot Open Proposal".to_owned(),
+                    code: Some("proposal_open_failed".to_owned()),
+                    message: e,
+                    fix: Some("Re-run the proposer to regenerate the manifest".to_owned()),
+                    blocking: false,
+                });
+            }
+        }
+    }
+
+    /// Start (or resume) the apply flow for the open proposal: dry-run the
+    /// first pending step.
+    pub fn proposals_start_apply(&mut self) {
+        let Some(flow) = self.proposals.opened.as_mut() else {
+            return;
+        };
+        if flow.appliable_done() {
+            self.proposals_final_check();
+            return;
+        }
+        let Some(step) = flow.first_pending() else {
+            return;
+        };
+        if let Err(e) = flow.dry_run_step(&self.runner, step) {
+            self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+            flow.phase = FlowPhase::Browsing;
+        }
+    }
+
+    /// Run the final `check` once every runnable step is done.
+    fn proposals_final_check(&mut self) {
+        let Some(flow) = self.proposals.opened.as_mut() else {
+            return;
+        };
+        match flow.final_check(&self.runner) {
+            Ok(None) => {
+                flow.phase = FlowPhase::CleanupPrompt;
+            }
+            Ok(Some(report)) => {
+                self.check.report = Some(report);
+                self.check.selected = 0;
+                self.active_view = ActiveView::Check;
+                self.alert = Some(AlertState {
+                    title: "Proposal Applied, Check Not Clean".to_owned(),
+                    code: Some("final_check_failed".to_owned()),
+                    message: "every step applied, but the final check has findings; fix them before cleaning up".to_owned(),
+                    fix: Some("Resolve the findings above, then re-run the apply to reach cleanup".to_owned()),
+                    blocking: false,
+                });
+            }
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+            }
         }
     }
 
@@ -225,7 +429,290 @@ impl<R: Runner> App<R> {
         match view {
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
+            ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
             _ => {}
+        }
+    }
+
+    /// Handle a key event while the proposals tab is active.
+    fn handle_proposals_key(&mut self, key: KeyEvent) {
+        let in_export_input = matches!(
+            self.proposals.opened.as_ref().map(|f| &f.phase),
+            Some(FlowPhase::CleanupExportInput { .. })
+        );
+        if !in_export_input {
+            match key.code {
+                KeyCode::Tab => {
+                    let next = self.active_view.next();
+                    self.switch_to(next);
+                    return;
+                }
+                KeyCode::BackTab => {
+                    let prev = self.active_view.prev();
+                    self.switch_to(prev);
+                    return;
+                }
+                KeyCode::Char('1') => {
+                    self.switch_to(ActiveView::Check);
+                    return;
+                }
+                KeyCode::Char('2') => {
+                    self.switch_to(ActiveView::Find);
+                    return;
+                }
+                KeyCode::Char('3') => {
+                    self.switch_to(ActiveView::Context);
+                    return;
+                }
+                KeyCode::Char('4') => {
+                    self.switch_to(ActiveView::Doctor);
+                    return;
+                }
+                KeyCode::Char('/') => {
+                    self.active_view = ActiveView::Find;
+                    self.input_mode = InputMode::EditingFind;
+                    self.find.editing = true;
+                    self.alert = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if in_export_input {
+            self.handle_export_input_key(key);
+        } else if self.proposals.opened.is_some() {
+            self.handle_open_proposal_key(key);
+        } else {
+            self.handle_proposal_list_key(key);
+        }
+    }
+
+    /// Text input for the lightfield cleanup export path.
+    fn handle_export_input_key(&mut self, key: KeyEvent) {
+        let run_with: Option<String> = {
+            let Some(flow) = self.proposals.opened.as_mut() else {
+                return;
+            };
+            let FlowPhase::CleanupExportInput { input } = &mut flow.phase else {
+                return;
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    flow.phase = FlowPhase::CleanupPrompt;
+                    None
+                }
+                KeyCode::Enter => Some(input.clone()),
+                KeyCode::Backspace => {
+                    input.pop();
+                    None
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    input.push(c);
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(path) = run_with {
+            self.proposals_run_cleanup(Some(path.as_str()));
+        }
+    }
+
+    fn handle_proposal_list_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.alert.is_some() {
+                    self.alert = None;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.proposals.entries.is_empty()
+                    && self.proposals.selected + 1 < self.proposals.entries.len()
+                {
+                    self.proposals.selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.proposals.selected = self.proposals.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => self.open_selected_proposal(),
+            KeyCode::Char('a') => {
+                self.open_selected_proposal();
+                self.proposals_start_apply();
+            }
+            KeyCode::Char('r') => self.load_proposals(),
+            _ => {}
+        }
+    }
+
+    fn handle_open_proposal_key(&mut self, key: KeyEvent) {
+        // Esc dismisses an alert first, before any view action.
+        if self.alert.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.alert = None;
+            return;
+        }
+        let phase = self.proposals.opened.as_ref().map(|f| f.phase.clone());
+        let Some(phase) = phase else { return };
+        match phase {
+            FlowPhase::Browsing => match key.code {
+                KeyCode::Esc => self.proposals.opened = None,
+                KeyCode::Char('a') => self.proposals_start_apply(),
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            },
+            FlowPhase::Diff { step, outcome } => match key.code {
+                KeyCode::Char('y') => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::Confirm { step, outcome };
+                    }
+                }
+                KeyCode::Esc => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::Browsing;
+                    }
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            },
+            // Any key other than `y` cancels back to the diff. Confirm is
+            // `y` typed into the modal, never Enter.
+            FlowPhase::Confirm { step, .. } => match key.code {
+                KeyCode::Char('y') => self.proposals_confirm_apply(step),
+                _ => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        if let FlowPhase::Confirm { step, outcome } = flow.phase.clone() {
+                            flow.phase = FlowPhase::Diff { step, outcome };
+                        }
+                    }
+                }
+            },
+            FlowPhase::StepFailed { .. } => match key.code {
+                KeyCode::Esc => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::Browsing;
+                    }
+                }
+                KeyCode::Char('r') => self.proposals_start_apply(),
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            },
+            FlowPhase::CleanupPrompt => match key.code {
+                KeyCode::Char('y') => {
+                    let is_lightfield = self
+                        .proposals
+                        .opened
+                        .as_ref()
+                        .is_some_and(|f| f.manifest.skill == "lightfield-import");
+                    if is_lightfield {
+                        if let Some(flow) = self.proposals.opened.as_mut() {
+                            flow.phase = FlowPhase::CleanupExportInput {
+                                input: String::new(),
+                            };
+                        }
+                    } else {
+                        self.proposals_run_cleanup(None);
+                    }
+                }
+                _ => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::Browsing;
+                    }
+                }
+            },
+            FlowPhase::CleanupFailed { .. } => match key.code {
+                KeyCode::Esc => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::CleanupPrompt;
+                    }
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                _ => {}
+            },
+            // Terminal phases are exited immediately by the action that
+            // produced them; any stray key just closes the detail.
+            FlowPhase::Finished | FlowPhase::CheckFailed | FlowPhase::CleanupExportInput { .. } => {
+                self.proposals.opened = None;
+            }
+        }
+    }
+
+    /// The operator confirmed in the modal: run the real apply for `step`,
+    /// then continue with the next pending step or the final check.
+    fn proposals_confirm_apply(&mut self, step: usize) {
+        let outcome = {
+            let Some(flow) = self.proposals.opened.as_mut() else {
+                return;
+            };
+            match flow.apply_step(&self.runner, step) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                    return;
+                }
+            }
+        };
+        match outcome {
+            StepApplyOutcome::Done { more } => {
+                if more {
+                    self.proposals_start_apply();
+                } else {
+                    let done = self
+                        .proposals
+                        .opened
+                        .as_ref()
+                        .is_some_and(|f| f.appliable_done());
+                    if done {
+                        self.proposals_final_check();
+                    }
+                    // Otherwise a step failed; the detail view shows it.
+                }
+            }
+            StepApplyOutcome::Failed => {
+                // The detail view shows the failure; the operator retries
+                // with `r` or goes back with Esc.
+            }
+            StepApplyOutcome::CheckBlocked { report } => {
+                // The report renders in the Check view itself; the step is
+                // not marked done.
+                self.check.report = Some(report);
+                self.check.selected = 0;
+                self.active_view = ActiveView::Check;
+            }
+        }
+    }
+
+    /// Run cleanup (delete the proposal set) for the open proposal.
+    fn proposals_run_cleanup(&mut self, export: Option<&str>) {
+        let result = {
+            let Some(flow) = self.proposals.opened.as_mut() else {
+                return;
+            };
+            flow.cleanup(&self.runner, export)
+        };
+        match result {
+            Ok(()) => {
+                let finished = self
+                    .proposals
+                    .opened
+                    .as_ref()
+                    .is_some_and(|f| f.phase == FlowPhase::Finished);
+                if finished {
+                    self.proposals.opened = None;
+                    self.load_proposals();
+                }
+            }
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                if let Some(flow) = self.proposals.opened.as_mut() {
+                    flow.phase = FlowPhase::Browsing;
+                }
+            }
         }
     }
 
@@ -246,6 +733,11 @@ impl<R: Runner> App<R> {
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 self.should_quit = true;
             }
+            return;
+        }
+
+        if self.active_view == ActiveView::Proposals {
+            self.handle_proposals_key(key);
             return;
         }
 
@@ -297,6 +789,7 @@ impl<R: Runner> App<R> {
             KeyCode::Char('2') => self.switch_to(ActiveView::Find),
             KeyCode::Char('3') => self.switch_to(ActiveView::Context),
             KeyCode::Char('4') => self.switch_to(ActiveView::Doctor),
+            KeyCode::Char('5') => self.switch_to(ActiveView::Proposals),
             KeyCode::Char('/') => {
                 self.active_view = ActiveView::Find;
                 self.input_mode = InputMode::EditingFind;
@@ -345,6 +838,8 @@ impl<R: Runner> App<R> {
                     }
                 }
             }
+            // The proposals tab handles its own keys in handle_proposals_key.
+            ActiveView::Proposals => {}
         }
     }
 
@@ -362,6 +857,8 @@ impl<R: Runner> App<R> {
             ActiveView::Doctor => {
                 self.doctor.selected = self.doctor.selected.saturating_sub(1);
             }
+            // The proposals tab handles its own keys in handle_proposals_key.
+            ActiveView::Proposals => {}
         }
     }
 
@@ -383,7 +880,7 @@ impl<R: Runner> App<R> {
                 .and_then(|f| f.id.as_deref())
                 .filter(|id| id.starts_with("p-"))
                 .map(str::to_owned),
-            ActiveView::Context | ActiveView::Doctor => None,
+            ActiveView::Context | ActiveView::Doctor | ActiveView::Proposals => None,
         };
 
         if let Some(pid) = person_id {
@@ -410,6 +907,7 @@ impl<R: Runner> App<R> {
             ActiveView::Find,
             ActiveView::Context,
             ActiveView::Doctor,
+            ActiveView::Proposals,
         ]
         .into_iter()
         .map(|v| {
@@ -421,7 +919,7 @@ impl<R: Runner> App<R> {
         })
         .collect();
         let header_line = format!(
-            "{} | Tab/1-4:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
+            "{} | Tab/1-5:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
             tabs.join(" ")
         );
         let header_block = Block::bordered().title(" confidant-tui (contract v1) ");
@@ -437,6 +935,161 @@ impl<R: Runner> App<R> {
             ActiveView::Find => find::render(&self.find, frame, chunks[1]),
             ActiveView::Context => context::render(&self.context, frame, chunks[1]),
             ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
+            ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
+        }
+    }
+
+    /// Render the proposals tab: list, open detail, or an in-flight step.
+    fn render_proposals(&self, frame: &mut Frame<'_>, area: Rect) {
+        if let Some(err) = &self.proposals.load_error {
+            frame.render_widget(
+                Paragraph::new(err.clone()).block(Block::bordered().title(" Proposals ")),
+                area,
+            );
+            return;
+        }
+        let Some(flow) = &self.proposals.opened else {
+            let state = ProposalsListState {
+                entries: self.proposals.entries.clone(),
+                selected: self.proposals.selected,
+                vault_note: self
+                    .proposals
+                    .vault_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            };
+            proposals::render_list(&state, frame, area);
+            return;
+        };
+        match &flow.phase {
+            FlowPhase::Diff { step, outcome } => {
+                let label = Self::flow_step_label(flow, *step);
+                diff::render(
+                    &DiffState::new(label, outcome.command.clone(), outcome.changes.clone()),
+                    frame,
+                    area,
+                );
+            }
+            FlowPhase::Confirm { step, outcome } => {
+                let label = Self::flow_step_label(flow, *step);
+                diff::render(
+                    &DiffState::new(
+                        label.clone(),
+                        outcome.command.clone(),
+                        outcome.changes.clone(),
+                    ),
+                    frame,
+                    area,
+                );
+                let argv = flow
+                    .steps
+                    .get(*step)
+                    .map(|s| format!("confidant {}", s.plan.argv.join(" ")))
+                    .unwrap_or_default();
+                confirm::render(
+                    &ConfirmState::new(
+                        format!("Apply: {label}"),
+                        vec![
+                            argv,
+                            String::new(),
+                            "This writes to the vault and creates one commit.".to_owned(),
+                        ],
+                    ),
+                    frame,
+                    area,
+                );
+            }
+            FlowPhase::CleanupPrompt => {
+                proposals::render_detail(&self.proposal_detail(flow), frame, area);
+                confirm::render(
+                    &ConfirmState::new(
+                        "Delete proposal set?".to_owned(),
+                        vec![
+                            "Delete proposal set (manifest, lines file, staged notes, progress file)?"
+                                .to_owned(),
+                        ],
+                    ),
+                    frame,
+                    area,
+                );
+            }
+            _ => {
+                proposals::render_detail(&self.proposal_detail(flow), frame, area);
+            }
+        }
+    }
+
+    fn flow_step_label(flow: &ApplyFlow, step: usize) -> String {
+        flow.steps
+            .get(step)
+            .map(|s| s.plan.label.clone())
+            .unwrap_or_default()
+    }
+
+    /// Build the detail view state for an open proposal.
+    fn proposal_detail(&self, flow: &ApplyFlow) -> ProposalDetailState {
+        let steps = flow
+            .steps
+            .iter()
+            .map(|s| {
+                let (icon, extra) = match &s.status {
+                    StepStatus::Pending => ("[ ]", String::new()),
+                    StepStatus::Done { commit } => (
+                        "[x]",
+                        format!(" (commit {})", &commit[..8.min(commit.len())]),
+                    ),
+                    StepStatus::Blocked { message } => ("[!]", format!(" — blocked: {message}")),
+                    StepStatus::Failed { message } => ("[E]", format!(" — failed: {message}")),
+                };
+                StepRow {
+                    label: format!("{}{}", s.plan.label, extra),
+                    status: icon.to_owned(),
+                }
+            })
+            .collect();
+        let hint = match &flow.phase {
+            FlowPhase::Browsing => {
+                if flow.first_pending().is_some() {
+                    "a: apply next step (dry-run, then explicit confirm) | Esc: back to list"
+                        .to_owned()
+                } else if flow.appliable_done() {
+                    "a: run final check and clean up | Esc: back to list".to_owned()
+                } else {
+                    "Esc: back to list".to_owned()
+                }
+            }
+            FlowPhase::StepFailed {
+                code, message, fix, ..
+            } => {
+                let mut h = format!("step failed [{code}]: {message}");
+                if let Some(fix) = fix {
+                    h.push_str(&format!(" Fix: {fix}"));
+                }
+                h.push_str(" | r: retry step | Esc: back");
+                h
+            }
+            FlowPhase::CleanupExportInput { input } => {
+                format!(
+                    "Lightfield cleanup deletes the plaintext export. Type the export file path.\nExport file: {input}_\nEnter: delete export and proposal set | Esc: cancel"
+                )
+            }
+            FlowPhase::CleanupFailed { message } => {
+                format!("cleanup failed: {message} | Esc: back to cleanup prompt")
+            }
+            _ => String::new(),
+        };
+        ProposalDetailState {
+            name: flow
+                .manifest_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            skill: flow.manifest.skill.clone(),
+            summary: flow.manifest.summary.clone().unwrap_or_default(),
+            warnings: flow.manifest.warnings.clone(),
+            steps,
+            hint,
         }
     }
 }

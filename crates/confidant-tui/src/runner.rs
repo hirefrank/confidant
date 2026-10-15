@@ -23,6 +23,11 @@ pub struct RawOutput {
 /// Abstraction over running `confidant` with CLI arguments.
 pub trait Runner {
     fn run(&self, args: &[&str]) -> Result<RawOutput>;
+
+    /// Run an external program (not the `confidant` binary): no `--json`,
+    /// `--no-input`, or `--vault` is injected. Used for skill `--cleanup`
+    /// scripts, which are plain programs with their own flags.
+    fn run_program(&self, program: &str, args: &[&str]) -> Result<RawOutput>;
 }
 
 /// Real child-process runner that executes the resolved `confidant` binary.
@@ -106,6 +111,26 @@ impl Runner for ProcessRunner {
             stdout: output.stdout,
         })
     }
+
+    fn run_program(&self, program: &str, args: &[&str]) -> Result<RawOutput> {
+        let mut cmd = Command::new(program);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        cmd.args(args);
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("failed to execute {program}"))?;
+        let status = output.status.code().unwrap_or(1);
+        Ok(RawOutput {
+            status,
+            stdout: output.stdout,
+        })
+    }
 }
 
 /// In-memory fake runner for deterministic unit and snapshot tests.
@@ -113,8 +138,10 @@ impl Runner for ProcessRunner {
 pub struct FakeRunner {
     queue: RefCell<VecDeque<RawOutput>>,
     by_subcommand: HashMap<String, RawOutput>,
+    by_program: HashMap<String, RawOutput>,
     fallback: Option<RawOutput>,
     calls: RefCell<Vec<Vec<String>>>,
+    program_calls: RefCell<Vec<(String, Vec<String>)>>,
 }
 
 impl FakeRunner {
@@ -127,11 +154,13 @@ impl FakeRunner {
         Self {
             queue: RefCell::new(VecDeque::new()),
             by_subcommand: HashMap::new(),
+            by_program: HashMap::new(),
             fallback: Some(RawOutput {
                 status,
                 stdout: stdout.into(),
             }),
             calls: RefCell::new(Vec::new()),
+            program_calls: RefCell::new(Vec::new()),
         }
     }
 
@@ -166,9 +195,31 @@ impl FakeRunner {
         });
     }
 
+    /// Register a canned response for an external program (`"python3"`).
+    pub fn with_program_response(
+        mut self,
+        program: &str,
+        status: i32,
+        stdout: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.by_program.insert(
+            program.to_owned(),
+            RawOutput {
+                status,
+                stdout: stdout.into(),
+            },
+        );
+        self
+    }
+
     /// Return all recorded argv slices passed to `run`.
     pub fn recorded_calls(&self) -> Vec<Vec<String>> {
         self.calls.borrow().clone()
+    }
+
+    /// Return all recorded `(program, argv)` pairs passed to `run_program`.
+    pub fn recorded_program_calls(&self) -> Vec<(String, Vec<String>)> {
+        self.program_calls.borrow().clone()
     }
 }
 
@@ -186,6 +237,26 @@ impl Runner for FakeRunner {
             if let Some(found) = self.by_subcommand.get(*sub) {
                 return Ok(found.clone());
             }
+        }
+
+        if let Some(fallback) = &self.fallback {
+            return Ok(fallback.clone());
+        }
+
+        Ok(RawOutput {
+            status: 1,
+            stdout: Vec::new(),
+        })
+    }
+
+    fn run_program(&self, program: &str, args: &[&str]) -> Result<RawOutput> {
+        self.program_calls.borrow_mut().push((
+            program.to_owned(),
+            args.iter().map(|s| (*s).to_owned()).collect(),
+        ));
+
+        if let Some(found) = self.by_program.get(program) {
+            return Ok(found.clone());
         }
 
         if let Some(fallback) = &self.fallback {

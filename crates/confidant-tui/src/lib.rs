@@ -1,12 +1,17 @@
-//! Read-only TUI for Confidant (`confidant-tui`), consuming the ADR-7 CLI
+//! Terminal UI for Confidant (`confidant-tui`), consuming the ADR-7 CLI
 //! JSON contract (`confidant <subcommand> --json --no-input`).
+//!
+//! Phase 1 views are read-only; the proposals view (Phase 2) applies
+//! skill-proposed changes through the CLI with explicit per-step confirm.
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write};
 
 pub mod app;
+pub mod apply;
 pub mod contract;
+pub mod proposals;
 pub mod runner;
 pub mod views;
 

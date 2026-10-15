@@ -33,6 +33,8 @@ Every skill follows the same shape:
    the manifest's stored value, never regenerate it.
 2. **Confirm.** The agent shows the logical change (ledger lines, record
    diffs) to the human and gets explicit approval. No approval, no write.
+   (Or review in `confidant-tui`: the proposals tab shows each proposal's
+   dry-run diff and applies it step by step with explicit `y` confirms.)
 3. **Apply.** The agent applies the approved change through the CLI:
    - Ledger lines: `confidant import --file <lines_file> --request-id
      <request_id from manifest> --dry-run --json --no-input` first, then

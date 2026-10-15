@@ -41,7 +41,7 @@ Read before changing behaviour:
 | `crates/confidant-core/` | Parser, model, derived values, check engine, search allowlist |
 | `crates/confidant-cli/` | The `confidant` binary (package `confidant-cli`) |
 | `crates/confidant-crypt/` | Encryption (milestone 2): per-client keys, envelope, AAD. Publishable as of 2026-10-12 (first publish is the operator's manual step), disclosed as unaudited (see README Status); wired into the CLI write path since spec 3 (`record add`, `note add`, `log session --note` encrypt; inbox `RecordWrite` encrypts at drain time, #213) |
-| `crates/confidant-tui/` | Read-only TUI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary, `publish = false` (no crates.io) |
+| `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary, `publish = false` (no crates.io) |
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser and §14 envelope decoder (own workspace, excluded from the main one; not run in CI) |
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (coaching and personal) |
