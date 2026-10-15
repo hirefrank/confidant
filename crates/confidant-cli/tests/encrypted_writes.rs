@@ -2863,7 +2863,7 @@ fn envelope_epoch(bytes: &str) -> u64 {
 #[test]
 fn record_edit_refuses_an_envelope_this_device_cannot_decrypt() {
     // #389 Q4: with the client's key gone, an edit fails closed instead of
-    // rewriting a record this device cannot read.
+    // rewriting a record this device cannot read — and commits nothing.
     let h = Harness::new();
     h.keyed(PERSON);
     let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
@@ -2875,6 +2875,7 @@ fn record_edit_refuses_an_envelope_this_device_cannot_decrypt() {
         "edited.md",
         &person_md(PERSON, "Ada Renamed", "New bio."),
     );
+    let commits = commit_count(&h);
     let out = h
         .cmd(&[
             "record",
@@ -2901,6 +2902,7 @@ fn record_edit_refuses_an_envelope_this_device_cannot_decrypt() {
         before,
         "the record was rewritten despite the refusal"
     );
+    assert_eq!(commit_count(&h), commits, "the refused edit made a commit");
 }
 
 #[test]
@@ -2975,6 +2977,27 @@ fn record_edit_rekeys_a_deal_to_the_new_persons_key() {
         !after.contains(&format!("key_id: {PERSON}/")),
         "the deal kept the old person's key: {after}"
     );
+
+    // #389 Q4: the human-readable run reports the re-key as a notice line
+    // on stdout, not only in the JSON.
+    let back = write_file(h._tmp.path(), "deal-back.md", &deal(PERSON));
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            DEAL,
+            "--file",
+            back.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit back: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!("rekeyed {DEAL}: {PERSON2} -> {PERSON}")),
+        "missing re-key notice: {}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -3019,6 +3042,90 @@ fn record_edit_restamps_no_ai_on_the_envelope_header() {
         !stdout(&out).contains("Bio."),
         "no-ai was not honoured after the edit: {}",
         stdout(&out)
+    );
+}
+
+#[test]
+fn record_edit_restamps_no_ai_when_a_with_person_turns_notes() {
+    // #389 Q5 test gap: an edit that adds a notes-mode person to `with:`
+    // re-stamps the envelope header, even though the primary person is
+    // still visible — `with:` inherits into the stamp for interactions.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client: {}", stderr(&out));
+
+    const IXN: &str = "i-01J9Z3K4QM0000000000000000";
+    for (id, name, extra) in [
+        (PERSON, "Ada Example", ""),
+        (PERSON2, "Bea Demo", "no-ai: notes\n"),
+    ] {
+        let input = write_file(
+            h._tmp.path(),
+            &format!("{id}.md"),
+            &format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n{extra}---\n\nBio.\n"),
+        );
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                input.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add {id}: {}", stderr(&out));
+    }
+
+    let ixn = |extra: &str| {
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Group dinner\ndate: 2026-10-06\nperson: {PERSON}\n{extra}---\n\nFake group dinner.\n"
+        )
+    };
+    let first = write_file(h._tmp.path(), "ixn.md", &ixn(""));
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            first.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add ixn: {}", stderr(&out));
+
+    let path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(before.contains("no-ai: false"), "{before}");
+
+    let second = write_file(
+        h._tmp.path(),
+        "ixn2.md",
+        &ixn(&format!("with: [{PERSON2}]\n")),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            IXN,
+            "--file",
+            second.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit ixn: {}", stderr(&out));
+
+    let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        after.contains("no-ai: true"),
+        "the stamp did not pick up the notes-mode `with:` person: {after}"
+    );
+    assert!(
+        after.contains(&format!("key_id: {PERSON}/")),
+        "`with:` changed the routing key: {after}"
     );
 }
 
