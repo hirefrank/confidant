@@ -897,3 +897,250 @@ fn proposals_live_apply_against_temp_git_vault() {
     assert!(log.lines().count() >= 4, "expected apply commits:\n{log}");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// QMD search view (Phase 3a, #212)
+// ---------------------------------------------------------------------------
+
+use confidant_tui::contract::SearchResult;
+use confidant_tui::search::filter_search_result;
+
+/// Temp dir containing a fake installed skill at qmd-search/bin/qmd-query.py.
+fn search_skills_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("remove old temp dir");
+    }
+    let bin = dir.join("qmd-search").join("bin");
+    fs::create_dir_all(&bin).expect("create skill bin dir");
+    fs::write(bin.join("qmd-query.py"), "#!/usr/bin/env python3\n").expect("write fake skill");
+    dir
+}
+
+fn which_json(skills_dir: &Path) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "skills_dir": skills_dir.to_string_lossy(),
+    })
+    .to_string()
+}
+
+fn qmd_hit_json() -> &'static str {
+    r#"{
+        "schema_version": "1", "ok": true, "vault": "/tmp/v",
+        "mode": "bm25", "query": "ada",
+        "matches": [
+            {"id": "p-01M3TC5H00MPJG000000000000", "path": "people/p-01M3TC5H00MPJG000000000000.cfd",
+             "line": 3, "excerpt": "Ada Example", "via": "qmd", "score": 0.9123}
+        ],
+        "dropped_uncleared": 0, "findings": []
+    }"#
+}
+
+fn fallback_json() -> &'static str {
+    r#"{
+        "schema_version": "1", "ok": true, "vault": "/tmp/v",
+        "mode": "find-fallback", "fallback": "qmd or index missing", "query": "ada",
+        "matches": [
+            {"id": "p-01M3TC5H00MPJG000000000000", "path": "people/p-01M3TC5H00MPJG000000000000.cfd",
+             "line": 3, "excerpt": "Ada Example", "via": "find", "score": 0.0}
+        ],
+        "dropped_uncleared": 3, "findings": []
+    }"#
+}
+
+fn unknown_via_json() -> &'static str {
+    r#"{
+        "schema_version": "1", "ok": true, "vault": "/tmp/v",
+        "mode": "bm25", "query": "ada",
+        "matches": [
+            {"id": "p-01", "path": "people/p-01.cfd", "line": 3,
+             "excerpt": "sneaky", "via": "bogus", "score": 0.5}
+        ],
+        "dropped_uncleared": 0, "findings": []
+    }"#
+}
+
+/// Build an App whose runner answers `which --skills-dir` and `python3` from fakes.
+fn search_app(skills_dir: &Path, script_stdout: &str) -> App<FakeRunner> {
+    let runner = FakeRunner::new()
+        .with_response("which", 0, which_json(skills_dir))
+        .with_program_response("python3", 0, script_stdout);
+    let mut app = App::new(runner);
+    app.set_vault_root(demo_vault());
+    app.active_view = ActiveView::Search;
+    app
+}
+
+#[test]
+fn search_qmd_hit_renders_via_and_score() {
+    let dir = search_skills_dir("confidant-tui-search-qmd");
+    let mut app = search_app(&dir, qmd_hit_json());
+    app.run_search("ada");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert_eq!(res.kept.len(), 1);
+    assert_eq!(res.kept[0].via, "qmd");
+    assert!((res.kept[0].score - 0.9123).abs() < 1e-9);
+    assert_eq!(res.dropped_unknown_via, 0);
+
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("[qmd 0.91]"),
+        "via+score in:\\n{rendered}"
+    );
+    assert!(
+        rendered.contains("mode: bm25"),
+        "mode line in:\\n{rendered}"
+    );
+    assert_snapshot("search_qmd_hit.snap", &rendered);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn search_fallback_shows_banner_and_dropped_uncleared() {
+    let dir = search_skills_dir("confidant-tui-search-fallback");
+    let mut app = search_app(&dir, fallback_json());
+    app.run_search("ada");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert_eq!(res.result.mode, "find-fallback");
+    assert_eq!(res.kept.len(), 1);
+    assert_eq!(res.kept[0].via, "find");
+
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("fallback: qmd or index missing"),
+        "fallback banner in:\\n{rendered}"
+    );
+    assert!(
+        rendered.contains("dropped_uncleared: 3"),
+        "dropped_uncleared in:\\n{rendered}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn search_unknown_via_is_dropped_fail_closed() {
+    let dir = search_skills_dir("confidant-tui-search-unknown-via");
+    let mut app = search_app(&dir, unknown_via_json());
+    app.run_search("ada");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert!(res.kept.is_empty(), "bogus via must not be shown");
+    assert_eq!(res.dropped_unknown_via, 1);
+
+    // The contract-level filter agrees.
+    let parsed: SearchResult =
+        serde_json::from_str(unknown_via_json()).expect("deserialize SearchResult");
+    let filtered = filter_search_result(parsed);
+    assert!(filtered.kept.is_empty());
+    assert_eq!(filtered.dropped_unknown_via, 1);
+
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("0 matches"),
+        "empty list in:\\n{rendered}"
+    );
+    assert!(
+        rendered.contains("dropped_unknown_via: 1"),
+        "drop count in:\\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("sneaky"),
+        "dropped excerpt must not render"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn search_missing_skill_shows_alert_never_falls_back_silently() {
+    // skills_dir exists but has no qmd-search/skill: the TUI must alert,
+    // not silently run plain `find`.
+    let dir = std::env::temp_dir().join("confidant-tui-search-no-skill");
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("remove old temp dir");
+    }
+    fs::create_dir_all(&dir).expect("create empty skills dir");
+    let mut app = search_app(&dir, qmd_hit_json());
+    app.run_search("ada");
+
+    let alert = app.alert.as_ref().expect("expected an alert");
+    assert_eq!(alert.code.as_deref(), Some("qmd_skill_missing"));
+    assert!(app.search.result.is_none(), "no result on missing skill");
+    let calls = app.runner.recorded_program_calls();
+    assert!(
+        calls.is_empty(),
+        "python3 must not run when the skill is missing: {calls:?}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn search_live_fallback_against_demo_vault_without_qmd() {
+    // The real qmd-query.py against the demo vault. `qmd` is not installed in
+    // CI, so the script takes its find-fallback path.
+    let script = repo_root().join("crates/confidant-cli/skills/qmd-search/bin/qmd-query.py");
+    assert!(
+        script.is_file(),
+        "skill script missing: {}",
+        script.display()
+    );
+
+    let target_debug = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target/debug")
+        .to_path_buf();
+    // The script finds `confidant` via shutil.which: put target/debug on PATH.
+    let path = format!(
+        "{}:{}",
+        target_debug.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let runner = ProcessRunner::new(confidant_bin(), Some(demo_vault()))
+        .with_env("PATH", path)
+        .with_env("CONFIDANT_OFFLINE", "1");
+    let raw = runner
+        .run_program(
+            "python3",
+            &[
+                &script.display().to_string(),
+                "--vault",
+                &demo_vault().display().to_string(),
+                "Ada Example",
+            ],
+        )
+        .expect("run qmd-query.py");
+    match parse_raw_output::<SearchResult>(&raw) {
+        ContractOutcome::Ok { data, .. } => {
+            assert_eq!(data.mode, "find-fallback", "expected fallback without qmd");
+            assert!(
+                data.fallback.as_deref().unwrap_or_default().contains("qmd"),
+                "fallback reason names qmd: {:?}",
+                data.fallback
+            );
+            assert!(
+                data.matches.iter().all(|m| m.via == "find"),
+                "fallback matches are via=find"
+            );
+            assert!(
+                data.matches
+                    .iter()
+                    .any(|m| m.excerpt.contains("Ada Example")),
+                "fallback finds Ada: {:?}",
+                data.matches.iter().map(|m| &m.excerpt).collect::<Vec<_>>()
+            );
+            // Fail-closed filter keeps every fallback match.
+            let filtered = filter_search_result(data);
+            assert_eq!(filtered.dropped_unknown_via, 0);
+            assert!(!filtered.kept.is_empty());
+        }
+        other => panic!("unexpected search outcome: {other:?}"),
+    }
+}

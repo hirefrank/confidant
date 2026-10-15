@@ -124,6 +124,49 @@ pub struct Hit {
     pub excerpt: String,
 }
 
+/// Output of `qmd-query.py --vault V <query>` (TUI Search view, #212 3a).
+///
+/// Same shape as `find --json`, plus the QMD mode, an optional fallback
+/// reason, per-match `via`/`score`, and the uncleared-drop count.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct SearchResult {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub fallback: Option<String>,
+    #[serde(default)]
+    pub matches: Vec<SearchHit>,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub dropped_uncleared: u32,
+    #[serde(default)]
+    pub skipped_encrypted: u32,
+    #[serde(default)]
+    pub refused_envelopes: u32,
+}
+
+/// One search match inside a [`SearchResult`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct SearchHit {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: u32,
+    #[serde(default)]
+    pub excerpt: String,
+    /// Provenance of the match: `"qmd"` or `"find"`. Anything else is
+    /// dropped at render time (fail closed).
+    #[serde(default)]
+    pub via: String,
+    #[serde(default)]
+    pub score: f64,
+}
+
 /// Output of `confidant context <person-id> --json --no-input`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Context {
