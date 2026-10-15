@@ -15,7 +15,7 @@ use crate::packs::grammars::{
     parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
     GRAMMAR_NON_EMPTY_STRING, GRAMMAR_RECURRING_DATE,
 };
-use crate::packs::manifest::parse_manifest;
+use crate::packs::manifest::{parse_manifest, PackManifest};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::{parse_with_list, Record, RecordKind};
 use crate::search::cleared_record_ids;
@@ -39,7 +39,10 @@ static PERSONAL_MANIFEST_TOML: &str = include_str!(concat!(
 /// trait's `&'static` signatures can serve them (#343). Parsed once; a
 /// parse failure is a programming error (the file is compile-time data),
 /// so it fails loudly rather than silently falling back to stale claims.
-struct ManifestClaims {
+/// The owned [`PackManifest`] is kept for message rendering (spec §7:
+/// text in the manifest, selection in Rust).
+pub(crate) struct ManifestClaims {
+    pub(crate) manifest: PackManifest,
     name: &'static str,
     verbs: Vec<&'static str>,
     verb_id_types: Vec<(&'static str, Prefix)>,
@@ -47,42 +50,77 @@ struct ManifestClaims {
     fields: Vec<&'static str>,
     balance_metrics: Vec<&'static str>,
     edge_kinds: Vec<EdgeKind>,
+    finding_codes: Vec<&'static str>,
 }
 
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-fn manifest_claims() -> &'static ManifestClaims {
+pub(crate) fn manifest_claims() -> &'static ManifestClaims {
     static CLAIMS: OnceLock<ManifestClaims> = OnceLock::new();
     CLAIMS.get_or_init(|| {
         let m = parse_manifest(PERSONAL_MANIFEST_TOML)
             .expect("embedded packs/personal/manifest.toml must parse");
+        let name = leak_str(format!("{}@{}", m.pack.name, m.pack.version));
+        let verbs: Vec<&'static str> = m.verbs.iter().map(|v| leak_str(v.name.clone())).collect();
+        let verb_id_types: Vec<(&'static str, Prefix)> = m
+            .verbs
+            .iter()
+            .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+            .collect();
+        let record_types: Vec<&'static str> =
+            m.record_types.iter().map(|r| leak_str(r.clone())).collect();
+        let fields: Vec<&'static str> = m.fields.iter().map(|f| leak_str(f.name.clone())).collect();
+        let balance_metrics: Vec<&'static str> = m
+            .balance_metrics
+            .iter()
+            .map(|b| leak_str(b.clone()))
+            .collect();
+        let edge_kinds: Vec<EdgeKind> = m
+            .edge_kinds
+            .iter()
+            .map(|e| EdgeKind {
+                name: leak_str(e.name.clone()),
+                symmetric: e.symmetric,
+            })
+            .collect();
+        let finding_codes: Vec<&'static str> = m
+            .finding_codes
+            .iter()
+            .map(|c| leak_str(c.clone()))
+            .collect();
         ManifestClaims {
-            name: leak_str(format!("{}@{}", m.pack.name, m.pack.version)),
-            verbs: m.verbs.iter().map(|v| leak_str(v.name.clone())).collect(),
-            verb_id_types: m
-                .verbs
-                .iter()
-                .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
-                .collect(),
-            record_types: m.record_types.iter().map(|r| leak_str(r.clone())).collect(),
-            fields: m.fields.iter().map(|f| leak_str(f.name.clone())).collect(),
-            balance_metrics: m
-                .balance_metrics
-                .iter()
-                .map(|b| leak_str(b.clone()))
-                .collect(),
-            edge_kinds: m
-                .edge_kinds
-                .iter()
-                .map(|e| EdgeKind {
-                    name: leak_str(e.name.clone()),
-                    symmetric: e.symmetric,
-                })
-                .collect(),
+            manifest: m,
+            name,
+            verbs,
+            verb_id_types,
+            record_types,
+            fields,
+            balance_metrics,
+            edge_kinds,
+            finding_codes,
         }
     })
+}
+
+/// Render a finding message from the manifest (spec §7: text in the
+/// manifest, selection in Rust). Panics on a missing code/variant or an
+/// unsupplied placeholder — the manifest is compile-time data.
+fn render_msg(code: &str, variant: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+    manifest_claims()
+        .manifest
+        .render_message(code, variant, args)
+}
+
+/// Render the finding's fix text from the manifest, or `None` when the
+/// manifest declares no `<variant>_fix` for this variant.
+fn render_fix(
+    code: &str,
+    variant: &str,
+    args: &[(&str, &dyn std::fmt::Display)],
+) -> Option<String> {
+    manifest_claims().manifest.render_fix(code, variant, args)
 }
 
 fn is_valid_touch_kind(kind: &str) -> bool {
@@ -286,20 +324,12 @@ impl Pack for PersonalPack {
     }
 
     fn finding_codes(&self) -> &'static [&'static str] {
-        // Unchanged in step 4; finding codes move to the manifest in step 6
-        // (#345). The manifest already carries them (the loader requires a
-        // [messages] table per code), and the parity test proves they match.
+        // Step 6 (#345): served from the manifest. The parity test pins
+        // the codes verbatim so a bad manifest fails loudly.
         // `E_TOUCH_MALFORMED` is a core code (emitted by `check`, not this
         // pack), so it is not listed here; it is documented in
         // `spec/findings.md`.
-        &[
-            "E_FRONTMATTER",
-            "E_INVALID_ID",
-            "E_WRONG_ID_TYPE",
-            "E_UNKNOWN_RECORD",
-            "W_CADENCE_OVERDUE",
-            "W_DATE_UPCOMING",
-        ]
+        &manifest_claims().finding_codes
     }
 
     fn edge_kinds(&self) -> &'static [EdgeKind] {
@@ -471,7 +501,7 @@ fn fold(
                     _ => push_field_error(
                         rec,
                         "birthday",
-                        "front matter key 'birthday' must be YYYY-MM-DD or --MM-DD",
+                        "must be YYYY-MM-DD or --MM-DD",
                         "Use YYYY-MM-DD (e.g. 1990-05-14) or --MM-DD (e.g. --05-14)",
                         findings,
                     ),
@@ -483,7 +513,7 @@ fn fold(
                     _ => push_field_error(
                         rec,
                         "cadence",
-                        "front matter key 'cadence' must be <N>d (1..=3650)",
+                        "must be <N>d (1..=3650)",
                         "Use a positive day count such as 30d or 90d",
                         findings,
                     ),
@@ -495,7 +525,7 @@ fn fold(
                     _ => push_field_error(
                         rec,
                         "relationship_to_me",
-                        "front matter key 'relationship_to_me' must not be empty",
+                        "must not be empty",
                         "Provide a non-empty relationship label or remove the key",
                         findings,
                     ),
@@ -507,7 +537,7 @@ fn fold(
                     _ => push_field_error(
                         rec,
                         "dates",
-                        "front matter key 'dates' must be a comma-separated list of label:YYYY-MM-DD or label:--MM-DD",
+                        "must be a comma-separated list of label:YYYY-MM-DD or label:--MM-DD",
                         "Example: dates: [anniversary:2020-06-15, graduation:--05-20]",
                         findings,
                     ),
@@ -564,17 +594,25 @@ fn push_field_error(
     rec: &Record,
     key: &str,
     problem: &str,
-    fix: &str,
+    fix_text: &str,
     findings: &mut Vec<Finding>,
 ) {
     let mut f = Finding::new(
         FindingCode::Frontmatter,
         Severity::Error,
-        problem.to_owned(),
+        render_msg(
+            "E_FRONTMATTER",
+            "default",
+            &[("key", &key), ("problem", &problem)],
+        ),
     )
     .at_file(&rec.path)
     .for_id(&rec.id)
-    .with_fix(fix.to_owned());
+    .with_fix(render_msg(
+        "E_FRONTMATTER",
+        "default_fix",
+        &[("fix", &fix_text)],
+    ));
     if let Some(line) = rec.field_lines.get(key) {
         f = f.at_line(*line);
     }
@@ -601,35 +639,39 @@ fn touch_note_integrity(vault: &Vault, state: &PersonalState, findings: &mut Vec
                 Finding::new(
                     FindingCode::InvalidId,
                     Severity::Error,
-                    "touch note is not a record ID".to_owned(),
+                    render_msg("E_INVALID_ID", "default", &[]),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix("Point note: at an existing n-<ULID> note"),
+                .with_fix(render_msg("E_INVALID_ID", "default_fix", &[])),
             ),
             Ok(nid) if nid.prefix() != Prefix::Note => findings.push(
                 Finding::new(
                     FindingCode::WrongIdType,
                     Severity::Error,
-                    format!("touch note '{nid}' is not a note id"),
+                    render_msg("E_WRONG_ID_TYPE", "default", &[("id", &nid)]),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix("Use note:n-<ULID>"),
+                .with_fix(render_msg("E_WRONG_ID_TYPE", "default_fix", &[])),
             ),
             Ok(nid) => match vault.records.get(&nid) {
                 None => findings.push(
                     Finding::new(
                         FindingCode::UnknownRecord,
                         Severity::Error,
-                        format!("touch note '{nid}' does not exist"),
+                        render_msg("E_UNKNOWN_RECORD", "missing", &[("id", &nid)]),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
                     .for_id(&person)
-                    .with_fix("Point note: at an existing n-<ULID> note"),
+                    .with_fix(render_msg(
+                        "E_UNKNOWN_RECORD",
+                        "missing_fix",
+                        &[],
+                    )),
                 ),
                 Some(rec) => {
                     let note_person = rec
@@ -641,12 +683,20 @@ fn touch_note_integrity(vault: &Vault, state: &PersonalState, findings: &mut Vec
                             Finding::new(
                                 FindingCode::UnknownRecord,
                                 Severity::Error,
-                                format!("touch note '{nid}' does not belong to {person}"),
+                                render_msg(
+                                    "E_UNKNOWN_RECORD",
+                                    "wrong_owner",
+                                    &[("id", &nid), ("person", &person)],
+                                ),
                             )
                             .at_file(&sourced.file)
                             .at_line(sourced.line)
                             .for_id(&person)
-                            .with_fix("Point note: at a note for this person"),
+                            .with_fix(render_msg(
+                                "E_UNKNOWN_RECORD",
+                                "wrong_owner_fix",
+                                &[],
+                            )),
                         );
                     }
                 }
@@ -692,21 +742,36 @@ fn cadence_and_date_rules(
                 }
             }
             let start = as_of - window;
-            let message = match last {
-                Some(d) => format!(
-                    "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+            let (message, fix) = match last {
+                Some(d) => (
+                    render_msg(
+                        "W_CADENCE_OVERDUE",
+                        "last",
+                        &[
+                            ("id", &id),
+                            ("start", &start),
+                            ("d", &d),
+                            ("cadence_days", &cadence_days),
+                        ],
+                    ),
+                    render_fix("W_CADENCE_OVERDUE", "last", &[("id", &id)])
+                        .expect("manifest declares last_fix"),
                 ),
-                None => format!(
-                    "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+                None => (
+                    render_msg(
+                        "W_CADENCE_OVERDUE",
+                        "none",
+                        &[("id", &id), ("cadence_days", &cadence_days)],
+                    ),
+                    render_fix("W_CADENCE_OVERDUE", "none", &[("id", &id)])
+                        .expect("manifest declares none_fix"),
                 ),
             };
             findings.push(
                 Finding::new(FindingCode::CadenceOverdue, sev, message)
                     .at_file(&rec.path)
                     .for_id(id)
-                    .with_fix(format!(
-                        "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
-                    )),
+                    .with_fix(fix),
             );
         }
     }
@@ -737,13 +802,18 @@ fn cadence_and_date_rules(
                         Finding::new(
                             FindingCode::DateUpcoming,
                             sev,
-                            format!("upcoming date for {id} on {occ} (in {delta}d)"),
+                            render_msg(
+                                "W_DATE_UPCOMING",
+                                "default",
+                                &[("id", &id), ("occ", &occ), ("delta", &delta)],
+                            ),
                         )
                         .at_file(&rec.path)
                         .for_id(id)
-                        .with_fix(format!(
-                            "Reach out to {id} or set `[checks] personal.date_upcoming = \"off\"`"
-                        )),
+                        .with_fix(
+                            render_fix("W_DATE_UPCOMING", "default", &[("id", &id)])
+                                .expect("manifest declares default_fix"),
+                        ),
                     );
                 }
             }
@@ -829,8 +899,9 @@ mod tests {
 
     /// Silas (#351 review): the §11 example's edge kinds and finding codes
     /// must match the code. The manifest is the §11 example; prove it
-    /// mechanically. `finding_codes()` is still the compiled slice in step
-    /// 4 (it moves in step 6), so the manifest must already agree with it.
+    /// mechanically. In step 6 (#345) `finding_codes()` serves the
+    /// manifest, so the trait-vs-manifest comparison is circular; the
+    /// verbatim list below pins the codes instead.
     #[test]
     fn manifest_finding_codes_and_edge_kinds_match_code() {
         let m = parse_manifest(PERSONAL_MANIFEST_TOML).expect("manifest parses");

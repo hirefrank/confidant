@@ -109,5 +109,5 @@ none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
 none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
 
 [messages."W_DATE_UPCOMING"]
-default = "person {id} has {label} on {date} ({days} days)"
-default_fix = "Log a touchpoint with `confidant log touch {id} <kind>`"
+default = "upcoming date for {id} on {occ} (in {delta}d)"
+default_fix = "Reach out to {id} or set `[checks] personal.date_upcoming = \"off\"`"

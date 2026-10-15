@@ -176,6 +176,26 @@ pub trait Pack: Send + Sync {
 /// Every pack compiled into this binary, in registry order.
 pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack, &personal::PersonalPack];
 
+/// The parsed manifests of every compiled pack, in registry order.
+/// `config` reads the `[checks]` key declarations from these so the
+/// allowlists and defaults live in the manifests, not in hardcoded
+/// slices (#345).
+pub(crate) fn pack_manifests() -> [&'static manifest::PackManifest; 2] {
+    [
+        &coaching::manifest_claims().manifest,
+        &personal::manifest_claims().manifest,
+    ]
+}
+
+/// The parsed manifest for a compiled pack, by `name@version`
+/// (e.g. `"coaching@0.1"`). Used by the CLI's drift tests to check
+/// manifest text against the embedded SKILL.md (#345).
+pub fn pack_manifest(name: &str) -> Option<&'static manifest::PackManifest> {
+    pack_manifests()
+        .into_iter()
+        .find(|m| format!("{}@{}", m.pack.name, m.pack.version) == name)
+}
+
 /// The enabled packs for a vault's `packs = [...]` list, each at most once
 /// (a duplicated listing folds once), plus the listed names no compiled pack
 /// implements. Order follows the config list.
@@ -528,5 +548,47 @@ mod tests {
         assert!(none.verbs.is_empty());
         assert!(none.fields.is_empty());
         assert!(none.edge_kinds.is_empty());
+    }
+
+    /// Every message template in every compiled pack's manifest must
+    /// render (#345). Extracts the `{placeholder}` names from each
+    /// template, supplies a dummy value per placeholder, and asserts the
+    /// render succeeds with no placeholders left. This catches template
+    /// syntax errors and placeholder typos; the integration tests prove
+    /// the code supplies the right values at each call site.
+    #[test]
+    fn all_manifest_message_templates_render() {
+        for m in super::pack_manifests() {
+            for code in &m.finding_codes {
+                let variants = &m.messages[code.as_str()];
+                for (variant, template) in variants {
+                    // Collect placeholder names.
+                    let mut placeholders = Vec::new();
+                    let mut chars = template.chars().peekable();
+                    while let Some(c) = chars.next() {
+                        if c == '{' {
+                            let mut name = String::new();
+                            for c in chars.by_ref() {
+                                if c == '}' {
+                                    break;
+                                }
+                                name.push(c);
+                            }
+                            placeholders.push(name);
+                        }
+                    }
+                    let args: Vec<(&str, &dyn std::fmt::Display)> = placeholders
+                        .iter()
+                        .map(|p| (p.as_str(), &"X" as &dyn std::fmt::Display))
+                        .collect();
+                    let rendered = m.render_message(code, variant, &args);
+                    assert!(
+                        !rendered.contains('{') && !rendered.contains('}'),
+                        "unrendered placeholder in [{code}].{variant}"
+                    );
+                    assert!(!rendered.is_empty(), "empty render for [{code}].{variant}");
+                }
+            }
+        }
     }
 }

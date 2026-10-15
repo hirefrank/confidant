@@ -13,23 +13,46 @@ pub const SPEC_VERSION: &str = "0.1";
 pub const COACHING_PACK: &str = "coaching@0.1";
 pub const PERSONAL_PACK: &str = "personal@0.1";
 pub const MAX_GAP_DAYS: u64 = 3650;
-pub const DEFAULT_GAP_DAYS: u64 = 45;
-pub const DEFAULT_PPS_LOOKBACK_DAYS: u64 = 180;
-pub const DEFAULT_DATE_UPCOMING_DAYS: u64 = 7;
 
-const KNOWN_SEVERITY_KEYS: &[&str] = &[
-    "coaching.require_duration",
-    "coaching.balance_nonnegative",
-    "coaching.session_notes",
-    "coaching.paid_session_gap",
-    "personal.cadence_overdue",
-    "personal.date_upcoming",
-];
-const KNOWN_INT_KEYS: &[&str] = &[
-    "coaching.paid_session_gap_days",
-    "coaching.pps_lookback_days",
-    "personal.date_upcoming_days",
-];
+/// `[checks]` severity keys, from the compiled packs' manifests (#345).
+/// `as_of` stays core-owned and is listed separately in `KNOWN_TOP_LEVEL`.
+fn known_severity_keys() -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    for m in crate::packs::pack_manifests() {
+        for s in &m.checks.severity {
+            // The manifest stores owned Strings; the keys are 'static
+            // because the manifest itself lives for 'static.
+            keys.push(s.key.as_str());
+        }
+    }
+    keys
+}
+
+/// `[checks]` integer keys, from the compiled packs' manifests (#345).
+fn known_int_keys() -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    for m in crate::packs::pack_manifests() {
+        for i in &m.checks.int {
+            keys.push(i.key.as_str());
+        }
+    }
+    keys
+}
+
+/// Default for a `[checks]` integer key, from the pack manifest that
+/// declares it (#345). Panics on an unknown key: callers only ask about
+/// keys in `known_int_keys()`.
+fn int_key_default(key: &str) -> u64 {
+    for m in crate::packs::pack_manifests() {
+        for i in &m.checks.int {
+            if i.key == key {
+                return u64::try_from(i.default).expect("manifest int default fits in u64");
+            }
+        }
+    }
+    panic!("unknown [checks] int key '{key}'")
+}
+
 const KNOWN_TOP_LEVEL: &[&str] = &["as_of"];
 
 /// A vault's `confidant.toml`.
@@ -161,9 +184,9 @@ impl VaultConfig {
         if cfg.spec.trim().is_empty() {
             return Err(DomainError::config("confidant.toml is missing spec"));
         }
-        cfg.checks.gap_days = DEFAULT_GAP_DAYS;
-        cfg.checks.pps_lookback_days = DEFAULT_PPS_LOOKBACK_DAYS;
-        cfg.checks.date_upcoming_days = DEFAULT_DATE_UPCOMING_DAYS;
+        cfg.checks.gap_days = int_key_default("coaching.paid_session_gap_days");
+        cfg.checks.pps_lookback_days = int_key_default("coaching.pps_lookback_days");
+        cfg.checks.date_upcoming_days = int_key_default("personal.date_upcoming_days");
         Ok(cfg)
     }
 
@@ -195,7 +218,7 @@ impl VaultConfig {
             if key == "as_of" || KNOWN_TOP_LEVEL.contains(&key.as_str()) {
                 continue;
             }
-            if KNOWN_SEVERITY_KEYS.contains(&key.as_str()) {
+            if known_severity_keys().contains(&key.as_str()) {
                 match self.checks.lookup(key) {
                     Some(toml::Value::String(s)) => {
                         if parse_severity_token(s).is_err() {
@@ -222,7 +245,7 @@ impl VaultConfig {
                 }
                 continue;
             }
-            if KNOWN_INT_KEYS.contains(&key.as_str()) {
+            if known_int_keys().contains(&key.as_str()) {
                 let default = int_key_default(key);
                 let value = self.checks.lookup(key).cloned();
                 let dest = int_key_dest(&mut self.checks, key);
@@ -295,14 +318,6 @@ impl VaultConfig {
             );
         }
         findings
-    }
-}
-
-fn int_key_default(key: &str) -> u64 {
-    match key {
-        "coaching.pps_lookback_days" => DEFAULT_PPS_LOOKBACK_DAYS,
-        "personal.date_upcoming_days" => DEFAULT_DATE_UPCOMING_DAYS,
-        _ => DEFAULT_GAP_DAYS,
     }
 }
 
@@ -434,10 +449,8 @@ coaching.paid_session_gap_days = 45
             Some(Severity::Error)
         );
         assert_eq!(cfg.checks.paid_session_gap_days(), 45);
-        assert_eq!(
-            cfg.checks.pps_lookback_days(),
-            super::DEFAULT_PPS_LOOKBACK_DAYS
-        );
+        // Default comes from the coaching manifest's [checks] table (#345).
+        assert_eq!(cfg.checks.pps_lookback_days(), 180);
         assert_eq!(
             cfg.checks
                 .severity("coaching.session_notes", Severity::Warning),

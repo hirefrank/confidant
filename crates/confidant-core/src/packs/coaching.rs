@@ -10,7 +10,7 @@ use crate::check::{duration_of, Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::ledger::{minutes_to_hundredths, parse_decimal_hundredths, parse_strict_date, Arg};
-use crate::packs::manifest::parse_manifest;
+use crate::packs::manifest::{parse_manifest, PackManifest};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::RecordKind;
 use crate::vault::{SourcedEntry, Vault};
@@ -32,7 +32,10 @@ static COACHING_MANIFEST_TOML: &str = include_str!(concat!(
 /// trait's `&'static` signatures can serve them (#344). Parsed once; a
 /// parse failure is a programming error (the file is compile-time data),
 /// so it fails loudly rather than silently falling back to stale claims.
-struct ManifestClaims {
+/// The owned [`PackManifest`] is kept for message rendering (spec §7:
+/// text in the manifest, selection in Rust).
+pub(crate) struct ManifestClaims {
+    pub(crate) manifest: PackManifest,
     name: &'static str,
     verbs: Vec<&'static str>,
     verb_id_types: Vec<(&'static str, Prefix)>,
@@ -40,42 +43,77 @@ struct ManifestClaims {
     fields: Vec<&'static str>,
     balance_metrics: Vec<&'static str>,
     edge_kinds: Vec<EdgeKind>,
+    finding_codes: Vec<&'static str>,
 }
 
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-fn manifest_claims() -> &'static ManifestClaims {
+pub(crate) fn manifest_claims() -> &'static ManifestClaims {
     static CLAIMS: OnceLock<ManifestClaims> = OnceLock::new();
     CLAIMS.get_or_init(|| {
         let m = parse_manifest(COACHING_MANIFEST_TOML)
             .expect("embedded packs/coaching/manifest.toml must parse");
+        let name = leak_str(format!("{}@{}", m.pack.name, m.pack.version));
+        let verbs: Vec<&'static str> = m.verbs.iter().map(|v| leak_str(v.name.clone())).collect();
+        let verb_id_types: Vec<(&'static str, Prefix)> = m
+            .verbs
+            .iter()
+            .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+            .collect();
+        let record_types: Vec<&'static str> =
+            m.record_types.iter().map(|r| leak_str(r.clone())).collect();
+        let fields: Vec<&'static str> = m.fields.iter().map(|f| leak_str(f.name.clone())).collect();
+        let balance_metrics: Vec<&'static str> = m
+            .balance_metrics
+            .iter()
+            .map(|b| leak_str(b.clone()))
+            .collect();
+        let edge_kinds: Vec<EdgeKind> = m
+            .edge_kinds
+            .iter()
+            .map(|e| EdgeKind {
+                name: leak_str(e.name.clone()),
+                symmetric: e.symmetric,
+            })
+            .collect();
+        let finding_codes: Vec<&'static str> = m
+            .finding_codes
+            .iter()
+            .map(|c| leak_str(c.clone()))
+            .collect();
         ManifestClaims {
-            name: leak_str(format!("{}@{}", m.pack.name, m.pack.version)),
-            verbs: m.verbs.iter().map(|v| leak_str(v.name.clone())).collect(),
-            verb_id_types: m
-                .verbs
-                .iter()
-                .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
-                .collect(),
-            record_types: m.record_types.iter().map(|r| leak_str(r.clone())).collect(),
-            fields: m.fields.iter().map(|f| leak_str(f.name.clone())).collect(),
-            balance_metrics: m
-                .balance_metrics
-                .iter()
-                .map(|b| leak_str(b.clone()))
-                .collect(),
-            edge_kinds: m
-                .edge_kinds
-                .iter()
-                .map(|e| EdgeKind {
-                    name: leak_str(e.name.clone()),
-                    symmetric: e.symmetric,
-                })
-                .collect(),
+            manifest: m,
+            name,
+            verbs,
+            verb_id_types,
+            record_types,
+            fields,
+            balance_metrics,
+            edge_kinds,
+            finding_codes,
         }
     })
+}
+
+/// Render a finding message from the manifest (spec §7: text in the
+/// manifest, selection in Rust). Panics on a missing code/variant or an
+/// unsupplied placeholder — the manifest is compile-time data.
+fn render_msg(code: &str, variant: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+    manifest_claims()
+        .manifest
+        .render_message(code, variant, args)
+}
+
+/// Render the finding's fix text from the manifest, or `None` when the
+/// manifest declares no `<variant>_fix` for this variant.
+fn render_fix(
+    code: &str,
+    variant: &str,
+    args: &[(&str, &dyn std::fmt::Display)],
+) -> Option<String> {
+    manifest_claims().manifest.render_fix(code, variant, args)
 }
 
 #[derive(Clone, Debug)]
@@ -219,23 +257,9 @@ impl Pack for CoachingPack {
     }
 
     fn finding_codes(&self) -> &'static [&'static str] {
-        // Unchanged in step 5; finding codes move to the manifest in step 6
-        // (#345). The manifest already carries them (the loader requires a
-        // [messages] table per code), and the parity test proves they match.
-        &[
-            "E_PARSE",
-            "E_BALANCE_MISMATCH",
-            "E_NEGATIVE_BALANCE",
-            "E_OPEN_MALFORMED",
-            "E_INVALID_ID",
-            "E_WRONG_ID_TYPE",
-            "E_MISSING_DURATION",
-            "E_SESSION_TAGS",
-            "W_SESSION_UNTAGGED",
-            "E_UNKNOWN_RECORD",
-            "E_SESSION_WITHOUT_NOTES",
-            "E_PAID_SESSION_GAP",
-        ]
+        // Step 6 (#345): served from the manifest. The parity test pins
+        // the codes verbatim so a bad manifest fails loudly.
+        &manifest_claims().finding_codes
     }
 
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
@@ -332,7 +356,7 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
             Finding::new(
                 FindingCode::Parse,
                 Severity::Error,
-                "balance line is missing a number".to_owned(),
+                render_msg("E_PARSE", "missing_number", &[]),
             )
             .at_file(&sourced.file)
             .at_line(sourced.line)
@@ -349,12 +373,16 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
                     Finding::new(
                         FindingCode::Parse,
                         Severity::Error,
-                        "expected integer".to_owned(),
+                        render_msg("E_PARSE", "expected_integer", &[]),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
                     .for_id(&e.id)
-                    .with_fix("Use an integer such as 3 for sessions_remaining"),
+                    .with_fix(render_msg(
+                        "E_PARSE",
+                        "expected_integer_fix",
+                        &[],
+                    )),
                 );
                 return;
             }
@@ -365,13 +393,19 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
                 Finding::new(
                     FindingCode::BalanceMismatch,
                     Severity::Error,
-                    format!("sessions_remaining asserted {asserted}, computed {computed}"),
+                    render_msg(
+                        "E_BALANCE_MISMATCH",
+                        "sessions_remaining",
+                        &[("asserted", &asserted), ("computed", &computed)],
+                    ),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix(format!(
-                    "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
+                .with_fix(render_msg(
+                    "E_BALANCE_MISMATCH",
+                    "sessions_remaining_fix",
+                    &[("person", &person)],
                 )),
             );
         }
@@ -381,12 +415,12 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
                 Finding::new(
                     FindingCode::Parse,
                     Severity::Error,
-                    "expected decimal".to_owned(),
+                    render_msg("E_PARSE", "expected_decimal", &[]),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&e.id)
-                .with_fix("Use a decimal such as 1.50 for icf_hours"),
+                .with_fix(render_msg("E_PARSE", "expected_decimal_fix", &[])),
             );
             return;
         };
@@ -396,17 +430,22 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
                 Finding::new(
                     FindingCode::BalanceMismatch,
                     Severity::Error,
-                    format!(
-                        "icf_hours asserted {}, computed {}",
-                        format_hundredths(asserted),
-                        format_hundredths(computed)
+                    render_msg(
+                        "E_BALANCE_MISMATCH",
+                        "icf_hours",
+                        &[
+                            ("asserted", &format_hundredths(asserted)),
+                            ("computed", &format_hundredths(computed)),
+                        ],
                     ),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix(format!(
-                    "Check session durations for {person} or correct the assertion"
+                .with_fix(render_msg(
+                    "E_BALANCE_MISMATCH",
+                    "icf_hours_fix",
+                    &[("person", &person)],
                 )),
             );
         }
@@ -534,10 +573,18 @@ fn fold(
                     Finding::new(
                         FindingCode::NegativeBalance,
                         sev,
-                        format!("sessions_remaining for {id} is {remaining}"),
+                        render_msg(
+                            "E_NEGATIVE_BALANCE",
+                            "default",
+                            &[("id", &id), ("remaining", &remaining)],
+                        ),
                     )
                     .for_id(&id)
-                    .with_fix("Add an open/renewal or remove extra session lines"),
+                    .with_fix(render_msg(
+                        "E_NEGATIVE_BALANCE",
+                        "default_fix",
+                        &[],
+                    )),
                 );
             }
         }
@@ -561,30 +608,34 @@ fn apply_open(
             Finding::new(
                 FindingCode::OpenMalformed,
                 Severity::Error,
-                "open line must be: DATE open PERSON-ID package PKG-ID N sessions".to_owned(),
+                render_msg("E_OPEN_MALFORMED", "shape", &[]),
             )
             .at_file(file)
             .at_line(line)
             .for_id(&entry.id)
-            .with_fix("Example: 2026-10-01 open p-… package pkg-… 6 sessions"),
+            .with_fix(render_msg("E_OPEN_MALFORMED", "shape_fix", &[])),
         ),
         Some(Err(OpenIssue::InvalidId(_raw))) => findings.push(
             Finding::new(
                 FindingCode::InvalidId,
                 Severity::Error,
-                "package id is not a record ID".to_owned(),
+                render_msg("E_INVALID_ID", "package", &[]),
             )
             .at_file(file)
             .at_line(line)
             .for_id(&entry.id)
-            .with_fix("Use a pkg-<ULID> package id"),
+            .with_fix(render_msg("E_INVALID_ID", "package_fix", &[])),
         ),
-        Some(Err(OpenIssue::Malformed(msg))) => findings.push(
-            Finding::new(FindingCode::OpenMalformed, Severity::Error, msg)
-                .at_file(file)
-                .at_line(line)
-                .for_id(&entry.id)
-                .with_fix("Use open <pkg-id> <positive-integer> on its own ledger line"),
+        Some(Err(OpenIssue::Malformed)) => findings.push(
+            Finding::new(
+                FindingCode::OpenMalformed,
+                Severity::Error,
+                render_msg("E_OPEN_MALFORMED", "not_integer", &[]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(&entry.id)
+            .with_fix(render_msg("E_OPEN_MALFORMED", "not_integer_fix", &[])),
         ),
         Some(Ok((pkg, n))) => {
             if pkg.prefix() != Prefix::Package {
@@ -592,7 +643,7 @@ fn apply_open(
                     Finding::new(
                         FindingCode::WrongIdType,
                         Severity::Error,
-                        format!("package id '{pkg}' must use the pkg- prefix"),
+                        render_msg("E_WRONG_ID_TYPE", "package", &[("pkg", &pkg)]),
                     )
                     .at_file(file)
                     .at_line(line)
@@ -604,12 +655,20 @@ fn apply_open(
                     Finding::new(
                         FindingCode::OpenMalformed,
                         Severity::Error,
-                        format!("open N {n} exceeds the cap of {MAX_OPEN_N}"),
+                        render_msg(
+                            "E_OPEN_MALFORMED",
+                            "exceeds_cap",
+                            &[("n", &n), ("cap", &MAX_OPEN_N)],
+                        ),
                     )
                     .at_file(file)
                     .at_line(line)
                     .for_id(&entry.id)
-                    .with_fix(format!("Use a package size between 1 and {MAX_OPEN_N}")),
+                    .with_fix(render_msg(
+                        "E_OPEN_MALFORMED",
+                        "exceeds_cap_fix",
+                        &[("cap", &MAX_OPEN_N)],
+                    )),
                 );
                 return;
             }
@@ -620,16 +679,20 @@ fn apply_open(
                     .iter()
                     .try_fold(0i64, |acc, o| acc.checked_add(o.n));
                 if opened.and_then(|acc| acc.checked_add(n)).is_none() {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::OpenMalformed,
-                            Severity::Error,
-                            format!("open total for {} overflows", entry.id),
-                        )
-                        .at_file(file)
-                        .at_line(line)
-                        .for_id(&entry.id),
-                    );
+                    let mut f = Finding::new(
+                        FindingCode::OpenMalformed,
+                        Severity::Error,
+                        render_msg("E_OPEN_MALFORMED", "total_overflow", &[("id", &entry.id)]),
+                    )
+                    .at_file(file)
+                    .at_line(line)
+                    .for_id(&entry.id);
+                    if let Some(fx) =
+                        render_fix("E_OPEN_MALFORMED", "total_overflow", &[("id", &entry.id)])
+                    {
+                        f = f.with_fix(fx);
+                    }
+                    findings.push(f);
                     return;
                 }
                 person.opens.push(OpenEvent {
@@ -645,7 +708,7 @@ fn apply_open(
 #[derive(Debug)]
 enum OpenIssue {
     InvalidId(String),
-    Malformed(String),
+    Malformed,
 }
 
 fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>> {
@@ -663,7 +726,7 @@ fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>>
     let n: i64 = match tokens[2].parse() {
         Ok(n) if n > 0 => n,
         Ok(_) => return None,
-        Err(_) => return Some(Err(OpenIssue::Malformed("expected integer".to_owned()))),
+        Err(_) => return Some(Err(OpenIssue::Malformed)),
     };
     Some(Ok((pkg, n)))
 }
@@ -681,12 +744,12 @@ fn apply_session(
             Finding::new(
                 FindingCode::MissingDuration,
                 Severity::Error,
-                format!("session for {} has no parseable duration", entry.id),
+                render_msg("E_MISSING_DURATION", "default", &[("id", &entry.id)]),
             )
             .at_file(file)
             .at_line(line)
             .for_id(&entry.id)
-            .with_fix("Add a duration such as 60m or 1h30m"),
+            .with_fix(render_msg("E_MISSING_DURATION", "default_fix", &[])),
         );
     }
     let paid = entry.has_token("paid");
@@ -698,15 +761,12 @@ fn apply_session(
             Finding::new(
                 FindingCode::SessionTags,
                 Severity::Error,
-                format!(
-                    "session for {} has more than one of paid, pps, comp",
-                    entry.id
-                ),
+                render_msg("E_SESSION_TAGS", "default", &[("id", &entry.id)]),
             )
             .at_file(file)
             .at_line(line)
             .for_id(&entry.id)
-            .with_fix("Keep exactly one billing tag: paid, pps, or comp"),
+            .with_fix(render_msg("E_SESSION_TAGS", "default_fix", &[])),
         );
     }
     if tag_count == 0 {
@@ -714,12 +774,12 @@ fn apply_session(
             Finding::new(
                 FindingCode::SessionUntagged,
                 Severity::Warning,
-                format!("session for {} has no paid, pps, or comp tag", entry.id),
+                render_msg("W_SESSION_UNTAGGED", "default", &[("id", &entry.id)]),
             )
             .at_file(file)
             .at_line(line)
             .for_id(&entry.id)
-            .with_fix("Tag the session paid, pps (pay-per-session), or comp (complimentary)"),
+            .with_fix(render_msg("W_SESSION_UNTAGGED", "default_fix", &[])),
         );
     }
     // `paid` consumes. `pps` and `comp` never do. Untagged still consumes so
@@ -729,16 +789,18 @@ fn apply_session(
     if let Some(mins) = duration {
         let current = person.minutes_on(NaiveDate::MAX);
         if current.checked_add(mins).is_none() {
-            findings.push(
-                Finding::new(
-                    FindingCode::Parse,
-                    Severity::Error,
-                    format!("session minutes for {} overflow", entry.id),
-                )
-                .at_file(file)
-                .at_line(line)
-                .for_id(&entry.id),
-            );
+            let mut f = Finding::new(
+                FindingCode::Parse,
+                Severity::Error,
+                render_msg("E_PARSE", "minutes_overflow", &[("id", &entry.id)]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(&entry.id);
+            if let Some(fx) = render_fix("E_PARSE", "minutes_overflow", &[("id", &entry.id)]) {
+                f = f.with_fix(fx);
+            }
+            findings.push(f);
         }
     }
     person.sessions.push(SessionEvent {
@@ -798,35 +860,39 @@ fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &mut V
                 Finding::new(
                     FindingCode::InvalidId,
                     Severity::Error,
-                    "session note is not a record ID".to_owned(),
+                    render_msg("E_INVALID_ID", "session_note", &[]),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix("Point note: at an existing n-<ULID> note"),
+                .with_fix(render_msg("E_INVALID_ID", "session_note_fix", &[])),
             ),
             Ok(nid) if nid.prefix() != Prefix::Note => findings.push(
                 Finding::new(
                     FindingCode::WrongIdType,
                     Severity::Error,
-                    format!("session note '{nid}' is not a note id"),
+                    render_msg("E_WRONG_ID_TYPE", "session_note", &[("nid", &nid)]),
                 )
                 .at_file(&sourced.file)
                 .at_line(sourced.line)
                 .for_id(&person)
-                .with_fix("Use note:n-<ULID>"),
+                .with_fix(render_msg("E_WRONG_ID_TYPE", "session_note_fix", &[])),
             ),
             Ok(nid) => match vault.records.get(&nid) {
                 None => findings.push(
                     Finding::new(
                         FindingCode::UnknownRecord,
                         Severity::Error,
-                        format!("session note '{nid}' does not exist"),
+                        render_msg("E_UNKNOWN_RECORD", "missing", &[("nid", &nid)]),
                     )
                     .at_file(&sourced.file)
                     .at_line(sourced.line)
                     .for_id(&person)
-                    .with_fix("Point note: at an existing n-<ULID> note"),
+                    .with_fix(render_msg(
+                        "E_UNKNOWN_RECORD",
+                        "missing_fix",
+                        &[],
+                    )),
                 ),
                 Some(rec) => {
                     let note_person = rec
@@ -838,12 +904,20 @@ fn session_note_integrity(vault: &Vault, state: &CoachingState, findings: &mut V
                             Finding::new(
                                 FindingCode::UnknownRecord,
                                 Severity::Error,
-                                format!("session note '{nid}' does not belong to {person}"),
+                                render_msg(
+                                    "E_UNKNOWN_RECORD",
+                                    "wrong_owner",
+                                    &[("nid", &nid), ("person", &person)],
+                                ),
                             )
                             .at_file(&sourced.file)
                             .at_line(sourced.line)
                             .for_id(&person)
-                            .with_fix("Point note: at a note for this person"),
+                            .with_fix(render_msg(
+                                "E_UNKNOWN_RECORD",
+                                "wrong_owner_fix",
+                                &[],
+                            )),
                         );
                     }
                 }
@@ -882,12 +956,16 @@ fn session_without_notes(
             Finding::new(
                 FindingCode::SessionWithoutNotes,
                 severity,
-                format!("session on {} for {} has no notes", e.date, person),
+                render_msg(
+                    "E_SESSION_WITHOUT_NOTES",
+                    "default",
+                    &[("date", &e.date), ("person", &person)],
+                ),
             )
             .at_file(&sourced.file)
             .at_line(sourced.line)
             .for_id(&person)
-            .with_fix("Add a note for that person and date, or note:n-<ULID> on the session line"),
+            .with_fix(render_msg("E_SESSION_WITHOUT_NOTES", "default_fix", &[])),
         );
     }
 }
@@ -971,21 +1049,39 @@ fn paid_session_gap(
         }
         let last = last_session;
         let start = as_of - window;
-        let message = match (last, remaining > 0) {
-            (None, _) => format!("paid client {id} has no session logged"),
-            (Some(d), true) => format!(
-                "paid client {id} has remaining sessions and no session on or after {start} (last was {d})"
+        let (message, fix) = match (last, remaining > 0) {
+            (None, _) => (
+                render_msg("E_PAID_SESSION_GAP", "none", &[("id", &id)]),
+                render_fix(
+                    "E_PAID_SESSION_GAP",
+                    "none",
+                    &[("id", &id), ("days", &days)],
+                )
+                .expect("manifest declares none_fix"),
             ),
-            (Some(d), false) => {
-                format!("paid client {id} has no session on or after {start} (last was {d})")
-            }
+            (Some(d), true) => (
+                render_msg(
+                    "E_PAID_SESSION_GAP",
+                    "remaining",
+                    &[("id", &id), ("start", &start), ("d", &d)],
+                ),
+                render_fix("E_PAID_SESSION_GAP", "remaining", &[("days", &days)])
+                    .expect("manifest declares remaining_fix"),
+            ),
+            (Some(d), false) => (
+                render_msg(
+                    "E_PAID_SESSION_GAP",
+                    "no_remaining",
+                    &[("id", &id), ("start", &start), ("d", &d)],
+                ),
+                render_fix("E_PAID_SESSION_GAP", "no_remaining", &[("days", &days)])
+                    .expect("manifest declares no_remaining_fix"),
+            ),
         };
         findings.push(
             Finding::new(FindingCode::PaidSessionGap, severity, message)
                 .for_id(&id)
-                .with_fix(format!(
-                    "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
-                )),
+                .with_fix(fix),
         );
     }
 }
@@ -1075,8 +1171,9 @@ mod tests {
 
     /// The manifest's finding codes must match the compiled
     /// `finding_codes()` slice, and its (empty) edge-kind list must match
-    /// the trait. `finding_codes()` is still the compiled slice in step 5
-    /// (it moves in step 6), so the manifest must already agree with it.
+    /// the trait. In step 6 (#345) `finding_codes()` serves the manifest,
+    /// so the trait-vs-manifest comparison is circular; the verbatim list
+    /// below pins the codes instead.
     #[test]
     fn manifest_finding_codes_and_edge_kinds_match_code() {
         let m = parse_manifest(COACHING_MANIFEST_TOML).expect("manifest parses");
