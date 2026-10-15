@@ -598,7 +598,7 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         if let Some(key) = disallowed {
             let line = line_of(key).unwrap_or(1);
             return Err(FrontmatterError::new(
-                format!("edge record has a front matter key that is not allowed: '{key}'"),
+                "edge record has a front matter key that is not allowed",
                 "Edge records allow only id, type, a, b, kind, since, and until; \
                  move the context into a note on one of the edge's people",
             )

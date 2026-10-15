@@ -4361,7 +4361,7 @@ fn edge_extra_front_matter_key_is_rejected() {
     two_people(dir.path());
     for (key, value) in [
         ("name", "sensitive context in a spec key"),
-        ("notes", "sensitive context in an invented key"),
+        ("zz_probe_key", "zz_probe_value"),
     ] {
         write(
             dir.path(),
@@ -4378,8 +4378,12 @@ fn edge_extra_front_matter_key_is_rejected() {
         );
         let message = json["findings"][0]["message"].as_str().unwrap();
         assert!(
-            message.contains(key),
-            "the error should name the offending key: {message}"
+            !message.contains(key),
+            "the error must not echo the offending key: {message}"
+        );
+        assert!(
+            !message.contains(value),
+            "the error must not echo the offending value: {message}"
         );
     }
 }
