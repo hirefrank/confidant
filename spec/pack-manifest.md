@@ -133,6 +133,10 @@ key = "personal.date_upcoming_days"
 default = 7
 
 # Finding message and fix templates, one table per code (§7).
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
 [messages."W_CADENCE_OVERDUE"]
 last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
 last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
@@ -211,7 +215,7 @@ boundary is explicit: **text in the manifest, selection in Rust.**
 
 Each `finding_codes` entry must have a `[messages.<CODE>]` table with
 at least one variant, and every `[messages]` key must be in
-`finding_codes` — no orphan text, no undocumented codes (§9 tests this).
+`finding_codes` — no orphan text, no undocumented codes (§10 tests this).
 
 The `fix` text (`with_fix`) is templated the same way. Severity is not
 in the manifest: it comes from the `[checks]` severity lookup at the
