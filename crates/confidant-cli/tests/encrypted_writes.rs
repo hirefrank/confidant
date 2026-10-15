@@ -440,6 +440,176 @@ fn deal_for_uninitialized_client_suggests_keys_init_client() {
 }
 
 #[test]
+fn inbox_drain_new_person_without_client_key_refuses() {
+    // #223 option B (#385): a new person arriving from the inbox waits
+    // for the operator to run `confidant keys init-client <id>`; the
+    // inbox never creates keys. Draining a person record for a keyless
+    // person must refuse with the init-client fix text and lose nothing:
+    // no key dir is created, the item stays queued, and nothing is
+    // committed.
+    let h = Harness::new();
+    // Init the vault keys, but do NOT init-client for the new person.
+    let out = h.init();
+    assert!(out.status.success(), "init failed: {}", stderr(&out));
+
+    // Inbox keypair, advertised in the vault config and pinned in the
+    // user config (mirrors the fallback-inbox e2e setup).
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    // Queue a person record for a NEW person (no client key exists).
+    let new_person = "p-01J9Z3K4QH0000000000000000";
+    let payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{new_person}/profile.md\n---\n{}",
+        person_md(new_person, "Ada Example", "Inbox bio is secret.")
+    );
+    confidant_core::queue_items(
+        &h.vault,
+        &[confidant_core::QueueItem {
+            stem: "new-person-profile".to_string(),
+            plaintext: payload,
+        }],
+        &inbox_recipient,
+    )
+    .expect("queue_items failed");
+
+    let rev_parse = |rev: &str| {
+        let out = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let main_before = rev_parse("HEAD");
+
+    // Drain: device key present (env), inbox key supplied, signatures
+    // allowed-unsigned.
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(!out.status.success(), "drain should have refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!("Run `confidant keys init-client {new_person}`")),
+        "error should suggest keys init-client, got: {err}"
+    );
+
+    // The inbox must never create client keys.
+    assert!(
+        !h.vault.join(format!("keys/{new_person}")).exists(),
+        "no key dir may be created for the keyless person"
+    );
+    // The refused record was not written.
+    assert!(
+        !h.vault
+            .join(format!("people/{new_person}/profile.md"))
+            .exists(),
+        "refused record must be absent"
+    );
+
+    // The item is still queued on the inbox branch.
+    let out = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .output()
+        .unwrap();
+    let inbox_tree = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        inbox_tree.contains("new-person-profile.age"),
+        "item must remain queued, inbox tree:\n{inbox_tree}"
+    );
+
+    // Nothing was committed: main is unmoved.
+    assert_eq!(
+        rev_parse("HEAD"),
+        main_before,
+        "drain must not commit on refusal"
+    );
+}
+
+#[test]
+fn inbox_drain_skip_holds_keyless_person() {
+    // #385: `--skip <item>` holds the keyless person item for a later
+    // `keys init-client` run: the drain succeeds, merges nothing, creates
+    // no key, and leaves the item queued. (That other items still merge
+    // alongside a skip is covered by `skip_flag_defers_item_in_json_dry_run`.)
+    let h = Harness::new();
+    let out = h.init();
+    assert!(out.status.success(), "init failed: {}", stderr(&out));
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let new_person = "p-01J9Z3K4QH0000000000000000";
+    let payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{new_person}/profile.md\n---\n{}",
+        person_md(new_person, "Ada Example", "Inbox bio is secret.")
+    );
+    confidant_core::queue_items(
+        &h.vault,
+        &[confidant_core::QueueItem {
+            stem: "new-person-profile".to_string(),
+            plaintext: payload,
+        }],
+        &inbox_recipient,
+    )
+    .expect("queue_items failed");
+
+    // Drain, skipping the keyless item: succeeds, merges nothing.
+    let mut drain = h.cmd(&[
+        "inbox",
+        "--allow-unsigned",
+        "--no-input",
+        "--skip",
+        "new-person-profile",
+    ]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("0 item(s) merged"),
+        "skipped drain should merge nothing: {}",
+        stdout(&out)
+    );
+
+    // Held: no key dir, no record, still queued.
+    assert!(
+        !h.vault.join(format!("keys/{new_person}")).exists(),
+        "no key dir may be created for the held person"
+    );
+    assert!(
+        !h.vault
+            .join(format!("people/{new_person}/profile.md"))
+            .exists(),
+        "held record must be absent"
+    );
+    let out = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .output()
+        .unwrap();
+    let inbox_tree = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        inbox_tree.contains("new-person-profile.age"),
+        "keyless item must remain queued, inbox tree:\n{inbox_tree}"
+    );
+}
+
+#[test]
 fn record_add_new_person_auto_creates_client_key() {
     let h = Harness::new();
     // Init the vault keys, but do NOT init-client for PERSON: #180
