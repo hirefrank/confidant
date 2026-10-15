@@ -283,6 +283,12 @@ enum Command {
         /// Fill note bodies with no-space CJK prose (quadratic-scan guard).
         #[arg(long)]
         cjk: bool,
+        /// Enable personal@0.1 and write a touch-heavy ledger (#188).
+        #[arg(long)]
+        touch: bool,
+        /// Encrypt every record so find/check measure the decrypt path (#188).
+        #[arg(long)]
+        encrypted: bool,
     },
 }
 
@@ -512,6 +518,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Agents { .. }
             | Command::Which { .. }
             | Command::Routing
+            | Command::BenchGen { .. }
             | Command::Keys {
                 action: KeysAction::DeviceAdd { initiate: true, .. },
             }
@@ -539,9 +546,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             people,
             notes,
             cjk,
+            touch,
+            encrypted,
         } => {
-            let (unique, common) =
-                confidant_core::bench::generate_realistic_vault(dir, *people, *notes, *cjk)?;
+            let (unique, common) = confidant_core::bench::generate_realistic_vault(
+                dir, *people, *notes, *cjk, *touch,
+            )?;
+            if *encrypted {
+                encrypt_bench_vault(dir)?;
+            }
             if json {
                 print_json(&ok_envelope(
                     Some(dir),
@@ -5910,6 +5923,136 @@ fn format_with_list(ids: &[confidant_core::id::RecordId]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{inner}]")
+}
+
+/// #188: encrypt every record in a freshly generated plaintext bench vault,
+/// so the benchmark measures the decrypt path. Uses the test-overrides key
+/// sources (`CONFIDANT_DEVICE_KEY` + `CONFIDANT_TEST_OPERATOR_KEY` +
+/// `CONFIDANT_KEYCHAIN=off`), so it needs the `--all-features` build and no
+/// OS keychain. The plaintext is deleted before re-encrypting (the production
+/// `encrypt_file` refuses to rewrite plaintext in place, ⚠1) — fine for a
+/// throwaway bench vault that is never committed.
+fn encrypt_bench_vault(root: &Path) -> anyhow::Result<()> {
+    use age::secrecy::ExposeSecret;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    // Throwaway device + operator keys, injected via env (no OS keychain).
+    let device = age::x25519::Identity::generate();
+    let device_secret = device.to_string().expose_secret().to_owned();
+    let operator = SigningKey::generate(&mut OsRng);
+    let operator_hex = hex::encode(operator.to_bytes());
+    std::env::set_var(confidant_crypt::keychain::DEVICE_KEY_ENV, &device_secret);
+    std::env::set_var("CONFIDANT_TEST_OPERATOR_KEY", &operator_hex);
+    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
+
+    // Isolate the operator config dir: `init` writes trust.toml under
+    // `$HOME/.config/confidant`, which must never touch the operator's real
+    // config during a benchmark. Point HOME at a throwaway dir OUTSIDE the
+    // vault (the anchor module refuses a trust anchor inside the vault, by
+    // design §4) and record its path in the vault so measuring later just
+    // re-exports the same HOME (see the hint at the end of this function).
+    // Both the subprocesses below and the in-process encryptor use it.
+    let bench_home = std::env::temp_dir().join(format!(
+        "confidant-bench-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&bench_home)?;
+    std::env::set_var("HOME", &bench_home);
+
+    let exe = std::env::current_exe()?;
+    let run = |args: &[&str], root: &Path| -> anyhow::Result<()> {
+        let out = std::process::Command::new(&exe)
+            .args(args)
+            .arg("--vault")
+            .arg(root)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "{} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(())
+    };
+
+    // `bench-gen` writes files but no git repo; `init` needs one (and an
+    // identity) for its commit-per-write.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .output()?;
+    anyhow::ensure!(out.status.success(), "git init failed");
+    for (key, value) in [("user.email", "bench@example.com"), ("user.name", "Bench")] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", key, value])
+            .output()?;
+        anyhow::ensure!(out.status.success(), "git config {key} failed");
+    }
+    // Commit the generated files so `init` sees a clean tree.
+    for args in [&["add", "-A"][..], &["commit", "-qm", "bench vault"][..]] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(out.status.success(), "git {} failed", args.join(" "));
+    }
+
+    // init: operator cert, device key, shared + lookup clients, anchor.
+    run(&["init", "--no-input"], root)?;
+
+    // The vault is now structurally encrypted (keys/ exists) but records are
+    // still plaintext; load it to enumerate person ids and record paths.
+    let vault = confidant_core::load_vault(root).map_err(anyhow::Error::new)?;
+    let persons: Vec<String> = vault
+        .records
+        .values()
+        .filter(|r| r.kind == RecordKind::Person)
+        .map(|r| r.id.to_string())
+        .collect();
+    for pid in &persons {
+        run(&["keys", "init-client", pid, "--no-input"], root)?;
+    }
+
+    // Encrypt each record in place: delete the plaintext first so the
+    // production `encrypt_file` (⚠1) treats it as a fresh write.
+    let encryptor = record_crypto::RecordEncryptor::for_vault(root, &vault)?
+        .ok_or_else(|| anyhow::anyhow!("bench vault is not encrypted after init"))?;
+    for rec in vault.records.values() {
+        let path = root.join(&rec.path);
+        let content = std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        let envelope = encryptor
+            .encrypt_file(std::path::Path::new(&rec.path), &content)
+            .map_err(|e| anyhow::anyhow!("encrypt {}: {e}", rec.path))?;
+        std::fs::write(&path, &envelope)?;
+    }
+    // Leave the throwaway device key beside the vault (0600, never
+    // committed — written after the last git commit above) so the benchmark
+    // can actually decrypt when measuring. The secret itself is never
+    // printed; only file paths are. Reads also need the throwaway trust
+    // anchor, which lives in the throwaway bench HOME whose path is
+    // recorded beside the vault (likewise uncommitted, and not a secret).
+    let key_path = root.join(".bench-device-key");
+    write_corpus_file(&key_path, device_secret.as_bytes())
+        .map_err(|e| anyhow::anyhow!("write bench device key: {e}"))?;
+    let home_path = root.join(".bench-home-path");
+    std::fs::write(&home_path, bench_home.to_string_lossy().as_bytes())
+        .map_err(|e| anyhow::anyhow!("write bench home path: {e}"))?;
+    eprintln!(
+        "bench vault encrypted; measure with HOME=$(cat {}) CONFIDANT_DEVICE_KEY=$(cat {})",
+        home_path.display(),
+        key_path.display()
+    );
+    Ok(())
 }
 
 fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
