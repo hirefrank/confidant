@@ -5702,9 +5702,11 @@ fn repair_shred_marker(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
         )))
     })?;
     // Tell the operator what to commit: the working-tree deletions from
-    // the shred were left uncommitted by the crash.
+    // the shred were left uncommitted by the crash. Also remind them the
+    // phrase was already shown: a Ctrl-C at the phrase prompt lands here
+    // via the next key op, and the shred is complete either way.
     eprintln!(
-        "shred repair complete: review and commit the working-tree changes (deleted edges, re-encrypted interactions) with `confidant keys shred`'s commit, or run the shred again"
+        "shred repair complete: a shred you started was completed; use the recovery phrase it showed. Review and commit the working-tree changes (deleted edges, re-encrypted interactions) in a separate commit"
     );
     Ok(())
 }
@@ -5816,9 +5818,11 @@ fn staged_shred_mutation(
         return Err(anyhow::Error::new(e));
     }
 
-    // Step 2: check before the swap. (See the #209 note in
-    // staged_keys_mutation: check reads keys/ only for crypto-mode
-    // detection, so the pre-loaded vault view is equivalent.)
+    // Step 2: check before the swap. The caller reloads the vault after
+    // the working-tree changes (edge deletions, interaction strips) and
+    // passes it in, so the check sees the post-shred record state. (See
+    // the #209 note in staged_keys_mutation: check reads keys/ only for
+    // crypto-mode detection.)
     let pre = check_vault(vault, &CheckOptions::default());
     if !pre.ok {
         remove_path_best_effort(&stage);
@@ -5872,19 +5876,21 @@ fn staged_shred_mutation(
                 "keys/ swap failed before anything moved ({e}); keys/ was not modified — ignore the phrase shown above; your old phrase is still current"
             ))));
         }
+        // Point of no return: keys/ has moved to keys.old and the marker
+        // exists, so repair will roll forward from here (finish the swap,
+        // re-pin, promote, clear). Disarm the working-tree guard NOW,
+        // before stage -> keys/ — a failure from this point on must NOT
+        // restore the deleted edges / stripped interactions (the privacy
+        // leak #320 closed, and the roll-back-after-roll-forward mix #290
+        // rules out).
+        guard.disarm();
     }
     if let Err(e) = std::fs::rename(&stage, &keys_dir) {
         let _ = repair_keys_staging(root, config_dir);
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "keys/ swap failed mid-swap ({e}); staging leftovers were repaired — ignore the phrase shown above; your old phrase is still current"
+            "keys/ swap failed mid-swap ({e}); shred is finishing, re-run to complete; the phrase shown above is your new recovery phrase"
         ))));
     }
-    // The swap landed: the shred is committed to rolling forward. Disarm
-    // the working-tree guard NOW — post-swap failures must NOT restore the
-    // deleted edges / stripped interactions (that would be the privacy
-    // leak #320 closed, and the roll-back-after-roll-forward mix #290
-    // rules out). Post-swap errors below report "re-run to complete".
-    guard.disarm();
 
     // Promote the staged seq tracker (same-directory rename, atomic).
     // Post-swap: on failure, repair rolls forward; report re-run.
@@ -7174,18 +7180,44 @@ mod tests {
 
     /// Fixture for shred-marker repair tests: a vault root with keys/,
     /// a config dir with a valid trust.toml, and a test keychain dir.
-    /// Returns (tmp, root, config_dir, keychain_dir, operator_sk).
+    /// Returns (tmp, root, config_dir, keychain_dir, env_guard) — the
+    /// guard restores `CONFIDANT_TEST_KEYCHAIN_DIR` on drop.
     ///
     /// NOTE: the marker tests manipulate the process-global
     /// `CONFIDANT_TEST_KEYCHAIN_DIR`; they take `KEYCHAIN_ENV_LOCK` to
     /// serialize against each other.
     static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Restores `CONFIDANT_TEST_KEYCHAIN_DIR` to its previous value (or
+    /// unsets it) on drop, so marker tests don't leak the process-global
+    /// env var into other tests running in the same binary.
+    struct KeychainEnvGuard {
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl KeychainEnvGuard {
+        fn set_dir(dir: &std::path::Path) -> Self {
+            let old = std::env::var_os("CONFIDANT_TEST_KEYCHAIN_DIR");
+            std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", dir);
+            Self { old }
+        }
+    }
+
+    impl Drop for KeychainEnvGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", v),
+                None => std::env::remove_var("CONFIDANT_TEST_KEYCHAIN_DIR"),
+            }
+        }
+    }
+
     fn shred_marker_fixture() -> (
         tempfile::TempDir,
         std::path::PathBuf,
         std::path::PathBuf,
         std::path::PathBuf,
+        KeychainEnvGuard,
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("vault");
@@ -7215,9 +7247,9 @@ mod tests {
         std::fs::write(config_dir.join("trust.toml"), trust_toml).unwrap();
         // Test keychain with an old device key.
         std::fs::write(keychain_dir.join("device.key"), b"OLD_DEVICE_KEY").unwrap();
-        // Point the test keychain at our dir.
-        std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", &keychain_dir);
-        (tmp, root, config_dir, keychain_dir)
+        // Point the test keychain at our dir (restored on drop by the guard).
+        let env_guard = KeychainEnvGuard::set_dir(&keychain_dir);
+        (tmp, root, config_dir, keychain_dir, env_guard)
     }
 
     fn write_test_marker(path: &std::path::Path, recovery_vk_hex: &str, device_key: &str) {
@@ -7238,7 +7270,7 @@ mod tests {
         // Repair must finish the swap, re-pin the anchor, promote the
         // device key, and clear the marker — never discard the stage.
         use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let stage = keys_stage_dir(&root);
         std::fs::create_dir_all(&stage).unwrap();
         // New tree in the stage (sentinel).
@@ -7280,7 +7312,7 @@ mod tests {
         // the re-pin and device-key promotion from the marker, then
         // clear it.
         use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let keys_dir = root.join("keys");
         // Simulate post-swap: new tree in keys/, old tree in keys.old.
         std::fs::write(keys_dir.join("NEW_TREE"), b"new").unwrap();
@@ -7317,7 +7349,7 @@ mod tests {
         // #220: crash during mutate/check (no marker). The stage is
         // discarded; keys/ and the anchor are untouched.
         use super::{keys_stage_dir, repair_keys_staging};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let stage = keys_stage_dir(&root);
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("PARTIAL"), b"partial").unwrap();
@@ -7355,7 +7387,7 @@ mod tests {
         // device-key promotion), then clear the marker. A second run
         // must also succeed.
         use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let keys_dir = root.join("keys");
         // Simulate post-re-pin: new tree in keys/, old tree in keys.old,
         // anchor ALREADY re-pinned, device key ALREADY promoted.
@@ -7418,7 +7450,7 @@ mod tests {
         // missing, keys.old present (old tree), stage present (new tree).
         // Repair must complete the swap, then finish promotions.
         use super::{keys_old_dir, keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let stage = keys_stage_dir(&root);
         // Simulate mid-swap: keys/ -> keys.old done, stage -> keys/ not.
         std::fs::create_dir_all(root.join(".confidant")).unwrap();
@@ -7467,7 +7499,7 @@ mod tests {
                 "version = 1\nrecovery_verifying_key_hex = \"ab",
             ),
         ] {
-            let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+            let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
             let marker_path = shred_marker_path(&root);
             std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
             std::fs::write(&marker_path, content).unwrap();
@@ -7494,7 +7526,7 @@ mod tests {
         // first via repair_keys_staging, not clobber it. The marker takes
         // precedence over the normal "discard the stage" path.
         use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain) = shred_marker_fixture();
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
         let stage = keys_stage_dir(&root);
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
