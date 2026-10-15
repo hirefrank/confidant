@@ -9,6 +9,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+// Shared integration-test helpers (#416 nit 3).
+#[path = "common/mod.rs"]
+mod common;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_confidant")
 }
@@ -16,20 +20,6 @@ fn bin() -> &'static str {
 /// The checked-out plaintext demo vault (never written to: callers copy it).
 fn demo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
-}
-
-/// Copy `src` into `dst` recursively (a throwaway vault a test may write to).
-fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), to).unwrap();
-        }
-    }
 }
 
 fn run(vault: &Path, args: &[&str]) -> Output {
@@ -97,7 +87,7 @@ fn git(vault: &Path, args: &[&str]) {
 fn reindex_corpus_matches_allowlist_exactly() {
     let tmp = tempfile::tempdir().unwrap();
     let vault = tmp.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
 
     let allow = run(&vault, &["allowlist", "--json", "--no-input"]);
     assert!(
@@ -163,7 +153,7 @@ fn reindex_corpus_matches_allowlist_exactly() {
 fn reindex_plaintext_vault_needs_no_keys() {
     let tmp = tempfile::tempdir().unwrap();
     let vault = tmp.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
 
     let out = Command::new(bin())
         .args(["reindex", "--json", "--no-input", "--vault"])
@@ -187,7 +177,7 @@ fn reindex_plaintext_vault_needs_no_keys() {
 fn reindex_gitignore_refusal_and_permissions() {
     let tmp = tempfile::tempdir().unwrap();
     let vault = tmp.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
     git(&vault, &["init", "-q"]);
 
     // Phase 1: a git repo without `.confidant/` ignored refuses, writes

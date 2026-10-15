@@ -302,10 +302,25 @@ fn search_exact_toggle_reruns_query() {
     app.handle_key(key(KeyCode::Char('e')));
     assert!(app.search.exact);
     assert!(app.runner.recorded_calls().is_empty());
-    // With a query present, toggling re-runs through the new engine.
-    app.search.query = "ada".to_owned();
+    // Back to qmd mode (no vault in this test env, so nothing can run),
+    // then set a query and toggle to exact: the toggle must re-run the
+    // query through `confidant find`.
     app.handle_key(key(KeyCode::Char('e')));
     assert!(!app.search.exact);
+    assert!(app.runner.recorded_calls().is_empty());
+    app.search.query = "ada".to_owned();
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(app.search.exact);
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &["find".to_string(), "--".to_string(), "ada".to_string()]),
+        "expected a `find` rerun after toggling to exact, got: {calls:?}"
+    );
+    // The `via` label reflects the engine that answered.
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("find-exact"), "{rendered}");
 }
 
 #[test]

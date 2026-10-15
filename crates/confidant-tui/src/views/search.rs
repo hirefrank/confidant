@@ -30,7 +30,10 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
     let query_title = if state.editing {
         format!(" Search{mode_tag} (typing query — Enter to search, Esc to cancel) ")
     } else {
-        format!(" Search{mode_tag} (press / to enter query, e for exact, Enter on p-… hit opens Context) ")
+        format!(
+            " Search{mode_tag} (press / to enter query — qmd-ranked when available, \
+             exact scan otherwise; e toggles exact, Enter on p-… hit opens Context) "
+        )
     };
     let query_line = if state.editing {
         Line::from(vec![

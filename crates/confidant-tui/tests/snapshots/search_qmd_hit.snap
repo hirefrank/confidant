@@ -1,5 +1,5 @@
  1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox                  confidant-tui v1
-╭ Search (press / to enter query, e for exact, Enter on p-… hit opens Context) ────────────────────╮
+╭ Search (press / to enter query — qmd-ranked when available, exact scan otherwise; e toggles exact╮
 │ query ada                                                                                        │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Status ──────────────────────────────────────────────────────────────────────────────────────────╮
