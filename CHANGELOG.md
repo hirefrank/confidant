@@ -8,6 +8,14 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `confidant tui` subcommand: launches `confidant-tui` from `PATH` with
+  arguments and environment passed through (an explicit `--vault` is
+  forwarded too); prints a `cargo install confidant-tui` hint when the
+  binary is missing (#363).
+- `confidant-tui` published to crates.io (it keeps shipping as a GitHub
+  Releases binary as well) (#363).
+
 ## [0.3.1] - 2026-10-15
 
 ### Fixed

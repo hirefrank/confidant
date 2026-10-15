@@ -252,7 +252,7 @@ than one is `E_SESSION_TAGS`. A merge between different record types is
 confidant check --json --fail-on warning --as-of 2026-10-08
 ```
 
-## TUI (preview)
+## TUI
 
 `confidant-tui` is a terminal UI for `check`, `find`, `context`, and
 `doctor`, plus confirm-before-apply review of skill proposals and QMD-backed
@@ -274,10 +274,17 @@ their merge actions, deferred items, and warnings — and applies it
 all-or-nothing through the existing `inbox` command on an explicit `y`
 confirm. There is no per-item selection in the TUI.
 
-It ships as a GitHub Releases binary (next to `confidant`), and is not on
-crates.io yet. It needs a `confidant` on `PATH` that speaks the same agent
-contract (`schema_version == "1"`) — it shells out to it rather than
-bundling its own copy. From a checkout:
+It ships both as a GitHub Releases binary (next to `confidant`) and on
+crates.io. You need **both** binaries: the TUI shells out to a `confidant`
+on `PATH` that speaks the same agent contract (`schema_version == "1"`) —
+it never bundles its own copy. Install with:
+
+```sh
+cargo install confidant-cli confidant-tui
+```
+
+then launch it with `confidant tui` (extra arguments pass through to
+`confidant-tui`). From a checkout:
 
 ```sh
 cargo run -p confidant-tui -- --vault examples/demo-vault

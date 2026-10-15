@@ -628,3 +628,169 @@ fn help_pack_needs_a_vault() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("need a vault"), "{stderr}");
 }
+
+#[test]
+fn tui_help_lists_subcommand() {
+    let out = Command::new(bin()).arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("tui"), "{help}");
+}
+
+#[test]
+fn tui_subcommand_help_describes_passthrough() {
+    let out = Command::new(bin())
+        .args(["tui", "--help"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("confidant-tui"), "{help}");
+}
+
+#[test]
+fn tui_missing_binary_prints_install_hint() {
+    let empty = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["tui"])
+        .env("PATH", empty.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cargo install confidant-tui"), "{stderr}");
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "hint must be one line: {stderr:?}"
+    );
+}
+
+#[test]
+fn tui_missing_binary_json_error() {
+    let empty = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["tui", "--json"])
+        .env("PATH", empty.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "expected failure");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_TUI_NOT_FOUND");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cargo install confidant-tui"));
+}
+
+/// Fake `confidant-tui` that records its argv and interesting env vars.
+#[cfg(unix)]
+fn write_fake_tui(dir: &std::path::Path) -> PathBuf {
+    let record = dir.join("record.txt");
+    let script = dir.join("confidant-tui");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             echo \"ARGS:$*\" >> '{}'\n\
+             echo \"VAULT:$CONFIDANT_VAULT\" >> '{}'\n\
+             echo \"CBIN:$CONFIDANT_BIN\" >> '{}'\n",
+            record.display(),
+            record.display(),
+            record.display(),
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    record
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_passes_through_args_and_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = write_fake_tui(dir.path());
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = Command::new(bin())
+        .args(["tui", "--", "--vault", "somevault"])
+        .env("PATH", &path)
+        .env("CONFIDANT_VAULT", "envvault")
+        .env("CONFIDANT_BIN", "envbin")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    assert!(
+        recorded.contains("ARGS:--vault somevault"),
+        "args not passed through: {recorded:?}"
+    );
+    assert!(
+        recorded.contains("VAULT:envvault"),
+        "CONFIDANT_VAULT not inherited: {recorded:?}"
+    );
+    assert!(
+        recorded.contains("CBIN:envbin"),
+        "CONFIDANT_BIN not inherited: {recorded:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_forwards_explicit_vault_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = write_fake_tui(dir.path());
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let vault_dir = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .arg("--vault")
+        .arg(vault_dir.path())
+        .arg("tui")
+        .env("PATH", &path)
+        .env("CONFIDANT_VAULT", "envvault")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    assert!(
+        recorded.contains(&format!("VAULT:{}", vault_dir.path().display())),
+        "explicit --vault not forwarded (env should not win): {recorded:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_propagates_child_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_tui(dir.path());
+    // Replace the fake with one that exits 3.
+    std::fs::write(dir.path().join("confidant-tui"), "#!/bin/sh\nexit 3\n").unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = Command::new(bin())
+        .args(["tui"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}

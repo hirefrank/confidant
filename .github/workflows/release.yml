@@ -23,7 +23,7 @@
 #  2. The `attest` job (build-provenance attestations, ADR-14).
 #  3. The `publish-crates-io` job (ADR-14; trusted publishing via OIDC, no
 #     stored token; skips prereleases; publishes confidant-crypt, then
-#     confidant-core, then confidant-cli).
+#     confidant-core, then confidant-tui, then confidant-cli).
 #  4. Action pins (2026-10-08, Silas review): every `uses:` is pinned to a
 #     full commit SHA with a `# vX` comment, matching ci.yml. If you
 #     regenerate, re-apply the pins — regeneration emits mutable tags, and
@@ -406,6 +406,10 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Publish confidant-core
         run: cargo publish -p confidant-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Publish confidant-tui
+        run: cargo publish -p confidant-tui --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Publish confidant-cli
