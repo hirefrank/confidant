@@ -3144,7 +3144,51 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
             rel.display()
         )))
     })?;
+    let id = rec.id.to_string();
+    // Fail closed before writing anything, naming the real cause. Each rung
+    // is a state the write layer would otherwise refuse later with a less
+    // specific error, or that the decrypt below would misreport as a key
+    // problem (#412).
+    let mut rekeyed: Option<(String, String)> = None;
     if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
+        if confidant_core::record::has_conflict_markers(&String::from_utf8_lossy(&existing)) {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "{} has unresolved merge conflicts; resolve them before editing",
+                    rel.display()
+                ))
+                .with_fix("Resolve the conflict markers (git mergetool), then re-run the edit"),
+            ));
+        }
+        let env = confidant_crypt::envelope::parse(&existing).map_err(|e| {
+            anyhow::Error::new(
+                DomainError::invalid(format!("{} is not a readable envelope: {e}", rel.display()))
+                    .with_fix("Restore the file from git history, then re-run the edit"),
+            )
+        })?;
+        if env.id != id || env.record_type != rec.kind.as_str() {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "{} holds {} (type {}), not {id} (type {})",
+                    rel.display(),
+                    env.id,
+                    env.record_type,
+                    rec.kind.as_str()
+                ))
+                .with_fix(
+                    "The stored record and its path disagree; remove the file and create the record again with `confidant record add --file`",
+                ),
+            ));
+        }
+        // Report a re-key rather than doing it silently: which client owns a
+        // record is a consequential difference, and `deal` edits move it.
+        let from_client = env.key_id.rsplit_once("/e").map(|(c, _)| c.to_owned());
+        if let (Some(from), Ok(to)) = (from_client, record_client_id(&rec)) {
+            if from != to {
+                rekeyed = Some((from, to));
+            }
+        }
+        // The only rung that needs the device key.
         if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
             enc.decrypt_existing(&rel, &existing).map_err(|_| {
                 anyhow::Error::new(
@@ -3159,7 +3203,6 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
             })?;
         }
     }
-    let id = rec.id.to_string();
     let contents = confidant_core::format_record(&rec);
     let (outcome, _created) = apply_record_write(
         root,
@@ -3174,16 +3217,31 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         },
         &write_options(cli),
     )?;
-    finish_write(
-        cli,
-        root,
-        "record-edit",
-        outcome,
-        serde_json::json!({
-            "id": id,
-            "path": rel.display().to_string(),
-        }),
-    )
+    let mut extra = serde_json::json!({
+        "id": id,
+        "path": rel.display().to_string(),
+    });
+    if let Some((from, to)) = &rekeyed {
+        extra["rekeyed"] = serde_json::json!({ "from": from, "to": to });
+    }
+    let applied = matches!(&outcome, WriteOutcome::Applied { .. });
+    let result = finish_write(cli, root, "record-edit", outcome, extra);
+    if let (true, false, Some((from, to))) = (applied, cli.json, &rekeyed) {
+        println!("rekeyed {id}: {from} -> {to}");
+    }
+    result
+}
+
+/// The client whose data key encrypts `rec`: its own id for a person, the
+/// `person` field otherwise. Mirrors the routing in
+/// `record_crypto::encrypt_file`; used to report a re-key on edit.
+fn record_client_id(rec: &Record) -> anyhow::Result<String> {
+    let routing_person = match rec.kind {
+        RecordKind::Person => Some(rec.id.to_string()),
+        _ => rec.field("person").map(str::to_owned),
+    };
+    confidant_crypt::client_id_for_record(rec.kind.as_str(), routing_person.as_deref())
+        .map_err(|e| anyhow::anyhow!("cannot route record to a client key: {e}"))
 }
 
 // ---------------------------------------------------------------------------

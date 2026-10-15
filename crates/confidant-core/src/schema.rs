@@ -175,6 +175,14 @@ pub fn contract_schema() -> Value {
                     "lines": {"type": "array", "items": {"type": "string"}, "description": "Ledger lines appended (log/import). Opaque IDs only."},
                     "id": {"type": ["string", "null"], "description": "New record id (note-add)."},
                     "path": {"type": ["string", "null"], "description": "New record path (note-add)."},
+                    "rekeyed": {
+                        "type": ["object", "null"],
+                        "description": "record-edit only: the record moved to another client's key. Absent when it did not.",
+                        "properties": {
+                            "from": {"type": "string", "description": "Opaque client id that held the record."},
+                            "to": {"type": "string", "description": "Opaque client id that holds it now."}
+                        }
+                    },
                     "changes": {
                         "type": "array",
                         "description": "Dry-run only: the logical change (ledger lines / plaintext). Never ciphertext.",
