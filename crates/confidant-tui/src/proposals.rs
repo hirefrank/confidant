@@ -78,7 +78,9 @@ pub const PROGRESS_SUFFIX: &str = ".tui-progress.json";
 
 /// Read and parse one manifest file. Errors are human-readable: a missing
 /// field or an unexpected type stops the proposal with a message naming the
-/// problem (the #211 "stop and ask" rule).
+/// problem (the #211 "stop and ask" rule). Unknown fields are ignored, not
+/// denied: real proposer manifests carry extra fields, so `deny_unknown_fields`
+/// would break them.
 pub fn read_manifest(path: &Path) -> Result<ProposalManifest, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read manifest: {e}"))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid manifest JSON: {e}"))
@@ -178,6 +180,15 @@ pub fn is_planned_under_dir(dir: &Path, candidate: &Path) -> bool {
     let mut ancestor: &Path = candidate;
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     loop {
+        // A symlink anywhere in the planned path — even a dangling one, which
+        // `exists()` reports as missing — cannot be resolved lexically: its
+        // target may lie outside `dir`. Fail closed rather than trust the name.
+        if ancestor
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return false;
+        }
         if ancestor.exists() {
             break;
         }
@@ -259,6 +270,31 @@ pub fn read_progress(manifest_path: &Path) -> TuiProgress {
     }
 }
 
+/// Open `path` for writing, refusing to follow a pre-planted symlink and
+/// enforcing mode 0600 even when the file already exists (`OpenOptionsExt::mode`
+/// only applies at creation). On unix the open uses `O_NOFOLLOW`, so a symlink
+/// at `path` fails instead of redirecting the write elsewhere.
+pub fn open_secure_write(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        // Refuse to follow a symlink planted at `path` before the write.
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode()` only applies when the file is created; a pre-existing file
+        // keeps whatever permissions it had — enforce 0600 explicitly.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 /// Write the progress file with mode 0600 (plaintext-adjacent: it holds
 /// commit SHAs and step keys, written next to the plaintext proposal set).
 pub fn write_progress(manifest_path: &Path, progress: &TuiProgress) -> Result<()> {
@@ -267,18 +303,21 @@ pub fn write_progress(manifest_path: &Path, progress: &TuiProgress) -> Result<()
         done: progress.done.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&file).context("serialize progress file")?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
     use std::io::Write;
-    opts.open(&path)
+    open_secure_write(&path)
         .and_then(|mut f| f.write_all(&bytes))
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Unique temp dir for tests. The old fixed names collided when test
+/// binaries ran in parallel, and a stale dir from a crashed run could
+/// poison the next one.
+#[cfg(test)]
+pub fn test_temp_dir(name: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir().join(format!("{name}-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -305,7 +344,7 @@ mod tests {
 
     #[test]
     fn read_manifest_rejects_missing_request_id() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-manifest");
+        let dir = test_temp_dir("tui-proposals-test-manifest");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.json");
         std::fs::write(&path, r#"{"skill": "x", "records": []}"#).unwrap();
@@ -316,7 +355,7 @@ mod tests {
 
     #[test]
     fn read_manifest_rejects_wrong_type() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-manifest-type");
+        let dir = test_temp_dir("tui-proposals-test-manifest-type");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.json");
         std::fs::write(&path, r#"{"skill": "x", "request_id": 42, "records": []}"#).unwrap();
@@ -327,7 +366,7 @@ mod tests {
 
     #[test]
     fn discover_skips_progress_files() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-discover");
+        let dir = test_temp_dir("tui-proposals-test-discover");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         std::fs::write(
@@ -346,7 +385,7 @@ mod tests {
 
     #[test]
     fn planned_under_dir_accepts_missing_scratch() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-planned");
+        let dir = test_temp_dir("tui-proposals-test-planned");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         // The stem dir doesn't exist yet (staged later at apply time).
@@ -358,7 +397,7 @@ mod tests {
 
     #[test]
     fn planned_under_dir_refuses_dotdot_escape() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-planned-escape");
+        let dir = test_temp_dir("tui-proposals-test-planned-escape");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         // Climbs out of proposals/ entirely: refused.
@@ -374,12 +413,64 @@ mod tests {
 
     #[test]
     fn planned_under_dir_refuses_outside_and_self() {
-        let dir = std::env::temp_dir().join("tui-proposals-test-planned-self");
+        let dir = test_temp_dir("tui-proposals-test-planned-self");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         assert!(!is_planned_under_dir(&proposals, Path::new("/etc/passwd")));
         assert!(!is_planned_under_dir(&proposals, &proposals));
         assert!(!is_under_dir(&proposals, &proposals));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planned_under_dir_refuses_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = test_temp_dir("tui-proposals-test-planned-dangling");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        // A dangling symlink: `exists()` is false, so the old walk treated it
+        // as a not-yet-created file and trusted the name. Its target may lie
+        // anywhere, so it must fail closed.
+        let dangling = proposals.join("evil.md");
+        symlink("/nonexistent-target-9f3a", &dangling).unwrap();
+        assert!(!dangling.exists());
+        assert!(!is_planned_under_dir(&proposals, &dangling));
+        // Same for a symlink that resolves, but outside proposals/.
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let link_out = proposals.join("link.md");
+        symlink(&outside, &link_out).unwrap();
+        assert!(!is_planned_under_dir(&proposals, &link_out));
+        assert!(!is_under_dir(&proposals, &link_out));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_secure_write_refuses_symlink_and_enforces_0600() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = test_temp_dir("tui-proposals-test-secure-write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.txt");
+        // A pre-planted symlink at the write path: the open must fail, not
+        // follow it.
+        let link = dir.join("link.txt");
+        symlink(&target, &link).unwrap();
+        assert!(open_secure_write(&link).is_err());
+        assert!(!target.exists(), "write must not follow the symlink");
+        // A pre-existing file with wide permissions gets 0600 enforced.
+        let wide = dir.join("wide.txt");
+        std::fs::write(&wide, "old").unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_secure_write(&wide).unwrap();
+        let mode = std::fs::metadata(&wide).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A fresh file is created 0600.
+        let fresh = dir.join("fresh.txt");
+        open_secure_write(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

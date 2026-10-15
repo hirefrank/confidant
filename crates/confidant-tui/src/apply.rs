@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::contract::{parse_raw_output, CheckReport, ContractOutcome};
 use crate::proposals::{
-    is_planned_under_dir, is_under_dir, manifest_stem, progress_path, read_manifest, read_progress,
-    write_progress, ProposalManifest, TuiProgress,
+    is_planned_under_dir, is_under_dir, manifest_stem, open_secure_write, progress_path,
+    read_manifest, read_progress, write_progress, ProposalManifest, TuiProgress,
 };
 use crate::runner::{RawOutput, Runner};
 
@@ -359,15 +359,8 @@ pub fn stage_scratch(scratch: &StagedScratch) -> Result<()> {
                 .with_context(|| format!("chmod 0700 {}", parent.display()))?;
         }
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
     use std::io::Write;
-    opts.open(&scratch.path)
+    open_secure_write(&scratch.path)
         .and_then(|mut f| f.write_all(scratch.content.as_bytes()))
         .with_context(|| format!("write {}", scratch.path.display()))?;
     Ok(())
@@ -791,7 +784,7 @@ pub fn remove_paths(paths: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proposals::ProposalManifest;
+    use crate::proposals::{test_temp_dir, ProposalManifest};
 
     fn manifest_fixture() -> ProposalManifest {
         ProposalManifest {
@@ -884,7 +877,7 @@ mod tests {
             body_file: None,
             request_id: None,
         }];
-        let dir = std::env::temp_dir().join("tui-apply-test-plan");
+        let dir = test_temp_dir("tui-apply-test-plan");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let manifest_path = proposals.join("m.json");
@@ -914,7 +907,7 @@ mod tests {
             body_file: None,
             request_id: Some("01BBBBBBBBBBBBBBBBBBBBBBBB".to_owned()),
         }];
-        let dir = std::env::temp_dir().join("tui-apply-test-prem2");
+        let dir = test_temp_dir("tui-apply-test-prem2");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let manifest_path = proposals.join("m.json");
@@ -944,7 +937,7 @@ mod tests {
             body_file: None,
             request_id: Some("01CCCCCCCCCCCCCCCCCCCCCCCC".to_owned()),
         }];
-        let dir = std::env::temp_dir().join("tui-apply-test-fresh-record");
+        let dir = test_temp_dir("tui-apply-test-fresh-record");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let manifest_path = proposals.join("m.json");
@@ -973,7 +966,7 @@ mod tests {
             body_file: Some("/etc/passwd".to_owned()),
             request_id: Some("01DDDDDDDDDDDDDDDDDDDDDDDD".to_owned()),
         }];
-        let dir = std::env::temp_dir().join("tui-apply-test-body-outside");
+        let dir = test_temp_dir("tui-apply-test-body-outside");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let manifest_path = proposals.join("m.json");
@@ -985,7 +978,7 @@ mod tests {
     #[test]
     fn plan_note_body_file_under_proposals_opens() {
         use crate::proposals::ProposalRecord;
-        let dir = std::env::temp_dir().join("tui-apply-test-body-inside");
+        let dir = test_temp_dir("tui-apply-test-body-inside");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let body = proposals.join("body.md");
@@ -1011,7 +1004,7 @@ mod tests {
 
     #[test]
     fn stage_scratch_writes_file() {
-        let dir = std::env::temp_dir().join("tui-apply-test-stage");
+        let dir = test_temp_dir("tui-apply-test-stage");
         let scratch = StagedScratch {
             path: dir.join("records").join("000.md"),
             content: "---\nid: p-1\n---\n".to_owned(),
@@ -1040,11 +1033,26 @@ mod tests {
 
     #[test]
     fn cleanup_refuses_paths_outside_proposals() {
-        let dir = std::env::temp_dir().join("tui-apply-test-cleanup");
+        let dir = test_temp_dir("tui-apply-test-cleanup");
         let proposals = dir.join(".confidant").join("proposals");
         std::fs::create_dir_all(&proposals).unwrap();
         let mut manifest = manifest_fixture();
         manifest.lines_file = Some("/etc/passwd".to_owned());
+        let manifest_path = proposals.join("m.json");
+        let err = cleanup_paths(&manifest, &manifest_path, &dir).expect_err("must refuse");
+        assert!(err.contains("outside .confidant/proposals/"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_proposals_dir_itself() {
+        let dir = test_temp_dir("tui-apply-test-cleanup-self");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        // A lines_file equal to the proposals/ directory would let cleanup
+        // delete the whole directory: the strict-child check must refuse it.
+        let mut manifest = manifest_fixture();
+        manifest.lines_file = Some(proposals.to_string_lossy().into_owned());
         let manifest_path = proposals.join("m.json");
         let err = cleanup_paths(&manifest, &manifest_path, &dir).expect_err("must refuse");
         assert!(err.contains("outside .confidant/proposals/"), "{err}");

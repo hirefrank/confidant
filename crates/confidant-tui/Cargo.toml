@@ -28,6 +28,7 @@ dist = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+libc = "0.2"
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
