@@ -1103,7 +1103,6 @@ pub fn apply_duration_off(vault: &Vault, findings: &mut Vec<Finding>) {
 mod tests {
     use super::parse_open;
     use super::{CoachingPack, COACHING_MANIFEST_TOML};
-    use crate::config::COACHING_PACK;
     use crate::id::Prefix;
     use crate::ledger::parse_line;
     use crate::packs::manifest::parse_manifest;
@@ -1133,7 +1132,6 @@ mod tests {
     #[test]
     fn manifest_claims_match_original_slices() {
         let pack = CoachingPack;
-        assert_eq!(pack.name(), COACHING_PACK);
         assert_eq!(pack.name(), "coaching@0.1");
         assert_eq!(pack.verbs(), &["open", "session"][..]);
         assert!(pack.record_types().is_empty());

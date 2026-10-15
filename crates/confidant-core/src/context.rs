@@ -152,7 +152,7 @@ pub fn build_context(
     // `to_value` in the pack produced it from this struct, so this cannot
     // fail unless the pack's view shape drifts from the struct.
     let coaching = packs
-        .get(crate::config::COACHING_PACK)
+        .get("coaching@0.1")
         .and_then(|v| serde_json::from_value::<CoachingView>(v.clone()).ok());
 
     let person_dir = format!("people/{person}/notes/");

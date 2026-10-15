@@ -30,6 +30,11 @@ Read before changing behaviour:
   design (key hierarchy, envelope, AAD, recovery, test plan).
 - [`packs/coaching/0.1.md`](packs/coaching/0.1.md): the coaching schema pack.
 - [`packs/personal/0.1.md`](packs/personal/0.1.md): the personal relationships pack.
+- [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
+  format. The manifest (`packs/<name>/manifest.toml`) is the single
+  source of truth for a pack's claims (verbs, fields, edge kinds,
+  finding codes, `[checks]` keys, message templates); the folds and
+  findings logic stay in Rust.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and
   [`docs/borrowing.md`](docs/borrowing.md): contributor setup, and what was
   adapted from `cr`.

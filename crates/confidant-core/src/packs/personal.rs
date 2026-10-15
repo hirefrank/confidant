@@ -824,7 +824,6 @@ fn cadence_and_date_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PERSONAL_PACK;
 
     /// Parity test (#343): the manifest-derived claims must equal the
     /// `&'static` slices the trait served before the manifest existed.
@@ -834,7 +833,6 @@ mod tests {
     #[test]
     fn manifest_claims_match_original_slices() {
         let pack = PersonalPack;
-        assert_eq!(pack.name(), PERSONAL_PACK);
         assert_eq!(pack.name(), "personal@0.1");
         assert_eq!(pack.verbs(), &["touch"][..]);
         assert!(pack.record_types().is_empty());
