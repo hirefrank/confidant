@@ -4381,6 +4381,83 @@ fn edge_no_ai_is_rejected() {
 }
 
 #[test]
+fn edge_extra_front_matter_key_is_rejected() {
+    // #390: an edge carries only ids, kind, and dates. An extra front-matter
+    // key is the same shared-key residue as a body — the value would be
+    // encrypted under `vault:shared` and survive a shred — so it is rejected
+    // rather than silently ignored like unknown keys elsewhere (spec §4).
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    for (key, value) in [
+        ("name", "sensitive context in a spec key"),
+        ("zz_probe_key", "zz_probe_value"),
+    ] {
+        write(
+            dir.path(),
+            &format!("edges/{EDGE1}/edge.md"),
+            &format!(
+                "---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\nkind: married\n{key}: {value}\n---\n"
+            ),
+        );
+        let json = report_json(dir.path(), None);
+        assert_eq!(
+            codes(&json),
+            vec!["E_FRONTMATTER"],
+            "key {key:?} was not rejected: {json}"
+        );
+        let message = json["findings"][0]["message"].as_str().unwrap();
+        assert!(
+            !message.contains(key),
+            "the error must not echo the offending key: {message}"
+        );
+        assert!(
+            !message.contains(value),
+            "the error must not echo the offending value: {message}"
+        );
+    }
+}
+
+#[test]
+fn edge_dates_are_still_allowed() {
+    // The whitelist must not reject the fields an edge legitimately has.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!(
+            "---\nid: {EDGE1}\ntype: edge\na: {ADA}\nb: {BEA}\nkind: married\n\
+             since: 2026-01-01\nuntil: 2026-06-01\n---\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_envelope_shell_is_exempt_from_the_whitelist() {
+    // #390 carve-out: an encrypted edge's outer header belongs to the
+    // envelope (id/type/no-ai/enc/key_id/nonce), not to the record, so the
+    // edge field whitelist must not apply to the shell.
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    write(dir.path(), "keys/operator.toml", "# placeholder\n");
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!(
+            "---\nid: {EDGE1}\ntype: edge\nno-ai: false\nenc: xchacha20poly1305\n\
+             key_id: vault:shared/e1\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_FRONTMATTER".to_string()),
+        "the edge envelope shell was rejected as a record: {json}"
+    );
+}
+
+#[test]
 fn edge_self_edge_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     two_people(dir.path());
