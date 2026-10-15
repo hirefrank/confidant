@@ -77,8 +77,22 @@ typo fails loudly rather than silently doing nothing).
 
 ```toml
 # Schema version of this file, not the pack version. A reader that does
-# not implement this version fails rather than guessing (cf. spec §0.1).
+# not implement this version fails rather than guessing (cf. spec/0.1.md).
 manifest_version = 1
+
+# Top-level keys come before the first [table] header: in TOML anything
+# after a table header belongs to that table.
+# Record types this pack owns (empty for both packs today).
+record_types = []
+
+# Balance metrics this pack's fold computes (empty for personal today;
+# see "Balance metrics" below for the element schema).
+balance_metrics = []
+
+# Finding codes this pack's fold/findings can emit. Must match the
+# [messages] keys exactly (see §7 for the templates, §10 for the drift
+# test). Real codes here so this skeleton parses as written.
+finding_codes = ["E_FRONTMATTER", "W_CADENCE_OVERDUE"]
 
 [pack]
 name = "personal"
@@ -95,26 +109,16 @@ skill = "SKILL.md"
 name = "touch"
 id_type = "person"          # optional
 
-# Record types this pack owns (empty for both packs today).
-record_types = []
-
 # Front-matter fields this pack owns. `grammar` names one of the fixed
 # grammars in §6; Rust supplies the parser for that name.
 [[fields]]
 name = "birthday"
 grammar = "recurring-date"
 
-# Balance metrics this pack owns (empty for personal today).
-balance_metrics = []
-
 # Edge kinds this pack introduces, with symmetry.
 [[edge_kinds]]
 name = "friend"
 symmetric = true
-
-# Finding codes this pack's fold/findings can emit. Must match the
-# `[messages]` keys exactly (see §9).
-finding_codes = ["E_FRONTMATTER", "W_CADENCE_OVERDUE", "..."]
 
 # [checks] keys this pack owns, with defaults. `type` is "severity" or
 # "int". Severity values are error|warning|off. These replace the
@@ -147,6 +151,17 @@ Keys are namespaced `<pack-name>.<rule>` (e.g.
 `personal.cadence_overdue`), matching today's dotted keys. A pack may
 only declare keys under its own name; the loader rejects others. The
 `as_of` top-level key stays core-owned.
+
+### Balance metrics
+
+`balance_metrics` is an array of metric-name strings — the metrics the
+pack's compiled fold computes and `check_balance` verifies (today's
+`Pack::balance_metrics`; e.g. coaching's `sessions_remaining` and
+`icf_hours`, personal's empty list). Each name must be a non-empty,
+unique string; the loader rejects duplicates. There is no separate
+drift check: the fold stays compiled, so step 4's parity test pins the
+manifest's list against the old slices, and the drift test only
+asserts well-formedness.
 
 ## 5. Versioning
 
@@ -248,6 +263,21 @@ cannot render a code it does not claim.
 ```toml
 manifest_version = 1
 
+# Top-level keys come before the first [table] header: in TOML anything
+# after a table header belongs to that table.
+record_types = []
+
+balance_metrics = []
+
+finding_codes = [
+  "E_FRONTMATTER",
+  "E_INVALID_ID",
+  "E_WRONG_ID_TYPE",
+  "E_UNKNOWN_RECORD",
+  "W_CADENCE_OVERDUE",
+  "W_DATE_UPCOMING",
+]
+
 [pack]
 name = "personal"
 version = "0.1"
@@ -256,8 +286,6 @@ skill = "SKILL.md"
 [[verbs]]
 name = "touch"
 id_type = "person"
-
-record_types = []
 
 [[fields]]
 name = "birthday"
@@ -274,8 +302,6 @@ grammar = "non-empty-string"
 [[fields]]
 name = "dates"
 grammar = "dates-list"
-
-balance_metrics = []
 
 [[edge_kinds]]
 name = "friend"
@@ -300,15 +326,6 @@ symmetric = false
 [[edge_kinds]]
 name = "mentor"
 symmetric = false
-
-finding_codes = [
-  "E_FRONTMATTER",
-  "E_INVALID_ID",
-  "E_WRONG_ID_TYPE",
-  "E_UNKNOWN_RECORD",
-  "W_CADENCE_OVERDUE",
-  "W_DATE_UPCOMING",
-]
 
 [[checks.severity]]
 key = "personal.cadence_overdue"
@@ -356,9 +373,15 @@ Notes on the example:
 - `E_TOUCH_MALFORMED` is intentionally absent: it is a core code
   emitted by `check`, not by the pack (cf. the comment on
   `finding_codes()` in `personal.rs`).
-- `E_FRONTMATTER`'s `problem`/`fix` placeholders carry the per-field
-  text today's `push_field_error` receives from each call site; the
-  template does not enumerate the fields.
+- The edge kinds and finding codes above were checked by hand
+  (2026-10-15) against `PERSONAL_EDGE_KINDS` and `finding_codes()` in
+  `crates/confidant-core/src/packs/personal.rs` and match exactly.
+  Step 4's parity test must prove the same mechanically.
+- `E_FRONTMATTER`'s `{problem}`/`{fix}` placeholders are filled by Rust
+  at the call site (per-field text from `push_field_error`); the
+  manifest holds only the template shell and never enumerates the
+  fields. This keeps the manifest inside claims territory: text in the
+  manifest, values in Rust.
 - `W_DATE_UPCOMING`'s template is illustrative of the shape; step 4
   pins the exact placeholders against the code.
 
