@@ -2446,3 +2446,235 @@ fn log_session_note_fallback_json_envelope() {
     assert_eq!(v["tip"].as_str().unwrap().len(), 40);
     assert!(v["vault"].is_string(), "envelope must carry vault: {v}");
 }
+
+// ---------------------------------------------------------------------------
+// #216: `record edit` / `record show --for-edit` on an encrypted vault
+// ---------------------------------------------------------------------------
+
+fn commit_count(h: &Harness) -> usize {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&h.vault)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+fn person_path(h: &Harness, id: &str) -> PathBuf {
+    h.vault.join(format!("people/{id}/profile.md"))
+}
+
+/// Add `PERSON` to the keyed vault and return the record file's path.
+fn add_person(h: &Harness, body: &str) -> PathBuf {
+    let input = write_file(h._tmp.path(), "person.md", body);
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+    person_path(h, PERSON)
+}
+
+#[test]
+fn record_edit_reencrypts_and_for_edit_reads_it_back() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "First bio."));
+    let before = std::fs::read(&path).unwrap();
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Example", "Second bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record edit failed: {}", stderr(&out));
+
+    let after = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&after);
+    assert_ne!(before, after, "the edit did not rewrite the file");
+    assert!(
+        text.contains("\nenc: xchacha20poly1305\n"),
+        "the edited record is not an envelope:\n{text}"
+    );
+    assert!(!text.contains("Second bio."), "plaintext leaked");
+
+    // The operator read hands the new body back, ready to edit again.
+    let out = h
+        .cmd(&["record", "show", PERSON, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record show failed: {}", stderr(&out));
+    let shown = stdout(&out);
+    assert!(
+        shown.contains("Second bio."),
+        "for-edit did not return the new body: {shown}"
+    );
+    assert!(
+        !shown.contains("First bio."),
+        "for-edit returned stale content: {shown}"
+    );
+}
+
+#[test]
+fn record_edit_unchanged_reuses_ciphertext_and_commits_nothing() {
+    // #389 Q1: an unchanged body reuses the existing ciphertext byte for
+    // byte, and makes no commit.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+
+    // First apply a real edit, so the stored plaintext is canonical.
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record edit failed: {}", stderr(&out));
+
+    let bytes = std::fs::read(&path).unwrap();
+    let commits = commit_count(&h);
+
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "no-op edit failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["unchanged"], serde_json::json!(true), "{v}");
+    assert!(
+        v.get("commit").is_none(),
+        "no-op edit reported a commit: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "the ciphertext changed on a no-op edit"
+    );
+    assert_eq!(commit_count(&h), commits, "a no-op edit committed");
+}
+
+#[test]
+fn record_edit_is_idempotent_for_a_repeated_request_id() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    const RID: &str = "01J9Z3K4QF000000000000REQ1";
+    let run = || {
+        h.cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--request-id",
+            RID,
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap()
+    };
+
+    let first = run();
+    assert!(first.status.success(), "{}", stderr(&first));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    let commit = v["commit"].as_str().unwrap().to_owned();
+    let commits = commit_count(&h);
+
+    let replay = run();
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&replay)).unwrap();
+    assert_eq!(v["idempotent"], serde_json::json!(true), "{v}");
+    assert_eq!(v["commit"].as_str().unwrap(), commit, "{v}");
+    assert_eq!(commit_count(&h), commits, "the replay committed again");
+}
+
+#[test]
+fn record_show_for_edit_decrypts_no_ai_that_reads_still_hide() {
+    // #389 Q5: the operator may edit their own no-ai records; agents still
+    // never see them.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let secret = "Hidden bio that agents must never see.";
+    add_person(
+        &h,
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Hidden\"\nno-ai: true\n---\n\n{secret}\n"
+        ),
+    );
+
+    let out = h
+        .cmd(&["record", "show", PERSON, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "for-edit failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(secret),
+        "for-edit did not decrypt the no-ai record: {}",
+        stdout(&out)
+    );
+
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let ctx: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        !ctx.to_string().contains(secret),
+        "the no-ai body leaked into context: {ctx}"
+    );
+
+    // Assert on matches, not on the raw document: the JSON echoes the query.
+    let out = h
+        .cmd(&["find", secret, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let found: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        found["matches"].as_array().unwrap().len(),
+        0,
+        "find returned a no-ai record: {found}"
+    );
+}

@@ -89,6 +89,13 @@ pub enum WriteOutcome {
     DryRun { preview: Vec<DryRunFile> },
     /// `--request-id` matched a previous identical write; `commit` is its SHA.
     Idempotent { commit: String },
+    /// Every change already matched what was on disk for that path: nothing
+    /// was written and nothing was committed. Distinct from [`Self::Idempotent`],
+    /// which reports the commit a replayed request already landed. Reachable
+    /// only from a write whose content can repeat — today `record edit`
+    /// (#216 / #389 Q1), since `encrypt_file` reuses existing ciphertext for
+    /// an unchanged body and the other write commands always change a file.
+    Unchanged,
     /// `check` failed; nothing was committed (files were rolled back).
     CheckBlocked { report: CheckReport },
 }
@@ -367,6 +374,22 @@ fn apply_write_inner(
     let pre = check_vault(&vault, &CheckOptions::default());
     if !pre.ok {
         return Ok(WriteOutcome::CheckBlocked { report: pre });
+    }
+
+    // 3b. Nothing to do: every change already matches the file on disk. The
+    // encryptor transform above has already run, so an encrypted record whose
+    // body is unchanged lands here too (it reused the existing ciphertext).
+    // This has to be its own outcome: step 7 cannot commit an empty changeset,
+    // and `git commit` on nothing staged fails with an empty message.
+    let unchanged = pending.changes.iter().all(|change| match change {
+        FileChange::WriteFile { path, contents } => {
+            crate::paths::read_to_string(root, path).is_ok_and(|on_disk| on_disk == *contents)
+        }
+        // An append always changes its file; keep those on the normal path.
+        FileChange::AppendLines { .. } => false,
+    });
+    if unchanged {
+        return Ok(WriteOutcome::Unchanged);
     }
 
     // 4. Fail closed on conflict markers; snapshot for rollback.

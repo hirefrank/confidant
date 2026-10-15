@@ -9,6 +9,10 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Added
+- `confidant record edit <id> --file F`: replaces a record's file through the
+  normal write pipeline (encrypted writes, `check`-gated, one commit), and
+  `confidant record show <id> --for-edit`, the operator-only read that supplies
+  the current text and decrypts `no-ai` records for editing (#216).
 - `confidant tui` subcommand: launches `confidant-tui` from `PATH` with
   arguments and environment passed through (an explicit `--vault` is
   forwarded too); prints a `cargo install confidant-tui` hint when the

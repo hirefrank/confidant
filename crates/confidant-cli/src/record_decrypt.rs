@@ -32,23 +32,44 @@ struct KeyMaterial {
 }
 
 /// Decrypts record files for one read command. Built by
-/// [`RecordDecryptor::for_reads`]; the same keyed-caller pattern as the
-/// write path (config dir → anchor → device identity → `KeyStore`), but
-/// every failure degrades to unkeyed mode instead of refusing the command.
+/// [`RecordDecryptor::for_reads`] (the agent read path) or
+/// [`RecordDecryptor::for_edit`] (the operator edit path); the same
+/// keyed-caller pattern as the write path (config dir → anchor → device
+/// identity → `KeyStore`), but every failure degrades to unkeyed mode
+/// instead of refusing the command.
 pub struct RecordDecryptor {
     vault_id: String,
     keys: Option<KeyMaterial>,
+    /// #216: operator mode (`record show --for-edit`). Decrypts `no-ai`
+    /// records in full instead of handing back the keyless shell, and
+    /// passes `for_agent = false` to the crypto layer. No agent-facing
+    /// read uses this: `mcp.rs` maps a fixed tool whitelist to argv, and
+    /// `record show` is not in it.
+    operator: bool,
 }
 
 impl RecordDecryptor {
-    /// Build the decryptor for `vault` at `root`. Never fails: any key
-    /// problem (no config dir, no anchor, no device key, not enrolled)
-    /// yields unkeyed mode, where envelopes are skipped and counted.
+    /// Build the agent read path for `vault` at `root`: `no-ai` records
+    /// come back as shells. Never fails: any key problem (no config dir, no
+    /// anchor, no device key, not enrolled) yields unkeyed mode, where
+    /// envelopes are skipped and counted.
     pub fn for_reads(root: &Path, vault_id: &str) -> Self {
+        Self::new(root, vault_id, false)
+    }
+
+    /// Build the operator edit path: `no-ai` records are decrypted in full,
+    /// because the operator may edit them (#216). Same key handling and the
+    /// same header/AAD/AEAD validation as [`Self::for_reads`].
+    pub fn for_edit(root: &Path, vault_id: &str) -> Self {
+        Self::new(root, vault_id, true)
+    }
+
+    fn new(root: &Path, vault_id: &str, operator: bool) -> Self {
         let keys = load_key_material(root, vault_id);
         Self {
             vault_id: vault_id.to_string(),
             keys,
+            operator,
         }
     }
 
@@ -63,7 +84,8 @@ impl RecordDecryptor {
     ///
     /// 1. Not envelope-shaped → plaintext passthrough (today's behavior).
     /// 2. `envelope::parse` fails → tampered/corrupt → refused + counted.
-    /// 3. Outer `no-ai: true` → shell, never decrypted (design §5).
+    /// 3. Outer `no-ai: true` → shell, never decrypted (design §5) — except
+    ///    in operator mode, which is what `record show --for-edit` needs.
     /// 4. No key material → skipped + counted (⚠2).
     /// 5. Data key won't unwrap → skipped + counted (key absent).
     /// 6. `decrypt_record(for_agent = true)` fails → refused + counted
@@ -76,7 +98,7 @@ impl RecordDecryptor {
             Ok(env) => env,
             Err(_) => return ContentOutcome::Refused,
         };
-        if env.no_ai.hidden_from_agents() {
+        if !self.operator && env.no_ai.hidden_from_agents() {
             return ContentOutcome::NoAiShell {
                 id: env.id,
                 record_type: env.record_type,
@@ -116,9 +138,10 @@ impl RecordDecryptor {
             purpose: purpose.to_string(),
             epoch,
         };
-        // `for_agent = true`: the agent read path. no-ai was already
-        // handled above, so this only enforces header/AAD/AEAD.
-        match confidant_crypt::decrypt_record(&ctx, &data_key, bytes, true) {
+        // `for_agent` mirrors the mode. Both paths run the same header,
+        // AAD, and AEAD validation; the agent path additionally refuses
+        // `no-ai` without decrypting.
+        match confidant_crypt::decrypt_record(&ctx, &data_key, bytes, !self.operator) {
             Ok(inner) => ContentOutcome::Content(inner),
             Err(_) => ContentOutcome::Refused,
         }

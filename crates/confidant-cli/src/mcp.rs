@@ -450,6 +450,53 @@ mod tests {
     }
 
     #[test]
+    fn tools_list_never_exposes_the_operator_only_record_reads() {
+        // #389 Q5 / #216: `record show --for-edit` decrypts no-ai records,
+        // and `record edit` rewrites records. Neither may be reachable from
+        // an agent connection, so neither appears in the tool whitelist —
+        // which is the only way MCP can invoke the CLI (`call_tool` maps
+        // known names to argv and rejects everything else).
+        let resp = handle(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            Path::new("/tmp"),
+            &None,
+        )
+        .unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for forbidden in ["record_show", "record_edit", "for_edit", "show", "edit"] {
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden:?} is exposed over MCP: {names:?}"
+            );
+        }
+        // And an agent asking for it by name is refused. The refusal is an
+        // `isError` tool result (not a JSON-RPC error), so assert on that.
+        let resp = handle(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"record_show","arguments":{"id":"p-01ABC"}}}"#,
+            Path::new("/tmp"),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "an unknown tool name must be refused: {resp}"
+        );
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown tool"),
+            "{resp}"
+        );
+    }
+
+    #[test]
     fn tools_list_names_all_tools() {
         let resp = handle(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
