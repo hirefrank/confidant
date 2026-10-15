@@ -190,3 +190,5 @@ Recorded so they are not confused with criteria, and because a reviewer will see
 3. Walk the questionnaire using this table; mark N/A for #22, #52, #53, #65 with the justifications above.
 4. Add the resulting badge to `README.md` (next to the Scorecard badge) and close
    [#237](https://github.com/hirefrank/confidant/issues/237) with the badge URL.
+
+<!-- ci-326 probe: docs-only change, do not merge -->
