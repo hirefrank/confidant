@@ -1,13 +1,11 @@
-┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[ 1:Check ] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [*5:Proposals*] [ 6:Search ] [ 7:Inbox ] | Tab/1│
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Dry run: Ledger import (1 lines) ────────────────────────────────────────────────────────────────┐
-│command: import                                                                                   │
+ 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+╭─ Dry run: Ledger import (1 lines) ───────────────────────────────────────────────────────────────╮
+│ command import                                                                                   │
 │                                                                                                  │
-│--- ledger/2026/09.cfd (append)                                                                   │
-│2026-09-01 open d-01M3TC5H00MPJG00248G000004 proposal src:test/1                                  │
+│ ─── ledger/2026/09.cfd (append)                                                                  │
+│ 2026-09-01 open d-01M3TC5H00MPJG00248G000004 proposal src:test/1                                 │
 │                                                                                                  │
-│y: confirm and apply | Esc: back (nothing is written until you confirm)                           │
+│ y: confirm and apply   Esc: back (nothing is written until you confirm)                          │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -21,4 +19,6 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit

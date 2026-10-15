@@ -5,11 +5,14 @@
 //! skill fell back to `confidant find`, and drop counts are always visible.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::search::{FilteredSearchResult, SearchViewState};
+use crate::theme;
+use crate::theme::palette;
 
 /// Pure renderer for the Search view.
 pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
@@ -28,15 +31,27 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
     } else {
         " Search (press / to enter query, Enter on p-… hit opens Context) "
     };
-    let query_display = if state.editing {
-        format!("query: {}_", state.input)
+    let query_line = if state.editing {
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(format!("{}_", state.input), Color::White),
+        ])
     } else if state.query.is_empty() {
-        "query: (empty — press / to search)".to_owned()
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(
+                "(empty — press / to search)",
+                Style::default().fg(palette::MUTED),
+            ),
+        ])
     } else {
-        format!("query: {}", state.query)
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(state.query.clone(), Color::White),
+        ])
     };
     frame.render_widget(
-        Paragraph::new(query_display).block(Block::bordered().title(query_title)),
+        Paragraph::new(query_line).block(theme::block(query_title)),
         chunks[0],
     );
 
@@ -47,10 +62,13 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
 
 /// Fallback banner, drop counts, and mode line.
 fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::bordered().title(" Status ");
+    let block = theme::block(" Status ");
     let Some(res) = result else {
         frame.render_widget(
-            Paragraph::new("No search run yet. Press / to enter a query.").block(block),
+            Paragraph::new(Line::from(
+                "No search run yet. Press / to enter a query.".dark_gray(),
+            ))
+            .block(block),
             area,
         );
         return;
@@ -59,81 +77,128 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
     let mut lines = Vec::new();
     if res.result.mode == "find-fallback" {
         let reason = res.result.fallback.as_deref().unwrap_or("unknown reason");
-        lines.push(Line::from(format!("fallback: {reason}")));
+        lines.push(Line::from(vec![
+            Span::styled("fallback: ", Style::default().fg(palette::WARNING).bold()),
+            Span::raw(reason.to_owned()),
+        ]));
     } else if !res.result.mode.is_empty() {
-        lines.push(Line::from(format!("mode: {}", res.result.mode)));
+        lines.push(Line::from(vec![
+            theme::label("mode: "),
+            Span::styled(res.result.mode.clone(), Color::White),
+        ]));
     }
-    let mut counts = Vec::new();
+    let mut count_spans: Vec<Span<'static>> = vec![
+        theme::label("matches shown: "),
+        Span::styled(
+            res.kept.len().to_string(),
+            Style::default().fg(Color::White).bold(),
+        ),
+    ];
     if res.result.dropped_uncleared > 0 {
-        counts.push(format!(
-            "dropped_uncleared: {}",
-            res.result.dropped_uncleared
+        count_spans.push(theme::label("  (dropped_uncleared: "));
+        count_spans.push(Span::styled(
+            res.result.dropped_uncleared.to_string(),
+            Style::default().fg(palette::WARNING).bold(),
         ));
+        count_spans.push(theme::label(")"));
     }
     if res.dropped_unknown_via > 0 {
-        counts.push(format!("dropped_unknown_via: {}", res.dropped_unknown_via));
+        count_spans.push(theme::label("  (dropped_unknown_via: "));
+        count_spans.push(Span::styled(
+            res.dropped_unknown_via.to_string(),
+            Style::default().fg(palette::WARNING).bold(),
+        ));
+        count_spans.push(theme::label(")"));
     }
-    if counts.is_empty() {
-        lines.push(Line::from(format!("{} matches shown", res.kept.len())));
-    } else {
-        lines.push(Line::from(format!(
-            "{} matches shown ({})",
-            res.kept.len(),
-            counts.join(", ")
-        )));
-    }
+    lines.push(Line::from(count_spans));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_matches(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::bordered().title(" Matches ");
+    let block = theme::block(" Matches ");
     let Some(res) = state.result.as_ref() else {
-        frame.render_widget(Paragraph::new("No search run yet.").block(block), area);
+        frame.render_widget(
+            Paragraph::new(Line::from("No search run yet.".dark_gray())).block(block),
+            area,
+        );
         return;
     };
     if res.kept.is_empty() {
-        frame.render_widget(Paragraph::new("0 matches").block(block), area);
+        frame.render_widget(
+            Paragraph::new(Line::from("0 matches".dark_gray())).block(block),
+            area,
+        );
         return;
     }
     let items: Vec<ListItem<'_>> = res
         .kept
         .iter()
-        .enumerate()
-        .map(|(idx, hit)| {
-            let marker = if idx == state.selected { ">" } else { " " };
-            let id = hit.id.as_deref().unwrap_or("-");
-            ListItem::new(Line::from(format!(
-                "{marker} {:<28} {}:{}  [{} {:.2}] {}",
-                id, hit.path, hit.line, hit.via, hit.score, hit.excerpt
-            )))
+        .map(|hit| {
+            let id = hit.id.clone().unwrap_or_else(|| "-".to_owned());
+            ListItem::new(Line::from(vec![
+                Span::styled(id, Style::default().fg(palette::ACCENT)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{}:{}", hit.path, hit.line),
+                    Style::default().fg(palette::MUTED),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("[{} {:.2}]", hit.via, hit.score),
+                    Style::default().fg(palette::MUTED),
+                ),
+                Span::raw("  "),
+                Span::raw(hit.excerpt.clone()),
+            ]))
         })
         .collect();
-    frame.render_widget(List::new(items).block(block), area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(Style::default().fg(palette::ACCENT).bold())
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always),
+        area,
+        &mut list_state,
+    );
 }
 
 fn render_detail(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
-    let detail_block = Block::bordered().title(" Match Detail ");
-    let detail_lines = match state
+    let detail_lines: Vec<Line<'_>> = match state
         .result
         .as_ref()
         .and_then(|r| r.kept.get(state.selected))
     {
-        None => vec![Line::from("No match selected.")],
+        None => vec![Line::from("No match selected.".dark_gray())],
         Some(hit) => vec![
-            Line::from(format!(
-                "id: {} | location: {}:{} | via: {} | score: {:.4}",
-                hit.id.as_deref().unwrap_or("-"),
-                hit.path,
-                hit.line,
-                hit.via,
-                hit.score
-            )),
-            Line::from(format!("excerpt: {}", hit.excerpt)),
+            Line::from(vec![
+                theme::label("id        "),
+                Span::styled(
+                    hit.id.clone().unwrap_or_else(|| "-".to_owned()),
+                    Style::default().fg(palette::ACCENT),
+                ),
+            ]),
+            Line::from(vec![
+                theme::label("location  "),
+                Span::styled(
+                    format!(
+                        "{}:{}  via {}  score {:.4}",
+                        hit.path, hit.line, hit.via, hit.score
+                    ),
+                    Style::default().fg(palette::MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                theme::label("excerpt   "),
+                Span::raw(hit.excerpt.clone()),
+            ]),
         ],
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
-            .block(detail_block)
+            .block(theme::block(" Match Detail "))
             .wrap(Wrap { trim: false }),
         area,
     );

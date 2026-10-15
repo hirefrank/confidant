@@ -2,11 +2,14 @@
 //! contract version mismatches.
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contract::ErrorBody;
+use crate::theme;
+use crate::theme::palette;
 
 /// State for an alert modal or blocking screen.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -88,24 +91,43 @@ impl AlertState {
 
 /// Pure renderer for an alert screen/panel.
 pub fn render(state: &AlertState, frame: &mut Frame<'_>, area: Rect) {
+    let title_style = if state.blocking {
+        Style::default().fg(palette::ERROR).bold()
+    } else {
+        Style::default().fg(palette::WARNING).bold()
+    };
+
     let mut lines = Vec::new();
     if let Some(code) = &state.code {
-        lines.push(Line::from(format!("code: {code}")));
+        lines.push(Line::from(vec![
+            theme::label("code    "),
+            Span::styled(code.clone(), Style::default().fg(palette::MUTED)),
+        ]));
     }
-    lines.push(Line::from(format!("message: {}", state.message)));
+    lines.push(Line::from(vec![
+        theme::label("message "),
+        Span::styled(state.message.clone(), Color::White),
+    ]));
     if let Some(fix) = &state.fix {
-        lines.push(Line::from(format!("fix: {fix}")));
+        lines.push(Line::from(vec![
+            theme::label("fix     "),
+            Span::styled(fix.clone(), Style::default().fg(palette::SUCCESS)),
+        ]));
     }
     lines.push(Line::from(""));
     if state.blocking {
-        lines.push(Line::from("Blocking alert: press q or Esc to exit."));
+        lines.push(Line::from(Span::styled(
+            "Blocking alert: press q or Esc to exit.",
+            Style::default().fg(palette::ERROR),
+        )));
     } else {
-        lines.push(Line::from(
+        lines.push(Line::from(Span::styled(
             "Press Esc to dismiss, r to retry, or q to quit.",
-        ));
+            Style::default().fg(palette::MUTED),
+        )));
     }
 
-    let block = Block::bordered().title(format!(" {} ", state.title));
+    let block = theme::block("").title(Span::styled(format!(" {} ", state.title), title_style));
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });

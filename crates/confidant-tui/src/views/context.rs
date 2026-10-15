@@ -1,11 +1,14 @@
 //! Read-only Context view (`confidant context <p-id> --json --no-input`).
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contract::Context;
+use crate::theme;
+use crate::theme::palette;
 
 /// State for the Context view.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -26,13 +29,24 @@ fn first_line(text: Option<&str>) -> &str {
     }
 }
 
+/// A `label value` line with a dim label.
+fn row<'a>(label_text: &'a str, value: Span<'a>) -> Line<'a> {
+    Line::from(vec![theme::label(label_text), value])
+}
+
 /// Pure renderer for the Context view.
 pub fn render(state: &ContextViewState, frame: &mut Frame<'_>, area: Rect) {
-    let block = Block::bordered().title(" Person Context ");
+    let block = theme::block(" Person Context ");
     let Some(ctx) = &state.context else {
         let msg = match &state.person_id {
-            Some(id) => format!("No context loaded for {id} (press r to reload)."),
-            None => "No person selected. Press Enter on a p-… item in Find or Check.".to_owned(),
+            Some(id) => Line::from(vec![
+                Span::raw(format!("No context loaded for {id} ")),
+                Span::styled("(press r to reload)", Style::default().fg(palette::MUTED)),
+            ]),
+            None => Line::from(Span::styled(
+                "No person selected. Press Enter on a p-… item in Find or Check.",
+                Style::default().fg(palette::MUTED),
+            )),
         };
         frame.render_widget(Paragraph::new(msg).block(block), area);
         return;
@@ -40,86 +54,132 @@ pub fn render(state: &ContextViewState, frame: &mut Frame<'_>, area: Rect) {
 
     let mut lines = Vec::new();
     let p = &ctx.person;
-    lines.push(Line::from(format!(
-        "person: {} | name: {}{}",
-        p.id,
-        p.name.as_deref().unwrap_or("(name withheld)"),
-        if p.no_ai { " [no-ai]" } else { "" }
-    )));
+    let mut person_spans = vec![
+        theme::label("person "),
+        Span::styled(p.id.clone(), Style::default().fg(palette::ACCENT)),
+        theme::label("  name "),
+        Span::styled(
+            p.name
+                .clone()
+                .unwrap_or_else(|| "(name withheld)".to_owned()),
+            Color::White,
+        ),
+    ];
+    if p.no_ai {
+        person_spans.push(Span::styled(
+            "  [no-ai]",
+            Style::default().fg(palette::WARNING).bold(),
+        ));
+    }
+    lines.push(Line::from(person_spans));
     if !ctx.scope.is_empty() {
-        lines.push(Line::from(format!("scope: {}", ctx.scope.join(", "))));
+        lines.push(row(
+            "scope ",
+            Span::styled(ctx.scope.join(", "), Style::default().fg(palette::MUTED)),
+        ));
     }
     if ctx.skipped_encrypted > 0 || ctx.refused_envelopes > 0 {
-        lines.push(Line::from(format!(
-            "skipped_encrypted: {} | refused_envelopes: {}",
-            ctx.skipped_encrypted, ctx.refused_envelopes
-        )));
+        lines.push(Line::from(vec![
+            theme::label("skipped_encrypted "),
+            Span::raw(ctx.skipped_encrypted.to_string()),
+            theme::label("  refused_envelopes "),
+            Span::raw(ctx.refused_envelopes.to_string()),
+        ]));
     }
-    lines.push(Line::from(format!(
-        "profile: {}",
-        first_line(p.profile.as_deref())
-    )));
+    lines.push(row(
+        "profile ",
+        Span::raw(first_line(p.profile.as_deref()).to_owned()),
+    ));
 
     if let Some(c) = &ctx.coaching {
-        lines.push(Line::from(format!(
-            "coaching: sessions_remaining: {} | icf_hours: {:.2}",
-            c.sessions_remaining, c.icf_hours
-        )));
+        lines.push(Line::from(vec![
+            theme::label("coaching: "),
+            theme::label("sessions_remaining: "),
+            Span::styled(
+                c.sessions_remaining.to_string(),
+                Style::default().fg(Color::White).bold(),
+            ),
+            theme::label(" | icf_hours: "),
+            Span::styled(
+                format!("{:.2}", c.icf_hours),
+                Style::default().fg(Color::White).bold(),
+            ),
+        ]));
         for s in &c.recent_sessions {
-            lines.push(Line::from(format!(
-                "  session {} ({}m, {})",
-                s.date,
-                s.duration_minutes.unwrap_or(0),
-                s.tag.as_deref().unwrap_or("untagged")
-            )));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(s.date.clone(), Style::default().fg(palette::MUTED)),
+                Span::raw(format!(
+                    " ({}m, {})",
+                    s.duration_minutes.unwrap_or(0),
+                    s.tag.as_deref().unwrap_or("untagged")
+                )),
+            ]));
         }
     }
 
-    lines.push(Line::from(format!("notes ({}):", ctx.notes.len())));
+    lines.push(Line::from(Span::styled(
+        format!("notes ({})", ctx.notes.len()),
+        Style::default().fg(palette::MUTED),
+    )));
     for n in &ctx.notes {
-        lines.push(Line::from(format!(
-            "  {} [{}]: {}",
-            n.id,
-            n.date.as_deref().unwrap_or("-"),
-            first_line(n.body.as_deref())
-        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(n.id.clone(), Style::default().fg(palette::ACCENT)),
+            Span::styled(
+                format!(" [{}]", n.date.as_deref().unwrap_or("-")),
+                Style::default().fg(palette::MUTED),
+            ),
+            Span::raw(format!(": {}", first_line(n.body.as_deref()))),
+        ]));
     }
 
-    lines.push(Line::from(format!(
-        "interactions ({}):",
-        ctx.interactions.len()
+    lines.push(Line::from(Span::styled(
+        format!("interactions ({})", ctx.interactions.len()),
+        Style::default().fg(palette::MUTED),
     )));
     for ixn in &ctx.interactions {
-        lines.push(Line::from(format!(
-            "  {} [{}] {}: {}",
-            ixn.id,
-            ixn.date.as_deref().unwrap_or("-"),
-            ixn.title.as_deref().unwrap_or("-"),
-            first_line(ixn.body.as_deref())
-        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(ixn.id.clone(), Style::default().fg(palette::ACCENT)),
+            Span::styled(
+                format!(" [{}]", ixn.date.as_deref().unwrap_or("-")),
+                Style::default().fg(palette::MUTED),
+            ),
+            Span::raw(format!(
+                " {}: {}",
+                ixn.title.as_deref().unwrap_or("-"),
+                first_line(ixn.body.as_deref())
+            )),
+        ]));
     }
 
-    lines.push(Line::from(format!(
-        "touchpoints ({}):",
-        ctx.touchpoints.len()
+    lines.push(Line::from(Span::styled(
+        format!("touchpoints ({})", ctx.touchpoints.len()),
+        Style::default().fg(palette::MUTED),
     )));
     for tp in &ctx.touchpoints {
-        lines.push(Line::from(format!(
-            "  {} (kind: {})",
-            tp.date,
-            tp.kind.as_deref().unwrap_or("-")
-        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(tp.date.clone(), Style::default().fg(palette::MUTED)),
+            Span::raw(format!(" (kind: {})", tp.kind.as_deref().unwrap_or("-"))),
+        ]));
     }
 
-    lines.push(Line::from(format!(
-        "aliases ({}): {}",
-        ctx.aliases.len(),
-        if ctx.aliases.is_empty() {
-            "-".to_owned()
-        } else {
-            ctx.aliases.join(", ")
-        }
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("aliases ({}) ", ctx.aliases.len()),
+            Style::default().fg(palette::MUTED),
+        ),
+        Span::styled(
+            if ctx.aliases.is_empty() {
+                "-".to_owned()
+            } else {
+                ctx.aliases.join(", ")
+            },
+            Style::default().fg(palette::MUTED),
+        ),
+    ]));
 
     let paragraph = Paragraph::new(lines)
         .block(block)

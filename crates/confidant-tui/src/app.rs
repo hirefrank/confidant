@@ -1,9 +1,13 @@
 //! Application state machine for `confidant-tui`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+
+use crate::theme;
 
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
@@ -1189,10 +1193,41 @@ impl<R: Runner> App<R> {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(10),
+                Constraint::Length(1),
+            ])
             .split(area);
 
-        let tabs: Vec<String> = [
+        self.render_header(frame, chunks[0]);
+
+        if let Some(active_alert) = &self.alert {
+            alert::render(active_alert, frame, chunks[1]);
+        } else {
+            match self.active_view {
+                ActiveView::Check => check::render(&self.check, frame, chunks[1]),
+                ActiveView::Find => find::render(&self.find, frame, chunks[1]),
+                ActiveView::Context => context::render(&self.context, frame, chunks[1]),
+                ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
+                ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
+                ActiveView::Search => search::render(&self.search, frame, chunks[1]),
+                ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
+            }
+        }
+
+        Self::render_footer(frame, chunks[2]);
+    }
+
+    /// Borderless header: tab pills on the left, app title right-aligned.
+    fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(18)])
+            .split(area);
+
+        let mut spans = Vec::new();
+        for v in [
             ActiveView::Check,
             ActiveView::Find,
             ActiveView::Context,
@@ -1200,37 +1235,37 @@ impl<R: Runner> App<R> {
             ActiveView::Proposals,
             ActiveView::Search,
             ActiveView::Inbox,
-        ]
-        .into_iter()
-        .map(|v| {
-            if v == self.active_view {
-                format!("[*{}*]", v.label())
-            } else {
-                format!("[ {} ]", v.label())
+        ] {
+            if !spans.is_empty() {
+                spans.push(Span::raw(" "));
             }
-        })
-        .collect();
-        let header_line = format!(
-            "{} | Tab/1-7:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
-            tabs.join(" ")
-        );
-        let header_block = Block::bordered().title(" confidant-tui (contract v1) ");
-        frame.render_widget(Paragraph::new(header_line).block(header_block), chunks[0]);
-
-        if let Some(active_alert) = &self.alert {
-            alert::render(active_alert, frame, chunks[1]);
-            return;
+            spans.push(theme::tab_pill(v.label(), v == self.active_view));
         }
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
 
-        match self.active_view {
-            ActiveView::Check => check::render(&self.check, frame, chunks[1]),
-            ActiveView::Find => find::render(&self.find, frame, chunks[1]),
-            ActiveView::Context => context::render(&self.context, frame, chunks[1]),
-            ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
-            ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
-            ActiveView::Search => search::render(&self.search, frame, chunks[1]),
-            ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
+        let title = Paragraph::new(Line::from(Span::styled(
+            "confidant-tui v1",
+            Style::default().fg(theme::palette::MUTED),
+        )))
+        .alignment(Alignment::Right);
+        frame.render_widget(title, chunks[1]);
+    }
+
+    /// Borderless one-line footer with key badges and action labels.
+    fn render_footer(frame: &mut Frame<'_>, area: Rect) {
+        let mut spans = Vec::new();
+        for (key, label) in [
+            ("Tab/1-7", "view"),
+            ("/", "find"),
+            ("j/k", "move"),
+            ("Enter", "context"),
+            ("r", "refresh"),
+            ("q/Esc", "quit"),
+        ] {
+            spans.push(theme::key_badge(key));
+            spans.push(theme::key_hint(label));
         }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Render the inbox tab: dry-run report, or the apply confirm modal.
@@ -1247,7 +1282,7 @@ impl<R: Runner> App<R> {
     fn render_proposals(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(err) = &self.proposals.load_error {
             frame.render_widget(
-                Paragraph::new(err.clone()).block(Block::bordered().title(" Proposals ")),
+                Paragraph::new(err.clone()).block(theme::block(" Proposals ")),
                 area,
             );
             return;

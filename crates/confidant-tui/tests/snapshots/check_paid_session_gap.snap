@@ -1,24 +1,24 @@
-┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Search ] [ 7:Inbox ] | Tab/1│
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Check Summary ───────────────────────────────────────────────────────────────────────────────────┐
-│status: FAILED | spec: 0.1 | records: 2 | ledger: 2 | errors: 0 | warnings: 1 | 1 findings        │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Findings ────────────────────────────────────────────────────────────────────────────────────────┐
-│> [warning] E_PAID_SESSION_GAP        p-01M3TC5H00MPJG000000000000 paid client p-01M3TC5H00MPJG000│
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Finding Detail (Enter on p-… opens Context) ─────────────────────────────────────────────────────┐
-│code: E_PAID_SESSION_GAP | severity: warning | id: p-01M3TC5H00MPJG000000000000 | location: -     │
-│message: paid client p-01M3TC5H00MPJG000000000000 has remaining sessions and no session on or     │
-│after 2026-08-24 (last was 2026-08-23)                                                            │
-│fix: Log a session, close the package, or widen coaching.paid_session_gap_days (currently 45)     │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+╭ Check Summary ───────────────────────────────────────────────────────────────────────────────────╮
+│  FAILED   spec 0.1  •  records 2  •  ledger 2  •  errors 0  •  warnings 1  •  findings 1         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
+│ › [warning] E_PAID_SESSION_GAP p-01M3TC5H00MPJG0000 ││ code      E_PAID_SESSION_GAP              │
+│                                                     ││ severity  [warning]                       │
+│                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
+│                                                     ││ location  -                               │
+│                                                     ││ message   paid client                     │
+│                                                     ││ p-01M3TC5H00MPJG000000000000 has          │
+│                                                     ││ remaining sessions and no session on or   │
+│                                                     ││ after 2026-08-24 (last was 2026-08-23)    │
+│                                                     ││ fix       Log a session, close the        │
+│                                                     ││ package, or widen                         │
+│                                                     ││ coaching.paid_session_gap_days (currently │
+│                                                     ││ 45)                                       │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯
+ Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit

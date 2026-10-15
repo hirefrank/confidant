@@ -1,11 +1,14 @@
 //! Read-only Doctor view (`confidant doctor --json --no-input`).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contract::DoctorReport;
+use crate::theme;
+use crate::theme::palette;
 
 /// State for the Doctor view.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -13,6 +16,17 @@ pub struct DoctorViewState {
     pub report: Option<DoctorReport>,
     pub ok: Option<bool>,
     pub selected: usize,
+}
+
+/// Status tag for a doctor check: red for errors, yellow for warnings,
+/// green otherwise.
+fn status_tag(status: &str) -> Span<'_> {
+    let style = match status {
+        "error" => Style::default().fg(palette::ERROR).bold(),
+        "warning" => Style::default().fg(palette::WARNING).bold(),
+        _ => Style::default().fg(palette::SUCCESS),
+    };
+    Span::styled(format!("[{status}]"), style)
 }
 
 /// Pure renderer for the Doctor view.
@@ -26,68 +40,92 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
         ])
         .split(area);
 
-    let summary_text = match &state.report {
-        None => "No doctor report loaded (press r to run doctor)".to_owned(),
+    let summary_line = match &state.report {
+        None => Line::from(vec![
+            Span::raw("No doctor report loaded "),
+            Span::styled(
+                "(press r to run doctor)",
+                Style::default().fg(palette::MUTED),
+            ),
+        ]),
         Some(r) => {
-            let overall = if state
+            let overall = state
                 .ok
-                .unwrap_or_else(|| !r.checks.iter().any(|c| c.status == "error"))
-            {
-                "OK"
-            } else {
-                "FAILED"
-            };
-            format!("status: {overall} | checks: {}", r.checks.len())
+                .unwrap_or_else(|| !r.checks.iter().any(|c| c.status == "error"));
+            let mut spans = vec![theme::status_badge(overall), Span::raw("  ")];
+            spans.extend(theme::count(
+                "checks ",
+                r.checks.len(),
+                Style::default().fg(Color::White).bold(),
+            ));
+            Line::from(spans)
         }
     };
     frame.render_widget(
-        Paragraph::new(summary_text).block(Block::bordered().title(" Doctor Summary ")),
+        Paragraph::new(summary_line).block(theme::block(" Doctor Summary ")),
         chunks[0],
     );
 
-    let checks_block = Block::bordered().title(" Checks ");
     match &state.report {
         None => {
             frame.render_widget(
-                Paragraph::new("Press r to run doctor.").block(checks_block),
+                Paragraph::new(Line::from("Press r to run doctor.".dark_gray()))
+                    .block(theme::block(" Checks ")),
                 chunks[1],
             );
         }
         Some(r) if r.checks.is_empty() => {
-            frame.render_widget(Paragraph::new("0 checks").block(checks_block), chunks[1]);
+            frame.render_widget(
+                Paragraph::new(Line::from("0 checks".dark_gray())).block(theme::block(" Checks ")),
+                chunks[1],
+            );
         }
         Some(r) => {
             let items: Vec<ListItem<'_>> = r
                 .checks
                 .iter()
-                .enumerate()
-                .map(|(idx, c)| {
-                    let marker = if idx == state.selected { ">" } else { " " };
-                    ListItem::new(Line::from(format!(
-                        "{marker} [{:<7}] {:<24} {}",
-                        c.status, c.id, c.message
-                    )))
+                .map(|c| {
+                    ListItem::new(Line::from(vec![
+                        status_tag(&c.status),
+                        Span::raw(" "),
+                        Span::styled(c.id.clone(), Color::White),
+                        Span::raw(" "),
+                        Span::raw(c.message.clone()),
+                    ]))
                 })
                 .collect();
-            frame.render_widget(List::new(items).block(checks_block), chunks[1]);
+            let mut list_state = ListState::default();
+            list_state.select(Some(state.selected));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(theme::block(" Checks "))
+                    .highlight_style(Style::default().fg(palette::ACCENT).bold())
+                    .highlight_symbol("› ")
+                    .highlight_spacing(HighlightSpacing::Always),
+                chunks[1],
+                &mut list_state,
+            );
         }
     }
 
-    let detail_block = Block::bordered().title(" Check Detail ");
-    let detail_lines = match state
+    let detail_lines: Vec<Line<'_>> = match state
         .report
         .as_ref()
         .and_then(|r| r.checks.get(state.selected))
     {
-        None => vec![Line::from("No check selected.")],
+        None => vec![Line::from("No check selected.".dark_gray())],
         Some(c) => vec![
-            Line::from(format!("id: {} | status: {}", c.id, c.status)),
-            Line::from(format!("message: {}", c.message)),
+            Line::from(vec![
+                theme::label("id      "),
+                Span::styled(c.id.clone(), Color::White),
+            ]),
+            Line::from(vec![theme::label("status  "), status_tag(&c.status)]),
+            Line::from(vec![theme::label("message "), Span::raw(c.message.clone())]),
         ],
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
-            .block(detail_block)
+            .block(theme::block(" Check Detail "))
             .wrap(Wrap { trim: false }),
         chunks[2],
     );

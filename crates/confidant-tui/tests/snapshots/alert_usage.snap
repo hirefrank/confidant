@@ -1,11 +1,9 @@
-┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Search ] [ 7:Inbox ] | Tab/1│
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Usage Error (exit 2) ────────────────────────────────────────────────────────────────────────────┐
-│code: usage_error                                                                                 │
-│message: usage error: find requires a non-empty query                                             │
+ 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+╭─ Usage Error (exit 2) ───────────────────────────────────────────────────────────────────────────╮
+│ code    usage_error                                                                              │
+│ message usage error: find requires a non-empty query                                             │
 │                                                                                                  │
-│Press Esc to dismiss, r to retry, or q to quit.                                                   │
+│ Press Esc to dismiss, r to retry, or q to quit.                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -21,4 +19,6 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit

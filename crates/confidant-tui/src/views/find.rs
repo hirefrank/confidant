@@ -1,11 +1,14 @@
 //! Read-only Find view (`confidant find <query> --json --no-input`).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contract::FindResult;
+use crate::theme;
+use crate::theme::palette;
 
 /// State for the Find view.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -33,23 +36,37 @@ pub fn render(state: &FindViewState, frame: &mut Frame<'_>, area: Rect) {
     } else {
         " Find (press / to enter query, Enter on p-… hit opens Context) "
     };
-    let query_display = if state.editing {
-        format!("query: {}_", state.input)
+    let query_line = if state.editing {
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(format!("{}_", state.input), Color::White),
+        ])
     } else if state.query.is_empty() {
-        "query: (empty — press / to search)".to_owned()
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(
+                "(empty — press / to search)",
+                Style::default().fg(palette::MUTED),
+            ),
+        ])
     } else {
-        format!("query: {}", state.query)
+        Line::from(vec![
+            theme::label("query "),
+            Span::styled(state.query.clone(), Color::White),
+        ])
     };
     frame.render_widget(
-        Paragraph::new(query_display).block(Block::bordered().title(query_title)),
+        Paragraph::new(query_line).block(theme::block(query_title)),
         chunks[0],
     );
 
     match &state.result {
         None => {
-            let block = Block::bordered().title(" Matches ");
             frame.render_widget(
-                Paragraph::new("No search run yet. Press / to enter a query.").block(block),
+                Paragraph::new(Line::from(
+                    "No search run yet. Press / to enter a query.".dark_gray(),
+                ))
+                .block(theme::block(" Matches ")),
                 chunks[1],
             );
         }
@@ -65,49 +82,75 @@ pub fn render(state: &FindViewState, frame: &mut Frame<'_>, area: Rect) {
                 title.push_str(&format!(", {} load findings", res.findings.len()));
             }
             title.push_str(") ");
-            let block = Block::bordered().title(title);
 
             if res.matches.is_empty() {
-                frame.render_widget(Paragraph::new("0 matches").block(block), chunks[1]);
+                frame.render_widget(
+                    Paragraph::new(Line::from("0 matches".dark_gray())).block(theme::block(&title)),
+                    chunks[1],
+                );
             } else {
                 let items: Vec<ListItem<'_>> = res
                     .matches
                     .iter()
-                    .enumerate()
-                    .map(|(idx, hit)| {
-                        let marker = if idx == state.selected { ">" } else { " " };
-                        let id = hit.id.as_deref().unwrap_or("-");
-                        ListItem::new(Line::from(format!(
-                            "{marker} {:<28} {}:{}  {}",
-                            id, hit.path, hit.line, hit.excerpt
-                        )))
+                    .map(|hit| {
+                        let id = hit.id.clone().unwrap_or_else(|| "-".to_owned());
+                        ListItem::new(Line::from(vec![
+                            Span::styled(id, Style::default().fg(palette::ACCENT)),
+                            Span::raw(" "),
+                            Span::styled(
+                                format!("{}:{}", hit.path, hit.line),
+                                Style::default().fg(palette::MUTED),
+                            ),
+                            Span::raw("  "),
+                            Span::raw(hit.excerpt.clone()),
+                        ]))
                     })
                     .collect();
-                frame.render_widget(List::new(items).block(block), chunks[1]);
+                let mut list_state = ListState::default();
+                list_state.select(Some(state.selected));
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .block(theme::block(&title))
+                        .highlight_style(Style::default().fg(palette::ACCENT).bold())
+                        .highlight_symbol("› ")
+                        .highlight_spacing(HighlightSpacing::Always),
+                    chunks[1],
+                    &mut list_state,
+                );
             }
         }
     }
 
-    let detail_block = Block::bordered().title(" Match Detail ");
-    let detail_lines = match state
+    let detail_lines: Vec<Line<'_>> = match state
         .result
         .as_ref()
         .and_then(|r| r.matches.get(state.selected))
     {
-        None => vec![Line::from("No match selected.")],
+        None => vec![Line::from("No match selected.".dark_gray())],
         Some(hit) => vec![
-            Line::from(format!(
-                "id: {} | location: {}:{}",
-                hit.id.as_deref().unwrap_or("-"),
-                hit.path,
-                hit.line
-            )),
-            Line::from(format!("excerpt: {}", hit.excerpt)),
+            Line::from(vec![
+                theme::label("id        "),
+                Span::styled(
+                    hit.id.clone().unwrap_or_else(|| "-".to_owned()),
+                    Style::default().fg(palette::ACCENT),
+                ),
+            ]),
+            Line::from(vec![
+                theme::label("location  "),
+                Span::styled(
+                    format!("{}:{}", hit.path, hit.line),
+                    Style::default().fg(palette::MUTED),
+                ),
+            ]),
+            Line::from(vec![
+                theme::label("excerpt   "),
+                Span::raw(hit.excerpt.clone()),
+            ]),
         ],
     };
     frame.render_widget(
         Paragraph::new(detail_lines)
-            .block(detail_block)
+            .block(theme::block(" Match Detail "))
             .wrap(Wrap { trim: false }),
         chunks[2],
     );

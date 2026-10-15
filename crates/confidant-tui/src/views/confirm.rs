@@ -4,9 +4,13 @@
 //! workflow's "explicit approval" step.
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
+
+use crate::theme;
+use crate::theme::palette;
 
 /// State for the confirm modal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -35,9 +39,15 @@ pub fn render(state: &ConfirmState, frame: &mut Frame<'_>, area: Rect) {
 
     let mut lines: Vec<Line> = state.lines.iter().map(|l| Line::from(l.clone())).collect();
     lines.push(Line::from(""));
-    lines.push(Line::from("Type y to confirm. Any other key cancels."));
+    lines.push(Line::from(vec![
+        Span::styled("Type y", Style::default().fg(palette::ACCENT).bold()),
+        Span::raw(" to confirm. Any other key cancels."),
+    ]));
 
-    let block = Block::bordered().title(format!(" Confirm: {} ", state.title));
+    let block = theme::block("").title(Span::styled(
+        format!(" Confirm: {} ", state.title),
+        Style::default().fg(palette::WARNING).bold(),
+    ));
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });

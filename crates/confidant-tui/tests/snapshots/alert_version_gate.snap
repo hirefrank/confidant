@@ -1,11 +1,9 @@
-┌ Contract Version Mismatch ───────────────────────────────────────────────────────────────────────┐
-│code: schema_version_mismatch                                                                     │
-│message: TUI built for agent contract v1; CLI reports v2                                          │
-│fix: Install matching versions of confidant and confidant-tui                                     │
+╭─ Contract Version Mismatch ──────────────────────────────────────────────────────────────────────╮
+│ code    schema_version_mismatch                                                                  │
+│ message TUI built for agent contract v1; CLI reports v2                                          │
+│ fix     Install matching versions of confidant and confidant-tui                                 │
 │                                                                                                  │
-│Blocking alert: press q or Esc to exit.                                                           │
-│                                                                                                  │
-│                                                                                                  │
+│ Blocking alert: press q or Esc to exit.                                                          │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -21,4 +19,6 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

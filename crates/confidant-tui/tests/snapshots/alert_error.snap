@@ -1,13 +1,11 @@
-┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Search ] [ 7:Inbox ] | Tab/1│
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ CLI Error (exit 1) ──────────────────────────────────────────────────────────────────────────────┐
-│code: E_LEDGER_UNREADABLE                                                                         │
-│message: 1 items                                                                                  │
-│fix: Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate  │
-│it                                                                                                │
+ 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+╭─ CLI Error (exit 1) ─────────────────────────────────────────────────────────────────────────────╮
+│ code    E_LEDGER_UNREADABLE                                                                      │
+│ message 1 items                                                                                  │
+│ fix     Fix permissions or replace the unreadable ledger file, then run `confidant check` to     │
+│ locate it                                                                                        │
 │                                                                                                  │
-│Press Esc to dismiss, r to retry, or q to quit.                                                   │
+│ Press Esc to dismiss, r to retry, or q to quit.                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
@@ -21,4 +19,6 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit
