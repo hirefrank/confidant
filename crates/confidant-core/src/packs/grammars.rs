@@ -18,11 +18,20 @@ use crate::ledger::parse_strict_date;
 /// Field grammars a manifest may name (spec §6). Fixed list: adding a
 /// grammar is a spec change plus a Rust parser — never a manifest-only
 /// change, so manifests cannot smuggle in new validation semantics.
+///
+/// Use the named constants below at call sites, never string literals:
+/// a typo in a literal compiles fine and surfaces only as a field-error
+/// finding at runtime.
+pub const GRAMMAR_RECURRING_DATE: &str = "recurring-date";
+pub const GRAMMAR_CADENCE: &str = "cadence";
+pub const GRAMMAR_DATES_LIST: &str = "dates-list";
+pub const GRAMMAR_NON_EMPTY_STRING: &str = "non-empty-string";
+
 pub const KNOWN_GRAMMARS: &[&str] = &[
-    "recurring-date",
-    "cadence",
-    "dates-list",
-    "non-empty-string",
+    GRAMMAR_RECURRING_DATE,
+    GRAMMAR_CADENCE,
+    GRAMMAR_DATES_LIST,
+    GRAMMAR_NON_EMPTY_STRING,
 ];
 
 /// A front-matter field value parsed by one of the [`KNOWN_GRAMMARS`].
@@ -51,10 +60,10 @@ pub fn parse_field_grammar(
     raw: &str,
 ) -> Option<FieldValue> {
     match grammar {
-        "recurring-date" => RecurringDate::parse(label, raw).map(FieldValue::RecurringDate),
-        "cadence" => parse_cadence_days(raw).map(FieldValue::CadenceDays),
-        "dates-list" => parse_dates_list(raw).map(FieldValue::DatesList),
-        "non-empty-string" => {
+        GRAMMAR_RECURRING_DATE => RecurringDate::parse(label, raw).map(FieldValue::RecurringDate),
+        GRAMMAR_CADENCE => parse_cadence_days(raw).map(FieldValue::CadenceDays),
+        GRAMMAR_DATES_LIST => parse_dates_list(raw).map(FieldValue::DatesList),
+        GRAMMAR_NON_EMPTY_STRING => {
             let trimmed = raw.trim();
             (!trimmed.is_empty()).then(|| FieldValue::Text(trimmed.to_owned()))
         }
@@ -276,6 +285,21 @@ mod tests {
                 "cadence",
                 "dates-list",
                 "non-empty-string"
+            ]
+        );
+    }
+
+    #[test]
+    fn grammar_constants_match_known_grammars() {
+        // Call sites use the constants, not literals; they must stay glued
+        // to the frozen list in the same order.
+        assert_eq!(
+            KNOWN_GRAMMARS,
+            &[
+                GRAMMAR_RECURRING_DATE,
+                GRAMMAR_CADENCE,
+                GRAMMAR_DATES_LIST,
+                GRAMMAR_NON_EMPTY_STRING,
             ]
         );
     }

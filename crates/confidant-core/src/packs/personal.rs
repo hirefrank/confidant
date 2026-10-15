@@ -11,7 +11,10 @@ use crate::check::{Finding, FindingCode, MergeMap, Severity};
 use crate::config::PERSONAL_PACK;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
-use crate::packs::grammars::{parse_field_grammar, FieldValue, RecurringDate};
+use crate::packs::grammars::{
+    parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
+    GRAMMAR_NON_EMPTY_STRING, GRAMMAR_RECURRING_DATE,
+};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::{parse_with_list, Record, RecordKind};
 use crate::search::cleared_record_ids;
@@ -425,7 +428,7 @@ fn fold(
         if rec.kind == RecordKind::Person {
             let entry = person_mut(&mut state, &rec.id);
             if let Some(raw) = rec.field("birthday") {
-                match parse_field_grammar("recurring-date", "birthday", raw) {
+                match parse_field_grammar(GRAMMAR_RECURRING_DATE, "birthday", raw) {
                     Some(FieldValue::RecurringDate(bd)) => entry.birthday = Some(bd),
                     _ => push_field_error(
                         rec,
@@ -437,7 +440,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("cadence") {
-                match parse_field_grammar("cadence", "cadence", raw) {
+                match parse_field_grammar(GRAMMAR_CADENCE, "cadence", raw) {
                     Some(FieldValue::CadenceDays(days)) => entry.cadence_days = Some(days),
                     _ => push_field_error(
                         rec,
@@ -449,7 +452,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("relationship_to_me") {
-                match parse_field_grammar("non-empty-string", "relationship_to_me", raw) {
+                match parse_field_grammar(GRAMMAR_NON_EMPTY_STRING, "relationship_to_me", raw) {
                     Some(FieldValue::Text(label)) => entry.relationship_to_me = Some(label),
                     _ => push_field_error(
                         rec,
@@ -461,7 +464,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("dates") {
-                match parse_field_grammar("dates-list", "dates", raw) {
+                match parse_field_grammar(GRAMMAR_DATES_LIST, "dates", raw) {
                     Some(FieldValue::DatesList(list)) => entry.dates = list,
                     _ => push_field_error(
                         rec,
