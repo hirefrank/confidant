@@ -159,6 +159,54 @@ mod tests {
         }
     }
 
+    /// Sync test (#370): the vendored `pack-skills/<name>/SKILL.md` copies
+    /// must match the repo-root `packs/<name>/SKILL.md` files. The spec and
+    /// docs point people at the repo-root files, but the binary ships the
+    /// vendored copies, so a drift would ship stale docs. Skips quietly
+    /// when the repo root isn't present (the published crate tarball).
+    #[test]
+    fn vendored_pack_skills_match_repo_root() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_packs = manifest_dir.join("../../packs");
+        if !repo_packs.is_dir() {
+            return; // published crate tarball: no repo root to compare against
+        }
+        let vendored = manifest_dir.join("pack-skills");
+
+        fn skill_pack_names(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .filter_map(|entry| {
+                    let entry = entry.unwrap_or_else(|e| panic!("dir entry: {e}"));
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let is_pack = entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                        && entry.path().join("SKILL.md").is_file();
+                    is_pack.then_some(name)
+                })
+                .collect();
+            names.sort_unstable();
+            names
+        }
+
+        let repo_names = skill_pack_names(&repo_packs);
+        let vendored_names = skill_pack_names(&vendored);
+        assert_eq!(
+            repo_names, vendored_names,
+            "pack dirs with SKILL.md differ between packs/ and pack-skills/"
+        );
+        for name in &repo_names {
+            let repo_text = std::fs::read_to_string(repo_packs.join(name).join("SKILL.md"))
+                .unwrap_or_else(|e| panic!("read packs/{name}/SKILL.md: {e}"));
+            let vendored_text = std::fs::read_to_string(vendored.join(name).join("SKILL.md"))
+                .unwrap_or_else(|e| panic!("read pack-skills/{name}/SKILL.md: {e}"));
+            assert_eq!(
+                repo_text, vendored_text,
+                "pack-skills/{name}/SKILL.md has drifted from \
+                 packs/{name}/SKILL.md; copy the repo-root file over"
+            );
+        }
+    }
+
     #[test]
     fn combined_pack_skill_lists_packs_in_scope() {
         let combined = combined_pack_skill(&["coaching@0.1"]).unwrap();
