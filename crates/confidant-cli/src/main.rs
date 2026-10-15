@@ -5730,8 +5730,10 @@ fn repair_shred_marker(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
 ///
 /// The recovery phrase is displayed BEFORE the swap (step 3.5): once the
 /// swap lands, the tree is wrapped to that phrase, so a crash before
-/// display would lose it. If the swap then fails, the error says to
-/// ignore the shown phrase — the old phrase is still current.
+/// display would lose it. If the swap then fails before anything moves
+/// (the first rename), the error says to ignore the shown phrase — the
+/// old phrase is still current. Once `keys/` has moved, the shown phrase
+/// is the new recovery phrase, and the error says so.
 #[allow(clippy::too_many_arguments)]
 fn staged_shred_mutation(
     root: &Path,
@@ -5851,8 +5853,10 @@ fn staged_shred_mutation(
 
     // Step 3.5: show the phrase BEFORE the swap. Once the swap lands the
     // tree is wrapped to this phrase; a crash before display would lose it.
-    // If the swap then fails, the error tells the operator to ignore the
-    // shown phrase — the old phrase is still current.
+    // If the first rename fails (before anything moved), the error tells
+    // the operator to ignore the shown phrase — the old phrase is still
+    // current. After it succeeds, the shown phrase is the new recovery
+    // phrase.
     let phrase = outcome.recovery_phrase_for_display();
     if let Err(e) = display_phrase_once(no_input, &phrase) {
         remove_path_best_effort(&stage);
@@ -5891,6 +5895,12 @@ fn staged_shred_mutation(
             "keys/ swap failed mid-swap ({e}); shred is finishing, re-run to complete; the phrase shown above is your new recovery phrase"
         ))));
     }
+    // Safety net: disarm() is idempotent. If keys/ did not exist above,
+    // the point-of-no-return disarm inside `if keys_dir.exists()` was
+    // skipped — but the swap has still landed, so no failure from this
+    // point on may restore the working tree. Unreachable today (shred
+    // stages from keys/), but safe even if that ever changes.
+    guard.disarm();
 
     // Promote the staged seq tracker (same-directory rename, atomic).
     // Post-swap: on failure, repair rolls forward; report re-run.
@@ -7265,7 +7275,7 @@ mod tests {
 
     #[test]
     fn shred_marker_pre_swap_rolls_forward() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220: crash after check, before swap (marker in .confidant/).
         // Repair must finish the swap, re-pin the anchor, promote the
         // device key, and clear the marker — never discard the stage.
@@ -7306,7 +7316,7 @@ mod tests {
 
     #[test]
     fn shred_marker_post_swap_finishes_promotions() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220: crash after swap, before re-pin (marker in .confidant/,
         // keys.old present, keys/ is the new tree). Repair must finish
         // the re-pin and device-key promotion from the marker, then
@@ -7345,7 +7355,7 @@ mod tests {
 
     #[test]
     fn shred_no_marker_discards_stage() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220: crash during mutate/check (no marker). The stage is
         // discarded; keys/ and the anchor are untouched.
         use super::{keys_stage_dir, repair_keys_staging};
@@ -7381,7 +7391,7 @@ mod tests {
 
     #[test]
     fn shred_marker_post_repin_is_safe_noop() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220/#339: crash after the re-pin, before marker removal.
         // Repair must be a safe no-op re-run (idempotent re-pin and
         // device-key promotion), then clear the marker. A second run
@@ -7445,7 +7455,7 @@ mod tests {
 
     #[test]
     fn shred_marker_mid_swap_completes_swap() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220/#339: mid-swap crash. Marker in .confidant/, keys/
         // missing, keys.old present (old tree), stage present (new tree).
         // Repair must complete the swap, then finish promotions.
@@ -7484,7 +7494,7 @@ mod tests {
 
     #[test]
     fn shred_marker_corrupt_fails_closed() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #339: a corrupt or empty marker must fail closed, and the error
         // must NOT quote the marker content (it may hold a private key).
         use super::{repair_keys_staging, shred_marker_path};
@@ -7520,7 +7530,7 @@ mod tests {
 
     #[test]
     fn shred_marker_other_op_rolls_forward() {
-        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
         // #220/#339, #99 rule: a different key operation (e.g. rotate)
         // starting while a shred marker exists must finish the shred
         // first via repair_keys_staging, not clobber it. The marker takes
