@@ -3758,21 +3758,27 @@ fn qmd_embedded_vectors(root: &Path, qmd: &Path) -> Option<u64> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    // Drain stdout on a helper thread while we poll: if qmd ever prints
+    // more than the pipe buffer, it would block on write and never exit,
+    // and we would only ever see the timeout below. Cap what we keep —
+    // we only need the `Vectors:` line. (#416 nit 1)
+    const MAX_STDOUT: u64 = 1 << 20; // 1 MiB
+    let stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = (&mut out).take(MAX_STDOUT).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
     // `qmd status` has no built-in timeout (unlike `qmd-query.py`, which
     // uses timeout=30); a hung qmd must not hang `doctor` or the TUI
     // Doctor tab. Poll with try_wait and kill after the grace period.
     const QMD_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let start = std::time::Instant::now();
-    let out = loop {
+    let status = loop {
         match child.try_wait().ok()? {
-            Some(status) => {
-                let mut stdout = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read as _;
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                break (status, stdout);
-            }
+            Some(status) => break status,
             None => {
                 if start.elapsed() >= QMD_STATUS_TIMEOUT {
                     let _ = child.kill();
@@ -3783,10 +3789,15 @@ fn qmd_embedded_vectors(root: &Path, qmd: &Path) -> Option<u64> {
             }
         }
     };
-    if !out.0.success() {
+    // The pipe's write end is closed now (child exited or was killed), so
+    // the drain thread always terminates.
+    let stdout = stdout_thread
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !status.success() {
         return None;
     }
-    parse_embedded_vectors(&out.1)
+    parse_embedded_vectors(&stdout)
 }
 
 /// Parse `qmd status` output for a `Vectors: <n> embedded` line.

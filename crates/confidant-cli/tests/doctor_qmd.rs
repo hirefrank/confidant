@@ -11,6 +11,13 @@ use std::process::Command;
 
 use serde_json::Value;
 
+// Shared integration-test helpers (#416 nit 3). The module only exists
+// on unix because its sole caller here (`copy_dir`) is unix-only;
+// without the gate the Windows build trips `-D warnings` (#402).
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_confidant")
 }
@@ -18,21 +25,6 @@ fn bin() -> &'static str {
 /// The checked-out plaintext demo vault (never written to: callers copy it).
 fn demo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
-}
-
-/// Copy `src` into `dst` recursively (a throwaway vault a test may write to).
-#[cfg(unix)]
-fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), to).unwrap();
-        }
-    }
 }
 
 /// A throwaway git identity, supplied to the child through git's
@@ -129,7 +121,7 @@ fn doctor_qmd_present_without_corpus_points_at_reindex() {
     // Throwaway vault copy with no `.confidant/qmd-corpus/`.
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
     assert!(!vault.join(".confidant/qmd-corpus").exists());
 
     let v = run_doctor(&vault, &path_with_fake_qmd(dir.path()), &[]);
@@ -148,7 +140,7 @@ fn doctor_qmd_corpus_without_vectors_points_at_embed() {
     write_fake_qmd(dir.path());
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     // The probe skips `qmd status` until the store exists (some qmd
     // versions create an empty index file as a side effect); a missing
@@ -177,7 +169,7 @@ fn doctor_qmd_with_vectors_reports_ready() {
     write_fake_qmd(dir.path());
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     // The probe only runs once the store file exists.
     std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
@@ -209,7 +201,7 @@ fn doctor_qmd_status_failure_does_not_point_at_embed() {
     .unwrap();
     let vault_dir = tempfile::tempdir().unwrap();
     let vault = vault_dir.path().join("vault");
-    copy_dir(&demo(), &vault);
+    common::copy_dir(&demo(), &vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
     std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
     std::fs::write(vault.join(".confidant/qmd/index.sqlite"), b"fake").unwrap();

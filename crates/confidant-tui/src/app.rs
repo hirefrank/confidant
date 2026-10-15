@@ -264,6 +264,28 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Whether qmd-ranked search is available for the `/` default (#416
+    /// nit 4, Frank's call): `qmd` on PATH and the vault's search corpus
+    /// built. Mirrors the `doctor` qmd-search check's first two probes;
+    /// the embeddings probe is skipped here because bm25 keyword search
+    /// works without embeddings.
+    fn qmd_available(&self) -> bool {
+        let paths = std::env::var_os("PATH");
+        let root = resolve_vault_root(self.vault_root_override.as_deref());
+        qmd_available_on(paths.as_deref(), root.as_deref())
+    }
+
+    /// Enter the Search tab for a new query (`/`), defaulting the mode
+    /// per Frank's call on #416 nit 4: qmd-ranked search when qmd is
+    /// available, exact literal scan otherwise.
+    fn enter_search(&mut self) {
+        self.active_view = ActiveView::Search;
+        self.input_mode = InputMode::EditingSearch;
+        self.search.editing = true;
+        self.search.exact = !self.qmd_available();
+        self.alert = None;
+    }
+
     /// Resolve the installed skills directory via `confidant which --skills-dir`.
     fn skills_dir(&mut self) -> Option<String> {
         let raw = match self.runner.run(&["which", "--skills-dir"]) {
@@ -662,10 +684,7 @@ impl<R: Runner> App<R> {
                     return;
                 }
                 KeyCode::Char('/') => {
-                    self.active_view = ActiveView::Search;
-                    self.input_mode = InputMode::EditingSearch;
-                    self.search.editing = true;
-                    self.alert = None;
+                    self.enter_search();
                     return;
                 }
                 _ => {}
@@ -1035,10 +1054,7 @@ impl<R: Runner> App<R> {
             KeyCode::Char('5') => self.switch_to(ActiveView::Search),
             KeyCode::Char('6') => self.switch_to(ActiveView::Inbox),
             KeyCode::Char('/') => {
-                self.active_view = ActiveView::Search;
-                self.input_mode = InputMode::EditingSearch;
-                self.search.editing = true;
-                self.alert = None;
+                self.enter_search();
             }
             // #387: exact literal scan toggle for the unified Search tab.
             KeyCode::Char('e') if self.active_view == ActiveView::Search => {
@@ -1404,5 +1420,55 @@ impl<R: Runner> App<R> {
             steps,
             hint,
         }
+    }
+}
+
+/// Pure check behind [`App::qmd_available`], taking its inputs explicitly
+/// so tests can control them without touching the process environment.
+fn qmd_available_on(
+    path_var: Option<&std::ffi::OsStr>,
+    vault_root: Option<&std::path::Path>,
+) -> bool {
+    let on_path = path_var.is_some_and(|paths| {
+        std::env::split_paths(paths).any(|dir| {
+            dir.join(if cfg!(windows) { "qmd.exe" } else { "qmd" })
+                .is_file()
+        })
+    });
+    if !on_path {
+        return false;
+    }
+    let Some(root) = vault_root else {
+        return false;
+    };
+    root.join(".confidant/qmd-corpus").is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qmd_available_needs_qmd_on_path_and_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+        let qmd_name = if cfg!(windows) { "qmd.exe" } else { "qmd" };
+        let path_var = std::ffi::OsString::from(bin_dir.as_os_str());
+
+        // qmd file missing -> not available.
+        assert!(!qmd_available_on(Some(&path_var), Some(&vault)));
+        // qmd present but no corpus -> not available.
+        std::fs::write(bin_dir.join(qmd_name), b"").unwrap();
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(!qmd_available_on(Some(&path_var), Some(&bare)));
+        // qmd present + corpus -> available.
+        assert!(qmd_available_on(Some(&path_var), Some(&vault)));
+        // No PATH / no vault -> not available.
+        assert!(!qmd_available_on(None, Some(&vault)));
+        assert!(!qmd_available_on(Some(&path_var), None));
     }
 }
