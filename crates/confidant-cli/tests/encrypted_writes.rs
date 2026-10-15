@@ -2888,3 +2888,103 @@ fn record_edit_rewrites_under_the_current_epoch() {
         "the edit did not move the record to the current epoch ({before} -> {after})"
     );
 }
+
+/// The `no-ai` line of a record file's plaintext outer header.
+fn outer_label(bytes: &str) -> String {
+    bytes
+        .lines()
+        .find(|l| l.starts_with("no-ai:"))
+        .unwrap_or("(none)")
+        .to_owned()
+}
+
+#[test]
+fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
+    // #406: the person's mode moved after this interaction was written, so
+    // the stored header is stale. Re-saving the same body must move it
+    // rather than report `unchanged`.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+
+    const IXN: &str = "i-01J9Z3K4QK0000000000000000";
+    let ixn_body = format!(
+        "---\nid: {IXN}\ntype: interaction\nname: \"Session one\"\ndate: 2026-10-01\nperson: {PERSON}\n---\n\nNotes about the session.\n"
+    );
+    // The same file is used for the add and the later re-save, so the
+    // canonical body is identical both times.
+    let ixn = write_file(h._tmp.path(), "ixn.md", &ixn_body);
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            ixn.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add interaction: {}", stderr(&out));
+
+    let path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(outer_label(&before), "no-ai: false", "{before}");
+
+    // The person becomes notes-hidden.
+    let hidden = write_file(
+        h._tmp.path(),
+        "hidden.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            hidden.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "hide person: {}", stderr(&out));
+
+    // Re-save the interaction with the body it already has.
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            IXN,
+            "--file",
+            ixn.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "re-save: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_ne!(
+        v["unchanged"],
+        serde_json::json!(true),
+        "a stale header must not be reported as unchanged: {v}"
+    );
+
+    let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&after),
+        "no-ai: true",
+        "the header was not re-stamped: {after}"
+    );
+}

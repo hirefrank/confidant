@@ -96,29 +96,10 @@ impl RecordEncryptor {
     ///   person's current epoch (B4).
     pub fn encrypt_file(&self, path: &Path, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         let abs = self.root.join(path);
-        if let Ok(existing) = std::fs::read(&abs) {
-            match stability_decision(&existing, plaintext, &|b| self.decrypt_existing(path, b)) {
-                StabilityOutcome::Reuse => return Ok(existing),
-                StabilityOutcome::Reencrypt => {}
-                StabilityOutcome::PlaintextExists => {
-                    // ⚠1: never encrypt a plaintext record in place, never
-                    // rewrite it as plaintext — fail closed.
-                    return Err(anyhow::Error::new(
-                        DomainError::new(
-                            ErrorKind::Invalid,
-                            format!(
-                                "{} already exists as plaintext in an encrypted vault; refusing to rewrite",
-                                path.display()
-                            ),
-                        )
-                        .with_fix(
-                            "Plaintext records are never encrypted in place; add a new record instead",
-                        ),
-                    ));
-                }
-            }
-        }
+        let existing = std::fs::read(&abs).ok();
 
+        // Parsed before the stability decision below, because the effective
+        // outer `no-ai` is part of what that decision needs (#406).
         let text = std::str::from_utf8(plaintext).map_err(|_| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "{} is not valid UTF-8",
@@ -144,6 +125,31 @@ impl RecordEncryptor {
         let own_mode = rec.no_ai_mode();
         let inherited = inherited_no_ai_mode(&self.root, &rec);
         let outer_no_ai = stamp_no_ai(record_type, own_mode, inherited);
+
+        if let Some(existing) = &existing {
+            match stability_decision(existing, plaintext, outer_no_ai, &|b| {
+                self.decrypt_existing(path, b)
+            }) {
+                StabilityOutcome::Reuse => return Ok(existing.clone()),
+                StabilityOutcome::Reencrypt => {}
+                StabilityOutcome::PlaintextExists => {
+                    // ⚠1: never encrypt a plaintext record in place, never
+                    // rewrite it as plaintext — fail closed.
+                    return Err(anyhow::Error::new(
+                        DomainError::new(
+                            ErrorKind::Invalid,
+                            format!(
+                                "{} already exists as plaintext in an encrypted vault; refusing to rewrite",
+                                path.display()
+                            ),
+                        )
+                        .with_fix(
+                            "Plaintext records are never encrypted in place; add a new record instead",
+                        ),
+                    ));
+                }
+            }
+        }
         // Route to the client key. A person record encrypts under its own
         // id (it has no `person` field); notes, interactions, and deals
         // with a person use the `person` field.
@@ -440,10 +446,18 @@ enum StabilityOutcome {
 fn stability_decision(
     existing: &[u8],
     plaintext: &[u8],
+    outer_no_ai: envelope::NoAi,
     decrypt: &dyn Fn(&[u8]) -> anyhow::Result<Vec<u8>>,
 ) -> StabilityOutcome {
     if !crypto_mode::is_envelope_bytes(existing) {
         return StabilityOutcome::PlaintextExists;
+    }
+    // #406: the outer `no-ai` is derived from the person records on disk, so
+    // it can move while the body stays the same — a person's mode changed
+    // after this child was written. Reusing on the body alone would keep the
+    // stale header, so the header has to match as well.
+    if !envelope::parse(existing).is_ok_and(|env| env.no_ai == outer_no_ai) {
+        return StabilityOutcome::Reencrypt;
     }
     match decrypt(existing) {
         Ok(inner) if inner == plaintext => StabilityOutcome::Reuse,
@@ -558,7 +572,12 @@ mod tests {
         // B3: envelope decrypting to the same plaintext -> reuse bytes.
         let existing = envelope_bytes();
         let plaintext = b"inner";
-        let out = stability_decision(existing.as_slice(), plaintext, &|_| Ok(plaintext.to_vec()));
+        let out = stability_decision(
+            existing.as_slice(),
+            plaintext,
+            envelope::NoAi::False,
+            &|_| Ok(plaintext.to_vec()),
+        );
         assert_eq!(out, StabilityOutcome::Reuse);
     }
 
@@ -568,6 +587,7 @@ mod tests {
         let out = stability_decision(
             existing.as_slice(),
             b"inner",
+            envelope::NoAi::False,
             &|_| Ok(b"different".to_vec()),
         );
         assert_eq!(out, StabilityOutcome::Reencrypt);
@@ -577,9 +597,12 @@ mod tests {
     fn failed_decrypt_counts_as_changed() {
         // A failed decrypt never reuses: it counts as changed.
         let existing = envelope_bytes();
-        let out = stability_decision(existing.as_slice(), b"inner", &|_| {
-            anyhow::bail!("tampered")
-        });
+        let out = stability_decision(
+            existing.as_slice(),
+            b"inner",
+            envelope::NoAi::False,
+            &|_| anyhow::bail!("tampered"),
+        );
         assert_eq!(out, StabilityOutcome::Reencrypt);
     }
 
@@ -588,7 +611,24 @@ mod tests {
         // \u26a01 guard: an existing plaintext file is never encrypted in
         // place — the caller fails closed.
         let existing = b"---\nid: p-01ABC\ntype: person\n---\n\nBio.\n";
-        let out = stability_decision(existing.as_slice(), b"inner", &|_| Ok(b"inner".to_vec()));
+        let out = stability_decision(
+            existing.as_slice(),
+            b"inner",
+            envelope::NoAi::False,
+            &|_| Ok(b"inner".to_vec()),
+        );
         assert_eq!(out, StabilityOutcome::PlaintextExists);
+    }
+
+    #[test]
+    fn moved_header_reencrypts_even_when_the_body_is_unchanged() {
+        // #406: the stored header says `no-ai: false`, but the effective
+        // value has moved (a referenced person's mode changed). Reusing the
+        // bytes would keep the stale header, so re-encrypt instead.
+        let existing = envelope_bytes();
+        let out = stability_decision(existing.as_slice(), b"inner", envelope::NoAi::True, &|_| {
+            Ok(b"inner".to_vec())
+        });
+        assert_eq!(out, StabilityOutcome::Reencrypt);
     }
 }
