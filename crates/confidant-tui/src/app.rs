@@ -740,25 +740,34 @@ impl<R: Runner> App<R> {
 
     /// Handle a key event while the inbox tab is active.
     ///
-    /// The view is read-only: `r` re-runs the dry run, `a` opens the
-    /// all-or-nothing apply confirm, and `y` inside the modal applies.
-    fn handle_inbox_key(&mut self, key: KeyEvent) {
+    /// Returns true when the key was consumed. The confirm modal swallows
+    /// every key: `y` applies, anything else just cancels. Outside the
+    /// modal, `r` re-runs the dry run and `a` opens the all-or-nothing
+    /// apply confirm; everything else falls through to the shared
+    /// navigation and quit handling in `handle_key`.
+    fn handle_inbox_key(&mut self, key: KeyEvent) -> bool {
         // Esc dismisses an alert first, before any view action.
         if self.alert.is_some() && matches!(key.code, KeyCode::Esc) {
             self.alert = None;
-            return;
+            return true;
         }
         if self.inbox.confirming {
             match key.code {
                 KeyCode::Char('y') => self.inbox_run_apply(),
                 _ => self.inbox.confirming = false,
             }
-            return;
+            return true;
         }
         match key.code {
-            KeyCode::Char('r') => self.load_inbox(),
-            KeyCode::Char('a') => self.inbox_begin_apply(),
-            _ => {}
+            KeyCode::Char('r') => {
+                self.load_inbox();
+                true
+            }
+            KeyCode::Char('a') => {
+                self.inbox_begin_apply();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -965,8 +974,7 @@ impl<R: Runner> App<R> {
             return;
         }
 
-        if self.active_view == ActiveView::Inbox {
-            self.handle_inbox_key(key);
+        if self.active_view == ActiveView::Inbox && self.handle_inbox_key(key) {
             return;
         }
 

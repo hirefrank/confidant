@@ -1041,6 +1041,48 @@ fn inbox_apply_with_no_items_does_not_open_confirm() {
     assert!(!app.inbox.confirming, "no confirm when nothing to apply");
 }
 
+#[test]
+fn inbox_tab_falls_through_to_shared_navigation() {
+    // Tab from Inbox wraps around to Check.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Check);
+
+    // `5` from Inbox switches to Proposals.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('5')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+
+    // Shift-Tab from Inbox steps back to Search.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::BackTab));
+    assert_eq!(app.active_view, ActiveView::Search);
+
+    // Esc with no alert quits.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.should_quit, "Esc quits from the inbox tab");
+}
+
+#[test]
+fn inbox_q_quits() {
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit, "q quits from the inbox tab");
+}
+
 /// Live dry run against a throwaway git vault with no inbox branch,
 /// reusing the `crates/confidant-cli/tests/inbox.rs` fixture shape.
 #[test]
