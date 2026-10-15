@@ -535,3 +535,585 @@ fn update_offline_relinks_without_network() {
     assert_eq!(v["linked"], 5, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 }
+
+// ---------------------------------------------------------------------------
+// #376: `update` offers to run the update; `setup` next-steps.
+// ---------------------------------------------------------------------------
+
+/// Stub GitHub Releases endpoint returning `tag_name`; the spawned thread
+/// answers one request and exits (same pattern as
+/// `update_behind_relinks_nothing`).
+#[cfg(feature = "test-overrides")]
+fn stub_release_server(tag: &str) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = serde_json::json!({"tag_name": tag}).to_string();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+struct RawOut {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Like `run`, but for human (non-JSON) output: `--no-input` is optional,
+/// env vars can be removed, and stderr is captured.
+fn run_raw(
+    args: &[&str],
+    env: &Env,
+    extra: &[(&str, &str)],
+    remove: &[&str],
+    no_input: bool,
+) -> RawOut {
+    let mut cmd = Command::new(bin());
+    cmd.args(args);
+    if no_input {
+        cmd.arg("--no-input");
+    }
+    cmd.env("HOME", &env.home)
+        .env("CONFIDANT_HOME", &env.share)
+        .env("CONFIDANT_SKILLS_DIR", &env.skills);
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
+    RawOut {
+        ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// A recorder path that must stay absent unless the test expects a run.
+#[cfg(feature = "test-overrides")]
+fn recorder_path(env: &Env) -> PathBuf {
+    PathBuf::from(&env.home).join("recorded.txt")
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_behind_interactive_no_runs_nothing() {
+    // Behind + interactive + `n`: one matching command printed, a `[y/N]`
+    // prompt on stderr, nothing run, no setup offer.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "n"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("cargo install confidant-cli"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("re-run the installer"),
+        "expected one command, not a list: {}",
+        r.stdout
+    );
+    assert!(r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "update command ran after `n`");
+    assert!(
+        !r.stderr.contains("confidant setup` now?"),
+        "setup offered after declining the update: {}",
+        r.stderr
+    );
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_behind_interactive_yes_runs_command_then_declines_setup() {
+    // `y` runs the expected command (recorded, never executed), reports
+    // success, then offers `confidant setup`; `n` declines the offer and
+    // nothing is re-linked.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y\nn"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let recorded = std::fs::read_to_string(&recorder).unwrap();
+    assert_eq!(recorded.trim(), "cargo install confidant-cli");
+    assert!(
+        r.stdout
+            .contains("updated via `cargo install confidant-cli`."),
+        "{}\n{}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("run `confidant setup` now? [y/N]"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        !PathBuf::from(&env.share).join("skills").exists(),
+        "update re-linked after the setup offer was declined"
+    );
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_behind_interactive_yes_reports_failure() {
+    // A failing update is reported and the setup offer never appears:
+    // exactly one prompt.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+            ("CONFIDANT_TEST_COMMAND_FAIL", "1"),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(recorder.exists(), "failing command was not recorded");
+    let both = format!("{}{}", r.stdout, r.stderr);
+    assert!(both.contains("update failed"), "{both}");
+    assert_eq!(
+        r.stderr.matches("[y/N]").count(),
+        1,
+        "setup offered after a failed update: {}",
+        r.stderr
+    );
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_behind_noninteractive_prints_command_without_prompt() {
+    // Behind + non-interactive: the single matching command is printed,
+    // nothing is prompted, nothing runs.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("cargo install confidant-cli"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "non-interactive run executed a command");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_behind_unknown_method_prints_generic_wording() {
+    // No CONFIDANT_TEST_EXE_PATH: the test binary is not under
+    // `.cargo/bin`, so the method is unknown — today's generic wording,
+    // no prompt, no offer.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[("CONFIDANT_TEST_RELEASES_URL", url.as_str())],
+        &[],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout
+            .contains("re-run the installer or `cargo install confidant-cli`"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_behind_json_reports_command_additively() {
+    // --json: new fields are additive, nothing is prompted or run.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let (ok, v, _) = run(
+        &["update", "--agent", "all", "--json"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["update"]["behind"], true, "{v}");
+    assert_eq!(v["update"]["install_method"], "cargo-install", "{v}");
+    assert_eq!(
+        v["update"]["update_command"], "cargo install confidant-cli",
+        "{v}"
+    );
+    // Existing fields intact.
+    assert_eq!(v["update"]["latest"], "v999.0.0", "{v}");
+    assert!(v["message"].as_str().unwrap().contains("is behind"), "{v}");
+    assert!(!recorder.exists(), "JSON path ran a command");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn update_offline_never_prompts() {
+    // CONFIDANT_OFFLINE=1: no fetch, no prompt — as today — even when the
+    // session looks interactive and a known install method is forced.
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_OFFLINE", "1"),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("staleness check disabled"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "offline run executed a command");
+}
+
+#[cfg(all(feature = "test-overrides", windows))]
+#[test]
+fn update_behind_windows_prints_command_only() {
+    // Windows cannot overwrite a running exe: the command is printed and
+    // never offered, even with `y` scripted.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "C:\\Users\\tester\\.cargo\\bin\\confidant.exe",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("cargo install confidant-cli"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "Windows ran the update command");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn setup_env_set_interactive_no_runs_nothing() {
+    // CONFIDANT_VAULT set + interactive + `n`: prompted, nothing run. The
+    // vault path does not exist, so success proves setup never probed it.
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_VAULT", "/nonexistent/vault-376"),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "n"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stderr.contains("run `confidant check` now? [y/N]"),
+        "{}",
+        r.stderr
+    );
+    assert!(!recorder.exists(), "check ran after `n`");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn setup_env_set_interactive_enter_runs_nothing() {
+    // Empty answer (Enter) is the default No: prompted, nothing run.
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_VAULT", "/nonexistent/vault-376"),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", ""),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "check ran after Enter");
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn setup_env_set_interactive_yes_runs_check() {
+    // `y` runs `confidant check` exactly once (recorded, never executed)
+    // and reports the result.
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_VAULT", "/nonexistent/vault-376"),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let recorded = std::fs::read_to_string(&recorder).unwrap();
+    assert_eq!(recorded.lines().count(), 1);
+    assert_eq!(recorded.trim(), "confidant check");
+    assert!(
+        r.stdout.contains("`confidant check` passed."),
+        "{}\n{}",
+        r.stdout,
+        r.stderr
+    );
+}
+
+#[test]
+fn setup_env_unset_prints_export_line() {
+    // CONFIDANT_VAULT unset: the exact export line replaces the old
+    // generic wording; no prompt either way.
+    let env = fresh_env();
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("export CONFIDANT_VAULT=<path>"),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("Set CONFIDANT_VAULT"),
+        "old generic wording still present: {}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+}
+
+#[test]
+fn setup_vault_flag_prints_real_export_path() {
+    // An explicit `--vault` gives the real path in the export line.
+    let env = fresh_env();
+    let r = run_raw(
+        &["setup", "--agent", "all", "--vault", "/tmp/fake-vault-376"],
+        &env,
+        &[],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout
+            .contains("export CONFIDANT_VAULT=/tmp/fake-vault-376"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("<path>"), "{}", r.stdout);
+}
+
+#[cfg(feature = "test-overrides")]
+#[test]
+fn setup_env_set_noninteractive_prints_check_without_prompt() {
+    // Non-interactive: only the check command is printed, nothing runs.
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let r = run_raw(
+        &["setup", "--agent", "all"],
+        &env,
+        &[
+            ("CONFIDANT_VAULT", "/tmp/vault-376"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("confidant check"), "{}", r.stdout);
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "non-interactive run executed a command");
+}
+
+#[test]
+fn setup_json_next_steps_are_additive() {
+    let env = fresh_env();
+    let (ok, v, _) = run(
+        &["setup", "--agent", "all", "--json"],
+        &env,
+        &[("CONFIDANT_VAULT", "/tmp/vault-376")],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["next_steps"]["check_command"], "confidant check", "{v}");
+    assert_eq!(v["next_steps"]["vault_set"], true, "{v}");
+    assert!(v["next_steps"]["vault_export"].is_null(), "{v}");
+    // Existing contract intact.
+    assert_eq!(v["linked"], 5, "{v}");
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
+}
+
+#[test]
+fn setup_json_next_steps_unset_carries_export_line() {
+    let env = fresh_env();
+    let r = run_raw(
+        &["setup", "--agent", "all", "--json"],
+        &env,
+        &[],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["next_steps"]["vault_set"], false, "{v}");
+    assert_eq!(
+        v["next_steps"]["vault_export"], "export CONFIDANT_VAULT=<path>",
+        "{v}"
+    );
+}

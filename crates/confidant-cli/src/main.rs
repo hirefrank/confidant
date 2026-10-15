@@ -16,6 +16,8 @@ mod record_decrypt;
 mod setup;
 
 use std::collections::{BTreeMap, HashSet};
+#[cfg(not(feature = "test-overrides"))]
+use std::io::IsTerminal;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -2282,6 +2284,163 @@ fn prompt_fallback_inbox() -> anyhow::Result<bool> {
     Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
 }
 
+// ---------------------------------------------------------------------------
+// #376: `update` / `setup` offers — install-method detection, shared y/N
+// prompt, and an injectable command runner.
+// ---------------------------------------------------------------------------
+
+/// How this binary was installed, for the `confidant update` offer (#376).
+/// Only install methods with a reliable, testable signal are detected;
+/// anything else is `Unknown` and falls back to the generic upgrade
+/// wording (no offer to run anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMethod {
+    /// The binary lives in `<cargo-home>/bin`. This covers `cargo install`;
+    /// the cargo-dist shell installer also targets `CARGO_HOME`, so an
+    /// installer-based setup lands here too and gets the `cargo install`
+    /// command, which is a working upgrade path for both.
+    CargoInstall,
+    Unknown,
+}
+
+impl InstallMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            InstallMethod::CargoInstall => "cargo-install",
+            InstallMethod::Unknown => "unknown",
+        }
+    }
+
+    /// The single update command to print for this method, or `None` when
+    /// the method is unknown (the caller prints the generic wording).
+    fn update_command(self) -> Option<&'static str> {
+        match self {
+            InstallMethod::CargoInstall => Some("cargo install confidant-cli"),
+            InstallMethod::Unknown => None,
+        }
+    }
+
+    /// Program + argv to run when the operator confirms the offer.
+    fn run_spec(self) -> Option<(&'static std::ffi::OsStr, &'static [&'static str])> {
+        match self {
+            InstallMethod::CargoInstall => {
+                Some((std::ffi::OsStr::new("cargo"), &["install", "confidant-cli"]))
+            }
+            InstallMethod::Unknown => None,
+        }
+    }
+}
+
+/// Detect the install method from the running binary's path (#376). The
+/// path is injected so the detection is unit-testable; production passes
+/// `std::env::current_exe()`.
+fn detect_install_method(exe_path: &Path) -> InstallMethod {
+    // Normalize separators so Windows-style paths stay detectable on any
+    // platform (unit tests run on Linux/macOS/Windows alike).
+    let normalized = exe_path.to_string_lossy().replace('\\', "/");
+    if normalized.contains("/.cargo/bin/") {
+        return InstallMethod::CargoInstall;
+    }
+    InstallMethod::Unknown
+}
+
+/// The binary path the update/check offers reason about. Under
+/// `test-overrides`, `CONFIDANT_TEST_EXE_PATH` overrides
+/// `std::env::current_exe()` so integration tests can force a known
+/// install method (the real test binary is not under `.cargo/bin`).
+fn offer_exe_path() -> PathBuf {
+    #[cfg(feature = "test-overrides")]
+    if let Ok(p) = std::env::var("CONFIDANT_TEST_EXE_PATH") {
+        return PathBuf::from(p);
+    }
+    std::env::current_exe().unwrap_or_default()
+}
+
+/// Whether `update` may offer to run the update command itself (#376): the
+/// install method must be known and replacing the running binary must be
+/// safe. Windows cannot overwrite a running exe, so there `update` only
+/// ever prints the command. `self_replace_safe` is injected for tests;
+/// production passes `!cfg!(windows)`.
+fn offerable_update(method: InstallMethod, self_replace_safe: bool) -> bool {
+    method.run_spec().is_some() && self_replace_safe
+}
+
+#[cfg(feature = "test-overrides")]
+static TEST_PROMPT_ANSWER_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Next scripted answer from `CONFIDANT_TEST_PROMPT_ANSWERS`
+/// (newline-separated, consumed in prompt order), or `None` when the hook
+/// is unset or exhausted.
+#[cfg(feature = "test-overrides")]
+fn test_prompt_answer() -> Option<String> {
+    let list = std::env::var("CONFIDANT_TEST_PROMPT_ANSWERS").ok()?;
+    let idx = TEST_PROMPT_ANSWER_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    list.split('\n').nth(idx).map(str::to_owned)
+}
+
+/// Shared y/N prompt for the `update` and `setup` offers (#376). Matches
+/// the `prompt_fallback_inbox` style: stderr, `[y/N]`, default No — only an
+/// explicit `y`/`yes` confirms, EOF fails closed.
+///
+/// Never prompts (returns `false`) when the session is non-interactive: no
+/// TTY on stdin, `--no-input`, or `--json`. Nothing is ever run without an
+/// explicit confirmation.
+fn confirm_yn(question: &str, no_input: bool, json: bool) -> anyhow::Result<bool> {
+    #[cfg(feature = "test-overrides")]
+    let interactive = std::env::var("CONFIDANT_TEST_FORCE_INTERACTIVE").is_ok();
+    #[cfg(not(feature = "test-overrides"))]
+    let interactive = std::io::stdin().is_terminal();
+    if !interactive || no_input || json {
+        return Ok(false);
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    // Integration-test hook: piped stdin is never a TTY, so tests supply
+    // answers (one per line, in prompt order) instead of typing. Unset =
+    // read stdin as usual (a closed pipe reads EOF and fails closed).
+    #[cfg(feature = "test-overrides")]
+    if let Some(answer) = test_prompt_answer() {
+        let answer = answer.trim();
+        return Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"));
+    }
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+/// Runs a command the operator explicitly confirmed (#376). Production
+/// spawns it and reports a non-zero exit as an error. Under
+/// `test-overrides`, `CONFIDANT_TEST_COMMAND_RECORDER` names a file the
+/// rendered command is appended to instead of executing — tests never run
+/// a real install or a real `check`. `CONFIDANT_TEST_COMMAND_FAIL=1`
+/// simulates a failure after recording.
+fn run_offered_command(
+    display: &str,
+    program: &std::ffi::OsStr,
+    args: &[&str],
+) -> anyhow::Result<()> {
+    #[cfg(feature = "test-overrides")]
+    if let Ok(path) = std::env::var("CONFIDANT_TEST_COMMAND_RECORDER") {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        use std::io::Write as _;
+        writeln!(f, "{display}")?;
+        if std::env::var("CONFIDANT_TEST_COMMAND_FAIL").is_ok() {
+            anyhow::bail!("simulated command failure (CONFIDANT_TEST_COMMAND_FAIL)");
+        }
+        return Ok(());
+    }
+    let status = std::process::Command::new(program).args(args).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("`{display}` exited with status {status}")
+    }
+}
+
 /// Queue a session's ledger line + note record to the `inbox` branch
 /// (#213 fallback): both items are age-encrypted to the pinned inbox
 /// pubkey and committed with a signed commit. Nothing is written to
@@ -4152,7 +4311,11 @@ fn cmd_setup(
     match setup::run_setup(agent, force, copy) {
         Ok(result) => {
             if cli.json {
-                print_json(&ok_envelope(None, setup_result_json(&result)))?;
+                let mut value = setup_result_json(&result);
+                if let Value::Object(ref mut obj) = value {
+                    obj.insert("next_steps".to_owned(), setup_next_steps_json(cli));
+                }
+                print_json(&ok_envelope(None, value))?;
             } else {
                 if verbose {
                     for line in &result.verbose_lines {
@@ -4175,9 +4338,7 @@ fn cmd_setup(
                     println!("  replace existing dirs with: confidant setup --force");
                 }
                 println!();
-                println!("Next:");
-                println!("  1. Set CONFIDANT_VAULT to your vault (or use --vault).");
-                println!("  2. Run `confidant check --json --no-input` against it.");
+                setup_next_steps(cli)?;
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -4185,9 +4346,69 @@ fn cmd_setup(
     }
 }
 
+/// True when the operator has pointed at a vault via `CONFIDANT_VAULT`
+/// (non-empty). Unset or empty means the next-steps block prints the
+/// export line instead.
+fn vault_env_set() -> bool {
+    std::env::var("CONFIDANT_VAULT")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The exact line to paste when `CONFIDANT_VAULT` is unset (#376): the real
+/// path only when one was given explicitly (e.g. `--vault`), otherwise the
+/// `<path>` placeholder. The vault itself is never read or probed.
+fn vault_export_line(cli: &Cli) -> String {
+    match &cli.vault {
+        Some(p) => format!("export CONFIDANT_VAULT={}", p.display()),
+        None => "export CONFIDANT_VAULT=<path>".to_owned(),
+    }
+}
+
+/// Additive `next_steps` entry for the `setup` JSON envelope (#376): the
+/// check command to run, whether `CONFIDANT_VAULT` is set, and the exact
+/// export line when it is not. Never probes the vault.
+fn setup_next_steps_json(cli: &Cli) -> Value {
+    let set = vault_env_set();
+    serde_json::json!({
+        "check_command": "confidant check",
+        "vault_set": set,
+        "vault_export": if set {
+            Value::Null
+        } else {
+            Value::String(vault_export_line(cli))
+        },
+    })
+}
+
+/// Human-readable next steps after `setup` (#376). When `CONFIDANT_VAULT`
+/// is set, an interactive terminal is offered `run `confidant check` now?`
+/// (default No, never automatic); non-interactive output only prints the
+/// check command. When unset, the exact export line replaces the old
+/// generic wording. The vault is never read or probed here — the check
+/// runs only after an explicit `y`, inheriting the environment.
+fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
+    println!("Next:");
+    if vault_env_set() {
+        println!("  Run `confidant check` against your vault.");
+        if confirm_yn("run `confidant check` now?", cli.no_input, cli.json)? {
+            let exe = offer_exe_path();
+            match run_offered_command("confidant check", exe.as_os_str(), &["check"]) {
+                Ok(()) => println!("`confidant check` passed."),
+                Err(err) => eprintln!("`confidant check` failed: {err:#}"),
+            }
+        }
+    } else {
+        println!("  {}", vault_export_line(cli));
+        println!("  Then run `confidant check`.");
+    }
+    Ok(())
+}
+
 fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
     // Self-update via the cargo-dist updater is not yet wired: `update`
-    // reports the latest release and re-links skills from this binary.
+    // reports the latest release, offers to run the matching upgrade
+    // command (#376), and re-links skills from this binary.
     // Honor CONFIDANT_OFFLINE=1 like `doctor` (no network at all).
     let offline = staleness_offline();
     let latest = if offline { None } else { latest_release_tag() };
@@ -4199,10 +4420,13 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             .zip(parse_release_version(tag))
             .map(|(l, r)| l < r)
     });
+    let method = detect_install_method(&offer_exe_path());
     let upgrade_cmd =
         "update the binary first (re-run the installer or `cargo install confidant-cli`), then re-run `confidant setup`.";
     if cli.json {
-        let update_info = match &latest {
+        // The JSON path never prompts and never runs anything (#376); the
+        // new fields are additive.
+        let mut update_info = match &latest {
             None if offline => {
                 serde_json::json!({"status": "disabled", "message": STALENESS_DISABLED, "behind": Value::Null})
             }
@@ -4213,6 +4437,19 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                 serde_json::json!({"status": "fetched", "latest": tag, "local": local, "behind": behind})
             }
         };
+        if let Value::Object(ref mut obj) = update_info {
+            obj.insert(
+                "install_method".to_owned(),
+                Value::String(method.as_str().to_owned()),
+            );
+            obj.insert(
+                "update_command".to_owned(),
+                method
+                    .update_command()
+                    .map(|c| Value::String(c.to_owned()))
+                    .unwrap_or(Value::Null),
+            );
+        }
         if behind == Some(true) {
             // Never re-link from a behind binary: the installed skills would
             // be stale on arrival. Tell the operator how to upgrade instead.
@@ -4238,15 +4475,49 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             None => println!("{STALENESS_UNKNOWN}"),
             Some(tag) => {
                 if behind == Some(true) {
-                    println!("confidant {local} is behind the latest release {tag}; {upgrade_cmd}");
+                    // Never re-link from a behind binary: the installed
+                    // skills would be stale on arrival. Print the single
+                    // command that fits this install; in an interactive
+                    // terminal, offer to run it (default No).
+                    if let (Some(cmd), Some((program, args))) =
+                        (method.update_command(), method.run_spec())
+                    {
+                        println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
+                        if offerable_update(method, !cfg!(windows))
+                            && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
+                        {
+                            match run_offered_command(cmd, program, args) {
+                                Ok(()) => {
+                                    println!("updated via `{cmd}`.");
+                                    if confirm_yn(
+                                        "run `confidant setup` now?",
+                                        cli.no_input,
+                                        cli.json,
+                                    )? {
+                                        return relink_after_update(agent, force, verbose);
+                                    }
+                                }
+                                Err(err) => eprintln!("update failed: {err:#}"),
+                            }
+                        }
+                    } else {
+                        println!(
+                            "confidant {local} is behind the latest release {tag}; {upgrade_cmd}"
+                        );
+                    }
                     return Ok(ExitCode::SUCCESS);
                 }
                 println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
             }
         }
     }
-    // Re-link from this binary. `force` is the operator's own flag: owned
-    // entries are re-pointed regardless, unowned entries need it.
+    relink_after_update(agent, force, verbose)
+}
+
+/// Shared tail of `update`: re-link skills from this binary and report.
+/// `force` is the operator's own flag: owned entries are re-pointed
+/// regardless, unowned entries need it.
+fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
     let result = setup::run_setup(agent, force, false)?;
     if verbose {
         for line in &result.verbose_lines {
@@ -7011,7 +7282,74 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{git_version_check_from, parse_git_version, MIN_GIT_VERSION};
+    use super::{
+        confirm_yn, detect_install_method, git_version_check_from, offerable_update,
+        parse_git_version, InstallMethod, MIN_GIT_VERSION,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn install_method_detection_from_exe_path() {
+        // `cargo install` (and the cargo-dist shell installer, which
+        // targets CARGO_HOME) lands in `<cargo-home>/bin`.
+        assert_eq!(
+            detect_install_method(Path::new("/home/ada/.cargo/bin/confidant")),
+            InstallMethod::CargoInstall
+        );
+        // Windows separators stay detectable on every platform.
+        assert_eq!(
+            detect_install_method(Path::new("C:\\Users\\ada\\.cargo\\bin\\confidant.exe")),
+            InstallMethod::CargoInstall
+        );
+        // Homebrew and anything else: unknown, so `update` falls back to
+        // the generic wording and offers nothing to run.
+        assert_eq!(
+            detect_install_method(Path::new("/opt/homebrew/bin/confidant")),
+            InstallMethod::Unknown
+        );
+        assert_eq!(
+            detect_install_method(Path::new("/usr/local/bin/confidant")),
+            InstallMethod::Unknown
+        );
+        assert_eq!(
+            detect_install_method(Path::new("confidant")),
+            InstallMethod::Unknown
+        );
+    }
+
+    #[test]
+    fn install_method_commands() {
+        let cargo = InstallMethod::CargoInstall;
+        assert_eq!(cargo.as_str(), "cargo-install");
+        assert_eq!(cargo.update_command(), Some("cargo install confidant-cli"));
+        let (program, args) = cargo.run_spec().unwrap();
+        assert_eq!(program, "cargo");
+        assert_eq!(args, &["install", "confidant-cli"]);
+
+        let unknown = InstallMethod::Unknown;
+        assert_eq!(unknown.as_str(), "unknown");
+        assert_eq!(unknown.update_command(), None);
+        assert_eq!(unknown.run_spec(), None);
+    }
+
+    #[test]
+    fn offerable_update_needs_known_method_and_safe_replacement() {
+        assert!(offerable_update(InstallMethod::CargoInstall, true));
+        // Windows cannot overwrite a running exe: print only.
+        assert!(!offerable_update(InstallMethod::CargoInstall, false));
+        // Unknown method: nothing to run.
+        assert!(!offerable_update(InstallMethod::Unknown, true));
+        assert!(!offerable_update(InstallMethod::Unknown, false));
+    }
+
+    #[test]
+    fn confirm_yn_never_prompts_when_non_interactive() {
+        // --no-input and --json short-circuit to false without touching
+        // stdin, on any terminal.
+        assert!(!confirm_yn("run it?", true, false).unwrap());
+        assert!(!confirm_yn("run it?", false, true).unwrap());
+        assert!(!confirm_yn("run it?", true, true).unwrap());
+    }
 
     #[test]
     fn parse_git_version_handles_real_world_strings() {
