@@ -8,7 +8,6 @@ pub mod confirm;
 pub mod context;
 pub mod diff;
 pub mod doctor;
-pub mod find;
 pub mod inbox;
 pub mod proposals;
 pub mod search;

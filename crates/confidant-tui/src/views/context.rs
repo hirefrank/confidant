@@ -44,7 +44,7 @@ pub fn render(state: &ContextViewState, frame: &mut Frame<'_>, area: Rect) {
                 Span::styled("(press r to reload)", Style::default().fg(palette::MUTED)),
             ]),
             None => Line::from(Span::styled(
-                "No person selected. Press Enter on a p-… item in Find or Check.",
+                "No person selected. Press Enter on a p-… item in Search or Check.",
                 Style::default().fg(palette::MUTED),
             )),
         };

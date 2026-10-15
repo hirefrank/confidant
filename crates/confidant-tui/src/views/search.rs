@@ -26,10 +26,11 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
         ])
         .split(area);
 
+    let mode_tag = if state.exact { " [exact]" } else { "" };
     let query_title = if state.editing {
-        " Search (typing query — Enter to search, Esc to cancel) "
+        format!(" Search{mode_tag} (typing query — Enter to search, Esc to cancel) ")
     } else {
-        " Search (press / to enter query, Enter on p-… hit opens Context) "
+        format!(" Search{mode_tag} (press / to enter query, e for exact, Enter on p-… hit opens Context) ")
     };
     let query_line = if state.editing {
         Line::from(vec![
@@ -51,7 +52,7 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
         ])
     };
     frame.render_widget(
-        Paragraph::new(query_line).block(theme::block(query_title)),
+        Paragraph::new(query_line).block(theme::block(&query_title)),
         chunks[0],
     );
 

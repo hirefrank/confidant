@@ -1,5 +1,5 @@
- 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
-╭ Search (press / to enter query, Enter on p-… hit opens Context) ─────────────────────────────────╮
+ 1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox                  confidant-tui v1
+╭ Search (press / to enter query, e for exact, Enter on p-… hit opens Context) ────────────────────╮
 │ query ada                                                                                        │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Status ──────────────────────────────────────────────────────────────────────────────────────────╮
@@ -21,4 +21,4 @@
 │ location  people/p-01M3TC5H00MPJG000000000000.cfd:3  via qmd  score 0.9123                       │
 │ excerpt   Ada Example                                                                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit
+ Tab/1-6  view  /  search  e  exact  j/k  move  Enter  context  r  refresh  q/Esc  quit
