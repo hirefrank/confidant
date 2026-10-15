@@ -2955,11 +2955,16 @@ fn record_edit_rekeys_a_deal_to_the_new_persons_key() {
             DEAL,
             "--file",
             second.to_str().unwrap(),
+            "--json",
             "--no-input",
         ])
         .output()
         .unwrap();
     assert!(out.status.success(), "edit deal: {}", stderr(&out));
+    // #412 Q4: the re-key is reported, not silent.
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["rekeyed"]["from"], PERSON, "{v}");
+    assert_eq!(v["rekeyed"]["to"], PERSON2, "{v}");
 
     let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
     assert!(
@@ -3154,4 +3159,237 @@ fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
         "no-ai: true",
         "the header was not re-stamped: {after}"
     );
+}
+
+/// Flip one base64 character in an envelope's body: still parseable, so it
+/// reaches the AEAD and fails authentication.
+fn tamper_envelope_body(path: &Path) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let body_start = text.rfind("---\n").unwrap() + 4;
+    let mut bytes = text.into_bytes();
+    let i = (body_start..bytes.len())
+        .find(|&i| bytes[i] != b'\n')
+        .expect("the envelope has a body");
+    bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+    std::fs::write(path, &bytes).unwrap();
+}
+
+#[test]
+fn record_edit_refuses_a_tampered_envelope() {
+    // #412 Q4: only the missing-key case was covered; a tampered envelope
+    // takes the same fail-closed path and must not be rewritten.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    tamper_envelope_body(&path);
+    let tampered = std::fs::read(&path).unwrap();
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a tampered envelope must be refused");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot decrypt"),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        tampered,
+        "the tampered file was rewritten"
+    );
+}
+
+#[test]
+fn record_edit_refuses_a_record_with_conflict_markers() {
+    // #412 Q6: the guard runs before the write layer's conflict check, so it
+    // must name the conflict rather than reporting a key problem.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    std::fs::write(
+        &path,
+        format!(
+            "---\nid: {PERSON}\ntype: person\n<<<<<<< HEAD\nno-ai: false\nenc: xchacha20poly1305\n\
+             =======\nno-ai: false\nenc: xchacha20poly1305\n>>>>>>> other\n---\nAQID\n"
+        ),
+    )
+    .unwrap();
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a conflicted record must be refused");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("conflict"), "{v}");
+    assert!(
+        !message.contains("cannot decrypt"),
+        "the conflict was misreported as a key problem: {v}"
+    );
+}
+
+#[test]
+fn record_edit_refuses_when_the_stored_file_holds_another_record() {
+    // #412 Q6: a file whose header names a different record is a broken
+    // vault, not a key problem — say which.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let other_id = PERSON2;
+    let out = h.init_client(other_id);
+    assert!(out.status.success(), "init-client: {}", stderr(&out));
+    for (who, name) in [(PERSON, "Ada"), (PERSON2, "Bea")] {
+        let p = write_file(
+            h._tmp.path(),
+            &format!("{who}.md"),
+            &person_md(who, name, "bio"),
+        );
+        let out = h
+            .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add {who}: {}", stderr(&out));
+    }
+    // Put PERSON's envelope where PERSON2's record belongs.
+    let a = h.vault.join(format!("people/{PERSON}/profile.md"));
+    let b = h.vault.join(format!("people/{other_id}/profile.md"));
+    let b_path = b.clone();
+    std::fs::copy(&a, &b).unwrap();
+    let copied = std::fs::read(&b_path).unwrap();
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(other_id, "Bea Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            other_id,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a mismatched record must be refused");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(PERSON) && message.contains(other_id),
+        "the message should name both records: {v}"
+    );
+    assert!(
+        v["error"]["fix"].as_str().unwrap().contains("record add"),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(&b_path).unwrap(),
+        copied,
+        "the file was rewritten despite the refusal"
+    );
+}
+
+#[test]
+fn dropping_the_last_notes_mode_reference_stamps_visible_again() {
+    // #412 Q5: the stamp follows the record's references in both directions.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client: {}", stderr(&out));
+    // PERSON is notes-hidden; PERSON2 is visible.
+    for (who, body) in [
+        (
+            PERSON,
+            format!(
+                "---\nid: {PERSON}\ntype: person\nname: \"Ada Hidden\"\nno-ai: notes\n---\n\nbio\n"
+            ),
+        ),
+        (PERSON2, person_md(PERSON2, "Bea Visible", "bio")),
+    ] {
+        let p = write_file(h._tmp.path(), &format!("{who}.md"), &body);
+        let out = h
+            .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add {who}: {}", stderr(&out));
+    }
+
+    const IXN: &str = "i-01J9Z3K4QM0000000000000000";
+    let ixn = |person: &str| {
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nname: \"Session one\"\ndate: 2026-10-01\nperson: {person}\n---\n\nNotes about the session.\n"
+        )
+    };
+    let first = write_file(h._tmp.path(), "ixn.md", &ixn(PERSON));
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            first.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add interaction: {}", stderr(&out));
+
+    let path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(outer_label(&before), "no-ai: true", "{before}");
+
+    // Re-point it at the visible person: its only reference is now visible.
+    let second = write_file(h._tmp.path(), "ixn2.md", &ixn(PERSON2));
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            IXN,
+            "--file",
+            second.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+
+    let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(outer_label(&after), "no-ai: false", "{after}");
+    assert_eq!(v["rekeyed"]["from"], PERSON, "{v}");
+    assert_eq!(v["rekeyed"]["to"], PERSON2, "{v}");
 }
