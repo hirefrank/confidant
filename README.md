@@ -102,9 +102,9 @@ The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 
 | Area | Commands | Notes |
 |---|---|---|
-| Read | `find`, `context`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call |
+| Write | `record add`, `record edit`, `note add`, `log session`, `log touch`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
+| Read | `find`, `context`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record show <id> --for-edit` is operator-only and decrypts `no-ai` records |
 | Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
-| Write | `record add`, `note add`, `log session`, `log touch`, `import` | One commit per write; `check` runs before every commit |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
 | Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |
 | Search | `reindex` + `qmd-search` skill | QMD index is local, gitignored, built from the cleared set only |
@@ -316,9 +316,8 @@ The roadmap is tracked as open issues on GitHub. The big themes:
 - **TUI** — a terminal UI on top of the agent contract, with write flows
   and proposal review (Phase 2, #211).
   [Issue #205](https://github.com/hirefrank/confidant/issues/205).
-- **Encrypted editing** — `record edit` through the write pipeline, blocked
-  on the outside audit.
-  [Issue #216](https://github.com/hirefrank/confidant/issues/216).
+- **Encrypted editing** — `record edit` and `record show --for-edit` landed in
+  the CLI (#216). The TUI editor on top of them is still to come.
 - **Ciphertext merge conflicts** — detection and resolution for encrypted
   records. [Issue #219](https://github.com/hirefrank/confidant/issues/219).
 - **Ledger query performance** — a rebuildable local index.

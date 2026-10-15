@@ -2678,3 +2678,213 @@ fn record_show_for_edit_decrypts_no_ai_that_reads_still_hide() {
         "find returned a no-ai record: {found}"
     );
 }
+
+/// `key_id` epoch from a record file, for the epoch assertions below.
+fn envelope_epoch(bytes: &str) -> u64 {
+    let key_id = bytes
+        .lines()
+        .find_map(|l| l.strip_prefix("key_id: "))
+        .expect("envelope has a key_id");
+    key_id
+        .rsplit_once("/e")
+        .expect("key_id carries an epoch")
+        .1
+        .parse()
+        .expect("epoch is numeric")
+}
+
+#[test]
+fn record_edit_refuses_an_envelope_this_device_cannot_decrypt() {
+    // #389 Q4: with the client's key gone, an edit fails closed instead of
+    // rewriting a record this device cannot read.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let before = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(h.vault.join(format!("keys/{PERSON}"))).unwrap();
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the edit should have refused");
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot decrypt"),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the record was rewritten despite the refusal"
+    );
+}
+
+#[test]
+fn record_edit_rekeys_a_deal_to_the_new_persons_key() {
+    // #389 Q4: an edit that changes a deal's `person:` moves the record to
+    // that person's client key.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client: {}", stderr(&out));
+    for (who, name) in [(PERSON, "Ada"), (PERSON2, "Bea")] {
+        let p = write_file(
+            h._tmp.path(),
+            &format!("{who}.md"),
+            &person_md(who, name, "bio"),
+        );
+        let out = h
+            .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add {who}: {}", stderr(&out));
+    }
+
+    const DEAL: &str = "d-01J9Z3K4QJ0000000000000000";
+    let deal = |person: &str| {
+        format!(
+            "---\nid: {DEAL}\ntype: deal\nname: \"Coaching package\"\nperson: {person}\n---\n\nDeal body.\n"
+        )
+    };
+    let first = write_file(h._tmp.path(), "deal.md", &deal(PERSON));
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            first.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add deal: {}", stderr(&out));
+
+    let path = h.vault.join(format!("deals/{DEAL}/deal.md"));
+    let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(before.contains(&format!("key_id: {PERSON}/")), "{before}");
+
+    let second = write_file(h._tmp.path(), "deal2.md", &deal(PERSON2));
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            DEAL,
+            "--file",
+            second.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit deal: {}", stderr(&out));
+
+    let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        after.contains(&format!("key_id: {PERSON2}/")),
+        "the deal did not move to the new person's key: {after}"
+    );
+    assert!(
+        !after.contains(&format!("key_id: {PERSON}/")),
+        "the deal kept the old person's key: {after}"
+    );
+}
+
+#[test]
+fn record_edit_restamps_no_ai_on_the_envelope_header() {
+    // #389 Q5: `no-ai` is re-derived from the edited content.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(before.contains("no-ai: false"), "{before}");
+
+    let hidden = write_file(
+        h._tmp.path(),
+        "hidden.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            hidden.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit: {}", stderr(&out));
+
+    let after = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        after.contains("no-ai: true"),
+        "the outer header kept the old no-ai value: {after}"
+    );
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        !stdout(&out).contains("Bio."),
+        "no-ai was not honoured after the edit: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn record_edit_rewrites_under_the_current_epoch() {
+    // #389 Q3: an edit re-encrypts under the current key epoch.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let path = add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let before = envelope_epoch(&String::from_utf8(std::fs::read(&path).unwrap()).unwrap());
+
+    let out = h
+        .cmd(&["keys", "rotate", PERSON, "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rotate: {}", stderr(&out));
+
+    let edited = write_file(
+        h._tmp.path(),
+        "edited.md",
+        &person_md(PERSON, "Ada Renamed", "New bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit: {}", stderr(&out));
+
+    let after = envelope_epoch(&String::from_utf8(std::fs::read(&path).unwrap()).unwrap());
+    assert!(
+        after > before,
+        "the edit did not move the record to the current epoch ({before} -> {after})"
+    );
+}

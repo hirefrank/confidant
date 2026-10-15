@@ -2931,17 +2931,34 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
 
 /// Vault-relative main file path for a record id, derived from its prefix.
 ///
-/// Notes are deliberately `None`: their files live under
-/// `people/<person>/notes/`, not the collection/main-file layout, and
-/// neither `record edit` nor `record show` handles them.
+/// `None` for the prefixes this pair of commands does not handle: a note's
+/// file lives at `people/<person>/notes/<id>.md` (not the collection/main
+/// layout), and a package has no record file at all.
 fn main_path_for(id: &RecordId) -> Option<PathBuf> {
     let prefix = id.prefix();
+    if matches!(prefix, Prefix::Note | Prefix::Package) {
+        return None;
+    }
     Some(PathBuf::from(format!(
         "{}/{}/{}",
         prefix.collection()?,
         id,
         prefix.main_filename()?
     )))
+}
+
+/// Ids `record show` / `record edit` do not handle, refused as usage errors
+/// (exit 2, ADR-7) rather than looked up and reported as missing.
+fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
+    match id.prefix() {
+        Prefix::Note => Err(anyhow::Error::new(DomainError::usage(
+            "notes are not read or edited by `record`; their files live under people/<person>/notes/",
+        ))),
+        Prefix::Package => Err(anyhow::Error::new(DomainError::usage(
+            "a package is a ledger id, not a record; use `confidant balance <person>`",
+        ))),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2972,24 +2989,42 @@ fn cmd_record_show(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
+    }
     let id = RecordId::parse(id_raw).map_err(|_| {
         anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
             "`record show` takes an opaque record id; use `confidant find <name>` to look one up",
         )
     })?;
+    reject_unsupported_prefix(&id)?;
     let Some(rec) = vault.records.get(&id) else {
-        // A file that is on disk but did not load is a decryption problem,
-        // not a missing record: fail closed and say which (⚠2b, as in
-        // `context`).
-        if main_path_for(&id).is_some_and(|rel| root.join(rel).exists()) {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "cannot read {id_raw}: this device cannot decrypt it"
-                ))
-                .with_fix(
-                    "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                ),
-            ));
+        // A file that is on disk but did not load is a problem with that
+        // file. Only claim a decryption failure when the file really is an
+        // envelope: a plaintext record that failed to parse is a different
+        // error, and `check` already reports it (⚠2b, as in `context`).
+        if let Some(rel) = main_path_for(&id) {
+            if let Ok(bytes) = std::fs::read(root.join(&rel)) {
+                if confidant_core::crypto_mode::is_envelope_bytes(&bytes) {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid(format!(
+                            "cannot read {id_raw}: this device cannot decrypt it"
+                        ))
+                        .with_fix(
+                            "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                        ),
+                    ));
+                }
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot read {id_raw}: {} is not a readable record",
+                        rel.display()
+                    ))
+                    .with_fix("Run `confidant check` for the finding on that file"),
+                ));
+            }
         }
         return Err(anyhow::Error::new(DomainError::not_found(format!(
             "no record with id {id_raw}"
@@ -3026,6 +3061,15 @@ fn cmd_record_show(
 /// match the id argument so a wrong file cannot silently clobber a record.
 fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
+    // Parse the id the same way every other positional record id is parsed:
+    // a malformed argument is a usage error (exit 2, ADR-7), and parsing
+    // canonicalises a lowercase ULID instead of rejecting it.
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
+            "`record edit` takes an opaque record id; use `confidant find <name>` to look one up",
+        )
+    })?;
+    reject_unsupported_prefix(&id)?;
     let text = std::fs::read_to_string(file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
@@ -3038,16 +3082,51 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         .unwrap_or_else(|| "record.md".to_owned());
     let rec = confidant_core::parse_record(&text, &provisional)
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
-    if rec.kind == RecordKind::Note {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "record edit does not edit notes; their files live under people/<person>/notes/",
-        )));
-    }
-    if rec.id.to_string() != id_raw {
+    if rec.id != id {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
                 .with_fix("Edit the record the file names, or fix `id:` in the file"),
         ));
+    }
+    // `record add` validates `with:` shape before encrypting, and an edit
+    // must too: in an encrypted vault the post-write `check` cannot see
+    // inside the envelope, so a malformed list would be committed and later
+    // block `keys shred` (which refuses when an interaction's `with:` will
+    // not parse). Touchpoints are not mirrored on an edit — see the PR notes.
+    if rec.kind == RecordKind::Interaction {
+        if let Some(raw) = rec.field("with") {
+            let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
+                anyhow::Error::new(
+                    DomainError::invalid(
+                        "front matter key 'with' is not a bracketed list of person IDs",
+                    )
+                    .with_fix("Use with: [p-<ULID>, p-<ULID>]"),
+                )
+            })?;
+            let primary = rec.person();
+            let mut seen: Vec<RecordId> = Vec::new();
+            for participant in &with {
+                if participant.prefix() != Prefix::Person {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: entries must be person ids")
+                            .with_fix("Use p-<ULID> ids in with:"),
+                    ));
+                }
+                if Some(participant) == primary.as_ref() {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the interaction's own person")
+                            .with_fix("Remove the primary person from with:"),
+                    ));
+                }
+                if seen.contains(participant) {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the same participant twice")
+                            .with_fix("List each participant once in with:"),
+                    ));
+                }
+                seen.push(participant.clone());
+            }
+        }
     }
     let rel = main_record_path(&rec)
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
@@ -3057,26 +3136,27 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
                 .with_fix("Use `confidant record add --file` to create a new record"),
         ));
     }
-    // #389 Q4: fail closed when the existing envelope cannot be read here.
-    // `encrypt_file`'s stability check treats an unreadable envelope as
-    // "reencrypt", which is right for an inbox retry but wrong for an edit:
-    // it would silently rewrite a record this device cannot read, possibly
-    // under a different client's key. Check readability first.
-    if let Ok(existing) = std::fs::read(root.join(&rel)) {
-        if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
-            if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
-                enc.decrypt_existing(&rel, &existing).map_err(|_| {
-                    anyhow::Error::new(
-                        DomainError::invalid(format!(
-                            "cannot edit {}: this device cannot decrypt the record",
-                            rel.display()
-                        ))
-                        .with_fix(
-                            "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                        ),
-                    )
-                })?;
-            }
+    // The path was checked above, so a read error here is a real failure and
+    // must not be swallowed by a fail-closed guard.
+    let existing = std::fs::read(root.join(&rel)).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            rel.display()
+        )))
+    })?;
+    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
+        if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
+            enc.decrypt_existing(&rel, &existing).map_err(|_| {
+                anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot edit {}: this device cannot decrypt the record",
+                        rel.display()
+                    ))
+                    .with_fix(
+                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                    ),
+                )
+            })?;
         }
     }
     let id = rec.id.to_string();
