@@ -349,6 +349,7 @@ fn is_trusted_component(name: &str) -> bool {
             | "deals"
             | "interactions"
             | "notes"
+            | "edges"
             | "ledger"
             | "keys"
             | ".confidant"
@@ -358,6 +359,7 @@ fn is_trusted_component(name: &str) -> bool {
             | "note.md"
             | "deal.md"
             | "interaction.md"
+            | "edge.md"
     ) || is_yyyy(name)
         || is_month_cfd(name)
         || RecordId::parse(name).is_ok()
@@ -1514,7 +1516,8 @@ fn is_month_cfd(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_month_cfd, redacted_filename};
+    use super::Prefix;
+    use super::{is_month_cfd, is_trusted_component, redacted_filename, COLLECTIONS};
     use std::path::Path;
 
     #[test]
@@ -1576,5 +1579,48 @@ mod tests {
             redacted_filename(Path::new("./people/ZXQVLEAK.md")),
             "<invalid-filename>"
         );
+    }
+
+    #[test]
+    fn edge_paths_keep_structural_components() {
+        // A valid edge file is trusted: returned unchanged, no marker.
+        assert_eq!(
+            redacted_filename(Path::new("edges/e-01M3TC5H00MPJG000000000000/edge.md")),
+            "edges/e-01M3TC5H00MPJG000000000000/edge.md"
+        );
+        // An invalid filename under an edge directory keeps the trusted
+        // structural parts; only the bad component becomes the marker.
+        assert_eq!(
+            redacted_filename(Path::new("edges/e-01M3TC5H00MPJG000000000000/ZXQVLEAK.md")),
+            "edges/e-01M3TC5H00MPJG000000000000/<invalid-filename>"
+        );
+    }
+
+    #[test]
+    fn all_structural_names_are_trusted() {
+        // Every collection directory and every record main filename is
+        // structural and can never be a client name, so the next
+        // collection added to COLLECTIONS can't drift out of
+        // is_trusted_component.
+        for collection in COLLECTIONS {
+            assert!(
+                is_trusted_component(collection),
+                "collection dir not trusted: {collection}"
+            );
+        }
+        for prefix in [
+            Prefix::Person,
+            Prefix::Org,
+            Prefix::Deal,
+            Prefix::Interaction,
+            Prefix::Note,
+            Prefix::Edge,
+        ] {
+            let filename = prefix.main_filename().unwrap();
+            assert!(
+                is_trusted_component(filename),
+                "main filename not trusted: {filename}"
+            );
+        }
     }
 }
