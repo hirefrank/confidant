@@ -3298,6 +3298,79 @@ fn skills_links_check() -> DoctorCheck {
     }
 }
 
+/// #386: informational `qmd` search-availability check. qmd is optional,
+/// so this is always `ok` — the same rule as the offline staleness check:
+/// a missing qmd never warns or fails, it just means search falls back to
+/// `confidant find` (see `qmd-query.py`).
+///
+/// Reports, in order: qmd on PATH? corpus built? embeddings present?
+/// (Hybrid and vector modes need `qmd embed`; bm25 keyword search works
+/// without it.)
+fn qmd_search_check(root: &Path) -> DoctorCheck {
+    const ID: &str = "qmd-search";
+    const INSTALL_HINT: &str = "npm install -g @tobilu/qmd";
+    let ok = |message: String| DoctorCheck {
+        id: ID,
+        status: "ok",
+        message,
+    };
+
+    let Some(qmd) = find_on_path("qmd") else {
+        return ok(format!(
+            "qmd not found on PATH; search falls back to `confidant find` \
+             (install with `{INSTALL_HINT}` to enable semantic search)"
+        ));
+    };
+    if !root.join(QMD_CORPUS_REL).is_dir() {
+        return ok("qmd is on PATH but the search corpus is missing; \
+             run `confidant reindex` to rebuild it \
+             (search falls back to `confidant find`)"
+            .to_owned());
+    }
+    match qmd_embedded_vectors(root, &qmd) {
+        Some(n) if n > 0 => ok(format!("qmd search available ({n} embedded vectors)")),
+        _ => ok(
+            "qmd index has no embedded vectors; hybrid/vector search needs \
+             `qmd embed` (bm25 keyword search works without it)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Probe the vault-local qmd store for embedded vectors, mirroring
+/// `qmd-query.py`'s `vectors_available` (same env, same `status` parse).
+/// Returns `None` when qmd cannot report (missing store, failing status).
+fn qmd_embedded_vectors(root: &Path, qmd: &Path) -> Option<u64> {
+    let store = root.join(QMD_STORE_REL);
+    let out = std::process::Command::new(qmd)
+        .arg("status")
+        .env("INDEX_PATH", store.join("index.sqlite"))
+        .env("QMD_CONFIG_DIR", store.join("config"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_embedded_vectors(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `qmd status` output for a `Vectors: <n> embedded` line.
+fn parse_embedded_vectors(output: &str) -> Option<u64> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Vectors:") {
+            let digits: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn cmd_doctor(
     cli: &Cli,
     root: &Path,
@@ -3611,6 +3684,8 @@ fn cmd_doctor(
         let latest = if offline { None } else { latest_release_tag() };
         checks.push(cli_staleness_check(latest, offline));
         checks.push(skills_links_check());
+        // #386: qmd search availability (informational; never warns or fails).
+        checks.push(qmd_search_check(root));
     }
 
     let ok = !checks.iter().any(|c| c.status == "error");
