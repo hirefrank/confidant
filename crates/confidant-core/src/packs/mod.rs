@@ -22,6 +22,7 @@ use crate::ledger::LedgerEntry;
 use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
+pub mod grammars;
 pub mod groups;
 pub mod manifest;
 pub mod personal;
