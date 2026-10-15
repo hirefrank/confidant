@@ -3615,6 +3615,35 @@ fn check_ledger_merge_conflict_does_not_leak_name() {
     );
 }
 
+/// #391 (part of #219): a git conflict on an encrypted record — an `enc:`
+/// envelope — is detected from the raw bytes, before anything tries to
+/// decrypt it. Both devices rewrote the envelope, so the conflict spans
+/// the outer front matter (the `nonce:` line) as well as the body, which
+/// is the case that makes the markers unparseable by `parse_record`.
+#[test]
+fn check_envelope_merge_conflict_reports_the_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    // A `keys/` tree is what makes the vault structurally encrypted.
+    write(dir.path(), "keys/operator.toml", "# placeholder\n");
+    write(
+        dir.path(),
+        "people/p-01M3TC5H00MPJG000000000000/profile.md",
+        "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nno-ai: false\n\
+         <<<<<<< HEAD\nenc: xchacha20poly1305\nkey_id: p-01M3TC5H00MPJG000000000000/e1\n\
+         nonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n=======\nenc: xchacha20poly1305\n\
+         key_id: p-01M3TC5H00MPJG000000000000/e1\nnonce: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
+         >>>>>>> other\n---\nAQID\n",
+    );
+    let json = report_json(dir.path(), None);
+    let found = codes(&json);
+    assert!(found.contains(&"E_MERGE_CONFLICT".to_string()), "{json}");
+    assert!(
+        !found.contains(&"E_FRONTMATTER".to_string()),
+        "conflict markers produced a derived E_FRONTMATTER: {json}"
+    );
+}
+
 /// #7 (round 2): an unreadable ledger subdirectory redacts the directory
 /// name in the directory-level Unreadable finding.
 #[test]
