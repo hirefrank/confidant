@@ -129,6 +129,14 @@ fn parse_key_id(key_id: &str) -> Result<(String, u64), Error> {
     Ok((client.to_string(), epoch))
 }
 
+/// Client half of a `key_id` (`<client>/e<epoch>`).
+///
+/// The key id layout is defined here, once — callers that need the client
+/// out of an envelope's key id use this instead of re-splitting the string.
+pub fn key_id_client(key_id: &str) -> Result<String, Error> {
+    parse_key_id(key_id).map(|(client, _)| client)
+}
+
 /// Parse an envelope from file bytes. Structural only — no keys needed.
 pub fn parse(bytes: &[u8]) -> Result<Envelope, Error> {
     let text = std::str::from_utf8(bytes)
