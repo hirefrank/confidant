@@ -77,6 +77,11 @@ pub struct Vault {
     /// Path-derived record IDs, including files/directories that failed to load.
     /// Always uncleared when not present in `records`.
     pub path_ids: BTreeSet<RecordId>,
+    /// Path-derived record IDs whose files carry git conflict markers (#396).
+    /// These records cannot be parsed, so references to them would otherwise
+    /// report misleading `E_DANGLING_REF` findings; the `E_MERGE_CONFLICT`
+    /// finding on the file itself already reports the cause.
+    pub conflicted_ids: BTreeSet<RecordId>,
     /// Crockford ULIDs taken from visited file/directory names whose windows
     /// are not already a loaded record's own exact name.
     pub path_ulids: BTreeSet<String>,
@@ -129,6 +134,7 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     let mut findings = config.config_findings();
     let mut records = BTreeMap::new();
     let mut path_ids = BTreeSet::new();
+    let mut conflicted_ids = BTreeSet::new();
     let mut path_ulids = BTreeSet::new();
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
@@ -144,6 +150,11 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         for (job, out) in jobs.iter().zip(outs) {
             skipped_encrypted += out.skipped;
             refused_envelopes += out.refused;
+            if out.conflicted {
+                if let Some(id) = &job.path_id {
+                    conflicted_ids.insert(id.clone());
+                }
+            }
             merge_markdown_job(job, (out.record, out.findings), &mut records, &mut findings);
         }
         scan_ledger(
@@ -167,6 +178,7 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         load_findings: findings,
         ledger_unread_count,
         path_ids,
+        conflicted_ids,
         path_ulids,
         skipped_encrypted,
         refused_envelopes,
@@ -812,6 +824,8 @@ struct JobOutput {
     findings: Vec<Finding>,
     skipped: u32,
     refused: u32,
+    /// Whether the file carries git conflict markers (#396).
+    conflicted: bool,
 }
 
 /// Merge one job result: content findings first (walk order is preserved
@@ -861,11 +875,12 @@ fn merge_markdown_job(
 fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) -> JobOutput {
     let mut findings = Vec::new();
     let file = paths::display_relative(&job.relative);
-    let fail = |findings: Vec<Finding>| JobOutput {
+    let fail = |findings: Vec<Finding>, conflicted: bool| JobOutput {
         record: None,
         findings,
         skipped: 0,
         refused: 0,
+        conflicted,
     };
     let text = match paths::read_to_string(root, &job.relative) {
         Ok(t) => t,
@@ -879,7 +894,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                 .at_file(&file)
                 .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
-            return fail(findings);
+            return fail(findings, false);
         }
     };
     // #391: conflict markers are detected from the raw bytes, before any
@@ -917,6 +932,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                     findings,
                     skipped: 1,
                     refused: 0,
+                    conflicted,
                 }
             }
             ContentOutcome::Refused => {
@@ -925,6 +941,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                     findings,
                     skipped: 0,
                     refused: 1,
+                    conflicted,
                 }
             }
         },
@@ -941,14 +958,14 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                 .at_file(&file)
                 .with_fix("Replace the file with valid UTF-8 Markdown"),
             );
-            return fail(findings);
+            return fail(findings, false);
         }
     };
     if conflicted {
         // #391: the markers make the file unparseable by construction, so
         // parsing on would only add a derived E_FRONTMATTER pointing at the
         // marker lines themselves. Report the conflict and stop.
-        return fail(findings);
+        return fail(findings, true);
     }
     match parse_record(&text, &file) {
         Err(err) => {
@@ -963,6 +980,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                 findings,
                 skipped: 0,
                 refused: 0,
+                conflicted,
             }
         }
         Ok(mut rec) => {
@@ -1019,6 +1037,7 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
                 findings,
                 skipped: 0,
                 refused: 0,
+                conflicted,
             }
         }
     }
