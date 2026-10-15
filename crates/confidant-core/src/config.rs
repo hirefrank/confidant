@@ -10,8 +10,6 @@ use crate::error::DomainError;
 use crate::ledger::parse_strict_date;
 
 pub const SPEC_VERSION: &str = "0.1";
-pub const COACHING_PACK: &str = "coaching@0.1";
-pub const PERSONAL_PACK: &str = "personal@0.1";
 pub const MAX_GAP_DAYS: u64 = 3650;
 
 /// `[checks]` severity keys, from the compiled packs' manifests (#345).
@@ -422,7 +420,7 @@ pub fn parse_iso_date(s: &str) -> Result<chrono::NaiveDate, DomainError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VaultConfig, COACHING_PACK, MAX_GAP_DAYS};
+    use super::{VaultConfig, MAX_GAP_DAYS};
     use crate::check::Severity;
 
     #[test]
@@ -442,7 +440,7 @@ coaching.paid_session_gap_days = 45
         .unwrap();
         assert!(cfg.config_findings().is_empty());
         assert_eq!(cfg.spec, "0.1");
-        assert!(cfg.has_pack(COACHING_PACK));
+        assert!(cfg.has_pack("coaching@0.1"));
         assert_eq!(
             cfg.checks
                 .severity("coaching.require_duration", Severity::Warning),
