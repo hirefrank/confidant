@@ -602,11 +602,7 @@ fn auto_init_rolls_back_key_dir_when_commit_fails() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &pre_commit,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     git(
         &h.vault,
