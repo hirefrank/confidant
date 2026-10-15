@@ -3003,6 +3003,114 @@ fn keys_shred_refused_shred_restores_working_tree() {
 }
 
 #[test]
+fn keys_shred_strip_refusal_restores_deleted_edges() {
+    // #320 / #336 review: `delete_edges_naming` deletes edge files BEFORE
+    // `strip_participant_from_interactions` runs. If the strip step refuses
+    // afterwards (here: a malformed `with:` list), the deleted edge must be
+    // restored byte-identical — otherwise a re-run cannot rediscover it,
+    // and it stays in HEAD under `vault:shared` (privacy leak).
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    const PERSON_A: &str = "p-01J9Z3K4QF0000000000000000";
+    const PERSON_B: &str = "p-01J9Z3K4QG0000000000000000";
+    const EDGE_AB: &str = "e-01M3TC5H00MPJG00E100000000";
+    const BAD_IXN: &str = "i-01M3TC5H00MPJG0048H0000009";
+    for client in [PERSON_A, PERSON_B] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+    for (id, name) in [(PERSON_A, "Ada Example"), (PERSON_B, "Bea Demo")] {
+        let file = h._tmp.path().join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\nBio.\n"),
+        )
+        .unwrap();
+        let out = h
+            .cmd(&[
+                "record",
+                "add",
+                "--file",
+                file.to_str().unwrap(),
+                "--no-input",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "record add {id} failed");
+    }
+    // An edge naming A.
+    let file = h._tmp.path().join(format!("{EDGE_AB}.md"));
+    std::fs::write(
+        &file,
+        format!(
+            "---\nid: {EDGE_AB}\ntype: edge\na: {PERSON_A}\nb: {PERSON_B}\nkind: married\n---\n"
+        ),
+    )
+    .unwrap();
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            file.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add edge failed");
+
+    // An interaction with a MALFORMED `with:` list, written directly:
+    // `record add` would reject it, but the strip step must still fail
+    // closed on one it finds in the tree. Plaintext (non-envelope) files
+    // pass through the decrypt hook and parse as ordinary records.
+    let bad_ixn = h
+        .vault
+        .join(format!("interactions/{BAD_IXN}/interaction.md"));
+    std::fs::create_dir_all(bad_ixn.parent().unwrap()).unwrap();
+    std::fs::write(
+        &bad_ixn,
+        format!(
+            "---\nid: {BAD_IXN}\ntype: interaction\nperson: {PERSON_B}\ndate: 2026-10-06\nwith: not-a-bracketed-list\n---\n\nBody.\n"
+        ),
+    )
+    .unwrap();
+
+    let edge_ab = h.vault.join(format!("edges/{EDGE_AB}/edge.md"));
+    let edge_before = std::fs::read(&edge_ab).unwrap();
+
+    // Shred A: the edge is deleted first, then the strip step refuses on
+    // the malformed `with:`.
+    let out = h
+        .cmd(&["keys", "shred", PERSON_A, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "shred should refuse the malformed with: list"
+    );
+    // With --json the refusal surfaces as JSON on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("malformed"),
+        "expected a malformed-with: refusal, got stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Rollback: the deleted edge file is byte-identical to before.
+    assert_eq!(
+        std::fs::read(&edge_ab).unwrap(),
+        edge_before,
+        "deleted edge file was not restored after strip refusal"
+    );
+}
+
+#[test]
 fn keys_shred_primary_then_another_participant_proceeds() {
     // #258 review: after shredding a PRIMARY, their interaction (now under a
     // destroyed key) must not block shredding someone else. A is the primary
