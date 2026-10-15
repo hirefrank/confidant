@@ -794,3 +794,137 @@ fn tui_propagates_child_exit_code() {
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
 }
+
+// #386: `find --json` carries an optional ranked-search hint only when qmd
+// is on PATH and the corpus exists. Matches, ordering, and exit status
+// never change.
+#[cfg(unix)]
+fn write_fake_qmd_for_find(dir: &std::path::Path) {
+    std::fs::write(dir.join("qmd"), "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("qmd"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn find_json_hint_absent_without_qmd_or_corpus() {
+    let empty = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(["find", "Ada Example", "--json", "--vault"])
+        .arg(demo())
+        .env("PATH", empty.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.get("hint").is_none(), "hint must be absent: {v}");
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| { m["excerpt"].as_str().unwrap().contains("Ada Example") }));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_json_hint_present_with_qmd_and_corpus() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd_for_find(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    // Copy the demo vault so we can create a corpus dir without touching it.
+    let demo = demo();
+    std::fs::create_dir_all(&vault).unwrap();
+    for entry in std::fs::read_dir(&demo).unwrap() {
+        let entry = entry.unwrap();
+        let dest = vault.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            let mut stack = vec![(entry.path(), dest)];
+            while let Some((src, dst)) = stack.pop() {
+                std::fs::create_dir_all(&dst).unwrap();
+                for e in std::fs::read_dir(&src).unwrap().flatten() {
+                    let d = dst.join(e.file_name());
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push((e.path(), d));
+                    } else {
+                        std::fs::copy(e.path(), d).unwrap();
+                    }
+                }
+            }
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = Command::new(bin())
+        .args(["find", "Ada Example", "--json", "--vault"])
+        .arg(&vault)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hint = v["hint"].as_str().expect("hint present");
+    assert!(hint.contains("qmd-search"), "{v}");
+    // Matches unchanged by the hint.
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| { m["excerpt"].as_str().unwrap().contains("Ada Example") }));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_text_hint_goes_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fake_qmd_for_find(dir.path());
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let demo = demo();
+    for entry in std::fs::read_dir(&demo).unwrap() {
+        let entry = entry.unwrap();
+        let dest = vault.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            let mut stack = vec![(entry.path(), dest)];
+            while let Some((src, dst)) = stack.pop() {
+                std::fs::create_dir_all(&dst).unwrap();
+                for e in std::fs::read_dir(&src).unwrap().flatten() {
+                    let d = dst.join(e.file_name());
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push((e.path(), d));
+                    } else {
+                        std::fs::copy(e.path(), d).unwrap();
+                    }
+                }
+            }
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+    let path = format!(
+        "{}:{}",
+        dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let out = Command::new(bin())
+        .args(["find", "Ada Example", "--vault"])
+        .arg(&vault)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("qmd-search"), "{stderr}");
+}

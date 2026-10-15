@@ -148,7 +148,7 @@ fn contract_goldens_deserialize_and_render_in_check_view() {
 }
 
 #[test]
-fn find_context_and_doctor_views_snapshot() {
+fn search_context_and_doctor_views_snapshot() {
     let find_json = r#"{
         "ok": true,
         "schema_version": "1",
@@ -250,18 +250,25 @@ fn find_context_and_doctor_views_snapshot() {
 
     let mut app = App::new(fake);
 
-    // Press `/` to enter query in Find, type "Ada Example", press Enter.
+    // Unified Search tab (#387): switch with `5`, toggle exact literal
+    // scan with `e`, then press `/`, type, Enter.
+    app.handle_key(key(KeyCode::Char('5')));
+    assert_eq!(app.active_view, ActiveView::Search);
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(app.search.exact);
     app.handle_key(key(KeyCode::Char('/')));
-    assert_eq!(app.active_view, ActiveView::Find);
-    assert_eq!(app.input_mode, InputMode::EditingFind);
+    assert_eq!(app.active_view, ActiveView::Search);
+    assert_eq!(app.input_mode, InputMode::EditingSearch);
     for ch in "Ada Example".chars() {
         app.handle_key(key(KeyCode::Char(ch)));
     }
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.input_mode, InputMode::Normal);
-    let find_rendered = render_to_string(&app);
-    assert!(find_rendered.contains("Ada Example"));
-    assert_snapshot("find_view.snap", &find_rendered);
+    let search_rendered = render_to_string(&app);
+    assert!(search_rendered.contains("Ada Example"));
+    assert!(search_rendered.contains("[exact]"));
+    assert!(search_rendered.contains("find-exact"));
+    assert_snapshot("search_exact.snap", &search_rendered);
 
     // Press Enter on the `p-01M3TC5H00MPJG000000000000` hit to open Context.
     app.handle_key(key(KeyCode::Enter));
@@ -271,13 +278,34 @@ fn find_context_and_doctor_views_snapshot() {
     assert!(context_rendered.contains("sessions_remaining: 5"));
     assert_snapshot("context_view.snap", &context_rendered);
 
-    // Switch to Doctor view with `4`.
-    app.handle_key(key(KeyCode::Char('4')));
+    // Switch to Doctor view with `3` (tabs renumbered 7 -> 6).
+    app.handle_key(key(KeyCode::Char('3')));
     assert_eq!(app.active_view, ActiveView::Doctor);
     let doctor_rendered = render_to_string(&app);
     assert!(doctor_rendered.contains("vault-discovery"));
     assert!(doctor_rendered.contains("cli-staleness"));
     assert_snapshot("doctor_view.snap", &doctor_rendered);
+}
+
+#[test]
+fn search_exact_toggle_reruns_query() {
+    let find_json = r#"{
+        "ok": true, "schema_version": "1", "vault": "/fake/v",
+        "query": "ada", "matches": [], "findings": [],
+        "skipped_encrypted": 0, "refused_envelopes": 0, "scope": []
+    }"#;
+    let fake = FakeRunner::new().with_response("find", 0, find_json);
+    let mut app = App::new(fake);
+    app.active_view = ActiveView::Search;
+    // No query yet: toggle flips the mode without running anything.
+    assert!(!app.search.exact);
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(app.search.exact);
+    assert!(app.runner.recorded_calls().is_empty());
+    // With a query present, toggling re-runs through the new engine.
+    app.search.query = "ada".to_owned();
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(!app.search.exact);
 }
 
 #[test]
@@ -431,14 +459,15 @@ fn live_find_omits_no_ai_people_in_tui() {
     let runner =
         ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
     let mut app = App::new(runner);
-    app.active_view = ActiveView::Find;
-    app.run_find("Cam Sample");
+    app.active_view = ActiveView::Search;
+    app.search.exact = true;
+    app.run_search("Cam Sample");
 
-    let res = app.find.result.as_ref().expect("find result populated");
+    let res = app.search.result.as_ref().expect("search result populated");
     assert!(
-        res.matches.is_empty(),
+        res.kept.is_empty(),
         "expected no matches for no-ai person, got {:?}",
-        res.matches
+        res.kept
     );
     let rendered = render_to_string(&app);
     assert!(rendered.contains("0 matches"));
@@ -512,7 +541,7 @@ fn check_blocked_json() -> &'static str {
 fn open_proposals_app(dir: &Path, runner: FakeRunner) -> App<FakeRunner> {
     let mut app = App::new(runner);
     app.set_vault_root(dir.to_path_buf());
-    app.handle_key(key(KeyCode::Char('5')));
+    app.handle_key(key(KeyCode::Char('4')));
     assert_eq!(app.active_view, ActiveView::Proposals);
     app
 }
@@ -733,7 +762,7 @@ fn proposals_list_shows_counts_from_lightfield_proposer() {
 
     let mut app = App::new(FakeRunner::new());
     app.set_vault_root(dir.clone());
-    app.handle_key(key(KeyCode::Char('5')));
+    app.handle_key(key(KeyCode::Char('4')));
     assert_eq!(app.proposals.entries.len(), 1);
     let entry = &app.proposals.entries[0];
     assert_eq!(entry.skill, "lightfield-import");
@@ -939,7 +968,7 @@ fn inbox_empty_json() -> &'static str {
 fn inbox_dry_run_renders_items_warnings_and_skipped() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     let rendered = render_to_string(&app);
     assert!(rendered.contains("01JAAA"), "item name shown:\n{rendered}");
@@ -960,7 +989,7 @@ fn inbox_dry_run_renders_items_warnings_and_skipped() {
 fn inbox_empty_renders_nothing_to_do() {
     let fake = FakeRunner::from_json(0, inbox_empty_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     let rendered = render_to_string(&app);
     assert!(
         rendered.contains("nothing to do"),
@@ -981,7 +1010,7 @@ fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
     fake.push_response(0, inbox_empty_json().as_bytes().to_vec());
 
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     // Begin apply: confirm modal opens.
     app.handle_key(key(KeyCode::Char('a')));
     assert!(app.inbox.confirming, "confirm modal open");
@@ -1019,7 +1048,7 @@ fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
 fn inbox_apply_cancel_does_not_run_real_inbox() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     app.handle_key(key(KeyCode::Char('a')));
     assert!(app.inbox.confirming);
     // Any key other than y cancels.
@@ -1036,7 +1065,7 @@ fn inbox_apply_cancel_does_not_run_real_inbox() {
 fn inbox_apply_with_no_items_does_not_open_confirm() {
     let fake = FakeRunner::from_json(0, inbox_empty_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     app.handle_key(key(KeyCode::Char('a')));
     assert!(!app.inbox.confirming, "no confirm when nothing to apply");
 }
@@ -1046,29 +1075,29 @@ fn inbox_tab_falls_through_to_shared_navigation() {
     // Tab from Inbox wraps around to Check.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.active_view, ActiveView::Check);
 
-    // `5` from Inbox switches to Proposals.
+    // `4` from Inbox switches to Proposals.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
-    app.handle_key(key(KeyCode::Char('5')));
+    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('4')));
     assert_eq!(app.active_view, ActiveView::Proposals);
 
     // Shift-Tab from Inbox steps back to Search.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     app.handle_key(key(KeyCode::BackTab));
     assert_eq!(app.active_view, ActiveView::Search);
 
     // Esc with no alert quits.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     app.handle_key(key(KeyCode::Esc));
     assert!(app.should_quit, "Esc quits from the inbox tab");
 }
@@ -1077,7 +1106,7 @@ fn inbox_tab_falls_through_to_shared_navigation() {
 fn inbox_q_quits() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     app.handle_key(key(KeyCode::Char('q')));
     assert!(app.should_quit, "q quits from the inbox tab");
@@ -1118,7 +1147,7 @@ fn inbox_live_dry_run_empty_vault() {
         .with_env("CONFIDANT_KEYCHAIN", "off")
         .with_env("HOME", home.path().to_string_lossy().to_string());
     let mut app = App::new(runner);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('6')));
     let report = app.inbox.report.as_ref().expect("report loaded");
     assert!(report.empty, "no inbox branch -> empty");
     assert!(report.dry_run);

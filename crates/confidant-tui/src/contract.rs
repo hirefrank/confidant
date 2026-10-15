@@ -109,6 +109,11 @@ pub struct FindResult {
     pub refused_envelopes: u32,
     #[serde(default)]
     pub scope: Vec<String>,
+    /// Optional ranked-search hint (#386): present only when qmd is on
+    /// PATH and the corpus exists. Absent otherwise; readers must accept
+    /// both shapes.
+    #[serde(default)]
+    pub hint: Option<String>,
 }
 
 /// One search match inside a [`FindResult`].

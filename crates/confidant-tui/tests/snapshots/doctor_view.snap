@@ -1,4 +1,4 @@
- 1:Check   2:Find   3:Context   4:Doctor   5:Proposals   6:Search   7:Inbox         confidant-tui v1
+ 1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox                  confidant-tui v1
 ╭ Doctor Summary ──────────────────────────────────────────────────────────────────────────────────╮
 │  OK   checks 4                                                                                   │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -21,4 +21,4 @@
 │ status  [ok]                                                                                     │
 │ message vault resolved to /fake/demo-vault                                                       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tab/1-7  view  /  find  j/k  move  Enter  context  r  refresh  q/Esc  quit
+ Tab/1-6  view  /  search  e  exact  j/k  move  Enter  context  r  refresh  q/Esc  quit

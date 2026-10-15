@@ -150,7 +150,10 @@ fn doctor_qmd_corpus_without_vectors_points_at_embed() {
     let vault = vault_dir.path().join("vault");
     copy_dir(&demo(), &vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
-
+    // The probe skips `qmd status` until the store exists (some qmd
+    // versions create an empty index file as a side effect); a missing
+    // store reports "no embedded vectors" without invoking qmd and
+    // without creating the file.
     let v = run_doctor(
         &vault,
         &path_with_fake_qmd(dir.path()),
@@ -161,6 +164,10 @@ fn doctor_qmd_corpus_without_vectors_points_at_embed() {
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("no embedded vectors"), "{msg}");
     assert!(msg.contains("qmd embed"), "{msg}");
+    assert!(
+        !vault.join(".confidant/qmd/index.sqlite").exists(),
+        "probe must not create the index file"
+    );
 }
 
 #[cfg(unix)]
@@ -172,6 +179,9 @@ fn doctor_qmd_with_vectors_reports_ready() {
     let vault = vault_dir.path().join("vault");
     copy_dir(&demo(), &vault);
     std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+    // The probe only runs once the store file exists.
+    std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
+    std::fs::write(vault.join(".confidant/qmd/index.sqlite"), b"fake").unwrap();
 
     let v = run_doctor(
         &vault,
@@ -182,4 +192,32 @@ fn doctor_qmd_with_vectors_reports_ready() {
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("12 embedded vectors"), "{msg}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_qmd_status_failure_does_not_point_at_embed() {
+    let dir = tempfile::tempdir().unwrap();
+    // Fake qmd whose `status` fails: the message must point at `qmd status`
+    // for diagnosis, not at `qmd embed` (which would not fix a broken status).
+    std::fs::write(dir.path().join("qmd"), "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.path().join("qmd"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let vault_dir = tempfile::tempdir().unwrap();
+    let vault = vault_dir.path().join("vault");
+    copy_dir(&demo(), &vault);
+    std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
+    std::fs::create_dir_all(vault.join(".confidant/qmd")).unwrap();
+    std::fs::write(vault.join(".confidant/qmd/index.sqlite"), b"fake").unwrap();
+
+    let v = run_doctor(&vault, &path_with_fake_qmd(dir.path()), &[]);
+    let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("qmd status"), "{msg}");
+    assert!(!msg.contains("qmd embed"), "{msg}");
 }

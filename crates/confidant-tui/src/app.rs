@@ -16,27 +16,25 @@ use crate::contract::{
 };
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
-use crate::search::{filter_search_result, SearchViewState};
+use crate::search::{filter_search_result, find_result_to_search, SearchViewState};
 use crate::views::alert::{self, AlertState};
 use crate::views::check::{self, CheckViewState};
 use crate::views::confirm::{self, ConfirmState};
 use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
-use crate::views::find::{self, FindViewState};
 use crate::views::inbox::{self, InboxViewState};
 use crate::views::proposals::{
     self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
 };
 use crate::views::search;
 
-/// The seven views: four Phase 1 views, proposal review (Phase 2),
-/// QMD search (Phase 3a), inbox (Phase 3c).
+/// The six views (#387): Check, Context, Doctor, Proposals, unified
+/// Search (qmd-ranked with an exact `find` toggle), Inbox.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
     Check,
-    Find,
     Context,
     Doctor,
     Proposals,
@@ -47,8 +45,7 @@ pub enum ActiveView {
 impl ActiveView {
     pub fn next(self) -> Self {
         match self {
-            Self::Check => Self::Find,
-            Self::Find => Self::Context,
+            Self::Check => Self::Context,
             Self::Context => Self::Doctor,
             Self::Doctor => Self::Proposals,
             Self::Proposals => Self::Search,
@@ -60,8 +57,7 @@ impl ActiveView {
     pub fn prev(self) -> Self {
         match self {
             Self::Check => Self::Inbox,
-            Self::Find => Self::Check,
-            Self::Context => Self::Find,
+            Self::Context => Self::Check,
             Self::Doctor => Self::Context,
             Self::Proposals => Self::Doctor,
             Self::Inbox => Self::Search,
@@ -72,12 +68,11 @@ impl ActiveView {
     pub fn label(self) -> &'static str {
         match self {
             Self::Check => "1:Check",
-            Self::Find => "2:Find",
-            Self::Context => "3:Context",
-            Self::Doctor => "4:Doctor",
-            Self::Proposals => "5:Proposals",
-            Self::Search => "6:Search",
-            Self::Inbox => "7:Inbox",
+            Self::Context => "2:Context",
+            Self::Doctor => "3:Doctor",
+            Self::Proposals => "4:Proposals",
+            Self::Search => "5:Search",
+            Self::Inbox => "6:Inbox",
         }
     }
 }
@@ -98,7 +93,6 @@ pub struct ProposalsTab {
 pub enum InputMode {
     #[default]
     Normal,
-    EditingFind,
     EditingSearch,
 }
 
@@ -109,7 +103,6 @@ pub struct App<R: Runner> {
     pub input_mode: InputMode,
     pub vault: Option<String>,
     pub check: CheckViewState,
-    pub find: FindViewState,
     pub context: ContextViewState,
     pub doctor: DoctorViewState,
     pub search: SearchViewState,
@@ -130,7 +123,6 @@ impl<R: Runner> App<R> {
             input_mode: InputMode::Normal,
             vault: None,
             check: CheckViewState::default(),
-            find: FindViewState::default(),
             context: ContextViewState::default(),
             doctor: DoctorViewState::default(),
             search: SearchViewState::default(),
@@ -163,35 +155,11 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Run `confidant find --json --no-input -- <query>` and update the Find view state.
-    pub fn run_find(&mut self, query: &str) {
-        let trimmed = query.trim().to_owned();
-        self.find.query = trimmed.clone();
-        self.find.input = trimmed.clone();
-        self.find.editing = false;
-        self.input_mode = InputMode::Normal;
-        if trimmed.is_empty() {
-            return;
-        }
-        let raw = match self.runner.run(&["find", "--", &trimmed]) {
-            Ok(r) => r,
-            Err(e) => {
-                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
-                return;
-            }
-        };
-        if let Some((_ok, result)) = self.apply_outcome::<FindResult>(&raw) {
-            self.find.result = Some(result);
-            self.find.selected = 0;
-        }
-    }
-
-    /// Run the `qmd-search` skill's `qmd-query.py` and update the Search view.
-    ///
-    /// The skill path comes from `confidant which --skills-dir`; the script
-    /// runs as `python3 <skills>/qmd-search/bin/qmd-query.py --vault V <q>`.
-    /// A missing `python3` or a missing skill shows an alert — the TUI never
-    /// falls back to plain `find` silently.
+    /// Run the unified Search tab (#387): exact literal scan via
+    /// `confidant find` when `exact` is set, otherwise qmd-ranked search
+    /// via the `qmd-search` skill's `qmd-query.py` (which already falls
+    /// back to `confidant find` with a banner when qmd or its corpus is
+    /// missing, so the `via` label always shows which engine answered).
     pub fn run_search(&mut self, query: &str) {
         let trimmed = query.trim().to_owned();
         self.search.query = trimmed.clone();
@@ -199,6 +167,10 @@ impl<R: Runner> App<R> {
         self.search.editing = false;
         self.input_mode = InputMode::Normal;
         if trimmed.is_empty() {
+            return;
+        }
+        if self.search.exact {
+            self.run_search_exact(&trimmed);
             return;
         }
 
@@ -232,7 +204,8 @@ impl<R: Runner> App<R> {
                 code: Some("qmd_skill_missing".to_owned()),
                 message: format!("qmd-search skill not found at {}", script.display()),
                 fix: Some(
-                    "Run `confidant setup` to install skills, or use the Find tab".to_owned(),
+                    "Run `confidant setup` to install skills, or press e for exact search"
+                        .to_owned(),
                 ),
                 blocking: false,
             });
@@ -251,7 +224,7 @@ impl<R: Runner> App<R> {
                     title: "Search Unavailable".to_owned(),
                     code: Some("python3_missing".to_owned()),
                     message: format!("could not run python3: {e:#}"),
-                    fix: Some("Install python3, or use the Find tab".to_owned()),
+                    fix: Some("Install python3, or press e for exact search".to_owned()),
                     blocking: false,
                 });
                 return;
@@ -260,6 +233,34 @@ impl<R: Runner> App<R> {
         if let Some((_ok, result)) = self.apply_outcome::<SearchResult>(&raw) {
             self.search.result = Some(filter_search_result(result));
             self.search.selected = 0;
+        }
+    }
+
+    /// Exact literal scan for the unified Search tab: runs
+    /// `confidant find --json --no-input -- <query>` and renders the hits
+    /// through the same fail-closed Search path (`via == "find"`).
+    fn run_search_exact(&mut self, trimmed: &str) {
+        let raw = match self.runner.run(&["find", "--", trimmed]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        if let Some((_ok, result)) = self.apply_outcome::<FindResult>(&raw) {
+            self.search.result = Some(filter_search_result(find_result_to_search(result)));
+            self.search.selected = 0;
+        }
+    }
+
+    /// Toggle the Search exact mode (#387) and re-run the current query
+    /// when one is present.
+    pub fn toggle_search_exact(&mut self) {
+        self.search.exact = !self.search.exact;
+        self.alert = None;
+        if !self.search.query.trim().is_empty() {
+            let q = self.search.query.clone();
+            self.run_search(&q);
         }
     }
 
@@ -384,12 +385,6 @@ impl<R: Runner> App<R> {
         self.alert = None;
         match self.active_view {
             ActiveView::Check => self.load_check(),
-            ActiveView::Find => {
-                let q = self.find.query.clone();
-                if !q.is_empty() {
-                    self.run_find(&q);
-                }
-            }
             ActiveView::Context => {
                 if let Some(pid) = self.context.person_id.clone() {
                     self.load_context(&pid);
@@ -613,7 +608,6 @@ impl<R: Runner> App<R> {
     fn switch_to(&mut self, view: ActiveView) {
         self.active_view = view;
         self.input_mode = InputMode::Normal;
-        self.find.editing = false;
         self.search.editing = false;
         self.alert = None;
         match view {
@@ -648,21 +642,29 @@ impl<R: Runner> App<R> {
                     return;
                 }
                 KeyCode::Char('2') => {
-                    self.switch_to(ActiveView::Find);
-                    return;
-                }
-                KeyCode::Char('3') => {
                     self.switch_to(ActiveView::Context);
                     return;
                 }
-                KeyCode::Char('4') => {
+                KeyCode::Char('3') => {
                     self.switch_to(ActiveView::Doctor);
                     return;
                 }
+                KeyCode::Char('4') => {
+                    self.switch_to(ActiveView::Proposals);
+                    return;
+                }
+                KeyCode::Char('5') => {
+                    self.switch_to(ActiveView::Search);
+                    return;
+                }
+                KeyCode::Char('6') => {
+                    self.switch_to(ActiveView::Inbox);
+                    return;
+                }
                 KeyCode::Char('/') => {
-                    self.active_view = ActiveView::Find;
-                    self.input_mode = InputMode::EditingFind;
-                    self.find.editing = true;
+                    self.active_view = ActiveView::Search;
+                    self.input_mode = InputMode::EditingSearch;
+                    self.search.editing = true;
                     self.alert = None;
                     return;
                 }
@@ -982,31 +984,6 @@ impl<R: Runner> App<R> {
             return;
         }
 
-        if self.input_mode == InputMode::EditingFind {
-            match key.code {
-                KeyCode::Esc => {
-                    self.input_mode = InputMode::Normal;
-                    self.find.editing = false;
-                    self.find.input = self.find.query.clone();
-                }
-                KeyCode::Enter => {
-                    let q = self.find.input.clone();
-                    self.run_find(&q);
-                }
-                KeyCode::Backspace => {
-                    self.find.input.pop();
-                }
-                KeyCode::Char(c)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    self.find.input.push(c);
-                }
-                _ => {}
-            }
-            return;
-        }
-
         if self.input_mode == InputMode::EditingSearch {
             match key.code {
                 KeyCode::Esc => {
@@ -1052,22 +1029,20 @@ impl<R: Runner> App<R> {
                 self.switch_to(prev);
             }
             KeyCode::Char('1') => self.switch_to(ActiveView::Check),
-            KeyCode::Char('2') => self.switch_to(ActiveView::Find),
-            KeyCode::Char('3') => self.switch_to(ActiveView::Context),
-            KeyCode::Char('4') => self.switch_to(ActiveView::Doctor),
-            KeyCode::Char('5') => self.switch_to(ActiveView::Proposals),
-            KeyCode::Char('6') => self.switch_to(ActiveView::Search),
-            KeyCode::Char('7') => self.switch_to(ActiveView::Inbox),
+            KeyCode::Char('2') => self.switch_to(ActiveView::Context),
+            KeyCode::Char('3') => self.switch_to(ActiveView::Doctor),
+            KeyCode::Char('4') => self.switch_to(ActiveView::Proposals),
+            KeyCode::Char('5') => self.switch_to(ActiveView::Search),
+            KeyCode::Char('6') => self.switch_to(ActiveView::Inbox),
             KeyCode::Char('/') => {
-                if self.active_view == ActiveView::Search {
-                    self.input_mode = InputMode::EditingSearch;
-                    self.search.editing = true;
-                } else {
-                    self.active_view = ActiveView::Find;
-                    self.input_mode = InputMode::EditingFind;
-                    self.find.editing = true;
-                }
+                self.active_view = ActiveView::Search;
+                self.input_mode = InputMode::EditingSearch;
+                self.search.editing = true;
                 self.alert = None;
+            }
+            // #387: exact literal scan toggle for the unified Search tab.
+            KeyCode::Char('e') if self.active_view == ActiveView::Search => {
+                self.toggle_search_exact();
             }
             KeyCode::Char('r') => {
                 self.refresh_current();
@@ -1091,13 +1066,6 @@ impl<R: Runner> App<R> {
                 if let Some(r) = &self.check.report {
                     if !r.findings.is_empty() && self.check.selected + 1 < r.findings.len() {
                         self.check.selected += 1;
-                    }
-                }
-            }
-            ActiveView::Find => {
-                if let Some(r) = &self.find.result {
-                    if !r.matches.is_empty() && self.find.selected + 1 < r.matches.len() {
-                        self.find.selected += 1;
                     }
                 }
             }
@@ -1128,9 +1096,6 @@ impl<R: Runner> App<R> {
             ActiveView::Check => {
                 self.check.selected = self.check.selected.saturating_sub(1);
             }
-            ActiveView::Find => {
-                self.find.selected = self.find.selected.saturating_sub(1);
-            }
             ActiveView::Context => {
                 self.context.scroll = self.context.scroll.saturating_sub(1);
             }
@@ -1147,14 +1112,6 @@ impl<R: Runner> App<R> {
 
     fn activate_selected(&mut self) {
         let person_id = match self.active_view {
-            ActiveView::Find => self
-                .find
-                .result
-                .as_ref()
-                .and_then(|r| r.matches.get(self.find.selected))
-                .and_then(|h| h.id.as_deref())
-                .filter(|id| id.starts_with("p-"))
-                .map(str::to_owned),
             ActiveView::Search => self
                 .search
                 .result
@@ -1207,7 +1164,6 @@ impl<R: Runner> App<R> {
         } else {
             match self.active_view {
                 ActiveView::Check => check::render(&self.check, frame, chunks[1]),
-                ActiveView::Find => find::render(&self.find, frame, chunks[1]),
                 ActiveView::Context => context::render(&self.context, frame, chunks[1]),
                 ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
                 ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
@@ -1229,7 +1185,6 @@ impl<R: Runner> App<R> {
         let mut spans = Vec::new();
         for v in [
             ActiveView::Check,
-            ActiveView::Find,
             ActiveView::Context,
             ActiveView::Doctor,
             ActiveView::Proposals,
@@ -1255,8 +1210,9 @@ impl<R: Runner> App<R> {
     fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
         for (key, label) in [
-            ("Tab/1-7", "view"),
-            ("/", "find"),
+            ("Tab/1-6", "view"),
+            ("/", "search"),
+            ("e", "exact"),
             ("j/k", "move"),
             ("Enter", "context"),
             ("r", "refresh"),
