@@ -4,7 +4,7 @@ use std::process::Command;
 use crate::paths;
 
 use super::git::git;
-use super::ItemOutcome;
+use super::{ItemOutcome, SkippedItem};
 
 #[derive(Clone, Debug)]
 pub(crate) enum PlannedWrite {
@@ -170,6 +170,7 @@ pub(crate) fn commit_applied(
     repo: &Path,
     applied: &[AppliedChange],
     outcomes: &[ItemOutcome],
+    skipped: &[SkippedItem],
 ) -> anyhow::Result<()> {
     for change in applied {
         let AppliedChange::Modified { abs, .. } = change;
@@ -186,6 +187,15 @@ pub(crate) fn commit_applied(
     let mut body = String::from("items:\n");
     for o in outcomes.iter().filter(|o| o.action == "merge") {
         body.push_str(&format!("{} {} {}\n", o.name, o.kind, o.target));
+    }
+    // #318: record operator-deferred items as opaque IDs (ADR-7), so the
+    // merge commit is an audit trail of what was intentionally left on the
+    // inbox branch. Matches the existing multi-`-m` body style.
+    if !skipped.is_empty() {
+        body.push_str("skipped:\n");
+        for s in skipped {
+            body.push_str(&format!("{}\n", s.name));
+        }
     }
     git(
         repo,

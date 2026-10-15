@@ -239,6 +239,10 @@ fn drain_for_rotate(
             trusted_signers: opts.trusted_signers.clone(),
             allow_unsigned: opts.allow_unsigned,
             pinned_pubkey: opts.pinned_pubkey.clone(),
+            skip: Vec::new(),
+            // #318: a rotate drain refuses `--skip` — leftovers encrypted
+            // to the old key must not survive `--finish` (§8a.3).
+            is_rotate_drain: true,
         },
         &decrypt,
         Some(keys.as_ref()),

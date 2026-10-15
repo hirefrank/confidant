@@ -69,6 +69,7 @@ pub(crate) fn preflight(
         return Ok(PreflightOutcome::Report(InboxReport {
             branch,
             items: Vec::new(),
+            skipped: Vec::new(),
             merged: 0,
             cleared: 0,
             dry_run: opts.dry_run,

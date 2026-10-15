@@ -352,6 +352,7 @@ fn rotate_drain_then_destroy() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: Some(new_recipient.clone()),
+            ..Default::default()
         },
         &decrypt,
         Some(&keys),
