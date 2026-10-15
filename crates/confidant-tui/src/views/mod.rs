@@ -11,3 +11,4 @@ pub mod doctor;
 pub mod find;
 pub mod inbox;
 pub mod proposals;
+pub mod search;

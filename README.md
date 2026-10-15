@@ -255,7 +255,8 @@ confidant check --json --fail-on warning --as-of 2026-10-08
 ## TUI (preview)
 
 `confidant-tui` is a terminal UI for `check`, `find`, `context`, and
-`doctor`, plus confirm-before-apply review of skill proposals. It consumes
+`doctor`, plus confirm-before-apply review of skill proposals and QMD-backed
+search. It consumes
 only the ADR-7 CLI JSON contract
 (`confidant <subcommand> --json --no-input`), never opens vault files
 directly, and keeps plaintext on the alternate screen only.
@@ -285,6 +286,14 @@ cargo run -p confidant-tui -- --vault examples/demo-vault
 `--vault` falls back to the `CONFIDANT_VAULT` environment variable when it
 isn't passed, so the vault path doesn't have to be given on every command
 line — same as the `confidant` CLI itself.
+
+The Search tab (Phase 3a, #212) runs the `qmd-search` skill's `qmd-query.py`
+against the vault's QMD index and renders each match with its provenance
+(`qmd` or `find`) and score. Rendering is fail-closed: matches with any
+other provenance are dropped and counted. When QMD or the index is missing,
+the skill falls back to plain `confidant find` and the tab shows a
+`fallback: <reason>` banner. If `python3` or the skill itself is missing, the
+tab shows an alert instead of falling back silently.
 
 ## Where we're going
 

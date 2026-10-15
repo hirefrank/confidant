@@ -190,6 +190,7 @@ def main():
         except json.JSONDecodeError:
             sys.exit(f"error: confidant find failed: {p.stderr.strip()}")
         data["mode"] = "find-fallback"
+        data["fallback"] = reason
         data["query"] = query
         data["dropped_uncleared"] = 0
         for m in data.get("matches", []):

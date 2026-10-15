@@ -5869,8 +5869,9 @@ fn staged_shred_mutation(
 
     // Step 4: swap (keys/ -> keys.old, stage -> keys/).
     // NOTE: the recovery phrase was already shown at step 3.5. If the
-    // swap fails, that phrase matches nothing — tell the operator to
-    // ignore it; the old phrase is still current.
+    // first rename fails (before anything moved), the shown phrase
+    // matches nothing — the old phrase is still current. Once keys/
+    // has moved, the shown phrase is the new recovery phrase.
     if keys_dir.exists() {
         if let Err(e) = std::fs::rename(&keys_dir, &old) {
             remove_path_best_effort(&stage);
@@ -5888,6 +5889,14 @@ fn staged_shred_mutation(
         // leak #320 closed, and the roll-back-after-roll-forward mix #290
         // rules out).
         guard.disarm();
+    } else {
+        // Safety net: disarm() is idempotent. If keys/ did not exist, the
+        // point-of-no-return disarm above was skipped — but the swap is
+        // about to land, so disarm NOW, before stage -> keys/. If the
+        // rename fails, the error branch below returns early, so a disarm
+        // after it would never run. Unreachable today (shred stages from
+        // keys/), but safe even if that ever changes.
+        guard.disarm();
     }
     if let Err(e) = std::fs::rename(&stage, &keys_dir) {
         let _ = repair_keys_staging(root, config_dir);
@@ -5895,12 +5904,6 @@ fn staged_shred_mutation(
             "keys/ swap failed mid-swap ({e}); shred is finishing, re-run to complete; the phrase shown above is your new recovery phrase"
         ))));
     }
-    // Safety net: disarm() is idempotent. If keys/ did not exist above,
-    // the point-of-no-return disarm inside `if keys_dir.exists()` was
-    // skipped — but the swap has still landed, so no failure from this
-    // point on may restore the working tree. Unreachable today (shred
-    // stages from keys/), but safe even if that ever changes.
-    guard.disarm();
 
     // Promote the staged seq tracker (same-directory rename, atomic).
     // Post-swap: on failure, repair rolls forward; report re-run.

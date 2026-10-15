@@ -8,9 +8,11 @@ use ratatui::Frame;
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, InboxReport,
+    SearchResult,
 };
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
+use crate::search::{filter_search_result, SearchViewState};
 use crate::views::alert::{self, AlertState};
 use crate::views::check::{self, CheckViewState};
 use crate::views::confirm::{self, ConfirmState};
@@ -22,8 +24,10 @@ use crate::views::inbox::{self, InboxViewState};
 use crate::views::proposals::{
     self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
 };
+use crate::views::search;
 
-/// The six views: four Phase 1 views, proposal review (Phase 2), inbox (3c).
+/// The seven views: four Phase 1 views, proposal review (Phase 2),
+/// QMD search (Phase 3a), inbox (Phase 3c).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
@@ -32,6 +36,7 @@ pub enum ActiveView {
     Context,
     Doctor,
     Proposals,
+    Search,
     Inbox,
 }
 
@@ -42,7 +47,8 @@ impl ActiveView {
             Self::Find => Self::Context,
             Self::Context => Self::Doctor,
             Self::Doctor => Self::Proposals,
-            Self::Proposals => Self::Inbox,
+            Self::Proposals => Self::Search,
+            Self::Search => Self::Inbox,
             Self::Inbox => Self::Check,
         }
     }
@@ -54,7 +60,8 @@ impl ActiveView {
             Self::Context => Self::Find,
             Self::Doctor => Self::Context,
             Self::Proposals => Self::Doctor,
-            Self::Inbox => Self::Proposals,
+            Self::Inbox => Self::Search,
+            Self::Search => Self::Proposals,
         }
     }
 
@@ -65,7 +72,8 @@ impl ActiveView {
             Self::Context => "3:Context",
             Self::Doctor => "4:Doctor",
             Self::Proposals => "5:Proposals",
-            Self::Inbox => "6:Inbox",
+            Self::Search => "6:Search",
+            Self::Inbox => "7:Inbox",
         }
     }
 }
@@ -87,6 +95,7 @@ pub enum InputMode {
     #[default]
     Normal,
     EditingFind,
+    EditingSearch,
 }
 
 /// Top-level TUI state machine generic over a [`Runner`].
@@ -99,6 +108,7 @@ pub struct App<R: Runner> {
     pub find: FindViewState,
     pub context: ContextViewState,
     pub doctor: DoctorViewState,
+    pub search: SearchViewState,
     pub alert: Option<AlertState>,
     pub blocking_alert: Option<AlertState>,
     pub should_quit: bool,
@@ -119,6 +129,7 @@ impl<R: Runner> App<R> {
             find: FindViewState::default(),
             context: ContextViewState::default(),
             doctor: DoctorViewState::default(),
+            search: SearchViewState::default(),
             alert: None,
             blocking_alert: None,
             should_quit: false,
@@ -168,6 +179,115 @@ impl<R: Runner> App<R> {
         if let Some((_ok, result)) = self.apply_outcome::<FindResult>(&raw) {
             self.find.result = Some(result);
             self.find.selected = 0;
+        }
+    }
+
+    /// Run the `qmd-search` skill's `qmd-query.py` and update the Search view.
+    ///
+    /// The skill path comes from `confidant which --skills-dir`; the script
+    /// runs as `python3 <skills>/qmd-search/bin/qmd-query.py --vault V <q>`.
+    /// A missing `python3` or a missing skill shows an alert — the TUI never
+    /// falls back to plain `find` silently.
+    pub fn run_search(&mut self, query: &str) {
+        let trimmed = query.trim().to_owned();
+        self.search.query = trimmed.clone();
+        self.search.input = trimmed.clone();
+        self.search.editing = false;
+        self.input_mode = InputMode::Normal;
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let vault_root = match resolve_vault_root(self.vault_root_override.as_deref()) {
+            Some(root) => root,
+            None => {
+                self.alert = Some(AlertState {
+                    title: "No Vault".to_owned(),
+                    code: Some("no_vault".to_owned()),
+                    message:
+                        "no vault found: pass --vault, set CONFIDANT_VAULT, or run inside a vault"
+                            .to_owned(),
+                    fix: None,
+                    blocking: false,
+                });
+                return;
+            }
+        };
+
+        let skills_dir = match self.skills_dir() {
+            Some(dir) => dir,
+            None => return, // skills_dir() sets the alert
+        };
+        let script = std::path::Path::new(&skills_dir)
+            .join("qmd-search")
+            .join("bin")
+            .join("qmd-query.py");
+        if !script.is_file() {
+            self.alert = Some(AlertState {
+                title: "Search Unavailable".to_owned(),
+                code: Some("qmd_skill_missing".to_owned()),
+                message: format!("qmd-search skill not found at {}", script.display()),
+                fix: Some(
+                    "Run `confidant setup` to install skills, or use the Find tab".to_owned(),
+                ),
+                blocking: false,
+            });
+            return;
+        }
+
+        let script_str = script.display().to_string();
+        let vault_str = vault_root.display().to_string();
+        let raw = match self
+            .runner
+            .run_program("python3", &[&script_str, "--vault", &vault_str, &trimmed])
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState {
+                    title: "Search Unavailable".to_owned(),
+                    code: Some("python3_missing".to_owned()),
+                    message: format!("could not run python3: {e:#}"),
+                    fix: Some("Install python3, or use the Find tab".to_owned()),
+                    blocking: false,
+                });
+                return;
+            }
+        };
+        if let Some((_ok, result)) = self.apply_outcome::<SearchResult>(&raw) {
+            self.search.result = Some(filter_search_result(result));
+            self.search.selected = 0;
+        }
+    }
+
+    /// Resolve the installed skills directory via `confidant which --skills-dir`.
+    fn skills_dir(&mut self) -> Option<String> {
+        let raw = match self.runner.run(&["which", "--skills-dir"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return None;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&raw.stdout) {
+            Ok(v) => v,
+            Err(_) => {
+                self.alert = Some(AlertState::invalid_json(raw.status));
+                return None;
+            }
+        };
+        match value.get("skills_dir").and_then(|s| s.as_str()) {
+            Some(dir) if !dir.is_empty() => Some(dir.to_owned()),
+            _ => {
+                self.alert = Some(AlertState {
+                    title: "Search Unavailable".to_owned(),
+                    code: Some("skills_dir_missing".to_owned()),
+                    message: "`confidant which --skills-dir` did not report a skills directory"
+                        .to_owned(),
+                    fix: Some("Run `confidant setup` to install skills".to_owned()),
+                    blocking: false,
+                });
+                None
+            }
         }
     }
 
@@ -273,6 +393,12 @@ impl<R: Runner> App<R> {
             }
             ActiveView::Doctor => self.load_doctor(),
             ActiveView::Proposals => self.load_proposals(),
+            ActiveView::Search => {
+                let q = self.search.query.clone();
+                if !q.is_empty() {
+                    self.run_search(&q);
+                }
+            }
             ActiveView::Inbox => self.load_inbox(),
         }
     }
@@ -484,6 +610,7 @@ impl<R: Runner> App<R> {
         self.active_view = view;
         self.input_mode = InputMode::Normal;
         self.find.editing = false;
+        self.search.editing = false;
         self.alert = None;
         match view {
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
@@ -868,6 +995,31 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        if self.input_mode == InputMode::EditingSearch {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                    self.search.editing = false;
+                    self.search.input = self.search.query.clone();
+                }
+                KeyCode::Enter => {
+                    let q = self.search.input.clone();
+                    self.run_search(&q);
+                }
+                KeyCode::Backspace => {
+                    self.search.input.pop();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.search.input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -892,11 +1044,17 @@ impl<R: Runner> App<R> {
             KeyCode::Char('3') => self.switch_to(ActiveView::Context),
             KeyCode::Char('4') => self.switch_to(ActiveView::Doctor),
             KeyCode::Char('5') => self.switch_to(ActiveView::Proposals),
-            KeyCode::Char('6') => self.switch_to(ActiveView::Inbox),
+            KeyCode::Char('6') => self.switch_to(ActiveView::Search),
+            KeyCode::Char('7') => self.switch_to(ActiveView::Inbox),
             KeyCode::Char('/') => {
-                self.active_view = ActiveView::Find;
-                self.input_mode = InputMode::EditingFind;
-                self.find.editing = true;
+                if self.active_view == ActiveView::Search {
+                    self.input_mode = InputMode::EditingSearch;
+                    self.search.editing = true;
+                } else {
+                    self.active_view = ActiveView::Find;
+                    self.input_mode = InputMode::EditingFind;
+                    self.find.editing = true;
+                }
                 self.alert = None;
             }
             KeyCode::Char('r') => {
@@ -941,6 +1099,13 @@ impl<R: Runner> App<R> {
                     }
                 }
             }
+            ActiveView::Search => {
+                if let Some(r) = &self.search.result {
+                    if !r.kept.is_empty() && self.search.selected + 1 < r.kept.len() {
+                        self.search.selected += 1;
+                    }
+                }
+            }
             // The proposals and inbox tabs handle their own keys.
             ActiveView::Proposals | ActiveView::Inbox => {}
         }
@@ -960,6 +1125,9 @@ impl<R: Runner> App<R> {
             ActiveView::Doctor => {
                 self.doctor.selected = self.doctor.selected.saturating_sub(1);
             }
+            ActiveView::Search => {
+                self.search.selected = self.search.selected.saturating_sub(1);
+            }
             // The proposals and inbox tabs handle their own keys.
             ActiveView::Proposals | ActiveView::Inbox => {}
         }
@@ -972,6 +1140,14 @@ impl<R: Runner> App<R> {
                 .result
                 .as_ref()
                 .and_then(|r| r.matches.get(self.find.selected))
+                .and_then(|h| h.id.as_deref())
+                .filter(|id| id.starts_with("p-"))
+                .map(str::to_owned),
+            ActiveView::Search => self
+                .search
+                .result
+                .as_ref()
+                .and_then(|r| r.kept.get(self.search.selected))
                 .and_then(|h| h.id.as_deref())
                 .filter(|id| id.starts_with("p-"))
                 .map(str::to_owned),
@@ -1014,6 +1190,7 @@ impl<R: Runner> App<R> {
             ActiveView::Context,
             ActiveView::Doctor,
             ActiveView::Proposals,
+            ActiveView::Search,
             ActiveView::Inbox,
         ]
         .into_iter()
@@ -1026,7 +1203,7 @@ impl<R: Runner> App<R> {
         })
         .collect();
         let header_line = format!(
-            "{} | Tab/1-6:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
+            "{} | Tab/1-7:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
             tabs.join(" ")
         );
         let header_block = Block::bordered().title(" confidant-tui (contract v1) ");
@@ -1043,6 +1220,7 @@ impl<R: Runner> App<R> {
             ActiveView::Context => context::render(&self.context, frame, chunks[1]),
             ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
             ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
+            ActiveView::Search => search::render(&self.search, frame, chunks[1]),
             ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
         }
     }

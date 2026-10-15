@@ -1,5 +1,5 @@
 ┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Inbox ] | Tab/1-6:view /:fin│
+│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] [ 6:Search ] [ 7:Inbox ] | Tab/1│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Check Summary ───────────────────────────────────────────────────────────────────────────────────┐
 │status: FAILED | spec: 0.1 | records: 2 | ledger: 3 | errors: 1 | warnings: 0 | 1 findings        │

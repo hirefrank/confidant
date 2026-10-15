@@ -182,6 +182,9 @@ than copying them.
 - When syncing `main` to `origin/main` or setting `core.hooksPath`, run git
   in `~/Projects/confidant` unless `main` is already checked out in the
   current worktree.
+- For release prep, follow `.agents/skills/confidant-release/SKILL.md` in
+  this repo, not the global `~/.agents/skills/confidant-release` copy (it
+  may still describe manual `cargo publish`).
 
 ## Learned Workspace Facts
 
@@ -190,3 +193,6 @@ than copying them.
 - Only one worktree may have `main` checked out; with `main` on the primary
   clone, `git checkout main` in a Cursor worktree fails because `main` is
   already in use there.
+- Releases ship by pushing a `v*` tag on the intended `main` commit;
+  `.github/workflows/release.yml` builds dist assets and publishes crates.io
+  via OIDC trusted publishing — no local `cargo publish`.

@@ -13,6 +13,7 @@ pub mod apply;
 pub mod contract;
 pub mod proposals;
 pub mod runner;
+pub mod search;
 pub mod views;
 
 /// Write the terminal teardown escape sequence (clear alternate buffer, reset

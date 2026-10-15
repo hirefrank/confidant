@@ -1,0 +1,113 @@
+# Pack manifest for personal@0.1 (spec/pack-manifest.md).
+#
+# Claims only: name, verbs, record types, front-matter fields and their
+# grammars, edge kinds and symmetry, finding codes, verb-to-ID type,
+# [checks] keys and defaults, and skill and finding text.
+# The reducers and date math (fold, findings) stay compiled in Rust
+# behind the Pack trait.
+
+manifest_version = 1
+
+# Top-level keys come before the first [table] header: in TOML anything
+# after a table header belongs to that table.
+record_types = []
+
+balance_metrics = []
+
+finding_codes = [
+  "E_FRONTMATTER",
+  "E_INVALID_ID",
+  "E_WRONG_ID_TYPE",
+  "E_UNKNOWN_RECORD",
+  "W_CADENCE_OVERDUE",
+  "W_DATE_UPCOMING",
+]
+
+[pack]
+name = "personal"
+version = "0.1"
+skill = "SKILL.md"
+
+[[verbs]]
+name = "touch"
+id_type = "person"
+
+[[fields]]
+name = "birthday"
+grammar = "recurring-date"
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+[[fields]]
+name = "relationship_to_me"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "dates"
+grammar = "dates-list"
+
+[[edge_kinds]]
+name = "friend"
+symmetric = true
+
+[[edge_kinds]]
+name = "family"
+symmetric = true
+
+[[edge_kinds]]
+name = "sibling"
+symmetric = true
+
+[[edge_kinds]]
+name = "partner"
+symmetric = true
+
+[[edge_kinds]]
+name = "parent"
+symmetric = false
+
+[[edge_kinds]]
+name = "mentor"
+symmetric = false
+
+[[checks.severity]]
+key = "personal.cadence_overdue"
+default = "warning"
+
+[[checks.severity]]
+key = "personal.date_upcoming"
+default = "warning"
+
+[[checks.int]]
+key = "personal.date_upcoming_days"
+default = 7
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[messages."E_INVALID_ID"]
+default = "touch note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_WRONG_ID_TYPE"]
+default = "touch note '{id}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+
+[messages."E_UNKNOWN_RECORD"]
+missing = "touch note '{id}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "touch note '{id}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
+
+[messages."W_CADENCE_OVERDUE"]
+last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+
+[messages."W_DATE_UPCOMING"]
+default = "person {id} has {label} on {date} ({days} days)"
+default_fix = "Log a touchpoint with `confidant log touch {id} <kind>`"

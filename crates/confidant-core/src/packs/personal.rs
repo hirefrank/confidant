@@ -3,15 +3,19 @@
 //! ledger verb.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::check::{Finding, FindingCode, MergeMap, Severity};
-use crate::config::PERSONAL_PACK;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
-use crate::packs::grammars::{parse_field_grammar, FieldValue, RecurringDate};
+use crate::packs::grammars::{
+    parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
+    GRAMMAR_NON_EMPTY_STRING, GRAMMAR_RECURRING_DATE,
+};
+use crate::packs::manifest::parse_manifest;
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::{parse_with_list, Record, RecordKind};
 use crate::search::cleared_record_ids;
@@ -20,33 +24,66 @@ use crate::vault::{SourcedEntry, Vault};
 /// Closed list of touchpoint kinds for `touch` (#182, #227 Q1).
 pub const TOUCH_KINDS: &[&str] = &["call", "text", "coffee", "gift", "meet"];
 
-/// Edge kinds introduced by `personal@0.1` (#179, #184).
-pub const PERSONAL_EDGE_KINDS: &[EdgeKind] = &[
-    EdgeKind {
-        name: "friend",
-        symmetric: true,
-    },
-    EdgeKind {
-        name: "family",
-        symmetric: true,
-    },
-    EdgeKind {
-        name: "sibling",
-        symmetric: true,
-    },
-    EdgeKind {
-        name: "partner",
-        symmetric: true,
-    },
-    EdgeKind {
-        name: "parent",
-        symmetric: false,
-    },
-    EdgeKind {
-        name: "mentor",
-        symmetric: false,
-    },
-];
+/// Embedded manifest for `personal@0.1` (spec §9). Vendored from
+/// `packs/personal/manifest.toml` at the repo root: the path must stay
+/// inside the crate so `cargo publish` / `cargo install` can compile
+/// (crates.io tarballs do not include `../../packs`). A test fails if the
+/// vendored copy drifts from the repo-root file. The binary serves the
+/// manifest it was compiled with, same guarantee as the embedded SKILL.md.
+static PERSONAL_MANIFEST_TOML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/personal/manifest.toml"
+));
+
+/// Claims from the embedded manifest, leaked to `&'static` so the `Pack`
+/// trait's `&'static` signatures can serve them (#343). Parsed once; a
+/// parse failure is a programming error (the file is compile-time data),
+/// so it fails loudly rather than silently falling back to stale claims.
+struct ManifestClaims {
+    name: &'static str,
+    verbs: Vec<&'static str>,
+    verb_id_types: Vec<(&'static str, Prefix)>,
+    record_types: Vec<&'static str>,
+    fields: Vec<&'static str>,
+    balance_metrics: Vec<&'static str>,
+    edge_kinds: Vec<EdgeKind>,
+}
+
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn manifest_claims() -> &'static ManifestClaims {
+    static CLAIMS: OnceLock<ManifestClaims> = OnceLock::new();
+    CLAIMS.get_or_init(|| {
+        let m = parse_manifest(PERSONAL_MANIFEST_TOML)
+            .expect("embedded packs/personal/manifest.toml must parse");
+        ManifestClaims {
+            name: leak_str(format!("{}@{}", m.pack.name, m.pack.version)),
+            verbs: m.verbs.iter().map(|v| leak_str(v.name.clone())).collect(),
+            verb_id_types: m
+                .verbs
+                .iter()
+                .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+                .collect(),
+            record_types: m.record_types.iter().map(|r| leak_str(r.clone())).collect(),
+            fields: m.fields.iter().map(|f| leak_str(f.name.clone())).collect(),
+            balance_metrics: m
+                .balance_metrics
+                .iter()
+                .map(|b| leak_str(b.clone()))
+                .collect(),
+            edge_kinds: m
+                .edge_kinds
+                .iter()
+                .map(|e| EdgeKind {
+                    name: leak_str(e.name.clone()),
+                    symmetric: e.symmetric,
+                })
+                .collect(),
+        }
+    })
+}
 
 fn is_valid_touch_kind(kind: &str) -> bool {
     TOUCH_KINDS.contains(&kind)
@@ -229,29 +266,32 @@ pub struct PersonalPack;
 
 impl Pack for PersonalPack {
     fn name(&self) -> &'static str {
-        PERSONAL_PACK
+        manifest_claims().name
     }
 
     fn verbs(&self) -> &'static [&'static str] {
-        &["touch"]
+        &manifest_claims().verbs
     }
 
     fn record_types(&self) -> &'static [&'static str] {
-        &[]
+        &manifest_claims().record_types
     }
 
     fn fields(&self) -> &'static [&'static str] {
-        &["birthday", "cadence", "relationship_to_me", "dates"]
+        &manifest_claims().fields
     }
 
     fn balance_metrics(&self) -> &'static [&'static str] {
-        &[]
+        &manifest_claims().balance_metrics
     }
 
     fn finding_codes(&self) -> &'static [&'static str] {
-        // Codes this pack's `fold` / `findings` emit. `E_TOUCH_MALFORMED`
-        // is a core code (emitted by `check`, not this pack), so it is not
-        // listed here; it is documented in `spec/findings.md`.
+        // Unchanged in step 4; finding codes move to the manifest in step 6
+        // (#345). The manifest already carries them (the loader requires a
+        // [messages] table per code), and the parity test proves they match.
+        // `E_TOUCH_MALFORMED` is a core code (emitted by `check`, not this
+        // pack), so it is not listed here; it is documented in
+        // `spec/findings.md`.
         &[
             "E_FRONTMATTER",
             "E_INVALID_ID",
@@ -263,14 +303,15 @@ impl Pack for PersonalPack {
     }
 
     fn edge_kinds(&self) -> &'static [EdgeKind] {
-        PERSONAL_EDGE_KINDS
+        &manifest_claims().edge_kinds
     }
 
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
-        match verb {
-            "touch" => Some(Prefix::Person),
-            _ => None,
-        }
+        manifest_claims()
+            .verb_id_types
+            .iter()
+            .find(|(v, _)| *v == verb)
+            .map(|(_, p)| *p)
     }
 
     fn validate_verb_args(&self, verb: &str, entry: &LedgerEntry) -> Option<bool> {
@@ -425,7 +466,7 @@ fn fold(
         if rec.kind == RecordKind::Person {
             let entry = person_mut(&mut state, &rec.id);
             if let Some(raw) = rec.field("birthday") {
-                match parse_field_grammar("recurring-date", "birthday", raw) {
+                match parse_field_grammar(GRAMMAR_RECURRING_DATE, "birthday", raw) {
                     Some(FieldValue::RecurringDate(bd)) => entry.birthday = Some(bd),
                     _ => push_field_error(
                         rec,
@@ -437,7 +478,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("cadence") {
-                match parse_field_grammar("cadence", "cadence", raw) {
+                match parse_field_grammar(GRAMMAR_CADENCE, "cadence", raw) {
                     Some(FieldValue::CadenceDays(days)) => entry.cadence_days = Some(days),
                     _ => push_field_error(
                         rec,
@@ -449,7 +490,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("relationship_to_me") {
-                match parse_field_grammar("non-empty-string", "relationship_to_me", raw) {
+                match parse_field_grammar(GRAMMAR_NON_EMPTY_STRING, "relationship_to_me", raw) {
                     Some(FieldValue::Text(label)) => entry.relationship_to_me = Some(label),
                     _ => push_field_error(
                         rec,
@@ -461,7 +502,7 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("dates") {
-                match parse_field_grammar("dates-list", "dates", raw) {
+                match parse_field_grammar(GRAMMAR_DATES_LIST, "dates", raw) {
                     Some(FieldValue::DatesList(list)) => entry.dates = list,
                     _ => push_field_error(
                         rec,
@@ -707,5 +748,127 @@ fn cadence_and_date_rules(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PERSONAL_PACK;
+
+    /// Parity test (#343): the manifest-derived claims must equal the
+    /// `&'static` slices the trait served before the manifest existed.
+    /// Expected values are copied verbatim from the deleted slices; this
+    /// test pins the manifest to the original claims so a bad manifest
+    /// fails loudly instead of silently changing behavior.
+    #[test]
+    fn manifest_claims_match_original_slices() {
+        let pack = PersonalPack;
+        assert_eq!(pack.name(), PERSONAL_PACK);
+        assert_eq!(pack.name(), "personal@0.1");
+        assert_eq!(pack.verbs(), &["touch"][..]);
+        assert!(pack.record_types().is_empty());
+        assert_eq!(
+            pack.fields(),
+            &["birthday", "cadence", "relationship_to_me", "dates"][..]
+        );
+        assert!(pack.balance_metrics().is_empty());
+        assert_eq!(
+            pack.edge_kinds(),
+            &[
+                EdgeKind {
+                    name: "friend",
+                    symmetric: true,
+                },
+                EdgeKind {
+                    name: "family",
+                    symmetric: true,
+                },
+                EdgeKind {
+                    name: "sibling",
+                    symmetric: true,
+                },
+                EdgeKind {
+                    name: "partner",
+                    symmetric: true,
+                },
+                EdgeKind {
+                    name: "parent",
+                    symmetric: false,
+                },
+                EdgeKind {
+                    name: "mentor",
+                    symmetric: false,
+                },
+            ][..]
+        );
+        assert_eq!(pack.verb_id_type("touch"), Some(Prefix::Person));
+        assert_eq!(pack.verb_id_type("session"), None);
+        assert_eq!(pack.verb_id_type(""), None);
+    }
+
+    /// The vendored manifest must match `packs/personal/manifest.toml` at
+    /// the repo root (#368 pattern). Skips gracefully when the repo-root
+    /// file is absent (e.g. a published crate), where there is nothing to
+    /// drift from.
+    #[test]
+    fn vendored_manifest_matches_repo_root() {
+        let root = format!(
+            "{}/../../packs/personal/manifest.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(root_text) = std::fs::read_to_string(&root) else {
+            return;
+        };
+        assert_eq!(
+            root_text, PERSONAL_MANIFEST_TOML,
+            "vendored manifest is stale; copy packs/personal/manifest.toml \
+             to crates/confidant-core/pack-manifests/personal/manifest.toml"
+        );
+    }
+
+    /// Silas (#351 review): the §11 example's edge kinds and finding codes
+    /// must match the code. The manifest is the §11 example; prove it
+    /// mechanically. `finding_codes()` is still the compiled slice in step
+    /// 4 (it moves in step 6), so the manifest must already agree with it.
+    #[test]
+    fn manifest_finding_codes_and_edge_kinds_match_code() {
+        let m = parse_manifest(PERSONAL_MANIFEST_TOML).expect("manifest parses");
+        let from_trait: Vec<String> = PersonalPack
+            .finding_codes()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(m.finding_codes, from_trait);
+        assert_eq!(
+            m.finding_codes,
+            [
+                "E_FRONTMATTER",
+                "E_INVALID_ID",
+                "E_WRONG_ID_TYPE",
+                "E_UNKNOWN_RECORD",
+                "W_CADENCE_OVERDUE",
+                "W_DATE_UPCOMING",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+        );
+        let edge_names: Vec<(&str, bool)> = m
+            .edge_kinds
+            .iter()
+            .map(|e| (e.name.as_str(), e.symmetric))
+            .collect();
+        assert_eq!(
+            edge_names,
+            [
+                ("friend", true),
+                ("family", true),
+                ("sibling", true),
+                ("partner", true),
+                ("parent", false),
+                ("mentor", false),
+            ]
+        );
     }
 }
