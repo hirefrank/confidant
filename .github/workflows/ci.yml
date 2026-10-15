@@ -186,6 +186,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: self-test crate path check
+        # Exercises the check against a fixture tree (positive and negative
+        # cases) so it can't silently regress to always-pass (#377).
+        run: python3 .github/scripts/check-crate-paths.py --self-test
       - name: check crate paths
         # Pure-Python, no toolchain: always runs, even for docs-only PRs.
         # Catches build-time paths that escape the crate directory
