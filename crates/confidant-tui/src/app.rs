@@ -7,7 +7,8 @@ use ratatui::Frame;
 
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
-    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, SearchResult,
+    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, InboxReport,
+    SearchResult,
 };
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
@@ -19,13 +20,14 @@ use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
 use crate::views::find::{self, FindViewState};
+use crate::views::inbox::{self, InboxViewState};
 use crate::views::proposals::{
     self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
 };
 use crate::views::search;
 
-/// The six views: four Phase 1 views plus proposal review (Phase 2) and
-/// QMD search (Phase 3a).
+/// The seven views: four Phase 1 views, proposal review (Phase 2),
+/// QMD search (Phase 3a), inbox (Phase 3c).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
@@ -35,6 +37,7 @@ pub enum ActiveView {
     Doctor,
     Proposals,
     Search,
+    Inbox,
 }
 
 impl ActiveView {
@@ -45,17 +48,19 @@ impl ActiveView {
             Self::Context => Self::Doctor,
             Self::Doctor => Self::Proposals,
             Self::Proposals => Self::Search,
-            Self::Search => Self::Check,
+            Self::Search => Self::Inbox,
+            Self::Inbox => Self::Check,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Check => Self::Search,
+            Self::Check => Self::Inbox,
             Self::Find => Self::Check,
             Self::Context => Self::Find,
             Self::Doctor => Self::Context,
             Self::Proposals => Self::Doctor,
+            Self::Inbox => Self::Search,
             Self::Search => Self::Proposals,
         }
     }
@@ -68,6 +73,7 @@ impl ActiveView {
             Self::Doctor => "4:Doctor",
             Self::Proposals => "5:Proposals",
             Self::Search => "6:Search",
+            Self::Inbox => "7:Inbox",
         }
     }
 }
@@ -107,6 +113,7 @@ pub struct App<R: Runner> {
     pub blocking_alert: Option<AlertState>,
     pub should_quit: bool,
     pub proposals: ProposalsTab,
+    pub inbox: InboxViewState,
     vault_root_override: Option<std::path::PathBuf>,
 }
 
@@ -127,6 +134,7 @@ impl<R: Runner> App<R> {
             blocking_alert: None,
             should_quit: false,
             proposals: ProposalsTab::default(),
+            inbox: InboxViewState::default(),
             vault_root_override: None,
         }
     }
@@ -316,6 +324,57 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Run `confidant inbox --dry-run --json --no-input` and update the
+    /// Inbox view state. Read-only: decrypts and plans, commits nothing.
+    pub fn load_inbox(&mut self) {
+        let raw = match self.runner.run(&["inbox", "--dry-run"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        if let Some((_, report)) = self.apply_outcome::<InboxReport>(&raw) {
+            self.inbox.report = Some(report);
+            self.inbox.confirming = false;
+            self.inbox.last_apply = None;
+        }
+    }
+
+    /// Open the apply confirm modal, if there is anything to apply.
+    pub fn inbox_begin_apply(&mut self) {
+        let can_apply = self
+            .inbox
+            .report
+            .as_ref()
+            .map(|r| !r.empty && !r.items.is_empty())
+            .unwrap_or(false);
+        if can_apply {
+            self.inbox.confirming = true;
+        }
+    }
+
+    /// Run the real `confidant inbox` (all-or-nothing merge + clear), then
+    /// reload the dry run so the view shows the new state.
+    pub fn inbox_run_apply(&mut self) {
+        self.inbox.confirming = false;
+        let raw = match self.runner.run(&["inbox"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        if let Some((_, report)) = self.apply_outcome::<InboxReport>(&raw) {
+            let msg = format!(
+                "merged {} item(s), cleared {}",
+                report.merged, report.cleared
+            );
+            self.load_inbox();
+            self.inbox.last_apply = Some(msg);
+        }
+    }
+
     /// Refresh the currently active view.
     pub fn refresh_current(&mut self) {
         self.alert = None;
@@ -340,6 +399,7 @@ impl<R: Runner> App<R> {
                     self.run_search(&q);
                 }
             }
+            ActiveView::Inbox => self.load_inbox(),
         }
     }
 
@@ -556,6 +616,7 @@ impl<R: Runner> App<R> {
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
             ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
+            ActiveView::Inbox if self.inbox.report.is_none() => self.load_inbox(),
             _ => {}
         }
     }
@@ -674,6 +735,39 @@ impl<R: Runner> App<R> {
             }
             KeyCode::Char('r') => self.load_proposals(),
             _ => {}
+        }
+    }
+
+    /// Handle a key event while the inbox tab is active.
+    ///
+    /// Returns true when the key was consumed. The confirm modal swallows
+    /// every key: `y` applies, anything else just cancels. Outside the
+    /// modal, `r` re-runs the dry run and `a` opens the all-or-nothing
+    /// apply confirm; everything else falls through to the shared
+    /// navigation and quit handling in `handle_key`.
+    fn handle_inbox_key(&mut self, key: KeyEvent) -> bool {
+        // Esc dismisses an alert first, before any view action.
+        if self.alert.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.alert = None;
+            return true;
+        }
+        if self.inbox.confirming {
+            match key.code {
+                KeyCode::Char('y') => self.inbox_run_apply(),
+                _ => self.inbox.confirming = false,
+            }
+            return true;
+        }
+        match key.code {
+            KeyCode::Char('r') => {
+                self.load_inbox();
+                true
+            }
+            KeyCode::Char('a') => {
+                self.inbox_begin_apply();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -880,6 +974,10 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        if self.active_view == ActiveView::Inbox && self.handle_inbox_key(key) {
+            return;
+        }
+
         if self.input_mode == InputMode::EditingFind {
             match key.code {
                 KeyCode::Esc => {
@@ -955,6 +1053,7 @@ impl<R: Runner> App<R> {
             KeyCode::Char('4') => self.switch_to(ActiveView::Doctor),
             KeyCode::Char('5') => self.switch_to(ActiveView::Proposals),
             KeyCode::Char('6') => self.switch_to(ActiveView::Search),
+            KeyCode::Char('7') => self.switch_to(ActiveView::Inbox),
             KeyCode::Char('/') => {
                 if self.active_view == ActiveView::Search {
                     self.input_mode = InputMode::EditingSearch;
@@ -1015,8 +1114,8 @@ impl<R: Runner> App<R> {
                     }
                 }
             }
-            // The proposals tab handles its own keys in handle_proposals_key.
-            ActiveView::Proposals => {}
+            // The proposals and inbox tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Inbox => {}
         }
     }
 
@@ -1037,8 +1136,8 @@ impl<R: Runner> App<R> {
             ActiveView::Search => {
                 self.search.selected = self.search.selected.saturating_sub(1);
             }
-            // The proposals tab handles its own keys in handle_proposals_key.
-            ActiveView::Proposals => {}
+            // The proposals and inbox tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Inbox => {}
         }
     }
 
@@ -1068,7 +1167,10 @@ impl<R: Runner> App<R> {
                 .and_then(|f| f.id.as_deref())
                 .filter(|id| id.starts_with("p-"))
                 .map(str::to_owned),
-            ActiveView::Context | ActiveView::Doctor | ActiveView::Proposals => None,
+            ActiveView::Context
+            | ActiveView::Doctor
+            | ActiveView::Proposals
+            | ActiveView::Inbox => None,
         };
 
         if let Some(pid) = person_id {
@@ -1097,6 +1199,7 @@ impl<R: Runner> App<R> {
             ActiveView::Doctor,
             ActiveView::Proposals,
             ActiveView::Search,
+            ActiveView::Inbox,
         ]
         .into_iter()
         .map(|v| {
@@ -1108,7 +1211,7 @@ impl<R: Runner> App<R> {
         })
         .collect();
         let header_line = format!(
-            "{} | Tab/1-6:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
+            "{} | Tab/1-7:view /:find j/k:move Enter:context r:refresh q/Esc:quit",
             tabs.join(" ")
         );
         let header_block = Block::bordered().title(" confidant-tui (contract v1) ");
@@ -1126,6 +1229,17 @@ impl<R: Runner> App<R> {
             ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
             ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
             ActiveView::Search => search::render(&self.search, frame, chunks[1]),
+            ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
+        }
+    }
+
+    /// Render the inbox tab: dry-run report, or the apply confirm modal.
+    fn render_inbox(&self, frame: &mut Frame<'_>, area: Rect) {
+        inbox::render(&self.inbox, frame, area);
+        if self.inbox.confirming {
+            if let Some(report) = &self.inbox.report {
+                inbox::render_confirm(frame, area, report.merged, report.cleared);
+            }
         }
     }
 
