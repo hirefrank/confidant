@@ -4852,7 +4852,7 @@ fn keys_shred_fresh_recipients(
 }
 
 fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    use confidant_crypt::anchor;
     validate_keys_client_id(client_id)?;
     // B1: init-client accepts vault:shared (routes to keys/shared/).
     // shred refuses both reserved ids (handled in cmd_keys_shred).
@@ -4863,22 +4863,18 @@ fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Resu
     let operator_sk = load_operator_sk(&anchor)?;
 
     let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-    let recipients = keys_current_recipients(&mut store, &anchor)?;
-    store
-        .init_client(client_id, &recipients, &anchor, &operator_sk)
-        .map_err(anyhow::Error::new)?;
+    // #220: init-client runs against a staged copy of keys/; the
+    // pre-commit check runs inside staged_keys_mutation before the swap,
+    // so a failure leaves keys/ (and the seq tracker) exactly as they were.
+    staged_keys_mutation(root, &vault, &config_dir, |store| {
+        let recipients = keys_current_recipients(store, &anchor)?;
+        store
+            .init_client(client_id, &recipients, &anchor, &operator_sk)
+            .map_err(anyhow::Error::new)
+    })?;
 
-    // B2: one commit, check first.
+    // B2: one commit (check already ran before the swap).
     let no_input = cli.no_input;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree",
-        )));
-    }
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
@@ -4901,7 +4897,7 @@ fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Resu
 }
 
 fn cmd_keys_rotate(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    use confidant_crypt::anchor;
     validate_keys_client_id(client_id)?;
 
     let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
@@ -4910,23 +4906,18 @@ fn cmd_keys_rotate(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Ex
     let operator_sk = load_operator_sk(&anchor)?;
 
     let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-    let mut store = KeyStore::with_config_dir(keys_dir, &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-    let _key = store
-        .rotate(client_id, &anchor, &operator_sk)
-        .map_err(anyhow::Error::new)?;
-    let new_epoch = store.current_epoch(client_id).map_err(anyhow::Error::new)?;
+    // #220: rotate runs against a staged copy of keys/; the pre-commit
+    // check runs inside staged_keys_mutation before the swap, so a
+    // failure leaves keys/ (and the seq tracker) exactly as they were.
+    let new_epoch = staged_keys_mutation(root, &vault, &config_dir, |store| {
+        store
+            .rotate(client_id, &anchor, &operator_sk)
+            .map_err(anyhow::Error::new)?;
+        store.current_epoch(client_id).map_err(anyhow::Error::new)
+    })?;
 
-    // B2: one commit, check first.
+    // B2: one commit (check already ran before the swap).
     let no_input = cli.no_input;
-    let vault = load_vault(root)?;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree",
-        )));
-    }
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
@@ -5413,6 +5404,143 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Durable marker for a keys shred operation that finished staging and
+/// check. See issue 220 and Frank's roll-forward decision on issue 290.
+///
+/// Written to git-ignored `.confidant/shred.marker` after `check` passes
+/// (it stays there across the swap — the swap only renames `keys/` and the
+/// stage). Presence means "roll forward, never back": the swap and the
+/// out-of-tree promotions (anchor re-pin, device key) must complete before
+/// any other key operation runs.
+///
+/// The marker carries the new anchor material and the new device private key
+/// so `repair_keys_staging` can finish the promotions after a crash. It is
+/// written with 0600 permissions, fsynced before the swap, lives outside
+/// git-tracked `keys/`, and is removed before the shred commit, so the
+/// private key is never committed. Rolling back after a crash would restore
+/// the destroyed keys and undo the shred — hence roll-forward.
+const SHRED_MARKER_FILE: &str = "shred.marker";
+const SHRED_MARKER_VERSION: u32 = 1;
+
+/// Path of the shred marker: git-ignored `.confidant/` (never inside
+/// git-tracked `keys/`). Repair keys off its contents to decide whether
+/// the swap happened yet (via `keys.old`).
+fn shred_marker_path(root: &Path) -> PathBuf {
+    root.join(".confidant").join(SHRED_MARKER_FILE)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ShredStageMarker {
+    version: u32,
+    /// New recovery verifying key (hex) for the anchor re-pin.
+    recovery_verifying_key_hex: String,
+    /// New recovery age recipient for the anchor re-pin.
+    recovery_age_recipient: String,
+    /// Fresh device private key (bech32) to promote to the keychain.
+    /// Sensitive: 0600 file, git-ignored, removed before commit.
+    /// Zeroized on drop (see `Drop` impl below).
+    device_key_bech32: String,
+}
+
+impl Drop for ShredStageMarker {
+    fn drop(&mut self) {
+        // The device private key must not linger in memory.
+        use zeroize::Zeroize;
+        self.device_key_bech32.zeroize();
+    }
+}
+
+/// Write the shred marker with 0600 permissions (it holds a private key),
+/// fsynced for crash durability: a torn write would block every key op
+/// until hand-fixed. Uses write-to-temp + rename + fsync so the marker
+/// is never observed partial.
+fn write_shred_marker(path: &Path, marker: &ShredStageMarker) -> anyhow::Result<()> {
+    let text = toml::to_string(marker).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot serialize shred marker: {e}"
+        )))
+    })?;
+    let dir = path.parent().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "shred marker path has no parent: {}",
+            path.display()
+        )))
+    })?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot create shred marker dir at {}: {e}",
+            dir.display()
+        )))
+    })?;
+    // Write to a temp file in the same directory, fsync, then rename.
+    let tmp = dir.join(".shred.marker.tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        use std::io::Write;
+        let mut f = opts.open(&tmp).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write shred marker at {}: {e}",
+                tmp.display()
+            )))
+        })?;
+        f.write_all(text.as_bytes()).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write shred marker: {e}"
+            )))
+        })?;
+        // Fsync the file before the rename so the content is durable.
+        f.sync_all().map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot fsync shred marker: {e}"
+            )))
+        })?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot install shred marker at {}: {e}",
+            path.display()
+        )))
+    })?;
+    // Fsync the directory so the rename itself is durable (best-effort
+    // on non-unix; the file fsync above is the critical part).
+    #[cfg(unix)]
+    {
+        if let Ok(dir_f) = std::fs::File::open(dir) {
+            let _ = dir_f.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn read_shred_marker(path: &Path) -> anyhow::Result<ShredStageMarker> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read shred marker at {}: {e}",
+            path.display()
+        )))
+    })?;
+    // NOTE: the toml parse error is deliberately NOT included: it can
+    // quote the offending line, which may be the device private key.
+    let marker: ShredStageMarker = toml::from_str(&text).map_err(|_| {
+        anyhow::Error::new(DomainError::invalid(
+            "bad shred marker: refusing to parse (fail closed; inspect .confidant/shred.marker by hand)",
+        ))
+    })?;
+    if marker.version != SHRED_MARKER_VERSION {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "unsupported shred marker version {}",
+            marker.version
+        ))));
+    }
+    Ok(marker)
+}
+
 /// Repair leftover staging state from a crashed or failed keys operation
 /// (#175). Runs before every staged keys mutation. The swap order makes
 /// every window unambiguous:
@@ -5425,11 +5553,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
 ///   failed op (keys/ was never touched) — delete it.
 /// - `keys/` missing + stage present + no `keys.old`: inconsistent (the
 ///   copy never deletes keys/) — refuse to guess.
+///
+/// A shred marker (`#220`) takes precedence over all of the above: it
+/// means the stage passed `check` and the operation must roll forward.
 fn repair_keys_staging(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
     let keys_dir = root.join("keys");
     let old = keys_old_dir(root);
     let stage = keys_stage_dir(root);
     let staged_tracker = keys_staged_tracker_path(config_dir);
+    // #220: shred roll-forward marker. A marker means the stage passed
+    // `check`; the shred must roll forward to completion (swap, re-pin,
+    // device-key promotion), never roll back — rolling back would restore
+    // the destroyed keys and undo the shred.
+    if shred_marker_path(root).exists() {
+        return repair_shred_marker(root, config_dir);
+    }
     if old.exists() {
         if keys_dir.exists() {
             remove_path_best_effort(&old);
@@ -5447,6 +5585,357 @@ fn repair_keys_staging(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
     remove_path_best_effort(&stage);
     remove_path_best_effort(&staged_tracker);
     Ok(())
+}
+
+/// Roll a crashed `keys shred` forward from its durable marker (#220).
+/// The marker lives at git-ignored `.confidant/shred.marker` (never inside
+/// git-tracked `keys/`). Every step is idempotent, so a second crash
+/// mid-repair is safe to retry.
+///
+/// Crash-point behavior (Frank's decision on #290), inferred from `keys.old`:
+/// - No `keys.old`, stage present: pre-swap crash. Do the swap now.
+/// - `keys.old` present, `keys/` missing: mid-swap crash. Complete the swap.
+/// - `keys.old` present, `keys/` present: post-swap crash. Finish the
+///   re-pin and device-key promotion from the marker's material.
+///   Then clear the marker. Any other combination fails closed.
+fn repair_shred_marker(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
+    use confidant_crypt::anchor;
+    let keys_dir = root.join("keys");
+    let old = keys_old_dir(root);
+    let stage = keys_stage_dir(root);
+    let staged_tracker = keys_staged_tracker_path(config_dir);
+    let real_tracker = confidant_crypt::manifest::seq_tracker_path(config_dir);
+    let marker_path = shred_marker_path(root);
+
+    // Fail closed on a corrupt marker: never print key material (the toml
+    // error text is already stripped by read_shred_marker).
+    let marker = read_shred_marker(&marker_path)?;
+
+    // Ensure the swap is complete, inferring the crash point.
+    if !old.exists() {
+        // No backup: the swap never started (pre-swap crash). The stage
+        // holds the new tree; keys/ holds the old tree.
+        if !stage.exists() || !keys_dir.exists() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "shred marker exists but the swap never started and the stage or keys/ is missing; refusing to guess — inspect .confidant/ and restore by hand",
+            )));
+        }
+        std::fs::rename(&keys_dir, &old).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot stage old keys/ aside during shred repair: {e}"
+            )))
+        })?;
+        std::fs::rename(&stage, &keys_dir).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot complete interrupted keys/ swap during shred repair: {e}"
+            )))
+        })?;
+    } else if !keys_dir.exists() {
+        // Mid-swap: keys/ -> keys.old happened, stage -> keys/ did not.
+        if !stage.exists() {
+            return Err(anyhow::Error::new(DomainError::invalid(
+                "shred marker exists, keys/ is missing, but the stage is gone too; refusing to guess — inspect .confidant/ and restore by hand",
+            )));
+        }
+        std::fs::rename(&stage, &keys_dir).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot complete interrupted keys/ swap during shred repair: {e}"
+            )))
+        })?;
+    }
+    // keys/ now holds the new tree. The old tree is shred's destroy
+    // target; remove it best-effort.
+    remove_path_best_effort(&old);
+
+    // Promote the staged seq tracker (same-directory rename, atomic).
+    if staged_tracker.exists() {
+        std::fs::rename(&staged_tracker, &real_tracker).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot promote staged seq tracker during shred repair: {e}"
+            )))
+        })?;
+    }
+
+    // Re-pin the trust anchor from the marker's material (idempotent:
+    // temp-and-rename with the same bytes is a no-op in effect).
+    let (anchor, _warnings) = anchor::load(config_dir, root).map_err(anyhow::Error::new)?;
+    let recovery_vk_bytes = hex::decode(&marker.recovery_verifying_key_hex).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "bad recovery key in shred marker: {e}"
+        )))
+    })?;
+    let recovery_vk =
+        ed25519_dalek::VerifyingKey::from_bytes(&recovery_vk_bytes.try_into().map_err(|_| {
+            anyhow::Error::new(DomainError::invalid(
+                "bad recovery key length in shred marker",
+            ))
+        })?)
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "bad recovery key in shred marker: {e}"
+            )))
+        })?;
+    anchor::replace(
+        config_dir,
+        root,
+        &anchor.operator,
+        &recovery_vk,
+        &marker.recovery_age_recipient,
+    )
+    .map_err(anyhow::Error::new)?;
+
+    // Promote the fresh device key from the marker (idempotent: overwrites
+    // the keychain entry with the same bytes).
+    store_rotated_device_key(&zeroize::Zeroizing::new(marker.device_key_bech32.clone())).map_err(
+        |e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot promote device key during shred repair: {e}"
+            )))
+        },
+    )?;
+
+    // All promotions done: clear the marker.
+    std::fs::remove_file(&marker_path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot clear shred marker at {}: {e}",
+            marker_path.display()
+        )))
+    })?;
+    // Tell the operator what to commit: the working-tree deletions from
+    // the shred were left uncommitted by the crash. Also remind them the
+    // phrase was already shown: a Ctrl-C at the phrase prompt lands here
+    // via the next key op, and the shred is complete either way.
+    eprintln!(
+        "shred repair complete: a shred you started was completed; use the recovery phrase it showed. Review and commit the working-tree changes (deleted edges, re-encrypted interactions) in a separate commit"
+    );
+    Ok(())
+}
+
+/// Run a `keys shred` through the staged path with roll-forward (#220,
+/// Frank's decision on #290). Operation order:
+/// 1. Stage `keys/` and mutate the copy (re-wrap remaining clients to
+///    fresh recipients, rotate recovery wrapping, re-sign operator cert
+///    into the stage).
+/// 2. Reload the vault and run `check` on the post-mutation state.
+/// 3. Record a durable marker at `.confidant/shred.marker` (complete +
+///    checked, with the new anchor material and the new device key).
+/// 4. Atomically swap the staged `keys/` into place, then disarm the
+///    working-tree guard: post-swap failures roll forward, never back.
+/// 5. Re-pin the trust anchor and promote the device key from the marker.
+/// 6. Remove the marker.
+///
+/// Why roll forward: shred exists to destroy the old keys; rolling back
+/// after a crash would restore them and undo the shred. The marker makes
+/// every crash point recoverable via `repair_keys_staging`.
+///
+/// The recovery phrase is displayed BEFORE the swap (step 3.5): once the
+/// swap lands, the tree is wrapped to that phrase, so a crash before
+/// display would lose it. If the swap then fails, the error says to
+/// ignore the shown phrase — the old phrase is still current.
+#[allow(clippy::too_many_arguments)]
+fn staged_shred_mutation(
+    root: &Path,
+    vault: &confidant_core::Vault,
+    config_dir: &Path,
+    anchor: &confidant_crypt::anchor::Anchor,
+    operator_sk: &ed25519_dalek::SigningKey,
+    identity: &dyn age::Identity,
+    client_id: &str,
+    all_refs: &[&str],
+    new_recipients: &confidant_crypt::manifest::RecipientMap,
+    fresh_device_key: &zeroize::Zeroizing<String>,
+    deleted_edges: usize,
+    stripped_interactions: usize,
+    no_input: bool,
+    guard: &mut ShredTreeGuard,
+) -> anyhow::Result<confidant_crypt::lifecycle::ShredOutcome> {
+    use confidant_crypt::{
+        anchor,
+        lifecycle::KeyStore,
+        manifest::{self, SeqTracker},
+    };
+    repair_keys_staging(root, config_dir)?;
+    let keys_dir = root.join("keys");
+    let stage = keys_stage_dir(root);
+    let old = keys_old_dir(root);
+    let staged_tracker = keys_staged_tracker_path(config_dir);
+    let real_tracker = manifest::seq_tracker_path(config_dir);
+
+    // Step 1: stage the tree and the seq tracker (same as staged_keys_mutation).
+    let mut store = match (|| -> anyhow::Result<KeyStore> {
+        if keys_dir.exists() {
+            copy_dir_recursive(&keys_dir, &stage)?;
+        } else {
+            std::fs::create_dir_all(&stage)?;
+        }
+        if real_tracker.exists() {
+            std::fs::copy(&real_tracker, &staged_tracker)?;
+        }
+        let seq = SeqTracker::load(&staged_tracker).map_err(anyhow::Error::new)?;
+        Ok(KeyStore::new(stage.clone(), &vault.config.vault_id, seq)
+            .with_committed_keys_dir(keys_dir.clone()))
+    })() {
+        Ok(s) => s,
+        Err(e) => {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Err(e);
+        }
+    };
+
+    // Mutate the stage: re-wrap remaining clients, rotate recovery.
+    // On failure the stage is discarded; keys/ and the anchor untouched.
+    let outcome = match store.shred(
+        client_id,
+        all_refs,
+        new_recipients,
+        operator_sk,
+        anchor,
+        identity,
+        deleted_edges,
+        stripped_interactions,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            return Err(anyhow::Error::new(e));
+        }
+    };
+
+    // Re-sign the operator cert into the STAGE (not the live keys_dir):
+    // it was signed by the OLD recovery key, and the new tree must carry
+    // a cert the NEW recovery key verifies.
+    let new_recovery = outcome.new_recovery();
+    if let Err(e) = anchor::write_operator_cert(
+        &stage,
+        &vault.config.vault_id,
+        &anchor.operator,
+        new_recovery.signing_key(),
+    ) {
+        remove_path_best_effort(&stage);
+        remove_path_best_effort(&staged_tracker);
+        return Err(anyhow::Error::new(e));
+    }
+
+    // Step 2: check before the swap. The caller reloads the vault after
+    // the working-tree changes (edge deletions, interaction strips) and
+    // passes it in, so the check sees the post-shred record state. (See
+    // the #209 note in staged_keys_mutation: check reads keys/ only for
+    // crypto-mode detection.)
+    let pre = check_vault(vault, &CheckOptions::default());
+    if !pre.ok {
+        remove_path_best_effort(&stage);
+        remove_path_best_effort(&staged_tracker);
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "check failed before committing keys/ tree; nothing was committed and keys/ was not modified",
+        )));
+    }
+
+    // Step 3: durable marker (complete + checked), with the new anchor
+    // material and the new device key for the post-swap promotions.
+    // Lives at git-ignored .confidant/shred.marker (never in keys/).
+    let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let marker = ShredStageMarker {
+        version: SHRED_MARKER_VERSION,
+        recovery_verifying_key_hex: hex(new_recovery.verifying_key().as_bytes()),
+        recovery_age_recipient: new_recovery.age_identity().to_recipient_string(),
+        device_key_bech32: fresh_device_key.as_str().to_owned(),
+    };
+    let marker_path = shred_marker_path(root);
+    if let Err(e) = write_shred_marker(&marker_path, &marker) {
+        remove_path_best_effort(&stage);
+        remove_path_best_effort(&staged_tracker);
+        return Err(e);
+    }
+
+    // Step 3.5: show the phrase BEFORE the swap. Once the swap lands the
+    // tree is wrapped to this phrase; a crash before display would lose it.
+    // If the swap then fails, the error tells the operator to ignore the
+    // shown phrase — the old phrase is still current.
+    let phrase = outcome.recovery_phrase_for_display();
+    if let Err(e) = display_phrase_once(no_input, &phrase) {
+        remove_path_best_effort(&stage);
+        remove_path_best_effort(&staged_tracker);
+        remove_path_best_effort(&marker_path);
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot display recovery phrase: {e}"
+        ))));
+    }
+
+    // Step 4: swap (keys/ -> keys.old, stage -> keys/).
+    // NOTE: the recovery phrase was already shown at step 3.5. If the
+    // swap fails, that phrase matches nothing — tell the operator to
+    // ignore it; the old phrase is still current.
+    if keys_dir.exists() {
+        if let Err(e) = std::fs::rename(&keys_dir, &old) {
+            remove_path_best_effort(&stage);
+            remove_path_best_effort(&staged_tracker);
+            remove_path_best_effort(&marker_path);
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "keys/ swap failed before anything moved ({e}); keys/ was not modified — ignore the phrase shown above; your old phrase is still current"
+            ))));
+        }
+        // Point of no return: keys/ has moved to keys.old and the marker
+        // exists, so repair will roll forward from here (finish the swap,
+        // re-pin, promote, clear). Disarm the working-tree guard NOW,
+        // before stage -> keys/ — a failure from this point on must NOT
+        // restore the deleted edges / stripped interactions (the privacy
+        // leak #320 closed, and the roll-back-after-roll-forward mix #290
+        // rules out).
+        guard.disarm();
+    }
+    if let Err(e) = std::fs::rename(&stage, &keys_dir) {
+        let _ = repair_keys_staging(root, config_dir);
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "keys/ swap failed mid-swap ({e}); shred is finishing, re-run to complete; the phrase shown above is your new recovery phrase"
+        ))));
+    }
+
+    // Promote the staged seq tracker (same-directory rename, atomic).
+    // Post-swap: on failure, repair rolls forward; report re-run.
+    if staged_tracker.exists() {
+        if let Err(e) = std::fs::rename(&staged_tracker, &real_tracker) {
+            let _ = repair_keys_staging(root, config_dir);
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "seq tracker promotion failed ({e}); shred is finishing, re-run to complete"
+            ))));
+        }
+    }
+
+    // Step 5: re-pin the anchor and promote the device key from the marker.
+    // Both are idempotent, so a crash here is safe to retry via repair.
+    // Post-swap: on failure, repair rolls forward; report re-run.
+    if let Err(e) = anchor::replace(
+        config_dir,
+        root,
+        &anchor.operator,
+        &new_recovery.verifying_key(),
+        &new_recovery.age_identity().to_recipient_string(),
+    ) {
+        let _ = repair_keys_staging(root, config_dir);
+        return Err(anyhow::Error::new(e).context("shred is finishing, re-run to complete"));
+    }
+    if let Err(e) = store_rotated_device_key(fresh_device_key) {
+        let _ = repair_keys_staging(root, config_dir);
+        return Err(e.context("shred is finishing, re-run to complete"));
+    }
+
+    // Step 6: remove the marker. Post-swap: on failure, repair clears it;
+    // report re-run.
+    if marker_path.exists() {
+        if let Err(e) = std::fs::remove_file(&marker_path) {
+            let _ = repair_keys_staging(root, config_dir);
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot clear shred marker at {} ({e}); shred is finishing, re-run to complete",
+                marker_path.display()
+            ))));
+        }
+    }
+
+    // Cleanup of the old tree is best-effort; the next run repairs a leftover.
+    remove_path_best_effort(&old);
+    Ok(outcome)
 }
 
 /// Run a `keys/` mutation atomically (#175): stage the tree aside,
@@ -5686,6 +6175,13 @@ impl<'a> ShredTreeGuard<'a> {
     fn disarm(&mut self) {
         self.armed = false;
         self.snapshots.clear();
+    }
+
+    /// Whether the guard is still armed. After the keys/ swap lands,
+    /// `staged_shred_mutation` disarms it: post-swap failures roll forward
+    /// via the shred marker, never back via restore.
+    fn is_armed(&self) -> bool {
+        self.armed
     }
 
     /// Restore all recorded files now. Returns vault-relative paths that
@@ -6253,9 +6749,8 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // Skip vault:lookup (keys/vault) — shred handles it separately.
     let vault = load_vault(root)?;
     let keys_dir = root.join("keys");
-    let mut store =
-        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-            .map_err(anyhow::Error::new)?;
+    let store = KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
     // Live clients (for the interaction-with: check below): every client
     // whose key still exists, minus the reserved lookup id. An interaction
     // under a client NOT in this set was shredded earlier and is skipped.
@@ -6306,31 +6801,51 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
         Err(e) => return Err(shred_restore(&mut guard, e)),
     };
 
-    // B5: verify-first, strand check, history-derived destroy list all come
-    // from KeyStore::shred — do not weaken them.
-    let outcome = match store.shred(
+    // #220: shred runs against a staged copy of keys/ with roll-forward
+    // (Frank's decision on #290). The mutation, check, marker, swap,
+    // anchor re-pin and device-key promotion all happen inside
+    // staged_shred_mutation; a crash at any point is recoverable via
+    // repair_keys_staging. B5: verify-first, strand check and the
+    // history-derived destroy list all come from KeyStore::shred —
+    // do not weaken them.
+    //
+    // #339: reload the vault AFTER the working-tree mutations above so
+    // the pre-swap check sees the post-shred record state (deleted edges,
+    // stripped interactions), as the old reload-and-check did.
+    let vault = load_vault(root)?;
+    let outcome = match staged_shred_mutation(
+        root,
+        &vault,
+        &config_dir,
+        &anchor,
+        &operator_sk,
+        identity.as_ref(),
         client_id,
         &all_refs,
         &new_recipients,
-        &operator_sk,
-        &anchor,
-        identity.as_ref(),
+        &fresh_device_key,
         deleted_edges.len(),
         stripped_interactions.len(),
+        cli.no_input,
+        &mut guard,
     ) {
         Ok(outcome) => outcome,
-        Err(e) => return Err(shred_restore(&mut guard, anyhow::Error::new(e))),
+        Err(e) => {
+            // If the swap landed, staged_shred_mutation disarmed the guard:
+            // the shred is committed to rolling forward via the marker.
+            // Do NOT restore the working tree (that would be the privacy
+            // leak #320 closed); repair already ran inside.
+            if guard.is_armed() {
+                return Err(shred_restore(&mut guard, e));
+            }
+            return Err(e);
+        }
     };
-    // Shred's checks passed and the vault was re-wrapped: the working-tree
-    // mutations above are now intentional. Disarm the guard before any
-    // further fallible step.
+    // The staged swap landed and the out-of-tree promotions completed
+    // (or the guard would still be armed): the working-tree mutations
+    // above are now intentional. The guard was disarmed on swap; this
+    // is a no-op safeguard.
     guard.disarm();
-
-    // Shred's checks passed and the vault was re-wrapped to the fresh
-    // keypair: store the fresh private key now. (If shred had refused,
-    // the old key would still be enrolled and this device could keep
-    // reading the vault.)
-    store_rotated_device_key(&fresh_device_key)?;
 
     // Delete this device's local search index (the QMD corpus + store): it
     // is a plaintext mirror that may hold the shredded client's content, and
@@ -6339,46 +6854,11 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
     // warnings). Best-effort: failures become warnings, not errors.
     let search_index_warnings = delete_search_index(root);
 
-    // B5: the CLI re-pins the anchor itself (new recovery halves) BEFORE
-    // any other key operation. #99 ordering: anchor re-pinned before the
-    // inbox rotation below. Uses atomic temp-and-rename replace (the
-    // anchor already exists — save would refuse to overwrite).
+    // #220: the anchor re-pin, operator-cert re-sign (into the staged
+    // tree), device-key promotion and phrase display all happened inside
+    // staged_shred_mutation before the swap. The check ran there too.
+    // B2: one commit.
     let no_input = cli.no_input;
-    let new_recovery = outcome.new_recovery();
-    anchor::replace(
-        &config_dir,
-        root,
-        &anchor.operator,
-        &new_recovery.verifying_key(),
-        &new_recovery.age_identity().to_recipient_string(),
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Re-sign the operator certificate with the new recovery key: it was
-    // signed by the OLD recovery key, and without this a fresh-device
-    // recover with the NEW phrase fails verify_operator_cert (silent
-    // lockout). Same staleness bug as #149's recover path.
-    anchor::write_operator_cert(
-        &keys_dir,
-        &vault.config.vault_id,
-        &anchor.operator,
-        new_recovery.signing_key(),
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Show the new phrase BEFORE any further fallible steps (commit,
-    // inbox rotation): if they fail, the operator still has the phrase.
-    let phrase = outcome.recovery_phrase_for_display();
-    display_phrase_once(no_input, &phrase)?;
-
-    // B2: one commit, check first.
-    let vault = load_vault(root)?;
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree",
-        )));
-    }
     stage_keys(root, no_input)?;
     // #179: stage the deleted edge files (deletions only, exact paths) so
     // they land in the same signed shred commit. Only tracked paths: an
@@ -6696,6 +7176,381 @@ mod tests {
         std::fs::remove_dir_all(root.join("keys")).unwrap();
         std::fs::create_dir_all(keys_stage_dir(&root)).unwrap();
         assert!(repair_keys_staging(&root, &config_dir).is_err());
+    }
+
+    /// Fixture for shred-marker repair tests: a vault root with keys/,
+    /// a config dir with a valid trust.toml, and a test keychain dir.
+    /// Returns (tmp, root, config_dir, keychain_dir, env_guard) — the
+    /// guard restores `CONFIDANT_TEST_KEYCHAIN_DIR` on drop.
+    ///
+    /// NOTE: the marker tests manipulate the process-global
+    /// `CONFIDANT_TEST_KEYCHAIN_DIR`; they take `KEYCHAIN_ENV_LOCK` to
+    /// serialize against each other.
+    static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores `CONFIDANT_TEST_KEYCHAIN_DIR` to its previous value (or
+    /// unsets it) on drop, so marker tests don't leak the process-global
+    /// env var into other tests running in the same binary.
+    struct KeychainEnvGuard {
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl KeychainEnvGuard {
+        fn set_dir(dir: &std::path::Path) -> Self {
+            let old = std::env::var_os("CONFIDANT_TEST_KEYCHAIN_DIR");
+            std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", dir);
+            Self { old }
+        }
+    }
+
+    impl Drop for KeychainEnvGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", v),
+                None => std::env::remove_var("CONFIDANT_TEST_KEYCHAIN_DIR"),
+            }
+        }
+    }
+
+    fn shred_marker_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        KeychainEnvGuard,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        let config_dir = tmp.path().join("config");
+        let keychain_dir = tmp.path().join("keychain");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&keychain_dir).unwrap();
+        // Minimal vault.
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
+        )
+        .unwrap();
+        // Old keys/ tree (sentinel to distinguish from the new tree).
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys").join("OLD_TREE"), b"old").unwrap();
+        // Valid trust.toml with generated keys.
+        let operator_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let trust_toml = format!(
+            "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3\"\n",
+            hex(operator_sk.verifying_key().as_bytes()),
+            hex(recovery_sk.verifying_key().as_bytes()),
+        );
+        std::fs::write(config_dir.join("trust.toml"), trust_toml).unwrap();
+        // Test keychain with an old device key.
+        std::fs::write(keychain_dir.join("device.key"), b"OLD_DEVICE_KEY").unwrap();
+        // Point the test keychain at our dir (restored on drop by the guard).
+        let env_guard = KeychainEnvGuard::set_dir(&keychain_dir);
+        (tmp, root, config_dir, keychain_dir, env_guard)
+    }
+
+    fn write_test_marker(path: &std::path::Path, recovery_vk_hex: &str, device_key: &str) {
+        use super::{write_shred_marker, ShredStageMarker, SHRED_MARKER_VERSION};
+        let marker = ShredStageMarker {
+            version: SHRED_MARKER_VERSION,
+            recovery_verifying_key_hex: recovery_vk_hex.to_owned(),
+            recovery_age_recipient: "age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3".to_string(),
+            device_key_bech32: device_key.to_owned(),
+        };
+        write_shred_marker(path, &marker).unwrap();
+    }
+
+    #[test]
+    fn shred_marker_pre_swap_rolls_forward() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220: crash after check, before swap (marker in .confidant/).
+        // Repair must finish the swap, re-pin the anchor, promote the
+        // device key, and clear the marker — never discard the stage.
+        use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let stage = keys_stage_dir(&root);
+        std::fs::create_dir_all(&stage).unwrap();
+        // New tree in the stage (sentinel).
+        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
+        // Marker in .confidant/ with new anchor material and device key.
+        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_vk_hex: String = new_recovery_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
+        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+
+        repair_keys_staging(&root, &config_dir).unwrap();
+
+        // Swap completed: keys/ holds the new tree, old tree gone.
+        assert!(root.join("keys/NEW_TREE").is_file());
+        assert!(!root.join("keys/OLD_TREE").exists());
+        assert!(!root.join(".confidant/keys.old").exists());
+        assert!(!stage.exists());
+        // Marker cleared from .confidant/.
+        assert!(!shred_marker_path(&root).exists());
+        // Anchor re-pinned to the new recovery key.
+        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+        assert_ne!(new_anchor, old_anchor);
+        assert!(new_anchor.contains(&new_vk_hex));
+        // Device key promoted.
+        let device_key = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
+        assert_eq!(device_key, "NEW_DEVICE_KEY");
+    }
+
+    #[test]
+    fn shred_marker_post_swap_finishes_promotions() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220: crash after swap, before re-pin (marker in .confidant/,
+        // keys.old present, keys/ is the new tree). Repair must finish
+        // the re-pin and device-key promotion from the marker, then
+        // clear it.
+        use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let keys_dir = root.join("keys");
+        // Simulate post-swap: new tree in keys/, old tree in keys.old.
+        std::fs::write(keys_dir.join("NEW_TREE"), b"new").unwrap();
+        std::fs::remove_file(keys_dir.join("OLD_TREE")).unwrap();
+        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
+        std::fs::write(keys_old_dir(&root).join("OLD_TREE"), b"old").unwrap();
+        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_vk_hex: String = new_recovery_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
+        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+
+        repair_keys_staging(&root, &config_dir).unwrap();
+
+        // Marker cleared, anchor re-pinned, device key promoted.
+        assert!(!shred_marker_path(&root).exists());
+        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+        assert_ne!(new_anchor, old_anchor);
+        assert!(new_anchor.contains(&new_vk_hex));
+        let device_key = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
+        assert_eq!(device_key, "NEW_DEVICE_KEY");
+        // keys/ untouched apart from the swap; old tree cleaned up.
+        assert!(keys_dir.join("NEW_TREE").is_file());
+        assert!(!keys_old_dir(&root).exists());
+    }
+
+    #[test]
+    fn shred_no_marker_discards_stage() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220: crash during mutate/check (no marker). The stage is
+        // discarded; keys/ and the anchor are untouched.
+        use super::{keys_stage_dir, repair_keys_staging};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let stage = keys_stage_dir(&root);
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("PARTIAL"), b"partial").unwrap();
+        let keys_before: Vec<_> = std::fs::read_dir(root.join("keys"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let anchor_before = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+        let device_before = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
+
+        repair_keys_staging(&root, &config_dir).unwrap();
+
+        // Stage discarded, keys/ byte-identical, anchor and device key untouched.
+        assert!(!stage.exists());
+        let keys_after: Vec<_> = std::fs::read_dir(root.join("keys"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(keys_before, keys_after);
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("trust.toml")).unwrap(),
+            anchor_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
+            device_before
+        );
+    }
+
+    #[test]
+    fn shred_marker_post_repin_is_safe_noop() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220/#339: crash after the re-pin, before marker removal.
+        // Repair must be a safe no-op re-run (idempotent re-pin and
+        // device-key promotion), then clear the marker. A second run
+        // must also succeed.
+        use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let keys_dir = root.join("keys");
+        // Simulate post-re-pin: new tree in keys/, old tree in keys.old,
+        // anchor ALREADY re-pinned, device key ALREADY promoted.
+        std::fs::write(keys_dir.join("NEW_TREE"), b"new").unwrap();
+        std::fs::remove_file(keys_dir.join("OLD_TREE")).unwrap();
+        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
+        std::fs::write(keys_old_dir(&root).join("OLD_TREE"), b"old").unwrap();
+        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_vk_hex: String = new_recovery_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // Pre-pin the anchor and promote the device key (as a crash
+        // after step 5 would have left them).
+        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
+        // Manually re-pin: rewrite trust.toml with the new recovery key
+        // (keeping a valid operator pubkey).
+        let operator_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let operator_hex: String = operator_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let trust_toml = format!(
+            "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3\"\n",
+            operator_hex, new_vk_hex
+        );
+        std::fs::write(config_dir.join("trust.toml"), &trust_toml).unwrap();
+        std::fs::write(_keychain.join("device.key"), b"NEW_DEVICE_KEY").unwrap();
+        let anchor_before = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+
+        // First repair: idempotent re-run, then clear marker.
+        repair_keys_staging(&root, &config_dir).unwrap();
+        assert!(!shred_marker_path(&root).exists());
+        // Anchor still the new key (re-pin was a no-op).
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("trust.toml")).unwrap(),
+            anchor_before
+        );
+        // Device key still promoted.
+        assert_eq!(
+            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
+            "NEW_DEVICE_KEY"
+        );
+        // keys/ still the new tree.
+        assert!(keys_dir.join("NEW_TREE").is_file());
+
+        // Second repair: no marker, normal path, succeeds.
+        repair_keys_staging(&root, &config_dir).unwrap();
+        assert!(keys_dir.join("NEW_TREE").is_file());
+    }
+
+    #[test]
+    fn shred_marker_mid_swap_completes_swap() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220/#339: mid-swap crash. Marker in .confidant/, keys/
+        // missing, keys.old present (old tree), stage present (new tree).
+        // Repair must complete the swap, then finish promotions.
+        use super::{keys_old_dir, keys_stage_dir, repair_keys_staging, shred_marker_path};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let stage = keys_stage_dir(&root);
+        // Simulate mid-swap: keys/ -> keys.old done, stage -> keys/ not.
+        std::fs::create_dir_all(root.join(".confidant")).unwrap();
+        std::fs::rename(root.join("keys"), keys_old_dir(&root)).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
+        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_vk_hex: String = new_recovery_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
+
+        repair_keys_staging(&root, &config_dir).unwrap();
+
+        // Swap completed, promotions done, marker cleared.
+        assert!(root.join("keys/NEW_TREE").is_file());
+        assert!(!root.join("keys/OLD_TREE").exists());
+        assert!(!keys_old_dir(&root).exists());
+        assert!(!stage.exists());
+        assert!(!shred_marker_path(&root).exists());
+        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+        assert!(new_anchor.contains(&new_vk_hex));
+        assert_eq!(
+            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
+            "NEW_DEVICE_KEY"
+        );
+    }
+
+    #[test]
+    fn shred_marker_corrupt_fails_closed() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #339: a corrupt or empty marker must fail closed, and the error
+        // must NOT quote the marker content (it may hold a private key).
+        use super::{repair_keys_staging, shred_marker_path};
+        for (name, content) in [
+            (
+                "corrupt",
+                "version = 1\ndevice_key_bech32 = \"SECRET_KEY_MATERIAL_12345\"\n###garbage###",
+            ),
+            ("empty", ""),
+            (
+                "truncated",
+                "version = 1\nrecovery_verifying_key_hex = \"ab",
+            ),
+        ] {
+            let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+            let marker_path = shred_marker_path(&root);
+            std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+            std::fs::write(&marker_path, content).unwrap();
+            let err = repair_keys_staging(&root, &config_dir).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("SECRET_KEY_MATERIAL_12345"),
+                "{name}: error leaked marker content: {msg}"
+            );
+            assert!(
+                !msg.contains("garbage"),
+                "{name}: error leaked marker content: {msg}"
+            );
+            // keys/ untouched.
+            assert!(root.join("keys/OLD_TREE").is_file());
+        }
+    }
+
+    #[test]
+    fn shred_marker_other_op_rolls_forward() {
+        let _env_guard = KEYCHAIN_ENV_LOCK.lock().unwrap();
+        // #220/#339, #99 rule: a different key operation (e.g. rotate)
+        // starting while a shred marker exists must finish the shred
+        // first via repair_keys_staging, not clobber it. The marker takes
+        // precedence over the normal "discard the stage" path.
+        use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
+        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
+        let stage = keys_stage_dir(&root);
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
+        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_vk_hex: String = new_recovery_sk
+            .verifying_key()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
+        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+
+        // This is what `keys rotate` / `keys init-client` call first.
+        repair_keys_staging(&root, &config_dir).unwrap();
+
+        // The shred rolled forward (not discarded): new tree swapped in,
+        // anchor re-pinned to the marker's key, marker cleared.
+        assert!(root.join("keys/NEW_TREE").is_file());
+        assert!(!stage.exists());
+        assert!(!shred_marker_path(&root).exists());
+        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
+        assert_ne!(new_anchor, old_anchor);
+        assert!(new_anchor.contains(&new_vk_hex));
     }
 
     #[cfg(unix)]

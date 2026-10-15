@@ -530,6 +530,93 @@ fn recovery_age(home: &Path) -> String {
 }
 
 #[test]
+fn keys_shred_refused_leaves_keys_anchor_device_untouched() {
+    // #220/#339: a shred refused through staged_shred_mutation (before
+    // the swap) must leave keys/, the trust anchor, and the device key
+    // byte-identical. The guard is still armed pre-swap, so the
+    // working tree is restored too.
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    for client in ["client-a", "client-b"] {
+        let out = h
+            .cmd(&["keys", "init-client", client, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "init-client {client} failed");
+    }
+
+    // Plant an initialized-but-unverifiable client dir so KeyStore::shred's
+    // verify-first pass refuses (same trick as
+    // keys_shred_refused_leaves_device_key_untouched).
+    let rogue = h.vault.join("keys/rogue");
+    std::fs::create_dir_all(&rogue).unwrap();
+    std::fs::write(rogue.join("epoch"), "1\n").unwrap();
+
+    // Snapshot keys/ (including the rogue dir), the anchor, and the device key.
+    fn snapshot_tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, base, out);
+                } else if p.is_file() {
+                    out.push((
+                        p.strip_prefix(base).unwrap().to_path_buf(),
+                        std::fs::read(&p).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+    let keys_before = snapshot_tree(&h.vault.join("keys"));
+    let trust_path = h.home.join(".config/confidant/trust.toml");
+    let trust_before = std::fs::read_to_string(&trust_path).unwrap();
+    let key_path = h.keychain_dir.as_ref().unwrap().join("device.key");
+    let device_before = std::fs::read_to_string(&key_path).unwrap();
+
+    // Shred must refuse before the swap.
+    let out = h
+        .cmd(&["keys", "shred", "client-a", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "shred should have refused the unverifiable client"
+    );
+
+    // Everything untouched: keys/ tree, anchor, device key.
+    assert_eq!(
+        snapshot_tree(&h.vault.join("keys")),
+        keys_before,
+        "keys/ changed despite refused shred"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&trust_path).unwrap(),
+        trust_before,
+        "trust anchor changed despite refused shred"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key_path).unwrap(),
+        device_before,
+        "device key changed despite refused shred"
+    );
+    // No marker left behind.
+    assert!(
+        !h.vault.join(".confidant/shred.marker").exists(),
+        "shred marker left after refused shred"
+    );
+    std::fs::remove_dir_all(&rogue).unwrap();
+}
+
+#[test]
 fn keys_shred_on_inbox_device_starts_rotation_test18() {
     // #105 test 18 (B1): on a device that holds the inbox key, `keys shred`
     // starts the inbox rotation — the new keypair is active, the old key is
