@@ -141,18 +141,36 @@ mod tests {
         }
     }
 
-    /// Drift test (#189): every finding code a pack declares it can emit
-    /// must be documented in its skill text ("what it means, what to do"),
-    /// so the docs stay honest as rules change.
+    /// Drift test (#189, generalized #345): every finding code a pack declares
+    /// it can emit must be documented in its skill text ("what it means, what
+    /// to do"), so the docs stay honest as rules change. Codes are read from
+    /// the pack's manifest (the source of truth since #345), not the trait.
+    /// Also, every `[checks]` key the manifest declares must be documented
+    /// in the skill text, so manifest text and SKILL.md cannot disagree.
     #[test]
     fn pack_skills_document_all_declared_finding_codes() {
         for pack in confidant_core::packs::ALL_PACKS {
+            let manifest = confidant_core::packs::pack_manifest(pack.name())
+                .unwrap_or_else(|| panic!("pack {} has no manifest", pack.name()));
             let text = pack_skill_text(pack.name())
                 .unwrap_or_else(|| panic!("pack {} ships no SKILL.md", pack.name()));
-            for code in pack.finding_codes() {
+            for code in &manifest.finding_codes {
                 assert!(
-                    text.contains(code),
+                    text.contains(code.as_str()),
                     "pack {} can emit {code} but its SKILL.md does not document it",
+                    pack.name()
+                );
+            }
+            for check in manifest
+                .checks
+                .severity
+                .iter()
+                .map(|s| &s.key)
+                .chain(manifest.checks.int.iter().map(|i| &i.key))
+            {
+                assert!(
+                    text.contains(&format!("`{check}`")),
+                    "pack {} declares [checks] key {check} but its SKILL.md does not document it",
                     pack.name()
                 );
             }

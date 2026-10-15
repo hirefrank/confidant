@@ -368,6 +368,69 @@ pub fn parse_manifest(text: &str) -> Result<PackManifest, DomainError> {
     Ok(manifest)
 }
 
+/// Render a message template: `{placeholder}` substitution only — no
+/// conditionals, no expressions, no filters (the loader already rejected
+/// anything else). A placeholder the caller does not supply is a render
+/// error: the manifest is compile-time data and the code must supply
+/// every placeholder the template names (spec §7). Extra args are
+/// ignored.
+fn render_template(template: &str, args: &[(&str, &dyn std::fmt::Display)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            out.push(c);
+            continue;
+        }
+        let mut name = String::new();
+        for c in chars.by_ref() {
+            if c == '}' {
+                break;
+            }
+            name.push(c);
+        }
+        let value = args.iter().find(|(k, _)| *k == name).unwrap_or_else(|| {
+            panic!("manifest template names placeholder '{{{name}}}' with no value supplied")
+        });
+        out.push_str(&value.1.to_string());
+    }
+    out
+}
+
+impl PackManifest {
+    /// Render a finding message (`messages[code][variant]`), substituting
+    /// `{placeholder}` with the supplied values. Panics when the code or
+    /// variant is missing, or when a placeholder has no value: the
+    /// manifest is compile-time data, so a bad lookup is a programming
+    /// error (spec §7: text in the manifest, selection in Rust).
+    pub fn render_message(
+        &self,
+        code: &str,
+        variant: &str,
+        args: &[(&str, &dyn std::fmt::Display)],
+    ) -> String {
+        let template = self
+            .messages
+            .get(code)
+            .and_then(|variants| variants.get(variant))
+            .unwrap_or_else(|| panic!("manifest has no [messages.\"{code}\"].{variant}"));
+        render_template(template, args)
+    }
+
+    /// Render the `<variant>_fix` template, or `None` when the manifest
+    /// declares no fix for this variant.
+    pub fn render_fix(
+        &self,
+        code: &str,
+        variant: &str,
+        args: &[(&str, &dyn std::fmt::Display)],
+    ) -> Option<String> {
+        let fix_variant = format!("{variant}_fix");
+        let template = self.messages.get(code)?.get(&fix_variant)?;
+        Some(render_template(template, args))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
