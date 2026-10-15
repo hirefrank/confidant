@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::contract::{parse_raw_output, CheckReport, ContractOutcome};
 use crate::proposals::{
-    is_planned_under_dir, is_under_dir, manifest_stem, open_secure_write, progress_path,
-    read_manifest, read_progress, write_progress, ProposalManifest, TuiProgress,
+    is_planned_under_dir, is_under_dir, manifest_stem, open_secure_write, progress_file_corrupt,
+    progress_path, read_manifest, read_progress, write_progress, ProposalManifest, TuiProgress,
 };
 use crate::runner::{RawOutput, Runner};
 
@@ -471,6 +471,9 @@ pub enum FlowPhase {
     CleanupFailed { message: String },
     /// Proposal set deleted.
     Finished,
+    /// The progress file was corrupt: ask before treating the proposal as
+    /// fresh (a corrupt file could make an applied step look pending).
+    CorruptProgress,
 }
 
 /// The dry-run preview the diff view renders.
@@ -500,6 +503,7 @@ impl ApplyFlow {
         let manifest = read_manifest(manifest_path)
             .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
         let planned = plan_manifest(&manifest, manifest_path, vault_root)?;
+        let corrupt_progress = progress_file_corrupt(manifest_path);
         let progress = read_progress(manifest_path);
         let steps = planned
             .into_iter()
@@ -522,7 +526,11 @@ impl ApplyFlow {
             vault_root: vault_root.to_path_buf(),
             steps,
             progress,
-            phase: FlowPhase::Browsing,
+            phase: if corrupt_progress {
+                FlowPhase::CorruptProgress
+            } else {
+                FlowPhase::Browsing
+            },
         })
     }
 
@@ -1056,6 +1064,33 @@ mod tests {
         let manifest_path = proposals.join("m.json");
         let err = cleanup_paths(&manifest, &manifest_path, &dir).expect_err("must refuse");
         assert!(err.contains("outside .confidant/proposals/"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_with_corrupt_progress_asks_before_fresh() {
+        let dir = test_temp_dir("tui-apply-test-corrupt-progress");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        let manifest_path = proposals.join("m.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{"skill": "s", "request_id": "01AAAAAAAAAAAAAAAAAAAAAAAA", "records": []}"#,
+        )
+        .unwrap();
+        // Corrupt progress file: open must land in the CorruptProgress phase
+        // (in-UI alert), not silently treat the proposal as fresh.
+        std::fs::write(proposals.join("m.tui-progress.json"), b"\xffnot json").unwrap();
+        let flow = ApplyFlow::open(&manifest_path, &dir).expect("must open");
+        assert_eq!(flow.phase, FlowPhase::CorruptProgress);
+        assert!(flow
+            .steps
+            .iter()
+            .all(|s| matches!(s.status, StepStatus::Pending)));
+        // Valid progress: straight to Browsing.
+        std::fs::write(proposals.join("m.tui-progress.json"), r#"{"done": {}}"#).unwrap();
+        let flow = ApplyFlow::open(&manifest_path, &dir).expect("must open");
+        assert_eq!(flow.phase, FlowPhase::Browsing);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

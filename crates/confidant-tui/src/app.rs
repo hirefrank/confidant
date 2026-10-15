@@ -634,6 +634,19 @@ impl<R: Runner> App<R> {
                 KeyCode::Char('q') => self.should_quit = true,
                 _ => {}
             },
+            // The progress file was corrupt: `y` treats the proposal as fresh
+            // (re-apply is safe — the CLI's idempotence checks skip done
+            // steps), any other key closes the proposal.
+            FlowPhase::CorruptProgress => match key.code {
+                KeyCode::Char('y') => {
+                    if let Some(flow) = self.proposals.opened.as_mut() {
+                        flow.phase = FlowPhase::Browsing;
+                    }
+                }
+                _ => {
+                    self.proposals.opened = None;
+                }
+            },
             // Terminal phases are exited immediately by the action that
             // produced them; any stray key just closes the detail.
             FlowPhase::Finished | FlowPhase::CheckFailed | FlowPhase::CleanupExportInput { .. } => {
@@ -1008,6 +1021,24 @@ impl<R: Runner> App<R> {
                         vec![
                             "Delete proposal set (manifest, lines file, staged notes, progress file)?"
                                 .to_owned(),
+                        ],
+                    ),
+                    frame,
+                    area,
+                );
+            }
+            FlowPhase::CorruptProgress => {
+                proposals::render_detail(&self.proposal_detail(flow), frame, area);
+                confirm::render(
+                    &ConfirmState::new(
+                        "Corrupt progress file".to_owned(),
+                        vec![
+                            "The progress file for this proposal is corrupt, so every".to_owned(),
+                            "step looks pending — an already-applied step may be among".to_owned(),
+                            "them.".to_owned(),
+                            String::new(),
+                            "Re-applying is safe: the CLI's idempotence checks skip".to_owned(),
+                            "steps that are already done.".to_owned(),
                         ],
                     ),
                     frame,

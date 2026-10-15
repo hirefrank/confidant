@@ -252,6 +252,10 @@ impl TuiProgress {
 
 /// Read the progress file; a missing or corrupt file yields empty progress
 /// (the request ids make re-running safe).
+/// Read the progress file. A missing file means a fresh proposal; a corrupt
+/// file is also treated as fresh, but silently — callers that need to tell
+/// the operator use [`progress_file_corrupt`], which surfaces it in-UI
+/// (never `eprintln!`: that would draw over the TUI screen).
 pub fn read_progress(manifest_path: &Path) -> TuiProgress {
     let path = progress_path(manifest_path);
     let bytes = match std::fs::read(&path) {
@@ -260,13 +264,18 @@ pub fn read_progress(manifest_path: &Path) -> TuiProgress {
     };
     match serde_json::from_slice::<ProgressFile>(&bytes) {
         Ok(file) => TuiProgress { done: file.done },
-        Err(_) => {
-            eprintln!(
-                "warning: corrupt progress file {}, starting fresh",
-                path.display()
-            );
-            TuiProgress::default()
-        }
+        Err(_) => TuiProgress::default(),
+    }
+}
+
+/// True when a progress file exists but does not parse. A corrupt file could
+/// make an already-applied step look pending, so the TUI asks before treating
+/// the proposal as fresh instead of silently resetting.
+pub fn progress_file_corrupt(manifest_path: &Path) -> bool {
+    let path = progress_path(manifest_path);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<ProgressFile>(&bytes).is_err(),
+        Err(_) => false,
     }
 }
 
@@ -471,6 +480,27 @@ mod tests {
         open_secure_write(&fresh).unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn progress_file_corrupt_detected() {
+        let dir = test_temp_dir("tui-proposals-test-progress-corrupt");
+        let manifest = dir.join("m.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No file: not corrupt, just fresh.
+        assert!(!progress_file_corrupt(&manifest));
+        // Valid file: not corrupt.
+        std::fs::write(dir.join("m.tui-progress.json"), r#"{"done": {}}"#).unwrap();
+        assert!(!progress_file_corrupt(&manifest));
+        // Garbage: corrupt.
+        std::fs::write(dir.join("m.tui-progress.json"), b"\xff\xfe{{{not json").unwrap();
+        assert!(progress_file_corrupt(&manifest));
+        // Empty: corrupt.
+        std::fs::write(dir.join("m.tui-progress.json"), b"").unwrap();
+        assert!(progress_file_corrupt(&manifest));
+        // read_progress still treats it as fresh (the caller surfaces it in-UI).
+        assert_eq!(read_progress(&manifest), TuiProgress::default());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
