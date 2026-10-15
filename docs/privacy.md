@@ -60,6 +60,14 @@ Ledger lines are searchable only when every ID on the line is cleared. A note,
 interaction, or deal is cleared only when every ledger line that names it is
 allowed; this does not apply to persons.
 
+## TUI proposal review
+
+`confidant-tui` shows dry-run plaintext (ledger lines, note bodies, record
+content) on screen only — it is never logged, written to disk, or sent
+anywhere. Proposal scratch files (manifest, lines file, staged note bodies
+and record content) live under `<vault>/.confidant/proposals/` (gitignored),
+are created `0600` (`0700` for directories), and are deleted after the apply.
+
 ## Packages
 
 `pkg-` IDs follow their openers. Dropping a record walks merge peers and

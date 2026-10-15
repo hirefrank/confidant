@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Read-only TUI for Confidant, consuming the ADR-7 CLI JSON contract."
+description = "Terminal UI for Confidant, consuming the ADR-7 CLI JSON contract."
 publish = false
 
 [[bin]]
@@ -20,7 +20,8 @@ path = "src/main.rs"
 # confidant-core so it remains the second consumer of the ADR-7 --json
 # contract). `dist = true` opts the binary into cargo-dist despite
 # `publish = false`, so the release workflow produces `confidant-tui`
-# alongside `confidant`. Flip to crates.io when Phase 2 (write flows) lands.
+# alongside `confidant`. Phase 2 (write flows) landed in #211; flipping to
+# crates.io still tracks #218.
 dist = true
 
 [dependencies]

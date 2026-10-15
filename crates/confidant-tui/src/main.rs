@@ -17,7 +17,8 @@ use confidant_tui::app::App;
 use confidant_tui::runner::ProcessRunner;
 use confidant_tui::{install_panic_hook, restore_terminal};
 
-/// Read-only terminal UI for Confidant (contract v1).
+/// Terminal UI for Confidant (contract v1): read-only views plus
+/// confirm-before-apply proposal review.
 #[derive(Debug, Parser)]
 #[command(name = "confidant-tui", version, about)]
 struct Cli {
@@ -33,7 +34,7 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let bin = ProcessRunner::resolve_bin(cli.confidant);
-    let runner = ProcessRunner::new(bin, cli.vault);
+    let runner = ProcessRunner::new(bin, cli.vault.clone());
 
     install_panic_hook();
     enable_raw_mode()?;
@@ -52,7 +53,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let run_result = run_event_loop(&mut terminal, runner);
+    let run_result = run_event_loop(&mut terminal, runner, cli.vault);
     let _ = terminal.clear();
     restore_terminal();
     run_result
@@ -61,8 +62,12 @@ fn main() -> Result<()> {
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     runner: ProcessRunner,
+    vault: Option<PathBuf>,
 ) -> Result<()> {
     let mut app = App::new(runner);
+    if let Some(vault) = vault {
+        app.set_vault_root(vault);
+    }
     app.load_check();
 
     loop {

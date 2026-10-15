@@ -1,5 +1,5 @@
 ┌ confidant-tui (contract v1) ─────────────────────────────────────────────────────────────────────┐
-│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] | Tab/1-4:view /:find j/k:move Enter:context r:r│
+│[*1:Check*] [ 2:Find ] [ 3:Context ] [ 4:Doctor ] [ 5:Proposals ] | Tab/1-5:view /:find j/k:move E│
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Usage Error (exit 2) ────────────────────────────────────────────────────────────────────────────┐
 │code: usage_error                                                                                 │

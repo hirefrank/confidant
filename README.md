@@ -254,10 +254,19 @@ confidant check --json --fail-on warning --as-of 2026-10-08
 
 ## TUI (preview)
 
-`confidant-tui` is a read-only terminal UI for `check`, `find`, `context`,
-and `doctor`. It consumes only the ADR-7 CLI JSON contract
+`confidant-tui` is a terminal UI for `check`, `find`, `context`, and
+`doctor`, plus confirm-before-apply review of skill proposals. It consumes
+only the ADR-7 CLI JSON contract
 (`confidant <subcommand> --json --no-input`), never opens vault files
 directly, and keeps plaintext on the alternate screen only.
+
+The proposals tab (Phase 2, #211) lists the manifests in
+`<vault>/.confidant/proposals/` and applies them exactly as the skill
+workflow does: ledger import, then notes, then records — each step shown as
+a dry-run diff first and applied only on an explicit `y` confirm. Records
+are never hand-written into the vault tree (pre-M2 records stay with the
+skill workflow); every write goes through the CLI, one commit per write,
+with progress tracked so a crashed apply resumes where it stopped.
 
 It ships as a GitHub Releases binary (next to `confidant`), and is not on
 crates.io yet. It needs a `confidant` on `PATH` that speaks the same agent
@@ -279,8 +288,8 @@ The roadmap is tracked as open issues on GitHub. The big themes:
 - **External packs** — installable, versioned, loaded at runtime so third
   parties can publish packs without a PR here.
   [Issue #193](https://github.com/hirefrank/confidant/issues/193).
-- **TUI** — a read-only terminal UI on top of the agent contract, with
-  write flows and proposal review to follow.
+- **TUI** — a terminal UI on top of the agent contract, with write flows
+  and proposal review (Phase 2, #211).
   [Issue #205](https://github.com/hirefrank/confidant/issues/205).
 - **Encrypted editing** — `record edit` through the write pipeline, blocked
   on the outside audit.
