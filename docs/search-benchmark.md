@@ -8,6 +8,8 @@ Method: `confidant bench-gen` writes a fake vault (no real names), then
 plaintext; **decrypt / AEAD is not measured** (`confidant-crypt` is a stub
 until the milestone 2 design review). A per-file decrypt cost is therefore
 not in these numbers and would scale with file count, not with match count.
+(Update 2026-10-15: `bench-gen --encrypted` now measures the decrypt path
+and `--touch` a touch-heavy ledger — see the issue #188 follow-up below.)
 
 `bench-gen` refuses a non-empty directory or an existing vault.
 
@@ -125,6 +127,64 @@ IDs, path ULIDs, ledger lines) dumped on the bench vault is
 byte-identical before/after; `find --json` with 2,400 matches is
 byte-identical before/after; the full workspace suite and golden files
 pass unchanged.
+
+## Follow-up: issue #188 (2026-10-15)
+
+The recommendation asked for the benchmark re-run with encryption on and
+with touch volume before building any cache. `bench-gen` grew two flags:
+
+- `--touch`: enables `personal@0.1` and writes 100 small `touch` ledger
+  lines per person across 2024–2026 (40,000 lines; ledger entries
+  10,320 → 50,320).
+- `--encrypted`: keys the fresh vault (`init` + `keys init-client` per
+  person under throwaway keys, no OS keychain) and encrypts all 2,400
+  records through the production `encrypt_file` path. Needs the
+  `--all-features` build (the operator key comes from the
+  test-overrides env source). The throwaway device key and bench-HOME
+  path are left beside the vault as `.bench-device-key` (0600) and
+  `.bench-home-path` (both uncommitted; never printed); measuring
+  re-exports them, and real `~/.config/confidant` is never touched:
+
+```sh
+cargo build --release --all-features --locked -p confidant-cli
+tmp=$(mktemp -d)
+./target/release/confidant bench-gen "$tmp" --people 400 --notes 5 --encrypted --touch
+export HOME=$(cat "$tmp/.bench-home-path")
+export CONFIDANT_DEVICE_KEY=$(cat "$tmp/.bench-device-key")
+./target/release/confidant find coaching-practice --vault "$tmp" --json --no-input
+./target/release/confidant check --vault "$tmp" --json --no-input
+```
+
+Same 400×5 layout, same Ryzen 5 7640U machine as the issue-#2
+follow-up, release build (`rustc 1.98.1`; repo pins 1.99.0). No
+hyperfine on this machine: each cell is mean ± stdev over 5 timed runs
+after warmups. `find` uses the default `--limit 50` (truncates
+printing, not scanning — scan work is identical).
+
+| Vault | Ledger entries | `find coaching-practice` | `check` |
+|---|---|---:|---:|
+| plaintext | 10,320 | 180.0 ± 14.0 ms | 62.0 ± 3.4 ms |
+| plaintext + touch | 50,320 | 338.2 ± 13.4 ms | 124.5 ± 7.9 ms |
+| encrypted | 10,320 | 670.1 ± 10.6 ms | 78.4 ± 2.2 ms |
+| encrypted + touch | 50,320 | 984.2 ± 27.0 ms | 163.1 ± 5.9 ms |
+
+Validity: `check` is clean (0 errors, 0 warnings) on all four vaults,
+and the encrypted vaults report `skipped_encrypted: 0` with full match
+sets — the decrypt path is genuinely measured, not skipped. (An early
+run without the device key/anchor env returned 0 matches with
+`skipped_encrypted: 2400`; those numbers were discarded.)
+
+Reading: touch volume scales both commands roughly with ledger size
+(~+160 ms find, ~+60 ms check for 5× ledger lines). Encryption adds
+~490 ms to `find` (per-file AEAD open across 2,400 records) but only
+~16 ms to `check` (the fold works over the plaintext ledger). The
+heaviest realistic case — encrypted records plus a touch-heavy ledger —
+stays around **1 s for `find`, 163 ms for `check`**.
+
+Recommendation: no cache or index is justified. ~1 s worst case is
+inside interactive range, and QMD (local BM25 + vectors, index never in
+git) remains the long-term plan. This closes the #188 re-measurement
+ask.
 
 ## Section 9b item 4
 

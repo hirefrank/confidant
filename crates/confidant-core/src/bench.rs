@@ -12,12 +12,15 @@ use crate::paths;
 const TIME_MS: u64 = 1_790_812_800_000; // 2026-10-01 UTC
 const SESSIONS_PER_PERSON: usize = 24;
 const NOTE_BODY_KB: usize = 3;
+const TOUCHES_PER_PERSON: usize = 100;
 
 /// Write a vault of `people` clients, each with `notes_per_person` notes.
 /// All names and emails are synthetic. Returns the unique token planted in
 /// person 0's profile (for a one-hit search) and a common token planted in
 /// every profile. When `cjk` is true, note bodies use a no-space CJK
-/// paragraph (with an embedded dash) instead of English filler.
+/// paragraph (with an embedded dash) instead of English filler. When
+/// `touch` is true, the vault also enables `personal@0.1` and writes
+/// `TOUCHES_PER_PERSON` small `touch` ledger lines per person.
 ///
 /// Refuses to run on a non-empty directory or an existing vault.
 pub fn generate_realistic_vault(
@@ -25,15 +28,21 @@ pub fn generate_realistic_vault(
     people: usize,
     notes_per_person: usize,
     cjk: bool,
+    touch: bool,
 ) -> Result<(String, String)> {
     refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
     let unique = "zxqvUniqueTokenAda0";
     let common = "coaching-practice";
     let vault_id = ulid_from_parts(TIME_MS, 1);
+    let packs = if touch {
+        r#"packs = ["coaching@0.1", "personal@0.1"]"#
+    } else {
+        r#"packs = ["coaching@0.1"]"#
+    };
     let cfg = format!(
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+{packs}
 vault_id = "{vault_id}"
 
 [checks]
@@ -131,6 +140,23 @@ coaching.pps_lookback_days = 180
                 ),
             );
         }
+        if touch {
+            // #188: many small `touch` lines, spread across 2024–2026, so
+            // the personal cadence fold and the search scanner see a
+            // touch-heavy ledger.
+            for t in 0..TOUCHES_PER_PERSON {
+                let month_index = (t as i32) % 36;
+                let year = 2024 + month_index / 12;
+                let month = (month_index % 12) as u32 + 1;
+                let day = (t as u32 % 27) + 1;
+                push_ledger(
+                    &mut ledgers,
+                    year,
+                    month,
+                    &format!("{year}-{month:02}-{day:02} touch {pid} call\n"),
+                );
+            }
+        }
     }
 
     for ((year, month), body) in ledgers {
@@ -188,7 +214,7 @@ mod tests {
     #[test]
     fn generated_vault_is_searchable() {
         let dir = tempfile::tempdir().unwrap();
-        let (unique, common) = generate_realistic_vault(dir.path(), 3, 2, false).unwrap();
+        let (unique, common) = generate_realistic_vault(dir.path(), 3, 2, false, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert_eq!(vault.records.len(), 3 + 6); // people + notes
         assert_eq!(
@@ -211,7 +237,7 @@ mod tests {
             "generated vault should check clean: {:?}",
             report.findings
         );
-        assert!(generate_realistic_vault(dir.path(), 1, 1, false).is_err());
+        assert!(generate_realistic_vault(dir.path(), 1, 1, false, false).is_err());
     }
 
     #[test]
@@ -266,7 +292,7 @@ mod tests {
 
         let small_dir = tempfile::tempdir().unwrap();
         let (small_unique, small_common) =
-            generate_realistic_vault(small_dir.path(), 200, 5, false).unwrap();
+            generate_realistic_vault(small_dir.path(), 200, 5, false, false).unwrap();
         let small_vault = load_vault(small_dir.path()).unwrap();
         assert!(
             small_vault.records.len() >= 1_200,
@@ -274,7 +300,7 @@ mod tests {
             small_vault.records.len()
         );
         let dir = tempfile::tempdir().unwrap();
-        let (unique, common) = generate_realistic_vault(dir.path(), 400, 5, false).unwrap();
+        let (unique, common) = generate_realistic_vault(dir.path(), 400, 5, false, false).unwrap();
         let vault = load_vault(dir.path()).unwrap();
         assert!(
             vault.records.len() >= 2_400,
