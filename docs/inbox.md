@@ -157,7 +157,7 @@ are.
 ## `confidant inbox`
 
 ```sh
-confidant inbox [--dry-run] [--json] [--no-input] [--allow-unsigned]
+confidant inbox [--dry-run] [--json] [--no-input] [--allow-unsigned] [--skip <stem>...]
 ```
 
 The run, in order:
@@ -224,6 +224,28 @@ vaults the retry decrypts an existing record envelope and compares
 plaintext, so a record item the first run merged is recognized as already
 merged rather than conflicting.
 `--dry-run` decrypts and plans without committing or clearing.
+
+### Deferring items (`--skip`)
+
+`confidant inbox --skip <stem> [--skip <stem>...]` merges everything
+except the named items. A skipped item is **deferred, not discarded**: its
+`.age` file stays on the `inbox` branch tip for the next run, which lists
+it again. Only the processed stems are cleared — the clear commit message
+reflects the partial clear (`inbox: clear N item(s)` counts cleared
+items, not the tip size).
+
+- Unknown names fail closed with `E_INBOX_SKIP`: a typo must not silently
+  merge the item the operator meant to defer. Pass exact item stems.
+- The dry-run report carries deferred items in a separate `skipped[]`
+  section (`name`/`kind`/`target`); `items[]` is unchanged. The merge
+  commit body gains a sibling `skipped:` section listing the deferred
+  opaque IDs (ADR-7) — an audit trail of what was intentionally left
+  behind, with no PII in git.
+- `--skip` is **refused during `inbox rotate`** (both the drain and
+  `--finish`): leftovers encrypted to the old key must not survive the
+  rotation (§8a.3), or they fail closed with `E_INBOX_CRYPTO` once the old
+  private key is destroyed. Finish or drop undecryptable/old-key items
+  before rotating — don't use `--skip` to paper over a rotation window.
 
 ## Fallback queue (`log session --note --fallback-inbox`, #213)
 

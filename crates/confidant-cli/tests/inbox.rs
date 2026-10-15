@@ -315,3 +315,78 @@ fn bad_item_name_is_rejected() {
     assert_eq!(code, 1, "stdout: {stdout}");
     assert_eq!(parse_json(&stdout)["error"]["code"], "E_INBOX_ITEM");
 }
+
+#[test]
+fn skip_flag_defers_item_in_json_dry_run() {
+    // #217: `--skip` defers an item; the dry-run JSON carries it in a
+    // separate `skipped[]` section, and `items[]` keeps its shape.
+    let f = Fixture::new();
+    let recipient = test_recipient(&TEST_INBOX_SECRET);
+    f.with_vault_inbox_pubkey(&recipient);
+    let item1 = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m src:cli-skip-1\n";
+    let item2 = "confidant-inbox/1\nkind: ledger\n---\n2026-10-09 session p-01M3TC5H00MPJG000000000000 30m src:cli-skip-2\n";
+    let ct1 = confidant_crypt::age_wrap::wrap_to_recipient(item1.as_bytes(), &recipient).unwrap();
+    let ct2 = confidant_crypt::age_wrap::wrap_to_recipient(item2.as_bytes(), &recipient).unwrap();
+    f.with_inbox(&[("01JAAA.age", &ct1), ("01JAAB.age", &ct2)]);
+    let key = test_bech32(&TEST_INBOX_SECRET);
+    let (code, stdout, _) = f.inbox_with_env(
+        &[
+            "--json",
+            "--dry-run",
+            "--allow-unsigned",
+            "--skip",
+            "01JAAB",
+        ],
+        Some(&key),
+    );
+    assert_eq!(code, 0, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["merged"], 1);
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["items"][0]["name"], "01JAAA");
+    assert_eq!(v["items"][0]["action"], "merge");
+    assert_eq!(v["skipped"].as_array().unwrap().len(), 1);
+    assert_eq!(v["skipped"][0]["name"], "01JAAB");
+    assert_eq!(v["skipped"][0]["kind"], "ledger");
+    assert_eq!(v["skipped"][0]["target"], "ledger/*");
+}
+
+#[test]
+fn skip_unknown_name_is_usage_error() {
+    // #217: a `--skip` name not on the inbox branch tip fails closed with
+    // E_INBOX_SKIP.
+    let f = Fixture::new();
+    let recipient = test_recipient(&TEST_INBOX_SECRET);
+    f.with_vault_inbox_pubkey(&recipient);
+    let item = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m src:cli-skip-3\n";
+    let ct = confidant_crypt::age_wrap::wrap_to_recipient(item.as_bytes(), &recipient).unwrap();
+    f.with_inbox(&[("01JAAA.age", &ct)]);
+    let key = test_bech32(&TEST_INBOX_SECRET);
+    let (code, stdout, _) = f.inbox_with_env(
+        &[
+            "--json",
+            "--dry-run",
+            "--allow-unsigned",
+            "--skip",
+            "01NOPE",
+        ],
+        Some(&key),
+    );
+    assert_eq!(code, 1, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INBOX_SKIP");
+}
+
+#[test]
+fn skip_refused_with_rotate_subcommand() {
+    // #217/#318: `--skip` is refused when combined with `inbox rotate`.
+    let f = Fixture::new();
+    let (code, stdout, _) = f.inbox(&["--json", "--skip", "01JAAA", "rotate"]);
+    assert_eq!(code, 2, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+}

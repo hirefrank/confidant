@@ -103,6 +103,15 @@ pub struct InboxOptions {
     /// refuses if the vault's `confidant.toml [inbox].pubkey` differs
     /// (possible key substitution).
     pub pinned_pubkey: Option<String>,
+    /// Item stems (opaque, without `.age`) to defer: everything except
+    /// these is merged, and skipped items stay on the `inbox` branch for
+    /// a later run. Repeatable `--skip` on the CLI. Unknown names fail
+    /// closed; `--skip` is refused during a rotate drain.
+    pub skip: Vec<String>,
+    /// Set by `drain_for_rotate`: this run is a rotate drain, so `--skip`
+    /// is refused — leftovers encrypted to the old key must not survive
+    /// `--finish` (§8a.3). Not settable from the CLI.
+    pub is_rotate_drain: bool,
 }
 
 /// What happened to one item.
@@ -118,12 +127,28 @@ pub struct ItemOutcome {
     pub action: String,
 }
 
+/// An item the operator deferred with `--skip`: not merged, not cleared,
+/// left on the `inbox` branch for a later run. Kept separate from
+/// [`ItemOutcome`] on purpose — `action: "skip"` already means "already
+/// present / idempotent no-op" and must not be overloaded (#318).
+#[derive(Clone, Debug)]
+pub struct SkippedItem {
+    /// Item file stem (opaque; no PII).
+    pub name: String,
+    /// `"ledger"` or `"record"`.
+    pub kind: String,
+    /// Vault-relative merge target.
+    pub target: String,
+}
+
 /// Result of [`run_inbox`].
 #[derive(Clone, Debug)]
 pub struct InboxReport {
     /// Mainline branch the items were merged into.
     pub branch: String,
     pub items: Vec<ItemOutcome>,
+    /// Operator-deferred items (`--skip`): still on the `inbox` branch.
+    pub skipped: Vec<SkippedItem>,
     pub merged: usize,
     pub cleared: usize,
     pub dry_run: bool,
@@ -187,9 +212,26 @@ pub fn run_inbox(
     let names = ready.names;
     let items = ready.items;
 
+    // #318: `--skip` is refused during a rotate drain — leftovers
+    // encrypted to the old key must not survive `--finish` (§8a.3).
+    if opts.is_rotate_drain && !opts.skip.is_empty() {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "--skip is refused during an inbox rotate drain: finish or drop old-key items before rotating",
+        )));
+    }
+    // #318: fail closed on unknown `--skip` names — a typo must not
+    // silently merge the item the operator meant to defer.
+    for s in &opts.skip {
+        if !names.contains(s) {
+            return Err(anyhow::Error::new(DomainError::inbox_skip(s)));
+        }
+    }
+    let skip_set: std::collections::HashSet<&str> = opts.skip.iter().map(String::as_str).collect();
+
     let existing_srcs = collect_vault_srcs(&vault);
     let mut ledger_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut outcomes = Vec::new();
+    let mut skipped = Vec::new();
     let mut applied: Vec<AppliedChange> = Vec::new();
     // A mid-loop failure must not leave the tree dirty: plan and apply
     // inside a closure so any error reverts what was applied so far.
@@ -199,6 +241,17 @@ pub fn run_inbox(
     // paths below already revert.)
     let planned: anyhow::Result<()> = (|| {
         for item in &items {
+            // #318: operator-deferred items are described for the report
+            // but never planned or applied. Preflight already decrypted
+            // and parsed every item, so kind/target are known.
+            if skip_set.contains(item.name.as_str()) {
+                skipped.push(SkippedItem {
+                    name: item.name.clone(),
+                    kind: item.kind.as_str().to_string(),
+                    target: describe_target(item),
+                });
+                continue;
+            }
             match plan_item(
                 vault_root,
                 item,
@@ -227,6 +280,7 @@ pub fn run_inbox(
         return Err(e);
     }
 
+    let mut cleared = 0usize;
     if !opts.dry_run {
         // `check` the merged vault before committing anything.
         let merged_vault = load_vault(vault_root)?;
@@ -249,7 +303,7 @@ pub fn run_inbox(
         }
         let merged = outcomes.iter().filter(|o| o.action == "merge").count();
         if merged > 0 {
-            if let Err(e) = commit_applied(repo, &applied, &outcomes) {
+            if let Err(e) = commit_applied(repo, &applied, &outcomes, &skipped) {
                 // All-or-nothing: the merge commit failed (e.g. a
                 // configured-but-broken signing setup), so unstage the
                 // applied paths and restore the worktree. The inbox is
@@ -259,15 +313,21 @@ pub fn run_inbox(
                 return Err(e);
             }
         }
-        clear_inbox(repo, &tip, &names)?;
+        // #318: partial clear — only processed stems are cleared; operator-
+        // skipped `.age` files stay on the tip for the next run. (Idempotent
+        // "already present" items keep today's behavior: they are cleared.)
+        let cleared_names: Vec<String> = outcomes.iter().map(|o| o.name.clone()).collect();
+        clear_inbox(repo, &tip, &cleared_names)?;
+        cleared = cleared_names.len();
     }
 
     let merged = outcomes.iter().filter(|o| o.action == "merge").count();
     Ok(InboxReport {
         branch,
         merged,
-        cleared: if opts.dry_run { 0 } else { names.len() },
+        cleared,
         items: outcomes,
+        skipped,
         dry_run: opts.dry_run,
         warnings,
         empty: false,

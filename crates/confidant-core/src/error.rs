@@ -56,6 +56,10 @@ pub enum ErrorKind {
     /// `confidant inbox` refused: the inbox branch moved between reading
     /// items and clearing them (TOCTOU).
     InboxRace,
+    /// `confidant inbox` refused: a `--skip` name is not on the inbox
+    /// branch tip. Fail closed on typos rather than merging an item the
+    /// operator meant to defer.
+    InboxSkip,
     /// `confidant reindex` refused to build the search corpus: encrypted
     /// records this device cannot read, or the corpus path is not
     /// git-ignored. A corpus that silently omits records is worse than no
@@ -86,6 +90,7 @@ impl ErrorKind {
             Self::InboxCheckFailed => "E_INBOX_CHECK_FAILED",
             Self::InboxCrypto => "E_INBOX_CRYPTO",
             Self::InboxRace => "E_INBOX_RACE",
+            Self::InboxSkip => "E_INBOX_SKIP",
             Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::Internal => "internal_error",
         }
@@ -279,6 +284,19 @@ impl DomainError {
         )
         .with_fix(
             "Configure commit signing (`git config commit.gpgsign true` and a `user.signingkey`), then run `confidant inbox` again",
+        )
+    }
+
+    pub fn inbox_skip(name: impl Into<String>) -> Self {
+        Self::new(
+            ErrorKind::InboxSkip,
+            format!(
+                "unknown --skip name '{}': not on the inbox branch tip; refusing rather than merging an item the operator meant to defer",
+                name.into()
+            ),
+        )
+        .with_fix(
+            "List the inbox branch tip and pass exact item stems to --skip",
         )
     }
 
@@ -486,6 +504,10 @@ mod tests {
             DomainError::inbox_signing_unconfigured().code(),
             "E_INBOX_UNTRUSTED"
         );
+        assert_eq!(DomainError::inbox_skip("01NOPE").code(), "E_INBOX_SKIP");
+        assert!(DomainError::inbox_skip("01NOPE")
+            .message()
+            .contains("refusing rather than merging"));
         assert!(DomainError::inbox_signing_unconfigured()
             .fix()
             .unwrap()

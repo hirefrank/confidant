@@ -108,6 +108,31 @@ impl Repo {
                 // explicit opt-in skips signature verification.
                 allow_unsigned: true,
                 pinned_pubkey: None,
+                ..Default::default()
+            },
+            identity,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`Repo::run`], but defers the named stems (`--skip`).
+    fn run_skip(
+        &self,
+        dry_run: bool,
+        skip: &[&str],
+    ) -> anyhow::Result<confidant_core::InboxReport> {
+        let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
+        run_inbox(
+            self.root(),
+            &InboxOptions {
+                dry_run,
+                trusted_signers: Vec::new(),
+                allow_unsigned: true,
+                pinned_pubkey: None,
+                skip: skip.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             },
             identity,
             None,
@@ -118,6 +143,8 @@ impl Repo {
 }
 
 const LEDGER_ITEM: &str = "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 45m paid note:n-01M3TC5H00MPJG000000000001 src:e2e-1\n";
+const LEDGER_ITEM_2: &str = "confidant-inbox/1\nkind: ledger\n---\n2026-10-09 session p-01M3TC5H00MPJG000000000000 30m paid src:e2e-2\n";
+const LEDGER_ITEM_3: &str = "confidant-inbox/1\nkind: ledger\n---\n2026-10-10 session p-01M3TC5H00MPJG000000000000 60m paid src:e2e-3\n";
 const RECORD_ITEM: &str = "confidant-inbox/1\nkind: record\npath: people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG000000000001.md\n---\n---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\n---\n\nFake note.\n";
 
 #[test]
@@ -298,6 +325,7 @@ fn symlinked_vault_root_merges() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         identity,
         None,
@@ -357,6 +385,7 @@ fn run_with(
             trusted_signers,
             allow_unsigned,
             pinned_pubkey,
+            ..Default::default()
         },
         identity,
         None,
@@ -499,6 +528,7 @@ fn push_between_verify_and_read_refuses() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         evil,
         None,
@@ -560,6 +590,7 @@ fn push_after_pin_is_neither_verified_nor_read() {
             trusted_signers: vec![fingerprint],
             allow_unsigned: false,
             pinned_pubkey: None,
+            ..Default::default()
         },
         evil,
         None,
@@ -997,6 +1028,7 @@ fn run_real(r: &Repo) -> anyhow::Result<confidant_core::InboxReport> {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         &decrypt,
         Some(&keys),
@@ -1191,6 +1223,7 @@ fn drain_encrypts_record_item_on_encrypted_vault() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         identity,
         None,
@@ -1246,6 +1279,7 @@ fn drain_conflicts_on_existing_envelope() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         identity,
         None,
@@ -1281,6 +1315,7 @@ fn retry_after_failed_clear_skips_merged_record_on_encrypted_vault() {
         trusted_signers: Vec::new(),
         allow_unsigned: true,
         pinned_pubkey: None,
+        ..Default::default()
     };
     // First run: merge + clear succeed.
     let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
@@ -1356,6 +1391,7 @@ fn failed_run_reverts_applied_writes() {
             trusted_signers: Vec::new(),
             allow_unsigned: true,
             pinned_pubkey: None,
+            ..Default::default()
         },
         identity,
         None,
@@ -1510,4 +1546,123 @@ fn queue_items_refuses_stem_collision() {
         .expect_err("re-queueing the same stem must fail closed");
     assert!(err.to_string().contains("already queued"));
     assert_eq!(git_out(r.root(), &["rev-parse", "inbox"]), tip_before);
+}
+
+// ---------------------------------------------------------------------------
+// #217: `inbox --skip <item>` (spec review #318)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skip_defers_item_and_partially_clears() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM_2), ("01JAAB.age", LEDGER_ITEM_3)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let report = r.run_skip(false, &["01JAAB"]).expect("inbox run failed");
+    assert!(!report.empty);
+    // Only the first item merged; the second was deferred.
+    assert_eq!(report.merged, 1);
+    assert_eq!(report.cleared, 1);
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].name, "01JAAA");
+    assert_eq!(report.items[0].action, "merge");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].name, "01JAAB");
+    assert_eq!(report.skipped[0].kind, "ledger");
+    assert_eq!(report.skipped[0].target, "ledger/*");
+
+    // First line landed; the deferred line did not.
+    let ledger = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(ledger.contains("src:e2e-2"), "ledger:\n{ledger}");
+    assert!(!ledger.contains("src:e2e-3"), "ledger:\n{ledger}");
+
+    // #318: the skipped stem survives on the tip; the merged stem is cleared.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree, "01JAAB.age", "inbox tree:\n{tree}");
+    let clear_log = git_out(r.root(), &["log", "-1", "--format=%s", "inbox"]);
+    assert!(
+        clear_log.starts_with("inbox: clear 1 item(s)"),
+        "clear log:\n{clear_log}"
+    );
+
+    // #318: the merge commit records the deferred opaque ID.
+    let log = git_out(r.root(), &["log", "-1", "--format=%s%n%b", "main"]);
+    assert!(log.starts_with("inbox: merge 1 item(s)"), "log:\n{log}");
+    assert!(log.contains("skipped:\n01JAAB"), "log:\n{log}");
+
+    // A second run picks up the deferred item.
+    let report2 = r.run(false).expect("second run failed");
+    assert_eq!(report2.merged, 1);
+    assert_eq!(report2.skipped.len(), 0);
+    let ledger2 = std::fs::read_to_string(r.root().join("ledger/2026/10.cfd")).unwrap();
+    assert!(ledger2.contains("src:e2e-3"), "ledger:\n{ledger2}");
+    let tree2 = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert!(tree2.is_empty(), "inbox tree:\n{tree2}");
+}
+
+#[test]
+fn skip_unknown_name_refuses() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    // Dry run: no signing needed, and the fail-closed check runs before
+    // the dry-run split.
+    let err = r
+        .run_skip(true, &["01NOPE"])
+        .expect_err("unknown --skip name must fail closed");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INBOX_SKIP");
+    // Nothing was merged or cleared.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree, "01JAAA.age", "inbox tree:\n{tree}");
+}
+
+#[test]
+fn skip_refused_during_rotate_drain() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let identity: &DecryptFn = &|b: &[u8]| Ok(zeroize::Zeroizing::new(b.to_vec()));
+    let err = run_inbox(
+        r.root(),
+        &InboxOptions {
+            dry_run: true,
+            trusted_signers: Vec::new(),
+            allow_unsigned: true,
+            pinned_pubkey: None,
+            skip: vec!["01JAAA".to_string()],
+            is_rotate_drain: true,
+        },
+        identity,
+        None,
+        None,
+        None,
+    )
+    .expect_err("--skip during a rotate drain must be refused");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INVALID");
+}
+
+#[test]
+fn skip_dry_run_reports_skipped_section() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)]);
+
+    let report = r.run_skip(true, &["01JAAB"]).expect("dry run failed");
+    assert!(report.dry_run);
+    assert_eq!(report.merged, 1);
+    assert_eq!(report.cleared, 0);
+    // #318: `items[]` keeps its shape (planned outcomes for candidates);
+    // operator-deferred items live in the separate `skipped[]`.
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(report.items[0].name, "01JAAA");
+    assert_eq!(report.items[0].action, "merge");
+    assert!(!report.items.iter().any(|i| i.name == "01JAAB"));
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].name, "01JAAB");
+    assert_eq!(report.skipped[0].kind, "record");
+    // Nothing committed, nothing cleared on a dry run.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.lines().count(), 2, "inbox tree:\n{tree}");
 }

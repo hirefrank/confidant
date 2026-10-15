@@ -101,4 +101,5 @@ Command-level error codes (not check findings):
 | `E_INBOX_CONFLICT` | 1 | `confidant inbox` refused: an item targets a record path that already exists with different content. |
 | `E_INBOX_CHECK_FAILED` | 1 | `confidant inbox` refused: the merged vault fails `check` (nothing was committed). |
 | `E_INBOX_CRYPTO` | 1 | `confidant inbox` cannot decrypt: milestone 2 crypto is not implemented yet. |
+| `E_INBOX_SKIP` | 1 | `confidant inbox --skip` refused: a `--skip` name is not on the `inbox` branch tip (fail closed on typos rather than merging an item the operator meant to defer). |
 | `internal_error` | 1 | Unclassified failure. Never match on its message. |

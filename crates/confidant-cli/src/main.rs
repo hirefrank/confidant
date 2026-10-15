@@ -146,6 +146,11 @@ enum Command {
         /// setups that have not configured `[trust] signers` yet.
         #[arg(long)]
         allow_unsigned: bool,
+        /// Defer items by stem (repeatable): merge everything except these.
+        /// Skipped items stay on the `inbox` branch for the next run.
+        /// Refused during `inbox rotate`.
+        #[arg(long)]
+        skip: Vec<String>,
         /// Rotate the inbox encryption key (drain-then-destroy, §8a.3).
         #[command(subcommand)]
         action: Option<InboxAction>,
@@ -692,6 +697,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Inbox {
             dry_run,
             allow_unsigned,
+            skip,
             action,
         } => {
             let root = vault_root.unwrap();
@@ -700,9 +706,24 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     finish,
                     allow_unsigned: rotate_unsigned,
                 }) => {
+                    // #318: `--skip` is refused during a rotate drain —
+                    // leftovers encrypted to the old key must not survive
+                    // `--finish` (§8a.3).
+                    if !skip.is_empty() {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--skip is refused during `inbox rotate`: finish or drop old-key items before rotating",
+                        )));
+                    }
                     cmd_inbox_rotate(&root, user_config.as_ref(), json, *finish, *rotate_unsigned)
                 }
-                None => cmd_inbox(json, &root, user_config.as_ref(), *dry_run, *allow_unsigned),
+                None => cmd_inbox(
+                    json,
+                    &root,
+                    user_config.as_ref(),
+                    *dry_run,
+                    *allow_unsigned,
+                    skip,
+                ),
             }
         }
         Command::Log { action } => {
@@ -1410,6 +1431,7 @@ fn cmd_inbox(
     user_config: Option<&UserConfig>,
     dry_run: bool,
     allow_unsigned: bool,
+    skip: &[String],
 ) -> anyhow::Result<ExitCode> {
     let vault_path = root.display().to_string();
     let trusted_signers = user_config
@@ -1491,6 +1513,8 @@ fn cmd_inbox(
             trusted_signers,
             allow_unsigned,
             pinned_pubkey,
+            skip: skip.to_vec(),
+            is_rotate_drain: false,
         },
         &decrypt,
         inbox_keys.as_deref(),
@@ -1515,6 +1539,11 @@ fn cmd_inbox(
                     "target": i.target,
                     "action": i.action,
                 })).collect::<Vec<_>>(),
+                "skipped": report.skipped.iter().map(|s| serde_json::json!({
+                    "name": s.name,
+                    "kind": s.kind,
+                    "target": s.target,
+                })).collect::<Vec<_>>(),
                 "warnings": report.warnings,
             }),
         ))?;
@@ -1523,18 +1552,25 @@ fn cmd_inbox(
             println!("inbox: nothing to do (no inbox branch)");
         } else if report.dry_run {
             println!(
-                "inbox: dry run — {} item(s) would merge, {} would be skipped",
+                "inbox: dry run — {} item(s) would merge, {} already present, {} deferred (--skip)",
                 report.merged,
-                report.items.len() - report.merged
+                report.items.len() - report.merged,
+                report.skipped.len()
             );
         } else {
             println!(
-                "inbox: {} item(s) merged into {}, {} cleared",
-                report.merged, report.branch, report.cleared
+                "inbox: {} item(s) merged into {}, {} cleared, {} deferred (--skip)",
+                report.merged,
+                report.branch,
+                report.cleared,
+                report.skipped.len()
             );
         }
         for i in &report.items {
             println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+        }
+        for s in &report.skipped {
+            println!("  {}  {:<6}  {}  deferred", s.name, s.kind, s.target);
         }
         for w in &report.warnings {
             println!("warning: {w}");
