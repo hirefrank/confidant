@@ -4,13 +4,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::check::{Finding, FindingCode, MergeMap, Severity};
-use crate::config::{MAX_GAP_DAYS, PERSONAL_PACK};
+use crate::config::PERSONAL_PACK;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
+use crate::packs::grammars::{parse_field_grammar, FieldValue, RecurringDate};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::{parse_with_list, Record, RecordKind};
 use crate::search::cleared_record_ids;
@@ -104,126 +105,6 @@ fn parse_personal_touch_args(args: &[Arg]) -> Option<&str> {
         }
     }
     Some(first)
-}
-
-/// Parsed calendar month/day with optional year (`YYYY-MM-DD` or `--MM-DD`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecurringDate {
-    pub label: String,
-    pub raw: String,
-    pub year: Option<i32>,
-    pub month: u32,
-    pub day: u32,
-}
-
-impl RecurringDate {
-    /// Parse `YYYY-MM-DD` or `--MM-DD`.
-    pub fn parse(label: impl Into<String>, raw: &str) -> Option<Self> {
-        let trimmed = raw.trim();
-        if let Some(rest) = trimmed.strip_prefix("--") {
-            let (m_str, d_str) = rest.split_once('-')?;
-            if m_str.len() != 2 || d_str.len() != 2 {
-                return None;
-            }
-            if !m_str.bytes().all(|b| b.is_ascii_digit())
-                || !d_str.bytes().all(|b| b.is_ascii_digit())
-            {
-                return None;
-            }
-            let month: u32 = m_str.parse().ok()?;
-            let day: u32 = d_str.parse().ok()?;
-            // Validate month/day against leap year 2024 so `--02-29` is valid
-            // while `--02-30` and `--13-01` are rejected.
-            NaiveDate::from_ymd_opt(2024, month, day)?;
-            Some(Self {
-                label: label.into(),
-                raw: trimmed.to_owned(),
-                year: None,
-                month,
-                day,
-            })
-        } else {
-            let date = parse_strict_date(trimmed)?;
-            Some(Self {
-                label: label.into(),
-                raw: trimmed.to_owned(),
-                year: Some(date.year()),
-                month: date.month(),
-                day: date.day(),
-            })
-        }
-    }
-
-    /// Next occurrence of this month/day on or after `as_of`, respecting
-    /// `self.year` (an event with a year cannot occur before that year).
-    pub fn next_occurrence_on_or_after(&self, as_of: NaiveDate) -> Option<NaiveDate> {
-        for cy in [
-            as_of.year(),
-            as_of.year() + 1,
-            as_of.year() + 2,
-            as_of.year() + 3,
-            as_of.year() + 4,
-        ] {
-            if self.year.is_some_and(|y| cy < y) {
-                continue;
-            }
-            if let Some(occ) = NaiveDate::from_ymd_opt(cy, self.month, self.day) {
-                if occ >= as_of {
-                    return Some(occ);
-                }
-            }
-        }
-        None
-    }
-}
-
-/// Parse `cadence` (`<N>d`, where `1 <= N <= 3650`).
-pub fn parse_cadence_days(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim();
-    let num_str = trimmed.strip_suffix('d')?;
-    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let days: u64 = num_str.parse().ok()?;
-    if days == 0 || days > MAX_GAP_DAYS {
-        return None;
-    }
-    u32::try_from(days).ok()
-}
-
-/// Parse `dates:` (`[label:DATE, ...]` or `label:DATE, ...`).
-pub fn parse_dates_list(raw: &str) -> Option<Vec<RecurringDate>> {
-    let trimmed = raw.trim();
-    let inner = if let Some(stripped) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-    {
-        stripped.trim()
-    } else if trimmed.starts_with('[') || trimmed.ends_with(']') {
-        return None;
-    } else {
-        trimmed
-    };
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut out = Vec::new();
-    for item in inner.split(',') {
-        let token = item.trim();
-        if token.is_empty() {
-            return None;
-        }
-        let (label_raw, date_raw) = token.split_once(':')?;
-        let label = label_raw.trim();
-        if label.is_empty()
-            || !label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        {
-            return None;
-        }
-        let rd = RecurringDate::parse(label, date_raw)?;
-        out.push(rd);
-    }
-    Some(out)
 }
 
 #[derive(Clone, Debug)]
@@ -544,9 +425,9 @@ fn fold(
         if rec.kind == RecordKind::Person {
             let entry = person_mut(&mut state, &rec.id);
             if let Some(raw) = rec.field("birthday") {
-                match RecurringDate::parse("birthday", raw) {
-                    Some(bd) => entry.birthday = Some(bd),
-                    None => push_field_error(
+                match parse_field_grammar("recurring-date", "birthday", raw) {
+                    Some(FieldValue::RecurringDate(bd)) => entry.birthday = Some(bd),
+                    _ => push_field_error(
                         rec,
                         "birthday",
                         "front matter key 'birthday' must be YYYY-MM-DD or --MM-DD",
@@ -556,9 +437,9 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("cadence") {
-                match parse_cadence_days(raw) {
-                    Some(days) => entry.cadence_days = Some(days),
-                    None => push_field_error(
+                match parse_field_grammar("cadence", "cadence", raw) {
+                    Some(FieldValue::CadenceDays(days)) => entry.cadence_days = Some(days),
+                    _ => push_field_error(
                         rec,
                         "cadence",
                         "front matter key 'cadence' must be <N>d (1..=3650)",
@@ -568,23 +449,21 @@ fn fold(
                 }
             }
             if let Some(raw) = rec.field("relationship_to_me") {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    push_field_error(
+                match parse_field_grammar("non-empty-string", "relationship_to_me", raw) {
+                    Some(FieldValue::Text(label)) => entry.relationship_to_me = Some(label),
+                    _ => push_field_error(
                         rec,
                         "relationship_to_me",
                         "front matter key 'relationship_to_me' must not be empty",
                         "Provide a non-empty relationship label or remove the key",
                         findings,
-                    );
-                } else {
-                    entry.relationship_to_me = Some(trimmed.to_owned());
+                    ),
                 }
             }
             if let Some(raw) = rec.field("dates") {
-                match parse_dates_list(raw) {
-                    Some(list) => entry.dates = list,
-                    None => push_field_error(
+                match parse_field_grammar("dates-list", "dates", raw) {
+                    Some(FieldValue::DatesList(list)) => entry.dates = list,
+                    _ => push_field_error(
                         rec,
                         "dates",
                         "front matter key 'dates' must be a comma-separated list of label:YYYY-MM-DD or label:--MM-DD",
@@ -828,55 +707,5 @@ fn cadence_and_date_rules(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recurring_date_parses_iso_and_yearless() {
-        let full = RecurringDate::parse("birthday", "1990-05-14").unwrap();
-        assert_eq!(full.year, Some(1990));
-        assert_eq!(full.month, 5);
-        assert_eq!(full.day, 14);
-
-        let yearless = RecurringDate::parse("birthday", "--10-12").unwrap();
-        assert_eq!(yearless.year, None);
-        assert_eq!(yearless.month, 10);
-        assert_eq!(yearless.day, 12);
-
-        let leap = RecurringDate::parse("birthday", "--02-29").unwrap();
-        assert_eq!(leap.month, 2);
-        assert_eq!(leap.day, 29);
-
-        assert!(RecurringDate::parse("birthday", "10-12").is_none());
-        assert!(RecurringDate::parse("birthday", "--02-30").is_none());
-        assert!(RecurringDate::parse("birthday", "--13-01").is_none());
-    }
-
-    #[test]
-    fn cadence_parser_accepts_positive_days_within_cap() {
-        assert_eq!(parse_cadence_days("30d"), Some(30));
-        assert_eq!(parse_cadence_days("3650d"), Some(3650));
-        assert_eq!(parse_cadence_days("0d"), None);
-        assert_eq!(parse_cadence_days("3651d"), None);
-        assert_eq!(parse_cadence_days("30"), None);
-        assert_eq!(parse_cadence_days("30w"), None);
-    }
-
-    #[test]
-    fn dates_list_parser_accepts_bracketed_and_plain() {
-        let list = parse_dates_list("[anniversary:2020-06-15, graduation:--05-20]").unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].label, "anniversary");
-        assert_eq!(list[0].year, Some(2020));
-        assert_eq!(list[1].label, "graduation");
-        assert_eq!(list[1].year, None);
-
-        assert!(parse_dates_list("[]").unwrap().is_empty());
-        assert!(parse_dates_list("[bad]").is_none());
-        assert!(parse_dates_list("[anniversary:2020-13-01]").is_none());
     }
 }

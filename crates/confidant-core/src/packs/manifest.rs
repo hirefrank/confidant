@@ -20,15 +20,10 @@ use crate::id::Prefix;
 /// A file declaring any other version is rejected rather than guessed at.
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// Field grammars a manifest may name (spec §6). Fixed list: adding a
-/// grammar is a spec change plus a Rust parser — never a manifest-only
-/// change, so manifests cannot smuggle in new validation semantics.
-pub const KNOWN_GRAMMARS: &[&str] = &[
-    "recurring-date",
-    "cadence",
-    "dates-list",
-    "non-empty-string",
-];
+/// Field grammars a manifest may name (spec §6). Canonical list lives in
+/// [`grammars`](crate::packs::grammars); re-exported here so the loader's
+/// validation reads the same frozen list the parser registry dispatches.
+pub use crate::packs::grammars::KNOWN_GRAMMARS;
 
 /// Record ID types a verb may constrain its ledger ID to (spec §4,
 /// today's `Prefix`).
