@@ -3408,6 +3408,334 @@ fn person_no_ai_edit_refuses_when_a_child_is_unreadable() {
 }
 
 #[test]
+fn person_no_ai_refusal_names_only_record_files() {
+    // #424: the unreadable list holds record files only. A load finding
+    // on a non-record file (here a bad `[checks].as_of` in
+    // `confidant.toml`) says nothing about who references the person, so
+    // it stays out of the refusal even while an unreadable child refuses
+    // the edit.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+
+    let note_body = write_file(
+        h._tmp.path(),
+        "note.md",
+        "A private session reflection for the record.\n",
+    );
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add note: {}", stderr(&out));
+    let note_path = h
+        .vault
+        .join(format!("people/{PERSON}/notes"))
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "md"))
+        .expect("the note file exists");
+    tamper_envelope_body(&note_path);
+    let tampered = std::fs::read(&note_path).unwrap();
+
+    // A non-record load finding, added after the writes above so the
+    // writes themselves are not blocked by `check`.
+    let config = std::fs::read_to_string(h.vault.join("confidant.toml")).unwrap();
+    std::fs::write(
+        h.vault.join("confidant.toml"),
+        format!("{config}\n[checks]\nas_of = \"not-a-date\"\n"),
+    )
+    .unwrap();
+
+    let commits_before = commit_count(&h);
+    let hidden = write_file(
+        h._tmp.path(),
+        "hidden.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            hidden.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an unreadable child must refuse the edit"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(note_path.file_name().unwrap().to_str().unwrap()),
+        "the refusal must name the unreadable child: {v}"
+    );
+    assert!(
+        !message.contains("confidant.toml"),
+        "the refusal must not name non-record files: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&note_path).unwrap(),
+        tampered,
+        "the unreadable child was rewritten despite the refusal"
+    );
+    assert_eq!(
+        commit_count(&h),
+        commits_before,
+        "the refused edit must not commit"
+    );
+}
+
+#[test]
+fn person_no_ai_notes_mode_restamps_a_with_only_child() {
+    // #424: a child that references the person only through `with:` —
+    // the field class a `notes` mode carries through — is re-stamped too,
+    // not just `person:` references.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h
+        .cmd(&["keys", "init-client", PERSON2, "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "init-client: {}", stderr(&out));
+
+    // Both people exist: the interaction routes to PERSON2's key, and
+    // its `with:` names PERSON.
+    for (id, name) in [(PERSON, "Ada Example"), (PERSON2, "Basil Example")] {
+        let p = write_file(h._tmp.path(), "person.md", &person_md(id, name, "Bio."));
+        let out = h
+            .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "add person {id}: {}", stderr(&out));
+    }
+
+    const IXN: &str = "i-01J9Z3K4QM0000000000000000";
+    let ixn = write_file(
+        h._tmp.path(),
+        "ixn.md",
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: \"Joint session\"\ndate: 2026-10-01\nperson: {PERSON2}\nwith: [{PERSON}]\n---\n\nInteraction body.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            ixn.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add interaction: {}", stderr(&out));
+    let ixn_path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    assert_eq!(
+        outer_label(&String::from_utf8(std::fs::read(&ixn_path).unwrap()).unwrap()),
+        "no-ai: false",
+        "the interaction should start visible"
+    );
+
+    // PERSON goes to notes mode; the interaction hides through `with:`.
+    let notes = write_file(
+        h._tmp.path(),
+        "notes.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let commits_before = commit_count(&h);
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            notes.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "notes person: {}", stderr(&out));
+    assert_eq!(
+        commit_count(&h),
+        commits_before + 1,
+        "the re-stamp split into more than one commit"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().contains(IXN)),
+        "the with:-only child was not re-stamped in the same commit: {v}"
+    );
+
+    let after = String::from_utf8(std::fs::read(&ixn_path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&after),
+        "no-ai: true",
+        "the with:-only child's header did not move: {after}"
+    );
+}
+
+#[test]
+fn person_no_ai_edit_keeps_unchanged_child_ciphertext_and_reports_only_rewrites() {
+    // #424/#425: a referencing child whose header does not move keeps its
+    // ciphertext byte for byte, and the JSON `files` lists only the paths
+    // actually rewritten — the reused child is not named, so the list
+    // matches the commit diff.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+
+    let note_body = write_file(
+        h._tmp.path(),
+        "note.md",
+        "A private session reflection for the record.\n",
+    );
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add note: {}", stderr(&out));
+    let note_path = h
+        .vault
+        .join(format!("people/{PERSON}/notes"))
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "md"))
+        .expect("the note file exists");
+    let note_rel = format!(
+        "people/{PERSON}/notes/{}",
+        note_path.file_name().unwrap().to_str().unwrap()
+    );
+
+    // A deal is a referencing child whose header never moves when the
+    // person tightens to `notes`: only notes and interactions inherit it.
+    const DEAL: &str = "d-01J9Z3K4QJ0000000000000000";
+    let deal = write_file(
+        h._tmp.path(),
+        "deal.md",
+        &format!(
+            "---\nid: {DEAL}\ntype: deal\nname: \"Deal one\"\nperson: {PERSON}\n---\n\nDeal body.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            deal.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add deal: {}", stderr(&out));
+    let deal_path = h.vault.join(format!("deals/{DEAL}/deal.md"));
+    let deal_before = std::fs::read(&deal_path).unwrap();
+
+    // Tighten to notes: the note's header moves, the deal's does not.
+    let notes = write_file(
+        h._tmp.path(),
+        "notes.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: notes\n---\n\nBio.\n"
+        ),
+    );
+    let commits_before = commit_count(&h);
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            notes.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "notes person: {}", stderr(&out));
+    assert_eq!(
+        commit_count(&h),
+        commits_before + 1,
+        "the re-stamp split into more than one commit"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let files: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    let person_rel = format!("people/{PERSON}/profile.md");
+    assert_eq!(
+        files,
+        vec![person_rel.as_str(), note_rel.as_str()],
+        "`files` must name exactly the rewritten paths: {files:?}"
+    );
+    assert_eq!(
+        std::fs::read(&deal_path).unwrap(),
+        deal_before,
+        "the unchanged child's ciphertext was not kept byte for byte"
+    );
+
+    let note_after = String::from_utf8(std::fs::read(&note_path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&note_after),
+        "no-ai: true",
+        "the note header was not re-stamped: {note_after}"
+    );
+}
+
+#[test]
 fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
     // #406: a header can move out from under a record whose body did not
     // change — e.g. restored from history, or written by an older CLI
