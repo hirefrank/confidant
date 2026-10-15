@@ -23,3 +23,8 @@ install-updater = false
 # install). dist's freshness check would fail on those edits, so it is
 # scoped off for CI scripts only.
 allow-dirty = ["ci"]
+# GitHub artifact attestations (#325): dist signs build provenance for every
+# artifact during `dist build`, so the next release tag carries provenance
+# (Scorecard Signed-Releases). Needs `id-token: write` + `attestations: write`
+# on the build-local-artifacts job in release.yml.
+github-attestations = true

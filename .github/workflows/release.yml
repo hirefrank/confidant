@@ -32,6 +32,13 @@
 #     not curl|sh. The `matrix.install_dist.run` snippet in
 #     build-local-artifacts is dist-generated per runner and is left as
 #     generated (see the #42 decision in the publish PR).
+#  6. `github-attestations = true` in dist-workspace.toml (#325) plus
+#     `id-token: write` + `attestations: write` on the build-local-artifacts
+#     job, so dist signs build provenance during the build.
+#  7. The container rustup bootstrap (`curl https://sh.rustup.rs | sh`,
+#     build-local-artifacts) is dist-generated per runner and left as
+#     generated (#325): pinning rustup-init by hash per platform would not
+#     survive `dist init` regeneration. Same standing decision as item 5.
 
 name: Release
 # Least privilege (2026-10-08, Silas review): this workflow ships binaries
@@ -125,6 +132,13 @@ jobs:
   # Build and packages all the platform-specific things
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
+    # GitHub attestations (#325): dist signs build provenance during
+    # `dist build` (github-attestations = true in dist-workspace.toml),
+    # which needs OIDC + the attestations permission on this job.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
