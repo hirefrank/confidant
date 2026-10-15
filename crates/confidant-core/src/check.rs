@@ -659,7 +659,10 @@ fn check_verbs_and_refs(
                 continue;
             }
         }
-        if e.id.prefix() != Prefix::Package && !known_ids.contains(&e.id) {
+        if e.id.prefix() != Prefix::Package
+            && !known_ids.contains(&e.id)
+            && !vault.conflicted_ids.contains(&e.id)
+        {
             findings.push(
                 Finding::new(
                     FindingCode::UnknownRecord,
@@ -745,7 +748,7 @@ pub(crate) fn check_aliases_and_merges(
                     continue;
                 }
                 for id in [&from, &to] {
-                    if !known_ids.contains(id) {
+                    if !known_ids.contains(id) && !vault.conflicted_ids.contains(id) {
                         findings.push(
                             Finding::new(
                                 FindingCode::UnresolvedMerge,
@@ -1106,7 +1109,9 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
                         .with_fix("Use a prefixed 26-character Crockford ULID"),
                     );
                 }
-                FrontmatterRef::Id(id) if !known_ids.contains(&id) => {
+                FrontmatterRef::Id(id)
+                    if !known_ids.contains(&id) && !vault.conflicted_ids.contains(&id) =>
+                {
                     let mut finding = Finding::new(
                         FindingCode::DanglingRef,
                         Severity::Error,
@@ -1223,7 +1228,7 @@ fn check_edges(
                                 .for_id(&rec.id)
                                 .with_fix("Use a p-<ULID> id"),
                             );
-                        } else if !known_ids.contains(&id) {
+                        } else if !known_ids.contains(&id) && !vault.conflicted_ids.contains(&id) {
                             let mut finding = Finding::new(
                                 FindingCode::DanglingRef,
                                 Severity::Error,
@@ -1422,7 +1427,7 @@ fn check_with_lists(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut
                 );
                 continue;
             }
-            if !known_ids.contains(id) {
+            if !known_ids.contains(id) && !vault.conflicted_ids.contains(id) {
                 findings.push(
                     Finding::new(
                         FindingCode::DanglingRef,
