@@ -1,20 +1,82 @@
 //! Coaching schema pack 0.1: sessions, packages, ICF hours, gap rules.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::check::{duration_of, Finding, FindingCode, MergeMap, Severity};
-use crate::config::COACHING_PACK;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::ledger::{minutes_to_hundredths, parse_decimal_hundredths, parse_strict_date, Arg};
-use crate::packs::{Pack, PackState};
+use crate::packs::manifest::parse_manifest;
+use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::RecordKind;
 use crate::vault::{SourcedEntry, Vault};
 
 const MAX_OPEN_N: i64 = 100_000;
+
+/// Embedded manifest for `coaching@0.1` (spec §9). Vendored from
+/// `packs/coaching/manifest.toml` at the repo root: the path must stay
+/// inside the crate so `cargo publish` / `cargo install` can compile
+/// (crates.io tarballs do not include `../../packs`). A test fails if the
+/// vendored copy drifts from the repo-root file. The binary serves the
+/// manifest it was compiled with, same guarantee as the embedded SKILL.md.
+static COACHING_MANIFEST_TOML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/pack-manifests/coaching/manifest.toml"
+));
+
+/// Claims from the embedded manifest, leaked to `&'static` so the `Pack`
+/// trait's `&'static` signatures can serve them (#344). Parsed once; a
+/// parse failure is a programming error (the file is compile-time data),
+/// so it fails loudly rather than silently falling back to stale claims.
+struct ManifestClaims {
+    name: &'static str,
+    verbs: Vec<&'static str>,
+    verb_id_types: Vec<(&'static str, Prefix)>,
+    record_types: Vec<&'static str>,
+    fields: Vec<&'static str>,
+    balance_metrics: Vec<&'static str>,
+    edge_kinds: Vec<EdgeKind>,
+}
+
+fn leak_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+fn manifest_claims() -> &'static ManifestClaims {
+    static CLAIMS: OnceLock<ManifestClaims> = OnceLock::new();
+    CLAIMS.get_or_init(|| {
+        let m = parse_manifest(COACHING_MANIFEST_TOML)
+            .expect("embedded packs/coaching/manifest.toml must parse");
+        ManifestClaims {
+            name: leak_str(format!("{}@{}", m.pack.name, m.pack.version)),
+            verbs: m.verbs.iter().map(|v| leak_str(v.name.clone())).collect(),
+            verb_id_types: m
+                .verbs
+                .iter()
+                .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
+                .collect(),
+            record_types: m.record_types.iter().map(|r| leak_str(r.clone())).collect(),
+            fields: m.fields.iter().map(|f| leak_str(f.name.clone())).collect(),
+            balance_metrics: m
+                .balance_metrics
+                .iter()
+                .map(|b| leak_str(b.clone()))
+                .collect(),
+            edge_kinds: m
+                .edge_kinds
+                .iter()
+                .map(|e| EdgeKind {
+                    name: leak_str(e.name.clone()),
+                    symmetric: e.symmetric,
+                })
+                .collect(),
+        }
+    })
+}
 
 #[derive(Clone, Debug)]
 struct OpenEvent {
@@ -130,26 +192,36 @@ fn format_hundredths(n: i64) -> String {
 
 impl Pack for CoachingPack {
     fn name(&self) -> &'static str {
-        COACHING_PACK
+        manifest_claims().name
     }
 
     fn verbs(&self) -> &'static [&'static str] {
-        &["open", "session"]
+        &manifest_claims().verbs
     }
 
     fn record_types(&self) -> &'static [&'static str] {
-        &[]
+        &manifest_claims().record_types
     }
 
     fn fields(&self) -> &'static [&'static str] {
-        &[]
+        &manifest_claims().fields
     }
 
     fn balance_metrics(&self) -> &'static [&'static str] {
-        &["sessions_remaining", "icf_hours"]
+        &manifest_claims().balance_metrics
+    }
+
+    fn edge_kinds(&self) -> &'static [EdgeKind] {
+        // coaching@0.1 introduces no edge kinds; the manifest declares
+        // none, so this serves the manifest's (empty) list explicitly
+        // rather than relying on the trait default.
+        &manifest_claims().edge_kinds
     }
 
     fn finding_codes(&self) -> &'static [&'static str] {
+        // Unchanged in step 5; finding codes move to the manifest in step 6
+        // (#345). The manifest already carries them (the loader requires a
+        // [messages] table per code), and the parity test proves they match.
         &[
             "E_PARSE",
             "E_BALANCE_MISMATCH",
@@ -167,10 +239,11 @@ impl Pack for CoachingPack {
     }
 
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
-        match verb {
-            "open" | "session" => Some(Prefix::Person),
-            _ => None,
-        }
+        manifest_claims()
+            .verb_id_types
+            .iter()
+            .find(|(v, _)| *v == verb)
+            .map(|(_, p)| *p)
     }
 
     fn fold(
@@ -933,7 +1006,12 @@ pub fn apply_duration_off(vault: &Vault, findings: &mut Vec<Finding>) {
 #[cfg(test)]
 mod tests {
     use super::parse_open;
+    use super::{CoachingPack, COACHING_MANIFEST_TOML};
+    use crate::config::COACHING_PACK;
+    use crate::id::Prefix;
     use crate::ledger::parse_line;
+    use crate::packs::manifest::parse_manifest;
+    use crate::packs::Pack;
 
     #[test]
     fn open_grammar() {
@@ -949,5 +1027,86 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(parse_open(&bad).is_none());
+    }
+
+    /// Parity test (#344): the manifest-derived claims must equal the
+    /// `&'static` slices the trait served before the manifest existed.
+    /// Expected values are copied verbatim from the deleted slices; this
+    /// test pins the manifest to the original claims so a bad manifest
+    /// fails loudly instead of silently changing behavior.
+    #[test]
+    fn manifest_claims_match_original_slices() {
+        let pack = CoachingPack;
+        assert_eq!(pack.name(), COACHING_PACK);
+        assert_eq!(pack.name(), "coaching@0.1");
+        assert_eq!(pack.verbs(), &["open", "session"][..]);
+        assert!(pack.record_types().is_empty());
+        assert!(pack.fields().is_empty());
+        assert_eq!(
+            pack.balance_metrics(),
+            &["sessions_remaining", "icf_hours"][..]
+        );
+        assert!(pack.edge_kinds().is_empty());
+        assert_eq!(pack.verb_id_type("open"), Some(Prefix::Person));
+        assert_eq!(pack.verb_id_type("session"), Some(Prefix::Person));
+        assert_eq!(pack.verb_id_type("touch"), None);
+        assert_eq!(pack.verb_id_type(""), None);
+    }
+
+    /// The vendored manifest must match `packs/coaching/manifest.toml` at
+    /// the repo root (#368 pattern). Skips gracefully when the repo-root
+    /// file is absent (e.g. a published crate), where there is nothing to
+    /// drift from.
+    #[test]
+    fn vendored_manifest_matches_repo_root() {
+        let root = format!(
+            "{}/../../packs/coaching/manifest.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let Ok(root_text) = std::fs::read_to_string(&root) else {
+            return;
+        };
+        assert_eq!(
+            root_text, COACHING_MANIFEST_TOML,
+            "vendored manifest is stale; copy packs/coaching/manifest.toml \
+             to crates/confidant-core/pack-manifests/coaching/manifest.toml"
+        );
+    }
+
+    /// The manifest's finding codes must match the compiled
+    /// `finding_codes()` slice, and its (empty) edge-kind list must match
+    /// the trait. `finding_codes()` is still the compiled slice in step 5
+    /// (it moves in step 6), so the manifest must already agree with it.
+    #[test]
+    fn manifest_finding_codes_and_edge_kinds_match_code() {
+        let m = parse_manifest(COACHING_MANIFEST_TOML).expect("manifest parses");
+        let from_trait: Vec<String> = CoachingPack
+            .finding_codes()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(m.finding_codes, from_trait);
+        assert_eq!(
+            m.finding_codes,
+            [
+                "E_PARSE",
+                "E_BALANCE_MISMATCH",
+                "E_NEGATIVE_BALANCE",
+                "E_OPEN_MALFORMED",
+                "E_INVALID_ID",
+                "E_WRONG_ID_TYPE",
+                "E_MISSING_DURATION",
+                "E_SESSION_TAGS",
+                "W_SESSION_UNTAGGED",
+                "E_UNKNOWN_RECORD",
+                "E_SESSION_WITHOUT_NOTES",
+                "E_PAID_SESSION_GAP",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+        );
+        assert!(m.edge_kinds.is_empty());
+        assert!(CoachingPack.edge_kinds().is_empty());
     }
 }
