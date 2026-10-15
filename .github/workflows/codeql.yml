@@ -2,6 +2,7 @@ name: CodeQL
 
 # Scorecard SAST check (#325): static analysis on every push and PR to main.
 # Score builds up as new commits get checked.
+# Rust extraction needs no build (build-mode: none).
 
 on:
   push:
@@ -11,10 +12,6 @@ on:
 
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   analyze:
@@ -28,15 +25,10 @@ jobs:
       fail-fast: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
-        with:
-          toolchain: "1.99.0"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Initialize CodeQL
         uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
         with:
           languages: rust
-      - name: Build
-        run: cargo build --workspace --locked
+          build-mode: none
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
