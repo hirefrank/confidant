@@ -3071,10 +3071,348 @@ fn outer_label(bytes: &str) -> String {
 }
 
 #[test]
+fn person_no_ai_edit_restamps_children_in_the_same_commit() {
+    // #410 (a): tighten. A note and an interaction written while the
+    // person is visible carry `no-ai: false` headers; editing the person
+    // to `no-ai: true` re-stamps both in the same commit, and the read
+    // path takes the keyless hidden path for them afterwards.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+
+    let note_body = write_file(
+        h._tmp.path(),
+        "note.md",
+        "A private session reflection for the record.\n",
+    );
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add note: {}", stderr(&out));
+    let note_path = h
+        .vault
+        .join(format!("people/{PERSON}/notes"))
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "md"))
+        .expect("the note file exists");
+    let note_rel = format!(
+        "people/{PERSON}/notes/{}",
+        note_path.file_name().unwrap().to_str().unwrap()
+    );
+
+    const IXN: &str = "i-01J9Z3K4QN0000000000000000";
+    let ixn = write_file(
+        h._tmp.path(),
+        "ixn.md",
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: \"Session one\"\ndate: 2026-10-01\nperson: {PERSON}\n---\n\nInteraction body.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            ixn.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add interaction: {}", stderr(&out));
+    let ixn_path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+
+    assert_eq!(
+        outer_label(&String::from_utf8(std::fs::read(&note_path).unwrap()).unwrap()),
+        "no-ai: false"
+    );
+    assert_eq!(
+        outer_label(&String::from_utf8(std::fs::read(&ixn_path).unwrap()).unwrap()),
+        "no-ai: false"
+    );
+
+    // The person goes fully hidden.
+    let hidden = write_file(
+        h._tmp.path(),
+        "hidden.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nBio.\n"
+        ),
+    );
+    let commits_before = commit_count(&h);
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            hidden.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "hide person: {}", stderr(&out));
+    // The person edit and both children landed as one commit.
+    assert_eq!(
+        commit_count(&h),
+        commits_before + 1,
+        "the re-stamp split into more than one commit"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let files: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    let person_rel = format!("people/{PERSON}/profile.md");
+    assert!(
+        files.contains(&person_rel.as_str()),
+        "the person file is in the commit: {files:?}"
+    );
+    assert!(
+        files.contains(&note_rel.as_str()),
+        "the note was not re-stamped in the same commit: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.contains(IXN)),
+        "the interaction was not re-stamped in the same commit: {files:?}"
+    );
+
+    let note_after = String::from_utf8(std::fs::read(&note_path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&note_after),
+        "no-ai: true",
+        "the note header was not re-stamped: {note_after}"
+    );
+    let ixn_after = String::from_utf8(std::fs::read(&ixn_path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&ixn_after),
+        "no-ai: true",
+        "the interaction header was not re-stamped: {ixn_after}"
+    );
+
+    // The read path now takes the keyless hidden path for the children.
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "context: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("A private session reflection"),
+        "the hidden note still leaks through context: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("Interaction body."),
+        "the hidden interaction still leaks through context: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn person_no_ai_loosening_unhides_children_headers() {
+    // #410 (b): loosen. A child written while the person is fully hidden
+    // carries `no-ai: true`; the person becoming visible re-derives the
+    // header so the child unwraps again instead of failing safe forever.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+
+    let note_body = write_file(
+        h._tmp.path(),
+        "note.md",
+        "A private session reflection for the record.\n",
+    );
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add note: {}", stderr(&out));
+    let note_path = h
+        .vault
+        .join(format!("people/{PERSON}/notes"))
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "md"))
+        .expect("the note file exists");
+    assert_eq!(
+        outer_label(&String::from_utf8(std::fs::read(&note_path).unwrap()).unwrap()),
+        "no-ai: true",
+        "the note should start hidden under a hidden person"
+    );
+
+    // The person becomes visible again.
+    let visible = write_file(
+        h._tmp.path(),
+        "visible.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            visible.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "reveal person: {}", stderr(&out));
+
+    let after = String::from_utf8(std::fs::read(&note_path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&after),
+        "no-ai: false",
+        "the loosened person did not unwrap the note's header: {after}"
+    );
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "context: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("A private session reflection"),
+        "the note did not become visible again: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn person_no_ai_edit_refuses_when_a_child_is_unreadable() {
+    // #410 (c): a child this device cannot read might reference the
+    // person, so the edit refuses the whole re-stamp — naming the file —
+    // and commits nothing.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let p = write_file(
+        h._tmp.path(),
+        "p.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&["record", "add", "--file", p.to_str().unwrap(), "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add person: {}", stderr(&out));
+    let note_body = write_file(
+        h._tmp.path(),
+        "note.md",
+        "A private session reflection for the record.\n",
+    );
+    let out = h
+        .cmd(&[
+            "note",
+            "add",
+            "--person",
+            PERSON,
+            "--body-file",
+            note_body.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add note: {}", stderr(&out));
+    let note_path = h
+        .vault
+        .join(format!("people/{PERSON}/notes"))
+        .read_dir()
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "md"))
+        .expect("the note file exists");
+    tamper_envelope_body(&note_path);
+    let tampered = std::fs::read(&note_path).unwrap();
+    let commits_before = commit_count(&h);
+
+    let hidden = write_file(
+        h._tmp.path(),
+        "hidden.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nBio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            hidden.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an unreadable child must refuse the edit"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(note_path.file_name().unwrap().to_str().unwrap()),
+        "the refusal must name the unreadable child: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&note_path).unwrap(),
+        tampered,
+        "the unreadable child was rewritten despite the refusal"
+    );
+    assert_eq!(
+        commit_count(&h),
+        commits_before,
+        "the refused edit must not commit"
+    );
+}
+
+#[test]
 fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
-    // #406: the person's mode moved after this interaction was written, so
-    // the stored header is stale. Re-saving the same body must move it
-    // rather than report `unchanged`.
+    // #406: a header can move out from under a record whose body did not
+    // change — e.g. restored from history, or written by an older CLI
+    // before #410 made the person edit re-stamp its children. Re-saving
+    // the same body must move the header rather than report `unchanged`.
     let h = Harness::new();
     h.keyed(PERSON);
     let p = write_file(
@@ -3111,7 +3449,8 @@ fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
     let before = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(outer_label(&before), "no-ai: false", "{before}");
 
-    // The person becomes notes-hidden.
+    // Manufacture the stale header: the person is now notes-hidden, but
+    // this envelope's outer header still says the record is visible.
     let hidden = write_file(
         h._tmp.path(),
         "hidden.md",
@@ -3131,6 +3470,35 @@ fn resaving_a_child_re_stamps_a_moved_no_ai_header() {
         .output()
         .unwrap();
     assert!(out.status.success(), "hide person: {}", stderr(&out));
+    // #410: the person edit itself re-stamped the interaction.
+    let restamped = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        outer_label(&restamped),
+        "no-ai: true",
+        "the person edit did not re-stamp its child in the same commit: {restamped}"
+    );
+    // Now make the header stale the way it actually goes stale after
+    // #410: restore the pre-edit envelope from git history, which still
+    // carries the old header with the identical inner body. The outer
+    // header is authenticated, so this cannot be simulated by editing
+    // bytes in place.
+    let pre_edit = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD~1"])
+        .output()
+        .unwrap();
+    let pre_edit = String::from_utf8_lossy(&pre_edit.stdout).trim().to_owned();
+    git(
+        &h.vault,
+        &[
+            "checkout",
+            &pre_edit,
+            "--",
+            &format!("interactions/{IXN}/interaction.md"),
+        ],
+    );
+    let stale = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(outer_label(&stale), "no-ai: false", "{stale}");
 
     // Re-save the interaction with the body it already has.
     let out = h

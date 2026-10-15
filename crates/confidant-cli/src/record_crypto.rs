@@ -9,6 +9,7 @@
 //! before anything is applied, and no plaintext fallback is ever written.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use confidant_core::crypto_mode::{self, WriteMode};
@@ -32,6 +33,16 @@ pub struct RecordEncryptor {
     /// recipient maps. `device-0` only for the init/recover/shred local
     /// device; `keys device-add` enrolls `device-{8-char suffix}`.
     device_key_id: String,
+    /// #410: no-ai modes a write in flight is about to give to person
+    /// records, keyed by person id. `encrypt_file` derives a child's
+    /// outer header from the person records on disk, and the write layer
+    /// encrypts every file in a changeset before any of them is written —
+    /// so a person edit that re-stamps its children in the same commit
+    /// would otherwise stamp them from the person's *old* mode. Each
+    /// entry is the mode the person will have once the changeset is
+    /// applied. Empty for every command except `record edit` on a person
+    /// whose effective mode changes.
+    mode_overrides: HashMap<String, envelope::NoAi>,
 }
 
 impl RecordEncryptor {
@@ -78,9 +89,19 @@ impl RecordEncryptor {
                     anchor,
                     identity: Box::new(device_identity),
                     device_key_id,
+                    mode_overrides: HashMap::new(),
                 }))
             }
         }
+    }
+
+    /// #410: supply the no-ai modes a write in flight is about to give to
+    /// person records, so children encrypted in the same changeset are
+    /// stamped from the person's *new* mode. See the `mode_overrides`
+    /// field. Only `record edit` on a person whose mode changes uses this.
+    pub fn with_mode_overrides(mut self, mode_overrides: HashMap<String, envelope::NoAi>) -> Self {
+        self.mode_overrides = mode_overrides;
+        self
     }
 
     /// Transform one record file's plaintext bytes into the bytes to
@@ -123,7 +144,7 @@ impl RecordEncryptor {
         // encrypted record, so the read path's `inherits_notes_no_ai`
         // never sees the decrypted `related:`/`with:` fields.
         let own_mode = rec.no_ai_mode();
-        let inherited = inherited_no_ai_mode(&self.root, &rec);
+        let inherited = inherited_no_ai_mode(&self.root, &rec, Some(&self.mode_overrides));
         let outer_no_ai = stamp_no_ai(record_type, own_mode, inherited);
 
         if let Some(existing) = &existing {
@@ -330,14 +351,34 @@ fn stamp_no_ai(
     }
 }
 
+/// #410: the mode stamping gives a person record — the person branch of
+/// [`stamp_no_ai`] — exposed so the `record edit` re-stamp planner reads
+/// the person's new mode through the same rule instead of restating it.
+pub(crate) fn person_own_mode(rec: &confidant_core::record::Record) -> envelope::NoAi {
+    rec.no_ai_mode().unwrap_or(envelope::NoAi::False)
+}
+
 /// Read a person's `no-ai` mode from its plaintext outer header — the
 /// envelope header when the profile is encrypted, the record front matter
 /// otherwise. Never decrypts.
 ///
+/// #410: `mode_overrides` carries the modes a write in flight is about to
+/// give to person records (see [`RecordEncryptor::with_mode_overrides`]);
+/// an override wins over the file on disk, which still holds the old mode
+/// while the changeset is being encrypted. `None` for every read that is
+/// not part of that write.
+///
 /// #181 version-skew rule: an unreadable or missing person header fails
 /// closed — children are stamped hidden rather than visible. (The old
 /// code returned `false` here.)
-fn person_no_ai_mode(root: &Path, person: &str) -> envelope::NoAi {
+pub(crate) fn person_no_ai_mode(
+    root: &Path,
+    person: &str,
+    mode_overrides: Option<&HashMap<String, envelope::NoAi>>,
+) -> envelope::NoAi {
+    if let Some(mode) = mode_overrides.and_then(|m| m.get(person)) {
+        return *mode;
+    }
     for candidate in [
         format!("people/{person}/profile.md"),
         format!("people/{person}.md"),
@@ -376,11 +417,15 @@ fn person_no_ai_mode(root: &Path, person: &str) -> envelope::NoAi {
 ///
 /// Merge-group peers are read-path only: stamp time sees the vault root,
 /// not the merge components.
-fn inherited_no_ai_mode(root: &Path, rec: &confidant_core::record::Record) -> envelope::NoAi {
+fn inherited_no_ai_mode(
+    root: &Path,
+    rec: &confidant_core::record::Record,
+    mode_overrides: Option<&HashMap<String, envelope::NoAi>>,
+) -> envelope::NoAi {
     use confidant_core::record::{parse_ref_id, parse_with_list, FrontmatterRef};
     use envelope::NoAi::{False, Notes, True};
     if let Some(person) = rec.field("person") {
-        match person_no_ai_mode(root, person) {
+        match person_no_ai_mode(root, person, mode_overrides) {
             True => return True,
             Notes => return Notes,
             False => {}
@@ -391,10 +436,12 @@ fn inherited_no_ai_mode(root: &Path, rec: &confidant_core::record::Record) -> en
             return false;
         }
         match parse_ref_id(value) {
-            FrontmatterRef::Id(id) => referenced_person_mode(root, &id) == Some(Notes),
+            FrontmatterRef::Id(id) => {
+                referenced_person_mode(root, &id, mode_overrides) == Some(Notes)
+            }
             _ => parse_with_list(value).is_some_and(|ids| {
                 ids.iter()
-                    .any(|id| referenced_person_mode(root, id) == Some(Notes))
+                    .any(|id| referenced_person_mode(root, id, mode_overrides) == Some(Notes))
             }),
         }
     });
@@ -412,8 +459,12 @@ fn inherited_no_ai_mode(root: &Path, rec: &confidant_core::record::Record) -> en
 fn referenced_person_mode(
     root: &Path,
     id: &confidant_core::id::RecordId,
+    mode_overrides: Option<&HashMap<String, envelope::NoAi>>,
 ) -> Option<envelope::NoAi> {
     let id = id.to_string();
+    if let Some(mode) = mode_overrides.and_then(|m| m.get(&id)) {
+        return Some(*mode);
+    }
     let bytes = [format!("people/{id}/profile.md"), format!("people/{id}.md")]
         .into_iter()
         .find_map(|candidate| std::fs::read(root.join(candidate)).ok())?;
@@ -526,39 +577,43 @@ mod tests {
         };
         // `person:` keeps the #181 behavior.
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("person: {ada}\n"))),
+            inherited_no_ai_mode(root, &note(&format!("person: {ada}\n")), None),
             Notes
         );
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("person: {bob}\n"))),
+            inherited_no_ai_mode(root, &note(&format!("person: {bob}\n")), None),
             False
         );
         // Any other single-ID field counts.
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("related: {ada}\n"))),
+            inherited_no_ai_mode(root, &note(&format!("related: {ada}\n")), None),
             Notes
         );
         // Bracketed ID lists count, on notes as well as interactions.
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("related: [{bob}, {ada}]\n"))),
+            inherited_no_ai_mode(root, &note(&format!("related: [{bob}, {ada}]\n")), None),
             Notes
         );
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("with: [{ada}]\n"))),
+            inherited_no_ai_mode(root, &note(&format!("with: [{ada}]\n")), None),
             Notes
         );
         // Non-person IDs and dangling references never hide.
         assert_eq!(
-            inherited_no_ai_mode(root, &note("related: d-01J9Z3K4QD1000000000000000\n")),
+            inherited_no_ai_mode(root, &note("related: d-01J9Z3K4QD1000000000000000\n"), None),
             False
         );
         assert_eq!(
-            inherited_no_ai_mode(root, &note("related: p-01J9Z3K4QG9000000000000000\n")),
+            inherited_no_ai_mode(root, &note("related: p-01J9Z3K4QG9000000000000000\n"), None),
             False
         );
         // A visible `person:` plus a notes-mode `related:` still hides.
         assert_eq!(
-            inherited_no_ai_mode(root, &note(&format!("person: {bob}\nrelated: {ada}\n"))),
+            inherited_no_ai_mode(
+                root,
+                &note(&format!("person: {bob}\nrelated: {ada}\n")),
+                None
+            ),
             Notes
         );
     }
