@@ -18,7 +18,26 @@ pub(crate) enum AppliedChange {
     Modified {
         abs: PathBuf,
         previous: Option<Vec<u8>>,
+        /// Absolute paths of directories created by this write, shallow to
+        /// deep. Revert removes them deepest-first when empty (#401).
+        created_dirs: Vec<PathBuf>,
     },
+}
+
+/// Ancestor directories under `vault_root` that do not exist yet, shallow
+/// to deep. Recorded before `ensure_directory` so revert only removes what
+/// this write created.
+fn missing_ancestors(vault_root: &Path, parent: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cur = PathBuf::new();
+    for comp in parent.components() {
+        cur.push(comp);
+        let abs = vault_root.join(&cur);
+        if !abs.is_dir() {
+            missing.push(abs);
+        }
+    }
+    missing
 }
 /// Apply planned writes to the working tree, recording previous bytes for
 /// revert. Uses atomic replace (`paths::write_replace`).
@@ -59,8 +78,10 @@ pub(crate) fn apply_writes(
                 let previous = paths::read_to_string(vault_root, file)
                     .ok()
                     .map(|s| s.into_bytes());
+                let mut created_dirs = Vec::new();
                 if let Some(parent) = file.parent() {
                     if !parent.as_os_str().is_empty() {
+                        created_dirs = missing_ancestors(vault_root, parent);
                         paths::ensure_directory(vault_root, parent).map_err(|e| {
                             anyhow::anyhow!("could not create {}: {e:#}", parent.display())
                         })?;
@@ -79,7 +100,11 @@ pub(crate) fn apply_writes(
                 }
                 paths::write_replace(vault_root, file, text.as_bytes())
                     .map_err(|e| anyhow::anyhow!("could not write {}: {e:#}", file.display()))?;
-                applied.push(AppliedChange::Modified { abs, previous });
+                applied.push(AppliedChange::Modified {
+                    abs,
+                    previous,
+                    created_dirs,
+                });
             }
             PlannedWrite::RecordWrite { path, content } => {
                 let abs = vault_root.join(path);
@@ -98,8 +123,10 @@ pub(crate) fn apply_writes(
                 } else {
                     content.as_bytes().to_vec()
                 };
+                let mut created_dirs = Vec::new();
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
+                        created_dirs = missing_ancestors(vault_root, parent);
                         paths::ensure_directory(vault_root, parent).map_err(|e| {
                             anyhow::anyhow!("could not create {}: {e:#}", parent.display())
                         })?;
@@ -107,7 +134,11 @@ pub(crate) fn apply_writes(
                 }
                 paths::write_replace(vault_root, path, &bytes)
                     .map_err(|e| anyhow::anyhow!("could not write {}: {e:#}", path.display()))?;
-                applied.push(AppliedChange::Modified { abs, previous });
+                applied.push(AppliedChange::Modified {
+                    abs,
+                    previous,
+                    created_dirs,
+                });
             }
         }
     }
@@ -116,9 +147,16 @@ pub(crate) fn apply_writes(
 
 /// Undo applied writes (the tree was clean when we started, so restoring
 /// previous bytes — or removing created files — returns it to clean).
+/// Directories created by the run are removed deepest-first when empty,
+/// so a later item failing cannot leave an empty record directory that
+/// wedges `check` (#401).
 pub(crate) fn revert_applied(applied: &[AppliedChange]) {
     for change in applied.iter().rev() {
-        let AppliedChange::Modified { abs, previous } = change;
+        let AppliedChange::Modified {
+            abs,
+            previous,
+            created_dirs,
+        } = change;
         match previous {
             Some(bytes) => {
                 let _ = std::fs::write(abs, bytes);
@@ -126,6 +164,10 @@ pub(crate) fn revert_applied(applied: &[AppliedChange]) {
             None => {
                 let _ = std::fs::remove_file(abs);
             }
+        }
+        for dir in created_dirs.iter().rev() {
+            // Only removes empty dirs; best effort like the file revert.
+            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -318,6 +360,56 @@ mod tests {
             "record directory must not be created on encrypt failure"
         );
         assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn inbox_revert_removes_dirs_created_by_earlier_write_in_batch() {
+        // #401 follow-up: when a later item in the same batch fails, revert
+        // must remove the file AND the directory created by the earlier
+        // write, or `check` stays wedged on the empty record directory.
+        let dir = vault_dir();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+        std::fs::write(root.join("keys/operator.toml"), "# placeholder\n").unwrap();
+
+        let encrypt = |path: &Path, plaintext: &[u8]| -> anyhow::Result<Vec<u8>> {
+            if path == Path::new("people/p-KEYLESS/profile.md") {
+                return Err(anyhow::anyhow!("no client key for person"));
+            }
+            let mut out = b"ENVELOPE:".to_vec();
+            out.extend_from_slice(plaintext);
+            Ok(out)
+        };
+        let writes = vec![
+            PlannedWrite::RecordWrite {
+                path: PathBuf::from("people/p-KEYED/profile.md"),
+                content: "---\nid: p-KEYED\ntype: person\n---\n".to_string(),
+            },
+            PlannedWrite::RecordWrite {
+                path: PathBuf::from("people/p-KEYLESS/profile.md"),
+                content: "---\nid: p-KEYLESS\ntype: person\n---\n".to_string(),
+            },
+        ];
+        let mut applied = Vec::new();
+        let err = apply_writes(root, &writes, &mut applied, Some(&encrypt)).unwrap_err();
+        assert!(
+            err.to_string().contains("no client key"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(applied.len(), 1, "first write should have applied");
+        revert_applied(&applied);
+        assert!(
+            !root.join("people/p-KEYED/profile.md").exists(),
+            "reverted file must be gone"
+        );
+        assert!(
+            !root.join("people/p-KEYED").exists(),
+            "revert must remove the record directory it created (#401)"
+        );
+        assert!(
+            !root.join("people/p-KEYLESS").exists(),
+            "failed write must not create a record directory"
+        );
     }
 
     #[test]

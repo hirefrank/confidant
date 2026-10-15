@@ -558,6 +558,142 @@ fn inbox_drain_new_person_without_client_key_refuses() {
 }
 
 #[test]
+fn inbox_drain_batch_failure_removes_earlier_created_dir() {
+    // #401 follow-up: a batch where the first item succeeds (keyed person)
+    // and a later item fails (keyless person) must revert cleanly — the
+    // earlier file AND its record directory are removed, or `check` and
+    // `keys init-client` stay wedged on the empty directory.
+    let h = Harness::new();
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let out = h.init();
+    assert!(out.status.success(), "init failed: {}", stderr(&out));
+
+    let keyed_person = "p-01J9Z3K4QJ0000000000000000";
+    let keyless_person = "p-01J9Z3K4QK0000000000000000";
+    let out = h.init_client(keyed_person);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+
+    // Stems sort alphabetically, so the keyed item drains first and the
+    // keyless item fails second — exercising batch revert.
+    let keyed_payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{keyed_person}/profile.md\n---\n{}",
+        person_md(keyed_person, "Ada Example", "Inbox bio is secret.")
+    );
+    let keyless_payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{keyless_person}/profile.md\n---\n{}",
+        person_md(keyless_person, "Bob Example", "Inbox bio is secret.")
+    );
+    confidant_core::queue_items(
+        &h.vault,
+        &[
+            confidant_core::QueueItem {
+                stem: "a-keyed-profile".to_string(),
+                plaintext: keyed_payload,
+            },
+            confidant_core::QueueItem {
+                stem: "b-keyless-profile".to_string(),
+                plaintext: keyless_payload,
+            },
+        ],
+        &inbox_recipient,
+    )
+    .expect("queue_items failed");
+
+    let rev_parse = |rev: &str| {
+        let out = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let main_before = rev_parse("HEAD");
+
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(!out.status.success(), "drain should have refused");
+    assert!(
+        stderr(&out).contains(&format!(
+            "Run `confidant keys init-client {keyless_person}`"
+        )),
+        "error should name the keyless person, got: {}",
+        stderr(&out)
+    );
+
+    // No key dir for the keyless person, and neither record directory
+    // may remain — including the earlier keyed item's dir.
+    assert!(
+        !h.vault.join(format!("keys/{keyless_person}")).exists(),
+        "no key dir may be created for the keyless person"
+    );
+    assert!(
+        !h.vault
+            .join(format!("people/{keyed_person}/profile.md"))
+            .exists(),
+        "earlier batch file must be reverted"
+    );
+    assert!(
+        !h.vault.join(format!("people/{keyed_person}")).exists(),
+        "earlier batch record directory must be reverted (#401)"
+    );
+    assert!(
+        !h.vault.join(format!("people/{keyless_person}")).exists(),
+        "failed write must not leave a record directory"
+    );
+
+    // Both items stay queued; nothing committed.
+    let out = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .output()
+        .unwrap();
+    let inbox_tree = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        inbox_tree.contains("a-keyed-profile.age") && inbox_tree.contains("b-keyless-profile.age"),
+        "both items must remain queued, inbox tree:\n{inbox_tree}"
+    );
+    assert_eq!(
+        rev_parse("HEAD"),
+        main_before,
+        "drain must not commit on refusal"
+    );
+
+    // After init-client, the retry drain succeeds and the vault is usable.
+    let out = h.init_client(keyless_person);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(
+        out.status.success(),
+        "drain after init-client failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        h.vault
+            .join(format!("people/{keyed_person}/profile.md"))
+            .exists(),
+        "keyed profile must exist after successful drain"
+    );
+    assert!(
+        h.vault
+            .join(format!("people/{keyless_person}/profile.md"))
+            .exists(),
+        "keyless profile must exist after successful drain"
+    );
+}
+
+#[test]
 fn inbox_drain_skip_holds_keyless_person() {
     // #385: `--skip <item>` holds the keyless person item for a later
     // `keys init-client` run: the drain succeeds, merges nothing, creates
