@@ -10,7 +10,8 @@ use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix,
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
 use crate::record::{
-    frontmatter_line_spec_key, has_conflict_markers, parse_record, Record, RecordKind,
+    frontmatter_line_spec_key, frontmatter_region, has_conflict_markers, parse_record, Record,
+    RecordKind,
 };
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
@@ -964,10 +965,15 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
         }
     };
     if conflicted {
-        // #391: the markers make the file unparseable by construction, so
-        // parsing on would only add a derived E_FRONTMATTER pointing at the
-        // marker lines themselves. Report the conflict and stop.
-        return fail(findings, true);
+        // #399: only skip parsing when the front matter itself is conflicted.
+        // Markers confined to the body still parse, so the record stays in
+        // the vault and references to it resolve instead of cascading into
+        // E_DANGLING_REF / E_UNKNOWN_RECORD. The conflict finding above
+        // still fires either way, and `conflicted` stays true so the id
+        // remains in `conflicted_ids` for the suppression checks in check.rs.
+        if has_conflict_markers(frontmatter_region(&text)) {
+            return fail(findings, true);
+        }
     }
     match parse_record(&text, &file) {
         Err(err) => {

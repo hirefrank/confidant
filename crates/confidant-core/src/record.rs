@@ -444,6 +444,29 @@ fn body_start_line(fm: &str) -> u32 {
     1 + fm_lines + 1 + 1
 }
 
+/// Front-matter region of a record file: the opening `---` line through the
+/// closing `---` line (BOM-tolerant, same fence rules as `split_frontmatter`).
+/// When the fences are absent the whole text is the region, so a
+/// missing-fence file keeps today's skip behavior and fails with
+/// `E_FRONTMATTER` either way.
+pub fn frontmatter_region(text: &str) -> &str {
+    let stripped = text.trim_start_matches('\u{feff}');
+    let bom_len = text.len() - stripped.len();
+    let Some(rest) = strip_open_fence(stripped) else {
+        return text;
+    };
+    let open_len = stripped.len() - rest.len();
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if is_yaml_fence_line(trimmed) {
+            return &text[..bom_len + open_len + offset];
+        }
+    }
+    text
+}
+
 fn strip_open_fence(text: &str) -> Option<&str> {
     let rest = text.strip_prefix("---")?;
     let nl = rest.find('\n')?;
@@ -715,7 +738,26 @@ pub fn has_conflict_markers(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_record, parse_record};
+    use super::{format_record, frontmatter_region, has_conflict_markers, parse_record};
+
+    #[test]
+    fn frontmatter_region_covers_fences_only() {
+        // Markers in the body are outside the region; markers in the
+        // front matter are inside it (#399).
+        let body_conflict =
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\n---\n\n<<<<<<< HEAD\n";
+        assert!(!has_conflict_markers(frontmatter_region(body_conflict)));
+        assert!(has_conflict_markers(body_conflict));
+        let fm_conflict =
+            "---\nid: p-01M3TC5H00MPJG000000000000\n<<<<<<< HEAD\ntype: person\n---\n\nBio.\n";
+        assert!(has_conflict_markers(frontmatter_region(fm_conflict)));
+        // No fences: the whole text is the region (fail safe).
+        let no_fences = "no front matter\n<<<<<<< HEAD\n";
+        assert_eq!(frontmatter_region(no_fences), no_fences);
+        // Unclosed fences: the whole text is the region (fail safe).
+        let unclosed = "---\nid: p-01M3TC5H00MPJG000000000000\n";
+        assert_eq!(frontmatter_region(unclosed), unclosed);
+    }
 
     #[test]
     fn round_trip_profile() {

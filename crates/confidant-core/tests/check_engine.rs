@@ -5183,3 +5183,43 @@ fn check_conflicted_person_in_with_list_is_not_dangling() {
         "conflicted target must not report E_DANGLING_REF: {json}"
     );
 }
+
+/// #399: conflict markers confined to the body still parse. The front
+/// matter is intact, so ADA stays in the record set: front-matter refs,
+/// `with:` lists, and ledger lines referencing ADA all resolve, and the
+/// only finding is E_MERGE_CONFLICT on the conflicted profile.
+#[test]
+fn check_body_only_conflict_keeps_record_and_refs_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    // Clean front matter; the conflict lives entirely in the body.
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\n<<<<<<< HEAD\nBio A.\n=======\nBio B.\n>>>>>>> branch\n"
+        ),
+    );
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 session {ADA} 60m paid\n\
+             2026-10-01 balance {ADA} sessions_remaining 5\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let found = codes(&json);
+    assert!(
+        found.contains(&"E_MERGE_CONFLICT".to_string()),
+        "expected E_MERGE_CONFLICT on the conflicted profile: {json}"
+    );
+    for code in ["E_DANGLING_REF", "E_UNKNOWN_RECORD", "E_FRONTMATTER"] {
+        assert!(
+            !found.contains(&code.to_string()),
+            "body-only conflict must not cascade into {code}: {json}"
+        );
+    }
+}
