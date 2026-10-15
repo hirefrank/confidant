@@ -15,7 +15,7 @@ mod record_crypto;
 mod record_decrypt;
 mod setup;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(not(feature = "test-overrides"))]
 use std::io::IsTerminal;
 use std::io::{self, Write};
@@ -1814,6 +1814,21 @@ fn apply_record_write(
     pending: PendingWrite,
     opts: &WriteOptions,
 ) -> anyhow::Result<(WriteOutcome, Vec<String>)> {
+    apply_record_write_inner(root, vault, pending, opts, HashMap::new())
+}
+
+/// #410: like [`apply_record_write`], but the encryptor is built with
+/// `mode_overrides` — the no-ai modes this changeset is about to give to
+/// person records — so children encrypted in the same commit are stamped
+/// from the person's new mode. Only `record edit` on a person whose mode
+/// changes supplies a non-empty map.
+fn apply_record_write_inner(
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    pending: PendingWrite,
+    opts: &WriteOptions,
+    mode_overrides: HashMap<String, confidant_crypt::envelope::NoAi>,
+) -> anyhow::Result<(WriteOutcome, Vec<String>)> {
     let needs_encryptor = pending
         .changes
         .iter()
@@ -1821,7 +1836,9 @@ fn apply_record_write(
     if !needs_encryptor {
         return Ok((apply_write(root, pending, opts)?, Vec::new()));
     }
-    match record_crypto::RecordEncryptor::for_vault(root, vault)? {
+    match record_crypto::RecordEncryptor::for_vault(root, vault)?
+        .map(|enc| enc.with_mode_overrides(mode_overrides))
+    {
         Some(enc) => {
             // #180: create a missing person key in the same commit as
             // the person record. On any non-Applied outcome the created
@@ -3241,18 +3258,33 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         }
     }
     let contents = confidant_core::format_record(&rec);
-    let (outcome, _created) = apply_record_write(
+    let mut changes = vec![FileChange::WriteFile {
+        path: rel.clone(),
+        contents,
+    }];
+    // #410: a person edit whose effective `no-ai` mode changes re-stamps
+    // that person's existing children in the same commit — the header the
+    // write-time stamp left behind moves with the person, in both
+    // directions. Refuses the whole edit (nothing committed) when a
+    // child cannot be read. See [`plan_no_ai_restamp`].
+    let mode_overrides = if rec.kind == RecordKind::Person {
+        let (overrides, child_changes) =
+            plan_no_ai_restamp(root, &vault, &id, record_crypto::person_own_mode(&rec))?;
+        changes.extend(child_changes);
+        overrides
+    } else {
+        HashMap::new()
+    };
+    let (outcome, _created) = apply_record_write_inner(
         root,
         &vault,
         PendingWrite {
-            changes: vec![FileChange::WriteFile {
-                path: rel.clone(),
-                contents,
-            }],
+            changes,
             summary: format!("record {id}"),
             canonical_request: format!("record-edit/v1\npath={}\nbody={}", rel.display(), text),
         },
         &write_options(cli),
+        mode_overrides,
     )?;
     let mut extra = serde_json::json!({
         "id": id,
@@ -3267,6 +3299,140 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         println!("rekeyed {id}: {from} -> {to}");
     }
     result
+}
+
+/// #410: when a person's effective `no-ai` mode changes, plan the
+/// re-stamp of that person's existing children in the same commit as the
+/// person edit — the same shape as `keys shred`'s
+/// `delete_edges_naming` / `strip_participant_from_interactions`,
+/// including their fail-closed refusals.
+///
+/// Returns the encryptor mode overrides (this person's new mode) and one
+/// `WriteFile` change per referencing child. The child changes carry each
+/// child's *inner plaintext unchanged*; the write layer's encryptor
+/// re-derives the outer header — from the override, so it sees the new
+/// mode — and re-encrypts only where the header actually changed
+/// (`stability_decision` keeps an unchanged child's ciphertext
+/// byte-for-byte, so the commit diff names exactly the records that
+/// moved).
+///
+/// Fail-closed discovery: finding a person's children in an encrypted
+/// vault means decrypting records to read their references, through the
+/// operator read path (#216) so `no-ai`-hidden children decrypt too. Any
+/// record this device cannot decrypt — or refuses as tampered, or cannot
+/// parse — refuses the whole edit, naming every unreadable file, and
+/// nothing is committed; the operator fixes or shreds those records and
+/// retries. A plaintext child in an encrypted vault has no outer header
+/// to move (its visibility follows the person at read time) and `check`
+/// reports the mixed mode, so it is left alone. On a plaintext vault
+/// there are no headers at all and this returns empty.
+fn plan_no_ai_restamp(
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    person_id: &str,
+    new_mode: confidant_crypt::envelope::NoAi,
+) -> anyhow::Result<(
+    HashMap<String, confidant_crypt::envelope::NoAi>,
+    Vec<FileChange>,
+)> {
+    let old_mode = record_crypto::person_no_ai_mode(root, person_id, None);
+    if old_mode == new_mode {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+    // Plaintext vault: nothing carries an outer header, so nothing is
+    // stale. The read path re-derives visibility live.
+    let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
+        .map_err(anyhow::Error::new)?;
+    if !matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted) {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+
+    // DISCOVER: decrypt every record through the operator read path and
+    // collect the ones this device cannot read. Any unreadable record
+    // could reference this person, so an unreadable one refuses the whole
+    // edit rather than leaving exactly those records with the stale
+    // header this re-stamp exists to remove.
+    let probe = load_vault(root)?;
+    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_edit(
+        root,
+        &probe.config.vault_id,
+    ));
+    let unreadable = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let inner = decryptor.hook();
+    let hook: ContentHook = std::sync::Arc::new({
+        let unreadable = std::sync::Arc::clone(&unreadable);
+        move |path: &str, bytes: &[u8]| {
+            let outcome = inner(path, bytes);
+            // Operator mode never returns the keyless `no-ai` shell, so
+            // anything that is not decrypted content is unreadable here:
+            // skipped (this device cannot decrypt it) or refused (tampered
+            // or corrupt).
+            if !matches!(outcome, ContentOutcome::Content(_)) {
+                unreadable.lock().unwrap().push(path.to_string());
+            }
+            outcome
+        }
+    });
+    let scanned =
+        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
+    let mut unreadable = unreadable.lock().unwrap().clone();
+    // A load finding on a record file means it could not be parsed — its
+    // references are unknown, same as an undecryptable envelope.
+    for finding in &scanned.load_findings {
+        if let Some(path) = &finding.file {
+            unreadable.push(path.clone());
+        }
+    }
+    if !unreadable.is_empty() {
+        unreadable.sort();
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot edit {person_id}: {} record file(s) could not be read to determine whether they reference this person: {}",
+            unreadable.len(),
+            unreadable.join(", ")
+        ))
+        .with_fix(
+            "Re-stamping must reach every child or the stale header survives on the records it skipped. Resolve the unreadable files on a device that can decrypt them (check reports them), or shred them, then re-run the edit",
+        )));
+    }
+
+    // PLAN: one change per referencing child, in the same reference set
+    // the write-time stamp uses.
+    let changes: Vec<FileChange> = scanned
+        .records
+        .values()
+        .filter(|rec| rec.id.to_string() != person_id)
+        .filter(|rec| references_person(&rec.fields, person_id))
+        .filter(|rec| {
+            // Only an envelope child has an outer header to re-stamp.
+            std::fs::read(root.join(&rec.path))
+                .map(|bytes| confidant_core::crypto_mode::is_envelope_bytes(&bytes))
+                .unwrap_or(false)
+        })
+        .map(|rec| FileChange::WriteFile {
+            path: std::path::PathBuf::from(&rec.path),
+            contents: rec.source.clone(),
+        })
+        .collect();
+    Ok((HashMap::from([(person_id.to_owned(), new_mode)]), changes))
+}
+
+/// #410: whether a record's front matter references `person`, using the
+/// same field scan `record_crypto::inherited_no_ai_mode` applies at stamp
+/// time — the `person:` field plus every other ID-valued or ID-list
+/// field. If the two scans ever drift apart, a stale header comes back
+/// through whichever side the scan no longer covers.
+fn references_person(fields: &BTreeMap<String, String>, person: &str) -> bool {
+    use confidant_core::record::{parse_ref_id, parse_with_list, FrontmatterRef};
+    fields.iter().any(|(key, value)| {
+        if key == "no-ai" {
+            return false;
+        }
+        match parse_ref_id(value) {
+            FrontmatterRef::Id(id) => id.to_string() == person,
+            _ => parse_with_list(value)
+                .is_some_and(|ids| ids.iter().any(|id| id.to_string() == person)),
+        }
+    })
 }
 
 /// The client whose data key encrypts `rec`: its own id for a person, the
