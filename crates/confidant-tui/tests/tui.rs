@@ -898,6 +898,237 @@ fn proposals_live_apply_against_temp_git_vault() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+fn inbox_dry_run_json() -> &'static str {
+    r#"{
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "branch": "main",
+        "dry_run": true,
+        "empty": false,
+        "merged": 2,
+        "cleared": 2,
+        "items": [
+            {"name": "01JAAA", "kind": "ledger", "target": "ledger/*", "action": "merge"},
+            {"name": "01JAAB", "kind": "record", "target": "people/p-01/record.md", "action": "skip"}
+        ],
+        "skipped": [
+            {"name": "01JAAC", "kind": "ledger", "target": "ledger/*"}
+        ],
+        "warnings": ["item 01JAAB already present: idempotent no-op"]
+    }"#
+}
+
+fn inbox_empty_json() -> &'static str {
+    r#"{
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "branch": "main",
+        "dry_run": true,
+        "empty": true,
+        "merged": 0,
+        "cleared": 0,
+        "items": [],
+        "skipped": [],
+        "warnings": []
+    }"#
+}
+
+#[test]
+fn inbox_dry_run_renders_items_warnings_and_skipped() {
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("01JAAA"), "item name shown:\n{rendered}");
+    assert!(rendered.contains("ledger/*"), "target shown:\n{rendered}");
+    assert!(rendered.contains("(merge)"), "action shown:\n{rendered}");
+    assert!(
+        rendered.contains("Deferred (1)"),
+        "skipped section:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("already present"),
+        "warnings shown:\n{rendered}"
+    );
+    assert_snapshot("inbox_dry_run.txt", &rendered);
+}
+
+#[test]
+fn inbox_empty_renders_nothing_to_do() {
+    let fake = FakeRunner::from_json(0, inbox_empty_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("nothing to do"),
+        "empty state:\n{rendered}"
+    );
+}
+
+#[test]
+fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
+    let fake = FakeRunner::new();
+    // Dry run, then the real apply, then the post-apply dry run (empty).
+    fake.push_response(0, inbox_dry_run_json().as_bytes().to_vec());
+    fake.push_response(
+        0,
+        r#"{"ok": true, "schema_version": "1", "dry_run": false, "empty": false,
+            "merged": 2, "cleared": 2, "items": [], "skipped": [], "warnings": []}"#,
+    );
+    fake.push_response(0, inbox_empty_json().as_bytes().to_vec());
+
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    // Begin apply: confirm modal opens.
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(app.inbox.confirming, "confirm modal open");
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("Confirm: apply inbox"),
+        "modal shown:\n{rendered}"
+    );
+    // Confirm with y: runs the real inbox, then reloads the dry run.
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(!app.inbox.confirming, "modal closed");
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &vec!["inbox".to_owned(), "--dry-run".to_owned()]),
+        "dry run issued: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c == &vec!["inbox".to_owned()]),
+        "real inbox issued without --dry-run: {calls:?}"
+    );
+    assert!(
+        app.inbox
+            .last_apply
+            .as_deref()
+            .unwrap_or("")
+            .contains("merged 2"),
+        "apply result recorded"
+    );
+}
+
+#[test]
+fn inbox_apply_cancel_does_not_run_real_inbox() {
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(app.inbox.confirming);
+    // Any key other than y cancels.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(!app.inbox.confirming, "modal closed");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls.iter().any(|c| c == &vec!["inbox".to_owned()]),
+        "no real inbox run: {calls:?}"
+    );
+}
+
+#[test]
+fn inbox_apply_with_no_items_does_not_open_confirm() {
+    let fake = FakeRunner::from_json(0, inbox_empty_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(!app.inbox.confirming, "no confirm when nothing to apply");
+}
+
+#[test]
+fn inbox_tab_falls_through_to_shared_navigation() {
+    // Tab from Inbox wraps around to Check.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Check);
+
+    // `5` from Inbox switches to Proposals.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('5')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+
+    // Shift-Tab from Inbox steps back to Search.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::BackTab));
+    assert_eq!(app.active_view, ActiveView::Search);
+
+    // Esc with no alert quits.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.should_quit, "Esc quits from the inbox tab");
+}
+
+#[test]
+fn inbox_q_quits() {
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit, "q quits from the inbox tab");
+}
+
+/// Live dry run against a throwaway git vault with no inbox branch,
+/// reusing the `crates/confidant-cli/tests/inbox.rs` fixture shape.
+#[test]
+fn inbox_live_dry_run_empty_vault() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main", "-q"]);
+    fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\nvault_id = \"tui-inbox-test\"\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+
+    let bin = confidant_bin();
+    let home = tempfile::TempDir::new().expect("temp home");
+    let runner = ProcessRunner::new(bin, Some(root.to_path_buf()))
+        .with_env("CONFIDANT_KEYCHAIN", "off")
+        .with_env("HOME", home.path().to_string_lossy().to_string());
+    let mut app = App::new(runner);
+    app.handle_key(key(KeyCode::Char('7')));
+    let report = app.inbox.report.as_ref().expect("report loaded");
+    assert!(report.empty, "no inbox branch -> empty");
+    assert!(report.dry_run);
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("nothing to do"),
+        "live empty state:\n{rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // QMD search view (Phase 3a, #212)
 // ---------------------------------------------------------------------------

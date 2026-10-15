@@ -269,6 +269,11 @@ are never hand-written into the vault tree (pre-M2 records stay with the
 skill workflow); every write goes through the CLI, one commit per write,
 with progress tracked so a crashed apply resumes where it stopped.
 
+The inbox tab (Phase 3, #212) shows the `inbox --dry-run` plan — items with
+their merge actions, deferred items, and warnings — and applies it
+all-or-nothing through the existing `inbox` command on an explicit `y`
+confirm. There is no per-item selection in the TUI.
+
 It ships both as a GitHub Releases binary (next to `confidant`) and on
 crates.io. You need **both** binaries: the TUI shells out to a `confidant`
 on `PATH` that speaks the same agent contract (`schema_version == "1"`) —
