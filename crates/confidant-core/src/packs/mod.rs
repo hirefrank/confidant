@@ -23,6 +23,7 @@ use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
 pub mod groups;
+pub mod manifest;
 pub mod personal;
 
 /// One edge kind a pack owns (#179). `name` is the `kind` front-matter

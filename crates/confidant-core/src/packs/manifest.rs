@@ -1,0 +1,668 @@
+//! Pack manifest types, parser, and validation (`spec/pack-manifest.md`).
+//!
+//! Step 2 of #295: the types and loader for `packs/<name>/manifest.toml`.
+//! Nothing loads a manifest yet and no pack reads its claims from one, so
+//! this changes no behaviour. Steps 4-5 wire the packs up; step 6
+//! generalizes the drift test against these types.
+//!
+//! The loader is strict: unknown keys are an error (a typo fails loudly
+//! rather than silently doing nothing), and every semantic rule in the
+//! spec's schema section is checked.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::Deserialize;
+
+use crate::error::DomainError;
+use crate::id::Prefix;
+
+/// Schema version this loader implements (`manifest_version` in the file).
+/// A file declaring any other version is rejected rather than guessed at.
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// Field grammars a manifest may name (spec §6). Fixed list: adding a
+/// grammar is a spec change plus a Rust parser — never a manifest-only
+/// change, so manifests cannot smuggle in new validation semantics.
+pub const KNOWN_GRAMMARS: &[&str] = &[
+    "recurring-date",
+    "cadence",
+    "dates-list",
+    "non-empty-string",
+];
+
+/// Record ID types a verb may constrain its ledger ID to (spec §4,
+/// today's `Prefix`).
+const KNOWN_ID_TYPES: &[(&str, Prefix)] = &[
+    ("person", Prefix::Person),
+    ("org", Prefix::Org),
+    ("deal", Prefix::Deal),
+    ("interaction", Prefix::Interaction),
+    ("note", Prefix::Note),
+    ("edge", Prefix::Edge),
+    ("package", Prefix::Package),
+];
+
+/// Severity values a `[checks]` severity default may take.
+const KNOWN_SEVERITIES: &[&str] = &["error", "warning", "off"];
+
+fn manifest_err(message: impl Into<String>) -> DomainError {
+    DomainError::config(message).with_file("manifest.toml")
+}
+
+/// The `[pack]` table: identity and skill-text reference.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PackInfo {
+    /// Short pack name, e.g. `"personal"`. The full name is
+    /// `"{name}@{version}"`, matching today's `Pack::name()`.
+    pub name: String,
+    /// Pack version, e.g. `"0.1"`.
+    pub version: String,
+    /// Skill text path relative to the pack directory, today `"SKILL.md"`.
+    /// Referenced, never duplicated.
+    pub skill: String,
+}
+
+/// Parse an `id_type` name (`person`, `org`, …) into a [`Prefix`].
+/// The derived `Deserialize` on `Prefix` expects variant names, not the
+/// manifest's lowercase names, so this is wired via `deserialize_with`.
+fn deserialize_id_type<'de, D>(deserializer: D) -> Result<Option<Prefix>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = serde::Deserialize::deserialize(deserializer)?;
+    KNOWN_ID_TYPES
+        .iter()
+        .find(|(name, _)| *name == s)
+        .map(|(_, prefix)| Some(*prefix))
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown id_type '{s}'; expected one of: {}",
+                KNOWN_ID_TYPES
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+/// One `[[verbs]]` entry: a ledger verb the pack owns.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerbDecl {
+    pub name: String,
+    /// The verb-to-ID-type claim (today's `verb_id_type`); `None` for
+    /// verbs with no ID-type claim.
+    #[serde(default, deserialize_with = "deserialize_id_type")]
+    pub id_type: Option<Prefix>,
+}
+
+/// One `[[fields]]` entry: a front-matter field the pack owns.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FieldDecl {
+    pub name: String,
+    /// Names one of [`KNOWN_GRAMMARS`]; Rust supplies the parser.
+    pub grammar: String,
+}
+
+/// One `[[edge_kinds]]` entry: an edge kind the pack introduces.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeKindDecl {
+    pub name: String,
+    pub symmetric: bool,
+}
+
+/// One `[[checks.severity]]` entry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SeverityCheck {
+    /// Namespaced `<pack-name>.<rule>`, e.g. `"personal.cadence_overdue"`.
+    pub key: String,
+    /// One of `error`, `warning`, `off`.
+    pub default: String,
+}
+
+/// One `[[checks.int]]` entry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IntCheck {
+    /// Namespaced `<pack-name>.<rule>`.
+    pub key: String,
+    pub default: i64,
+}
+
+/// The `[checks]` table: keys this pack owns, with defaults.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChecksDecl {
+    #[serde(default)]
+    pub severity: Vec<SeverityCheck>,
+    #[serde(default)]
+    pub int: Vec<IntCheck>,
+}
+
+/// A parsed and validated pack manifest. All names are owned strings;
+/// steps 4-5 compare these against the compiled `&'static` slices.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PackManifest {
+    /// Schema version of the file; must equal [`MANIFEST_VERSION`].
+    pub manifest_version: u32,
+    /// Record types this pack owns (empty for both packs today).
+    pub record_types: Vec<String>,
+    /// Balance metrics this pack's fold computes.
+    pub balance_metrics: Vec<String>,
+    /// Finding codes this pack's fold/findings can emit. Must match the
+    /// `[messages]` keys exactly.
+    pub finding_codes: Vec<String>,
+    pub pack: PackInfo,
+    /// Verbs this pack owns. Empty when the pack owns none.
+    #[serde(default)]
+    pub verbs: Vec<VerbDecl>,
+    /// Front-matter fields this pack owns. Empty when the pack owns none.
+    #[serde(default)]
+    pub fields: Vec<FieldDecl>,
+    /// Edge kinds this pack introduces. Empty when the pack owns none.
+    #[serde(default)]
+    pub edge_kinds: Vec<EdgeKindDecl>,
+    #[serde(default)]
+    pub checks: ChecksDecl,
+    /// Finding message and fix templates, one table per code:
+    /// `messages[code][variant] = template`. Every code in
+    /// `finding_codes` needs a table with at least one variant, and every
+    /// table key must be in `finding_codes`.
+    pub messages: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Check one message template: `{placeholder}` substitution only — no
+/// conditionals, no expressions, no filters. Braces must balance and
+/// placeholders must be non-empty plain identifiers.
+fn check_template(template: &str) -> Result<(), String> {
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                if c == '{' {
+                    return Err("nested '{' inside a placeholder".to_string());
+                }
+                name.push(c);
+            }
+            if !closed {
+                return Err("unclosed '{'".to_string());
+            }
+            if name.is_empty() {
+                return Err("empty placeholder '{}'".to_string());
+            }
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "placeholder '{{{name}}}' is not a plain identifier"
+                ));
+            }
+        } else if c == '}' {
+            return Err("unmatched '}'".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn check_unique(names: &[String], what: &str) -> Result<(), DomainError> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if name.trim().is_empty() {
+            return Err(manifest_err(format!("{what} names must be non-empty"))
+                .with_fix("Remove the empty entry or give it a name"));
+        }
+        if !seen.insert(name) {
+            return Err(manifest_err(format!("duplicate {what} name '{name}'"))
+                .with_fix("Each name may be declared only once"));
+        }
+    }
+    Ok(())
+}
+
+impl PackManifest {
+    fn validate(&self) -> Result<(), DomainError> {
+        if self.manifest_version != MANIFEST_VERSION {
+            return Err(manifest_err(format!(
+                "manifest_version {} is not supported (this loader implements {})",
+                self.manifest_version, MANIFEST_VERSION
+            ))
+            .with_fix("Set manifest_version = 1 or upgrade the CLI"));
+        }
+
+        if self.pack.name.trim().is_empty() {
+            return Err(manifest_err("[pack].name must be non-empty")
+                .with_fix("Set the pack's short name, e.g. name = \"personal\""));
+        }
+        if self.pack.name.contains('@') {
+            return Err(manifest_err(format!(
+                "[pack].name '{}' must not contain '@'; the version goes in [pack].version",
+                self.pack.name
+            )));
+        }
+        if self.pack.version.trim().is_empty() {
+            return Err(manifest_err("[pack].version must be non-empty")
+                .with_fix("Set the pack version, e.g. version = \"0.1\""));
+        }
+        if self.pack.version.contains('@') {
+            return Err(manifest_err(
+                "[pack].version must not contain '@'; the full name is \"{name}@{version}\"",
+            ));
+        }
+        if self.pack.skill.trim().is_empty() {
+            return Err(manifest_err("[pack].skill must be non-empty")
+                .with_fix("Reference the skill text, e.g. skill = \"SKILL.md\""));
+        }
+
+        check_unique(&self.record_types, "record type")?;
+        check_unique(&self.balance_metrics, "balance metric")?;
+        check_unique(&self.finding_codes, "finding code")?;
+
+        let verb_names: Vec<String> = self.verbs.iter().map(|v| v.name.clone()).collect();
+        check_unique(&verb_names, "verb")?;
+        let field_names: Vec<String> = self.fields.iter().map(|f| f.name.clone()).collect();
+        check_unique(&field_names, "field")?;
+        for field in &self.fields {
+            if !KNOWN_GRAMMARS.contains(&field.grammar.as_str()) {
+                return Err(manifest_err(format!(
+                    "field '{}' names unknown grammar '{}'; expected one of: {}",
+                    field.name,
+                    field.grammar,
+                    KNOWN_GRAMMARS.join(", ")
+                ))
+                .with_fix("Adding a grammar is a spec change plus a Rust parser — never a manifest-only change"));
+            }
+        }
+        let edge_names: Vec<String> = self.edge_kinds.iter().map(|e| e.name.clone()).collect();
+        check_unique(&edge_names, "edge kind")?;
+
+        // [checks] keys are namespaced <pack-name>.<rule>; a pack may only
+        // declare keys under its own name. `as_of` stays core-owned.
+        let prefix = format!("{}.", self.pack.name);
+        for entry in self
+            .checks
+            .severity
+            .iter()
+            .map(|s| &s.key)
+            .chain(self.checks.int.iter().map(|i| &i.key))
+        {
+            if !entry.starts_with(&prefix) || entry.len() == prefix.len() {
+                return Err(manifest_err(format!(
+                    "checks key '{entry}' is not namespaced to this pack; keys must look like '{prefix}<rule>'"
+                ))
+                .with_fix("The `as_of` key stays core-owned and cannot be declared here"));
+            }
+        }
+        for check in &self.checks.severity {
+            if !KNOWN_SEVERITIES.contains(&check.default.as_str()) {
+                return Err(manifest_err(format!(
+                    "checks key '{}' has bad severity default '{}'; expected one of: {}",
+                    check.key,
+                    check.default,
+                    KNOWN_SEVERITIES.join(", ")
+                )));
+            }
+        }
+
+        // Every finding code needs a [messages.<CODE>] table with at least
+        // one variant, and every [messages] key must be a finding code —
+        // no orphan text, no undocumented codes.
+        for code in &self.finding_codes {
+            match self.messages.get(code) {
+                None => {
+                    return Err(manifest_err(format!(
+                        "finding code '{code}' has no [messages.\"{code}\"] table"
+                    ))
+                    .with_fix("Add one table per code, with at least one variant"))
+                }
+                Some(variants) if variants.is_empty() => {
+                    return Err(manifest_err(format!(
+                        "[messages.\"{code}\"] must declare at least one variant"
+                    )))
+                }
+                _ => {}
+            }
+        }
+        for code in self.messages.keys() {
+            if !self.finding_codes.contains(code) {
+                return Err(
+                    manifest_err(format!("[messages.\"{code}\"] is not in finding_codes"))
+                        .with_fix("Add the code to finding_codes or remove the table"),
+                );
+            }
+        }
+        for (code, variants) in &self.messages {
+            for (variant, template) in variants {
+                if variant.trim().is_empty() {
+                    return Err(manifest_err(format!(
+                        "[messages.\"{code}\"] has an empty variant name"
+                    )));
+                }
+                check_template(template).map_err(|detail| {
+                    manifest_err(format!(
+                        "[messages.\"{code}\"].{variant} is not a plain template: {detail}"
+                    ))
+                    .with_fix("Templates allow {{placeholder}} substitution only — no conditionals or expressions")
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Parse and validate a pack manifest (`packs/<name>/manifest.toml`).
+/// Returns the manifest on success; nothing is loaded from disk and no
+/// pack reads its claims from it yet (steps 4-5).
+pub fn parse_manifest(text: &str) -> Result<PackManifest, DomainError> {
+    let manifest: PackManifest = toml::from_str(text).map_err(|err| {
+        manifest_err(format!("manifest.toml is not valid TOML: {err}")).with_fix(
+            "Top-level keys (record_types, balance_metrics, finding_codes) must come before the first [table] header",
+        )
+    })?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid manifest exercising every section.
+    fn valid_toml() -> String {
+        r#"
+manifest_version = 1
+record_types = []
+balance_metrics = ["sessions_remaining"]
+finding_codes = ["E_WRONG", "W_LATE"]
+
+[pack]
+name = "coaching"
+version = "0.1"
+skill = "SKILL.md"
+
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[verbs]]
+name = "note"
+
+[[fields]]
+name = "birthday"
+grammar = "recurring-date"
+
+[[edge_kinds]]
+name = "mentor"
+symmetric = false
+
+[checks]
+[[checks.severity]]
+key = "coaching.wrong_thing"
+default = "warning"
+
+[[checks.int]]
+key = "coaching.lookback_days"
+default = 7
+
+[messages."E_WRONG"]
+default = "wrong {id}"
+default_fix = "fix {id}"
+
+[messages."W_LATE"]
+default = "late"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn parses_valid_manifest() {
+        let m = parse_manifest(&valid_toml()).unwrap();
+        assert_eq!(m.manifest_version, 1);
+        assert_eq!(m.pack.name, "coaching");
+        assert_eq!(m.pack.version, "0.1");
+        assert_eq!(m.balance_metrics, vec!["sessions_remaining".to_string()]);
+        assert_eq!(m.verbs.len(), 2);
+        assert_eq!(m.verbs[0].id_type, Some(Prefix::Person));
+        assert_eq!(m.verbs[1].id_type, None);
+        assert_eq!(m.fields[0].grammar, "recurring-date");
+        assert!(!m.edge_kinds[0].symmetric);
+        assert_eq!(m.checks.severity[0].default, "warning");
+        assert_eq!(m.checks.int[0].default, 7);
+        assert_eq!(m.messages["E_WRONG"]["default"], "wrong {id}".to_string());
+    }
+
+    #[test]
+    fn minimal_manifest_with_defaults() {
+        let text = r#"
+manifest_version = 1
+record_types = []
+balance_metrics = []
+finding_codes = ["E_X"]
+
+[pack]
+name = "tiny"
+version = "0.1"
+skill = "SKILL.md"
+
+[messages."E_X"]
+default = "x"
+"#;
+        let m = parse_manifest(text).unwrap();
+        assert!(m.verbs.is_empty());
+        assert!(m.fields.is_empty());
+        assert!(m.edge_kinds.is_empty());
+        assert!(m.checks.severity.is_empty());
+        assert!(m.checks.int.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_toml() {
+        let err = parse_manifest("manifest_version = ").unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"));
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        let text = valid_toml() + "bogus_key = 1\n";
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("bogus_key"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_verb() {
+        let text = valid_toml().replace("name = \"session\"", "name = \"session\"\nbogus = true");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_wrong_manifest_version() {
+        let text = valid_toml().replace("manifest_version = 1", "manifest_version = 2");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("not supported"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_verb_names() {
+        let text = valid_toml().replace(
+            "[[verbs]]\nname = \"note\"",
+            "[[verbs]]\nname = \"session\"",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("duplicate verb"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_field_names() {
+        let text = valid_toml() + "[[fields]]\nname = \"birthday\"\ngrammar = \"cadence\"\n";
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("duplicate field"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_edge_kind_names() {
+        let text = valid_toml() + "[[edge_kinds]]\nname = \"mentor\"\nsymmetric = true\n";
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("duplicate edge kind"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_finding_codes() {
+        let text = valid_toml().replace(
+            "finding_codes = [\"E_WRONG\", \"W_LATE\"]",
+            "finding_codes = [\"E_WRONG\", \"E_WRONG\"]",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate finding code"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_balance_metrics() {
+        let text = valid_toml().replace(
+            "balance_metrics = [\"sessions_remaining\"]",
+            "balance_metrics = [\"sessions_remaining\", \"sessions_remaining\"]",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate balance metric"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_grammar() {
+        let text =
+            valid_toml().replace("grammar = \"recurring-date\"", "grammar = \"fancy-regex\"");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown grammar"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_unknown_id_type() {
+        let text = valid_toml().replace("id_type = \"person\"", "id_type = \"human\"");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown id_type"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_template_unclosed() {
+        let text = valid_toml().replace("wrong {id}", "wrong {id");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("unclosed"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_template_empty_placeholder() {
+        let text = valid_toml().replace("wrong {id}", "wrong {}");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("empty placeholder"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_template_unmatched_close() {
+        let text = valid_toml().replace("wrong {id}", "wrong {id}}");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("unmatched"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_template_nested() {
+        let text = valid_toml().replace("wrong {id}", "wrong {{id}}");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("nested"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_code_without_messages_table() {
+        let text = valid_toml().replace(
+            "finding_codes = [\"E_WRONG\", \"W_LATE\"]",
+            "finding_codes = [\"E_WRONG\", \"W_LATE\", \"E_MISSING\"]",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("no [messages"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_orphan_messages_table() {
+        let text = valid_toml() + "[messages.\"E_ORPHAN\"]\ndefault = \"orphan\"\n";
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("not in finding_codes"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_empty_messages_table() {
+        // A table header with no variants under it.
+        let text = valid_toml().replace(
+            "[messages.\"W_LATE\"]\ndefault = \"late\"",
+            "[messages.\"W_LATE\"]",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("at least one variant"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_checks_key_wrong_namespace() {
+        let text = valid_toml().replace(
+            "key = \"coaching.wrong_thing\"",
+            "key = \"personal.wrong_thing\"",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("not namespaced"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_checks_key_core_owned() {
+        let text = valid_toml().replace("key = \"coaching.wrong_thing\"", "key = \"as_of\"");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("not namespaced"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_bad_severity_default() {
+        let text = valid_toml().replace("default = \"warning\"", "default = \"loud\"");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("bad severity"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_empty_pack_name() {
+        let text = valid_toml().replace("name = \"coaching\"\nversion", "name = \"\"\nversion");
+        // Note: the first `name = "coaching"` is under [pack]; verbs use
+        // `name = "session"` so this replace is scoped to the pack table.
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("[pack].name"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_pack_name_with_at() {
+        let text = valid_toml().replace(
+            "[pack]\nname = \"coaching\"",
+            "[pack]\nname = \"coaching@0.1\"",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("must not contain '@'"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_empty_finding_code() {
+        let text = valid_toml().replace(
+            "finding_codes = [\"E_WRONG\", \"W_LATE\"]",
+            "finding_codes = [\"E_WRONG\", \"\"]",
+        );
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err:?}");
+    }
+}
