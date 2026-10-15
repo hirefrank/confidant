@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::contract::{parse_raw_output, CheckReport, ContractOutcome};
 use crate::proposals::{
-    is_under_dir, manifest_stem, progress_path, read_manifest, read_progress, write_progress,
-    ProposalManifest, TuiProgress,
+    is_planned_under_dir, is_under_dir, manifest_stem, progress_path, read_manifest, read_progress,
+    write_progress, ProposalManifest, TuiProgress,
 };
 use crate::runner::{RawOutput, Runner};
 
@@ -219,7 +219,7 @@ pub fn plan_manifest(
     let stem = manifest_stem(manifest_path);
     for (index, record) in manifest.records.iter().enumerate() {
         if record.note_id.is_some() {
-            steps.push(plan_note(record, index)?);
+            steps.push(plan_note(record, index, &proposals_dir)?);
         } else {
             steps.push(plan_record(record, index, manifest, &stem, &proposals_dir)?);
         }
@@ -231,6 +231,7 @@ pub fn plan_manifest(
 fn plan_note(
     record: &crate::proposals::ProposalRecord,
     index: usize,
+    proposals_dir: &Path,
 ) -> Result<PlannedStep, String> {
     let note_id = record.note_id.as_deref().unwrap_or("?");
     let label = format!(
@@ -253,6 +254,14 @@ fn plan_note(
                  re-run the proposer (the TUI never mints ids)"
             )),
         });
+    };
+    // The body file is committed verbatim as the note body, so it gets the
+    // same under-proposals/ check as lines_file: a manifest must not point
+    // it at an arbitrary readable file.
+    if !is_under_dir(proposals_dir, Path::new(&body_file)) {
+        return Err(format!(
+            "note {note_id} body_file is outside .confidant/proposals/: {body_file}"
+        ));
     };
     let mut argv = vec![
         "note".to_owned(),
@@ -311,7 +320,9 @@ fn plan_record(
         });
     };
     let scratch_path = stem.join("records").join(format!("{index:03}.md"));
-    if !is_under_dir(proposals_dir, &scratch_path) {
+    // The scratch file doesn't exist yet (it is staged at apply time), so
+    // check the nearest existing ancestor instead of canonicalizing it.
+    if !is_planned_under_dir(proposals_dir, &scratch_path) {
         return Err(format!(
             "record scratch path is outside .confidant/proposals/: {}",
             scratch_path.display()
@@ -364,8 +375,9 @@ pub fn stage_scratch(scratch: &StagedScratch) -> Result<()> {
 
 /// The proposal-set paths the TUI may delete on cleanup: the manifest, the
 /// lines file, the notes dir, the staged records dir, and the progress file.
-/// Every path must canonicalize under `.confidant/proposals/`; anything else
-/// is refused, never deleted.
+/// Every path must resolve under `.confidant/proposals/`; anything else is
+/// refused, never deleted. The TUI's own scratch dirs may not exist yet, so
+/// the check canonicalizes the nearest existing ancestor.
 pub fn cleanup_paths(
     manifest: &ProposalManifest,
     manifest_path: &Path,
@@ -390,7 +402,7 @@ pub fn cleanup_paths(
     paths.push(stem);
 
     for path in &paths {
-        if !is_under_dir(&proposals_dir, path) {
+        if !is_planned_under_dir(&proposals_dir, path) {
             return Err(format!(
                 "refusing cleanup: {} is outside .confidant/proposals/",
                 path.display()
@@ -912,6 +924,88 @@ mod tests {
             steps[0].blocked.as_deref(),
             Some("pre-M2 records must be applied by the skill workflow")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plan_record_fresh_scratch_opens() {
+        // Regression test for the #348 review blocker: on a fresh proposal
+        // the stem dir (and the scratch file) doesn't exist yet, and the
+        // plan must still open the record step.
+        use crate::proposals::ProposalRecord;
+        let mut manifest = manifest_fixture();
+        manifest.records = vec![ProposalRecord {
+            path: "people/p-1/person.md".to_owned(),
+            content: "---\nid: p-1\n---\n".to_owned(),
+            note_id: None,
+            person: None,
+            date: None,
+            no_ai: false,
+            body_file: None,
+            request_id: Some("01CCCCCCCCCCCCCCCCCCCCCCCC".to_owned()),
+        }];
+        let dir = std::env::temp_dir().join("tui-apply-test-fresh-record");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        let manifest_path = proposals.join("m.json");
+        // The stem dir is deliberately absent: nothing staged yet.
+        assert!(!proposals.join("m").exists());
+        let steps =
+            plan_manifest(&manifest, &manifest_path, &dir).expect("fresh record step must open");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].key, "record:01CCCCCCCCCCCCCCCCCCCCCCCC");
+        assert!(steps[0].blocked.is_none());
+        assert!(steps[0].scratch.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plan_note_body_file_outside_proposals_is_refused() {
+        use crate::proposals::ProposalRecord;
+        let mut manifest = manifest_fixture();
+        manifest.records = vec![ProposalRecord {
+            path: "people/p-1/notes/n-1.md".to_owned(),
+            content: String::new(),
+            note_id: Some("n-1".to_owned()),
+            person: Some("p-1".to_owned()),
+            date: Some("2026-10-15".to_owned()),
+            no_ai: false,
+            body_file: Some("/etc/passwd".to_owned()),
+            request_id: Some("01DDDDDDDDDDDDDDDDDDDDDDDD".to_owned()),
+        }];
+        let dir = std::env::temp_dir().join("tui-apply-test-body-outside");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        let manifest_path = proposals.join("m.json");
+        let err = plan_manifest(&manifest, &manifest_path, &dir).expect_err("must refuse");
+        assert!(err.contains("outside .confidant/proposals/"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plan_note_body_file_under_proposals_opens() {
+        use crate::proposals::ProposalRecord;
+        let dir = std::env::temp_dir().join("tui-apply-test-body-inside");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        let body = proposals.join("body.md");
+        std::fs::write(&body, "note body\n").unwrap();
+        let mut manifest = manifest_fixture();
+        manifest.records = vec![ProposalRecord {
+            path: "people/p-1/notes/n-1.md".to_owned(),
+            content: String::new(),
+            note_id: Some("n-1".to_owned()),
+            person: Some("p-1".to_owned()),
+            date: Some("2026-10-15".to_owned()),
+            no_ai: false,
+            body_file: Some(body.to_string_lossy().into_owned()),
+            request_id: Some("01EEEEEEEEEEEEEEEEEEEEEEEE".to_owned()),
+        }];
+        let manifest_path = proposals.join("m.json");
+        let steps = plan_manifest(&manifest, &manifest_path, &dir).expect("must open");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].key, "note:01EEEEEEEEEEEEEEEEEEEEEEEE");
+        assert!(steps[0].blocked.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

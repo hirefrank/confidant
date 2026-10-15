@@ -62,11 +62,13 @@ allowed; this does not apply to persons.
 
 ## TUI proposal review
 
-`confidant-tui` shows dry-run plaintext (ledger lines, note bodies, record
-content) on screen only — it is never logged, written to disk, or sent
-anywhere. Proposal scratch files (manifest, lines file, staged note bodies
-and record content) live under `<vault>/.confidant/proposals/` (gitignored),
-are created `0600` (`0700` for directories), and are deleted after the apply.
+`confidant-tui` renders dry-run plaintext (ledger lines, note bodies, record
+content) on screen only by the TUI itself; it is not logged or sent anywhere.
+The proposal files it reads are plaintext on disk under
+`<vault>/.confidant/proposals/` (gitignored) until cleanup: manifest, lines
+file, staged note bodies and record content are created `0600` (`0700` for
+directories) and deleted after the apply. Cleanup is a normal file remove by
+the skill's `--cleanup`, not a secure wipe.
 
 ## Packages
 

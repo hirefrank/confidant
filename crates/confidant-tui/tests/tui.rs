@@ -569,14 +569,17 @@ fn proposals_cancel_confirm_writes_nothing() {
 fn proposals_apply_uses_manifest_ids_and_resumes_after_crash() {
     let dir = proposals_temp_dir("tui-test-proposals-resume");
     let note_rid = "01M3TC5H00MPJG0066D000000C".to_owned();
+    let body_file = dir.join(".confidant").join("proposals").join("body.md");
+    fs::write(&body_file, "note body\n").expect("write body file");
     let note_json = format!(
         r#"{{"path": "people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md",
             "content": "---\nid: n-01\n---\nbody\n",
             "note_id": "n-01M3TC5H00MPJG002NAM000005",
             "person": "p-01M3TC5H00MPJG000000000000",
             "date": "2026-09-01",
-            "body_file": "/fake/body.md",
-            "request_id": "{note_rid}"}}"#
+            "body_file": {},
+            "request_id": "{note_rid}"}}"#,
+        serde_json::to_string(&body_file.to_string_lossy()).unwrap(),
     );
     let (manifest_path, manifest_rid) = write_test_manifest(&dir, "m", &note_json);
 

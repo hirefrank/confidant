@@ -154,14 +154,55 @@ pub fn progress_path(manifest_path: &Path) -> PathBuf {
     manifest_stem(manifest_path).with_extension("tui-progress.json")
 }
 
-/// Returns true when `candidate` canonicalizes to a location under `dir`.
+/// Returns true when `candidate` canonicalizes to a strict child of `dir`.
 /// Anything that cannot be canonicalized (missing, broken symlink) counts as
-/// outside — fail closed.
+/// outside — fail closed. `dir` itself is not "under" `dir`: a manifest path
+/// equal to the proposals directory would let cleanup delete the whole
+/// directory.
 pub fn is_under_dir(dir: &Path, candidate: &Path) -> bool {
     let (Ok(dir_c), Ok(cand_c)) = (dir.canonicalize(), candidate.canonicalize()) else {
         return false;
     };
-    cand_c.starts_with(dir_c)
+    cand_c != dir_c && cand_c.starts_with(dir_c)
+}
+
+/// Like `is_under_dir`, but for paths that may not exist yet — scratch files
+/// and directories the TUI stages later. Canonicalize the nearest existing
+/// ancestor, then re-append the missing tail lexically. A `..` in the missing
+/// tail is refused (it could climb out of `dir` after the ancestor was
+/// validated), and the result must still be a strict child of `dir`.
+pub fn is_planned_under_dir(dir: &Path, candidate: &Path) -> bool {
+    let Ok(dir_c) = dir.canonicalize() else {
+        return false;
+    };
+    let mut ancestor: &Path = candidate;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            break;
+        }
+        match ancestor.file_name() {
+            Some(name) => {
+                tail.push(name);
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent,
+                    None => return false,
+                }
+            }
+            // `..`, `/`, or an empty path: cannot resolve lexically.
+            None => return false,
+        }
+    }
+    let Ok(mut base) = ancestor.canonicalize() else {
+        return false;
+    };
+    // The tail holds only `file_name` components (never `..`: `file_name`
+    // returns `None` for a path terminating in `..`, which fails closed
+    // above), so re-appending it cannot climb out of the ancestor.
+    for component in tail.iter().rev() {
+        base.push(component);
+    }
+    base != dir_c && base.starts_with(&dir_c)
 }
 
 /// Progress of a proposal apply, persisted as `<manifest>.tui-progress.json`
@@ -208,7 +249,13 @@ pub fn read_progress(manifest_path: &Path) -> TuiProgress {
     };
     match serde_json::from_slice::<ProgressFile>(&bytes) {
         Ok(file) => TuiProgress { done: file.done },
-        Err(_) => TuiProgress::default(),
+        Err(_) => {
+            eprintln!(
+                "warning: corrupt progress file {}, starting fresh",
+                path.display()
+            );
+            TuiProgress::default()
+        }
     }
 }
 
@@ -294,6 +341,45 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "a.json");
         assert!(found[0].manifest.is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn planned_under_dir_accepts_missing_scratch() {
+        let dir = std::env::temp_dir().join("tui-proposals-test-planned");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        // The stem dir doesn't exist yet (staged later at apply time).
+        let scratch = proposals.join("m").join("records").join("000.md");
+        assert!(!scratch.exists());
+        assert!(is_planned_under_dir(&proposals, &scratch));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn planned_under_dir_refuses_dotdot_escape() {
+        let dir = std::env::temp_dir().join("tui-proposals-test-planned-escape");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        // Climbs out of proposals/ entirely: refused.
+        let evil = proposals.join("..").join("evil.md");
+        assert!(!is_planned_under_dir(&proposals, &evil));
+        // A `..` through a not-yet-existing component can't be resolved, so
+        // it fails closed even though it would land inside proposals/.
+        let unresolvable = proposals.join("m").join("..").join("evil.md");
+        assert!(!unresolvable.exists());
+        assert!(!is_planned_under_dir(&proposals, &unresolvable));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn planned_under_dir_refuses_outside_and_self() {
+        let dir = std::env::temp_dir().join("tui-proposals-test-planned-self");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        assert!(!is_planned_under_dir(&proposals, Path::new("/etc/passwd")));
+        assert!(!is_planned_under_dir(&proposals, &proposals));
+        assert!(!is_under_dir(&proposals, &proposals));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
