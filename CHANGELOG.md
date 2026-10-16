@@ -8,17 +8,78 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
+**Disclosure:** the milestone 2 encryption has had no outside review
+([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
+other people's client data in a vault until the audit lands.
+
 ### Added
 - `confidant record edit <id> --file F`: replaces a record's file through the
   normal write pipeline (encrypted writes, `check`-gated, one commit), and
   `confidant record show <id> --for-edit`, the operator-only read that supplies
-  the current text and decrypts `no-ai` records for editing (#216).
+  the current text and decrypts `no-ai` records for editing (#216). An edit
+  that resolves a record to another client's key prints a notice and reports
+  `rekeyed` (#418); changing a person's effective `no-ai` mode re-stamps their
+  existing children in the same commit (#410). The write layer gained
+  `WriteOutcome::Unchanged`, so an edit that changes nothing reports
+  `unchanged` and commits nothing. The for-edit read is kept away from agents
+  by the MCP tool whitelist, not by access control (#412, #419).
 - `confidant tui` subcommand: launches `confidant-tui` from `PATH` with
   arguments and environment passed through (an explicit `--vault` is
   forwarded too); prints a `cargo install confidant-tui` hint when the
   binary is missing (#363).
 - `confidant-tui` published to crates.io (it keeps shipping as a GitHub
-  Releases binary as well) (#363).
+  Releases binary as well) (#363). New Search tab, QMD-backed with provenance
+  and an exact-match toggle, and an inbox review tab with confirm-before-apply
+  (#212).
+- `confidant doctor` reports whether qmd semantic search is available
+  (informational only; it never warns or fails) (#386).
+- `confidant update` detects the install method from the binary path and, in
+  an interactive terminal, offers to run the update and then to re-run
+  `setup`; `setup` offers `confidant check` or prints the `CONFIDANT_VAULT`
+  export line (#376). JSON gains additive `install_method`,
+  `update_command`, and `next_steps` fields.
+- Pack manifests: each pack's claims (name, verbs, record types, fields,
+  balance metrics, edge kinds, finding codes, `[checks]` keys and defaults,
+  and finding message templates) now come from `packs/<name>/manifest.toml`
+  instead of hardcoded Rust slices, with parity tests against the vendored
+  copy in `confidant-core` (#295, #343, #345, #346).
+- CI checks for build-time include paths escaping the crate directory (the
+  v0.3.0 `cargo publish` break, #367), extended to `concat!`/`env!` forms with
+  a `--self-test` (#377), and a sync test that
+  `crates/confidant-cli/pack-skills/` matches `packs/*/SKILL.md` (#375).
+
+### Changed
+- TUI rendering layer restyled: a semantic theme, rounded bordered blocks, tab
+  pills, and status badges; no logic or keybinding changes (#378). The Find
+  and Search tabs merged into one Search tab with an exact-match toggle
+  (#387).
+- Spec: edge front matter now has a closed key set (`id`, `type`, `a`, `b`,
+  `kind`, `since`, `until`); an unknown key is `E_FRONTMATTER` (#390), and the
+  error names no key so free text cannot reach logs (#397).
+- Spec: an edit writes the canonical form, and a stored envelope is reused
+  only when the effective `no-ai` header still matches, so a stale header is
+  re-encrypted rather than kept (#406). §13 and the agent threat model state
+  the for-edit read's limit (#419); re-stamping looks forward only (#426).
+- Spec: the `E_IDEMPOTENCY_CONFLICT` row describes when the code is emitted,
+  not a reservation (#415).
+- Documentation: pack-manifest spec nits (#352), release learnings in
+  `AGENTS.md` (#373), and a stale `read_progress` doc line removed (#358).
+
+### Fixed
+- `check`: a body-only conflicted record stays parseable (#417), a conflicted
+  file reports `E_MERGE_CONFLICT` without the derived `E_FRONTMATTER` parse
+  error (#391), and `E_DANGLING_REF` is suppressed for conflicted records
+  (#396).
+- `is_trusted_component` trusts `edges`/`edge.md` again (#392).
+- The Windows build compiles: `copy_dir` is gated with `cfg(unix)` (#402).
+- Inbox: an encrypted write that fails mid-batch reverts the empty
+  `people/<id>/` directory it created (#398, #401).
+- A write's `files` list and the commit diff agree (#425), and the
+  unreadable-file refusal lists record files only (#424).
+- qmd probe pipe drain and the Find/Search toggle nits from #414 (#416), and
+  the staged shred guard can no longer be skipped by an early return (#353).
 
 ## [0.3.1] - 2026-10-15
 
@@ -129,7 +190,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/hirefrank/confidant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hirefrank/confidant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hirefrank/confidant/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hirefrank/confidant/compare/v0.1.1...v0.2.0
