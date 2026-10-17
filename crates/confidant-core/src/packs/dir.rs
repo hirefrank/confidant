@@ -263,23 +263,24 @@ pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
 
         total_size += content.len() as u64;
         files.insert(name.to_string(), content);
-    }
 
-    // Enforce file count limit.
-    if files.len() > MAX_FILES {
-        return Err(DomainError::pack_invalid(format!(
-            "pack has {} files, over the 200-file limit",
-            files.len()
-        ))
-        .with_fix("Remove files from the pack directory"));
-    }
-
-    // Enforce total size limit.
-    if total_size > MAX_TOTAL_SIZE {
-        return Err(DomainError::pack_invalid(format!(
-            "pack is {total_size} bytes total, over the 4 MiB limit"
-        ))
-        .with_fix("Remove files from the pack directory"));
+        // Machine-generated packs are untrusted input, so fail as soon as a
+        // limit is crossed instead of reading the whole directory into memory
+        // first: without this, a tree of 10k files would be read at up to
+        // 1 MiB each before the post-walk check rejected it.
+        if files.len() > MAX_FILES {
+            return Err(DomainError::pack_invalid(format!(
+                "pack has {} files, over the 200-file limit",
+                files.len()
+            ))
+            .with_fix("Remove files from the pack directory"));
+        }
+        if total_size > MAX_TOTAL_SIZE {
+            return Err(DomainError::pack_invalid(format!(
+                "pack is {total_size} bytes total, over the 4 MiB limit"
+            ))
+            .with_fix("Remove files from the pack directory"));
+        }
     }
 
     // The skill file must exist (manifest references it).
@@ -299,7 +300,6 @@ pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::os::unix::ffi::OsStrExt;
 
     /// Write `files` (name → content) into a fresh tempdir, in the given
     /// order. Returns the tempdir (must be kept alive).
@@ -577,6 +577,7 @@ default = "example field"
     #[test]
     #[cfg(unix)]
     fn reject_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
             dir.path().join("manifest.toml"),
