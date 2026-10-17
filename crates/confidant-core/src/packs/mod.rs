@@ -190,6 +190,13 @@ pub(crate) fn pack_manifests() -> [&'static manifest::PackManifest; 2] {
     ]
 }
 
+/// The pack manifests consulted for `[checks]` key handling (#433).
+/// Compiled packs today; #438 extends this with loaded external packs.
+/// Returns a `Vec` (not a fixed array) so later issues can append.
+pub(crate) fn pack_manifests_for_config() -> Vec<&'static manifest::PackManifest> {
+    pack_manifests().into_iter().collect()
+}
+
 /// The parsed manifest for a compiled pack, by `name@version`
 /// (e.g. `"coaching@0.1"`). Used by the CLI's drift tests to check
 /// manifest text against the embedded SKILL.md (#345).
