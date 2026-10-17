@@ -42,7 +42,7 @@ present, for CI users who want the stricter gate.
 | `E_MERGE_CYCLE` | error | | `merge` entries form a cycle. |
 | `E_MERGE_FORK` | error | | The same `FROM` is merged into two different `TO`s. |
 | `E_SYMLINK` | error | | A symbolic link exists in the vault. |
-| `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. |
+| `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. When both conflict sides parse as encrypted envelopes, the message says the encrypted record has two versions and points at `record resolve`. |
 | `E_MISSING_DURATION` | error | `coaching.require_duration` | A `session` has no parseable duration. |
 | `E_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, `N` is over 100000, or the running open total overflows. |
 | `E_NEGATIVE_BALANCE` | error | `coaching.balance_nonnegative` | Computed `sessions_remaining` is negative. |

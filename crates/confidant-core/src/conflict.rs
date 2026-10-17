@@ -283,6 +283,23 @@ pub fn split_conflict_sides(text: &str) -> Result<ConflictSides, ConflictSplitEr
     })
 }
 
+/// Whether a conflicted file's two sides are both encrypted envelopes.
+///
+/// Returns `true` when [`split_conflict_sides`] succeeds and both
+/// reconstructed sides parse with [`confidant_crypt::envelope::parse`].
+/// Every failure (no markers, malformed split, either side not an
+/// envelope) is `false`. Structural only: no keys, no decryption, no I/O,
+/// and the finding that uses this carries no file content.
+pub fn is_envelope_conflict(text: &str) -> bool {
+    match split_conflict_sides(text) {
+        Ok(sides) => {
+            confidant_crypt::envelope::parse(sides.ours.as_bytes()).is_ok()
+                && confidant_crypt::envelope::parse(sides.theirs.as_bytes()).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
