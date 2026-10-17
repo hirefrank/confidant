@@ -465,12 +465,13 @@ enum RecordAction {
         #[arg(long)]
         for_edit: bool,
     },
-    /// Resolve a merge conflict on a record: print both decrypted versions.
+    /// Resolve a merge conflict on a record.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
     /// a fixed tool whitelist). Exactly one action flag is required; a bare
-    /// invocation is a usage error. Only `--show` is implemented so far
-    /// (#453); the write half lands in #454/#455.
+    /// invocation is a usage error. `--show` prints both sides (#453);
+    /// `--take` keeps one side byte for byte (#454); `--merged-file` and
+    /// `--edit` land in #455.
     #[command(group(
         clap::ArgGroup::new("resolve_action").required(true).multiple(false)
     ))]
@@ -480,7 +481,7 @@ enum RecordAction {
         /// Print both decrypted versions to stdout.
         #[arg(long, group = "resolve_action")]
         show: bool,
-        /// Keep one side's version (not yet implemented; see #454).
+        /// Keep one side's version byte for byte, staged but not committed.
         #[arg(long, value_enum, group = "resolve_action")]
         take: Option<Side>,
         /// Hand-merge from a file (not yet implemented; see #455).
@@ -494,9 +495,19 @@ enum RecordAction {
 
 /// Which side of a merge conflict to keep (`record resolve --take`).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum Side {
+pub(crate) enum Side {
     Ours,
     Theirs,
+}
+
+impl Side {
+    /// The CLI spelling used in output (`--json` and human text).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Side::Ours => "ours",
+            Side::Theirs => "theirs",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -3170,22 +3181,6 @@ fn cmd_record_resolve(
     merged_file: Option<&Path>,
     edit: bool,
 ) -> anyhow::Result<ExitCode> {
-    // Only --show is implemented in #453; the flags are accepted so the
-    // interface does not change when the write half lands.
-    if !show {
-        let what = if take.is_some() {
-            "--take"
-        } else if merged_file.is_some() {
-            "--merged-file"
-        } else if edit {
-            "--edit"
-        } else {
-            "this action"
-        };
-        return Err(anyhow::Error::new(DomainError::usage(format!(
-            "{what} is not implemented yet; only `record resolve <id> --show` is available (see #454/#455)"
-        ))));
-    }
     let vault = vault_or!(root, cli.json);
     if vault.config.spec != confidant_core::SPEC_VERSION {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
@@ -3197,26 +3192,70 @@ fn cmd_record_resolve(
             "`record resolve` takes an opaque record id; use `confidant find <name>` to look one up",
         )
     })?;
-    let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
-    let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
-    let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
-    if cli.json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "id": id.to_string(),
-                "path": sides.path,
-                "ours": { "label": sides.ours_label, "text": ours_text },
-                "theirs": { "label": sides.theirs_label, "text": theirs_text },
-            }),
-        ))?;
-    } else {
-        println!("== ours ({}) ==", sides.ours_label);
-        println!("{ours_text}");
-        println!("== theirs ({}) ==", sides.theirs_label);
-        println!("{theirs_text}");
+    if show {
+        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
+        let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "path": sides.path,
+                    "ours": { "label": sides.ours_label, "text": ours_text },
+                    "theirs": { "label": sides.theirs_label, "text": theirs_text },
+                }),
+            ))?;
+        } else {
+            println!("== ours ({}) ==", sides.ours_label);
+            println!("{ours_text}");
+            println!("== theirs ({}) ==", sides.theirs_label);
+            println!("{theirs_text}");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
-    Ok(ExitCode::SUCCESS)
+    if let Some(side) = take {
+        // #454: install one side byte for byte, stage it, print the next
+        // git step. Both sides were decrypted by `load_sides`, so the
+        // operator has seen what they discard (CD7).
+        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        let outcome = record_resolve::take_side(root, cli.no_input, &sides, side)?;
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "command": "record-resolve",
+                    "action": "take",
+                    "side": side.name(),
+                    "id": id.to_string(),
+                    "path": sides.path,
+                    "staged": true,
+                    "next": outcome.next,
+                }),
+            ))?;
+        } else {
+            println!(
+                "Kept the {} side of {} ({}); staged.",
+                side.name(),
+                id,
+                sides.path.display()
+            );
+            println!("Next: {}", outcome.next);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Only --merged-file/--edit remain unimplemented (#455); the flags are
+    // accepted so the interface does not change when they land.
+    let what = if merged_file.is_some() {
+        "--merged-file"
+    } else if edit {
+        "--edit"
+    } else {
+        "this action"
+    };
+    Err(anyhow::Error::new(DomainError::usage(format!(
+        "{what} is not implemented yet; `record resolve <id> --show|--take` is available (see #455)"
+    ))))
 }
 
 /// #216: replace an existing main record's file from a markdown file.
