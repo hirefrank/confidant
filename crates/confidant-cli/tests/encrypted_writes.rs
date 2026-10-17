@@ -4872,6 +4872,193 @@ fn staged_paths(vault: &Path) -> Vec<String> {
         .collect()
 }
 
+/// #465: `--dry-run --take ours` verifies both sides but changes nothing.
+#[test]
+fn take_dry_run_changes_nothing() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let conflicted_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    // In a conflicted merge `git diff --cached --name-only` already shows
+    // the unmerged path, so the acceptance is: the dry run changes the
+    // staged set not at all (it must add no staging of its own).
+    let before_staged = staged_paths(&h.vault);
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--take",
+            "ours",
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours --dry-run failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "record-resolve");
+    assert_eq!(v["dry_run"], true, "expected a dry run: {v}");
+    assert_eq!(v["action"], "take");
+    assert_eq!(v["side"], "ours");
+    assert_eq!(v["staged"], false, "dry run must not stage: {v}");
+
+    // The acceptance: file bytes are still the conflicted bytes and the
+    // index is untouched.
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "--dry-run --take ours rewrote the file"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "--dry-run --take ours staged something"
+    );
+    // The conflict stays as it was (a dry run resolves nothing); the
+    // byte-for-byte file check above already shows that.
+
+    // Human mode reports the same no-op.
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--take",
+            "ours",
+            "--dry-run",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "text dry-run failed: {}",
+        stderr(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dry run"),
+        "expected a dry run notice, got: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "--dry-run --take ours rewrote the file (text mode)"
+    );
+}
+
+/// #465: `--dry-run --merged-file` reads and validates the merged file
+/// but re-encrypts nothing.
+#[test]
+fn merged_file_dry_run_changes_nothing() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let conflicted_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+
+    // A valid hand-merge, same shape as `merged_file_reencrypts_and_stages`,
+    // so it would install if not for --dry-run.
+    let merged = write_file(
+        h._tmp.path(),
+        "dried_merge.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --merged-file --dry-run failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "expected a dry run: {v}");
+    assert_eq!(v["action"], "merged-file");
+    assert_eq!(v["staged"], false, "dry run must not stage: {v}");
+    assert!(
+        v["merged_file"]
+            .as_str()
+            .unwrap()
+            .ends_with("dried_merge.md"),
+        "merged_file missing: {v}"
+    );
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "--dry-run --merged-file rewrote the file"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "--dry-run --merged-file staged something"
+    );
+}
+
+/// #465: `--dry-run --edit` creates no scratch and installs nothing.
+#[test]
+fn edit_dry_run_changes_nothing() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let conflicted_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+
+    // No editor is configured on purpose: the dry run must not need one,
+    // because it never opens the editor.
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--edit",
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --edit --dry-run failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "expected a dry run: {v}");
+    assert_eq!(v["action"], "edit");
+    assert_eq!(v["staged"], false, "dry run must not stage: {v}");
+
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "--dry-run --edit rewrote the file"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "--dry-run --edit staged something"
+    );
+    // No scratch left behind (#455 keeps scratch under .confidant/conflicts).
+    assert!(
+        !h.vault.join(".confidant").join("conflicts").exists(),
+        "--dry-run --edit created scratch"
+    );
+}
+
 /// #454: `--take ours` installs the ours bytes exactly and stages the file.
 /// Ours is HEAD (device B's edit in the merge harness).
 #[test]
