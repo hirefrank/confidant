@@ -5697,8 +5697,8 @@ fn edit_creates_0600_scratch_in_0700_dir_and_removes_all() {
         "editor.sh",
         "#!/bin/sh\n\
          d=$(dirname \"$1\")\n\
-         stat -c '%a %n' \"$d\" > \"$d/modes.txt\"\n\
-         stat -c '%a %n' \"$d\"/*.md >> \"$d/modes.txt\"\n",
+         ls -ld \"$d\" > \"$d/modes.txt\"\n\
+         ls -l \"$d\"/*.md >> \"$d/modes.txt\"\n",
     );
     #[cfg(unix)]
     {
@@ -5754,10 +5754,10 @@ fn edit_scratch_modes_are_0600_in_0700_dir() {
         &format!(
             "#!/bin/sh\n\
              d=$(dirname \"$1\")\n\
-             stat -c '%a' \"$d\" > \"{}\"\n\
-             stat -c '%a' \"$d/ours.md\" >> \"{}\"\n\
-             stat -c '%a' \"$d/theirs.md\" >> \"{}\"\n\
-             stat -c '%a' \"$d/merged.md\" >> \"{}\"\n",
+             ls -ld \"$d\" | cut -c1-10 > \"{}\"\n\
+             ls -l \"$d/ours.md\" | cut -c1-10 >> \"{}\"\n\
+             ls -l \"$d/theirs.md\" | cut -c1-10 >> \"{}\"\n\
+             ls -l \"$d/merged.md\" | cut -c1-10 >> \"{}\"\n",
             modes_out.display(),
             modes_out.display(),
             modes_out.display(),
@@ -5785,11 +5785,14 @@ fn edit_scratch_modes_are_0600_in_0700_dir() {
     let modes = std::fs::read_to_string(&modes_out).unwrap();
     let lines: Vec<&str> = modes.lines().collect();
     assert_eq!(lines.len(), 4, "expected 4 mode lines: {modes}");
-    assert_eq!(lines[0], "700", "scratch dir should be 0700: {modes}");
+    assert_eq!(
+        lines[0], "drwx------",
+        "scratch dir should be 0700: {modes}"
+    );
     for (i, name) in ["ours.md", "theirs.md", "merged.md"].iter().enumerate() {
         assert_eq!(
             lines[i + 1],
-            "600",
+            "-rw-------",
             "scratch file {name} should be 0600: {modes}"
         );
     }
