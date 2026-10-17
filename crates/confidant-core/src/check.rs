@@ -1702,4 +1702,121 @@ mod tests {
         assert_eq!(findings[1].code, FindingCode::Pack("E_AAA"));
         assert_eq!(findings[2].code, FindingCode::Pack("W_ZZZ"));
     }
+
+    /// `ALL_BUILTIN_STRS` is a second hand-maintained copy of the builtin
+    /// `as_str()` values, so a new variant could be missing from it and
+    /// `from_pack_str` would then accept a colliding pack code. This keeps
+    /// the two in step: the match below lists every variant with no
+    /// wildcard arm, so adding one fails to compile until it is added
+    /// here too, and the assertion compares the full sequence (order and
+    /// length included) against the constant.
+    #[test]
+    fn all_builtin_strs_lists_every_builtin_variant() {
+        let variants = [
+            FindingCode::Parse,
+            FindingCode::Unreadable,
+            FindingCode::Config,
+            FindingCode::SpecUnsupported,
+            FindingCode::PackUnknown,
+            FindingCode::PackConflict,
+            FindingCode::PackOrphan,
+            FindingCode::PackHash,
+            FindingCode::PackInvalid,
+            FindingCode::InvalidId,
+            FindingCode::InvalidFilename,
+            FindingCode::IdPathMismatch,
+            FindingCode::TypePathMismatch,
+            FindingCode::DuplicateId,
+            FindingCode::Frontmatter,
+            FindingCode::UnknownVerb,
+            FindingCode::UnknownRecord,
+            FindingCode::UnknownMetric,
+            FindingCode::LedgerPath,
+            FindingCode::LedgerDate,
+            FindingCode::BalanceMismatch,
+            FindingCode::AliasPlaintext,
+            FindingCode::AliasCollision,
+            FindingCode::UnresolvedMerge,
+            FindingCode::SelfMerge,
+            FindingCode::MergeCycle,
+            FindingCode::Symlink,
+            FindingCode::MergeConflict,
+            FindingCode::MissingDuration,
+            FindingCode::OpenMalformed,
+            FindingCode::NegativeBalance,
+            FindingCode::SessionWithoutNotes,
+            FindingCode::PaidSessionGap,
+            FindingCode::WrongIdType,
+            FindingCode::DuplicateUlid,
+            FindingCode::MergeFork,
+            FindingCode::DanglingRef,
+            FindingCode::DuplicateSrc,
+            FindingCode::SessionUntagged,
+            FindingCode::SessionTags,
+            FindingCode::InboxKeyMismatch,
+            FindingCode::SelfEdge,
+            FindingCode::DuplicateEdge,
+            FindingCode::UnknownEdgeKind,
+            FindingCode::TouchMalformed,
+            FindingCode::CadenceOverdue,
+            FindingCode::DateUpcoming,
+        ];
+        for code in &variants {
+            match code {
+                FindingCode::Parse
+                | FindingCode::Unreadable
+                | FindingCode::Config
+                | FindingCode::SpecUnsupported
+                | FindingCode::PackUnknown
+                | FindingCode::PackConflict
+                | FindingCode::PackOrphan
+                | FindingCode::PackHash
+                | FindingCode::PackInvalid
+                | FindingCode::InvalidId
+                | FindingCode::InvalidFilename
+                | FindingCode::IdPathMismatch
+                | FindingCode::TypePathMismatch
+                | FindingCode::DuplicateId
+                | FindingCode::Frontmatter
+                | FindingCode::UnknownVerb
+                | FindingCode::UnknownRecord
+                | FindingCode::UnknownMetric
+                | FindingCode::LedgerPath
+                | FindingCode::LedgerDate
+                | FindingCode::BalanceMismatch
+                | FindingCode::AliasPlaintext
+                | FindingCode::AliasCollision
+                | FindingCode::UnresolvedMerge
+                | FindingCode::SelfMerge
+                | FindingCode::MergeCycle
+                | FindingCode::Symlink
+                | FindingCode::MergeConflict
+                | FindingCode::MissingDuration
+                | FindingCode::OpenMalformed
+                | FindingCode::NegativeBalance
+                | FindingCode::SessionWithoutNotes
+                | FindingCode::PaidSessionGap
+                | FindingCode::WrongIdType
+                | FindingCode::DuplicateUlid
+                | FindingCode::MergeFork
+                | FindingCode::DanglingRef
+                | FindingCode::DuplicateSrc
+                | FindingCode::SessionUntagged
+                | FindingCode::SessionTags
+                | FindingCode::InboxKeyMismatch
+                | FindingCode::SelfEdge
+                | FindingCode::DuplicateEdge
+                | FindingCode::UnknownEdgeKind
+                | FindingCode::TouchMalformed
+                | FindingCode::CadenceOverdue
+                | FindingCode::DateUpcoming => {}
+                FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
+            }
+        }
+        assert_eq!(
+            variants.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            FindingCode::ALL_BUILTIN_STRS.to_vec(),
+            "ALL_BUILTIN_STRS must list every builtin variant, in declaration order"
+        );
+    }
 }
