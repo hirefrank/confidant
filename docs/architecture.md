@@ -287,6 +287,13 @@ confidant import --file portal-events.jsonl --request-id portal-2026-10-07 --jso
 
 **Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; v0 can compile the coaching pack into the binary behind the pack interface.
 
+*External packs (#193, approved 2026-10-16).* Schema packs can now also
+ship outside the binary: a v2 manifest (`spec/pack-manifest.md` §13)
+vendored at `<vault>/packs/<name>@<version>/` and pinned by
+`confidant.lock` (`spec/pack-lock.md`), with rule kinds implemented in
+core Rust (PD1). Trust is "pin the hash and review the diff": no central
+registry, no signing in v1. External packs affect `check` only.
+
 ### ADR-9. Identity: aliases and history-preserving merges.
 
 **Door:** Reversible.

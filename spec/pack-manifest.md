@@ -394,7 +394,172 @@ Notes on the example:
 - No new pack is added by this spec; the two compiled packs keep
   working exactly as today.
 - No change to the `Pack` trait's compiled methods.
-- No grammar language, no rule DSL, no WASM (per the retrospective §6:
-  the calculation abstraction is not proven).
+- No grammar language, no expression language, no WASM (per the
+  retrospective §6: the calculation abstraction is not proven). Rule
+  *kinds* (§13) are in: a fixed list of named, core-implemented rule
+  shapes. What stays out is any way for a manifest to describe new
+  logic — no conditionals, no arithmetic, no filters, no scripting.
 - The manifest does not describe vault layout, ledger syntax, or core
   finding codes — those stay in `spec/0.1.md` and `spec/findings.md`.
+
+## 13. Manifest v2 (external packs)
+
+*Part of #193 (installable external packs, approved by Frank 2026-10-16).
+Spec PR for #431; #435 implements the parser.*
+
+v1 (§1–§12) describes the claims of packs compiled into the binary.
+v2 extends the same file for **external packs**: packs vendored into the
+vault at `<vault>/packs/<name>@<version>/` and pinned by
+`confidant.lock` (`spec/pack-lock.md`). A v2 manifest is the same
+claims file plus `requires_spec` and `[[rules]]`; the folds and findings
+logic for each rule *kind* stays compiled in core Rust, exactly as the
+v1 folds stay compiled behind the `Pack` trait.
+
+Set `manifest_version = 2`. A reader that does not implement v2 fails
+with `E_PACK_INVALID` and an "upgrade confidant" fix rather than
+guessing (PD11).
+
+### 13.1. New and changed keys
+
+```toml
+manifest_version = 2
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+# Exact spec versions this pack supports. Non-empty list; each entry is
+# an exact version string like "0.1". A vault whose spec is not listed
+# gets E_PACK_VERSION (PD11).
+requires_spec = ["0.1"]
+```
+
+- `[pack].requires_spec`: required in v2, absent in v1. Non-empty list
+  of exact spec version strings.
+- `[[rules]]`: the declarative checks (§13.2). Absent in v1.
+- Everything else (§4) is unchanged: `record_types`, `balance_metrics`,
+  `finding_codes`, `[pack]` name/version/skill, `[[verbs]]`,
+  `[[fields]]`, `[[edge_kinds]]`, `[checks]`, `[messages]`.
+
+### 13.2. `[[rules]]`: generic keys
+
+Each rule is a named, typed invocation of one **rule kind**. The kind's
+logic is implemented once in core Rust; the manifest supplies
+parameters. Adding a kind is a spec edit plus Rust — never
+manifest-only — so manifests cannot smuggle in new semantics (PD1).
+
+Generic keys (all required unless marked optional). Unknown keys are an
+error.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `id` | string | Unique within the pack. Must match `^[a-z][a-z0-9_]*$`. |
+| `kind` | string | One of the fixed kind list below. |
+| `code` | string | The finding code this rule emits. Must be in the pack's `finding_codes`. |
+| `severity_key` | string, optional | A declared `[[checks.severity]]` key (without the pack prefix is not accepted; write the full `example-pack.some_rule` key). When present, the operator controls severity through `confidant.toml`. Kinds with a fixed severity omit it. |
+
+After the generic keys come the kind-specific keys, defined by each
+kind's own spec section. Unknown keys — generic or kind-specific — are
+an error.
+
+**The fixed kind list.** This spec starts the list empty. Each kind's
+own issue appends its section with the parameter table:
+
+| Kind | Spec issue | Reproduces |
+|---|---|---|
+| *(none yet)* | — | — |
+
+(Planned: `cadence-overdue` #442, `date-upcoming` #443, `note-ref`
+#458, `ledger-balance` #446, `session-checks` #447, `activity-gap`
+#448.)
+
+### 13.3. Names
+
+- Pack names match `^[a-z][a-z0-9-]{1,31}$` (PD14).
+- `coaching` and `personal` are reserved: no external pack may use
+  them. If a vault lists `coaching@0.1` or `personal@0.1`, the compiled
+  pack always wins and any lockfile entry for it is ignored (`doctor`
+  notes it).
+- Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
+- Finding codes declared by an external pack must match
+  `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
+  compiled-pack code, and a code claimed by two enabled *external*
+  packs is `E_PACK_CONFLICT`. In the manifest they appear in
+  `finding_codes` and need `[messages.<CODE>]` tables exactly as in v1
+  (§7, §10).
+
+### 13.4. Capability limits (PD8)
+
+A pack's capabilities are its **claims** (verbs, record types, fields,
+balance metrics, edge kinds, finding codes, `[checks]` keys), which #178
+scoping already enforces. These hard limits are enforced at load; each
+violation is `E_PACK_INVALID`:
+
+1. A pack may not claim core verbs (`alias`, `merge`, `stage`,
+   `balance`, `touch`).
+2. A pack may not claim core record types.
+3. A pack may not claim core edge kinds (`CORE_EDGE_KINDS` in
+   `packs/mod.rs`).
+4. A pack may not claim core finding codes.
+5. Claims may not collide with an enabled pack (`E_PACK_CONFLICT`,
+   already enforced by `find_conflict`).
+6. Rule parameters may only name front-matter fields and balance
+   metrics the pack itself declares.
+7. Rules read ledger entries and declared front-matter fields only:
+   never note bodies, never `no-ai` content, never keys. Rules only
+   emit findings; they never write.
+
+Ledger verbs named in rule parameters (e.g. `event_verbs`) are
+read-only access to plaintext ledger metadata (date, verb, opaque id)
+and may be any verb: `personal@0.1` counts coaching's `session` as a
+touchpoint.
+
+### 13.5. Allowed pack contents (PD7)
+
+A pack directory may contain only:
+
+- `manifest.toml`
+- the skill file named in `[pack].skill` (default `SKILL.md`)
+- `<version>.md` (the pack's contract file, e.g. `0.1.md`)
+- optional `README*` / `LICENSE*`
+
+Anything else (for example `bin/`, scripts) is rejected at install and
+at load with `E_PACK_INVALID`. Packs ship data and agent-facing
+**text**, never executables.
+
+### 13.6. Worked example: v2 skeleton
+
+A minimal valid v2 manifest: `requires_spec`, one field, one severity
+check, one finding code, one message, no rules yet.
+
+```toml
+manifest_version = 2
+
+record_types = []
+balance_metrics = []
+finding_codes = ["E_EXAMPLE_FIELD"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "example_field"
+grammar = "non-empty-string"
+
+[checks]
+[[checks.severity]]
+key = "example-pack.example_rule"
+default = "warning"
+
+[messages."E_EXAMPLE_FIELD"]
+default = "example field '{key}' {problem}"
+default_fix = "{fix}"
+```
+
+Compatibility note: this example parses with the existing v1 loader
+once `manifest_version` is set to `1` and the v2-only
+`requires_spec` key is removed (checked by hand 2026-10-17). The M1
+issue turns the v2 example into a test.
