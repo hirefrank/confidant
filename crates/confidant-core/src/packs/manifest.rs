@@ -181,9 +181,12 @@ pub struct IntCheck {
 
 /// One `[[rules]]` entry (v2 only): a named invocation of a rule kind.
 /// The kind-specific parameters are kept raw in `params`; each kind's
-/// own issue validates them. No `deny_unknown_fields` here — unknown
-/// *generic* keys are still an error (they fail to deserialize into the
-/// named fields), but kind-specific keys land in `params`.
+/// own issue validates them. No `deny_unknown_fields` here: `params`
+/// flattens every key the named fields don't claim, so an unknown key —
+/// a typo of a generic key included (`severity_kye`, `cod`) — lands in
+/// `params` instead of failing to deserialize. A *missing* generic key
+/// still fails, the manifest parser only checks the fixed generic keys,
+/// and each rule kind must validate its own `params` strictly.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct RuleDecl {
     /// Unique within the pack; matches `^[a-z][a-z0-9_]*$`.
