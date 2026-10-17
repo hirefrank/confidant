@@ -73,7 +73,11 @@ impl Harness {
             "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
         )
         .unwrap();
-        git(&vault, &["init", "-q"]);
+        // Pin the initial branch to `master`: the conflict tests check it
+        // out by name, and `git init` alone would follow the machine's
+        // `init.defaultBranch` (`main` on most machines) and fail there.
+        // `git init -b` overrides any `init.defaultBranch` config.
+        git(&vault, &["init", "-q", "-b", "master"]);
         git(&vault, &["config", "user.email", "test@example.com"]);
         git(&vault, &["config", "user.name", "Test"]);
         git(&vault, &["add", "-A"]);
