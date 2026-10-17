@@ -3271,7 +3271,11 @@ fn cmd_record_resolve(
         )
     })?;
     // Sweep stale `--edit` scratch from a crashed earlier run (CD5). This
-    // runs for every resolve action, not just `--edit`.
+    // runs for every resolve action, not just `--edit`. It also runs
+    // under `--dry-run`, deliberately: cleaning up zeroed scratch left
+    // behind by a previous crashed run is recovery of this command's own
+    // local state, not a vault write, and `--dry-run` promises the vault
+    // stays untouched, not the scratch dir. (#487 item 1.)
     record_resolve::sweep_stale_scratch(root);
     if let Some(stem) = from_inbox {
         return cmd_record_resolve_from_inbox(
@@ -3429,8 +3433,16 @@ fn cmd_record_resolve(
         return print_merge_result(cli, root, &id, &outcome, rekeyed);
     }
     if edit {
+        // #487 item 2: on non-unix the real `--edit` refuses as unsupported
+        // (`cmd_resolve_edit` never compiles there); the dry run refuses in
+        // step instead of reporting a write it could never perform.
+        #[cfg(not(unix))]
+        if cli.dry_run {
+            return unsupported_edit_error();
+        }
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
         // `load_sides` is the same decrypt check the real edit would do.
+        #[cfg(unix)]
         if cli.dry_run {
             let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
             return print_resolve_dry_run(
@@ -3699,8 +3711,15 @@ fn cmd_record_resolve_from_inbox(
         return print_merge_result(cli, root, id, &outcome, rekeyed);
     }
     if edit {
+        // #487 item 2: the from-inbox edit path refuses on non-unix
+        // (`cmd_resolve_edit_from_inbox`); the dry run refuses in step.
+        #[cfg(not(unix))]
+        if cli.dry_run {
+            return unsupported_edit_error();
+        }
         // #465: `--dry-run --edit` writes no scratch and installs nothing;
         // the editor path is the same otherwise (#457).
+        #[cfg(unix)]
         if cli.dry_run {
             return print_resolve_dry_run(
                 cli,

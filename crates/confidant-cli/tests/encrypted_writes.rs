@@ -5015,6 +5015,9 @@ fn merged_file_dry_run_changes_nothing() {
 }
 
 /// #465: `--dry-run --edit` creates no scratch and installs nothing.
+/// Unix only: on Windows the dry run now refuses like the real edit
+/// (#487 item 2).
+#[cfg(unix)]
 #[test]
 fn edit_dry_run_changes_nothing() {
     let h = conflicted_harness();
@@ -6768,5 +6771,123 @@ fn resolve_from_inbox_show_needs_no_trust_gate() {
         out.status.success(),
         "resolve --show should not need the trust gate: {}",
         stderr(&out)
+    );
+}
+
+/// #487: `--from-inbox --take theirs --dry-run` verifies (with the trust
+/// gate and the inbox item both surfaced) but writes nothing: the record
+/// keeps its current content, nothing is staged, and the item stays
+/// queued.
+#[test]
+fn from_inbox_take_theirs_dry_run_changes_nothing() {
+    let (h, inbox_bech32, stem) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let rel = person_rel();
+    let before_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+    let inbox_tree = |h: &Harness| -> String {
+        let out = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["ls-tree", "-r", "--name-only", "inbox"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let before_tree = inbox_tree(&h);
+    assert!(
+        before_tree.contains(&stem),
+        "fixture: item should be queued: {before_tree}"
+    );
+
+    let out = resolve_from_inbox_cmd(
+        &h,
+        &inbox_bech32,
+        &[
+            "--take",
+            "theirs",
+            "--dry-run",
+            "--json",
+            "--allow-unsigned",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "resolve --from-inbox --take theirs --dry-run failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "record-resolve");
+    assert_eq!(v["dry_run"], true, "expected a dry run: {v}");
+    assert_eq!(v["action"], "take");
+    assert_eq!(v["side"], "theirs");
+    assert_eq!(v["staged"], false, "dry run must not stage: {v}");
+    assert_eq!(v["from_inbox"], stem, "dry run must name the item: {v}");
+
+    // Nothing written: record content, index, and the queued item.
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        before_bytes,
+        "--dry-run rewrote the record"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "--dry-run staged something"
+    );
+    assert_eq!(
+        inbox_tree(&h),
+        before_tree,
+        "--dry-run consumed the inbox item"
+    );
+}
+
+/// #487: `--dry-run` must not skip the signed-tip trust check: an
+/// untrusted (unsigned) tip still refuses, and nothing is written.
+#[test]
+fn from_inbox_dry_run_refuses_unsigned_tip() {
+    let (h, inbox_bech32, stem) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let rel = person_rel();
+    let before_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs", "--dry-run"]);
+    assert!(
+        !out.status.success(),
+        "--dry-run must not bypass the trust gate: {}",
+        stdout(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+
+    // Nothing written by the refused dry run.
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        before_bytes,
+        "the refused dry run rewrote the record"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "the refused dry run staged something"
+    );
+    let tree = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let tree_text = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        tree_text.contains(&stem),
+        "the refused dry run must keep the item queued: {tree_text}"
     );
 }
