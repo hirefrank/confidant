@@ -14,11 +14,17 @@ targets = [
 version = 2
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2026-0173: proc-macro-error2 (via i18n-embed-fl <- age) is
-    # unmaintained. It is a compile-time proc-macro used only for age's
-    # localized error messages; it has no effect on runtime crypto.
-    # No safe upgrade exists (age 0.11 pins it); re-evaluate on age 0.12.
-    "RUSTSEC-2026-0173",
+    # RUSTSEC-2026-0370/-0371/-0372: zvariant, zbus_names and
+    # zvariant_derive are unmaintained standalone crates (merged into
+    # zbus 6). They reach us only through keyring -> zbus -> zvariant,
+    # which carries the Linux Secret Service keychain backend, so they
+    # stay out of every runtime crypto and data path. No safe upgrade
+    # exists: keyring 3.6 pins zbus 4, and keyring 4 still asks for
+    # zbus 5, whose zvariant 5 is flagged the same way. Re-evaluate
+    # when the Secret Service backend moves to zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
