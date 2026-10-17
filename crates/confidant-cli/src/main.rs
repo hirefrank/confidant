@@ -3400,10 +3400,10 @@ fn cmd_resolve_edit(
     _id: &RecordId,
     _id_raw: &str,
 ) -> anyhow::Result<ExitCode> {
-    Err(anyhow::Error::new(DomainError::usage(
-        "`record resolve --edit` is not supported on this platform",
+    Err(anyhow::Error::new(
+        DomainError::usage("`record resolve --edit` is not supported on this platform")
+            .with_fix("Use --merged-file with a file outside the vault"),
     ))
-    .with_fix("Use --merged-file with a file outside the vault"))
 }
 
 /// Parameters for [`prepare_record_write`], bundled to keep the

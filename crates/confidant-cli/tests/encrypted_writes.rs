@@ -5696,9 +5696,10 @@ fn edit_creates_0600_scratch_in_0700_dir_and_removes_all() {
         h._tmp.path(),
         "editor.sh",
         "#!/bin/sh\n\
+         mode() { stat -c '%a %n' \"$1\" 2>/dev/null || stat -f '%Lp %N' \"$1\"; }\n\
          d=$(dirname \"$1\")\n\
-         stat -c '%a %n' \"$d\" > \"$d/modes.txt\"\n\
-         stat -c '%a %n' \"$d\"/*.md >> \"$d/modes.txt\"\n",
+         mode \"$d\" > \"$d/modes.txt\"\n\
+         for f in \"$d\"/*.md; do mode \"$f\" >> \"$d/modes.txt\"; done\n",
     );
     #[cfg(unix)]
     {
@@ -5753,11 +5754,12 @@ fn edit_scratch_modes_are_0600_in_0700_dir() {
         "editor.sh",
         &format!(
             "#!/bin/sh\n\
+             mode() {{ stat -c '%a' \"$1\" 2>/dev/null || stat -f '%Lp' \"$1\"; }}\n\
              d=$(dirname \"$1\")\n\
-             stat -c '%a' \"$d\" > \"{}\"\n\
-             stat -c '%a' \"$d/ours.md\" >> \"{}\"\n\
-             stat -c '%a' \"$d/theirs.md\" >> \"{}\"\n\
-             stat -c '%a' \"$d/merged.md\" >> \"{}\"\n",
+             mode \"$d\" > \"{}\"\n\
+             mode \"$d/ours.md\" >> \"{}\"\n\
+             mode \"$d/theirs.md\" >> \"{}\"\n\
+             mode \"$d/merged.md\" >> \"{}\"\n",
             modes_out.display(),
             modes_out.display(),
             modes_out.display(),
