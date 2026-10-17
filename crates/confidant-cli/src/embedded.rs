@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn embedded_packs_tree_has_skill_per_pack() {
-        for pack in confidant_core::packs::ALL_PACKS {
+        for pack in confidant_core::packs::PackRegistry::compiled().all() {
             assert!(
                 pack_skill_text(pack.name()).is_some(),
                 "pack {} ships no SKILL.md",
@@ -149,7 +149,7 @@ mod tests {
     /// in the skill text, so manifest text and SKILL.md cannot disagree.
     #[test]
     fn pack_skills_document_all_declared_finding_codes() {
-        for pack in confidant_core::packs::ALL_PACKS {
+        for pack in confidant_core::packs::PackRegistry::compiled().all() {
             let manifest = confidant_core::packs::pack_manifest(pack.name())
                 .unwrap_or_else(|| panic!("pack {} has no manifest", pack.name()));
             let text = pack_skill_text(pack.name())

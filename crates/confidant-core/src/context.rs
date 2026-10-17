@@ -15,7 +15,6 @@ use serde::Serialize;
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
 use crate::id::RecordId;
 use crate::packs::coaching::CoachingView;
-use crate::packs::{resolve_enabled, ALL_PACKS};
 use crate::record::RecordKind;
 use crate::scope::{
     note_linkage_owners, owners_of_ledger_entry, record_owners, OwnerKey, PackScope,
@@ -160,7 +159,7 @@ pub fn build_context(
     // #178: notes/interactions filter by pack ownership. A note is visible
     // when a pack in scope owns it (field claim or ledger linkage);
     // unattributed notes are visible only unscoped.
-    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let linkage = note_linkage_owners(vault, &enabled);
     let scope_names = scope.names(&enabled);
 
@@ -225,7 +224,9 @@ pub fn build_context(
             date: s.entry.date.to_string(),
             // The touchpoint kind is the claiming pack's grammar (#185/#296):
             // ask the registered pack through the trait, not `packs::personal`.
-            kind: ALL_PACKS
+            kind: vault
+                .pack_registry()
+                .all()
                 .iter()
                 .find(|p| p.verbs().contains(&s.entry.verb.as_str()))
                 .and_then(|p| p.verb_kind(&s.entry.verb, &s.entry)),
