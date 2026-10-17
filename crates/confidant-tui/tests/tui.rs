@@ -1703,10 +1703,37 @@ fn conflict_hand_merge_runs_edit_argv_and_refreshes() {
     assert_eq!(interactive, vec![expected], "interactive call recorded");
 
     // The host resumes: list reloads, detail closes.
-    app.after_suspended_command();
+    app.after_suspended_command(Ok(status));
     assert!(app.suspended.is_none(), "suspended cleared after resume");
     assert!(app.conflict.detail.is_none(), "detail closed after resume");
     assert_eq!(app.conflict.entries.len(), 2, "list reloaded");
+}
+
+#[test]
+fn conflict_hand_merge_nonzero_exit_raises_alert() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    // Reload after the suspended edit completes.
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.set_interactive_status(1);
+    let mut app = App::new(fake);
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Char('m')));
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let cmd = app
+        .take_suspended_command()
+        .expect("suspended command queued");
+    let result = app.run_suspended_command(&cmd);
+    assert_eq!(result.as_ref().copied().unwrap(), 1);
+    app.after_suspended_command(result);
+    assert!(
+        app.alert
+            .as_ref()
+            .is_some_and(|a| a.title == "Hand-merge failed"),
+        "alert raised on nonzero edit exit"
+    );
 }
 
 #[test]

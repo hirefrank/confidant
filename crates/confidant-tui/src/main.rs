@@ -81,13 +81,14 @@ fn run_event_loop(
         // the editor, run it, then resume and refresh.
         if let Some(cmd) = app.take_suspended_command() {
             restore_terminal();
-            let _ = app.run_suspended_command(&cmd);
+            let result = app.run_suspended_command(&cmd);
             enable_raw_mode()?;
             if let Err(err) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
                 let _ = crossterm::terminal::disable_raw_mode();
                 return Err(err.into());
             }
-            app.after_suspended_command();
+            terminal.clear()?;
+            app.after_suspended_command(result);
             continue;
         }
         if event::poll(Duration::from_millis(250))? {

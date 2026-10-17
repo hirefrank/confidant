@@ -471,7 +471,7 @@ impl<R: Runner> App<R> {
             return;
         };
         let id = entry.id.clone();
-        let raw = match self.runner.run(&["record", "resolve", "--show", &id]) {
+        let raw = match self.runner.run(&["record", "resolve", &id, "--show"]) {
             Ok(r) => r,
             Err(e) => {
                 self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
@@ -608,9 +608,30 @@ impl<R: Runner> App<R> {
 
     /// Refresh after an interactive command completes: the hand-merge may
     /// have resolved the record, so reload the list and close the detail.
-    pub fn after_suspended_command(&mut self) {
+    /// A failed or nonzero `--edit` run raises the alert view instead of
+    /// silently refreshing.
+    pub fn after_suspended_command(&mut self, result: anyhow::Result<i32>) {
         self.suspended = None;
+        // Reload first: the loaders clear the alert on success, so the
+        // failure alert below must be raised after.
         self.load_conflicts();
+        match result {
+            Ok(0) => {}
+            Ok(status) => {
+                self.alert = Some(AlertState {
+                    title: "Hand-merge failed".to_owned(),
+                    code: None,
+                    message: format!("`record resolve --edit` exited with status {status}"),
+                    fix: Some("re-run the hand-merge from the conflict detail view".to_owned()),
+                    blocking: false,
+                });
+            }
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!(
+                    "hand-merge command failed: {e:#}"
+                )));
+            }
+        }
     }
 
     /// Refresh the currently active view.
