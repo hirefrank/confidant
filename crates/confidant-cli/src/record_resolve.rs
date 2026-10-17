@@ -313,11 +313,13 @@ pub(crate) struct MergeOutcome {
 /// explicitly on the success path (after which drop is a no-op). Every
 /// file is attempted even if one fails; errors are swallowed so cleanup
 /// never masks the original result.
+#[cfg(unix)]
 pub(crate) struct ScratchGuard {
     dir: PathBuf,
     files: Vec<PathBuf>,
 }
 
+#[cfg(unix)]
 impl ScratchGuard {
     pub(crate) fn new(dir: PathBuf, files: Vec<PathBuf>) -> Self {
         ScratchGuard { dir, files }
@@ -347,6 +349,7 @@ impl ScratchGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ScratchGuard {
     fn drop(&mut self) {
         self.cleanup();
@@ -602,6 +605,7 @@ pub(crate) fn setup_edit_scratch(
 /// Resolve the operator's editor: `$VISUAL`, then `$EDITOR`.
 ///
 /// Neither set is a usage error (exit 2, ADR-7).
+#[cfg(unix)]
 pub(crate) fn resolve_editor() -> anyhow::Result<String> {
     std::env::var("VISUAL")
         .ok()
@@ -622,6 +626,7 @@ pub(crate) fn resolve_editor() -> anyhow::Result<String> {
 /// Run the operator's editor on `path`.
 ///
 /// A non-zero editor exit is an error; the caller must not apply anything.
+#[cfg(unix)]
 pub(crate) fn run_editor(path: &Path) -> anyhow::Result<()> {
     let editor = resolve_editor()?;
     let status = std::process::Command::new(&editor)
@@ -718,6 +723,7 @@ mod tests {
     /// holds a read handle open across the drop; reading through it after
     /// the drop must yield zeros (the file is gone from the directory).
     #[test]
+    #[cfg(unix)]
     fn scratch_guard_zeroizes_before_unlink() {
         use std::io::{Read, Seek, SeekFrom};
 
@@ -753,6 +759,7 @@ mod tests {
     /// #455: `ScratchGuard` drop (without explicit cleanup) also zeroes
     /// and removes.
     #[test]
+    #[cfg(unix)]
     fn scratch_guard_drop_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("secret.md");
