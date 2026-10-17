@@ -242,6 +242,7 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
     let mut seen_fields: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_metrics: HashMap<&'static str, &'static str> = HashMap::new();
     let mut seen_edge_kinds: HashMap<&'static str, &'static str> = HashMap::new();
+    let mut seen_codes: HashMap<&'static str, &'static str> = HashMap::new();
     for pack in packs {
         for (kind, claims, seen) in [
             ("verb", pack.verbs(), &mut seen_verbs),
@@ -273,6 +274,25 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
                 });
             }
             seen_edge_kinds.insert(edge_kind.name, pack.name());
+        }
+        // #434: finding codes claimed by two enabled *external* packs
+        // conflict. Codes that are already builtin enum codes are skipped:
+        // compiled packs legitimately share them (coaching@0.1 and
+        // personal@0.1 both list E_INVALID_ID, E_WRONG_ID_TYPE,
+        // E_UNKNOWN_RECORD).
+        for code in pack.finding_codes() {
+            if crate::check::FindingCode::is_builtin_code(code) {
+                continue;
+            }
+            if let Some(first) = seen_codes.get(code) {
+                return Some(PackConflict {
+                    kind: "finding code",
+                    name: code,
+                    first,
+                    second: pack.name(),
+                });
+            }
+            seen_codes.insert(code, pack.name());
         }
     }
     None
@@ -586,6 +606,87 @@ mod tests {
         assert_eq!(conflict.name, "mentor");
         assert_eq!(conflict.first, "testpack@0.1");
         assert_eq!(conflict.second, "clash@0.1");
+    }
+
+    /// A pack that claims finding codes, for conflict tests (#434).
+    macro_rules! code_pack {
+        ($name:ident, $pack_name:expr, $codes:expr) => {
+            struct $name;
+            impl Pack for $name {
+                fn name(&self) -> &'static str {
+                    $pack_name
+                }
+                fn verbs(&self) -> &'static [&'static str] {
+                    &[]
+                }
+                fn record_types(&self) -> &'static [&'static str] {
+                    &[]
+                }
+                fn fields(&self) -> &'static [&'static str] {
+                    &[]
+                }
+                fn balance_metrics(&self) -> &'static [&'static str] {
+                    &[]
+                }
+                fn finding_codes(&self) -> &'static [&'static str] {
+                    $codes
+                }
+                fn fold(
+                    &self,
+                    _vault: &Vault,
+                    _merges: &MergeMap,
+                    _as_of: NaiveDate,
+                    _findings: &mut Vec<Finding>,
+                ) -> Box<dyn PackState> {
+                    Box::new(TestState)
+                }
+                fn findings(
+                    &self,
+                    _vault: &Vault,
+                    _state: &dyn PackState,
+                    _as_of: NaiveDate,
+                    _findings: &mut Vec<Finding>,
+                ) {
+                }
+                fn check_balance(
+                    &self,
+                    _vault: &Vault,
+                    _state: &dyn PackState,
+                    _sourced: &SourcedEntry,
+                    _findings: &mut Vec<Finding>,
+                ) {
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn find_conflict_ignores_shared_core_codes() {
+        // coaching@0.1 and personal@0.1 both list E_INVALID_ID,
+        // E_WRONG_ID_TYPE, E_UNKNOWN_RECORD — shared builtin codes must not
+        // conflict (#434).
+        static PERSONAL: personal::PersonalPack = personal::PersonalPack;
+        let packs: Vec<&dyn Pack> = vec![&COACHING, &PERSONAL];
+        assert!(find_conflict(&packs).is_none());
+    }
+
+    #[test]
+    fn find_conflict_reports_duplicate_finding_code() {
+        code_pack!(CodePackA, "codea@0.1", &["W_EXAMPLE_THING"]);
+        code_pack!(CodePackB, "codeb@0.1", &["W_EXAMPLE_THING", "E_OTHER_CODE"]);
+        static A: CodePackA = CodePackA;
+        static B: CodePackB = CodePackB;
+        let packs: Vec<&dyn Pack> = vec![&A, &B];
+        let conflict = find_conflict(&packs).unwrap();
+        assert_eq!(conflict.kind, "finding code");
+        assert_eq!(conflict.name, "W_EXAMPLE_THING");
+        assert_eq!(conflict.first, "codea@0.1");
+        assert_eq!(conflict.second, "codeb@0.1");
+        // No conflict when codes are distinct.
+        code_pack!(CodePackC, "codec@0.1", &["W_DIFFERENT_CODE"]);
+        static C: CodePackC = CodePackC;
+        let packs: Vec<&dyn Pack> = vec![&A, &C];
+        assert!(find_conflict(&packs).is_none());
     }
 
     #[test]
