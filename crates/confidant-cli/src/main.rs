@@ -3358,6 +3358,12 @@ fn cmd_record_resolve(
                 canonical.display()
             )))
         })?;
+        // #473: refuse an unfinished merge before it is re-encrypted.
+        record_resolve::refuse_merged_conflict_markers(
+            &text,
+            &format!("the merged file {}", canonical.display()),
+        )
+        .map_err(anyhow::Error::new)?;
         let provisional = canonical
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3555,6 +3561,12 @@ fn cmd_record_resolve_from_inbox(
                 canonical.display()
             )))
         })?;
+        // #473: refuse an unfinished merge before it is re-encrypted.
+        record_resolve::refuse_merged_conflict_markers(
+            &text,
+            &format!("the merged file {}", canonical.display()),
+        )
+        .map_err(anyhow::Error::new)?;
         let provisional = canonical
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3614,6 +3626,13 @@ fn cmd_resolve_edit_from_inbox(
             merged_path.display()
         )))
     })?;
+    // #473: refuse an unfinished merge before it is re-encrypted. The
+    // guard is dropped by the `?`, cleaning the scratch up.
+    record_resolve::refuse_merged_conflict_markers(
+        &text,
+        &format!("the merged record from {}", merged_path.display()),
+    )
+    .map_err(anyhow::Error::new)?;
     let prepared = prepare_record_write(
         root,
         vault,
@@ -3726,6 +3745,13 @@ fn cmd_resolve_edit(
             merged_path.display()
         )))
     })?;
+    // #473: refuse an unfinished merge before it is re-encrypted. The
+    // guard is dropped by the `?`, cleaning the scratch up.
+    record_resolve::refuse_merged_conflict_markers(
+        &text,
+        &format!("the merged record from {}", merged_path.display()),
+    )
+    .map_err(anyhow::Error::new)?;
     let prepared = prepare_record_write(
         root,
         vault,

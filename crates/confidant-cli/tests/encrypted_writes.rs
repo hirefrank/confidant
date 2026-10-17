@@ -4918,6 +4918,136 @@ fn assert_no_unmerged(vault: &Path, rel: &str) {
     );
 }
 
+/// #473: `--merged-file` refuses a merged file that still carries conflict
+/// markers instead of re-encrypting and installing it. The stored record
+/// and the index are untouched, and the error names the marker without
+/// leaking the merged plaintext.
+#[test]
+fn merged_file_with_conflict_markers_refused() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let conflicted_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+
+    let merged = write_file(
+        h._tmp.path(),
+        "unfinished_merge.md",
+        &format!(
+            "{}\n<<<<<<< HEAD\nSENTINEL-OURS-bio.\n=======\nSENTINEL-THEIRS-bio.\n>>>>>>> device-a\n",
+            person_md(PERSON, "Ada Example", "SENTINEL-BASE-bio.")
+        ),
+    );
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "conflict markers must be a usage error: {}",
+        stderr(&out)
+    );
+    let err_text = stderr(&out);
+    assert!(
+        err_text.contains("conflict marker") && err_text.contains("<<<<<<<"),
+        "error must name the marker: {err_text}"
+    );
+    assert!(
+        !err_text.contains("SENTINEL") && !err_text.contains("Ada Example"),
+        "error must not leak the merged plaintext: {err_text}"
+    );
+
+    // The record and the index are untouched.
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "the refused merge must leave the conflicted file unchanged"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "the refused merge must stage nothing"
+    );
+}
+
+/// #473: the same guard on the `--edit` path: a scratch text that still
+/// carries markers fails closed, and the scratch is cleaned up.
+#[cfg(unix)]
+#[test]
+fn edit_with_conflict_markers_refused() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    // The edit scratch path requires .confidant/ to be git-ignored (CD5).
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let conflicted_bytes = std::fs::read(h.vault.join(&rel)).unwrap();
+    let before_staged = staged_paths(&h.vault);
+
+    // A fake editor that overwrites the scratch merge with an unfinished
+    // merge (markers left in). `$MERGE_FROM` points at the operator text.
+    use std::os::unix::fs::PermissionsExt;
+    let editor = write_file(
+        h._tmp.path(),
+        "fake_editor.sh",
+        "#!/bin/sh\ncp \"$MERGE_FROM\" \"$1\"\n",
+    );
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let unfinished = write_file(
+        h._tmp.path(),
+        "unfinished_merge.md",
+        &format!(
+            "{}\n<<<<<<< HEAD\nSENTINEL-OURS-bio.\n=======\nSENTINEL-THEIRS-bio.\n>>>>>>> device-a\n",
+            person_md(PERSON, "Ada Example", "SENTINEL-BASE-bio.")
+        ),
+    );
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("EDITOR", editor.to_str().unwrap())
+        .env("MERGE_FROM", unfinished.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "conflict markers must be a usage error: {}",
+        stderr(&out)
+    );
+    let err_text = stderr(&out);
+    assert!(
+        err_text.contains("conflict marker") && err_text.contains("<<<<<<<"),
+        "error must name the marker: {err_text}"
+    );
+    assert!(
+        !err_text.contains("SENTINEL") && !err_text.contains("Ada Example"),
+        "error must not leak the merged plaintext: {err_text}"
+    );
+
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        conflicted_bytes,
+        "the refused merge must leave the conflicted file unchanged"
+    );
+    assert_eq!(
+        staged_paths(&h.vault),
+        before_staged,
+        "the refused merge must stage nothing"
+    );
+    // The failed edit cleaned its scratch up (guard drop).
+    assert!(
+        !h.vault.join(".confidant").join("conflicts").exists(),
+        "the refused edit must clean up its scratch: {:?}",
+        h.vault.join(".confidant").join("conflicts")
+    );
+}
+
 /// #454: `--take theirs` installs the theirs bytes exactly and stages the file.
 /// Theirs is the device-a branch in the merge harness.
 #[test]

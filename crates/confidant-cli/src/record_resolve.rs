@@ -517,6 +517,49 @@ impl Drop for ScratchGuard {
 
 /// Refuse any `--merged-file` path inside the vault tree (CD5).
 ///
+/// #473: refuse to install merged plaintext that still contains conflict
+/// markers.
+///
+/// `--merged-file` and `--edit` hand the operator's text to the re-encrypt
+/// path without any stored-file check (the stored file *is* the conflict,
+/// so the resolve path skips `record edit`'s guard). This scan is the
+/// install-time guard instead: a text that still carries git markers is an
+/// unfinished merge, and re-encrypting it would hide the state inside an
+/// envelope, where `check` cannot see it.
+///
+/// `<<<<<<<` and `>>>>>>>` are unambiguous. A lone `=======` line is the
+/// separator git writes; in a hand-merge it means an unresolved side is
+/// still present, and the three together are what the issue asks to
+/// refuse. (This is deliberately stricter than `record edit`, whose
+/// stored-file guard tolerates setext `=======` headings in existing
+/// files; here the text is brand-new operator input.)
+///
+/// The error names the first offending marker and its line number, never
+/// the line's content: the merged text is decrypted plaintext and must not
+/// reach logs or error output (rule 4).
+pub(crate) fn refuse_merged_conflict_markers(text: &str, source: &str) -> Result<(), DomainError> {
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let marker = if trimmed.starts_with("<<<<<<<") {
+            "<<<<<<<"
+        } else if trimmed.starts_with(">>>>>>>") {
+            ">>>>>>>"
+        } else if trimmed == "=======" {
+            "======="
+        } else {
+            continue;
+        };
+        return Err(DomainError::usage(format!(
+            "{source} still contains a conflict marker ({marker} at line {})",
+            n + 1
+        ))
+        .with_fix(
+            "Remove the conflict markers — keep the text you merged — then re-run the command",
+        ));
+    }
+    Ok(())
+}
+
 /// The operator's merged file must live outside the vault so a plaintext
 /// merge file cannot be committed by accident. There is no `.confidant/`
 /// exception. Symlinks and `..` segments are resolved via canonicalization,
@@ -932,5 +975,35 @@ mod tests {
             !dir.path().exists(),
             "scratch dir should be removed on drop"
         );
+    }
+
+    /// #473: hand-merged text still carrying any of the three git markers
+    /// refuses, naming the first marker and its line number, with no
+    /// plaintext in the message.
+    #[test]
+    fn merged_marker_scan_refuses_each_marker() {
+        let cases = ["<<<<<<< HEAD\n", ">>>>>>> device-a\n", "=======\n"];
+        for (n, trailing) in cases.iter().enumerate() {
+            let text = format!(
+                "---\nid: p-FAKE\ntype: person\n---\n\nBio.\n\nSENTINEL-SECRET-LINE\n{trailing}"
+            );
+            let err = refuse_merged_conflict_markers(&text, "the merged file")
+                .expect_err("markers must refuse");
+            let msg = format!("{err}");
+            assert!(msg.contains("conflict marker"), "case {n}: {msg}");
+            assert!(msg.contains("line 9"), "case {n}: {msg}");
+            assert!(!msg.contains("SENTINEL"), "case {n}: leaked: {msg}");
+        }
+    }
+
+    /// #473: clean merged text passes; similar-looking ordinary markdown
+    /// (`===` short of the separator) passes too.
+    #[test]
+    fn merged_marker_scan_passes_clean_text() {
+        let short_of_separator = "plainline\n======extra\n";
+        refuse_merged_conflict_markers(short_of_separator, "the merged file")
+            .expect("======= with more characters is not a git separator");
+        refuse_merged_conflict_markers("no markers at all\n", "the merged file")
+            .expect("clean text must pass");
     }
 }
