@@ -4203,11 +4203,10 @@ fn dropping_the_last_notes_mode_reference_stamps_visible_again() {
 fn two_device_edit_conflict_is_reported_by_check() {
     let h = Harness::new();
     h.keyed(PERSON);
+    // `record add` commits itself; no manual git commit needed.
     add_person(&h, &person_md(PERSON, "Ada Example", "First bio."));
-    git(&h.vault, &["add", "-A"]);
-    git(&h.vault, &["commit", "-qm", "add person"]);
 
-    // Device A edits on a branch.
+    // Device A edits on a branch (`record edit` commits itself).
     git(&h.vault, &["checkout", "-qb", "device-a"]);
     let edited_a = write_file(
         h._tmp.path(),
@@ -4230,8 +4229,6 @@ fn two_device_edit_conflict_is_reported_by_check() {
         "record edit (device A) failed: {}",
         stderr(&out)
     );
-    git(&h.vault, &["add", "-A"]);
-    git(&h.vault, &["commit", "-qm", "device A edit"]);
 
     // Device B edits differently on master.
     git(&h.vault, &["checkout", "-q", "master"]);
@@ -4256,8 +4253,6 @@ fn two_device_edit_conflict_is_reported_by_check() {
         "record edit (device B) failed: {}",
         stderr(&out)
     );
-    git(&h.vault, &["add", "-A"]);
-    git(&h.vault, &["commit", "-qm", "device B edit"]);
 
     // Merge → conflict (both sides rewrote the envelope).
     let st = Command::new("git")
