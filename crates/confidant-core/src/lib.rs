@@ -11,6 +11,7 @@
 pub mod bench;
 pub mod check;
 pub mod config;
+pub mod conflict;
 pub mod context;
 pub mod crypto_mode;
 pub mod discover;
