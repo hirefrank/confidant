@@ -4196,3 +4196,107 @@ fn dropping_the_last_notes_mode_reference_stamps_visible_again() {
     assert_eq!(v["rekeyed"]["from"], PERSON, "{v}");
     assert_eq!(v["rekeyed"]["to"], PERSON2, "{v}");
 }
+
+/// #452: two devices edit the same encrypted record, the merge conflicts,
+/// and `check` reports the encrypted-record message with the record id.
+#[test]
+fn two_device_edit_conflict_is_reported_by_check() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    // `record add` commits itself; no manual git commit needed.
+    add_person(&h, &person_md(PERSON, "Ada Example", "First bio."));
+
+    // Device A edits on a branch (`record edit` commits itself).
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let edited_a = write_file(
+        h._tmp.path(),
+        "edited_a.md",
+        &person_md(PERSON, "Ada Example", "Bio from device A."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (device A) failed: {}",
+        stderr(&out)
+    );
+
+    // Device B edits differently on master.
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let edited_b = write_file(
+        h._tmp.path(),
+        "edited_b.md",
+        &person_md(PERSON, "Ada Example", "Bio from device B."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (device B) failed: {}",
+        stderr(&out)
+    );
+
+    // Merge → conflict (both sides rewrote the envelope).
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["merge", "--no-edit", "device-a"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the merge to conflict");
+
+    let out = h.cmd(&["check", "--json", "--no-input"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "check should exit 1: {}",
+        stderr(&out)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"].as_str() == Some("E_MERGE_CONFLICT"))
+        .collect();
+    assert_eq!(
+        findings.len(),
+        1,
+        "expected one E_MERGE_CONFLICT: {}",
+        stdout(&out)
+    );
+    let f = findings[0];
+    assert_eq!(
+        f["message"].as_str(),
+        Some("encrypted record has two versions after a merge conflict"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(f["id"].as_str(), Some(PERSON), "{}", stdout(&out));
+    assert!(
+        f["fix"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&format!("confidant record resolve {PERSON} --show")),
+        "fix should point at record resolve: {}",
+        stdout(&out)
+    );
+}

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
+use crate::conflict::is_envelope_conflict;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::paths::{self, EntryKind};
@@ -905,15 +906,33 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
     // skip/refuse paths below.
     let conflicted = has_conflict_markers(&text);
     if conflicted {
-        findings.push(
-            Finding::new(
+        // CD1 (#452): when both conflict sides parse as encrypted
+        // envelopes, the record is an encrypted record with two versions —
+        // say so and point at `record resolve`. Every other conflicted
+        // file keeps the generic message and fix exactly.
+        let envelope_id = is_envelope_conflict(&text)
+            .then(|| job.path_id.clone())
+            .flatten();
+        let finding = match envelope_id {
+            Some(id) => Finding::new(
+                FindingCode::MergeConflict,
+                Severity::Error,
+                "encrypted record has two versions after a merge conflict".to_owned(),
+            )
+            .at_file(&file)
+            .for_id(&id)
+            .with_fix(format!(
+                "Run `confidant record resolve {id} --show` to compare the two versions"
+            )),
+            None => Finding::new(
                 FindingCode::MergeConflict,
                 Severity::Error,
                 "file contains git conflict markers".to_owned(),
             )
             .at_file(&file)
             .with_fix("Resolve the conflict; check keeps both sides visible until you do"),
-        );
+        };
+        findings.push(finding);
     }
     // Spec 4: the content hook maps raw bytes to the bytes core parses
     // (decrypted inner record), a no-ai shell, or a skip/refuse decision.
