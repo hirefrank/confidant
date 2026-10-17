@@ -297,6 +297,350 @@ fn next_git_step(root: &Path) -> String {
     }
 }
 
+/// Outcome of `record resolve --merged-file` / `--edit`: what was staged.
+#[derive(Debug)]
+pub(crate) struct MergeOutcome {
+    /// The next git step for the operator, e.g. `git merge --continue`.
+    pub next: String,
+    /// Vault-relative path of the resolved record.
+    pub path: PathBuf,
+}
+
+/// Guard for `--edit` scratch files (#455, CD5).
+///
+/// Zero-overwrites each file (same length), syncs, removes the files and
+/// the directory on drop. [`ScratchGuard::cleanup`] can also be called
+/// explicitly on the success path (after which drop is a no-op). Every
+/// file is attempted even if one fails; errors are swallowed so cleanup
+/// never masks the original result.
+pub(crate) struct ScratchGuard {
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+impl ScratchGuard {
+    pub(crate) fn new(dir: PathBuf, files: Vec<PathBuf>) -> Self {
+        ScratchGuard { dir, files }
+    }
+
+    /// Zero-overwrite, sync, and remove every file, then remove the dir.
+    pub(crate) fn cleanup(&mut self) {
+        use std::io::Write;
+        for file in &self.files {
+            if let Ok(len) = std::fs::metadata(file).map(|m| m.len()) {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(file) {
+                    let zeros = vec![0u8; len as usize];
+                    let _ = f.write_all(&zeros);
+                    let _ = f.sync_all();
+                }
+            }
+            let _ = std::fs::remove_file(file);
+        }
+        // Remove the dir recursively: the editor may have left untracked
+        // files (e.g. test artifacts). Tracked files were zeroed above.
+        let _ = std::fs::remove_dir_all(&self.dir);
+        // Try to remove the parent `conflicts/` dir if it's now empty.
+        if let Some(parent) = self.dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        self.files.clear();
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Refuse any `--merged-file` path inside the vault tree (CD5).
+///
+/// The operator's merged file must live outside the vault so a plaintext
+/// merge file cannot be committed by accident. There is no `.confidant/`
+/// exception. Symlinks and `..` segments are resolved via canonicalization,
+/// so a path that resolves into the vault is refused too.
+pub(crate) fn refuse_vault_path(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = path.canonicalize().map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            path.display()
+        )))
+    })?;
+    let canonical_root = root.canonicalize().map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot resolve vault root {}: {e}",
+            root.display()
+        )))
+    })?;
+    if canonical.starts_with(&canonical_root) {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "refusing to read a merge file inside the vault: {}",
+                path.display()
+            ))
+            .with_fix("Put the merged file outside the vault tree"),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Remove a stale `.confidant/conflicts/` dir left by a crashed
+/// `resolve --edit` (#455, CD5). Best-effort: files are zero-overwritten
+/// before the tree is removed, and every file is attempted.
+pub(crate) fn sweep_stale_scratch(root: &Path) {
+    use std::io::Write;
+    let dir = root.join(".confidant").join("conflicts");
+    if !dir.exists() {
+        return;
+    }
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(len) = std::fs::metadata(&p).map(|m| m.len()) {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&p) {
+                    let zeros = vec![0u8; len as usize];
+                    let _ = f.write_all(&zeros);
+                    let _ = f.sync_all();
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Apply a merged record (#455).
+///
+/// Encrypts each planned change through the vault's [`RecordEncryptor`]
+/// (the same encryptor `record edit` uses, with the prepared mode
+/// overrides), writes each envelope atomically, verifies no error finding
+/// on any changed path (rolling everything back on failure, as #454
+/// does), then stages every changed path (CD6: stage only, never commit).
+///
+/// `prepared` comes from the shared [`crate::prepare_record_write`].
+/// Returns the next git step for the operator.
+pub(crate) fn apply_merge(
+    root: &Path,
+    no_input: bool,
+    vault: &confidant_core::vault::Vault,
+    prepared: &crate::PreparedWrite,
+) -> anyhow::Result<MergeOutcome> {
+    use confidant_core::write::FileChange;
+
+    // The same encryptor `record edit` uses, with the #410 mode overrides
+    // from the shared planner. `None` on a plaintext vault: contents are
+    // written as-is.
+    let enc = crate::record_crypto::RecordEncryptor::for_vault(root, vault)?
+        .map(|e| e.with_mode_overrides(prepared.mode_overrides.clone()));
+
+    // Save every original for rollback before writing anything.
+    let mut originals: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for change in &prepared.pending.changes {
+        let FileChange::WriteFile { path, .. } = change else {
+            continue;
+        };
+        let bytes = std::fs::read(root.join(path)).unwrap_or_default();
+        originals.push((path.clone(), bytes));
+    }
+
+    // Encrypt (or pass through) and install each change atomically.
+    for change in &prepared.pending.changes {
+        let FileChange::WriteFile { path, contents } = change else {
+            continue;
+        };
+        let bytes = match &enc {
+            Some(e) => e.encrypt_file(path, contents.as_bytes())?,
+            None => contents.as_bytes().to_vec(),
+        };
+        confidant_core::paths::write_replace(root, path, &bytes).map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not write {}: {e}",
+                path.display()
+            )))
+        })?;
+    }
+
+    // Every changed path must check clean; on failure restore all
+    // originals byte for byte and refuse, leaving nothing staged.
+    let mut failed: Option<anyhow::Error> = None;
+    for (path, _) in &originals {
+        if let Err(e) = check_path_clean(root, path) {
+            failed = Some(e);
+            break;
+        }
+    }
+    if let Some(e) = failed {
+        for (path, bytes) in &originals {
+            let _ = confidant_core::paths::write_replace(root, path, bytes);
+        }
+        return Err(e);
+    }
+
+    // CD6: stage only, never commit. On a staging failure restore the
+    // originals rather than leaving a half-done write.
+    for (path, _) in &originals {
+        if let Err(e) =
+            confidant_core::write::git(root, &["add", "--", &path.to_string_lossy()], no_input)
+        {
+            for (p, b) in &originals {
+                let _ = confidant_core::paths::write_replace(root, p, b);
+            }
+            return Err(anyhow::Error::new(DomainError::internal(format!(
+                "could not stage {}: {e}",
+                path.display()
+            ))));
+        }
+    }
+
+    Ok(MergeOutcome {
+        next: next_git_step(root),
+        path: prepared.rel.clone(),
+    })
+}
+
+/// The rekey report for a merge, exactly when `record edit` would report
+/// one: the merged record's client differs from the ours side's client
+/// (the local state the merge starts from). Returns `None` when they
+/// agree, or when either client cannot be determined (fail closed: no
+/// wrong report).
+pub(crate) fn rekeyed_for_merge(
+    sides: &LoadedSides,
+    rec: &confidant_core::record::Record,
+) -> Option<(String, String)> {
+    let ours_env = envelope::parse(&sides.ours_raw).ok()?;
+    let from = envelope::key_id_client(&ours_env.key_id).ok()?;
+    let to = crate::record_client_id(rec).ok()?;
+    if from != to {
+        Some((from, to))
+    } else {
+        None
+    }
+}
+
+/// Set up `--edit` scratch files (CD5, unix only).
+///
+/// Creates `.confidant/conflicts/<id>/` (0700) with `ours.md`, `theirs.md`,
+/// and `merged.md` (0600), pre-filling `merged.md` with the ours plaintext.
+/// `.confidant/` must already be git-ignored (checked via
+/// [`crate::ensure_corpus_gitignored`]); otherwise the edit is refused so
+/// plaintext can never be committed by accident.
+///
+/// Returns the guard (which zero-overwrites and removes everything on
+/// drop) and the path to `merged.md` for the editor.
+#[cfg(unix)]
+pub(crate) fn setup_edit_scratch(
+    root: &Path,
+    id: &RecordId,
+    sides: &LoadedSides,
+) -> anyhow::Result<(ScratchGuard, PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    crate::ensure_corpus_gitignored(root).map_err(anyhow::Error::new)?;
+
+    let dir = root
+        .join(".confidant")
+        .join("conflicts")
+        .join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot create scratch dir {}: {e}",
+            dir.display()
+        )))
+    })?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot set permissions on {}: {e}",
+            dir.display()
+        )))
+    })?;
+
+    let ours_path = dir.join("ours.md");
+    let theirs_path = dir.join("theirs.md");
+    let merged_path = dir.join("merged.md");
+    // `merged.md` is pre-filled with the ours plaintext (CD5).
+    for (path, bytes) in [
+        (&ours_path, sides.ours_bytes.as_slice()),
+        (&theirs_path, sides.theirs_bytes.as_slice()),
+        (&merged_path, sides.ours_bytes.as_slice()),
+    ] {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::internal(format!(
+                    "cannot write scratch file {}: {e}",
+                    path.display()
+                )))
+            })?;
+        f.write_all(bytes).map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot write scratch file {}: {e}",
+                path.display()
+            )))
+        })?;
+        f.sync_all().map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot sync scratch file {}: {e}",
+                path.display()
+            )))
+        })?;
+    }
+
+    let guard = ScratchGuard::new(dir, vec![ours_path, theirs_path, merged_path.clone()]);
+    Ok((guard, merged_path))
+}
+
+/// Resolve the operator's editor: `$VISUAL`, then `$EDITOR`.
+///
+/// Neither set is a usage error (exit 2, ADR-7).
+pub(crate) fn resolve_editor() -> anyhow::Result<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::Error::new(
+                DomainError::usage("no editor configured")
+                    .with_fix("Set $EDITOR or use --merged-file"),
+            )
+        })
+}
+
+/// Run the operator's editor on `path`.
+///
+/// A non-zero editor exit is an error; the caller must not apply anything.
+pub(crate) fn run_editor(path: &Path) -> anyhow::Result<()> {
+    let editor = resolve_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(path)
+        .status()
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not run editor '{editor}': {e}"
+            )))
+        })?;
+    if !status.success() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("editor exited with an error; the merge was not applied")
+                .with_fix("Fix the merge and retry, or use --merged-file"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +712,58 @@ mod tests {
             }
         }
         assert!(!temp_left, "no temp files should remain");
+    }
+
+    /// #455: `ScratchGuard` zero-overwrites before unlinking. The test
+    /// holds a read handle open across the drop; reading through it after
+    /// the drop must yield zeros (the file is gone from the directory).
+    #[test]
+    fn scratch_guard_zeroizes_before_unlink() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.md");
+        std::fs::write(&file, b"SENTINEL-SECRET-CONTENT").unwrap();
+
+        // Open a read handle before the guard drops.
+        let mut handle = std::fs::File::open(&file).unwrap();
+
+        {
+            let mut guard = ScratchGuard::new(dir.path().to_owned(), vec![file.clone()]);
+            // Explicit cleanup, as the success path does.
+            guard.cleanup();
+            // Drop is a no-op after explicit cleanup.
+        }
+
+        // The file is gone from the directory.
+        assert!(!file.exists(), "scratch file should be removed");
+        assert!(!dir.path().exists(), "scratch dir should be removed");
+
+        // The bytes the handle still sees were zeroed before the unlink.
+        handle.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        handle.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), b"SENTINEL-SECRET-CONTENT".len());
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "scratch bytes should be zeroed, got {buf:?}"
+        );
+    }
+
+    /// #455: `ScratchGuard` drop (without explicit cleanup) also zeroes
+    /// and removes.
+    #[test]
+    fn scratch_guard_drop_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.md");
+        std::fs::write(&file, b"SENTINEL-SECRET-CONTENT").unwrap();
+        {
+            let _guard = ScratchGuard::new(dir.path().to_owned(), vec![file.clone()]);
+        }
+        assert!(!file.exists(), "scratch file should be removed on drop");
+        assert!(
+            !dir.path().exists(),
+            "scratch dir should be removed on drop"
+        );
     }
 }
