@@ -65,6 +65,10 @@ pub enum ErrorKind {
     /// git-ignored. A corpus that silently omits records is worse than no
     /// corpus, so this fails closed instead of building a partial one.
     ReindexRefused,
+    /// An external pack directory failed validation (bad manifest, disallowed
+    /// file, symlink, size limit, or hash mismatch). Packs ship data and
+    /// agent-facing text, never executables.
+    PackInvalid,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -92,6 +96,7 @@ impl ErrorKind {
             Self::InboxRace => "E_INBOX_RACE",
             Self::InboxSkip => "E_INBOX_SKIP",
             Self::ReindexRefused => "E_REINDEX_REFUSED",
+            Self::PackInvalid => "E_PACK_INVALID",
             Self::Internal => "internal_error",
         }
     }
@@ -135,6 +140,10 @@ impl DomainError {
 
     pub fn config(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Config, message)
+    }
+
+    pub fn pack_invalid(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::PackInvalid, message)
     }
 
     pub fn spec_unsupported(spec: impl Display) -> Self {
