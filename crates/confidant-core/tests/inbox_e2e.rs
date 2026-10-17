@@ -304,6 +304,9 @@ fn check_failure_reverts_everything() {
 }
 
 #[test]
+// `std::os::unix` does not exist on Windows, and the repo's other
+// symlink tests are unix-only too.
+#[cfg(unix)]
 fn symlinked_vault_root_merges() {
     // Regression: git reports the physical toplevel, so a symlinked vault
     // root must not trip the "escapes the repository" guard.
