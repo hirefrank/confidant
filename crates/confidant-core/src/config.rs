@@ -317,11 +317,15 @@ impl VaultConfig {
                 }
                 continue;
             }
-            // Legacy nested-table form: `[checks.<pack>]` is accepted when
-            // `<pack>` is a known pack name (#433; was hard-coded to
-            // coaching/personal).
-            let first_segment = key.split('.').next().unwrap_or("");
-            if manifests.iter().any(|m| m.pack.name == first_segment) {
+            // Legacy bare pack key: `[checks] <pack> = <value>` is accepted
+            // when `<pack>` is a known pack name (#433; was hard-coded to
+            // coaching/personal). Only the key itself matches a pack name:
+            // a *leaf* under a pack name is not automatically known. A
+            // declared leaf (`coaching.paid_session_gap_days`) was already
+            // accepted above by the severity/int key checks; an undeclared
+            // one (`coaching.bogus`, or a typo) is still an unknown key
+            // rather than a silently ignored config line.
+            if manifests.iter().any(|m| m.pack.name == key.as_str()) {
                 continue;
             }
             findings.push(
@@ -612,6 +616,68 @@ bogus.key = 1
         assert!(findings
             .iter()
             .any(|f| f.message.contains("unknown [checks] key 'bogus.key'")));
+    }
+
+    #[test]
+    fn config_unknown_key_under_known_pack_rejected() {
+        // A leaf under a known pack name is not automatically known: a
+        // typo must still be an `E_CONFIG` unknown key rather than being
+        // silently accepted (or silently defaulted) (#433 review).
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+coaching.bogus = 1
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("unknown [checks] key 'coaching.bogus'")),
+            "expected an unknown-key finding, got {findings:?}"
+        );
+
+        // The same shape with an undeclared severity key.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+coaching.paid_session_gap_dayz = 5
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(
+            findings.iter().any(|f| f
+                .message
+                .contains("unknown [checks] key 'coaching.paid_session_gap_dayz'")),
+            "expected an unknown-key finding, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn config_legacy_nested_pack_table_declared_keys_still_accepted() {
+        // The legacy `[checks.<pack>]` table form keeps working for keys
+        // the pack actually declares (#433).
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks.coaching]
+paid_session_gap_days = 10
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.config_findings().is_empty(),
+            "legacy nested table should be accepted"
+        );
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(10));
+        assert_eq!(cfg.checks.paid_session_gap_days(), 10);
     }
 
     #[test]
