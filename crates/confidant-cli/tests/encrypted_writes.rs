@@ -4764,3 +4764,450 @@ fn resolve_show_stderr_has_no_sentinels() {
         stderr(&out)
     );
 }
+
+// =====================================================================
+// #454: `record resolve --take ours|theirs`
+// =====================================================================
+
+/// #454: build a vault where PERSON's record conflicts via `git rebase`
+/// (instead of `git merge`). Returns the harness with the vault mid-rebase.
+fn rebased_harness() -> Harness {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-BASE-bio."));
+
+    // Device A edits on a branch (`record edit` commits itself).
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let edited_a = write_file(
+        h._tmp.path(),
+        "edited_a.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-A-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (device A) failed: {}",
+        stderr(&out)
+    );
+
+    // Master edits differently.
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let edited_b = write_file(
+        h._tmp.path(),
+        "edited_b.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-B-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (master) failed: {}",
+        stderr(&out)
+    );
+
+    // Rebase device-a onto master → conflict (ours = master, theirs = device-a).
+    git(&h.vault, &["checkout", "-q", "device-a"]);
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rebase", "master"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the rebase to conflict");
+    h
+}
+
+/// Vault-relative path of PERSON's record file.
+fn person_rel() -> String {
+    format!("people/{PERSON}/profile.md")
+}
+
+/// `git show <rev>:<path>` bytes.
+fn git_show(vault: &Path, rev: &str, path: &str) -> Vec<u8> {
+    Command::new("git")
+        .current_dir(vault)
+        .args(["show", &format!("{rev}:{path}")])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .stdout
+}
+
+/// Staged paths (`git diff --cached --name-only`).
+fn staged_paths(vault: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .current_dir(vault)
+        .args(["diff", "--cached", "--name-only"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.to_owned())
+        .collect()
+}
+
+/// #454: `--take ours` installs the ours bytes exactly and stages the file.
+/// Ours is HEAD (device B's edit in the merge harness).
+#[test]
+fn take_ours_installs_ours_bytes_and_stages() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let ours_bytes = git_show(&h.vault, "HEAD", &rel);
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        ours_bytes,
+        "installed bytes differ from the ours side"
+    );
+    // The conflict is resolved: no unmerged paths remain. (`git diff
+    // --cached` is empty here because ours is byte-identical to HEAD, so
+    // the unmerged-path check is the meaningful assertion.)
+    assert_no_unmerged(&h.vault, &rel);
+}
+
+/// `git status --porcelain` shows no unmerged (`UU`) entry for `rel`.
+fn assert_no_unmerged(vault: &Path, rel: &str) {
+    let out = Command::new("git")
+        .current_dir(vault)
+        .args(["status", "--porcelain"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !status
+            .lines()
+            .any(|l| l.starts_with("UU") && l.contains(rel)),
+        "unmerged path remains: {status}"
+    );
+}
+
+/// #454: `--take theirs` installs the theirs bytes exactly and stages the file.
+/// Theirs is the device-a branch in the merge harness.
+#[test]
+fn take_theirs_installs_theirs_bytes_and_stages() {
+    let h = conflicted_harness();
+    let rel = person_rel();
+    let theirs_bytes = git_show(&h.vault, "device-a", &rel);
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--take",
+            "theirs",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take theirs failed: {}",
+        stderr(&out)
+    );
+
+    assert_eq!(
+        std::fs::read(h.vault.join(&rel)).unwrap(),
+        theirs_bytes,
+        "installed bytes differ from the theirs side"
+    );
+    assert!(
+        staged_paths(&h.vault).iter().any(|p| p == &rel),
+        "path not staged"
+    );
+}
+
+/// #454: after `--take`, `git commit` completes the merge and `check` is clean.
+#[test]
+fn take_then_merge_continue_makes_clean_vault() {
+    let h = conflicted_harness();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+
+    git(&h.vault, &["commit", "--no-edit", "-q"]);
+
+    let out = h.cmd(&["check", "--no-input"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "check failed after merge: {}",
+        stderr(&out)
+    );
+}
+
+/// #454: `--take` never creates a commit (CD6: stage only).
+#[test]
+fn take_creates_no_commit() {
+    let h = conflicted_harness();
+    let head_before = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .stdout;
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+
+    let head_after = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(head_before, head_after, "take created a commit");
+    // Sanity: the conflict was resolved (proves the take did something).
+    assert_no_unmerged(&h.vault, &person_rel());
+}
+
+/// #454: during a rebase, the next-step hint is `git rebase --continue`.
+#[test]
+fn take_during_rebase_prints_rebase_continue() {
+    let h = rebased_harness();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("git rebase --continue"),
+        "missing rebase hint: {text}"
+    );
+}
+
+/// #454: `--take` refuses when a side cannot be decrypted here (CD7).
+#[test]
+fn take_refuses_when_other_side_unreadable() {
+    let h = conflicted_harness();
+
+    let out = h
+        .cmd_no_device_key(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "take without a key should fail");
+    let text = stderr(&out) + &stdout(&out);
+    assert!(
+        text.contains("ours") || text.contains("theirs"),
+        "error should name the unreadable side: {text}"
+    );
+    // The conflicted file is untouched.
+    let content = std::fs::read(h.vault.join(person_rel())).unwrap();
+    assert!(
+        String::from_utf8_lossy(&content).contains("<<<<<<<"),
+        "conflicted file was modified"
+    );
+}
+
+/// #454: `--take` on a record with no conflict is an error.
+#[test]
+fn take_refuses_non_conflicted_record() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-bio."));
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = stderr(&out) + &stdout(&out);
+    assert!(text.contains("no merge conflict"), "wrong error: {text}");
+}
+
+/// #454: `--take` refuses when a side's envelope names a different record.
+#[test]
+fn take_refuses_envelope_with_wrong_id() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    h.init_client(PERSON2);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-P1-bio."));
+    let input2 = write_file(
+        h._tmp.path(),
+        "person2.md",
+        &person_md(PERSON2, "Ada Example", "SENTINEL-P2-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input2.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record add PERSON2 failed: {}",
+        stderr(&out)
+    );
+
+    // Craft a conflicted file: ours names PERSON, theirs names PERSON2.
+    let path1 = h.vault.join(format!("people/{PERSON}/profile.md"));
+    let env1 = String::from_utf8_lossy(&std::fs::read(&path1).unwrap()).into_owned();
+    let env2 = String::from_utf8_lossy(
+        &std::fs::read(h.vault.join(format!("people/{PERSON2}/profile.md"))).unwrap(),
+    )
+    .into_owned();
+    fn ensure_nl(mut s: String) -> String {
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s
+    }
+    std::fs::write(
+        &path1,
+        format!(
+            "<<<<<<< HEAD\n{}=======\n{}>>>>>>> branch\n",
+            ensure_nl(env1),
+            ensure_nl(env2),
+        ),
+    )
+    .unwrap();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "take with wrong-id side should fail");
+    let text = stderr(&out) + &stdout(&out);
+    assert!(
+        text.contains("different record"),
+        "wrong id not refused: {text}"
+    );
+}
+
+/// #454: `--take` leaves no temp files behind.
+#[test]
+fn take_leaves_no_temp_files() {
+    let h = conflicted_harness();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+
+    let temps: Vec<_> = walk(&h.vault)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".confidant-tmp-")
+        })
+        .collect();
+    assert!(temps.is_empty(), "temp files left: {temps:?}");
+}
+
+/// #454: `--take` never prints decrypted content.
+#[test]
+fn take_does_not_print_plaintext() {
+    let h = conflicted_harness();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take ours failed: {}",
+        stderr(&out)
+    );
+    let combined = stdout(&out) + &stderr(&out);
+    assert!(
+        !combined.contains("SENTINEL-"),
+        "plaintext leaked: {combined}"
+    );
+}
+
+/// #454: `--take --json` shape.
+#[test]
+fn take_json_shape() {
+    let h = conflicted_harness();
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--take",
+            "theirs",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --take --json failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "record-resolve");
+    assert_eq!(v["action"], "take");
+    assert_eq!(v["side"], "theirs");
+    assert_eq!(v["staged"], true);
+    assert_eq!(v["next"], "git merge --continue");
+    assert!(
+        v["path"].as_str().unwrap().contains(PERSON),
+        "path missing: {v}"
+    );
+}
