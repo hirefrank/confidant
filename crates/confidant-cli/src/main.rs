@@ -3316,6 +3316,23 @@ fn cmd_record_resolve(
         // git step. Both sides were decrypted by `load_sides`, so the
         // operator has seen what they discard (CD7).
         let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        // #465: `--dry-run` verifies both sides are decryptable (same
+        // CD7 read the real write needs) but writes nothing.
+        if cli.dry_run {
+            return print_resolve_dry_run(
+                cli,
+                root,
+                &id,
+                "take",
+                &sides.path,
+                ResolveDryRunDetail {
+                    side: Some(side.name()),
+                    merged_file: None,
+                    from_inbox: None,
+                    next: None,
+                },
+            );
+        }
         let outcome = record_resolve::take_side(root, cli.no_input, &sides, side)?;
         if cli.json {
             print_json(&ok_envelope(
@@ -3385,10 +3402,45 @@ fn cmd_record_resolve(
             ))));
         }
         let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+        // #465: `--dry-run` runs the full read-only validation above but
+        // stops before the re-encrypt/install step.
+        if cli.dry_run {
+            return print_resolve_dry_run(
+                cli,
+                root,
+                &id,
+                "merged-file",
+                &sides.path,
+                ResolveDryRunDetail {
+                    side: None,
+                    merged_file: Some(&canonical),
+                    from_inbox: None,
+                    next: None,
+                },
+            );
+        }
         let outcome = record_resolve::apply_merge(root, cli.no_input, &vault, &prepared)?;
         return print_merge_result(cli, root, &id, &outcome, rekeyed);
     }
     if edit {
+        // #465: `--dry-run --edit` creates no scratch and installs nothing;
+        // `load_sides` is the same decrypt check the real edit would do.
+        if cli.dry_run {
+            let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+            return print_resolve_dry_run(
+                cli,
+                root,
+                &id,
+                "edit",
+                &sides.path,
+                ResolveDryRunDetail {
+                    side: None,
+                    merged_file: None,
+                    from_inbox: None,
+                    next: None,
+                },
+            );
+        }
         return cmd_resolve_edit(cli, root, &vault, &id, id_raw);
     }
     // Unreachable: clap's ArgGroup requires exactly one resolve action.
@@ -3488,6 +3540,23 @@ fn cmd_record_resolve_from_inbox(
                 // The file is already the ours side: nothing to write and
                 // nothing to stage. Point at `inbox --discard` — otherwise
                 // the item would conflict forever.
+                if cli.dry_run {
+                    // #465: even this no-write action reports `dry_run`
+                    // rather than implying the item was consumed.
+                    return print_resolve_dry_run(
+                        cli,
+                        root,
+                        id,
+                        "take",
+                        &sides.path,
+                        ResolveDryRunDetail {
+                            side: Some("ours"),
+                            merged_file: None,
+                            from_inbox: Some(stem),
+                            next: Some(&format!("confidant inbox --discard {stem}")),
+                        },
+                    );
+                }
                 if cli.json {
                     print_json(&ok_envelope(
                         Some(root),
@@ -3540,6 +3609,23 @@ fn cmd_record_resolve_from_inbox(
                     ))));
                 }
                 let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+                // #465: `--dry-run` runs the read-only validation above
+                // (including the trust gate) but writes and stages nothing.
+                if cli.dry_run {
+                    return print_resolve_dry_run(
+                        cli,
+                        root,
+                        id,
+                        "take",
+                        &sides.path,
+                        ResolveDryRunDetail {
+                            side: Some("theirs"),
+                            merged_file: None,
+                            from_inbox: Some(stem),
+                            next: None,
+                        },
+                    );
+                }
                 let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
                 return print_merge_result(cli, root, id, &outcome, rekeyed);
             }
@@ -3580,10 +3666,44 @@ fn cmd_record_resolve_from_inbox(
             ))));
         }
         let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+        // #465: `--dry-run` stops before the re-encrypt/install step; the
+        // validation above is read-only.
+        if cli.dry_run {
+            return print_resolve_dry_run(
+                cli,
+                root,
+                id,
+                "merged-file",
+                &sides.path,
+                ResolveDryRunDetail {
+                    side: None,
+                    merged_file: Some(&canonical),
+                    from_inbox: Some(stem),
+                    next: None,
+                },
+            );
+        }
         let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
         return print_merge_result(cli, root, id, &outcome, rekeyed);
     }
     if edit {
+        // #465: `--dry-run --edit` writes no scratch and installs nothing;
+        // the editor path is the same otherwise (#457).
+        if cli.dry_run {
+            return print_resolve_dry_run(
+                cli,
+                root,
+                id,
+                "edit",
+                &sides.path,
+                ResolveDryRunDetail {
+                    side: None,
+                    merged_file: None,
+                    from_inbox: Some(stem),
+                    next: None,
+                },
+            );
+        }
         return cmd_resolve_edit_from_inbox(cli, root, vault, id, id_raw, &sides);
     }
     // Unreachable: clap's ArgGroup requires exactly one resolve action.
@@ -3693,6 +3813,99 @@ fn print_merge_result(
             println!("rekeyed {id}: {from} -> {to}");
         }
         println!("Next: {}", outcome.next);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// #465: report what a `record resolve` write action would do instead of
+/// doing it, when the global `--dry-run` flag is set.
+///
+/// Callers reach this only after read-only validation (`load_sides`,
+/// `refuse_vault_path`, reading `--merged-file`, `prepare_record_write`):
+/// the dry run fails the same way the real run would, and by this point
+/// nothing has been written — no vault file, no index entry, no scratch,
+/// no inbox change (CD6: stage only, never commit — here not even that).
+struct ResolveDryRunDetail<'a> {
+    /// `--take <side>`: the side spelling as printed elsewhere.
+    side: Option<&'a str>,
+    /// `--merged-file`: the operator's local file (outside the vault).
+    merged_file: Option<&'a Path>,
+    /// `--from-inbox <stem>`: the item stem, for `inbox --discard` hints.
+    from_inbox: Option<&'a str>,
+    /// A follow-up command the real run would suggest.
+    next: Option<&'a str>,
+}
+
+fn print_resolve_dry_run(
+    cli: &Cli,
+    root: &Path,
+    id: &RecordId,
+    action: &str,
+    path: &Path,
+    detail: ResolveDryRunDetail<'_>,
+) -> anyhow::Result<ExitCode> {
+    if cli.json {
+        let mut obj = serde_json::json!({
+            "command": "record-resolve",
+            "dry_run": true,
+            "action": action,
+            "id": id.to_string(),
+            "path": path,
+            "staged": false,
+        });
+        let o = obj.as_object_mut().expect("json object literal");
+        if let Some(side) = detail.side {
+            o.insert("side".into(), serde_json::json!(side));
+        }
+        if let Some(merged_file) = detail.merged_file {
+            o.insert(
+                "merged_file".into(),
+                serde_json::json!(merged_file.display().to_string()),
+            );
+        }
+        if let Some(stem) = detail.from_inbox {
+            o.insert("from_inbox".into(), serde_json::json!(stem));
+        }
+        if let Some(next) = detail.next {
+            o.insert("next".into(), serde_json::json!(next));
+        }
+        print_json(&ok_envelope(Some(root), obj))?;
+    } else {
+        // Text mirrors the real action's wording; `nothing changed` is the
+        // operator-visible gap versus a real run.
+        if action == "take" && detail.side == Some("ours") {
+            println!(
+                "dry run — would keep the current version of {} ({}); nothing changed.",
+                id,
+                path.display()
+            );
+        } else if action == "take" {
+            println!(
+                "dry run — would keep the {} side of {} ({}); nothing changed.",
+                detail.side.unwrap_or("?"),
+                id,
+                path.display()
+            );
+        } else if action == "merged-file" {
+            println!(
+                "dry run — would install {} into {} ({}); nothing changed.",
+                detail
+                    .merged_file
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                id,
+                path.display()
+            );
+        } else {
+            println!(
+                "dry run — would open the merge for {} ({}) in an editor; nothing changed.",
+                id,
+                path.display()
+            );
+        }
+        if let Some(next) = detail.next {
+            println!("Next: {next}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
