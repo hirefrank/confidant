@@ -6184,7 +6184,7 @@ fn resolve_from_inbox_take_theirs_then_drain_skips_and_clears() {
     if inbox_bech32.is_empty() {
         return;
     }
-    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs"]);
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs", "--allow-unsigned"]);
     assert!(
         out.status.success(),
         "resolve --take failed: {}",
@@ -6231,7 +6231,7 @@ fn resolve_from_inbox_take_ours_then_discard_clears_item() {
     if inbox_bech32.is_empty() {
         return;
     }
-    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "ours"]);
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "ours", "--allow-unsigned"]);
     assert!(
         out.status.success(),
         "resolve --take failed: {}",
@@ -6276,7 +6276,7 @@ fn resolve_from_inbox_no_plaintext_in_stderr() {
     if inbox_bech32.is_empty() {
         return;
     }
-    for args in [&["--show"][..], &["--take", "ours"][..]] {
+    for args in [&["--show"][..], &["--take", "ours", "--allow-unsigned"][..]] {
         let out = resolve_from_inbox_cmd(&h, &inbox_bech32, args);
         assert!(out.status.success());
         let err = stderr(&out);
@@ -6304,5 +6304,130 @@ fn resolve_from_inbox_no_plaintext_in_stderr() {
     assert!(
         !err.contains("SENTINEL-MAIN-bio") && !err.contains("SENTINEL-INBOX-bio"),
         "stderr leaked plaintext: {err}"
+    );
+}
+
+/// #457: `--take theirs` without trusted signers refuses with
+/// `E_INBOX_UNTRUSTED` (the drain's trust gate applies to write actions).
+#[test]
+fn resolve_from_inbox_take_theirs_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs"]);
+    assert!(!out.status.success(), "resolve --take should have refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--take theirs --allow-unsigned` bypasses the trust gate.
+#[test]
+fn resolve_from_inbox_take_theirs_allow_unsigned_succeeds() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs", "--allow-unsigned"]);
+    assert!(
+        out.status.success(),
+        "resolve --take --allow-unsigned failed: {}",
+        stderr(&out)
+    );
+}
+
+/// #457: `--merged-file` without trusted signers refuses with
+/// `E_INBOX_UNTRUSTED`.
+#[test]
+fn resolve_from_inbox_merged_file_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let out = resolve_from_inbox_cmd(
+        &h,
+        &inbox_bech32,
+        &["--merged-file", merged.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "resolve --merged-file should have refused"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--merged-file --allow-unsigned` bypasses the trust gate.
+#[test]
+fn resolve_from_inbox_merged_file_allow_unsigned_succeeds() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let out = resolve_from_inbox_cmd(
+        &h,
+        &inbox_bech32,
+        &[
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--allow-unsigned",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "resolve --merged-file --allow-unsigned failed: {}",
+        stderr(&out)
+    );
+}
+
+/// #457: `--edit` without trusted signers refuses with `E_INBOX_UNTRUSTED`
+/// before the editor runs (the trust gate precedes all write actions).
+#[test]
+fn resolve_from_inbox_edit_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--edit"]);
+    assert!(!out.status.success(), "resolve --edit should have refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--show` stays read-only — no trust check, no `--allow-unsigned`
+/// needed (already covered by `resolve_from_inbox_show_both_sides`, which
+/// passes without the flag).
+#[test]
+fn resolve_from_inbox_show_needs_no_trust_gate() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    // `--show` without `--allow-unsigned` succeeds: the trust gate does not
+    // apply to the read-only action.
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--show"]);
+    assert!(
+        out.status.success(),
+        "resolve --show should not need the trust gate: {}",
+        stderr(&out)
     );
 }

@@ -506,6 +506,10 @@ enum RecordAction {
         /// Hand-merge in $VISUAL/$EDITOR with 0600 scratch files (see #455).
         #[arg(long, group = "resolve_action")]
         edit: bool,
+        /// Skip inbox signature verification for `--from-inbox` write
+        /// actions (same escape hatch as `inbox --allow-unsigned`).
+        #[arg(long)]
+        allow_unsigned: bool,
     },
 }
 
@@ -910,15 +914,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     take,
                     merged_file,
                     edit,
+                    allow_unsigned,
                 } => cmd_record_resolve(
                     &cli,
                     &root,
+                    user_config.as_ref(),
                     id,
                     from_inbox.as_deref(),
                     *show,
                     *take,
                     merged_file.as_deref(),
                     *edit,
+                    *allow_unsigned,
                 ),
             }
         }
@@ -3243,12 +3250,14 @@ fn cmd_record_show(
 fn cmd_record_resolve(
     cli: &Cli,
     root: &Path,
+    user_config: Option<&UserConfig>,
     id_raw: &str,
     from_inbox: Option<&str>,
     show: bool,
     take: Option<Side>,
     merged_file: Option<&Path>,
     edit: bool,
+    allow_unsigned: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     if vault.config.spec != confidant_core::SPEC_VERSION {
@@ -3269,6 +3278,7 @@ fn cmd_record_resolve(
             cli,
             root,
             &vault,
+            user_config,
             &id,
             id_raw,
             stem,
@@ -3276,6 +3286,7 @@ fn cmd_record_resolve(
             take,
             merged_file,
             edit,
+            allow_unsigned,
         );
     }
     if show {
@@ -3416,6 +3427,7 @@ fn cmd_record_resolve_from_inbox(
     cli: &Cli,
     root: &Path,
     vault: &confidant_core::vault::Vault,
+    user_config: Option<&UserConfig>,
     id: &RecordId,
     id_raw: &str,
     stem: &str,
@@ -3423,6 +3435,7 @@ fn cmd_record_resolve_from_inbox(
     take: Option<Side>,
     merged_file: Option<&Path>,
     edit: bool,
+    allow_unsigned: bool,
 ) -> anyhow::Result<ExitCode> {
     let decrypt = inbox_decrypt_closure()?;
     let sides =
@@ -3449,6 +3462,14 @@ fn cmd_record_resolve_from_inbox(
         }
         return Ok(ExitCode::SUCCESS);
     }
+    // Write actions run the drain's signed-tip trust check (#457): the
+    // inbox item's content is about to land in the encrypted record, and
+    // these actions can run without `--show` first. `--show` stays
+    // read-only above. Honors `--allow-unsigned` like the drain.
+    let trusted_signers = user_config
+        .map(|u| u.trust.signers.clone())
+        .unwrap_or_default();
+    confidant_core::verify_inbox_trust(root, &trusted_signers, allow_unsigned)?;
     if let Some(side) = take {
         match side {
             Side::Ours => {

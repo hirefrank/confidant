@@ -41,9 +41,9 @@ pub use id::RecordId;
 pub use inbox::inbox_decrypt;
 pub use inbox::{
     discard_inbox_items, queue_items, queue_signing_configured, read_inbox_item, run_inbox,
-    run_inbox_rotate, DecryptExistingFn, DecryptFn, EncryptFn, InboxItemContent, InboxKeys,
-    InboxOptions, InboxReport, InboxRotateOptions, InboxRotateOutcome, ItemOutcome, QueueItem,
-    SkippedItem, INBOX_BRANCH,
+    run_inbox_rotate, verify_inbox_trust, DecryptExistingFn, DecryptFn, EncryptFn,
+    InboxItemContent, InboxKeys, InboxOptions, InboxReport, InboxRotateOptions, InboxRotateOutcome,
+    ItemOutcome, QueueItem, SkippedItem, INBOX_BRANCH,
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};

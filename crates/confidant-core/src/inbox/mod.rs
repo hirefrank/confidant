@@ -270,6 +270,31 @@ pub fn read_inbox_item(
     })
 }
 
+/// Verify the inbox branch tip's signature provenance — the same trust
+/// check the drain runs before merging (#457).
+///
+/// Refuses with `E_INBOX_UNTRUSTED` when no trusted signers are configured
+/// and `allow_unsigned` is false; otherwise verifies that every item at the
+/// tip was introduced by a trusted signer. Used by
+/// `record resolve --from-inbox` write actions (`--take`, `--merged-file`,
+/// `--edit`); `--show` stays read-only without the check.
+pub fn verify_inbox_trust(
+    vault_root: &Path,
+    trusted_signers: &[String],
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    if trusted_signers.is_empty() && !allow_unsigned {
+        return Err(anyhow::Error::new(DomainError::inbox_untrusted(
+            "no [trust] signers configured; refusing to resolve from the inbox branch \
+             (configure signers in ~/.config/confidant/config.toml or pass --allow-unsigned)",
+        )));
+    }
+    let repo = git::toplevel(vault_root)?;
+    let tip = git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    trust::verify_inbox_signatures(&repo, &tip, trusted_signers)?;
+    Ok(())
+}
+
 /// Run the inbox: decrypt items on the `inbox` branch, `check` the merged
 /// vault, merge into the current branch, and clear the inbox.
 ///
