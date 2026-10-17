@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
 use crate::conflict::is_envelope_conflict;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
+use crate::packs::external as packs_external;
 use crate::packs::PackRegistry;
 use crate::paths::{self, EntryKind};
 use crate::record::{
@@ -94,14 +95,20 @@ pub struct Vault {
     /// Envelopes refused as tampered/corrupt by the content hook (spec 4).
     /// Never folded into `skipped_encrypted`.
     pub refused_envelopes: u32,
+    /// The vault's own pack registry: compiled packs plus the loaded
+    /// external packs (#438). Replaces #432's process-wide static.
+    pack_registry: PackRegistry,
+    /// External packs that failed to load, fail closed (PD12). Converted
+    /// to findings in `check.rs`; read commands ignore them.
+    pub pack_problems: Vec<packs_external::PackProblem>,
 }
 
 impl Vault {
-    /// The process-wide compiled pack registry (#432). A later issue makes
-    /// this per-vault once packs can load from disk (#438).
+    /// The vault's own pack registry (#438): compiled packs first, then
+    /// the loaded external packs. Per vault, replacing #432's
+    /// process-wide static.
     pub fn pack_registry(&self) -> &PackRegistry {
-        static REGISTRY: OnceLock<PackRegistry> = OnceLock::new();
-        REGISTRY.get_or_init(PackRegistry::compiled)
+        &self.pack_registry
     }
 }
 
@@ -143,7 +150,28 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     let mut config = VaultConfig::parse(&cfg_text)
         .map_err(|err| anyhow::Error::new(err.with_file("confidant.toml")))?;
 
-    let mut findings = config.config_findings();
+    // External packs (#438): resolve the vault's pack list against the
+    // compiled registry, the lockfile and the vendored directories.
+    // Built before `config_findings`, which must accept the `[checks]`
+    // keys the external manifests declare (#433). On an unsupported
+    // spec, external packs are not resolved at all: the spec finding
+    // already fails `check`, and loading would only stack noise.
+    let (pack_registry, pack_problems, external_manifests) = if config.spec == SPEC_VERSION {
+        let compiled = PackRegistry::compiled();
+        let load =
+            packs_external::load_external_packs(root, &config.spec, &config.packs, &compiled);
+        let mut registry = compiled;
+        for pack in &load.packs {
+            registry.register(*pack);
+        }
+        (registry, load.problems, load.manifests)
+    } else {
+        (PackRegistry::compiled(), Vec::new(), Vec::new())
+    };
+
+    let mut manifests = crate::packs::pack_manifests_for_config();
+    manifests.extend(external_manifests);
+    let mut findings = config.config_findings_with(&manifests);
     let mut records = BTreeMap::new();
     let mut path_ids = BTreeSet::new();
     let mut conflicted_ids = BTreeSet::new();
@@ -194,6 +222,8 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         path_ulids,
         skipped_encrypted,
         refused_envelopes,
+        pack_registry,
+        pack_problems,
     })
 }
 
@@ -421,6 +451,8 @@ fn flag_entry(ent: &paths::DirectoryEntry, child: &Path, findings: &mut Vec<Find
 fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
     let allowed = [
         "confidant.toml",
+        "confidant.lock",
+        "packs",
         "people",
         "orgs",
         "deals",

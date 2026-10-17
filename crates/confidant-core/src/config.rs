@@ -210,10 +210,11 @@ impl VaultConfig {
         self.config_findings_with(&manifests)
     }
 
-    /// `config_findings` with an explicit manifest list (#433). Lets tests
-    /// inject an extra manifest to prove the generic mechanism; #438 will
-    /// extend the manifest set with loaded external packs.
-    fn config_findings_with(
+    /// `config_findings` with an explicit manifest list (#433). The vault
+    /// load path calls this with the loaded external manifests appended
+    /// to the compiled ones (#438); tests inject an extra manifest to
+    /// prove the generic mechanism.
+    pub fn config_findings_with(
         &mut self,
         manifests: &[&crate::packs::manifest::PackManifest],
     ) -> Vec<Finding> {

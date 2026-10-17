@@ -5405,3 +5405,293 @@ fn check_body_only_conflict_keeps_record_and_refs_resolve() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// External packs (#438)
+// ---------------------------------------------------------------------------
+
+use confidant_core::packs::dir::read_pack_dir;
+
+/// Vendor a minimal valid external pack into `dir` and return the
+/// canonical tree hash the lockfile must pin (all fake data).
+fn install_external_pack(root: &Path, name: &str, version: &str, verb: &str) -> String {
+    let pack_dir = root.join(format!("packs/{name}@{version}"));
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        root,
+        &format!("packs/{name}@{version}/manifest.toml"),
+        &format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["W_{GREET_CODE}"]
+
+[pack]
+name = "{name}"
+version = "{version}"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[messages."W_{GREET_CODE}"]
+default = "stale greeting"
+
+[[verbs]]
+name = "{verb}"
+"#,
+            GREET_CODE = "GREET_STALE",
+        ),
+    );
+    write(
+        root,
+        &format!("packs/{name}@{version}/SKILL.md"),
+        &format!("# {name} pack.\n\nVerb `{verb}`: fake skill text.\n"),
+    );
+    write(
+        root,
+        &format!("packs/{name}@{version}/{version}.md"),
+        "Fake pack notes.\n",
+    );
+    read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash
+}
+
+/// Write a lockfile pinning `name@version` to `hash`.
+fn install_lockfile(root: &Path, name: &str, version: &str, hash: &str) {
+    write(
+        root,
+        "confidant.lock",
+        &format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"https://example.invalid/org/{name}.git\"\nrev = \"0123456789abcdef0123456789abcdef01234567\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    );
+}
+
+/// confidant.toml listing both the compiled pack and the external one.
+fn external_vault_toml(root: &Path, packs: &str, checks: &str) {
+    write(
+        root,
+        "confidant.toml",
+        &format!(
+            r#"spec = "0.1"
+packs = [{packs}]
+vault_id = "test-vault"
+
+[checks]
+as_of = "2026-10-08"
+{checks}
+"#
+        ),
+    );
+}
+
+/// #438: a vault listing an installed, hash-valid external pack checks
+/// clean; the pack's verbs and fields are owned by it exactly like a
+/// compiled pack's claims.
+#[test]
+fn external_pack_installed_checks_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 greet {ADA} kind:wave\n"),
+    );
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+
+    let json = report_json(dir.path(), None);
+    assert!(json["ok"].as_bool().unwrap(), "expected clean: {json}");
+    assert!(codes(&json).is_empty(), "{json:?}");
+    assert_eq!(json["summary"]["records"].as_u64().unwrap(), 1);
+}
+
+/// #438: a `[[pack]]` claim that collides with an enabled pack is
+/// `E_PACK_CONFLICT` — conflict detection spans compiled and external
+/// packs exactly as PD8 says (claims may not collide with an enabled
+/// pack; core verbs are refused at load by the manifest loader, see
+/// `external_rejects_core_verb`).
+#[test]
+fn external_pack_claiming_enabled_pack_verb_is_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let manifest = fs::read_to_string(dir.path().join("packs/example-pack@0.1/manifest.toml"));
+    let _ = manifest;
+    // Vendor a pack whose verb is core (`session`): PD8 limit.
+    let pack_dir = dir.path().join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/manifest.toml",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["W_EXAMPLE_CODE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[messages."W_EXAMPLE_CODE"]
+default = "stale"
+
+[[verbs]]
+name = "session"
+"#,
+    );
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n",
+    );
+    let hash = read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash;
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+
+    let json = report_json(dir.path(), None);
+    let found = codes(&json);
+    // The claim collides with coaching's `session`: E_PACK_CONFLICT, and
+    // the pack set is incoherent (nothing folds).
+    assert!(
+        found.contains(&"E_PACK_CONFLICT".to_string()),
+        "an enabled-pack verb collision must be E_PACK_CONFLICT: {json}"
+    );
+}
+
+/// #438: each failure kind reports its own stable code, without echoing
+/// the operator's pack name (privacy contract; the name review question
+/// is filed as `[pack-install-review]`).
+#[test]
+fn external_pack_problems_report_their_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+
+    // Hash mismatch: vendored file edited after install.
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/SKILL.md",
+        "# tampered skill.\n",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_HASH".to_string()),
+        "{json:?}"
+    );
+    let dumped = serde_json::to_string(&json).unwrap();
+    assert!(
+        !dumped.contains("example-pack"),
+        "pack name must not echo: {dumped}"
+    );
+
+    // Missing vendored dir.
+    fs::remove_dir_all(dir.path().join("packs/example-pack@0.1")).unwrap();
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_HASH".to_string()),
+        "{json:?}"
+    );
+
+    // No lockfile pin at all (confidant.toml lists it).
+    fs::remove_file(dir.path().join("confidant.lock")).unwrap();
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
+        "{json:?}"
+    );
+
+    // Wrong spec listed in the manifest (reinstall with mismatched pin).
+    let pack_dir = dir.path().join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/manifest.toml",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["W_GREET_STALE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["9.9"]
+
+[messages."W_GREET_STALE"]
+default = "stale greeting"
+
+[[verbs]]
+name = "greet"
+"#,
+    );
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n",
+    );
+    let hash = read_pack_dir(&pack_dir).unwrap().hash;
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_VERSION".to_string()),
+        "{json:?}"
+    );
+}
+
+/// #438: the vault scanner never treats `packs/**` as records — a
+/// person-shaped file inside a vendored pack is pack data, never a
+/// record.
+#[test]
+fn packs_dir_contents_are_not_records() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+    // A person-shaped file inside the vendored pack.
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/samples/fake-person.md",
+        "---\nid: p-01J9Z3K4QF0000000000000001\ntype: person\nname: Not A Record\n---\n\nNot a record.\n",
+    );
+    // Recompute the hash: the extra file changes it (and gets refused as
+    // an unlisted file, PD7) — so this fixture uses a directory that
+    // would fail load; the assertion is that the vault STILL checks
+    // clean of records: the pack is E_PACK_INVALID (extra file) but the
+    // file is never parsed as a record.
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    let json = report_json(dir.path(), None);
+    assert_eq!(
+        json["summary"]["records"].as_u64().unwrap(),
+        1,
+        "packs/** must not load as records: {json:?}"
+    );
+    let dumped = serde_json::to_string(&json).unwrap();
+    assert!(
+        !dumped.contains("Not A Record"),
+        "pack contents must not leak: {dumped}"
+    );
+}

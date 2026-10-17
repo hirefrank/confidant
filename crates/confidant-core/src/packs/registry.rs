@@ -29,6 +29,14 @@ impl std::fmt::Debug for PackRegistry {
 }
 
 impl PackRegistry {
+    /// Register one pack at load time (#438). External packs are leaked
+    /// per vault load and appended here; the compiled packs always come
+    /// first, so a compiled pack wins on the same `name@version` (PD14)
+    /// by construction of the loader.
+    pub fn register(&mut self, pack: &'static dyn Pack) {
+        self.packs.push(pack);
+    }
+
     /// The compiled packs, in `ALL_PACKS` order.
     pub fn compiled() -> Self {
         Self {
