@@ -12,11 +12,11 @@ use crate::ledger::parse_strict_date;
 pub const SPEC_VERSION: &str = "0.1";
 pub const MAX_GAP_DAYS: u64 = 3650;
 
-/// `[checks]` severity keys, from the compiled packs' manifests (#345).
+/// `[checks]` severity keys, from the pack manifests (#345, #433).
 /// `as_of` stays core-owned and is listed separately in `KNOWN_TOP_LEVEL`.
-fn known_severity_keys() -> Vec<&'static str> {
+fn known_severity_keys<'a>(manifests: &[&'a crate::packs::manifest::PackManifest]) -> Vec<&'a str> {
     let mut keys = Vec::new();
-    for m in crate::packs::pack_manifests() {
+    for m in manifests {
         for s in &m.checks.severity {
             // The manifest stores owned Strings; the keys are 'static
             // because the manifest itself lives for 'static.
@@ -26,10 +26,10 @@ fn known_severity_keys() -> Vec<&'static str> {
     keys
 }
 
-/// `[checks]` integer keys, from the compiled packs' manifests (#345).
-fn known_int_keys() -> Vec<&'static str> {
+/// `[checks]` integer keys, from the pack manifests (#345, #433).
+fn known_int_keys<'a>(manifests: &[&'a crate::packs::manifest::PackManifest]) -> Vec<&'a str> {
     let mut keys = Vec::new();
-    for m in crate::packs::pack_manifests() {
+    for m in manifests {
         for i in &m.checks.int {
             keys.push(i.key.as_str());
         }
@@ -38,10 +38,10 @@ fn known_int_keys() -> Vec<&'static str> {
 }
 
 /// Default for a `[checks]` integer key, from the pack manifest that
-/// declares it (#345). Panics on an unknown key: callers only ask about
+/// declares it (#345, #433). Panics on an unknown key: callers only ask about
 /// keys in `known_int_keys()`.
-fn int_key_default(key: &str) -> u64 {
-    for m in crate::packs::pack_manifests() {
+fn int_key_default(manifests: &[&crate::packs::manifest::PackManifest], key: &str) -> u64 {
+    for m in manifests {
         for i in &m.checks.int {
             if i.key == key {
                 return u64::try_from(i.default).expect("manifest int default fits in u64");
@@ -114,12 +114,12 @@ pub struct ChecksConfig {
     pub as_of: Option<String>,
     #[serde(flatten)]
     pub rules: BTreeMap<String, toml::Value>,
+    /// Resolved integer values for every declared `[checks]` int key,
+    /// keyed by the full dotted key (#433). Filled by `VaultConfig::parse`
+    /// (defaults from manifests) and updated by `config_findings()` (file
+    /// overrides with validation). Not serialized.
     #[serde(skip)]
-    pub gap_days: u64,
-    #[serde(skip)]
-    pub pps_lookback_days: u64,
-    #[serde(skip)]
-    pub date_upcoming_days: u64,
+    pub ints: BTreeMap<String, u64>,
 }
 
 impl ChecksConfig {
@@ -148,15 +148,21 @@ impl ChecksConfig {
     }
 
     pub fn paid_session_gap_days(&self) -> u64 {
-        self.gap_days
+        self.ints["coaching.paid_session_gap_days"]
     }
 
     pub fn pps_lookback_days(&self) -> u64 {
-        self.pps_lookback_days
+        self.ints["coaching.pps_lookback_days"]
     }
 
     pub fn date_upcoming_days(&self) -> u64 {
-        self.date_upcoming_days
+        self.ints["personal.date_upcoming_days"]
+    }
+
+    /// Generic accessor for any declared `[checks]` int key (#433).
+    /// Returns `None` for unknown keys.
+    pub fn int(&self, key: &str) -> Option<u64> {
+        self.ints.get(key).copied()
     }
 }
 
@@ -182,9 +188,15 @@ impl VaultConfig {
         if cfg.spec.trim().is_empty() {
             return Err(DomainError::config("confidant.toml is missing spec"));
         }
-        cfg.checks.gap_days = int_key_default("coaching.paid_session_gap_days");
-        cfg.checks.pps_lookback_days = int_key_default("coaching.pps_lookback_days");
-        cfg.checks.date_upcoming_days = int_key_default("personal.date_upcoming_days");
+        // Fill [checks] int defaults from the pack manifests (#433).
+        // `config_findings()` applies file overrides with validation.
+        let manifests = crate::packs::pack_manifests_for_config();
+        for m in &manifests {
+            for i in &m.checks.int {
+                let default = u64::try_from(i.default).expect("manifest int default fits in u64");
+                cfg.checks.ints.insert(i.key.clone(), default);
+            }
+        }
         Ok(cfg)
     }
 
@@ -194,6 +206,19 @@ impl VaultConfig {
 
     /// Semantic `[checks]` problems as `E_CONFIG` findings. Never panics.
     pub fn config_findings(&mut self) -> Vec<Finding> {
+        let manifests = crate::packs::pack_manifests_for_config();
+        self.config_findings_with(&manifests)
+    }
+
+    /// `config_findings` with an explicit manifest list (#433). Lets tests
+    /// inject an extra manifest to prove the generic mechanism; #438 will
+    /// extend the manifest set with loaded external packs.
+    fn config_findings_with(
+        &mut self,
+        manifests: &[&crate::packs::manifest::PackManifest],
+    ) -> Vec<Finding> {
+        let severity_keys = known_severity_keys(manifests);
+        let int_keys = known_int_keys(manifests);
         let mut findings = Vec::new();
         if let Some(as_of) = self.checks.as_of.as_deref() {
             if parse_iso_date(as_of).is_err() {
@@ -216,7 +241,7 @@ impl VaultConfig {
             if key == "as_of" || KNOWN_TOP_LEVEL.contains(&key.as_str()) {
                 continue;
             }
-            if known_severity_keys().contains(&key.as_str()) {
+            if severity_keys.contains(&key.as_str()) {
                 match self.checks.lookup(key) {
                     Some(toml::Value::String(s)) => {
                         if parse_severity_token(s).is_err() {
@@ -243,10 +268,9 @@ impl VaultConfig {
                 }
                 continue;
             }
-            if known_int_keys().contains(&key.as_str()) {
-                let default = int_key_default(key);
+            if int_keys.contains(&key.as_str()) {
+                let default = int_key_default(manifests, key);
                 let value = self.checks.lookup(key).cloned();
-                let dest = int_key_dest(&mut self.checks, key);
                 match value {
                     Some(toml::Value::Integer(n)) if n < 0 => {
                         findings.push(
@@ -257,7 +281,7 @@ impl VaultConfig {
                             )
                             .at_file("confidant.toml"),
                         );
-                        *dest = default;
+                        self.checks.ints.insert(key.clone(), default);
                     }
                     Some(toml::Value::Integer(n)) => {
                         let n = n as u64;
@@ -273,9 +297,9 @@ impl VaultConfig {
                                 .at_file("confidant.toml")
                                 .with_fix(format!("Use a value between 0 and {MAX_GAP_DAYS}")),
                             );
-                            *dest = MAX_GAP_DAYS;
+                            self.checks.ints.insert(key.clone(), MAX_GAP_DAYS);
                         } else {
-                            *dest = n;
+                            self.checks.ints.insert(key.clone(), n);
                         }
                     }
                     Some(_) => {
@@ -287,13 +311,21 @@ impl VaultConfig {
                             )
                             .at_file("confidant.toml"),
                         );
-                        *dest = default;
+                        self.checks.ints.insert(key.clone(), default);
                     }
                     None => {}
                 }
                 continue;
             }
-            if key == "coaching" || key == "personal" {
+            // Legacy bare pack key: `[checks] <pack> = <value>` is accepted
+            // when `<pack>` is a known pack name (#433; was hard-coded to
+            // coaching/personal). Only the key itself matches a pack name:
+            // a *leaf* under a pack name is not automatically known. A
+            // declared leaf (`coaching.paid_session_gap_days`) was already
+            // accepted above by the severity/int key checks; an undeclared
+            // one (`coaching.bogus`, or a typo) is still an unknown key
+            // rather than a silently ignored config line.
+            if manifests.iter().any(|m| m.pack.name == key.as_str()) {
                 continue;
             }
             findings.push(
@@ -307,6 +339,31 @@ impl VaultConfig {
             );
         }
 
+        // Empty `[checks.<name>]` tables produce no leaf keys above; reject
+        // them when `<name>` is not a known pack (#433).
+        for (top_key, value) in &self.checks.rules {
+            if matches!(value, toml::Value::Table(_))
+                && top_key != "as_of"
+                && !manifests.iter().any(|m| m.pack.name == top_key.as_str())
+            {
+                // Only report if no leaf keys were already reported (avoid
+                // duplicates when the table has content).
+                let prefix = format!("{top_key}.");
+                let has_leaf = seen.iter().any(|k| k.starts_with(&prefix));
+                if !has_leaf {
+                    findings.push(
+                        Finding::new(
+                            FindingCode::Config,
+                            Severity::Error,
+                            format!("unknown [checks] key '{top_key}'"),
+                        )
+                        .at_file("confidant.toml")
+                        .with_fix("See spec/0.1.md for the keys defined in 0.1"),
+                    );
+                }
+            }
+        }
+
         // [crypto] table: unknown keys and bad mode values are E_CONFIG.
         for problem in crate::crypto_mode::crypto_config_problems(self) {
             findings.push(
@@ -316,14 +373,6 @@ impl VaultConfig {
             );
         }
         findings
-    }
-}
-
-fn int_key_dest<'a>(checks: &'a mut ChecksConfig, key: &str) -> &'a mut u64 {
-    match key {
-        "coaching.pps_lookback_days" => &mut checks.pps_lookback_days,
-        "personal.date_upcoming_days" => &mut checks.date_upcoming_days,
-        _ => &mut checks.gap_days,
     }
 }
 
@@ -493,5 +542,218 @@ unknown_key = true
         assert_eq!(cfg.checks.paid_session_gap_days(), MAX_GAP_DAYS);
         assert!(findings.iter().any(|f| f.message.contains("warn")));
         assert!(findings.iter().any(|f| f.message.contains("unknown")));
+    }
+
+    #[test]
+    fn config_int_key_default_applies() {
+        // Vault with no [checks]: defaults come from the manifests (#433).
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.config_findings().is_empty());
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(45));
+        assert_eq!(cfg.checks.int("personal.date_upcoming_days"), Some(7));
+        // The accessors read from the same map.
+        assert_eq!(cfg.checks.paid_session_gap_days(), 45);
+        assert_eq!(cfg.checks.date_upcoming_days(), 7);
+    }
+
+    #[test]
+    fn config_int_key_override_and_cap() {
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+coaching.paid_session_gap_days = 3651
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(findings
+            .iter()
+            .any(|f| f.message.contains("exceeds the cap of 3650")));
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(3650));
+        assert_eq!(cfg.checks.paid_session_gap_days(), 3650);
+    }
+
+    #[test]
+    fn config_int_key_negative_is_error() {
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+personal.date_upcoming_days = -1
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(findings
+            .iter()
+            .any(|f| f.message.contains("must be non-negative")));
+        // Falls back to the manifest default.
+        assert_eq!(cfg.checks.int("personal.date_upcoming_days"), Some(7));
+        assert_eq!(cfg.checks.date_upcoming_days(), 7);
+    }
+
+    #[test]
+    fn config_unknown_key_still_rejected() {
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+bogus.key = 1
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(findings
+            .iter()
+            .any(|f| f.message.contains("unknown [checks] key 'bogus.key'")));
+    }
+
+    #[test]
+    fn config_unknown_key_under_known_pack_rejected() {
+        // A leaf under a known pack name is not automatically known: a
+        // typo must still be an `E_CONFIG` unknown key rather than being
+        // silently accepted (or silently defaulted) (#433 review).
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+coaching.bogus = 1
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("unknown [checks] key 'coaching.bogus'")),
+            "expected an unknown-key finding, got {findings:?}"
+        );
+
+        // The same shape with an undeclared severity key.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+coaching.paid_session_gap_dayz = 5
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(
+            findings.iter().any(|f| f
+                .message
+                .contains("unknown [checks] key 'coaching.paid_session_gap_dayz'")),
+            "expected an unknown-key finding, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn config_legacy_nested_pack_table_declared_keys_still_accepted() {
+        // The legacy `[checks.<pack>]` table form keeps working for keys
+        // the pack actually declares (#433).
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks.coaching]
+paid_session_gap_days = 10
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.config_findings().is_empty(),
+            "legacy nested table should be accepted"
+        );
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(10));
+        assert_eq!(cfg.checks.paid_session_gap_days(), 10);
+    }
+
+    #[test]
+    fn config_nested_pack_table_ignored() {
+        // Legacy `[checks.<pack>]` table form is accepted for known packs.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks.coaching]
+"#,
+        )
+        .unwrap();
+        assert!(cfg.config_findings().is_empty());
+
+        // Unknown pack names are rejected.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks.unknownpack]
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert!(findings
+            .iter()
+            .any(|f| f.message.contains("unknown [checks] key")));
+    }
+
+    #[test]
+    fn config_example_pack_key_works_generically() {
+        use crate::packs::manifest::{ChecksDecl, IntCheck, PackInfo, PackManifest};
+        use std::collections::BTreeMap;
+
+        // A test-only manifest for a hypothetical third pack (#433).
+        // Proves the [checks] machinery is generic, not per-pack.
+        let example_manifest = PackManifest {
+            manifest_version: 1,
+            record_types: Vec::new(),
+            balance_metrics: Vec::new(),
+            finding_codes: Vec::new(),
+            pack: PackInfo {
+                name: "example".to_string(),
+                version: "0.1".to_string(),
+                skill: "SKILL.md".to_string(),
+            },
+            verbs: Vec::new(),
+            fields: Vec::new(),
+            edge_kinds: Vec::new(),
+            checks: ChecksDecl {
+                severity: Vec::new(),
+                int: vec![IntCheck {
+                    key: "example.window_days".to_string(),
+                    default: 5,
+                }],
+            },
+            messages: BTreeMap::new(),
+        };
+
+        let mut manifests = crate::packs::pack_manifests_for_config();
+        manifests.push(&example_manifest);
+
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+vault_id = "abc"
+[checks]
+example.window_days = 10
+"#,
+        )
+        .unwrap();
+        // The key is accepted (no E_CONFIG) and the override is readable
+        // via the generic accessor.
+        let findings = cfg.config_findings_with(&manifests);
+        assert!(findings.is_empty());
+        assert_eq!(cfg.checks.int("example.window_days"), Some(10));
     }
 }
