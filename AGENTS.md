@@ -79,9 +79,11 @@ compile-only `check (windows-latest)` job
 (`cargo check --workspace --all-targets --all-features --locked`). That
 check exists because the unix job never compiles the `#[cfg(not(unix))]`
 arms, so a break there would otherwise reach `main` before anyone saw it.
-`macos-latest` and the full `windows-latest` test job run on push to
-`main`, a nightly schedule, and `workflow_dispatch`. Keep code portable
-across all three.
+It is **advisory**: it reports on every pull request but is not one of the
+required contexts, so a red result means "fix it before merging", not a
+blocked button. `macos-latest` and the full `windows-latest` test job run
+on push to `main`, a nightly schedule, and `workflow_dispatch`. Keep code
+portable across all three.
 
 Narrower loops while iterating:
 
