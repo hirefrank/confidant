@@ -23,10 +23,7 @@ use crate::config::{parse_iso_date, SPEC_VERSION};
 use crate::error::DomainError;
 use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
-use crate::packs::{
-    find_conflict, orphan_owners, resolve_enabled, OrphanOwners, Pack, PackState, ALL_PACKS,
-    CORE_EDGE_KINDS,
-};
+use crate::packs::{find_conflict, OrphanOwners, Pack, PackState, CORE_EDGE_KINDS};
 use crate::record::{parse_ref_id, parse_with_list, FrontmatterRef, RecordKind};
 use crate::vault::Vault;
 
@@ -338,7 +335,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         }
     }
 
-    let (enabled_packs, unknown_packs) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let (enabled_packs, unknown_packs) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     for _ in &unknown_packs {
         findings.push(
             Finding::new(
@@ -378,7 +375,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     }
 
     let known_verbs = known_verbs(&enabled_packs);
-    let orphans = orphan_owners(ALL_PACKS, &enabled_packs);
+    let orphans = vault.pack_registry().orphan_owners(&enabled_packs);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
@@ -468,7 +465,7 @@ pub fn pack_snapshots(
     vault: &Vault,
     as_of: NaiveDate,
 ) -> Vec<(&'static dyn Pack, Box<dyn PackState>)> {
-    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
     let mut findings = Vec::new();
     let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut findings);
@@ -597,7 +594,9 @@ fn check_verbs_and_refs(
                     _ => false,
                 };
                 if !mirrored_ok {
-                    let pack_shape = ALL_PACKS
+                    let pack_shape = vault
+                        .pack_registry()
+                        .all()
                         .iter()
                         .find(|p| p.verbs().contains(&e.verb.as_str()))
                         .and_then(|p| p.validate_verb_args(&e.verb, e));
@@ -638,7 +637,9 @@ fn check_verbs_and_refs(
                 .iter()
                 .find_map(|p| p.verb_id_type(e.verb.as_str()))
                 .or_else(|| {
-                    ALL_PACKS
+                    vault
+                        .pack_registry()
+                        .all()
                         .iter()
                         .find_map(|p| p.verb_id_type(e.verb.as_str()))
                 }),
@@ -1297,7 +1298,9 @@ fn check_edges(
                         .for_id(&rec.id)
                         .with_fix(format!("Enable {owner} or remove the edge")),
                     );
-                    symmetric = ALL_PACKS
+                    symmetric = vault
+                        .pack_registry()
+                        .all()
                         .iter()
                         .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind))
                         .map(|k| k.symmetric);

@@ -32,7 +32,6 @@ use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date, Arg, LedgerEntry};
-use confidant_core::packs::{resolve_enabled, ALL_PACKS};
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
@@ -1016,7 +1015,7 @@ fn resolve_cli_scope(
     raw: Option<&str>,
 ) -> Result<(PackScope, Vec<String>), DomainError> {
     let requested = raw.map(parse_pack_list);
-    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let scope = resolve_scope(requested.as_deref(), &enabled)?;
     let names = scope.names(&enabled);
     Ok((scope, names))
@@ -2300,7 +2299,7 @@ fn cmd_log_touch(
     fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     // Find the pack that owns the `touch` verb (#185/#323) — the same routing
     // `check` uses — instead of gating on a hardcoded pack name.
     let Some(owner) = enabled.iter().find(|p| p.verbs().contains(&"touch")) else {
@@ -5886,7 +5885,7 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
                 )));
             }
             if !names.iter().any(|n| n == name) {
-                let known = ALL_PACKS.iter().any(|p| p.name() == name);
+                let known = v.pack_registry().all().iter().any(|p| p.name() == name);
                 return Err(anyhow::Error::new(
                     DomainError::not_found(if known {
                         format!(

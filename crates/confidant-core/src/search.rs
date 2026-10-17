@@ -12,7 +12,6 @@ use crate::id::{
     PrefixedScan, RecordId,
 };
 use crate::ledger::ledger_line_verb;
-use crate::packs::{resolve_enabled, ALL_PACKS};
 use crate::record::{parse_ref_id, parse_with_list, unquote, FrontmatterRef, RecordKind};
 use crate::scope::{
     note_linkage_owners, owner_of_field, owners_of_ledger_text, record_owners, OwnerKey, PackScope,
@@ -226,7 +225,7 @@ pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
 
 impl<'a> Allowlist<'a> {
     fn build(vault: &'a Vault, scope: &PackScope) -> Self {
-        let (enabled, _) = resolve_enabled(&vault.config.packs, ALL_PACKS);
+        let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
         let linkage = note_linkage_owners(vault, &enabled);
         let mut by_path = BTreeMap::new();
         for rec in vault.records.values() {

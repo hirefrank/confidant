@@ -26,6 +26,9 @@ pub mod grammars;
 pub mod groups;
 pub mod manifest;
 pub mod personal;
+pub mod registry;
+
+pub use registry::PackRegistry;
 
 /// One edge kind a pack owns (#179). `name` is the `kind` front-matter
 /// value on an edge record; `symmetric` declares whether the relation
@@ -396,6 +399,59 @@ mod tests {
 
     fn registry() -> Vec<&'static dyn Pack> {
         vec![&COACHING, &TEST_PACK]
+    }
+
+    #[test]
+    fn registry_compiled_matches_all_packs() {
+        let names: Vec<&str> = PackRegistry::compiled()
+            .all()
+            .iter()
+            .map(|p| p.name())
+            .collect();
+        assert_eq!(names, vec!["coaching@0.1", "personal@0.1"]);
+        let all_names: Vec<&str> = ALL_PACKS.iter().map(|p| p.name()).collect();
+        assert_eq!(names, all_names);
+    }
+
+    #[test]
+    fn registry_resolve_enabled_dedups_and_reports_unknown() {
+        let registry = PackRegistry::compiled();
+        let names = vec![
+            "coaching@0.1".to_string(),
+            "coaching@0.1".to_string(),
+            "nope@9.9".to_string(),
+        ];
+        let (found, unknown) = registry.resolve_enabled(&names);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "coaching@0.1");
+        assert_eq!(unknown, vec!["nope@9.9".to_string()]);
+    }
+
+    #[test]
+    fn registry_orphan_owners_matches_free_function() {
+        let registry = PackRegistry::compiled();
+        let personal = registry
+            .all()
+            .iter()
+            .find(|p| p.name() == "personal@0.1")
+            .unwrap();
+        let enabled: Vec<&dyn Pack> = vec![*personal];
+        let via_method = registry.orphan_owners(&enabled);
+        let via_free = orphan_owners(ALL_PACKS, &enabled);
+        // Coaching verbs are orphans when only personal is enabled.
+        assert_eq!(via_method.verbs.get("open"), Some(&"coaching@0.1"));
+        assert_eq!(via_method.verbs.get("session"), Some(&"coaching@0.1"));
+        assert_eq!(via_method.verbs, via_free.verbs);
+        assert_eq!(via_method.record_types, via_free.record_types);
+        assert_eq!(via_method.fields, via_free.fields);
+        assert_eq!(via_method.balance_metrics, via_free.balance_metrics);
+        assert_eq!(via_method.edge_kinds, via_free.edge_kinds);
+    }
+
+    #[test]
+    fn registry_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PackRegistry>();
     }
 
     #[test]
