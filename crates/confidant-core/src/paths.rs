@@ -816,9 +816,15 @@ mod portable {
 
 #[cfg(test)]
 mod tests {
-    use super::{components, read_dir, read_to_string, resolve, write_replace, EntryKind};
+    use super::{components, read_to_string, write_replace};
     use std::fs;
     use std::path::Path;
+    // Only the `#[cfg(unix)]` tests below use these. Importing them
+    // unconditionally fails the Windows build of the test target: those
+    // tests are compiled out there, so the imports are unused and CI sets
+    // `-D warnings`.
+    #[cfg(unix)]
+    use super::{read_dir, resolve, EntryKind};
 
     #[test]
     fn rejects_parent_components() {
