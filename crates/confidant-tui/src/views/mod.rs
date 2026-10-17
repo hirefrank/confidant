@@ -5,6 +5,7 @@
 pub mod alert;
 pub mod check;
 pub mod confirm;
+pub mod conflict;
 pub mod context;
 pub mod diff;
 pub mod doctor;

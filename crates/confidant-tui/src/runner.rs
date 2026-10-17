@@ -28,6 +28,12 @@ pub trait Runner {
     /// `--no-input`, or `--vault` is injected. Used for skill `--cleanup`
     /// scripts, which are plain programs with their own flags.
     fn run_program(&self, program: &str, args: &[&str]) -> Result<RawOutput>;
+
+    /// Run the `confidant` binary interactively, inheriting the terminal's
+    /// stdin/stdout/stderr and without `--json`/`--no-input`. Used for
+    /// editor flows like `record resolve <id> --edit` (#455), where the
+    /// TUI suspends its alternate screen first. Returns the exit status.
+    fn run_confidant_interactive(&self, args: &[&str]) -> Result<i32>;
 }
 
 /// Real child-process runner that executes the resolved `confidant` binary.
@@ -131,6 +137,27 @@ impl Runner for ProcessRunner {
             stdout: output.stdout,
         })
     }
+
+    fn run_confidant_interactive(&self, args: &[&str]) -> Result<i32> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.stdin(Stdio::inherit());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        if let Some(vault) = &self.vault {
+            if !args.contains(&"--vault") {
+                cmd.arg("--vault").arg(vault);
+            }
+        }
+        cmd.args(args);
+
+        let status = cmd
+            .status()
+            .with_context(|| format!("failed to execute {}", self.bin.display()))?;
+        Ok(status.code().unwrap_or(1))
+    }
 }
 
 /// In-memory fake runner for deterministic unit and snapshot tests.
@@ -142,6 +169,8 @@ pub struct FakeRunner {
     fallback: Option<RawOutput>,
     calls: RefCell<Vec<Vec<String>>>,
     program_calls: RefCell<Vec<(String, Vec<String>)>>,
+    interactive_calls: RefCell<Vec<Vec<String>>>,
+    interactive_status: RefCell<i32>,
 }
 
 impl FakeRunner {
@@ -161,6 +190,8 @@ impl FakeRunner {
             }),
             calls: RefCell::new(Vec::new()),
             program_calls: RefCell::new(Vec::new()),
+            interactive_calls: RefCell::new(Vec::new()),
+            interactive_status: RefCell::new(0),
         }
     }
 
@@ -221,6 +252,16 @@ impl FakeRunner {
     pub fn recorded_program_calls(&self) -> Vec<(String, Vec<String>)> {
         self.program_calls.borrow().clone()
     }
+
+    /// Return all recorded argv slices passed to `run_confidant_interactive`.
+    pub fn recorded_interactive_calls(&self) -> Vec<Vec<String>> {
+        self.interactive_calls.borrow().clone()
+    }
+
+    /// Set the exit status returned by `run_confidant_interactive`.
+    pub fn set_interactive_status(&self, status: i32) {
+        *self.interactive_status.borrow_mut() = status;
+    }
 }
 
 impl Runner for FakeRunner {
@@ -267,5 +308,12 @@ impl Runner for FakeRunner {
             status: 1,
             stdout: Vec::new(),
         })
+    }
+
+    fn run_confidant_interactive(&self, args: &[&str]) -> Result<i32> {
+        self.interactive_calls
+            .borrow_mut()
+            .push(args.iter().map(|s| (*s).to_owned()).collect());
+        Ok(*self.interactive_status.borrow())
     }
 }
