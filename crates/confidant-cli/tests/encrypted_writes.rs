@@ -4300,3 +4300,467 @@ fn two_device_edit_conflict_is_reported_by_check() {
         stdout(&out)
     );
 }
+
+/// #453: build a vault where PERSON's record has a real two-device merge
+/// conflict. Device A and device B each `record edit` the same person with
+/// different sentinel bios; the merge conflicts. Returns the harness with
+/// the vault left mid-conflict.
+fn conflicted_harness() -> Harness {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-BASE-bio."));
+
+    // Device A edits on a branch (`record edit` commits itself).
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let edited_a = write_file(
+        h._tmp.path(),
+        "edited_a.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-A-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (device A) failed: {}",
+        stderr(&out)
+    );
+
+    // Device B edits differently on master.
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let edited_b = write_file(
+        h._tmp.path(),
+        "edited_b.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-B-bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record edit (device B) failed: {}",
+        stderr(&out)
+    );
+
+    // Merge → conflict (both sides rewrote the envelope).
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["merge", "--no-edit", "device-a"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the merge to conflict");
+    h
+}
+
+/// #453: `--show` prints both decrypted sides in full and changes nothing.
+#[test]
+fn resolve_show_prints_both_sides_and_changes_nothing() {
+    let h = conflicted_harness();
+    let before_status = {
+        let out = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["status", "--porcelain"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let before_walk = walk(&h.vault);
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --show failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("== ours ("), "missing ours header: {text}");
+    assert!(
+        text.contains("SENTINEL-B-bio"),
+        "missing ours body (HEAD=device B): {text}"
+    );
+    assert!(
+        text.contains("== theirs ("),
+        "missing theirs header: {text}"
+    );
+    assert!(
+        text.contains("SENTINEL-A-bio"),
+        "missing theirs body (device-a): {text}"
+    );
+
+    // Nothing changed: no files created, no .confidant/conflicts/.
+    let after_status = {
+        let out = Command::new("git")
+            .current_dir(&h.vault)
+            .args(["status", "--porcelain"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(before_status, after_status, "git status changed");
+    assert_eq!(before_walk, walk(&h.vault), "vault tree changed");
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        ".confidant/conflicts/ must not be created"
+    );
+}
+
+/// #453: `--json` shape has both sides with labels and the vault path.
+#[test]
+fn resolve_show_json_shape_and_vault_path() {
+    let h = conflicted_harness();
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--show",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --show --json failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], serde_json::json!(true));
+    assert_eq!(v["id"].as_str(), Some(PERSON));
+    assert!(
+        v["vault"].as_str().unwrap_or("").ends_with("vault"),
+        "vault path missing: {v}"
+    );
+    assert!(
+        v["path"].as_str().unwrap_or("").contains(PERSON),
+        "record path missing: {v}"
+    );
+    for side in ["ours", "theirs"] {
+        assert!(
+            v[side]["label"].as_str().is_some_and(|l| !l.is_empty()),
+            "{side} label missing: {v}"
+        );
+        assert!(
+            v[side]["text"].as_str().is_some_and(|t| !t.is_empty()),
+            "{side} text missing: {v}"
+        );
+    }
+    assert!(
+        v["ours"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SENTINEL-B-bio"),
+        "ours text wrong (HEAD=device B): {v}"
+    );
+    assert!(
+        v["theirs"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SENTINEL-A-bio"),
+        "theirs text wrong (device-a): {v}"
+    );
+}
+
+/// #453 (CD2): exactly one action flag is required; bare or doubled
+/// invocations are usage errors (exit 2).
+#[test]
+fn resolve_requires_exactly_one_action() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "bare resolve must exit 2");
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--show",
+            "--take",
+            "ours",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--show --take must exit 2: {}",
+        stderr(&out)
+    );
+
+    // Accepted-but-unimplemented flags are usage errors, not clap errors.
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--take must exit 2: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("not implemented yet"),
+        "wrong message: {}",
+        stderr(&out)
+    );
+}
+
+/// #453: a non-conflicted record errors without leaking content.
+#[test]
+fn resolve_show_non_conflicted_record_errors_without_content() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-PLAIN-bio."));
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must fail on a clean record");
+    let err = stderr(&out);
+    assert!(
+        err.contains("has no merge conflict"),
+        "wrong message: {err}"
+    );
+    assert!(
+        !err.contains("SENTINEL-PLAIN-bio"),
+        "plaintext leaked into stderr: {err}"
+    );
+    assert!(
+        !stdout(&out).contains("SENTINEL-PLAIN-bio"),
+        "plaintext leaked into stdout"
+    );
+}
+
+/// #453: a side whose envelope names a different record errors, naming the
+/// side and not the content.
+#[test]
+fn resolve_show_id_mismatch_in_a_side_errors() {
+    let h = conflicted_harness();
+    let rel = format!("people/{PERSON}/profile.md");
+    let raw = std::fs::read(h.vault.join(&rel)).unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    // Swap the envelope id in the ours side (first header block).
+    let tampered = text.replacen(&format!("id: {PERSON}"), &format!("id: {PERSON2}"), 1);
+    assert_ne!(tampered, text, "expected to find the id header");
+    std::fs::write(h.vault.join(&rel), tampered).unwrap();
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must fail on id mismatch");
+    let err = stderr(&out);
+    assert!(
+        err.contains("ours") && err.contains("different record"),
+        "must name the side: {err}"
+    );
+    assert!(
+        !err.contains("SENTINEL-A-bio") && !err.contains("SENTINEL-B-bio"),
+        "plaintext leaked: {err}"
+    );
+}
+
+/// #453 (CD7): with no device key, the failure names the side and prints
+/// no plaintext of either side.
+#[test]
+fn resolve_show_unreadable_side_names_the_side() {
+    let h = conflicted_harness();
+    let out = h
+        .cmd_no_device_key(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must fail without a device key");
+    let err = stderr(&out);
+    assert!(
+        err.contains("ours") || err.contains("theirs"),
+        "must name the failing side: {err}"
+    );
+    assert!(
+        !err.contains("SENTINEL-A-bio") && !err.contains("SENTINEL-B-bio"),
+        "plaintext leaked into stderr: {err}"
+    );
+    assert!(
+        !stdout(&out).contains("SENTINEL-A-bio") && !stdout(&out).contains("SENTINEL-B-bio"),
+        "plaintext leaked into stdout"
+    );
+}
+
+/// #453: a `no-ai: true` record is shown in full to the operator, while
+/// `find --json` still hides it from agents.
+#[test]
+fn resolve_show_no_ai_record_shown_to_operator_only() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(
+        &h,
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nSENTINEL-NOAI-bio.\n"
+        ),
+    );
+
+    // Conflict it like the other tests.
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let edited_a = write_file(
+        h._tmp.path(),
+        "edited_a.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nSENTINEL-NOAI-OURS-bio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit A failed: {}", stderr(&out));
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let edited_b = write_file(
+        h._tmp.path(),
+        "edited_b.md",
+        &format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\nno-ai: true\n---\n\nSENTINEL-NOAI-THEIRS-bio.\n"
+        ),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            PERSON,
+            "--file",
+            edited_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "edit B failed: {}", stderr(&out));
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["merge", "--no-edit", "device-a"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the merge to conflict");
+
+    // The operator sees both sides in full.
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --show failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("SENTINEL-NOAI-OURS-bio"),
+        "ours hidden: {text}"
+    );
+    assert!(
+        text.contains("SENTINEL-NOAI-THEIRS-bio"),
+        "theirs hidden: {text}"
+    );
+
+    // Agents still cannot see it via find.
+    let out = h
+        .cmd(&["find", "Ada", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("SENTINEL-NOAI"),
+        "no-ai content leaked to find: {}",
+        stdout(&out)
+    );
+}
+
+/// #453: nothing decrypted ever reaches stderr — success and error paths.
+#[test]
+fn resolve_show_stderr_has_no_sentinels() {
+    let h = conflicted_harness();
+
+    // Success path.
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !stderr(&out).contains("SENTINEL-"),
+        "sentinel in stderr on success: {}",
+        stderr(&out)
+    );
+
+    // Error paths.
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--show",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        !stderr(&out).contains("SENTINEL-"),
+        "sentinel in stderr on json success: {}",
+        stderr(&out)
+    );
+
+    // Bad id.
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            "p-01ZZZZZZZZZZZZZZZZZZZZZZ",
+            "--show",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        !stderr(&out).contains("SENTINEL-"),
+        "sentinel in stderr on bad id: {}",
+        stderr(&out)
+    );
+}

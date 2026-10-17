@@ -80,6 +80,13 @@ impl RecordDecryptor {
         Arc::new(move |path: &str, bytes: &[u8]| this.decrypt_file(path, bytes))
     }
 
+    /// One-shot decryption of a single record file's bytes, outside the
+    /// vault loader (used by `record resolve --show`). Same logic as the
+    /// hook path; the caller maps the outcome.
+    pub fn decrypt_bytes(&self, path: &str, bytes: &[u8]) -> ContentOutcome {
+        self.decrypt_file(path, bytes)
+    }
+
     /// Map one record file's raw bytes to a [`ContentOutcome`].
     ///
     /// 1. Not envelope-shaped → plaintext passthrough (today's behavior).

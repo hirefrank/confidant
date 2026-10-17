@@ -468,7 +468,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for forbidden in ["record_show", "record_edit", "for_edit", "show", "edit"] {
+        for forbidden in [
+            "record_show",
+            "record_edit",
+            "record_resolve",
+            "for_edit",
+            "show",
+            "edit",
+            "resolve",
+        ] {
             assert!(
                 !names.contains(&forbidden),
                 "{forbidden:?} is exposed over MCP: {names:?}"
