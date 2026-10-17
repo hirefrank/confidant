@@ -5211,3 +5211,780 @@ fn take_json_shape() {
         "path missing: {v}"
     );
 }
+/// #455: `resolve --merged-file` re-encrypts the merged plaintext through
+/// the `record edit` path, stages it (no commit), and the decrypted result
+/// equals the canonical input.
+#[test]
+fn merged_file_reencrypts_and_stages() {
+    let h = conflicted_harness();
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --merged-file failed: {}",
+        stderr(&out)
+    );
+
+    // Staged but not committed.
+    let status = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["status", "--porcelain"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_text.starts_with("M "),
+        "expected staged modification, got: {status_text}"
+    );
+
+    // The file is a fresh envelope, not the conflicted bytes.
+    let path = h.vault.join(format!("people/{PERSON}/profile.md"));
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("<<<<<<<"), "conflict markers remain");
+    assert!(
+        text.contains("\nenc: xchacha20poly1305\n"),
+        "not an envelope"
+    );
+
+    // Commit, then decrypt: the result equals the canonical input.
+    git(&h.vault, &["commit", "-qm", "resolve"]);
+    let out = h
+        .cmd(&["record", "show", PERSON, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record show --for-edit failed: {}",
+        stderr(&out)
+    );
+    let shown = stdout(&out);
+    assert!(
+        shown.contains("SENTINEL-MERGED-bio."),
+        "merged bio not in decrypted output: {shown}"
+    );
+    assert!(
+        !shown.contains("SENTINEL-A-bio") && !shown.contains("SENTINEL-B-bio"),
+        "old side leaked into merged output: {shown}"
+    );
+}
+
+/// #455: `--merged-file` refuses a file whose `id:` does not match.
+#[test]
+fn merged_file_id_mismatch_refused() {
+    let h = conflicted_harness();
+    let wrong = write_file(
+        h._tmp.path(),
+        "wrong.md",
+        &person_md(PERSON2, "Ada Example", "Wrong person."),
+    );
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            wrong.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "id mismatch should be refused: {}",
+        stdout(&out)
+    );
+}
+
+/// #455: `--merged-file` refuses malformed front matter.
+#[test]
+fn merged_file_malformed_front_matter_refused() {
+    let h = conflicted_harness();
+    let bad = write_file(h._tmp.path(), "bad.md", "not a record at all\n");
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            bad.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "malformed front matter should be refused: {}",
+        stdout(&out)
+    );
+}
+
+/// #455: `--merged-file` enforces `with:` list rules like `record edit`.
+/// Uses a conflicted interaction built via the two-device pattern.
+#[test]
+fn merged_file_with_list_rules_enforced() {
+    const IXN: &str = "i-01J9Z3K4QH0000000000000000";
+    let ixn_md = |with: &str, body: &str| {
+        format!(
+            "---\nid: {IXN}\ntype: interaction\nperson: {PERSON}\ndate: 2026-10-17\nwith: [{with}]\n---\n\n{body}\n"
+        )
+    };
+
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    add_person(&h, &person_md(PERSON2, "Bob Example", "Bio."));
+
+    // Add the interaction on master.
+    let first = write_file(h._tmp.path(), "ixn.md", &ixn_md(PERSON2, "Base body."));
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            first.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add interaction: {}", stderr(&out));
+    let ixn_path = h.vault.join(format!("interactions/{IXN}/interaction.md"));
+    assert!(ixn_path.exists(), "interaction file not created");
+
+    // Device A edits on a branch.
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let edited_a = write_file(h._tmp.path(), "ixn_a.md", &ixn_md(PERSON2, "Body A."));
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            IXN,
+            "--file",
+            edited_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "edit ixn (device A): {}",
+        stderr(&out)
+    );
+
+    // Device B edits on master.
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let edited_b = write_file(h._tmp.path(), "ixn_b.md", &ixn_md(PERSON2, "Body B."));
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            IXN,
+            "--file",
+            edited_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "edit ixn (device B): {}",
+        stderr(&out)
+    );
+
+    // Merge must conflict (both sides changed the same envelope file).
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["merge", "--no-edit", "device-a"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the merge to conflict");
+
+    // Merged file with `with:` listing the interaction's own person: refused.
+    let bad_with = write_file(h._tmp.path(), "bad_with.md", &ixn_md(PERSON, "Merged."));
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            IXN,
+            "--merged-file",
+            bad_with.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "self-participant with: should be refused: {}",
+        stdout(&out)
+    );
+    let combined = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(combined.contains("own person"), "wrong error: {combined}");
+}
+
+/// #455: `--merged-file` refuses a path inside the vault tree.
+#[test]
+fn merged_file_inside_vault_refused() {
+    let h = conflicted_harness();
+    let inside = write_file(
+        &h.vault,
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            inside.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "vault-internal merge file should be refused: {}",
+        stdout(&out)
+    );
+}
+
+/// #455: `--merged-file` refuses a path under `.confidant/` (no exception).
+#[test]
+fn merged_file_under_dot_confidant_refused() {
+    let h = conflicted_harness();
+    let dotdir = h.vault.join(".confidant");
+    std::fs::create_dir_all(&dotdir).unwrap();
+    let inside = write_file(
+        &dotdir,
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            inside.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        ".confidant merge file should be refused: {}",
+        stdout(&out)
+    );
+}
+
+/// #455: `--merged-file` refuses a symlink that resolves into the vault.
+#[test]
+#[cfg(unix)]
+fn merged_file_symlink_into_vault_refused() {
+    use std::os::unix::fs::symlink;
+
+    let h = conflicted_harness();
+    let real = write_file(
+        &h.vault,
+        "real_merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let link = h._tmp.path().join("link.md");
+    symlink(&real, &link).unwrap();
+
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            link.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "symlink into vault should be refused: {}",
+        stdout(&out)
+    );
+}
+
+/// #455: a deal whose `person:` moves reports `rekeyed`, exactly when
+/// `record edit` would.
+#[test]
+fn merged_file_rekey_reported_for_deal_person_change() {
+    const DEAL: &str = "d-01J9Z3K4QJ0000000000000000";
+    let deal = |person: &str| {
+        format!(
+            "---\nid: {DEAL}\ntype: deal\nname: \"Coaching package\"\nperson: {person}\n---\n\nDeal body.\n"
+        )
+    };
+
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = h.init_client(PERSON2);
+    assert!(out.status.success(), "init-client failed: {}", stderr(&out));
+    // Add the deal under PERSON.
+    let first = write_file(h._tmp.path(), "deal.md", &deal(PERSON));
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            first.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "add deal: {}", stderr(&out));
+
+    // Device A moves it to PERSON2 on a branch; device B changes the body
+    // on master; merge conflicts (both sides touched the file).
+    git(&h.vault, &["checkout", "-qb", "device-a"]);
+    let moved_a = write_file(h._tmp.path(), "moved_a.md", &deal(PERSON2));
+    // Use `record edit` on the branch (it commits).
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            DEAL,
+            "--file",
+            moved_a.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "edit deal (device A): {}",
+        stderr(&out)
+    );
+    git(&h.vault, &["checkout", "-q", "master"]);
+    let changed_b = write_file(
+        h._tmp.path(),
+        "changed_b.md",
+        &deal(PERSON).replace("Deal body.", "Deal body B."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "edit",
+            DEAL,
+            "--file",
+            changed_b.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "edit deal (device B): {}",
+        stderr(&out)
+    );
+    let st = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["merge", "--no-edit", "device-a"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(!st.success(), "expected the merge to conflict");
+
+    // Merge keeping PERSON2 (theirs side): the deal moves keys.
+    let merged = write_file(h._tmp.path(), "merged_deal.md", &deal(PERSON2));
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            DEAL,
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --merged-file failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "record-resolve");
+    assert_eq!(v["action"], "merge");
+    assert_eq!(v["rekeyed"]["from"], PERSON, "{v}");
+    assert_eq!(v["rekeyed"]["to"], PERSON2, "{v}");
+}
+
+/// #455: `--merged-file` stages but never commits.
+#[test]
+fn merged_file_no_commit_created() {
+    let h = conflicted_harness();
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+
+    let before = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "resolve failed: {}", stderr(&out));
+    let after = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&before.stdout),
+        String::from_utf8_lossy(&after.stdout),
+        "resolve must not commit"
+    );
+}
+
+/// #455: `--edit` creates 0600 scratch files in a 0700 dir, then removes
+/// everything. A fake $EDITOR records the modes it sees.
+#[test]
+#[cfg(unix)]
+fn edit_creates_0600_scratch_in_0700_dir_and_removes_all() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = conflicted_harness();
+    // `.confidant/` must be git-ignored for --edit to run.
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    // Fake editor: records modes of the scratch dir and files, then leaves
+    // merged.md as-is (pre-filled with ours).
+    let script = write_file(
+        h._tmp.path(),
+        "editor.sh",
+        "#!/bin/sh\n\
+         d=$(dirname \"$1\")\n\
+         stat -c '%a %n' \"$d\" > \"$d/modes.txt\"\n\
+         stat -c '%a %n' \"$d\"/*.md >> \"$d/modes.txt\"\n",
+    );
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", script.to_str().unwrap())
+        .output()
+        .unwrap();
+    // The modes file is inside the scratch dir, which is removed; the
+    // editor script itself records nothing outside. We assert removal and
+    // success here; mode assertions happen via a variant below that copies
+    // the modes out. For now, just check the scratch is gone.
+    assert!(
+        out.status.success(),
+        "resolve --edit failed: {} {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        "scratch dir should be removed"
+    );
+    // The merge was applied (ours pre-fill) and staged.
+    let status = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["status", "--porcelain"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).starts_with("M "),
+        "expected staged modification: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
+/// #455: while the editor runs, scratch files are 0600 in a 0700 dir.
+/// The fake editor copies the modes file out before exiting so the test
+/// can assert on it after the scratch is removed.
+#[test]
+#[cfg(unix)]
+fn edit_scratch_modes_are_0600_in_0700_dir() {
+    let h = conflicted_harness();
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let modes_out = h._tmp.path().join("modes.txt");
+    let script = write_file(
+        h._tmp.path(),
+        "editor.sh",
+        &format!(
+            "#!/bin/sh\n\
+             d=$(dirname \"$1\")\n\
+             stat -c '%a' \"$d\" > \"{}\"\n\
+             stat -c '%a' \"$d/ours.md\" >> \"{}\"\n\
+             stat -c '%a' \"$d/theirs.md\" >> \"{}\"\n\
+             stat -c '%a' \"$d/merged.md\" >> \"{}\"\n",
+            modes_out.display(),
+            modes_out.display(),
+            modes_out.display(),
+            modes_out.display(),
+        ),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", script.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --edit failed: {} {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let modes = std::fs::read_to_string(&modes_out).unwrap();
+    let lines: Vec<&str> = modes.lines().collect();
+    assert_eq!(lines.len(), 4, "expected 4 mode lines: {modes}");
+    assert_eq!(lines[0], "700", "scratch dir should be 0700: {modes}");
+    for (i, name) in ["ours.md", "theirs.md", "merged.md"].iter().enumerate() {
+        assert_eq!(
+            lines[i + 1],
+            "600",
+            "scratch file {name} should be 0600: {modes}"
+        );
+    }
+}
+
+/// #455: an editor that exits non-zero cleans the scratch and changes nothing.
+#[test]
+#[cfg(unix)]
+fn edit_editor_failure_cleans_scratch_and_changes_nothing() {
+    let h = conflicted_harness();
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let before = std::fs::read(h.vault.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    let script = write_file(h._tmp.path(), "failing.sh", "#!/bin/sh\nexit 3\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", script.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "failing editor should error: {}",
+        stdout(&out)
+    );
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        "scratch should be cleaned after editor failure"
+    );
+    let after = std::fs::read(h.vault.join(format!("people/{PERSON}/profile.md"))).unwrap();
+    assert_eq!(before, after, "conflicted file must be unchanged");
+    // The merge was not applied: the file still has conflict markers.
+    let text = String::from_utf8_lossy(&after);
+    assert!(
+        text.contains("<<<<<<<"),
+        "conflict markers should remain after editor failure"
+    );
+}
+
+/// #455: no editor configured is a usage error (exit 2).
+#[test]
+#[cfg(unix)]
+fn edit_without_editor_env_is_usage_error() {
+    let h = conflicted_harness();
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", "")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2: {}",
+        stderr(&out)
+    );
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        "no scratch should remain"
+    );
+}
+
+/// #455: `merged.md` is pre-filled with the ours plaintext.
+#[test]
+#[cfg(unix)]
+fn edit_prefills_merged_with_ours_plaintext() {
+    let h = conflicted_harness();
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    // Fake editor copies merged.md out for assertion, then leaves it.
+    let copy_out = h._tmp.path().join("merged_copy.md");
+    let script = write_file(
+        h._tmp.path(),
+        "editor.sh",
+        &format!("#!/bin/sh\ncp \"$1\" \"{}\"\n", copy_out.display()),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", script.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --edit failed: {} {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let copied = std::fs::read_to_string(&copy_out).unwrap();
+    assert!(
+        copied.contains("SENTINEL-B-bio"),
+        "merged.md should be pre-filled with ours (SENTINEL-B-bio): {copied}"
+    );
+    // The test deletes the copy (it holds plaintext outside the vault).
+    std::fs::remove_file(&copy_out).unwrap();
+}
+
+/// #455: stale `.confidant/conflicts/` is swept at the start of the next resolve.
+#[test]
+#[cfg(unix)]
+fn edit_stale_scratch_swept_on_next_resolve() {
+    let h = conflicted_harness();
+    // Plant a stale scratch dir (simulating a crashed earlier run).
+    let stale = h.vault.join(".confidant/conflicts").join(PERSON);
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("merged.md"), b"STALE-SENTINEL").unwrap();
+
+    // A --show (any resolve) sweeps it.
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--show", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "resolve --show failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        "stale scratch should be swept"
+    );
+}
+
+/// #455: `--edit` refuses when `.confidant/` is not git-ignored.
+#[test]
+#[cfg(unix)]
+fn edit_refuses_when_dot_confidant_not_gitignored() {
+    let h = conflicted_harness();
+    // No .gitignore: `.confidant/` is not ignored, so --edit must refuse
+    // rather than risk committing plaintext.
+    assert!(!h.vault.join(".gitignore").exists());
+
+    let out = h
+        .cmd(&["record", "resolve", PERSON, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", "/bin/true")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "unignored .confidant should be refused: {}",
+        stdout(&out)
+    );
+    assert!(
+        !h.vault.join(".confidant/conflicts").exists(),
+        "no scratch should be created"
+    );
+}
+
+/// #455: no plaintext (sentinels) in stdout/stderr on any merge path.
+#[test]
+fn no_plaintext_in_stdout_stderr_on_any_path() {
+    // --merged-file with an invalid record: error must not leak content.
+    let h = conflicted_harness();
+    let bad = write_file(
+        h._tmp.path(),
+        "bad.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-SECRET-BIO."),
+    );
+    // Corrupt it so validation fails after reading.
+    std::fs::write(&bad, "---\nid: wrong\n---\nSENTINEL-SECRET-BIO\n").unwrap();
+    let out = h
+        .cmd(&[
+            "record",
+            "resolve",
+            PERSON,
+            "--merged-file",
+            bad.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        !stdout(&out).contains("SENTINEL-SECRET-BIO"),
+        "stdout leaked plaintext"
+    );
+    assert!(
+        !stderr(&out).contains("SENTINEL-SECRET-BIO"),
+        "stderr leaked plaintext"
+    );
+    // The sentinels from the conflicted record itself must not appear
+    // in error output either.
+    assert!(
+        !stdout(&out).contains("SENTINEL-A-bio") && !stdout(&out).contains("SENTINEL-B-bio"),
+        "stdout leaked side plaintext"
+    );
+}

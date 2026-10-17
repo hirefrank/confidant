@@ -484,10 +484,10 @@ enum RecordAction {
         /// Keep one side's version byte for byte, staged but not committed.
         #[arg(long, value_enum, group = "resolve_action")]
         take: Option<Side>,
-        /// Hand-merge from a file (not yet implemented; see #455).
+        /// Hand-merge from a file outside the vault (see #455).
         #[arg(long, group = "resolve_action")]
         merged_file: Option<PathBuf>,
-        /// Hand-merge in $EDITOR (not yet implemented; see #455).
+        /// Hand-merge in $VISUAL/$EDITOR with 0600 scratch files (see #455).
         #[arg(long, group = "resolve_action")]
         edit: bool,
     },
@@ -1350,7 +1350,7 @@ fn refuse_reindex(
 /// `.confidant/` is git-ignored (it holds the corpus, the QMD store, and the
 /// build temp dir). git absent or the vault not being a repo is a note, not
 /// a refusal (there is nothing to commit with), matching the skill.
-fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
+pub(crate) fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
     let git_dir = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -3192,6 +3192,9 @@ fn cmd_record_resolve(
             "`record resolve` takes an opaque record id; use `confidant find <name>` to look one up",
         )
     })?;
+    // Sweep stale `--edit` scratch from a crashed earlier run (CD5). This
+    // runs for every resolve action, not just `--edit`.
+    record_resolve::sweep_stale_scratch(root);
     if show {
         let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
         let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
@@ -3244,51 +3247,239 @@ fn cmd_record_resolve(
         }
         return Ok(ExitCode::SUCCESS);
     }
-    // Only --merged-file/--edit remain unimplemented (#455); the flags are
-    // accepted so the interface does not change when they land.
-    let what = if merged_file.is_some() {
-        "--merged-file"
-    } else if edit {
-        "--edit"
-    } else {
-        "this action"
-    };
-    Err(anyhow::Error::new(DomainError::usage(format!(
-        "{what} is not implemented yet; `record resolve <id> --show|--take` is available (see #455)"
-    ))))
+    // Only --merged-file/--edit remain; the flags are accepted so the
+    // interface does not change when they land.
+    if let Some(merged_path) = merged_file {
+        // #455: hand-merge from a file outside the vault. The operator's
+        // file is validated like `record edit --file` and re-encrypted
+        // through the same path; it is staged, never committed (CD6).
+        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        // CD5: refuse ANY path inside the vault tree, no `.confidant/`
+        // exception, so a plaintext merge file cannot be committed by
+        // accident.
+        let canonical = record_resolve::refuse_vault_path(root, merged_path)?;
+        let text = std::fs::read_to_string(&canonical).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read {}: {e}",
+                canonical.display()
+            )))
+        })?;
+        let provisional = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "record.md".to_owned());
+        let prepared = prepare_record_write(
+            root,
+            &vault,
+            PrepareSpec {
+                id: &id,
+                id_raw,
+                text: &text,
+                provisional: &provisional,
+                summary: format!("record-resolve {id}"),
+                canonical_prefix: "record-resolve/v1",
+                allow_conflict: true,
+            },
+        )?;
+        // Defense in depth: the merged record must name the conflicted
+        // file's own path.
+        if prepared.rel != sides.path {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "the merged record belongs at {}, not {}",
+                prepared.rel.display(),
+                sides.path.display()
+            ))));
+        }
+        let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+        let outcome = record_resolve::apply_merge(root, cli.no_input, &vault, &prepared)?;
+        return print_merge_result(cli, root, &id, &outcome, rekeyed);
+    }
+    if edit {
+        return cmd_resolve_edit(cli, root, &vault, &id, id_raw);
+    }
+    // Unreachable: clap's ArgGroup requires exactly one resolve action.
+    Err(anyhow::Error::new(DomainError::usage(
+        "choose one of --show, --take, --merged-file, --edit",
+    )))
 }
 
-/// #216: replace an existing main record's file from a markdown file.
+/// Print the `record resolve --merged-file` / `--edit` result.
+fn print_merge_result(
+    cli: &Cli,
+    root: &Path,
+    id: &RecordId,
+    outcome: &record_resolve::MergeOutcome,
+    rekeyed: Option<(String, String)>,
+) -> anyhow::Result<ExitCode> {
+    if cli.json {
+        let mut obj = serde_json::json!({
+            "command": "record-resolve",
+            "action": "merge",
+            "id": id.to_string(),
+            "path": outcome.path,
+            "staged": true,
+            "next": outcome.next,
+        });
+        if let Some((from, to)) = &rekeyed {
+            obj["rekeyed"] = serde_json::json!({ "from": from, "to": to });
+        }
+        print_json(&ok_envelope(Some(root), obj))?;
+    } else {
+        println!("Merged {} ({}); staged.", id, outcome.path.display());
+        if let Some((from, to)) = &rekeyed {
+            println!("rekeyed {id}: {from} -> {to}");
+        }
+        println!("Next: {}", outcome.next);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// #455: `record resolve <id> --edit` — hand-merge in the operator's
+/// editor with 0600 scratch files under `.confidant/conflicts/<id>/`.
 ///
-/// The write goes through [`apply_record_write`], so in an encrypted vault
-/// it encrypts, runs `check` before the commit, and makes one commit —
-/// exactly like `record add`. The target path is derived from the record's
-/// id, never from the path the caller passed, and the file's own `id:` must
-/// match the id argument so a wrong file cannot silently clobber a record.
-fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
-    let vault = vault_or!(root, cli.json);
-    // Parse the id the same way every other positional record id is parsed:
-    // a malformed argument is a usage error (exit 2, ADR-7), and parsing
-    // canonicalises a lowercase ULID instead of rejecting it.
-    let id = RecordId::parse(id_raw).map_err(|_| {
-        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
-            "`record edit` takes an opaque record id; use `confidant find <name>` to look one up",
-        )
-    })?;
-    reject_unsupported_prefix(&id)?;
-    let text = std::fs::read_to_string(file).map_err(|e| {
+/// Both sides are decrypted to scratch (CD7 already held by `load_sides`);
+/// `merged.md` is pre-filled with the ours plaintext. After the editor
+/// exits, the merged text goes through the shared validate → re-encrypt →
+/// stage path. Scratch is zero-overwritten and removed on every exit path
+/// via `ScratchGuard` (explicit on success, drop on error).
+#[cfg(unix)]
+fn cmd_resolve_edit(
+    cli: &Cli,
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    id: &RecordId,
+    id_raw: &str,
+) -> anyhow::Result<ExitCode> {
+    let sides = record_resolve::load_sides(root, &vault.config.vault_id, id)?;
+    // Fail fast if no editor is configured, before creating any scratch
+    // files (which would hold plaintext).
+    record_resolve::resolve_editor()?;
+    let (mut guard, merged_path) = record_resolve::setup_edit_scratch(root, id, &sides)?;
+    // An editor failure returns here; the guard drops and cleans up.
+    record_resolve::run_editor(&merged_path)?;
+    let text = std::fs::read_to_string(&merged_path).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
-            file.display()
+            merged_path.display()
         )))
     })?;
-    let provisional = file
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "record.md".to_owned());
-    let rec = confidant_core::parse_record(&text, &provisional)
+    let prepared = prepare_record_write(
+        root,
+        vault,
+        PrepareSpec {
+            id,
+            id_raw,
+            text: &text,
+            provisional: "merged.md",
+            summary: format!("record-resolve {id}"),
+            canonical_prefix: "record-resolve/v1",
+            allow_conflict: true,
+        },
+    )?;
+    if prepared.rel != sides.path {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "the merged record belongs at {}, not {}",
+            prepared.rel.display(),
+            sides.path.display()
+        ))));
+    }
+    let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+    let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
+    // Explicit cleanup on the success path (drop after is a no-op).
+    guard.cleanup();
+    print_merge_result(cli, root, id, &outcome, rekeyed)
+}
+
+/// `--edit` needs 0600/0700 file modes; refuse rather than falling back
+/// to insecure permissions on non-unix (CD5).
+#[cfg(not(unix))]
+fn cmd_resolve_edit(
+    _cli: &Cli,
+    _root: &Path,
+    _vault: &confidant_core::vault::Vault,
+    _id: &RecordId,
+    _id_raw: &str,
+) -> anyhow::Result<ExitCode> {
+    Err(anyhow::Error::new(DomainError::usage(
+        "`record resolve --edit` is not supported on this platform",
+    ))
+    .with_fix("Use --merged-file with a file outside the vault"))
+}
+
+/// Parameters for [`prepare_record_write`], bundled to keep the
+/// argument count within clippy's limit.
+pub(crate) struct PrepareSpec<'a> {
+    /// The parsed record id.
+    pub id: &'a RecordId,
+    /// The raw id string, for error messages (preserves user spelling).
+    pub id_raw: &'a str,
+    /// The new record text (merged plaintext).
+    pub text: &'a str,
+    /// Filename used in parse error messages.
+    pub provisional: &'a str,
+    /// Summary for the planned write (e.g. `"record {id}"`).
+    pub summary: String,
+    /// Prefix for the idempotency canonical request (e.g. `"record-edit/v1"`).
+    pub canonical_prefix: &'a str,
+    /// Whether the existing file may have conflict markers. `record edit`
+    /// refuses them (they must be resolved first); the resolve path
+    /// expects them. The check runs before the no-ai restamp planning,
+    /// which cannot read a conflicted file (#412 Q6).
+    pub allow_conflict: bool,
+}
+
+/// The validated record and its planned write, shared by `record edit` and
+/// `record resolve --merged-file` / `--edit` (#455).
+///
+/// `pending` holds the `WriteFile` changes (the record itself, plus #410
+/// child re-stamps for a person whose `no-ai` mode changed). The caller
+/// applies it: `cmd_record_edit` via [`apply_record_write_inner`] (which
+/// commits), the resolve path by encrypting and staging each change
+/// without committing (CD6).
+pub(crate) struct PreparedWrite {
+    /// The write to apply.
+    pub pending: PendingWrite,
+    /// Vault-relative path of the record file.
+    pub rel: PathBuf,
+    /// The parsed record (for rekeyed detection and reporting).
+    pub rec: Record,
+    /// Mode overrides for the encryptor (#410 no-ai re-stamp).
+    pub mode_overrides: HashMap<String, confidant_crypt::envelope::NoAi>,
+}
+
+/// Validate `text` as the new contents of record `id` and plan the write.
+///
+/// Shared by `record edit` and `record resolve --merged-file` / `--edit`
+/// (#455): parses the record, checks the id, validates `with:` lists,
+/// derives the record path (which must already exist), formats the
+/// canonical contents, and plans the #410 no-ai re-stamp for persons.
+///
+/// Does not read the existing file and does not apply the write. The
+/// caller does its own fail-closed checks on the stored bytes first:
+/// `cmd_record_edit`'s ladder (conflict markers, envelope identity,
+/// rekeyed detection, decrypt), or the resolve path's `load_sides`
+/// (which already verified the conflict and decrypted both sides, CD7).
+///
+/// `provisional` is the filename used in parse error messages;
+/// `summary` and `canonical_prefix` label the planned write (e.g.
+/// `"record {id}"` / `"record-edit/v1"` for edit).
+fn prepare_record_write(
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    spec: PrepareSpec<'_>,
+) -> anyhow::Result<PreparedWrite> {
+    let PrepareSpec {
+        id,
+        id_raw,
+        text,
+        provisional,
+        summary,
+        canonical_prefix,
+        allow_conflict,
+    } = spec;
+    let rec = confidant_core::parse_record(text, provisional)
         .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
-    if rec.id != id {
+    if rec.id != *id {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
                 .with_fix("Edit the record the file names, or fix `id:` in the file"),
@@ -3342,22 +3533,19 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
                 .with_fix("Use `confidant record add --file` to create a new record"),
         ));
     }
-    // The path was checked above, so a read error here is a real failure and
-    // must not be swallowed by a fail-closed guard.
-    let existing = std::fs::read(root.join(&rel)).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot read {}: {e}",
-            rel.display()
-        )))
-    })?;
-    let id = rec.id.to_string();
-    // Fail closed before writing anything, naming the real cause. Each rung
-    // is a state the write layer would otherwise refuse later with a less
-    // specific error, or that the decrypt below would misreport as a key
-    // problem (#412).
-    let mut rekeyed: Option<(String, String)> = None;
-    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
-        if confidant_core::record::has_conflict_markers(&String::from_utf8_lossy(&existing)) {
+    // The conflict-marker guard must run before the no-ai restamp planning
+    // below, which cannot read a conflicted file (#412 Q6). `record edit`
+    // refuses; the resolve path expects a conflict and skips this.
+    if !allow_conflict {
+        let existing = std::fs::read(root.join(&rel)).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read {}: {e}",
+                rel.display()
+            )))
+        })?;
+        if confidant_core::crypto_mode::is_envelope_bytes(&existing)
+            && confidant_core::record::has_conflict_markers(&String::from_utf8_lossy(&existing))
+        {
             return Err(anyhow::Error::new(
                 DomainError::invalid(format!(
                     "{} has unresolved merge conflicts; resolve them before editing",
@@ -3366,16 +3554,115 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
                 .with_fix("Resolve the conflict markers (git mergetool), then re-run the edit"),
             ));
         }
+    }
+    let contents = confidant_core::format_record(&rec);
+    let mut changes = vec![FileChange::WriteFile {
+        path: rel.clone(),
+        contents,
+    }];
+    // #410: a person edit whose effective `no-ai` mode changes re-stamps
+    // that person's existing children in the same commit — the header the
+    // write-time stamp left behind moves with the person, in both
+    // directions. Refuses the whole edit (nothing committed) when a
+    // child cannot be read. See [`plan_no_ai_restamp`].
+    //
+    // Skipped for the resolve path (`allow_conflict`): the existing file
+    // is conflicted by definition, so its mode cannot be read. The
+    // operator can re-run an edit afterwards if a re-stamp is needed.
+    let id_str = rec.id.to_string();
+    let mode_overrides = if rec.kind == RecordKind::Person && !allow_conflict {
+        let (overrides, child_changes) =
+            plan_no_ai_restamp(root, vault, &id_str, record_crypto::person_own_mode(&rec))?;
+        changes.extend(child_changes);
+        overrides
+    } else {
+        HashMap::new()
+    };
+    Ok(PreparedWrite {
+        pending: PendingWrite {
+            changes,
+            summary,
+            canonical_request: format!("{canonical_prefix}\npath={}\nbody={}", rel.display(), text),
+        },
+        rel,
+        rec,
+        mode_overrides,
+    })
+}
+
+/// #216: replace an existing main record's file from a markdown file.
+///
+/// The write goes through [`apply_record_write`], so in an encrypted vault
+/// it encrypts, runs `check` before the commit, and makes one commit —
+/// exactly like `record add`. The target path is derived from the record's
+/// id, never from the path the caller passed, and the file's own `id:` must
+/// match the id argument so a wrong file cannot silently clobber a record.
+fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    // Parse the id the same way every other positional record id is parsed:
+    // a malformed argument is a usage error (exit 2, ADR-7), and parsing
+    // canonicalises a lowercase ULID instead of rejecting it.
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
+            "`record edit` takes an opaque record id; use `confidant find <name>` to look one up",
+        )
+    })?;
+    reject_unsupported_prefix(&id)?;
+    let text = std::fs::read_to_string(file).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            file.display()
+        )))
+    })?;
+    let provisional = file
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "record.md".to_owned());
+    // Shared validation + write planning (#455). The fail-closed ladder
+    // below is edit-specific: the resolve path already verified the
+    // conflict and decrypted both sides via `load_sides` (CD7).
+    let prepared = prepare_record_write(
+        root,
+        &vault,
+        PrepareSpec {
+            id: &id,
+            id_raw,
+            text: &text,
+            provisional: &provisional,
+            summary: format!("record {id}"),
+            canonical_prefix: "record-edit/v1",
+            allow_conflict: false,
+        },
+    )?;
+    let rec = &prepared.rec;
+    let rel = &prepared.rel;
+    let id_str = rec.id.to_string();
+    // The path was checked above, so a read error here is a real failure and
+    // must not be swallowed by a fail-closed guard.
+    let existing = std::fs::read(root.join(rel)).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            rel.display()
+        )))
+    })?;
+    // Fail closed before writing anything, naming the real cause. Each rung
+    // is a state the write layer would otherwise refuse later with a less
+    // specific error, or that the decrypt below would misreport as a key
+    // problem (#412).
+    let mut rekeyed: Option<(String, String)> = None;
+    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
+        // (Conflict markers were already refused by `prepare_record_write`
+        // above when `allow_conflict` is false.)
         let env = confidant_crypt::envelope::parse(&existing).map_err(|e| {
             anyhow::Error::new(
                 DomainError::invalid(format!("{} is not a readable envelope: {e}", rel.display()))
                     .with_fix("Restore the file from git history, then re-run the edit"),
             )
         })?;
-        if env.id != id || env.record_type != rec.kind.as_str() {
+        if env.id != id_str || env.record_type != rec.kind.as_str() {
             return Err(anyhow::Error::new(
                 DomainError::invalid(format!(
-                    "{} holds {} (type {}), not {id} (type {})",
+                    "{} holds {} (type {}), not {id_str} (type {})",
                     rel.display(),
                     env.id,
                     env.record_type,
@@ -3391,14 +3678,14 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         // `envelope::parse` already validated the key id shape; failure here
         // is unreachable, but fail closed rather than reporting a wrong client.
         let from_client = confidant_crypt::envelope::key_id_client(&env.key_id).ok();
-        if let (Some(from), Ok(to)) = (from_client, record_client_id(&rec)) {
+        if let (Some(from), Ok(to)) = (from_client, record_client_id(rec)) {
             if from != to {
                 rekeyed = Some((from, to));
             }
         }
         // The only rung that needs the device key.
         if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
-            enc.decrypt_existing(&rel, &existing).map_err(|_| {
+            enc.decrypt_existing(rel, &existing).map_err(|_| {
                 anyhow::Error::new(
                     DomainError::invalid(format!(
                         "cannot edit {}: this device cannot decrypt the record",
@@ -3411,37 +3698,15 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
             })?;
         }
     }
-    let contents = confidant_core::format_record(&rec);
-    let mut changes = vec![FileChange::WriteFile {
-        path: rel.clone(),
-        contents,
-    }];
-    // #410: a person edit whose effective `no-ai` mode changes re-stamps
-    // that person's existing children in the same commit — the header the
-    // write-time stamp left behind moves with the person, in both
-    // directions. Refuses the whole edit (nothing committed) when a
-    // child cannot be read. See [`plan_no_ai_restamp`].
-    let mode_overrides = if rec.kind == RecordKind::Person {
-        let (overrides, child_changes) =
-            plan_no_ai_restamp(root, &vault, &id, record_crypto::person_own_mode(&rec))?;
-        changes.extend(child_changes);
-        overrides
-    } else {
-        HashMap::new()
-    };
     let (outcome, _created) = apply_record_write_inner(
         root,
         &vault,
-        PendingWrite {
-            changes,
-            summary: format!("record {id}"),
-            canonical_request: format!("record-edit/v1\npath={}\nbody={}", rel.display(), text),
-        },
+        prepared.pending,
         &write_options(cli),
-        mode_overrides,
+        prepared.mode_overrides,
     )?;
     let mut extra = serde_json::json!({
-        "id": id,
+        "id": id_str,
         "path": rel.display().to_string(),
     });
     if let Some((from, to)) = &rekeyed {
@@ -3450,7 +3715,7 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
     let applied = matches!(&outcome, WriteOutcome::Applied { .. });
     let result = finish_write(cli, root, "record-edit", outcome, extra);
     if let (true, false, Some((from, to))) = (applied, cli.json, &rekeyed) {
-        println!("rekeyed {id}: {from} -> {to}");
+        println!("rekeyed {id_str}: {from} -> {to}");
     }
     result
 }
@@ -3599,7 +3864,7 @@ fn references_person(fields: &BTreeMap<String, String>, person: &str) -> bool {
 /// The client whose data key encrypts `rec`: its own id for a person, the
 /// `person` field otherwise. Mirrors the routing in
 /// `record_crypto::encrypt_file`; used to report a re-key on edit.
-fn record_client_id(rec: &Record) -> anyhow::Result<String> {
+pub(crate) fn record_client_id(rec: &Record) -> anyhow::Result<String> {
     let routing_person = match rec.kind {
         RecordKind::Person => Some(rec.id.to_string()),
         _ => rec.field("person").map(str::to_owned),
