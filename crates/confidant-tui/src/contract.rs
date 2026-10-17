@@ -335,6 +335,71 @@ pub struct InboxReport {
     pub warnings: Vec<String>,
 }
 
+/// One decrypted side of a conflicted record
+/// (`confidant record resolve <id> --show --json --no-input`, #453).
+///
+/// `text` holds decrypted plaintext: the manual [`std::fmt::Debug`] impl
+/// redacts it so plaintext never reaches logs or panic messages.
+#[derive(Clone, Default, Deserialize, PartialEq)]
+pub struct ResolveSide {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+impl std::fmt::Debug for ResolveSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolveSide")
+            .field("label", &self.label)
+            .field("text", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Output of `confidant record resolve <id> --show --json --no-input`.
+///
+/// Plaintext lives in memory only: the TUI never writes it to disk.
+/// The manual [`std::fmt::Debug`] impl redacts both sides.
+#[derive(Clone, Default, Deserialize, PartialEq)]
+pub struct ResolveShow {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub ours: ResolveSide,
+    #[serde(default)]
+    pub theirs: ResolveSide,
+}
+
+impl std::fmt::Debug for ResolveShow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolveShow")
+            .field("id", &self.id)
+            .field("path", &self.path)
+            .field("ours", &self.ours)
+            .field("theirs", &self.theirs)
+            .finish()
+    }
+}
+
+/// Output of `confidant record resolve <id> --take ours|theirs --json
+/// --no-input` (#454).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ResolveApplied {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub next: String,
+}
+
 /// Parsed outcome of a CLI invocation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContractOutcome<T> {

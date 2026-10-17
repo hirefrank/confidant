@@ -12,7 +12,7 @@ use crate::theme;
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, InboxReport,
-    SearchResult,
+    ResolveApplied, ResolveShow, SearchResult,
 };
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
@@ -20,6 +20,7 @@ use crate::search::{filter_search_result, find_result_to_search, SearchViewState
 use crate::views::alert::{self, AlertState};
 use crate::views::check::{self, CheckViewState};
 use crate::views::confirm::{self, ConfirmState};
+use crate::views::conflict::{self, ConflictAction, ConflictListEntry, ConflictViewState};
 use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
@@ -29,8 +30,8 @@ use crate::views::proposals::{
 };
 use crate::views::search;
 
-/// The six views (#387): Check, Context, Doctor, Proposals, unified
-/// Search (qmd-ranked with an exact `find` toggle), Inbox.
+/// The seven views: Check, Context, Doctor, Proposals, unified
+/// Search (qmd-ranked with an exact `find` toggle), Inbox, Conflicts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
@@ -40,6 +41,7 @@ pub enum ActiveView {
     Proposals,
     Search,
     Inbox,
+    Conflicts,
 }
 
 impl ActiveView {
@@ -50,18 +52,20 @@ impl ActiveView {
             Self::Doctor => Self::Proposals,
             Self::Proposals => Self::Search,
             Self::Search => Self::Inbox,
-            Self::Inbox => Self::Check,
+            Self::Inbox => Self::Conflicts,
+            Self::Conflicts => Self::Check,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Check => Self::Inbox,
+            Self::Check => Self::Conflicts,
             Self::Context => Self::Check,
             Self::Doctor => Self::Context,
             Self::Proposals => Self::Doctor,
             Self::Inbox => Self::Search,
             Self::Search => Self::Proposals,
+            Self::Conflicts => Self::Inbox,
         }
     }
 
@@ -73,6 +77,7 @@ impl ActiveView {
             Self::Proposals => "4:Proposals",
             Self::Search => "5:Search",
             Self::Inbox => "6:Inbox",
+            Self::Conflicts => "7:Conflicts",
         }
     }
 }
@@ -96,6 +101,14 @@ pub enum InputMode {
     EditingSearch,
 }
 
+/// An interactive `confidant` invocation the TUI must run outside its
+/// alternate screen (#456 hand-merge): the host suspends the terminal,
+/// runs the argv, then resumes and refreshes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuspendedCommand {
+    pub args: Vec<String>,
+}
+
 /// Top-level TUI state machine generic over a [`Runner`].
 pub struct App<R: Runner> {
     pub runner: R,
@@ -111,6 +124,10 @@ pub struct App<R: Runner> {
     pub should_quit: bool,
     pub proposals: ProposalsTab,
     pub inbox: InboxViewState,
+    pub conflict: ConflictViewState,
+    /// Pending interactive command (set by hand-merge confirm); the host
+    /// takes it, suspends the terminal, runs it, and resumes.
+    pub suspended: Option<SuspendedCommand>,
     vault_root_override: Option<std::path::PathBuf>,
 }
 
@@ -131,6 +148,8 @@ impl<R: Runner> App<R> {
             should_quit: false,
             proposals: ProposalsTab::default(),
             inbox: InboxViewState::default(),
+            conflict: ConflictViewState::default(),
+            suspended: None,
             vault_root_override: None,
         }
     }
@@ -402,6 +421,198 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Run `confidant check --json --no-input` and list the
+    /// `E_MERGE_CONFLICT` findings that carry a record id (#456).
+    pub fn load_conflicts(&mut self) {
+        let raw = match self.runner.run(&["check"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        if let Some((_, report)) = self.apply_outcome::<CheckReport>(&raw) {
+            self.conflict.entries = report
+                .findings
+                .iter()
+                .filter(|f| f.code == "E_MERGE_CONFLICT" && f.id.is_some())
+                .map(|f| ConflictListEntry {
+                    id: f.id.clone().unwrap_or_default(),
+                    message: f.message.clone(),
+                })
+                .collect();
+            self.conflict.selected = 0;
+            self.conflict.detail = None;
+            self.conflict.detail_id = None;
+            self.conflict.confirming = None;
+            self.conflict.last_result = None;
+            self.conflict.loaded = true;
+        }
+    }
+
+    /// Alert shown when the CLI does not support `record resolve`
+    /// (unknown subcommand on an older binary): the operator needs to
+    /// upgrade confidant.
+    fn resolve_unsupported_alert() -> AlertState {
+        AlertState {
+            title: "Resolve Not Available".to_owned(),
+            code: Some("old_cli".to_owned()),
+            message: "this confidant binary does not support `record resolve`".to_owned(),
+            fix: Some("upgrade confidant to resolve merge conflicts".to_owned()),
+            blocking: false,
+        }
+    }
+
+    /// Open the detail view for the selected conflict: run
+    /// `record resolve <id> --show` and keep both decrypted sides in
+    /// memory only.
+    pub fn open_conflict_detail(&mut self) {
+        let Some(entry) = self.conflict.entries.get(self.conflict.selected) else {
+            return;
+        };
+        let id = entry.id.clone();
+        let raw = match self.runner.run(&["record", "resolve", "--show", &id]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        match parse_raw_output::<ResolveShow>(&raw) {
+            ContractOutcome::Ok { vault, data, .. } => {
+                if vault.is_some() {
+                    self.vault = vault;
+                }
+                self.alert = None;
+                self.conflict.detail_id = Some(id);
+                self.conflict.detail = Some(data);
+            }
+            ContractOutcome::CliError {
+                usage_error: true, ..
+            } => {
+                self.alert = Some(Self::resolve_unsupported_alert());
+            }
+            ContractOutcome::CliError {
+                status,
+                usage_error,
+                error,
+            } => {
+                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+            }
+            ContractOutcome::VersionMismatch { reported_version } => {
+                self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
+            }
+            ContractOutcome::InvalidJson { status } => {
+                self.alert = Some(AlertState::invalid_json(status));
+            }
+        }
+    }
+
+    /// Open the `y`/`n` confirm modal for taking one side.
+    pub fn conflict_begin_take(&mut self, side: ConflictAction) {
+        if self.conflict.detail.is_some() {
+            self.conflict.confirming = Some(side);
+        }
+    }
+
+    /// Open the `y`/`n` confirm modal for the editor hand-merge.
+    pub fn conflict_begin_hand_merge(&mut self) {
+        if self.conflict.detail.is_some() {
+            self.conflict.confirming = Some(ConflictAction::HandMerge);
+        }
+    }
+
+    /// Run `record resolve <id> --take ours|theirs` after confirm: the
+    /// chosen side is installed byte for byte and staged, never committed.
+    /// Shows the CLI's `next` line, then refreshes the list.
+    pub fn conflict_run_take(&mut self, side: ConflictAction) {
+        self.conflict.confirming = None;
+        let (id, side_name) = match (&self.conflict.detail_id, side) {
+            (Some(id), ConflictAction::TakeOurs) => (id.clone(), "ours"),
+            (Some(id), ConflictAction::TakeTheirs) => (id.clone(), "theirs"),
+            _ => return,
+        };
+        let raw = match self
+            .runner
+            .run(&["record", "resolve", &id, "--take", side_name])
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        match parse_raw_output::<ResolveApplied>(&raw) {
+            ContractOutcome::Ok { vault, data, .. } => {
+                if vault.is_some() {
+                    self.vault = vault;
+                }
+                self.alert = None;
+                let msg = format!(
+                    "kept the {side_name} side of {id}; staged. Next: {}",
+                    data.next
+                );
+                self.load_conflicts();
+                self.conflict.last_result = Some(msg);
+            }
+            ContractOutcome::CliError {
+                usage_error: true, ..
+            } => {
+                self.alert = Some(Self::resolve_unsupported_alert());
+            }
+            ContractOutcome::CliError {
+                status,
+                usage_error,
+                error,
+            } => {
+                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+            }
+            ContractOutcome::VersionMismatch { reported_version } => {
+                self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
+            }
+            ContractOutcome::InvalidJson { status } => {
+                self.alert = Some(AlertState::invalid_json(status));
+            }
+        }
+    }
+
+    /// Queue the interactive hand-merge: the host suspends the TUI and
+    /// runs `confidant record resolve <id> --edit` in the terminal.
+    pub fn conflict_run_hand_merge(&mut self) {
+        self.conflict.confirming = None;
+        let Some(id) = self.conflict.detail_id.clone() else {
+            return;
+        };
+        self.suspended = Some(SuspendedCommand {
+            args: vec![
+                "record".to_owned(),
+                "resolve".to_owned(),
+                id,
+                "--edit".to_owned(),
+            ],
+        });
+    }
+
+    /// Take the pending interactive command for the host to run while the
+    /// alternate screen is suspended.
+    pub fn take_suspended_command(&mut self) -> Option<SuspendedCommand> {
+        self.suspended.take()
+    }
+
+    /// Run a suspended command through the runner with an inherited
+    /// terminal. Called by the host while the TUI is suspended.
+    pub fn run_suspended_command(&self, cmd: &SuspendedCommand) -> anyhow::Result<i32> {
+        self.runner
+            .run_confidant_interactive(&cmd.args.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// Refresh after an interactive command completes: the hand-merge may
+    /// have resolved the record, so reload the list and close the detail.
+    pub fn after_suspended_command(&mut self) {
+        self.suspended = None;
+        self.load_conflicts();
+    }
+
     /// Refresh the currently active view.
     pub fn refresh_current(&mut self) {
         self.alert = None;
@@ -421,6 +632,7 @@ impl<R: Runner> App<R> {
                 }
             }
             ActiveView::Inbox => self.load_inbox(),
+            ActiveView::Conflicts => self.load_conflicts(),
         }
     }
 
@@ -637,6 +849,7 @@ impl<R: Runner> App<R> {
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
             ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
             ActiveView::Inbox if self.inbox.report.is_none() => self.load_inbox(),
+            ActiveView::Conflicts if !self.conflict.loaded => self.load_conflicts(),
             _ => {}
         }
     }
@@ -681,6 +894,10 @@ impl<R: Runner> App<R> {
                 }
                 KeyCode::Char('6') => {
                     self.switch_to(ActiveView::Inbox);
+                    return;
+                }
+                KeyCode::Char('7') => {
+                    self.switch_to(ActiveView::Conflicts);
                     return;
                 }
                 KeyCode::Char('/') => {
@@ -793,6 +1010,80 @@ impl<R: Runner> App<R> {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Handle a key event while the conflicts tab is active.
+    ///
+    /// Returns true when the key was consumed. The confirm modal swallows
+    /// every key: `y` runs the pending action, anything else cancels.
+    /// In the detail view, `o`/`t` take a side and `m` hand-merges (each
+    /// behind a confirm); `q`/Esc goes back to the list. In the list,
+    /// `Enter` opens the detail and `r` reloads. Everything else falls
+    /// through to the shared navigation and quit handling in `handle_key`.
+    fn handle_conflict_key(&mut self, key: KeyEvent) -> bool {
+        // Esc dismisses an alert first, before any view action.
+        if self.alert.is_some() && matches!(key.code, KeyCode::Esc) {
+            self.alert = None;
+            return true;
+        }
+        if let Some(action) = self.conflict.confirming {
+            match key.code {
+                KeyCode::Char('y') => match action {
+                    ConflictAction::TakeOurs | ConflictAction::TakeTheirs => {
+                        self.conflict_run_take(action)
+                    }
+                    ConflictAction::HandMerge => self.conflict_run_hand_merge(),
+                },
+                _ => self.conflict.confirming = None,
+            }
+            return true;
+        }
+        if self.conflict.detail.is_some() {
+            match key.code {
+                KeyCode::Char('o') => {
+                    self.conflict_begin_take(ConflictAction::TakeOurs);
+                    true
+                }
+                KeyCode::Char('t') => {
+                    self.conflict_begin_take(ConflictAction::TakeTheirs);
+                    true
+                }
+                KeyCode::Char('m') => {
+                    self.conflict_begin_hand_merge();
+                    true
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    self.conflict.detail = None;
+                    self.conflict.detail_id = None;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('r') => {
+                    self.load_conflicts();
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !self.conflict.entries.is_empty()
+                        && self.conflict.selected + 1 < self.conflict.entries.len()
+                    {
+                        self.conflict.selected += 1;
+                    }
+                    true
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.conflict.selected = self.conflict.selected.saturating_sub(1);
+                    true
+                }
+                KeyCode::Enter => {
+                    self.open_conflict_detail();
+                    true
+                }
+                _ => false,
+            }
         }
     }
 
@@ -1003,6 +1294,10 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        if self.active_view == ActiveView::Conflicts && self.handle_conflict_key(key) {
+            return;
+        }
+
         if self.input_mode == InputMode::EditingSearch {
             match key.code {
                 KeyCode::Esc => {
@@ -1053,6 +1348,7 @@ impl<R: Runner> App<R> {
             KeyCode::Char('4') => self.switch_to(ActiveView::Proposals),
             KeyCode::Char('5') => self.switch_to(ActiveView::Search),
             KeyCode::Char('6') => self.switch_to(ActiveView::Inbox),
+            KeyCode::Char('7') => self.switch_to(ActiveView::Conflicts),
             KeyCode::Char('/') => {
                 self.enter_search();
             }
@@ -1102,8 +1398,8 @@ impl<R: Runner> App<R> {
                     }
                 }
             }
-            // The proposals and inbox tabs handle their own keys.
-            ActiveView::Proposals | ActiveView::Inbox => {}
+            // The proposals, inbox, and conflicts tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
         }
     }
 
@@ -1121,8 +1417,8 @@ impl<R: Runner> App<R> {
             ActiveView::Search => {
                 self.search.selected = self.search.selected.saturating_sub(1);
             }
-            // The proposals and inbox tabs handle their own keys.
-            ActiveView::Proposals | ActiveView::Inbox => {}
+            // The proposals, inbox, and conflicts tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
         }
     }
 
@@ -1147,7 +1443,8 @@ impl<R: Runner> App<R> {
             ActiveView::Context
             | ActiveView::Doctor
             | ActiveView::Proposals
-            | ActiveView::Inbox => None,
+            | ActiveView::Inbox
+            | ActiveView::Conflicts => None,
         };
 
         if let Some(pid) = person_id {
@@ -1185,6 +1482,7 @@ impl<R: Runner> App<R> {
                 ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
                 ActiveView::Search => search::render(&self.search, frame, chunks[1]),
                 ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
+                ActiveView::Conflicts => self.render_conflict(frame, chunks[1]),
             }
         }
 
@@ -1206,6 +1504,7 @@ impl<R: Runner> App<R> {
             ActiveView::Proposals,
             ActiveView::Search,
             ActiveView::Inbox,
+            ActiveView::Conflicts,
         ] {
             if !spans.is_empty() {
                 spans.push(Span::raw(" "));
@@ -1226,7 +1525,7 @@ impl<R: Runner> App<R> {
     fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
         for (key, label) in [
-            ("Tab/1-6", "view"),
+            ("Tab/1-7", "view"),
             ("/", "search"),
             ("e", "exact"),
             ("j/k", "move"),
@@ -1247,6 +1546,27 @@ impl<R: Runner> App<R> {
             if let Some(report) = &self.inbox.report {
                 inbox::render_confirm(frame, area, report.merged, report.cleared);
             }
+        }
+    }
+
+    /// Render the conflicts tab: list, open detail, or the take/hand-merge
+    /// confirm modal.
+    fn render_conflict(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.conflict.detail.is_some() {
+            conflict::render_detail(&self.conflict, frame, area);
+        } else {
+            conflict::render(&self.conflict, frame, area);
+        }
+        if let Some(action) = self.conflict.confirming {
+            let id = self.conflict.detail_id.clone().unwrap_or_default();
+            confirm::render(
+                &ConfirmState::new(
+                    action.title().to_owned(),
+                    conflict::confirm_lines(action, &id, None),
+                ),
+                frame,
+                area,
+            );
         }
     }
 

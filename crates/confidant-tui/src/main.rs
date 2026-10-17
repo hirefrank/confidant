@@ -76,6 +76,20 @@ fn run_event_loop(
         if app.should_quit {
             break;
         }
+        // Hand-merge (#456): the operator confirmed `record resolve --edit`.
+        // Suspend the alternate screen so the CLI gets a real terminal for
+        // the editor, run it, then resume and refresh.
+        if let Some(cmd) = app.take_suspended_command() {
+            restore_terminal();
+            let _ = app.run_suspended_command(&cmd);
+            enable_raw_mode()?;
+            if let Err(err) = crossterm::execute!(io::stdout(), EnterAlternateScreen) {
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(err.into());
+            }
+            app.after_suspended_command();
+            continue;
+        }
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 app.handle_key(key);
