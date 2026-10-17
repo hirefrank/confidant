@@ -53,6 +53,11 @@ struct Harness {
     operator_hex: String,
     keychain_dir: Option<PathBuf>,
     _tmp: tempfile::TempDir,
+    /// Keep-alive for the ssh signing key tempdir (see [`ssh_signing`]).
+    /// The vault's git config points at the key file, so it must outlive
+    /// every signed commit a test makes — dropping it early makes
+    /// `commit-tree -S` fail with "Couldn't load public key".
+    _signing: Option<tempfile::TempDir>,
 }
 
 impl Harness {
@@ -83,6 +88,7 @@ impl Harness {
             operator_hex,
             keychain_dir: None,
             _tmp: tmp,
+            _signing: None,
         }
     }
 
@@ -5989,5 +5995,457 @@ fn no_plaintext_in_stdout_stderr_on_any_path() {
     assert!(
         !stdout(&out).contains("SENTINEL-A-bio") && !stdout(&out).contains("SENTINEL-B-bio"),
         "stdout leaked side plaintext"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #457: `record resolve --from-inbox`
+// ---------------------------------------------------------------------------
+
+/// Harness with an inbox item conflicting with an existing record.
+/// Returns (harness, inbox_bech32, stem).
+fn inbox_conflict_harness() -> (Harness, String, String) {
+    let mut h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-MAIN-bio."));
+    let Some(signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        // Return a dummy; the caller must check and return early.
+        return (h, String::new(), String::new());
+    };
+    // Keep the key file alive for the whole test: these tests make further
+    // signed commits after this function returns (`inbox --discard`, a
+    // second `queue_items`, the drain's clear).
+    h._signing = Some(signing);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+
+    // Queue an item targeting the existing record with different content.
+    let stem = "conflict-item-01";
+    let payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{PERSON}/profile.md\n---\n{}",
+        person_md(PERSON, "Ada Example", "SENTINEL-INBOX-bio.")
+    );
+    confidant_core::queue_items(
+        &h.vault,
+        &[confidant_core::QueueItem {
+            stem: stem.to_string(),
+            plaintext: payload,
+        }],
+        &inbox_recipient,
+    )
+    .expect("queue_items failed");
+    (h, inbox_bech32, stem.to_string())
+}
+
+/// Run a `record resolve --from-inbox` command with the inbox key in env.
+fn resolve_from_inbox_cmd(h: &Harness, inbox_bech32: &str, args: &[&str]) -> std::process::Output {
+    let mut full = vec![
+        "record",
+        "resolve",
+        PERSON,
+        "--from-inbox",
+        "conflict-item-01",
+    ];
+    full.extend(args);
+    full.push("--no-input");
+    let mut cmd = h.cmd(&full);
+    cmd.env("CONFIDANT_INBOX_KEY", inbox_bech32);
+    // Keep off the real OS keychain.
+    cmd.env("CONFIDANT_KEYCHAIN", "off");
+    cmd.output().unwrap()
+}
+
+/// #457: `--show` prints both the current record and the inbox item.
+#[test]
+fn resolve_from_inbox_show_both_sides() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--show"]);
+    assert!(
+        out.status.success(),
+        "resolve --show failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("== ours ("), "missing ours header: {text}");
+    assert!(
+        text.contains("SENTINEL-MAIN-bio"),
+        "missing ours body: {text}"
+    );
+    assert!(
+        text.contains("== theirs ("),
+        "missing theirs header: {text}"
+    );
+    assert!(
+        text.contains("inbox:conflict-item-01"),
+        "missing theirs label: {text}"
+    );
+    assert!(
+        text.contains("SENTINEL-INBOX-bio"),
+        "missing theirs body: {text}"
+    );
+}
+
+/// #457: `--show --json` has the inbox shape.
+#[test]
+fn resolve_from_inbox_show_json_shape() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--show", "--json"]);
+    assert!(
+        out.status.success(),
+        "resolve --show failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["from_inbox"], "conflict-item-01");
+    assert!(v["ours"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("SENTINEL-MAIN-bio"));
+    assert!(v["theirs"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("SENTINEL-INBOX-bio"));
+    assert_eq!(v["theirs"]["label"], "inbox:conflict-item-01");
+}
+
+/// #457: unknown stem fails closed with E_INBOX_SKIP.
+#[test]
+fn resolve_from_inbox_unknown_stem_fails_closed() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let full = vec![
+        "record",
+        "resolve",
+        PERSON,
+        "--from-inbox",
+        "01NOPE",
+        "--show",
+        "--json",
+        "--no-input",
+    ];
+    let mut cmd = h.cmd(&full);
+    cmd.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    cmd.env("CONFIDANT_KEYCHAIN", "off");
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success(), "unknown stem must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_INBOX_SKIP");
+}
+
+/// #457: an item for a missing record is not a conflict.
+#[test]
+fn resolve_from_inbox_item_for_missing_record_is_not_a_conflict() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    // Queue an item for a record that does not exist.
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    // A valid ULID that has no record: a malformed id would fail as a usage
+    // error before the missing-record check this test is about.
+    let ghost = "p-01J9Z3K4QF0000000000000001";
+    let payload = format!(
+        "confidant-inbox/1\nkind: record\npath: people/{ghost}/profile.md\n---\n{}",
+        person_md(ghost, "Ghost Example", "SENTINEL-GHOST-bio.")
+    );
+    confidant_core::queue_items(
+        &h.vault,
+        &[confidant_core::QueueItem {
+            stem: "ghost-item".to_string(),
+            plaintext: payload,
+        }],
+        &inbox_recipient,
+    )
+    .expect("queue_items failed");
+
+    let full = vec![
+        "record",
+        "resolve",
+        ghost,
+        "--from-inbox",
+        "ghost-item",
+        "--show",
+        "--json",
+        "--no-input",
+    ];
+    let mut cmd = h.cmd(&full);
+    cmd.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    cmd.env("CONFIDANT_KEYCHAIN", "off");
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success(), "missing record must be refused");
+    // `--json` reports the error as an envelope on stdout (ADR-7).
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(text.contains("nothing to resolve"), "wrong error: {text}");
+}
+
+/// #457: `--take theirs` encrypts the item and the next drain skips it as merged.
+#[test]
+fn resolve_from_inbox_take_theirs_then_drain_skips_and_clears() {
+    let (h, inbox_bech32, stem) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs", "--allow-unsigned"]);
+    assert!(
+        out.status.success(),
+        "resolve --take failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("Merged"),
+        "missing merge confirmation: {text}"
+    );
+
+    // The record now holds the inbox content (decrypt to check).
+    let out = h
+        .cmd(&["record", "show", PERSON, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("SENTINEL-INBOX-bio"));
+
+    // Take the CLI's next git step (CD6: stage only, never commit). The
+    // drain refuses to merge from a dirty worktree, and a staged resolve is
+    // dirty by design, so the operator's commit comes first.
+    git(&h.vault, &["commit", "-q", "-m", "resolve inbox conflict"]);
+
+    // The next drain sees the item as already merged and clears it.
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    drain.env("CONFIDANT_KEYCHAIN", "off");
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+    // The item was skipped as already-present and cleared.
+    let tree = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let tree_text = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        !tree_text.contains(&stem),
+        "item should be cleared: {tree_text}"
+    );
+}
+
+/// #457: `--take ours` keeps the record; `inbox --discard` retires the item.
+#[test]
+fn resolve_from_inbox_take_ours_then_discard_clears_item() {
+    let (h, inbox_bech32, stem) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "ours", "--allow-unsigned"]);
+    assert!(
+        out.status.success(),
+        "resolve --take failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("inbox --discard"),
+        "missing discard hint: {text}"
+    );
+
+    // The record is untouched.
+    let out = h
+        .cmd(&["record", "show", PERSON, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("SENTINEL-MAIN-bio"));
+
+    // Discard the item.
+    let mut discard = h.cmd(&["inbox", "--discard", &stem, "--no-input"]);
+    discard.env("CONFIDANT_KEYCHAIN", "off");
+    let out = discard.output().unwrap();
+    assert!(out.status.success(), "discard failed: {}", stderr(&out));
+    let tree = Command::new("git")
+        .current_dir(&h.vault)
+        .args(["ls-tree", "-r", "--name-only", "inbox"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let tree_text = String::from_utf8_lossy(&tree.stdout);
+    assert!(
+        !tree_text.contains(&stem),
+        "item should be discarded: {tree_text}"
+    );
+}
+
+/// #457: no plaintext reaches stderr on success or failure.
+#[test]
+fn resolve_from_inbox_no_plaintext_in_stderr() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    for args in [&["--show"][..], &["--take", "ours", "--allow-unsigned"][..]] {
+        let out = resolve_from_inbox_cmd(&h, &inbox_bech32, args);
+        assert!(out.status.success());
+        let err = stderr(&out);
+        assert!(
+            !err.contains("SENTINEL-MAIN-bio") && !err.contains("SENTINEL-INBOX-bio"),
+            "stderr leaked plaintext: {err}"
+        );
+    }
+    // Failure path: unknown stem.
+    let full = vec![
+        "record",
+        "resolve",
+        PERSON,
+        "--from-inbox",
+        "01NOPE",
+        "--show",
+        "--no-input",
+    ];
+    let mut cmd = h.cmd(&full);
+    cmd.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    cmd.env("CONFIDANT_KEYCHAIN", "off");
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        !err.contains("SENTINEL-MAIN-bio") && !err.contains("SENTINEL-INBOX-bio"),
+        "stderr leaked plaintext: {err}"
+    );
+}
+
+/// #457: `--take theirs` without trusted signers refuses with
+/// `E_INBOX_UNTRUSTED` (the drain's trust gate applies to write actions).
+#[test]
+fn resolve_from_inbox_take_theirs_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs"]);
+    assert!(!out.status.success(), "resolve --take should have refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--take theirs --allow-unsigned` bypasses the trust gate.
+#[test]
+fn resolve_from_inbox_take_theirs_allow_unsigned_succeeds() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--take", "theirs", "--allow-unsigned"]);
+    assert!(
+        out.status.success(),
+        "resolve --take --allow-unsigned failed: {}",
+        stderr(&out)
+    );
+}
+
+/// #457: `--merged-file` without trusted signers refuses with
+/// `E_INBOX_UNTRUSTED`.
+#[test]
+fn resolve_from_inbox_merged_file_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let out = resolve_from_inbox_cmd(
+        &h,
+        &inbox_bech32,
+        &["--merged-file", merged.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "resolve --merged-file should have refused"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--merged-file --allow-unsigned` bypasses the trust gate.
+#[test]
+fn resolve_from_inbox_merged_file_allow_unsigned_succeeds() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let merged = write_file(
+        h._tmp.path(),
+        "merged.md",
+        &person_md(PERSON, "Ada Example", "SENTINEL-MERGED-bio."),
+    );
+    let out = resolve_from_inbox_cmd(
+        &h,
+        &inbox_bech32,
+        &[
+            "--merged-file",
+            merged.to_str().unwrap(),
+            "--allow-unsigned",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "resolve --merged-file --allow-unsigned failed: {}",
+        stderr(&out)
+    );
+}
+
+/// #457: `--edit` without trusted signers refuses with `E_INBOX_UNTRUSTED`
+/// before the editor runs (the trust gate precedes all write actions).
+#[test]
+fn resolve_from_inbox_edit_refuses_unsigned_tip() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--edit"]);
+    assert!(!out.status.success(), "resolve --edit should have refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains("E_INBOX_UNTRUSTED"),
+        "expected E_INBOX_UNTRUSTED, got: {err}"
+    );
+}
+
+/// #457: `--show` stays read-only — no trust check, no `--allow-unsigned`
+/// needed (already covered by `resolve_from_inbox_show_both_sides`, which
+/// passes without the flag).
+#[test]
+fn resolve_from_inbox_show_needs_no_trust_gate() {
+    let (h, inbox_bech32, _) = inbox_conflict_harness();
+    if inbox_bech32.is_empty() {
+        return;
+    }
+    // `--show` without `--allow-unsigned` succeeds: the trust gate does not
+    // apply to the read-only action.
+    let out = resolve_from_inbox_cmd(&h, &inbox_bech32, &["--show"]);
+    assert!(
+        out.status.success(),
+        "resolve --show should not need the trust gate: {}",
+        stderr(&out)
     );
 }

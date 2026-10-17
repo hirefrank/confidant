@@ -163,6 +163,33 @@ pub(crate) fn is_item_stem(stem: &str) -> bool {
 /// signing config); run_inbox refuses before getting here when signing
 /// isn't configured (ADR-10).
 pub(crate) fn clear_inbox(repo: &Path, expected_tip: &str, names: &[String]) -> anyhow::Result<()> {
+    prune_inbox(repo, expected_tip, names, "clear")
+}
+
+/// Remove the named items from the inbox branch without merging them
+/// (#457, `inbox --discard`).
+///
+/// Same plumbing as [`clear_inbox`]: the pruned tree is built with `mktree`
+/// from the old tip minus the named items, committed with `commit-tree`
+/// (parent = old tip, signed `-S`), and the ref is moved with `update-ref`
+/// as an atomic compare-and-swap on the expected tip. The inbox branch is
+/// never checked out. The commit message is `inbox: discard N item(s)`.
+pub(crate) fn discard_inbox(
+    repo: &Path,
+    expected_tip: &str,
+    names: &[String],
+) -> anyhow::Result<()> {
+    prune_inbox(repo, expected_tip, names, "discard")
+}
+
+/// Shared prune: remove `names` from the inbox tip's tree and commit the
+/// result with message `inbox: {verb} N item(s)`.
+fn prune_inbox(
+    repo: &Path,
+    expected_tip: &str,
+    names: &[String],
+    verb: &str,
+) -> anyhow::Result<()> {
     if names.is_empty() {
         return Ok(());
     }
@@ -177,7 +204,7 @@ pub(crate) fn clear_inbox(repo: &Path, expected_tip: &str, names: &[String]) -> 
             expected_tip,
             "-S",
             "-m",
-            &format!("inbox: clear {} item(s)", names.len()),
+            &format!("inbox: {verb} {} item(s)", names.len()),
         ],
     )?;
     if let Err(e) = git(

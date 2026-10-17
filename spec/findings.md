@@ -100,7 +100,7 @@ Command-level error codes (not check findings):
 | `E_INBOX_DIRTY` | 1 | `confidant inbox` refused: the working tree is not clean. |
 | `E_INBOX_UNTRUSTED` | 1 | `confidant inbox` refused: the `inbox` branch tip is not signed by a key in the user config's `[trust] signers`. |
 | `E_INBOX_ITEM` | 1 | `confidant inbox` refused: an inbox item is not `<name>.age`, is undecryptable, or its decrypted payload is malformed. |
-| `E_INBOX_CONFLICT` | 1 | `confidant inbox` refused: an item targets a record path that already exists with different content. |
+| `E_INBOX_CONFLICT` | 1 | `confidant inbox` refused: an item targets a record path that already exists with different content. Resolve with `confidant record resolve <id> --from-inbox <stem>`; retire the item afterwards with `confidant inbox --discard <stem>`. |
 | `E_INBOX_CHECK_FAILED` | 1 | `confidant inbox` refused: the merged vault fails `check` (nothing was committed). |
 | `E_INBOX_CRYPTO` | 1 | `confidant inbox` cannot decrypt: milestone 2 crypto is not implemented yet. |
 | `E_INBOX_SKIP` | 1 | `confidant inbox --skip` refused: a `--skip` name is not on the `inbox` branch tip (fail closed on typos rather than merging an item the operator meant to defer). |

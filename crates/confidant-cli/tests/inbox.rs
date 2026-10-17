@@ -390,3 +390,63 @@ fn skip_refused_with_rotate_subcommand() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "usage_error");
 }
+
+// ---------------------------------------------------------------------------
+// #457: `inbox --discard`
+// ---------------------------------------------------------------------------
+
+/// Fixture with an inbox branch holding one plaintext item (discard does
+/// not decrypt, so plaintext items suffice for CLI wiring tests).
+fn discard_fixture() -> Fixture {
+    let f = Fixture::new();
+    f.with_inbox(&[("01JAAA.age", b"fake-item-bytes")]);
+    f
+}
+
+#[test]
+fn discard_unknown_stem_fails_with_inbox_skip() {
+    let f = discard_fixture();
+    let (code, stdout, _) = f.inbox(&["--json", "--discard", "01NOPE"]);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INBOX_SKIP");
+}
+
+#[test]
+fn discard_without_signing_refuses_untrusted() {
+    let f = discard_fixture();
+    // No commit signing configured in this fixture.
+    let (code, stdout, _) = f.inbox(&["--json", "--discard", "01JAAA"]);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INBOX_UNTRUSTED");
+    // The item is still there.
+    let tree = git(f.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert!(tree.contains("01JAAA.age"), "tree:\n{tree}");
+}
+
+#[test]
+fn discard_refused_with_rotate_subcommand() {
+    let f = discard_fixture();
+    let (code, stdout, _) = f.inbox(&["--json", "--discard", "01JAAA", "rotate"]);
+    assert_eq!(code, 2, "stdout: {stdout}");
+    let v = parse_json(&stdout);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+}
+
+#[test]
+fn discard_json_shape() {
+    // The shape is verified against the untrusted refusal (no signing in
+    // this fixture); the success shape mirrors it.
+    let f = discard_fixture();
+    let (code, stdout, _) = f.inbox(&["--json", "--discard", "01NOPE"]);
+    assert_eq!(code, 1);
+    let v = parse_json(&stdout);
+    // ADR-7 envelope: ok=false, error with code.
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["code"].is_string());
+    assert!(v["vault"].is_string());
+}

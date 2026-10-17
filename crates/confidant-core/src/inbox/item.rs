@@ -98,6 +98,17 @@ pub(crate) fn parse_item(name: &str, text: &str) -> anyhow::Result<ParsedItem> {
     let kind = kind.ok_or_else(|| fail("missing `kind` header"))?;
     let body_at = body_at.ok_or_else(|| fail("missing `---` separator"))?;
     let content = all[body_at..].join("\n");
+    // `lines()` dropped the body's final newline, so a body that ends with
+    // one (every record a normal write produces does) would come back a
+    // byte short. The content is the record plaintext as queued: keeping
+    // the tail means the drain writes canonical bytes and the resolve path
+    // (`--take theirs`, which reformats) still matches the drain's
+    // encrypt-and-compare idempotency check.
+    let content = if text.ends_with('\n') {
+        format!("{content}\n")
+    } else {
+        content
+    };
     if content.trim().is_empty() {
         return Err(fail("empty content"));
     }

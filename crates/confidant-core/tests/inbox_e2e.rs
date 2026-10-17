@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::Command;
 
 use confidant_core::{
-    queue_items, run_inbox, DecryptExistingFn, DecryptFn, DomainError, InboxOptions, QueueItem,
+    queue_items, read_inbox_item, run_inbox, verify_inbox_trust, DecryptExistingFn, DecryptFn,
+    DomainError, InboxOptions, QueueItem,
 };
 use tempfile::TempDir;
 
@@ -1665,4 +1666,167 @@ fn skip_dry_run_reports_skipped_section() {
     // Nothing committed, nothing cleared on a dry run.
     let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
     assert_eq!(tree.lines().count(), 2, "inbox tree:\n{tree}");
+}
+
+// ---------------------------------------------------------------------------
+// #457: `inbox --discard`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn discard_removes_items_in_one_signed_commit() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+    let new_tip = confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()])
+        .expect("discard failed");
+    assert_ne!(new_tip, tip_before);
+
+    // Exactly one new commit, with the discard message.
+    let log = git_out(r.root(), &["log", "--format=%s", "inbox"]);
+    let subjects: Vec<&str> = log.lines().collect();
+    assert_eq!(subjects.len(), 2, "log:\n{log}");
+    assert_eq!(subjects[0], "inbox: discard 1 item(s)");
+    // The discard commit is signed.
+    let validity = git_out(r.root(), &["log", "-1", "--format=%G?", "inbox"]);
+    assert_eq!(validity, "G", "discard commit is not signed");
+
+    // Only the discarded item is gone; the other stays.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAB.age", "inbox tree:\n{tree}");
+}
+
+#[test]
+fn discard_multiple_stems_one_commit() {
+    let r = Repo::new();
+    r.with_inbox(&[
+        ("01JAAA.age", LEDGER_ITEM),
+        ("01JAAB.age", RECORD_ITEM),
+        ("01JAAC.age", LEDGER_ITEM_2),
+    ]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string(), "01JAAC".to_string()])
+        .expect("discard failed");
+
+    let log = git_out(r.root(), &["log", "-1", "--format=%s", "inbox"]);
+    assert_eq!(log, "inbox: discard 2 item(s)", "log:\n{log}");
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAB.age", "inbox tree:\n{tree}");
+}
+
+#[test]
+fn discard_requires_signing_config() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    // Repo::new sets no signing config.
+    let err = confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()])
+        .expect_err("discard without signing must be refused");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INBOX_UNTRUSTED");
+    // Nothing changed on the branch.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAA.age");
+}
+
+#[test]
+fn discard_unknown_stem_fails_closed() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+
+    let err = confidant_core::discard_inbox_items(r.root(), &["01NOPE".to_string()])
+        .expect_err("unknown stem must fail closed");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INBOX_SKIP");
+    // The tip did not move and the item is still there.
+    assert_eq!(git_out(r.root(), &["rev-parse", "inbox"]), tip_before);
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAA.age");
+}
+
+#[test]
+fn discard_does_not_touch_main_worktree_or_head() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let main_before = git_out(r.root(), &["rev-parse", "main"]);
+    let status_before = git_out(r.root(), &["status", "--porcelain"]);
+
+    confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()]).expect("discard failed");
+
+    assert_eq!(git_out(r.root(), &["rev-parse", "main"]), main_before);
+    assert_eq!(
+        git_out(r.root(), &["status", "--porcelain"]),
+        status_before,
+        "worktree must be untouched"
+    );
+    assert_eq!(
+        git_out(r.root(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
+}
+
+#[test]
+fn resolve_from_inbox_refuses_when_the_tip_moves_after_the_read() {
+    // #457 review: `read_inbox_item` returns the tip it read at, and the
+    // write actions pass that tip to `verify_inbox_trust`, which refuses
+    // with `E_INBOX_RACE` when the branch no longer points there. That
+    // makes the verified commit always the commit whose bytes are used.
+    // The decryptor moves the branch mid-read, as the drain's
+    // `push_between_verify_and_read_refuses` does.
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", RECORD_ITEM)]);
+    let root = r.root().to_path_buf();
+    let moved = std::sync::Mutex::new(false);
+    let evil: &DecryptFn = &move |b: &[u8]| {
+        let mut guard = moved.lock().unwrap();
+        if !*guard {
+            *guard = true;
+            let tip = git_out(&root, &["rev-parse", "inbox"]);
+            let tree = git_out(&root, &["rev-parse", "inbox^{tree}"]);
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit-tree", &tree, "-p", &tip, "-m", "unsigned push"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("commit-tree failed");
+            assert!(out.status.success());
+            let new_commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["update-ref", "refs/heads/inbox", &new_commit, &tip])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("update-ref failed");
+            assert!(out.status.success());
+        }
+        Ok(zeroize::Zeroizing::new(b.to_vec()))
+    };
+
+    let item = read_inbox_item(r.root(), "01JAAA", evil).expect("item read");
+    // `--allow-unsigned` skips the signature requirement, not the pin.
+    let err =
+        verify_inbox_trust(r.root(), &[], true, &item.tip).expect_err("expected E_INBOX_RACE");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
 }

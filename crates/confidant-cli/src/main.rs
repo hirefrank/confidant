@@ -146,6 +146,13 @@ enum Command {
         /// Refused during `inbox rotate`.
         #[arg(long)]
         skip: Vec<String>,
+        /// Discard items by stem (repeatable) without merging them: remove
+        /// them from the `inbox` branch in one signed commit. For an item
+        /// the operator chose not to apply after `record resolve
+        /// --from-inbox`. Unknown stems fail closed (`E_INBOX_SKIP`); a
+        /// moved tip refuses (`E_INBOX_RACE`).
+        #[arg(long)]
+        discard: Vec<String>,
         /// Rotate the inbox encryption key (drain-then-destroy).
         #[command(subcommand)]
         action: Option<InboxAction>,
@@ -471,12 +478,22 @@ enum RecordAction {
     /// invocation is a usage error. `--show` prints both sides (#453);
     /// `--take` keeps one side byte for byte (#454); `--merged-file` and
     /// `--edit` land in #455.
+    ///
+    /// `--from-inbox <stem>` switches the conflict source from git conflict
+    /// markers to an inbox item (#457): `ours` is the current record on
+    /// main, `theirs` is the inbox item's plaintext. The actions are the
+    /// same; `--take theirs` encrypts the item through the `record edit`
+    /// path (there is no envelope to keep byte for byte).
     #[command(group(
         clap::ArgGroup::new("resolve_action").required(true).multiple(false)
     ))]
     Resolve {
         /// Opaque record id (p-…, o-…, d-…, e-…).
         id: String,
+        /// Resolve against an inbox item instead of git conflict markers.
+        /// The stem is the item's file stem on the `inbox` branch.
+        #[arg(long)]
+        from_inbox: Option<String>,
         /// Print both decrypted versions to stdout.
         #[arg(long, group = "resolve_action")]
         show: bool,
@@ -489,6 +506,10 @@ enum RecordAction {
         /// Hand-merge in $VISUAL/$EDITOR with 0600 scratch files (see #455).
         #[arg(long, group = "resolve_action")]
         edit: bool,
+        /// Skip inbox signature verification for `--from-inbox` write
+        /// actions (same escape hatch as `inbox --allow-unsigned`).
+        #[arg(long, requires = "from_inbox")]
+        allow_unsigned: bool,
     },
 }
 
@@ -783,9 +804,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             dry_run,
             allow_unsigned,
             skip,
+            discard,
             action,
         } => {
             let root = vault_root.unwrap();
+            // #457: `--discard` removes items without merging. It does not
+            // combine with the drain or with rotate.
+            if !discard.is_empty() {
+                if action.is_some() {
+                    return Err(anyhow::Error::new(DomainError::usage(
+                        "`inbox --discard` does not combine with `inbox rotate`",
+                    )));
+                }
+                return cmd_inbox_discard(json, &root, discard);
+            }
             match action {
                 Some(InboxAction::Rotate {
                     finish,
@@ -877,13 +909,24 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
                 RecordAction::Resolve {
                     id,
+                    from_inbox,
                     show,
                     take,
                     merged_file,
                     edit,
-                } => {
-                    cmd_record_resolve(&cli, &root, id, *show, *take, merged_file.as_deref(), *edit)
-                }
+                    allow_unsigned,
+                } => cmd_record_resolve(
+                    &cli,
+                    &root,
+                    user_config.as_ref(),
+                    id,
+                    from_inbox.as_deref(),
+                    *show,
+                    *take,
+                    merged_file.as_deref(),
+                    *edit,
+                    *allow_unsigned,
+                ),
             }
         }
         Command::Context {
@@ -2053,6 +2096,39 @@ fn month_path(date: &chrono::NaiveDate) -> PathBuf {
     PathBuf::from(format!("ledger/{}/{:02}.cfd", date.year(), date.month()))
 }
 
+/// #457: `confidant inbox --discard <stem>...` — remove items from the
+/// `inbox` branch without merging them.
+///
+/// For an item the operator chose not to apply (e.g. after `record
+/// resolve <id> --from-inbox <stem> --take ours`). Exactly one signed
+/// commit (`inbox: discard N item(s)`); the main worktree is never
+/// touched. Fails closed on unknown stems (`E_INBOX_SKIP`), a moved tip
+/// (`E_INBOX_RACE`), and missing signing config (`E_INBOX_UNTRUSTED`).
+fn cmd_inbox_discard(json: bool, root: &Path, discard: &[String]) -> anyhow::Result<ExitCode> {
+    let vault_path = root.display().to_string();
+    let new_tip = match confidant_core::inbox::discard_inbox_items(root, discard) {
+        Ok(tip) => tip,
+        Err(err) => return fail_command(json, Some(&vault_path), &err),
+    };
+    if json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "inbox-discard",
+                "discarded": discard.len(),
+                "stems": discard,
+                "tip": new_tip,
+            }),
+        ))?;
+    } else {
+        println!("inbox: discarded {} item(s)", discard.len(),);
+        for s in discard {
+            println!("  {s}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 #[allow(clippy::too_many_arguments)]
 /// `confidant inbox rotate [--finish]` (drain-then-destroy, §8a.3).
 ///
@@ -3174,11 +3250,14 @@ fn cmd_record_show(
 fn cmd_record_resolve(
     cli: &Cli,
     root: &Path,
+    user_config: Option<&UserConfig>,
     id_raw: &str,
+    from_inbox: Option<&str>,
     show: bool,
     take: Option<Side>,
     merged_file: Option<&Path>,
     edit: bool,
+    allow_unsigned: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     if vault.config.spec != confidant_core::SPEC_VERSION {
@@ -3194,6 +3273,22 @@ fn cmd_record_resolve(
     // Sweep stale `--edit` scratch from a crashed earlier run (CD5). This
     // runs for every resolve action, not just `--edit`.
     record_resolve::sweep_stale_scratch(root);
+    if let Some(stem) = from_inbox {
+        return cmd_record_resolve_from_inbox(
+            cli,
+            root,
+            &vault,
+            user_config,
+            &id,
+            id_raw,
+            stem,
+            show,
+            take,
+            merged_file,
+            edit,
+            allow_unsigned,
+        );
+    }
     if show {
         let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
         let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
@@ -3302,7 +3397,264 @@ fn cmd_record_resolve(
     )))
 }
 
-/// Print the `record resolve --merged-file` / `--edit` result.
+/// Build the inbox-item decrypt closure (same key path the drain uses).
+///
+/// Used by `record resolve --from-inbox` to decrypt the named item.
+fn inbox_decrypt_closure() -> anyhow::Result<impl Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>> {
+    let keys = confidant_core::InboxKeys::load_opt()?;
+    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
+        keys.map(std::sync::Arc::new);
+    Ok(move |ciphertext: &[u8]| match &inbox_keys {
+        Some(k) => k.decrypt(ciphertext),
+        None => Err(anyhow::Error::new(DomainError::inbox_crypto(
+            "no inbox key enrolled".to_string(),
+        ))),
+    })
+}
+
+/// #457: `record resolve <id> --from-inbox <stem> <action>` — resolve a
+/// record against a conflicting inbox item.
+///
+/// `ours` is the current record on main (decrypted with the operator key);
+/// `theirs` is the inbox item's plaintext. The actions mirror the markers
+/// source: `--show` prints both; `--take ours` keeps the file and prints
+/// the `inbox --discard` hint; `--take theirs` encrypts the item's
+/// plaintext through the `record edit` encryptor (#455's apply path — there
+/// is no envelope to keep byte for byte); `--merged-file` / `--edit` run
+/// the #455 hand-merge with the inbox sides.
+#[allow(clippy::too_many_arguments)]
+fn cmd_record_resolve_from_inbox(
+    cli: &Cli,
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    user_config: Option<&UserConfig>,
+    id: &RecordId,
+    id_raw: &str,
+    stem: &str,
+    show: bool,
+    take: Option<Side>,
+    merged_file: Option<&Path>,
+    edit: bool,
+    allow_unsigned: bool,
+) -> anyhow::Result<ExitCode> {
+    let decrypt = inbox_decrypt_closure()?;
+    let sides =
+        record_resolve::load_sides_from_inbox(root, &vault.config.vault_id, id, stem, &decrypt)?;
+    if show {
+        let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
+        let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "path": sides.path,
+                    "from_inbox": stem,
+                    "ours": { "label": sides.ours_label, "text": ours_text },
+                    "theirs": { "label": sides.theirs_label, "text": theirs_text },
+                }),
+            ))?;
+        } else {
+            println!("== ours ({}) ==", sides.ours_label);
+            println!("{ours_text}");
+            println!("== theirs ({}) ==", sides.theirs_label);
+            println!("{theirs_text}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Write actions run the drain's signed-tip trust check (#457): the
+    // inbox item's content is about to land in the encrypted record, and
+    // these actions can run without `--show` first. `--show` stays
+    // read-only above. Honors `--allow-unsigned` like the drain.
+    //
+    // The tip pinned by the read is what gets verified, and the branch must
+    // still point there: verifying one commit while writing another's bytes
+    // is exactly the gap the drain closes with `E_INBOX_RACE` (#457 review).
+    let trusted_signers = user_config
+        .map(|u| u.trust.signers.clone())
+        .unwrap_or_default();
+    let tip = sides.inbox_tip.as_deref().ok_or_else(|| {
+        anyhow::Error::new(DomainError::internal(
+            "inbox-sourced resolve is missing the tip it read the item at",
+        ))
+    })?;
+    confidant_core::verify_inbox_trust(root, &trusted_signers, allow_unsigned, tip)?;
+    if allow_unsigned {
+        eprintln!("warning: {}", confidant_core::ALLOW_UNSIGNED_WARNING);
+    }
+    if let Some(side) = take {
+        match side {
+            Side::Ours => {
+                // The file is already the ours side: nothing to write and
+                // nothing to stage. Point at `inbox --discard` — otherwise
+                // the item would conflict forever.
+                if cli.json {
+                    print_json(&ok_envelope(
+                        Some(root),
+                        serde_json::json!({
+                            "command": "record-resolve",
+                            "action": "take",
+                            "side": "ours",
+                            "id": id.to_string(),
+                            "path": sides.path,
+                            "staged": false,
+                            "next": format!("confidant inbox --discard {stem}"),
+                        }),
+                    ))?;
+                } else {
+                    println!(
+                        "Kept the current version of {} ({}); nothing staged.",
+                        id,
+                        sides.path.display()
+                    );
+                    println!("Next: confidant inbox --discard {stem}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            Side::Theirs => {
+                // No envelope to keep byte for byte: encrypt the item's
+                // plaintext through the `record edit` path (#455).
+                let text = String::from_utf8(sides.theirs_bytes.clone()).map_err(|_| {
+                    anyhow::Error::new(DomainError::internal(format!(
+                        "inbox item '{stem}' is not valid UTF-8"
+                    )))
+                })?;
+                let prepared = prepare_record_write(
+                    root,
+                    vault,
+                    PrepareSpec {
+                        id,
+                        id_raw,
+                        text: &text,
+                        provisional: &format!("{stem}.age"),
+                        summary: format!("record-resolve {id}"),
+                        canonical_prefix: "record-resolve/v1",
+                        allow_conflict: false,
+                    },
+                )?;
+                if prepared.rel != sides.path {
+                    return Err(anyhow::Error::new(DomainError::invalid(format!(
+                        "the inbox item belongs at {}, not {}",
+                        prepared.rel.display(),
+                        sides.path.display()
+                    ))));
+                }
+                let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+                let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
+                return print_merge_result(cli, root, id, &outcome, rekeyed);
+            }
+        }
+    }
+    if let Some(merged_path) = merged_file {
+        // Same hand-merge as #455, but the scratch sides come from the
+        // inbox item rather than conflict markers.
+        let canonical = record_resolve::refuse_vault_path(root, merged_path)?;
+        let text = std::fs::read_to_string(&canonical).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read {}: {e}",
+                canonical.display()
+            )))
+        })?;
+        let provisional = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "record.md".to_owned());
+        let prepared = prepare_record_write(
+            root,
+            vault,
+            PrepareSpec {
+                id,
+                id_raw,
+                text: &text,
+                provisional: &provisional,
+                summary: format!("record-resolve {id}"),
+                canonical_prefix: "record-resolve/v1",
+                allow_conflict: false,
+            },
+        )?;
+        if prepared.rel != sides.path {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "the merged record belongs at {}, not {}",
+                prepared.rel.display(),
+                sides.path.display()
+            ))));
+        }
+        let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
+        let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
+        return print_merge_result(cli, root, id, &outcome, rekeyed);
+    }
+    if edit {
+        return cmd_resolve_edit_from_inbox(cli, root, vault, id, id_raw, &sides);
+    }
+    // Unreachable: clap's ArgGroup requires exactly one resolve action.
+    Err(anyhow::Error::new(DomainError::usage(
+        "choose one of --show, --take, --merged-file, --edit",
+    )))
+}
+
+/// #457: `record resolve <id> --from-inbox <stem> --edit` — hand-merge in
+/// the operator's editor, with the inbox item as the theirs side.
+///
+/// Reuses #455's scratch/edit/apply machinery; only the sides differ.
+#[cfg(unix)]
+fn cmd_resolve_edit_from_inbox(
+    cli: &Cli,
+    root: &Path,
+    vault: &confidant_core::vault::Vault,
+    id: &RecordId,
+    id_raw: &str,
+    sides: &record_resolve::LoadedSides,
+) -> anyhow::Result<ExitCode> {
+    record_resolve::resolve_editor()?;
+    let (mut guard, merged_path) = record_resolve::setup_edit_scratch(root, id, sides)?;
+    record_resolve::run_editor(&merged_path)?;
+    let text = std::fs::read_to_string(&merged_path).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            merged_path.display()
+        )))
+    })?;
+    let prepared = prepare_record_write(
+        root,
+        vault,
+        PrepareSpec {
+            id,
+            id_raw,
+            text: &text,
+            provisional: "merged.md",
+            summary: format!("record-resolve {id}"),
+            canonical_prefix: "record-resolve/v1",
+            allow_conflict: false,
+        },
+    )?;
+    if prepared.rel != sides.path {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "the merged record belongs at {}, not {}",
+            prepared.rel.display(),
+            sides.path.display()
+        ))));
+    }
+    let rekeyed = record_resolve::rekeyed_for_merge(sides, &prepared.rec);
+    let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
+    guard.cleanup();
+    print_merge_result(cli, root, id, &outcome, rekeyed)
+}
+
+/// `--edit` needs 0600/0700 file modes; refuse on non-unix (CD5).
+#[cfg(not(unix))]
+fn cmd_resolve_edit_from_inbox(
+    _cli: &Cli,
+    _root: &Path,
+    _vault: &confidant_core::vault::Vault,
+    _id: &RecordId,
+    _id_raw: &str,
+    _sides: &record_resolve::LoadedSides,
+) -> anyhow::Result<ExitCode> {
+    Err(anyhow::Error::new(DomainError::usage(
+        "`record resolve --edit` is not supported on this platform",
+    ))
+    .with_fix("Use --merged-file with a file outside the vault"))
+}
 fn print_merge_result(
     cli: &Cli,
     root: &Path,

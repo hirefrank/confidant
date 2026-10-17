@@ -98,8 +98,7 @@ pub(crate) fn preflight(
         )));
     }
     if opts.allow_unsigned {
-        warnings
-            .push("proceeding without inbox signature verification (--allow-unsigned)".to_string());
+        warnings.push(super::ALLOW_UNSIGNED_WARNING.to_string());
     }
 
     let tip = git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
