@@ -53,6 +53,11 @@ struct Harness {
     operator_hex: String,
     keychain_dir: Option<PathBuf>,
     _tmp: tempfile::TempDir,
+    /// Keep-alive for the ssh signing key tempdir (see [`ssh_signing`]).
+    /// The vault's git config points at the key file, so it must outlive
+    /// every signed commit a test makes — dropping it early makes
+    /// `commit-tree -S` fail with "Couldn't load public key".
+    _signing: Option<tempfile::TempDir>,
 }
 
 impl Harness {
@@ -83,6 +88,7 @@ impl Harness {
             operator_hex,
             keychain_dir: None,
             _tmp: tmp,
+            _signing: None,
         }
     }
 
@@ -5999,14 +6005,18 @@ fn no_plaintext_in_stdout_stderr_on_any_path() {
 /// Harness with an inbox item conflicting with an existing record.
 /// Returns (harness, inbox_bech32, stem).
 fn inbox_conflict_harness() -> (Harness, String, String) {
-    let h = Harness::new();
+    let mut h = Harness::new();
     h.keyed(PERSON);
     add_person(&h, &person_md(PERSON, "Ada Example", "SENTINEL-MAIN-bio."));
-    let Some(_signing) = ssh_signing(&h) else {
+    let Some(signing) = ssh_signing(&h) else {
         eprintln!("SKIP: ssh-keygen unavailable");
         // Return a dummy; the caller must check and return early.
         return (h, String::new(), String::new());
     };
+    // Keep the key file alive for the whole test: these tests make further
+    // signed commits after this function returns (`inbox --discard`, a
+    // second `queue_items`, the drain's clear).
+    h._signing = Some(signing);
 
     let inbox_bech32 = age_generate_bech32();
     let inbox_recipient = age_recipient(&inbox_bech32);
@@ -6203,6 +6213,11 @@ fn resolve_from_inbox_take_theirs_then_drain_skips_and_clears() {
         .unwrap();
     assert!(out.status.success());
     assert!(stdout(&out).contains("SENTINEL-INBOX-bio"));
+
+    // Take the CLI's next git step (CD6: stage only, never commit). The
+    // drain refuses to merge from a dirty worktree, and a staged resolve is
+    // dirty by design, so the operator's commit comes first.
+    git(&h.vault, &["commit", "-q", "-m", "resolve inbox conflict"]);
 
     // The next drain sees the item as already merged and clears it.
     let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
