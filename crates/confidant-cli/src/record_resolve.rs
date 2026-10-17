@@ -46,6 +46,11 @@ pub(crate) struct LoadedSides {
     pub ours_label: String,
     /// Label from the first hunk's `>>>>>>>` line (e.g. `feature/x`).
     pub theirs_label: String,
+    /// For an inbox-sourced read (#457), the inbox branch tip the item was
+    /// read at. The write actions verify that exact commit
+    /// ([`confidant_core::verify_inbox_trust`]) instead of re-resolving the
+    /// branch. `None` for the conflict-marker source.
+    pub inbox_tip: Option<String>,
 }
 
 /// Where the two sides of a conflict come from.
@@ -173,6 +178,7 @@ fn load_sides_from_markers(
         raw: bytes,
         ours_label: sides.ours_label,
         theirs_label: sides.theirs_label,
+        inbox_tip: None,
     })
 }
 
@@ -206,6 +212,9 @@ fn load_sides_from_inbox_inner(
         )
     })?;
     let item = confidant_core::inbox::read_inbox_item(root, stem, decrypt)?;
+    // Pin the tip the item was read at (#457 review): the trust check
+    // verifies this commit, and refuses if the branch has moved since.
+    let item_tip = item.tip.clone();
     if item.kind != "record" {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!(
@@ -261,6 +270,9 @@ fn load_sides_from_inbox_inner(
         raw: current,
         ours_label,
         theirs_label: format!("inbox:{stem}"),
+        // Pinned tip (#457 review): the write actions verify this exact
+        // commit, not whatever the branch points at later.
+        inbox_tip: Some(item_tip),
     })
 }
 
@@ -825,6 +837,7 @@ mod tests {
             raw: conflicted.to_vec(),
             ours_label: "HEAD".to_owned(),
             theirs_label: "branch".to_owned(),
+            inbox_tip: None,
         };
 
         let err = take_side_with_check(root, true, &sides, Side::Ours, || {

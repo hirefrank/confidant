@@ -508,7 +508,7 @@ enum RecordAction {
         edit: bool,
         /// Skip inbox signature verification for `--from-inbox` write
         /// actions (same escape hatch as `inbox --allow-unsigned`).
-        #[arg(long)]
+        #[arg(long, requires = "from_inbox")]
         allow_unsigned: bool,
     },
 }
@@ -3466,10 +3466,22 @@ fn cmd_record_resolve_from_inbox(
     // inbox item's content is about to land in the encrypted record, and
     // these actions can run without `--show` first. `--show` stays
     // read-only above. Honors `--allow-unsigned` like the drain.
+    //
+    // The tip pinned by the read is what gets verified, and the branch must
+    // still point there: verifying one commit while writing another's bytes
+    // is exactly the gap the drain closes with `E_INBOX_RACE` (#457 review).
     let trusted_signers = user_config
         .map(|u| u.trust.signers.clone())
         .unwrap_or_default();
-    confidant_core::verify_inbox_trust(root, &trusted_signers, allow_unsigned)?;
+    let tip = sides.inbox_tip.as_deref().ok_or_else(|| {
+        anyhow::Error::new(DomainError::internal(
+            "inbox-sourced resolve is missing the tip it read the item at",
+        ))
+    })?;
+    confidant_core::verify_inbox_trust(root, &trusted_signers, allow_unsigned, tip)?;
+    if allow_unsigned {
+        eprintln!("warning: {}", confidant_core::ALLOW_UNSIGNED_WARNING);
+    }
     if let Some(side) = take {
         match side {
             Side::Ours => {

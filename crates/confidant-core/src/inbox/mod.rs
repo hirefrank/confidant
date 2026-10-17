@@ -65,6 +65,12 @@ pub use rotate::{run_inbox_rotate, InboxRotateOptions, InboxRotateOutcome};
 /// The git branch outside tools push intake items to.
 pub const INBOX_BRANCH: &str = "inbox";
 
+/// Warning the drain emits when `--allow-unsigned` skips the inbox
+/// signature gate. `record resolve --from-inbox` write actions print the
+/// same line to stderr (#457 review).
+pub const ALLOW_UNSIGNED_WARNING: &str =
+    "proceeding without inbox signature verification (--allow-unsigned)";
+
 /// Decrypts item ciphertext. Production passes a closure over [`InboxKeys`]
 /// (the real `confidant-crypt` age path); tests inject a fake.
 pub type DecryptFn = dyn Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>;
@@ -220,6 +226,10 @@ pub struct InboxItemContent {
     pub path: Option<PathBuf>,
     /// Decrypted plaintext content.
     pub content: String,
+    /// The inbox branch tip the item was read at (#457 review). Pass this
+    /// to [`verify_inbox_trust`] so the commit whose signatures are
+    /// verified is the exact commit the bytes came from.
+    pub tip: String,
 }
 
 /// Read one inbox item by stem for `record resolve --from-inbox` (#457).
@@ -229,9 +239,10 @@ pub struct InboxItemContent {
 /// Fails closed when the stem is malformed or not on the tip
 /// (`E_INBOX_SKIP`), when decryption fails, or when parsing fails.
 ///
-/// Signatures are not verified here: the operator explicitly named this
-/// item and sees its plaintext on screen (`--show`) before any action is
-/// taken. The drain's signature checks still gate unattended merges.
+/// Signatures are not verified here. The caller decides: `--show` reads
+/// the item without a trust check (nothing is written), while the write
+/// actions call [`verify_inbox_trust`] with the `tip` this function
+/// returns, so the verified commit is the one the bytes came from.
 pub fn read_inbox_item(
     vault_root: &Path,
     stem: &str,
@@ -267,21 +278,29 @@ pub fn read_inbox_item(
         kind: parsed.kind.as_str().to_string(),
         path: parsed.path,
         content: parsed.content,
+        tip,
     })
 }
 
 /// Verify the inbox branch tip's signature provenance — the same trust
 /// check the drain runs before merging (#457).
 ///
+/// `expected_tip` is the tip the caller read the item at (see
+/// [`InboxItemContent::tip`]). The branch must still point there, or the
+/// check refuses with `E_INBOX_RACE`: the drain pins the tip once and
+/// re-checks it before acting, and this path must not verify one commit
+/// while writing another's bytes.
+///
 /// Refuses with `E_INBOX_UNTRUSTED` when no trusted signers are configured
-/// and `allow_unsigned` is false; otherwise verifies that every item at the
-/// tip was introduced by a trusted signer. Used by
+/// and `allow_unsigned` is false; otherwise verifies that every item at
+/// the pinned tip was introduced by a trusted signer. Used by
 /// `record resolve --from-inbox` write actions (`--take`, `--merged-file`,
 /// `--edit`); `--show` stays read-only without the check.
 pub fn verify_inbox_trust(
     vault_root: &Path,
     trusted_signers: &[String],
     allow_unsigned: bool,
+    expected_tip: &str,
 ) -> anyhow::Result<()> {
     if trusted_signers.is_empty() && !allow_unsigned {
         return Err(anyhow::Error::new(DomainError::inbox_untrusted(
@@ -290,8 +309,14 @@ pub fn verify_inbox_trust(
         )));
     }
     let repo = git::toplevel(vault_root)?;
-    let tip = git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
-    trust::verify_inbox_signatures(&repo, &tip, trusted_signers)?;
+    let current = git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    if current != expected_tip {
+        return Err(anyhow::Error::new(DomainError::inbox_race(
+            expected_tip,
+            &current,
+        )));
+    }
+    trust::verify_inbox_signatures(&repo, expected_tip, trusted_signers)?;
     Ok(())
 }
 

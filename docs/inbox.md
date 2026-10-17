@@ -285,6 +285,14 @@ and clears it. `--take ours` leaves the record untouched — follow it with
 `inbox --discard <stem>` so the item stops conflicting. `--merged-file`
 and `--edit` work as with git-conflict resolution.
 
+The write actions (`--take`, `--merged-file`, `--edit`) run the drain's
+signed-tip trust check on the inbox branch: with `[trust]` signers
+configured it refuses an unsigned or untrusted tip with
+`E_INBOX_UNTRUSTED`, and it refuses with `E_INBOX_RACE` if the branch
+moves between the item being read and the write. `--allow-unsigned` is the
+same escape hatch as `inbox --allow-unsigned` (and prints the same
+warning). `--show` is read-only and does not run the check.
+
 ## Fallback queue (`log session --note --fallback-inbox`, #213)
 
 When the keychain is unavailable, `log session --note` cannot encrypt

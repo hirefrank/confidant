@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::Command;
 
 use confidant_core::{
-    queue_items, run_inbox, DecryptExistingFn, DecryptFn, DomainError, InboxOptions, QueueItem,
+    queue_items, read_inbox_item, run_inbox, verify_inbox_trust, DecryptExistingFn, DecryptFn,
+    DomainError, InboxOptions, QueueItem,
 };
 use tempfile::TempDir;
 
@@ -1778,4 +1779,54 @@ fn discard_does_not_touch_main_worktree_or_head() {
         git_out(r.root(), &["rev-parse", "--abbrev-ref", "HEAD"]),
         "main"
     );
+}
+
+#[test]
+fn resolve_from_inbox_refuses_when_the_tip_moves_after_the_read() {
+    // #457 review: `read_inbox_item` returns the tip it read at, and the
+    // write actions pass that tip to `verify_inbox_trust`, which refuses
+    // with `E_INBOX_RACE` when the branch no longer points there. That
+    // makes the verified commit always the commit whose bytes are used.
+    // The decryptor moves the branch mid-read, as the drain's
+    // `push_between_verify_and_read_refuses` does.
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", RECORD_ITEM)]);
+    let root = r.root().to_path_buf();
+    let moved = std::sync::Mutex::new(false);
+    let evil: &DecryptFn = &move |b: &[u8]| {
+        let mut guard = moved.lock().unwrap();
+        if !*guard {
+            *guard = true;
+            let tip = git_out(&root, &["rev-parse", "inbox"]);
+            let tree = git_out(&root, &["rev-parse", "inbox^{tree}"]);
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["commit-tree", &tree, "-p", &tip, "-m", "unsigned push"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("commit-tree failed");
+            assert!(out.status.success());
+            let new_commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["update-ref", "refs/heads/inbox", &new_commit, &tip])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("update-ref failed");
+            assert!(out.status.success());
+        }
+        Ok(zeroize::Zeroizing::new(b.to_vec()))
+    };
+
+    let item = read_inbox_item(r.root(), "01JAAA", evil).expect("item read");
+    // `--allow-unsigned` skips the signature requirement, not the pin.
+    let err =
+        verify_inbox_trust(r.root(), &[], true, &item.tip).expect_err("expected E_INBOX_RACE");
+    assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_RACE");
 }
