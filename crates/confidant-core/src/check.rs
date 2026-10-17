@@ -64,6 +64,10 @@ pub fn parse_fail_on(s: &str) -> Result<Severity, DomainError> {
 
 /// Stable finding code. Serialized as the `E_*` string. Callers branch on
 /// this, never on message text.
+///
+/// `Pack` carries a pack-defined code (#434). It is the last variant so the
+/// derived `Ord` keeps all enum variants first (declaration order), then
+/// `Pack` codes by string.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum FindingCode {
     Parse,
@@ -73,6 +77,8 @@ pub enum FindingCode {
     PackUnknown,
     PackConflict,
     PackOrphan,
+    PackHash,
+    PackInvalid,
     InvalidId,
     InvalidFilename,
     IdPathMismatch,
@@ -111,6 +117,7 @@ pub enum FindingCode {
     TouchMalformed,
     CadenceOverdue,
     DateUpcoming,
+    Pack(&'static str),
 }
 
 impl FindingCode {
@@ -123,6 +130,8 @@ impl FindingCode {
             Self::PackUnknown => "E_PACK_UNKNOWN",
             Self::PackConflict => "E_PACK_CONFLICT",
             Self::PackOrphan => "W_PACK_ORPHAN",
+            Self::PackHash => "E_PACK_HASH",
+            Self::PackInvalid => "E_PACK_INVALID",
             Self::InvalidId => "E_INVALID_ID",
             Self::InvalidFilename => "E_INVALID_FILENAME",
             Self::IdPathMismatch => "E_ID_PATH_MISMATCH",
@@ -161,8 +170,102 @@ impl FindingCode {
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
+            Self::Pack(code) => code,
         }
     }
+
+    /// All builtin code strings, in declaration order. Used to reject
+    /// pack-declared codes that collide with an existing code.
+    const ALL_BUILTIN_STRS: &[&str] = &[
+        "E_PARSE",
+        "E_UNREADABLE",
+        "E_CONFIG",
+        "E_SPEC_UNSUPPORTED",
+        "E_PACK_UNKNOWN",
+        "E_PACK_CONFLICT",
+        "W_PACK_ORPHAN",
+        "E_PACK_HASH",
+        "E_PACK_INVALID",
+        "E_INVALID_ID",
+        "E_INVALID_FILENAME",
+        "E_ID_PATH_MISMATCH",
+        "E_TYPE_PATH_MISMATCH",
+        "E_DUPLICATE_ID",
+        "E_FRONTMATTER",
+        "E_UNKNOWN_VERB",
+        "E_UNKNOWN_RECORD",
+        "E_UNKNOWN_METRIC",
+        "E_LEDGER_PATH",
+        "E_LEDGER_DATE",
+        "E_BALANCE_MISMATCH",
+        "E_ALIAS_PLAINTEXT",
+        "E_ALIAS_COLLISION",
+        "E_UNRESOLVED_MERGE",
+        "E_SELF_MERGE",
+        "E_MERGE_CYCLE",
+        "E_SYMLINK",
+        "E_MERGE_CONFLICT",
+        "E_MISSING_DURATION",
+        "E_OPEN_MALFORMED",
+        "E_NEGATIVE_BALANCE",
+        "E_SESSION_WITHOUT_NOTES",
+        "E_PAID_SESSION_GAP",
+        "E_WRONG_ID_TYPE",
+        "E_DUPLICATE_ULID",
+        "E_MERGE_FORK",
+        "E_DANGLING_REF",
+        "E_DUPLICATE_SRC",
+        "W_SESSION_UNTAGGED",
+        "E_SESSION_TAGS",
+        "E_INBOX_KEY_MISMATCH",
+        "E_SELF_EDGE",
+        "E_DUPLICATE_EDGE",
+        "E_UNKNOWN_EDGE_KIND",
+        "E_TOUCH_MALFORMED",
+        "W_CADENCE_OVERDUE",
+        "W_DATE_UPCOMING",
+    ];
+
+    /// Whether `s` is the string of a builtin enum variant (not a `Pack` code).
+    pub fn is_builtin_code(s: &str) -> bool {
+        Self::ALL_BUILTIN_STRS.contains(&s)
+    }
+
+    /// Build a `Pack` code from a pack-declared string (#434). The string
+    /// must match `^[EW]_[A-Z0-9_]{2,40}$` and must not collide with any
+    /// existing builtin code. The caller leaks the string once at load time
+    /// (same `Box::leak` pattern as pack manifests).
+    pub fn from_pack_str(code: &'static str) -> Result<FindingCode, DomainError> {
+        if !is_valid_pack_code(code) {
+            return Err(DomainError::invalid(format!(
+                "invalid pack finding code '{code}' (must match ^[EW]_[A-Z0-9_]{{2,40}}$)"
+            )));
+        }
+        if Self::is_builtin_code(code) {
+            return Err(DomainError::invalid(format!(
+                "pack finding code '{code}' collides with an existing code"
+            )));
+        }
+        Ok(FindingCode::Pack(code))
+    }
+}
+
+/// A pack-declared finding code must match `^[EW]_[A-Z0-9_]{2,40}$`.
+fn is_valid_pack_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    // E/W + _ + 2..40 of [A-Z0-9_] = 4..42 bytes total.
+    if bytes.len() < 4 || bytes.len() > 42 {
+        return false;
+    }
+    if bytes[0] != b'E' && bytes[0] != b'W' {
+        return false;
+    }
+    if bytes[1] != b'_' {
+        return false;
+    }
+    bytes[2..]
+        .iter()
+        .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 impl Serialize for FindingCode {
@@ -1492,7 +1595,7 @@ pub(crate) fn duration_of(entry: &LedgerEntry) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fail_on, CheckSummary, FindingCode, Severity};
+    use super::{parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
 
     #[test]
     fn fail_on_and_summary() {
@@ -1524,5 +1627,196 @@ mod tests {
         assert_eq!(FindingCode::SessionTags.as_str(), "E_SESSION_TAGS");
         assert_eq!(FindingCode::PackConflict.as_str(), "E_PACK_CONFLICT");
         assert_eq!(FindingCode::PackOrphan.as_str(), "W_PACK_ORPHAN");
+        assert_eq!(FindingCode::PackHash.as_str(), "E_PACK_HASH");
+        assert_eq!(FindingCode::PackInvalid.as_str(), "E_PACK_INVALID");
+    }
+
+    #[test]
+    fn from_pack_str_accepts_valid() {
+        assert_eq!(
+            FindingCode::from_pack_str("W_EXAMPLE_THING").unwrap(),
+            FindingCode::Pack("W_EXAMPLE_THING")
+        );
+        assert_eq!(
+            FindingCode::from_pack_str("E_AB1").unwrap(),
+            FindingCode::Pack("E_AB1")
+        );
+        // Boundary lengths: 2 and 40 chars after the E_/W_ prefix.
+        assert!(FindingCode::from_pack_str("E_AB").is_ok());
+        assert!(FindingCode::from_pack_str("E_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_ok());
+    }
+
+    #[test]
+    fn from_pack_str_rejects_bad_shape() {
+        assert!(FindingCode::from_pack_str("w_lower").is_err());
+        assert!(FindingCode::from_pack_str("X_NOPE").is_err());
+        assert!(FindingCode::from_pack_str("E_").is_err());
+        assert!(FindingCode::from_pack_str("E_A").is_err());
+        // 41 chars after the prefix: too long.
+        assert!(FindingCode::from_pack_str("E_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err());
+        assert!(FindingCode::from_pack_str("E_BAD-CODE").is_err());
+        assert!(FindingCode::from_pack_str("").is_err());
+    }
+
+    #[test]
+    fn from_pack_str_rejects_core_collision() {
+        assert!(FindingCode::from_pack_str("E_PARSE").is_err());
+        assert!(FindingCode::from_pack_str("W_CADENCE_OVERDUE").is_err());
+        assert!(FindingCode::from_pack_str("E_PACK_HASH").is_err());
+        assert!(FindingCode::from_pack_str("E_PACK_INVALID").is_err());
+        assert!(FindingCode::from_pack_str("W_PACK_ORPHAN").is_err());
+    }
+
+    #[test]
+    fn pack_code_serializes_as_string() {
+        let finding = Finding::new(
+            FindingCode::Pack("W_EXAMPLE_THING"),
+            Severity::Warning,
+            "example",
+        );
+        let json = serde_json::to_string(&finding).unwrap();
+        assert!(json.contains("\"code\":\"W_EXAMPLE_THING\""), "{json}");
+        assert_eq!(
+            FindingCode::Pack("W_EXAMPLE_THING").as_str(),
+            "W_EXAMPLE_THING"
+        );
+    }
+
+    #[test]
+    fn findings_sort_is_stable_with_pack_codes() {
+        // Enum variants sort by declaration order (via derived Ord), then
+        // Pack codes sort by string. sort_findings itself orders by as_str().
+        assert!(FindingCode::Parse < FindingCode::Pack("W_AAA"));
+        assert!(FindingCode::DateUpcoming < FindingCode::Pack("E_AAA"));
+        assert!(FindingCode::Pack("E_AAA") < FindingCode::Pack("W_AAA"));
+        assert!(FindingCode::Pack("W_AAA") < FindingCode::Pack("W_AAB"));
+
+        let mut findings = vec![
+            Finding::new(FindingCode::Pack("W_ZZZ"), Severity::Warning, "z"),
+            Finding::new(FindingCode::Parse, Severity::Error, "p"),
+            Finding::new(FindingCode::Pack("E_AAA"), Severity::Warning, "a"),
+        ];
+        super::sort_findings(&mut findings);
+        // sort_findings orders by severity desc, then as_str().
+        assert_eq!(findings[0].code, FindingCode::Parse);
+        assert_eq!(findings[1].code, FindingCode::Pack("E_AAA"));
+        assert_eq!(findings[2].code, FindingCode::Pack("W_ZZZ"));
+    }
+
+    /// `ALL_BUILTIN_STRS` is a second hand-maintained copy of the builtin
+    /// `as_str()` values, so a new variant could be missing from it and
+    /// `from_pack_str` would then accept a colliding pack code. This keeps
+    /// the two in step: the match below lists every variant with no
+    /// wildcard arm, so adding one fails to compile until it is added
+    /// here too, and the assertion compares the full sequence (order and
+    /// length included) against the constant.
+    #[test]
+    fn all_builtin_strs_lists_every_builtin_variant() {
+        let variants = [
+            FindingCode::Parse,
+            FindingCode::Unreadable,
+            FindingCode::Config,
+            FindingCode::SpecUnsupported,
+            FindingCode::PackUnknown,
+            FindingCode::PackConflict,
+            FindingCode::PackOrphan,
+            FindingCode::PackHash,
+            FindingCode::PackInvalid,
+            FindingCode::InvalidId,
+            FindingCode::InvalidFilename,
+            FindingCode::IdPathMismatch,
+            FindingCode::TypePathMismatch,
+            FindingCode::DuplicateId,
+            FindingCode::Frontmatter,
+            FindingCode::UnknownVerb,
+            FindingCode::UnknownRecord,
+            FindingCode::UnknownMetric,
+            FindingCode::LedgerPath,
+            FindingCode::LedgerDate,
+            FindingCode::BalanceMismatch,
+            FindingCode::AliasPlaintext,
+            FindingCode::AliasCollision,
+            FindingCode::UnresolvedMerge,
+            FindingCode::SelfMerge,
+            FindingCode::MergeCycle,
+            FindingCode::Symlink,
+            FindingCode::MergeConflict,
+            FindingCode::MissingDuration,
+            FindingCode::OpenMalformed,
+            FindingCode::NegativeBalance,
+            FindingCode::SessionWithoutNotes,
+            FindingCode::PaidSessionGap,
+            FindingCode::WrongIdType,
+            FindingCode::DuplicateUlid,
+            FindingCode::MergeFork,
+            FindingCode::DanglingRef,
+            FindingCode::DuplicateSrc,
+            FindingCode::SessionUntagged,
+            FindingCode::SessionTags,
+            FindingCode::InboxKeyMismatch,
+            FindingCode::SelfEdge,
+            FindingCode::DuplicateEdge,
+            FindingCode::UnknownEdgeKind,
+            FindingCode::TouchMalformed,
+            FindingCode::CadenceOverdue,
+            FindingCode::DateUpcoming,
+        ];
+        for code in &variants {
+            match code {
+                FindingCode::Parse
+                | FindingCode::Unreadable
+                | FindingCode::Config
+                | FindingCode::SpecUnsupported
+                | FindingCode::PackUnknown
+                | FindingCode::PackConflict
+                | FindingCode::PackOrphan
+                | FindingCode::PackHash
+                | FindingCode::PackInvalid
+                | FindingCode::InvalidId
+                | FindingCode::InvalidFilename
+                | FindingCode::IdPathMismatch
+                | FindingCode::TypePathMismatch
+                | FindingCode::DuplicateId
+                | FindingCode::Frontmatter
+                | FindingCode::UnknownVerb
+                | FindingCode::UnknownRecord
+                | FindingCode::UnknownMetric
+                | FindingCode::LedgerPath
+                | FindingCode::LedgerDate
+                | FindingCode::BalanceMismatch
+                | FindingCode::AliasPlaintext
+                | FindingCode::AliasCollision
+                | FindingCode::UnresolvedMerge
+                | FindingCode::SelfMerge
+                | FindingCode::MergeCycle
+                | FindingCode::Symlink
+                | FindingCode::MergeConflict
+                | FindingCode::MissingDuration
+                | FindingCode::OpenMalformed
+                | FindingCode::NegativeBalance
+                | FindingCode::SessionWithoutNotes
+                | FindingCode::PaidSessionGap
+                | FindingCode::WrongIdType
+                | FindingCode::DuplicateUlid
+                | FindingCode::MergeFork
+                | FindingCode::DanglingRef
+                | FindingCode::DuplicateSrc
+                | FindingCode::SessionUntagged
+                | FindingCode::SessionTags
+                | FindingCode::InboxKeyMismatch
+                | FindingCode::SelfEdge
+                | FindingCode::DuplicateEdge
+                | FindingCode::UnknownEdgeKind
+                | FindingCode::TouchMalformed
+                | FindingCode::CadenceOverdue
+                | FindingCode::DateUpcoming => {}
+                FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
+            }
+        }
+        assert_eq!(
+            variants.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+            FindingCode::ALL_BUILTIN_STRS.to_vec(),
+            "ALL_BUILTIN_STRS must list every builtin variant, in declaration order"
+        );
     }
 }
