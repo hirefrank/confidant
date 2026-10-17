@@ -916,10 +916,38 @@ mod tests {
     }
 
     #[test]
+    fn record_item_body_keeps_its_trailing_newline() {
+        // The body is the record plaintext as queued. Dropping the final
+        // newline would make the drain write a non-canonical record and
+        // would stop `record resolve --take theirs` (which reformats) from
+        // matching the drain's encrypt-and-compare idempotency check.
+        let item = parse_item("01JABC", RECORD_ITEM).unwrap();
+        assert_eq!(item.content, "# Acme\n");
+
+        // A body with no trailing newline is passed through unchanged.
+        let item = parse_item(
+            "01JABC",
+            "confidant-inbox/1\nkind: record\npath: people/p-acme/profile.md\n---\n# Acme",
+        )
+        .unwrap();
+        assert_eq!(item.content, "# Acme");
+
+        // Extra trailing newlines survive.
+        let item = parse_item(
+            "01JABC",
+            "confidant-inbox/1\nkind: record\npath: people/p-acme/profile.md\n---\n# Acme\n\n",
+        )
+        .unwrap();
+        assert_eq!(item.content, "# Acme\n\n");
+    }
+
+    #[test]
     fn record_identical_is_idempotent() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("people/p-acme")).unwrap();
-        std::fs::write(dir.path().join("people/p-acme/profile.md"), "# Acme").unwrap();
+        // `RECORD_ITEM`'s body keeps its trailing newline, so the identical
+        // record on disk is the canonical form (which ends with one).
+        std::fs::write(dir.path().join("people/p-acme/profile.md"), "# Acme\n").unwrap();
         let item = parse_item("01JABC", RECORD_ITEM).unwrap();
         assert!(plan_test(dir.path(), &item, &BTreeSet::new())
             .unwrap()

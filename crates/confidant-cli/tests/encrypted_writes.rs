@@ -6153,7 +6153,9 @@ fn resolve_from_inbox_item_for_missing_record_is_not_a_conflict() {
     }
     // Queue an item for a record that does not exist.
     let inbox_recipient = age_recipient(&inbox_bech32);
-    let ghost = "p-01GHOST000000000000000000";
+    // A valid ULID that has no record: a malformed id would fail as a usage
+    // error before the missing-record check this test is about.
+    let ghost = "p-01J9Z3K4QF0000000000000001";
     let payload = format!(
         "confidant-inbox/1\nkind: record\npath: people/{ghost}/profile.md\n---\n{}",
         person_md(ghost, "Ghost Example", "SENTINEL-GHOST-bio.")
@@ -6183,7 +6185,8 @@ fn resolve_from_inbox_item_for_missing_record_is_not_a_conflict() {
     cmd.env("CONFIDANT_KEYCHAIN", "off");
     let out = cmd.output().unwrap();
     assert!(!out.status.success(), "missing record must be refused");
-    let text = stderr(&out);
+    // `--json` reports the error as an envelope on stdout (ADR-7).
+    let text = format!("{}{}", stdout(&out), stderr(&out));
     assert!(text.contains("nothing to resolve"), "wrong error: {text}");
 }
 
