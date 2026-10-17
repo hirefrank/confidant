@@ -13,6 +13,7 @@ mod embedded;
 mod mcp;
 mod record_crypto;
 mod record_decrypt;
+mod record_resolve;
 mod setup;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -464,6 +465,38 @@ enum RecordAction {
         #[arg(long)]
         for_edit: bool,
     },
+    /// Resolve a merge conflict on a record: print both decrypted versions.
+    ///
+    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
+    /// a fixed tool whitelist). Exactly one action flag is required; a bare
+    /// invocation is a usage error. Only `--show` is implemented so far
+    /// (#453); the write half lands in #454/#455.
+    #[command(group(
+        clap::ArgGroup::new("resolve_action").required(true).multiple(false)
+    ))]
+    Resolve {
+        /// Opaque record id (p-…, o-…, d-…, e-…).
+        id: String,
+        /// Print both decrypted versions to stdout.
+        #[arg(long, group = "resolve_action")]
+        show: bool,
+        /// Keep one side's version (not yet implemented; see #454).
+        #[arg(long, value_enum, group = "resolve_action")]
+        take: Option<Side>,
+        /// Hand-merge from a file (not yet implemented; see #455).
+        #[arg(long, group = "resolve_action")]
+        merged_file: Option<PathBuf>,
+        /// Hand-merge in $EDITOR (not yet implemented; see #455).
+        #[arg(long, group = "resolve_action")]
+        edit: bool,
+    },
+}
+
+/// Which side of a merge conflict to keep (`record resolve --take`).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Side {
+    Ours,
+    Theirs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -832,6 +865,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
                 RecordAction::Edit { id, file } => cmd_record_edit(&cli, &root, id, file),
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
+                RecordAction::Resolve {
+                    id,
+                    show,
+                    take,
+                    merged_file,
+                    edit,
+                } => {
+                    cmd_record_resolve(&cli, &root, id, *show, *take, merged_file.as_deref(), *edit)
+                }
             }
         }
         Command::Context {
@@ -2986,7 +3028,7 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
 /// `None` for the prefixes this pair of commands does not handle: a note's
 /// file lives at `people/<person>/notes/<id>.md` (not the collection/main
 /// layout), and a package has no record file at all.
-fn main_path_for(id: &RecordId) -> Option<PathBuf> {
+pub(crate) fn main_path_for(id: &RecordId) -> Option<PathBuf> {
     let prefix = id.prefix();
     if matches!(prefix, Prefix::Note | Prefix::Package) {
         return None;
@@ -2999,9 +3041,10 @@ fn main_path_for(id: &RecordId) -> Option<PathBuf> {
     )))
 }
 
-/// Ids `record show` / `record edit` do not handle, refused as usage errors
-/// (exit 2, ADR-7) rather than looked up and reported as missing.
-fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
+/// Ids `record show` / `record edit` / `record resolve` do not handle,
+/// refused as usage errors (exit 2, ADR-7) rather than looked up and
+/// reported as missing.
+pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
     match id.prefix() {
         Prefix::Note => Err(anyhow::Error::new(DomainError::usage(
             "notes are not read or edited by `record`; their files live under people/<person>/notes/",
@@ -3100,6 +3143,78 @@ fn cmd_record_show(
         // Byte-for-byte on stdout, so it can be redirected into an editor
         // or a file and edited in place.
         print!("{text}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// record resolve (operator-only) (#453, part of #219)
+// ---------------------------------------------------------------------------
+
+/// #453: print both decrypted versions of a conflicted record so the
+/// operator can resolve a merge conflict.
+///
+/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
+/// argv and this command is not in it. Decryption runs through the operator
+/// decryptor (`RecordDecryptor::for_edit`), so `no-ai` records are shown in
+/// full; plaintext goes to stdout only, never to logs or error messages.
+/// The read half of resolution: `--take`, `--merged-file` and `--edit`
+/// land in #454/#455.
+#[allow(clippy::too_many_arguments)]
+fn cmd_record_resolve(
+    cli: &Cli,
+    root: &Path,
+    id_raw: &str,
+    show: bool,
+    take: Option<Side>,
+    merged_file: Option<&Path>,
+    edit: bool,
+) -> anyhow::Result<ExitCode> {
+    // Only --show is implemented in #453; the flags are accepted so the
+    // interface does not change when the write half lands.
+    if !show {
+        let what = if take.is_some() {
+            "--take"
+        } else if merged_file.is_some() {
+            "--merged-file"
+        } else if edit {
+            "--edit"
+        } else {
+            "this action"
+        };
+        return Err(anyhow::Error::new(DomainError::usage(format!(
+            "{what} is not implemented yet; only `record resolve <id> --show` is available (see #454/#455)"
+        ))));
+    }
+    let vault = vault_or!(root, cli.json);
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
+    }
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a record id: {id_raw}"))).context(
+            "`record resolve` takes an opaque record id; use `confidant find <name>` to look one up",
+        )
+    })?;
+    let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+    let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
+    let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "id": id.to_string(),
+                "path": sides.path,
+                "ours": { "label": sides.ours_label, "text": ours_text },
+                "theirs": { "label": sides.theirs_label, "text": theirs_text },
+            }),
+        ))?;
+    } else {
+        println!("== ours ({}) ==", sides.ours_label);
+        println!("{ours_text}");
+        println!("== theirs ({}) ==", sides.theirs_label);
+        println!("{theirs_text}");
     }
     Ok(ExitCode::SUCCESS)
 }
