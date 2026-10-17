@@ -724,6 +724,8 @@ vault_id = "abc"
                 name: "example".to_string(),
                 version: "0.1".to_string(),
                 skill: "SKILL.md".to_string(),
+                // v2-only; absent in a v1 manifest (#435).
+                requires_spec: Vec::new(),
             },
             verbs: Vec::new(),
             fields: Vec::new(),
@@ -735,6 +737,8 @@ vault_id = "abc"
                     default: 5,
                 }],
             },
+            // v2-only `[[rules]]` (#435); empty for a v1 manifest.
+            rules: Vec::new(),
             messages: BTreeMap::new(),
         };
 

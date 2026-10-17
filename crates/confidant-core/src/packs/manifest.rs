@@ -13,12 +13,58 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use crate::check::FindingCode;
 use crate::error::DomainError;
 use crate::id::Prefix;
 
 /// Schema version this loader implements (`manifest_version` in the file).
 /// A file declaring any other version is rejected rather than guessed at.
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// Schema version for external pack manifests (`manifest_version = 2`).
+/// Parsed by [`parse_manifest_external`]; `parse_manifest` (v1, compiled)
+/// still rejects 2.
+pub const MANIFEST_VERSION_V2: u32 = 2;
+
+/// Rule kinds an external pack may declare (`[[rules]]`). Starts empty;
+/// each kind's own issue appends its name (PD1). Until a kind lands, any
+/// `[[rules]]` entry is rejected as an unknown kind.
+pub const KNOWN_RULE_KINDS: &[&str] = &[];
+
+/// Core ledger verbs no external pack may claim (PD8 rule 1).
+const CORE_VERBS_V2: &[&str] = &["alias", "merge", "stage", "balance", "touch"];
+
+/// Core record types no external pack may claim (PD8 rule 2).
+const CORE_RECORD_TYPES: &[&str] = &["person", "org", "deal", "interaction", "note", "edge"];
+
+/// Pack names reserved for the compiled packs (PD14).
+const RESERVED_PACK_NAMES: &[&str] = &["coaching", "personal"];
+
+/// Check a pack name against the v2 grammar `^[a-z][a-z0-9-]{1,31}$`.
+fn is_valid_pack_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    // 2..32 chars total: first is [a-z], rest are [a-z0-9-].
+    if bytes.len() < 2 || bytes.len() > 32 {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Check a rule id against `^[a-z][a-z0-9_]*$`.
+fn is_valid_rule_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
 
 /// Field grammars a manifest may name (spec §6). Canonical list lives in
 /// [`grammars`](crate::packs::grammars); re-exported here so the loader's
@@ -56,6 +102,10 @@ pub struct PackInfo {
     /// Skill text path relative to the pack directory, today `"SKILL.md"`.
     /// Referenced, never duplicated.
     pub skill: String,
+    /// Exact spec versions this pack supports (v2 only). Absent in v1
+    /// files; v2 requires it non-empty with each entry non-empty.
+    #[serde(default)]
+    pub requires_spec: Vec<String>,
 }
 
 /// Parse an `id_type` name (`person`, `org`, …) into a [`Prefix`].
@@ -129,6 +179,31 @@ pub struct IntCheck {
     pub default: i64,
 }
 
+/// One `[[rules]]` entry (v2 only): a named invocation of a rule kind.
+/// The kind-specific parameters are kept raw in `params`; each kind's
+/// own issue validates them. No `deny_unknown_fields` here: `params`
+/// flattens every key the named fields don't claim, so an unknown key —
+/// a typo of a generic key included (`severity_kye`, `cod`) — lands in
+/// `params` instead of failing to deserialize. A *missing* generic key
+/// still fails, the manifest parser only checks the fixed generic keys,
+/// and each rule kind must validate its own `params` strictly.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RuleDecl {
+    /// Unique within the pack; matches `^[a-z][a-z0-9_]*$`.
+    pub id: String,
+    /// One of [`KNOWN_RULE_KINDS`].
+    pub kind: String,
+    /// The finding code this rule emits; must be in `finding_codes`.
+    pub code: String,
+    /// Optional declared `[[checks.severity]]` key (full namespaced key).
+    /// Kinds with a fixed severity omit it.
+    #[serde(default)]
+    pub severity_key: Option<String>,
+    /// Kind-specific parameters, kept raw.
+    #[serde(flatten)]
+    pub params: toml::Table,
+}
+
 /// The `[checks]` table: keys this pack owns, with defaults.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -141,7 +216,7 @@ pub struct ChecksDecl {
 
 /// A parsed and validated pack manifest. All names are owned strings;
 /// steps 4-5 compare these against the compiled `&'static` slices.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PackManifest {
     /// Schema version of the file; must equal [`MANIFEST_VERSION`].
@@ -165,6 +240,10 @@ pub struct PackManifest {
     pub edge_kinds: Vec<EdgeKindDecl>,
     #[serde(default)]
     pub checks: ChecksDecl,
+    /// Declarative rules (v2 only). Empty for v1 and for v2 packs that
+    /// declare none yet.
+    #[serde(default)]
+    pub rules: Vec<RuleDecl>,
     /// Finding message and fix templates, one table per code:
     /// `messages[code][variant] = template`. Every code in
     /// `finding_codes` needs a table with at least one variant, and every
@@ -233,7 +312,166 @@ impl PackManifest {
             ))
             .with_fix("Set manifest_version = 1 or upgrade the CLI"));
         }
+        self.validate_common()
+    }
 
+    /// Validate an external (v2) pack manifest: the v2 schema from #431
+    /// plus the capability limits (PD8). Called by
+    /// [`parse_manifest_external`]; the finding wrapper (`E_PACK_INVALID`)
+    /// comes in #438, so errors here are `DomainError::config`.
+    fn validate_external(&self) -> Result<(), DomainError> {
+        if self.manifest_version != MANIFEST_VERSION_V2 {
+            return Err(manifest_err(format!(
+                "manifest_version {} is not an external pack manifest (this loader expects {})",
+                self.manifest_version, MANIFEST_VERSION_V2
+            ))
+            .with_fix("Set manifest_version = 2 for external packs"));
+        }
+
+        // PD14: name grammar and reserved names.
+        if !is_valid_pack_name(&self.pack.name) {
+            return Err(manifest_err(format!(
+                "[pack].name '{}' is not a valid external pack name (must match ^[a-z][a-z0-9-]{{1,31}}$)",
+                self.pack.name
+            ))
+            .with_fix("Use a lowercase name with dashes, e.g. name = \"example-pack\""));
+        }
+        if RESERVED_PACK_NAMES.contains(&self.pack.name.as_str()) {
+            return Err(manifest_err(format!(
+                "[pack].name '{}' is reserved for a compiled pack",
+                self.pack.name
+            ))
+            .with_fix("Choose a different pack name"));
+        }
+
+        // PD11: requires_spec is required in v2, non-empty, each entry non-empty.
+        if self.pack.requires_spec.is_empty() {
+            return Err(
+                manifest_err("[pack].requires_spec must be non-empty for external packs").with_fix(
+                    "List the spec versions this pack supports, e.g. requires_spec = [\"0.1\"]",
+                ),
+            );
+        }
+        for spec in &self.pack.requires_spec {
+            if spec.trim().is_empty() {
+                return Err(
+                    manifest_err("[pack].requires_spec entries must be non-empty")
+                        .with_fix("Remove the empty entry or give it a spec version"),
+                );
+            }
+        }
+
+        // PD13: every finding_codes entry must pass the shape and collision
+        // rules. Leak once at load time (same Box::leak pattern as #434).
+        for code in &self.finding_codes {
+            let leaked: &'static str = Box::leak(code.clone().into_boxed_str());
+            FindingCode::from_pack_str(leaked).map_err(|e| {
+                manifest_err(format!("finding code '{code}' is invalid: {e}")).with_fix(
+                    "Codes must match ^[EW]_[A-Z0-9_]{2,40}$ and must not collide with an existing code",
+                )
+            })?;
+        }
+
+        // PD8 rule 1: no core verbs.
+        for verb in &self.verbs {
+            if CORE_VERBS_V2.contains(&verb.name.as_str()) {
+                return Err(manifest_err(format!(
+                    "verb '{}' is a core verb and cannot be claimed by an external pack",
+                    verb.name
+                ))
+                .with_fix("Remove the verb or choose a different name"));
+            }
+        }
+
+        // PD8 rule 2: no core record types.
+        for record_type in &self.record_types {
+            if CORE_RECORD_TYPES.contains(&record_type.as_str()) {
+                return Err(manifest_err(format!(
+                    "record type '{record_type}' is a core record type and cannot be claimed by an external pack",
+                ))
+                .with_fix("Remove the record type or choose a different name"));
+            }
+        }
+
+        // PD8 rule 3: no core edge kinds.
+        for edge_kind in &self.edge_kinds {
+            if crate::packs::CORE_EDGE_KINDS
+                .iter()
+                .any(|k| k.name == edge_kind.name)
+            {
+                return Err(manifest_err(format!(
+                    "edge kind '{}' is a core edge kind and cannot be claimed by an external pack",
+                    edge_kind.name
+                ))
+                .with_fix("Remove the edge kind or choose a different name"));
+            }
+        }
+
+        // PD8 rule 4 is covered by the from_pack_str collision check above.
+
+        // Skill path must be a plain file name (no `/`, no `..`).
+        if self.pack.skill.contains('/') || self.pack.skill.contains("..") {
+            return Err(manifest_err(format!(
+                "[pack].skill '{}' must be a plain file name (no `/`, no `..`)",
+                self.pack.skill
+            ))
+            .with_fix("Use a plain file name like skill = \"SKILL.md\""));
+        }
+
+        // Rules validation: IDs first (validity + uniqueness), then the
+        // per-rule checks. The ID pass runs separately so duplicate IDs are
+        // caught even though KNOWN_RULE_KINDS is empty (kind check would
+        // fire first otherwise).
+        let mut seen_rule_ids = BTreeSet::new();
+        for rule in &self.rules {
+            if !is_valid_rule_id(&rule.id) {
+                return Err(manifest_err(format!(
+                    "rule id '{}' is not valid (must match ^[a-z][a-z0-9_]*$)",
+                    rule.id
+                ))
+                .with_fix("Use a lowercase id with underscores, e.g. id = \"my_rule\""));
+            }
+            if !seen_rule_ids.insert(&rule.id) {
+                return Err(manifest_err(format!("duplicate rule id '{}'", rule.id))
+                    .with_fix("Each rule id may be declared only once"));
+            }
+        }
+        let severity_keys: BTreeSet<&str> = self
+            .checks
+            .severity
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        for rule in &self.rules {
+            if !KNOWN_RULE_KINDS.contains(&rule.kind.as_str()) {
+                return Err(manifest_err(format!(
+                    "rule '{}' has unknown rule kind '{}'",
+                    rule.id, rule.kind
+                ))
+                .with_fix("The kind list is empty until a kind issue adds its name"));
+            }
+            if !self.finding_codes.contains(&rule.code) {
+                return Err(manifest_err(format!(
+                    "rule '{}' emits code '{}' which is not in finding_codes",
+                    rule.id, rule.code
+                ))
+                .with_fix("Add the code to finding_codes or use a declared code"));
+            }
+            if let Some(key) = &rule.severity_key {
+                if !severity_keys.contains(key.as_str()) {
+                    return Err(manifest_err(format!(
+                        "rule '{}' names undeclared severity_key '{}'",
+                        rule.id, key
+                    ))
+                    .with_fix("Declare the key in [[checks.severity]] or omit severity_key"));
+                }
+            }
+        }
+
+        self.validate_common()
+    }
+
+    fn validate_common(&self) -> Result<(), DomainError> {
         if self.pack.name.trim().is_empty() {
             return Err(manifest_err("[pack].name must be non-empty")
                 .with_fix("Set the pack's short name, e.g. name = \"personal\""));
@@ -365,6 +603,20 @@ pub fn parse_manifest(text: &str) -> Result<PackManifest, DomainError> {
         )
     })?;
     manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Parse and validate an external (v2) pack manifest. Requires
+/// `manifest_version = 2` and applies the v2 schema plus capability
+/// limits (PD8). Returns the manifest on success; nothing is read from
+/// disk.
+pub fn parse_manifest_external(text: &str) -> Result<PackManifest, DomainError> {
+    let manifest: PackManifest = toml::from_str(text).map_err(|err| {
+        manifest_err(format!("manifest.toml is not valid TOML: {err}")).with_fix(
+            "Top-level keys (record_types, balance_metrics, finding_codes) must come before the first [table] header",
+        )
+    })?;
+    manifest.validate_external()?;
     Ok(manifest)
 }
 
@@ -722,5 +974,195 @@ default = "x"
         );
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("non-empty"), "{err:?}");
+    }
+
+    /// A minimal valid v2 manifest from spec §13.6.
+    fn valid_v2_toml() -> String {
+        r#"
+manifest_version = 2
+
+record_types = []
+balance_metrics = []
+finding_codes = ["E_EXAMPLE_FIELD"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "example_field"
+grammar = "non-empty-string"
+
+[checks]
+[[checks.severity]]
+key = "example-pack.example_rule"
+default = "warning"
+
+[messages."E_EXAMPLE_FIELD"]
+default = "example field '{key}' {problem}"
+default_fix = "{fix}"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn external_accepts_spec_example() {
+        let m = parse_manifest_external(&valid_v2_toml()).unwrap();
+        assert_eq!(m.manifest_version, 2);
+        assert_eq!(m.pack.name, "example-pack");
+        assert_eq!(m.pack.requires_spec, vec!["0.1".to_string()]);
+        assert!(m.rules.is_empty());
+    }
+
+    #[test]
+    fn external_accepts_no_rules() {
+        // Valid v2 with no [[rules]] at all.
+        let m = parse_manifest_external(&valid_v2_toml()).unwrap();
+        assert!(m.rules.is_empty());
+    }
+
+    #[test]
+    fn external_rejects_v1_version() {
+        let text = valid_v2_toml().replace("manifest_version = 2", "manifest_version = 1");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("manifest_version 1 is not an external pack manifest"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn external_rejects_missing_requires_spec() {
+        let text = valid_v2_toml().replace("requires_spec = [\"0.1\"]\n", "");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("requires_spec"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_empty_requires_spec() {
+        let text = valid_v2_toml().replace("requires_spec = [\"0.1\"]", "requires_spec = []");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("requires_spec"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_reserved_name() {
+        let text = valid_v2_toml().replace("name = \"example-pack\"", "name = \"coaching\"");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_bad_name() {
+        for bad in ["Bad_Name", "a", &"a".repeat(33)] {
+            let text =
+                valid_v2_toml().replace("name = \"example-pack\"", &format!("name = \"{bad}\""));
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(err.to_string().contains("name"), "{bad}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn external_rejects_core_verb() {
+        for verb in ["touch", "merge"] {
+            let text = valid_v2_toml() + &format!("\n[[verbs]]\nname = \"{verb}\"\n");
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(err.to_string().contains("core verb"), "{verb}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn external_rejects_core_edge_kind() {
+        let text = valid_v2_toml() + "\n[[edge_kinds]]\nname = \"married\"\nsymmetric = true\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("core edge kind"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_core_record_type() {
+        let text = valid_v2_toml().replace("record_types = []", "record_types = [\"person\"]");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("core record type"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_core_finding_code() {
+        // E_PARSE is a builtin code; external packs cannot claim it.
+        let text = valid_v2_toml()
+            .replace(
+                "finding_codes = [\"E_EXAMPLE_FIELD\"]",
+                "finding_codes = [\"E_PARSE\"]",
+            )
+            .replace("[messages.\"E_EXAMPLE_FIELD\"]", "[messages.\"E_PARSE\"]");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("collides"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_bad_finding_code_shape() {
+        let text = valid_v2_toml()
+            .replace(
+                "finding_codes = [\"E_EXAMPLE_FIELD\"]",
+                "finding_codes = [\"w_x\"]",
+            )
+            .replace("[messages.\"E_EXAMPLE_FIELD\"]", "[messages.\"w_x\"]");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("finding code"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_unknown_rule_kind() {
+        let text = valid_v2_toml()
+            + "\n[[rules]]\nid = \"my_rule\"\nkind = \"nope\"\ncode = \"E_EXAMPLE_FIELD\"\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_rule_code_not_declared() {
+        // With an empty KNOWN_RULE_KINDS, the kind check fires first.
+        // Once kinds are added, this will verify the code-must-be-declared check.
+        let text = valid_v2_toml()
+            + "\n[[rules]]\nid = \"my_rule\"\nkind = \"cadence-overdue\"\ncode = \"E_UNDECLARED\"\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_rule_severity_key_undeclared() {
+        // With an empty KNOWN_RULE_KINDS, the kind check fires first.
+        // Once kinds are added, this will verify the severity_key check.
+        let text = valid_v2_toml()
+            + "\n[[rules]]\nid = \"my_rule\"\nkind = \"cadence-overdue\"\ncode = \"E_EXAMPLE_FIELD\"\nseverity_key = \"example-pack.undeclared\"\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_duplicate_rule_id() {
+        // Duplicate IDs are checked before kind, so this hits the duplicate
+        // check even with an empty kind list.
+        let text = valid_v2_toml()
+            + "\n[[rules]]\nid = \"dup\"\nkind = \"nope\"\ncode = \"E_EXAMPLE_FIELD\"\n"
+            + "\n[[rules]]\nid = \"dup\"\nkind = \"nope\"\ncode = \"E_EXAMPLE_FIELD\"\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("duplicate rule id"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_skill_path_traversal() {
+        let text = valid_v2_toml().replace("skill = \"SKILL.md\"", "skill = \"../x.md\"");
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("skill"), "{err:?}");
+    }
+
+    #[test]
+    fn external_rejects_unknown_top_level_key() {
+        let text = valid_v2_toml() + "bogus_key = 1\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("bogus_key"), "{err:?}");
     }
 }
