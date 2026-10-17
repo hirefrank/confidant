@@ -3650,11 +3650,23 @@ fn cmd_resolve_edit_from_inbox(
     _id_raw: &str,
     _sides: &record_resolve::LoadedSides,
 ) -> anyhow::Result<ExitCode> {
-    Err(anyhow::Error::new(DomainError::usage(
-        "`record resolve --edit` is not supported on this platform",
-    ))
-    .with_fix("Use --merged-file with a file outside the vault"))
+    unsupported_edit_error()
 }
+
+/// `--edit` needs 0600/0700 file modes: the non-unix arms refuse with this.
+///
+/// Deliberately not platform-gated, so a mistake in the error construction
+/// fails the ordinary Linux build (and pull-request CI) instead of only the
+/// Windows lane, which runs on push to `main`. On unix the two callers are
+/// compiled out, hence the `allow`.
+#[cfg_attr(unix, allow(dead_code))]
+fn unsupported_edit_error() -> anyhow::Result<ExitCode> {
+    Err(anyhow::Error::new(
+        DomainError::usage("`record resolve --edit` is not supported on this platform")
+            .with_fix("Use --merged-file with a file outside the vault"),
+    ))
+}
+
 fn print_merge_result(
     cli: &Cli,
     root: &Path,
@@ -3751,10 +3763,7 @@ fn cmd_resolve_edit(
     _id: &RecordId,
     _id_raw: &str,
 ) -> anyhow::Result<ExitCode> {
-    Err(anyhow::Error::new(
-        DomainError::usage("`record resolve --edit` is not supported on this platform")
-            .with_fix("Use --merged-file with a file outside the vault"),
-    ))
+    unsupported_edit_error()
 }
 
 /// Parameters for [`prepare_record_write`], bundled to keep the
