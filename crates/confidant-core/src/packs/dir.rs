@@ -419,15 +419,25 @@ default = "example field"
     #[test]
     #[cfg(unix)]
     fn reject_symlink() {
+        // The link target must itself be an allowed pack file. `read_dir`
+        // order is not stable, so with an unlisted target the walk could
+        // reject the target first and this test would then assert against
+        // the wrong rejection (it did, on CI).
         let dir = pack_dir_with(&[
             (
                 "manifest.toml",
                 minimal_manifest("SKILL.md", "0.1").as_bytes(),
             ),
-            ("real.md", b"# Real.\n" as &[u8]),
+            ("README-target", b"# Real.\n" as &[u8]),
         ]);
-        std::os::unix::fs::symlink("real.md", dir.path().join("SKILL.md")).expect("symlink");
+        std::os::unix::fs::symlink("README-target", dir.path().join("SKILL.md")).expect("symlink");
         let err = read_pack_dir(dir.path()).expect_err("symlink should be rejected");
+        assert_eq!(
+            err.code(),
+            "E_PACK_INVALID",
+            "wrong code: {}",
+            err.message()
+        );
         let msg = err.message();
         assert!(msg.contains("SKILL.md"), "names the path: {msg}");
         assert!(msg.contains("symlink"), "says symlink: {msg}");
