@@ -247,6 +247,44 @@ items, not the tip size).
   private key is destroyed. Finish or drop undecryptable/old-key items
   before rotating — don't use `--skip` to paper over a rotation window.
 
+### Discarding items (`--discard`)
+
+`confidant inbox --discard <stem> [--discard <stem>...]` removes the named
+items from the `inbox` branch **without merging them**, in exactly one
+signed commit (`inbox: discard N item(s)`). Use it for an item the operator
+chose not to apply — e.g. after `record resolve <id> --from-inbox <stem>
+--take ours`, where the item would otherwise conflict forever. Unlike
+`--skip` (defer), `--discard` is permanent: the item leaves the branch.
+
+- Only stems currently on the `inbox` branch tip are accepted; unknown
+  names fail closed with `E_INBOX_SKIP`, like `--skip`.
+- The tip is pinned before the read and re-verified before the commit; a
+  moved tip refuses with `E_INBOX_RACE`.
+- Without commit signing configured the command refuses with
+  `E_INBOX_UNTRUSTED` (an unsigned discard commit would never pass the
+  drain's trust check).
+- Plumbing only (`mktree` / `commit-tree` / `update-ref`): the inbox branch
+  is never checked out and the main worktree is never touched.
+- `--discard` does not combine with the drain flags or `inbox rotate`.
+
+### Resolving an `E_INBOX_CONFLICT`
+
+When the drain refuses with `E_INBOX_CONFLICT` — an item targets a record
+path that already exists with different content — resolve it explicitly:
+
+```sh
+confidant record resolve <id> --from-inbox <stem> --show   # compare both versions
+confidant record resolve <id> --from-inbox <stem> --take theirs   # apply the item
+confidant record resolve <id> --from-inbox <stem> --take ours     # keep the record
+confidant inbox --discard <stem>   # retire the item afterwards
+```
+
+`--take theirs` encrypts the item's plaintext through the `record edit`
+path and stages it; the next `confidant inbox` run recognizes it as merged
+and clears it. `--take ours` leaves the record untouched — follow it with
+`inbox --discard <stem>` so the item stops conflicting. `--merged-file`
+and `--edit` work as with git-conflict resolution.
+
 ## Fallback queue (`log session --note --fallback-inbox`, #213)
 
 When the keychain is unavailable, `log session --note` cannot encrypt

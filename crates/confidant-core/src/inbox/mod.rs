@@ -51,7 +51,7 @@ mod trust;
 
 pub use queue::{queue_items, QueueItem};
 
-use git::clear_inbox;
+use git::{clear_inbox, discard_inbox};
 use item::describe_target;
 use merge::{apply_writes, commit_applied, revert_applied, unstage_applied, AppliedChange};
 use plan::{collect_vault_srcs, plan_item};
@@ -164,6 +164,110 @@ pub struct InboxReport {
 pub fn queue_signing_configured(vault_root: &Path) -> anyhow::Result<bool> {
     let repo = git::toplevel(vault_root)?;
     git::commit_signing_configured(&repo)
+}
+
+/// Discard inbox items without merging them (#457, `inbox --discard`).
+///
+/// Removes the named stems from the `inbox` branch in exactly one signed
+/// commit (`inbox: discard N item(s)`), using the same plumbing as the
+/// clear step: `mktree` / `commit-tree` / `update-ref` as an atomic
+/// compare-and-swap on the pinned tip. The inbox branch is never checked
+/// out and the main worktree is never touched.
+///
+/// Fails closed: an empty stem list is a usage error; a malformed stem or
+/// a stem not on the current tip is `E_INBOX_SKIP` (like `--skip`); a tip
+/// that moved between the read and the swap is `E_INBOX_RACE`; missing
+/// commit-signing config is `E_INBOX_UNTRUSTED` (same rule as the clear
+/// step — an unsigned discard commit would never pass the drain's trust
+/// check). Returns the new inbox tip SHA.
+pub fn discard_inbox_items(vault_root: &Path, stems: &[String]) -> anyhow::Result<String> {
+    if stems.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "inbox --discard needs at least one item stem",
+        )));
+    }
+    for s in stems {
+        if !git::is_item_stem(s) {
+            return Err(anyhow::Error::new(DomainError::inbox_skip(s)));
+        }
+    }
+    let repo = git::toplevel(vault_root)?;
+    if !git::branch_exists(&repo, INBOX_BRANCH)? {
+        return Err(anyhow::Error::new(DomainError::inbox_skip(&stems[0])));
+    }
+    let tip = git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    let names = git::list_items(&repo, &tip)?;
+    for s in stems {
+        if !names.contains(s) {
+            return Err(anyhow::Error::new(DomainError::inbox_skip(s)));
+        }
+    }
+    if !git::commit_signing_configured(&repo)? {
+        return Err(anyhow::Error::new(DomainError::inbox_signing_unconfigured()));
+    }
+    discard_inbox(&repo, &tip, stems)?;
+    git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])
+}
+
+/// A decrypted inbox item read for `record resolve --from-inbox` (#457).
+#[derive(Clone, Debug)]
+pub struct InboxItemContent {
+    /// Item file stem (opaque; no PII).
+    pub stem: String,
+    /// `"ledger"` or `"record"`.
+    pub kind: String,
+    /// Vault-relative target path (records only).
+    pub path: Option<PathBuf>,
+    /// Decrypted plaintext content.
+    pub content: String,
+}
+
+/// Read one inbox item by stem for `record resolve --from-inbox` (#457).
+///
+/// Reads `<stem>.age` from the current inbox branch tip, decrypts it with
+/// `decrypt` (the same inbox key path the drain uses), and parses it.
+/// Fails closed when the stem is malformed or not on the tip
+/// (`E_INBOX_SKIP`), when decryption fails, or when parsing fails.
+///
+/// Signatures are not verified here: the operator explicitly named this
+/// item and sees its plaintext on screen (`--show`) before any action is
+/// taken. The drain's signature checks still gate unattended merges.
+pub fn read_inbox_item(
+    vault_root: &Path,
+    stem: &str,
+    decrypt: &DecryptFn,
+) -> anyhow::Result<InboxItemContent> {
+    if !git::is_item_stem(stem) {
+        return Err(anyhow::Error::new(DomainError::inbox_skip(stem)));
+    }
+    let repo = git::toplevel(vault_root)?;
+    if !git::branch_exists(&repo, INBOX_BRANCH)? {
+        return Err(anyhow::Error::new(DomainError::inbox_skip(stem)));
+    }
+    let tip = git::git_line(&repo, &["rev-parse", &format!("refs/heads/{INBOX_BRANCH}")])?;
+    let names = git::list_items(&repo, &tip)?;
+    if !names.iter().any(|n| n == stem) {
+        return Err(anyhow::Error::new(DomainError::inbox_skip(stem)));
+    }
+    let bytes = git::git_bytes(&repo, &format!("{tip}:{stem}.age"))?;
+    let plaintext = decrypt(bytes.as_slice()).map_err(|e| match DomainError::of(&e) {
+        Some(d) => anyhow::Error::new(d.clone()),
+        None => anyhow::Error::new(DomainError::inbox_item(format!(
+            "item '{stem}' could not be decrypted"
+        ))),
+    })?;
+    let text = std::str::from_utf8(&plaintext).map_err(|_| {
+        anyhow::Error::new(DomainError::inbox_item(format!(
+            "item '{stem}' decrypted to non-UTF-8"
+        )))
+    })?;
+    let parsed = item::parse_item(stem, text)?;
+    Ok(InboxItemContent {
+        stem: stem.to_string(),
+        kind: parsed.kind.as_str().to_string(),
+        path: parsed.path,
+        content: parsed.content,
+    })
 }
 
 /// Run the inbox: decrypt items on the `inbox` branch, `check` the merged
@@ -343,8 +447,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::inbox::git::{
-        clear_inbox, commit_signing_configured, git, git_bytes, is_item_stem, list_items,
-        verify_inbox_tip,
+        clear_inbox, commit_signing_configured, discard_inbox, git, git_bytes, is_item_stem,
+        list_items, verify_inbox_tip,
     };
     use crate::inbox::item::{parse_item, ItemKind, ParsedItem};
     use crate::inbox::merge::PlannedWrite;
@@ -862,6 +966,45 @@ as_of = "2026-10-08"
             .expect("git rev-parse failed");
         assert!(out.status.success());
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #457: `discard_inbox` with a stale expected tip refuses with
+    /// `E_INBOX_RACE` (the compare-and-swap half of the plumbing).
+    #[test]
+    fn discard_with_stale_tip_refuses_race() {
+        let (_dir, root) = plumbing_repo(&[("01JAAA.age", "item-a"), ("01JAAB.age", "item-b")]);
+        let stale_tip = rev_parse(&root, "inbox");
+        // Simulate a concurrent push: move the tip.
+        let tree = rev_parse(&root, "inbox^{tree}");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["commit-tree", &tree, "-p", &stale_tip, "-m", "concurrent"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("commit-tree failed");
+        assert!(out.status.success());
+        let new_tip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["update-ref", "refs/heads/inbox", &new_tip, &stale_tip])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("update-ref failed");
+        assert!(out.status.success());
+
+        let err = discard_inbox(&root, &stale_tip, &["01JAAA".to_string()])
+            .expect_err("stale tip must refuse");
+        let domain = DomainError::of(&err).expect("expected a DomainError");
+        assert_eq!(domain.code(), "E_INBOX_RACE");
+        // Nothing was removed.
+        let tree = rev_parse(&root, "inbox^{tree}");
+        assert_eq!(tree, rev_parse(&root, &format!("{new_tip}^{{tree}}")));
     }
 
     #[test]

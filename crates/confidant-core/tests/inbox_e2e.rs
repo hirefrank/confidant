@@ -1666,3 +1666,116 @@ fn skip_dry_run_reports_skipped_section() {
     let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
     assert_eq!(tree.lines().count(), 2, "inbox tree:\n{tree}");
 }
+
+// ---------------------------------------------------------------------------
+// #457: `inbox --discard`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn discard_removes_items_in_one_signed_commit() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM), ("01JAAB.age", RECORD_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+    let new_tip = confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()])
+        .expect("discard failed");
+    assert_ne!(new_tip, tip_before);
+
+    // Exactly one new commit, with the discard message.
+    let log = git_out(r.root(), &["log", "--format=%s", "inbox"]);
+    let subjects: Vec<&str> = log.lines().collect();
+    assert_eq!(subjects.len(), 2, "log:\n{log}");
+    assert_eq!(subjects[0], "inbox: discard 1 item(s)");
+    // The discard commit is signed.
+    let validity = git_out(r.root(), &["log", "-1", "--format=%G?", "inbox"]);
+    assert_eq!(validity, "G", "discard commit is not signed");
+
+    // Only the discarded item is gone; the other stays.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAB.age", "inbox tree:\n{tree}");
+}
+
+#[test]
+fn discard_multiple_stems_one_commit() {
+    let r = Repo::new();
+    r.with_inbox(&[
+        ("01JAAA.age", LEDGER_ITEM),
+        ("01JAAB.age", RECORD_ITEM),
+        ("01JAAC.age", LEDGER_ITEM_2),
+    ]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string(), "01JAAC".to_string()])
+        .expect("discard failed");
+
+    let log = git_out(r.root(), &["log", "-1", "--format=%s", "inbox"]);
+    assert_eq!(log, "inbox: discard 2 item(s)", "log:\n{log}");
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAB.age", "inbox tree:\n{tree}");
+}
+
+#[test]
+fn discard_requires_signing_config() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    // Repo::new sets no signing config.
+    let err = confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()])
+        .expect_err("discard without signing must be refused");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INBOX_UNTRUSTED");
+    // Nothing changed on the branch.
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAA.age");
+}
+
+#[test]
+fn discard_unknown_stem_fails_closed() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let tip_before = git_out(r.root(), &["rev-parse", "inbox"]);
+
+    let err = confidant_core::discard_inbox_items(r.root(), &["01NOPE".to_string()])
+        .expect_err("unknown stem must fail closed");
+    let domain = DomainError::of(&err).expect("expected a DomainError");
+    assert_eq!(domain.code(), "E_INBOX_SKIP");
+    // The tip did not move and the item is still there.
+    assert_eq!(git_out(r.root(), &["rev-parse", "inbox"]), tip_before);
+    let tree = git_out(r.root(), &["ls-tree", "-r", "--name-only", "inbox"]);
+    assert_eq!(tree.trim(), "01JAAA.age");
+}
+
+#[test]
+fn discard_does_not_touch_main_worktree_or_head() {
+    let r = Repo::new();
+    r.with_inbox(&[("01JAAA.age", LEDGER_ITEM)]);
+    let Some(_signing) = require_commit_signing(&r) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+    let main_before = git_out(r.root(), &["rev-parse", "main"]);
+    let status_before = git_out(r.root(), &["status", "--porcelain"]);
+
+    confidant_core::discard_inbox_items(r.root(), &["01JAAA".to_string()]).expect("discard failed");
+
+    assert_eq!(git_out(r.root(), &["rev-parse", "main"]), main_before);
+    assert_eq!(
+        git_out(r.root(), &["status", "--porcelain"]),
+        status_before,
+        "worktree must be untouched"
+    );
+    assert_eq!(
+        git_out(r.root(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
+}

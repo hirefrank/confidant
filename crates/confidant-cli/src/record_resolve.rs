@@ -48,6 +48,17 @@ pub(crate) struct LoadedSides {
     pub theirs_label: String,
 }
 
+/// Where the two sides of a conflict come from.
+///
+/// `Markers` is the git-conflict-markers source (#451): both sides are
+/// reconstructed from the conflicted file. `InboxItem` is the inbox
+/// source (#457): `ours` is the current record on main, `theirs` is the
+/// inbox item's plaintext.
+pub(crate) enum Source {
+    Markers,
+    InboxItem(String),
+}
+
 /// Load and decrypt both sides of the conflicted record `id`.
 ///
 /// The file path is derived from the id via [`crate::main_path_for`]; notes
@@ -56,6 +67,54 @@ pub(crate) struct LoadedSides {
 /// `type`; both must decrypt with the operator key, else the error names
 /// the failing side (CD7) and nothing is printed.
 pub(crate) fn load_sides(
+    root: &Path,
+    vault_id: &str,
+    id: &RecordId,
+) -> anyhow::Result<LoadedSides> {
+    load_sides_inner(root, vault_id, id, &Source::Markers, None)
+}
+
+/// Load both sides for `record resolve --from-inbox <stem>` (#457).
+///
+/// `ours` is the current record on main, decrypted with the operator key;
+/// `theirs` is the inbox item's plaintext (decrypted with the same inbox
+/// key path the drain uses). The item must be a record item targeting this
+/// record's path; an item for a missing record is not a conflict and is
+/// refused (the drain would merge it cleanly).
+pub(crate) fn load_sides_from_inbox(
+    root: &Path,
+    vault_id: &str,
+    id: &RecordId,
+    stem: &str,
+    decrypt: &confidant_core::inbox::DecryptFn,
+) -> anyhow::Result<LoadedSides> {
+    load_sides_inner(
+        root,
+        vault_id,
+        id,
+        &Source::InboxItem(stem.to_string()),
+        Some(decrypt),
+    )
+}
+
+fn load_sides_inner(
+    root: &Path,
+    vault_id: &str,
+    id: &RecordId,
+    source: &Source,
+    inbox_decrypt: Option<&confidant_core::inbox::DecryptFn>,
+) -> anyhow::Result<LoadedSides> {
+    match source {
+        Source::Markers => load_sides_from_markers(root, vault_id, id),
+        Source::InboxItem(stem) => {
+            let decrypt = inbox_decrypt.expect("inbox source needs the inbox decrypt closure");
+            load_sides_from_inbox_inner(root, vault_id, id, stem, decrypt)
+        }
+    }
+}
+
+/// The original `load_sides` body, for the markers source.
+fn load_sides_from_markers(
     root: &Path,
     vault_id: &str,
     id: &RecordId,
@@ -114,6 +173,94 @@ pub(crate) fn load_sides(
         raw: bytes,
         ours_label: sides.ours_label,
         theirs_label: sides.theirs_label,
+    })
+}
+
+/// Load both sides for the inbox source (#457).
+///
+/// `ours` is the current record file on main, decrypted with the operator
+/// decryptor (fail-closed per side, CD7). `theirs` is the inbox item's
+/// plaintext content. The item must be a record item whose path is this
+/// record's path; anything else is not a conflict and is refused.
+fn load_sides_from_inbox_inner(
+    root: &Path,
+    vault_id: &str,
+    id: &RecordId,
+    stem: &str,
+    decrypt: &confidant_core::inbox::DecryptFn,
+) -> anyhow::Result<LoadedSides> {
+    crate::reject_unsupported_prefix(id)?;
+    let rel = crate::main_path_for(id).ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "record resolve does not handle ids like {id}"
+        )))
+    })?;
+    // The record must exist: an inbox item for a missing record is not a
+    // conflict (the drain merges it cleanly).
+    let current = std::fs::read(root.join(&rel)).map_err(|_| {
+        anyhow::Error::new(
+            DomainError::invalid(format!(
+                "no record with id {id} on main; nothing to resolve"
+            ))
+            .with_fix("The inbox item targets a missing record; run `confidant inbox` to merge it"),
+        )
+    })?;
+    let item = confidant_core::inbox::read_inbox_item(root, stem, decrypt)?;
+    if item.kind != "record" {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "inbox item '{stem}' is a {} item, not a record",
+                item.kind
+            ))
+            .with_fix("Only record items can conflict with a record"),
+        ));
+    }
+    let item_path = item.path.as_ref().ok_or_else(|| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "inbox item '{stem}' is a record item without a path"
+        )))
+    })?;
+    if item_path != &rel {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "inbox item '{stem}' targets {}, not {id}",
+                item_path.display()
+            ))
+            .with_fix("Pass the id of the record the item targets"),
+        ));
+    }
+
+    // Ours: decrypt the current record with the operator decryptor.
+    // Same fail-closed per-side behaviour as the markers source (CD7).
+    let decryptor = RecordDecryptor::for_edit(root, vault_id);
+    let path_str = rel.to_string_lossy();
+    let ours_bytes = decrypt_side(&decryptor, &path_str, "ours", id, &current)?;
+
+    // Theirs: the item's plaintext. The inbox transport (age) is already
+    // removed by `read_inbox_item`; the content is the record plaintext
+    // the drain would merge.
+    let theirs_bytes = item.content.into_bytes();
+
+    // Labels for `--show`: the current branch for ours, the inbox stem
+    // for theirs.
+    let ours_label = confidant_core::write::git(root, &["branch", "--show-current"], true)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "current".to_string());
+
+    Ok(LoadedSides {
+        path: rel,
+        ours_bytes,
+        theirs_bytes: theirs_bytes.clone(),
+        ours_raw: current.clone(),
+        // No envelope on the theirs side: the item is plaintext. `--take`
+        // never installs these bytes directly (it re-encrypts through the
+        // #455 apply path); they are kept for symmetry only.
+        theirs_raw: theirs_bytes,
+        raw: current,
+        ours_label,
+        theirs_label: format!("inbox:{stem}"),
     })
 }
 
