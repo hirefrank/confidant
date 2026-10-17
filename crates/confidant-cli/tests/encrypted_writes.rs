@@ -4516,21 +4516,21 @@ fn resolve_requires_exactly_one_action() {
         stderr(&out)
     );
 
-    // Accepted-but-unimplemented flags are usage errors, not clap errors.
+    // --take is implemented (#454): on a non-conflicted record it fails
+    // with "no merge conflict", not "not implemented yet".
     let out = h
         .cmd(&["record", "resolve", PERSON, "--take", "ours", "--no-input"])
         .output()
         .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "--take must exit 2: {}",
-        stderr(&out)
-    );
     assert!(
-        stderr(&out).contains("not implemented yet"),
-        "wrong message: {}",
-        stderr(&out)
+        !out.status.success(),
+        "--take on a clean record should fail"
+    );
+    let text = stderr(&out) + &stdout(&out);
+    assert!(text.contains("no merge conflict"), "wrong error: {text}");
+    assert!(
+        !text.contains("not implemented yet"),
+        "--take is implemented: {text}"
     );
 }
 
