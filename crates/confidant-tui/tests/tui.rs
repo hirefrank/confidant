@@ -1087,11 +1087,15 @@ fn inbox_apply_with_no_items_does_not_open_confirm() {
 
 #[test]
 fn inbox_tab_falls_through_to_shared_navigation() {
-    // Tab from Inbox wraps around to Check.
+    // Tab from Inbox advances to Conflicts.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
     app.handle_key(key(KeyCode::Char('6')));
     assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
+
+    // Tab from Conflicts wraps around to Check.
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.active_view, ActiveView::Check);
 
@@ -1418,4 +1422,350 @@ fn search_live_fallback_against_demo_vault_without_qmd() {
         }
         other => panic!("unexpected search outcome: {other:?}"),
     }
+}
+
+fn conflict_check_json() -> &'static str {
+    r#"{
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "spec": "0.1",
+        "summary": {"errors": 2, "warnings": 0, "records": 11, "ledger_entries": 0},
+        "findings": [
+            {"code": "E_MERGE_CONFLICT", "severity": "error",
+             "file": "people/p-01FAKE000000000000000001/record.md",
+             "id": "p-01FAKE000000000000000001",
+             "message": "encrypted record has two versions after a merge conflict",
+             "fix": "Run `confidant record resolve p-01FAKE000000000000000001 --show` to compare the two versions"},
+            {"code": "E_MERGE_CONFLICT", "severity": "error",
+             "file": "people/p-01FAKE000000000000000002/record.md",
+             "id": "p-01FAKE000000000000000002",
+             "message": "encrypted record has two versions after a merge conflict",
+             "fix": "Run `confidant record resolve p-01FAKE000000000000000002 --show` to compare the two versions"},
+            {"code": "E_MERGE_CONFLICT", "severity": "error",
+             "file": "ledger/2026-10-17.md",
+             "message": "merge conflict markers",
+             "fix": "resolve the conflict markers"}
+        ]
+    }"#
+}
+
+fn conflict_show_json() -> &'static str {
+    r#"{
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "id": "p-01FAKE000000000000000001",
+        "path": "people/p-01FAKE000000000000000001/record.md",
+        "ours": {"label": "HEAD", "text": "---\nid: p-01FAKE000000000000000001\n---\nAda Example\n\nOurs version of the note."},
+        "theirs": {"label": "feature", "text": "---\nid: p-01FAKE000000000000000001\n---\nAda Example\n\nTheirs version of the note."}
+    }"#
+}
+
+fn conflict_take_json() -> &'static str {
+    r#"{
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "command": "record-resolve",
+        "action": "take",
+        "side": "ours",
+        "id": "p-01FAKE000000000000000001",
+        "path": "people/p-01FAKE000000000000000001/record.md",
+        "staged": true,
+        "next": "git commit"
+    }"#
+}
+
+fn conflict_cli_error_json() -> &'static str {
+    r#"{
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/tmp/fake-vault",
+        "error": {"code": "E_UNREADABLE", "message": "cannot decrypt theirs side of p-01FAKE000000000000000001", "fix": "check device keys"}
+    }"#
+}
+
+/// Queue the fake responses for: check, resolve --show, resolve --take, check (reload).
+fn conflict_take_runner() -> FakeRunner {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_take_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake
+}
+
+fn open_conflict_detail(app: &mut App<FakeRunner>) {
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.conflict.detail.is_some(), "detail loaded after Enter");
+}
+
+#[test]
+fn conflict_list_snapshot() {
+    let fake = FakeRunner::from_json(0, conflict_check_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
+    // Two E_MERGE_CONFLICT findings with ids; the ledger one (no id) is filtered out.
+    assert_eq!(app.conflict.entries.len(), 2);
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("p-01FAKE000000000000000001"),
+        "first id shown:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("p-01FAKE000000000000000002"),
+        "second id shown:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("ledger/2026-10-17.md"),
+        "finding without id filtered out:\n{rendered}"
+    );
+    assert_snapshot("conflict_list.snap", &rendered);
+}
+
+#[test]
+fn conflict_detail_two_sides_snapshot() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    let mut app = App::new(fake);
+    open_conflict_detail(&mut app);
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("Ours version of the note."),
+        "ours side shown:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Theirs version of the note."),
+        "theirs side shown:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("p-01FAKE000000000000000001"),
+        "record id in header:\n{rendered}"
+    );
+    assert_snapshot("conflict_detail_two_sides.snap", &rendered);
+}
+
+#[test]
+fn conflict_take_ours_invokes_cli_with_expected_argv() {
+    let mut app = App::new(conflict_take_runner());
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Char('o')));
+    assert!(
+        app.conflict.confirming.is_some(),
+        "confirm modal open for take ours"
+    );
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("Confirm: Take ours"),
+        "modal title shown:\n{rendered}"
+    );
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let calls = app.runner.recorded_calls();
+    let expected = vec![
+        "record".to_owned(),
+        "resolve".to_owned(),
+        "p-01FAKE000000000000000001".to_owned(),
+        "--take".to_owned(),
+        "ours".to_owned(),
+    ];
+    assert!(
+        calls.iter().any(|c| c == &expected),
+        "take ours issued with expected argv: {calls:?}"
+    );
+    assert!(
+        app.conflict
+            .last_result
+            .as_deref()
+            .unwrap_or("")
+            .contains("kept the ours side"),
+        "result line recorded"
+    );
+    assert!(
+        app.conflict
+            .last_result
+            .as_deref()
+            .unwrap_or("")
+            .contains("git commit"),
+        "CLI next line shown"
+    );
+}
+
+#[test]
+fn conflict_take_theirs_invokes_cli_with_expected_argv() {
+    let mut app = App::new(conflict_take_runner());
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Char('t')));
+    assert!(
+        app.conflict.confirming.is_some(),
+        "confirm modal open for take theirs"
+    );
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let calls = app.runner.recorded_calls();
+    let expected = vec![
+        "record".to_owned(),
+        "resolve".to_owned(),
+        "p-01FAKE000000000000000001".to_owned(),
+        "--take".to_owned(),
+        "theirs".to_owned(),
+    ];
+    assert!(
+        calls.iter().any(|c| c == &expected),
+        "take theirs issued with expected argv: {calls:?}"
+    );
+}
+
+#[test]
+fn conflict_take_requires_confirmation() {
+    let mut app = App::new(conflict_take_runner());
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Char('o')));
+    assert!(app.conflict.confirming.is_some());
+    // `n` cancels: no CLI call, modal closed.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.conflict.confirming.is_none(), "modal closed after n");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls.iter().any(|c| c.contains(&"--take".to_owned())),
+        "no take issued without confirm: {calls:?}"
+    );
+}
+
+#[test]
+fn conflict_cli_error_shows_alert() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(1, conflict_cli_error_json().as_bytes().to_vec());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.alert.is_some(), "alert shown on CLI error");
+    assert!(app.conflict.detail.is_none(), "no detail on CLI error");
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("cannot decrypt theirs side"),
+        "CD7 message shown:\n{rendered}"
+    );
+}
+
+#[test]
+fn conflict_old_cli_shows_upgrade_alert() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    // Exit 2 with no JSON: unknown subcommand on an older CLI.
+    fake.push_response(2, b"".to_vec());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Enter));
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("upgrade confidant"),
+        "upgrade hint shown:\n{rendered}"
+    );
+}
+
+#[test]
+fn conflict_hand_merge_runs_edit_argv_and_refreshes() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    // Reload after the suspended edit completes.
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    let mut app = App::new(fake);
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Char('m')));
+    assert!(
+        app.conflict.confirming.is_some(),
+        "confirm modal open for hand-merge"
+    );
+    app.handle_key(key(KeyCode::Char('y')));
+
+    // The host takes the suspended command and runs it with a terminal.
+    let cmd = app
+        .take_suspended_command()
+        .expect("suspended command queued");
+    let expected = vec![
+        "record".to_owned(),
+        "resolve".to_owned(),
+        "p-01FAKE000000000000000001".to_owned(),
+        "--edit".to_owned(),
+    ];
+    assert_eq!(cmd.args, expected, "edit argv queued");
+    let status = app.run_suspended_command(&cmd).expect("interactive run");
+    assert_eq!(status, 0);
+    let interactive = app.runner.recorded_interactive_calls();
+    assert_eq!(interactive, vec![expected], "interactive call recorded");
+
+    // The host resumes: list reloads, detail closes.
+    app.after_suspended_command();
+    assert!(app.suspended.is_none(), "suspended cleared after resume");
+    assert!(app.conflict.detail.is_none(), "detail closed after resume");
+    assert_eq!(app.conflict.entries.len(), 2, "list reloaded");
+}
+
+#[test]
+fn conflict_view_never_renders_labels_as_record_names() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    let mut app = App::new(fake);
+    open_conflict_detail(&mut app);
+    let rendered = render_to_string(&app);
+    // The header block shows the opaque record id only: tab pills (1 line)
+    // plus the 3-line Conflict header. The ours pane starts after that.
+    let header: String = rendered.lines().take(4).collect::<Vec<_>>().join("\n");
+    assert!(
+        header.contains("p-01FAKE000000000000000001"),
+        "id in header:\n{header}"
+    );
+    assert!(
+        !header.contains("HEAD") && !header.contains("feature"),
+        "side labels not in the identity header:\n{header}"
+    );
+    // Side labels appear only as pane titles, never as the record identity.
+    assert!(
+        rendered.contains("ours (HEAD)"),
+        "ours pane labeled:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("theirs (feature)"),
+        "theirs pane labeled:\n{rendered}"
+    );
+}
+
+#[test]
+fn conflict_tab_navigation() {
+    let fake = FakeRunner::from_json(0, conflict_check_json());
+    let mut app = App::new(fake);
+    // `7` switches to Conflicts.
+    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
+    // Tab wraps around to Check; Shift-Tab steps back to Inbox.
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Check);
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::BackTab));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    // `q` quits from the conflicts tab.
+    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit, "q quits from the conflicts tab");
+}
+
+#[test]
+fn conflict_esc_from_detail_returns_to_list() {
+    let fake = FakeRunner::new();
+    fake.push_response(0, conflict_check_json().as_bytes().to_vec());
+    fake.push_response(0, conflict_show_json().as_bytes().to_vec());
+    let mut app = App::new(fake);
+    open_conflict_detail(&mut app);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.conflict.detail.is_none(), "Esc closes the detail view");
+    assert_eq!(app.active_view, ActiveView::Conflicts);
 }

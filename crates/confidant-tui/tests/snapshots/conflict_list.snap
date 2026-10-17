@@ -1,0 +1,24 @@
+ 1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox   7:Conflicts    confidant-tui v1
+╭ Conflicts ───────────────────────────────────────────────────────────────────────────────────────╮
+│ Conflicts 2 record(s)                                                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ › p-01FAKE000000000000000001 encrypted record has two versions after a merge conflict            │
+│   p-01FAKE000000000000000002 encrypted record has two versions after a merge conflict            │
+│                                                                                                  │
+│   Enter: show both sides   r: refresh                                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Tab/1-7  view  /  search  e  exact  j/k  move  Enter  context  r  refresh  q/Esc  quit
