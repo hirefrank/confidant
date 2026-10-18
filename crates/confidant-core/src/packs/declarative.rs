@@ -25,6 +25,7 @@
 //! `check` already loaded — ledger metadata and the pack's declared
 //! plaintext front-matter fields — and emit findings only (PD8).
 
+use std::collections::{BTreeMap, HashMap};
 use std::panic::catch_unwind;
 use std::sync::Mutex;
 
@@ -34,9 +35,11 @@ use crate::check::{Finding, FindingCode, Severity};
 
 use crate::config::parse_severity_token;
 use crate::error::DomainError;
-use crate::packs::grammars::parse_field_grammar;
+use crate::id::RecordId;
+use crate::packs::grammars::{parse_field_grammar, FieldValue};
 use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, RuleDecl};
+use crate::record::Record;
 use crate::vault::Vault;
 
 /// What one rule evaluation sees. `merges` is the pack's merge view —
@@ -86,12 +89,18 @@ static TEST_REGISTRY: Mutex<Option<Vec<&'static dyn RuleKind>>> = Mutex::new(Non
 /// issues (#442, #443, #458, #446, #447, #448). Tests register via
 /// [`with_rule_kinds_for_test`].
 pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
-    TEST_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .map(std::vec::Vec::clone)
-        .unwrap_or_default()
+    // The kind implementations live in Rust (PD1); each kind's issue
+    // appends its static here. #442: `cadence-overdue`.
+    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE];
+    kinds.extend(
+        TEST_REGISTRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(std::vec::Vec::clone)
+            .unwrap_or_default(),
+    );
+    kinds
 }
 
 /// Look up a registered kind by manifest `kind` name.
@@ -302,6 +311,259 @@ fn push_external_field_error(
     }
     out.push(finding);
 }
+
+// ---------------------------------------------------------------------------
+// Rule kinds (#442: cadence-overdue)
+// ---------------------------------------------------------------------------
+
+/// `cadence-overdue` (#442): for each merge-canonical person, warn when
+/// the last contact older than the person's cadence window. Parameters
+/// (spec/pack-manifest.md): `cadence_field` names one of the pack's own
+/// declared fields with grammar `cadence`; `event_verbs` lists the
+/// ledger verbs that count as contact (read-only access to ledger
+/// metadata: date, verb, opaque id — PD8). Severity comes from
+/// `severity_key`; an off rule is skipped before evaluation.
+pub(crate) struct CadenceOverdueKind;
+
+impl RuleKind for CadenceOverdueKind {
+    fn name(&self) -> &'static str {
+        "cadence-overdue"
+    }
+
+    /// Parameter validation (#442): `cadence_field` must name one of the
+    /// pack's own `[[fields]]` entries with grammar `cadence`;
+    /// `event_verbs` must be a non-empty list of non-empty strings; the
+    /// message table must declare `last`, `none`, `last_fix`, `none_fix`.
+    fn validate(&self, rule: &RuleDecl, manifest: &PackManifest) -> Result<(), DomainError> {
+        let err = |detail: String| DomainError::config(format!("rule '{}': {detail}", rule.id));
+        let Some(cadence_field) = rule.params.get("cadence_field").and_then(|v| v.as_str()) else {
+            return Err(err(
+                "the cadence_field parameter is missing (it names the pack's cadence field)"
+                    .to_owned(),
+            )
+            .with_fix("Set cadence_field to a [[fields]] entry with grammar \"cadence\""));
+        };
+        let field = manifest
+            .fields
+            .iter()
+            .find(|f| f.name == cadence_field)
+            .ok_or_else(|| {
+                err(format!(
+                    "cadence_field '{cadence_field}' is not one of the pack's declared fields"
+                ))
+                .with_fix("Declare the field in [[fields]] or use its declared name")
+            })?;
+        if field.grammar != "cadence" {
+            return Err(err(format!(
+                "cadence_field '{}' has grammar '{}', not \"cadence\"",
+                cadence_field, field.grammar
+            ))
+            .with_fix("Use a field declared with grammar = \"cadence\""));
+        }
+        let verbs = rule
+            .params
+            .get("event_verbs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                err("the event_verbs parameter is missing (it lists the verbs that count as contact)".to_owned())
+                    .with_fix("Set event_verbs = [\"touch\", \"session\"]")
+            })?;
+        if verbs.is_empty() {
+            return Err(err("event_verbs must not be empty".to_owned())
+                .with_fix("Set event_verbs = [\"touch\", \"session\"]"));
+        }
+        for verb in verbs {
+            let Some(verb) = verb.as_str() else {
+                return Err(err("every event_verbs entry must be a string".to_owned())
+                    .with_fix("Set event_verbs = [\"touch\", \"session\"]"));
+            };
+            if verb.trim().is_empty() {
+                return Err(
+                    err("every event_verbs entry must be a non-empty verb".to_owned())
+                        .with_fix("Set event_verbs = [\"touch\", \"session\"]"),
+                );
+            }
+        }
+        for variant in ["last", "none"] {
+            if !manifest
+                .messages
+                .get(&rule.code)
+                .is_some_and(|m| m.contains_key(variant))
+            {
+                return Err(err(format!(
+                    "the manifest's [messages.{}] table has no '{variant}' variant",
+                    rule.code
+                ))
+                .with_fix("Add the variant template (see spec/pack-manifest.md)"));
+            }
+            let fix_variant = format!("{variant}_fix");
+            if !manifest
+                .messages
+                .get(&rule.code)
+                .is_some_and(|m| m.contains_key(&fix_variant))
+            {
+                return Err(err(format!(
+                    "the manifest's [messages.{}] table has no '{fix_variant}' variant",
+                    rule.code
+                ))
+                .with_fix("Add the fix template (see spec/pack-manifest.md)"));
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, ctx: &RuleCtx, rule: &RuleDecl, out: &mut Vec<Finding>) {
+        let cadence_field = rule
+            .params
+            .get("cadence_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cadence");
+        let event_verbs: Vec<&str> = rule
+            .params
+            .get("event_verbs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let Ok(code) = FindingCode::from_pack_str_or_builtin(intern_str(&rule.code)) else {
+            return; // the loader validated the code; unreachable
+        };
+
+        // 1. Each person's cadence value from the pack's declared field.
+        //    Invalid values are already reported by the field-grammar
+        //    validation phase; here a missing/invalid value is "no
+        //    cadence", which skips the person.
+        let mut cadence: HashMap<RecordId, u32> = HashMap::new();
+        for rec in vault_persons(ctx.vault) {
+            if let Some(raw) = rec.field(cadence_field) {
+                if let Some(FieldValue::CadenceDays(days)) =
+                    parse_field_grammar("cadence", cadence_field, raw)
+                {
+                    cadence.insert(rec.id.clone(), days);
+                }
+            }
+        }
+
+        // 2. Canonical persons in deterministic order (merge-aware).
+        let mut canonical_people: BTreeMap<RecordId, &Record> = BTreeMap::new();
+        for rec in vault_persons(ctx.vault) {
+            let canon = ctx.merges.canonical_on(&rec.id, ctx.as_of);
+            if canon == rec.id {
+                canonical_people.insert(canon, rec);
+            }
+        }
+
+        // 3. Merge groups for `as_of`, seeded with every person so a
+        //    canonical person with no direct events still groups.
+        let all_persons: Vec<RecordId> = vault_persons(ctx.vault)
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        ctx.merges.ensure_members(all_persons, ctx.as_of);
+        let groups_borrow = ctx.merges.groups();
+        let groups = groups_borrow.get(&ctx.as_of).expect("members cached");
+
+        for (id, rec) in canonical_people {
+            // The person's own cadence first, else the first merged
+            // member that has one (group members are sorted).
+            let members: &[RecordId] = groups.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
+            let Some(cadence_days) = cadence
+                .get(&id)
+                .copied()
+                .or_else(|| members.iter().find_map(|m| cadence.get(m).copied()))
+            else {
+                continue;
+            };
+
+            // 4. Last contact: latest ledger date <= as_of whose verb is
+            //    one of event_verbs, for the person or a merged member.
+            let last = ctx
+                .vault
+                .entries
+                .iter()
+                .filter(|s| event_verbs.contains(&s.entry.verb.as_str()))
+                .filter(|s| s.entry.date <= ctx.as_of)
+                .filter(|s| {
+                    groups
+                        .get(&id)
+                        .is_some_and(|members| members.contains(&s.entry.id))
+                })
+                .map(|s| s.entry.date)
+                .max();
+            if let Some(d) = last {
+                if ctx.as_of.signed_duration_since(d)
+                    <= chrono::Duration::days(i64::from(cadence_days))
+                {
+                    continue; // within the window
+                }
+            }
+            let start = ctx.as_of - chrono::Duration::days(i64::from(cadence_days));
+            let (message, fix) = match last {
+                Some(d) => (
+                    ctx.manifest.render_message(
+                        &rule.code,
+                        "last",
+                        &[
+                            ("id", &id),
+                            ("start", &start),
+                            ("d", &d),
+                            ("cadence_days", &cadence_days),
+                        ],
+                    ),
+                    ctx.manifest
+                        .render_fix(&rule.code, "last", &[("id", &id)])
+                        .unwrap_or_default(),
+                ),
+                None => (
+                    ctx.manifest.render_message(
+                        &rule.code,
+                        "none",
+                        &[("id", &id), ("cadence_days", &cadence_days)],
+                    ),
+                    ctx.manifest
+                        .render_fix(&rule.code, "none", &[("id", &id)])
+                        .unwrap_or_default(),
+                ),
+            };
+            out.push(
+                Finding::new(code, ctx.severity, message)
+                    .at_file(&rec.path)
+                    .for_id(id)
+                    .with_fix(fix),
+            );
+        }
+    }
+}
+
+/// Intern a short string to a `'static` str so repeated check runs
+/// (long-lived MCP/TUI processes) don't leak one string per evaluation
+/// (#495 review nit). The map grows once per distinct string, then stops.
+fn intern_str(s: &str) -> &'static str {
+    static INTERNED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = INTERNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&leaked) = map.get(s) {
+        return leaked;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    map.insert(s.to_owned(), leaked);
+    leaked
+}
+
+/// Person records in deterministic order.
+fn vault_persons(vault: &Vault) -> Vec<&crate::record::Record> {
+    let mut records: Vec<&crate::record::Record> = vault
+        .records
+        .values()
+        .filter(|r| r.kind == crate::record::RecordKind::Person)
+        .collect();
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    records
+}
+
+static CADENCE_OVERDUE: CadenceOverdueKind = CadenceOverdueKind;
 
 #[cfg(test)]
 mod tests {
@@ -536,15 +798,20 @@ default = "test rule"
                 TestKind::leaked("other-rule"),
             ],
             || {
+                // The manifest list is derived from the registered
+                // kinds: production kinds first, then the test hook's.
                 let names = crate::packs::manifest::known_rule_kinds();
-                assert_eq!(names, vec!["test-rule", "other-rule"]);
+                assert_eq!(names, vec!["cadence-overdue", "test-rule", "other-rule"]);
             },
         );
-        // Outside the hook the list is empty. Run this inside an
-        // empty-kinds hook: it holds the serial lock, so no parallel
-        // test can have kinds registered while we assert.
+        // Outside the hook only the production kinds remain. Run this
+        // inside an empty-kinds hook: it holds the serial lock, so no
+        // parallel test can have kinds registered while we assert.
         crate::packs::declarative::with_rule_kinds_for_test(vec![], || {
-            assert!(crate::packs::manifest::known_rule_kinds().is_empty());
+            assert_eq!(
+                crate::packs::manifest::known_rule_kinds(),
+                vec!["cadence-overdue"]
+            );
         });
     }
 
@@ -665,5 +932,265 @@ default = "test rule"
         // Guard the fixture's shape: the person record is a person.
         let vault = fixture_vault("", None);
         assert!(vault.records.values().all(|r| r.kind == RecordKind::Person));
+    }
+}
+
+#[cfg(test)]
+mod cadence_kind_tests {
+    use super::tests::{as_of, empty_merges};
+    use super::*;
+    use crate::load_vault;
+    use crate::packs::dir::read_pack_dir;
+    use crate::packs::external::load_external_packs;
+    use crate::packs::lock::Lockfile;
+    use crate::packs::manifest::parse_manifest_external;
+    use crate::packs::registry::PackRegistry;
+
+    /// Vendor a pack whose cadence rule has the given manifest body
+    /// (params vary per test) and return the loader's problem kinds.
+    fn load_with_rule(rules: &str, messages: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+{rules}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+
+{messages}
+"#
+        );
+        let pack_dir = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("manifest.toml"), text).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# example pack.\n").unwrap();
+        let hash = read_pack_dir(&pack_dir)
+            .map(|p| p.hash)
+            .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
+        let mut lock = Lockfile::default();
+        lock.upsert(crate::packs::lock::LockEntry {
+            name: "example-pack".to_owned(),
+            version: "0.1".to_owned(),
+            source: "https://example.invalid/org/example-pack.git".to_owned(),
+            rev: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            subdir: String::new(),
+            hash,
+        });
+        std::fs::write(dir.path().join("confidant.lock"), lock.to_toml()).unwrap();
+        let compiled = PackRegistry::compiled();
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["example-pack@0.1".to_owned()],
+            &compiled,
+        );
+        load.problems
+            .iter()
+            .map(|p| format!("{:?}", p.kind))
+            .collect()
+    }
+
+    fn cadence_rule(params: &str) -> String {
+        format!(
+            "[[rules]]\nid = \"cadence\"\nkind = \"cadence-overdue\"\ncode = \"W_EXAMPLE_CADENCE\"\nseverity_key = \"example-pack.cadence_overdue\"\n{params}"
+        )
+    }
+
+    fn cadence_messages() -> String {
+        r#"[messages."W_EXAMPLE_CADENCE"]
+last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence""#
+            .to_owned()
+    }
+
+    fn severity_entry() -> String {
+        "[[checks.severity]]\nkey = \"example-pack.cadence_overdue\"\ndefault = \"warning\"\n"
+            .to_owned()
+    }
+
+    /// #495: the loader negatives — each bad parameter makes the pack
+    /// fail closed with an `Invalid` problem (an `E_PACK_INVALID`
+    /// finding through `check`).
+    #[test]
+    fn loader_refuses_undeclared_cadence_field() {
+        let problems = load_with_rule(
+            &format!(
+                "{}\n{}",
+                cadence_rule("cadence_field = \"ghost\"\nevent_verbs = [\"touch\"]\n"),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+    }
+
+    #[test]
+    fn loader_refuses_cadence_field_with_wrong_grammar() {
+        // The pack declares `cadence` with grammar "recurring-date":
+        // not usable as a cadence_field.
+        let dir_rules = cadence_rule("cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\n");
+        let text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "cadence"
+grammar = "recurring-date"
+
+{dir_rules}
+
+[[checks.severity]]
+key = "example-pack.cadence_overdue"
+default = "warning"
+
+{msg}
+"#,
+            msg = cadence_messages()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("manifest.toml"), text).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# example pack.\n").unwrap();
+        let hash = read_pack_dir(&pack_dir)
+            .map(|p| p.hash)
+            .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
+        let mut lock = Lockfile::default();
+        lock.upsert(crate::packs::lock::LockEntry {
+            name: "example-pack".to_owned(),
+            version: "0.1".to_owned(),
+            source: "https://example.invalid/org/example-pack.git".to_owned(),
+            rev: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            subdir: String::new(),
+            hash,
+        });
+        std::fs::write(dir.path().join("confidant.lock"), lock.to_toml()).unwrap();
+        let compiled = PackRegistry::compiled();
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["example-pack@0.1".to_owned()],
+            &compiled,
+        );
+        assert_eq!(
+            load.problems
+                .iter()
+                .map(|p| format!("{:?}", p.kind))
+                .collect::<Vec<_>>(),
+            vec!["Invalid"],
+            "{:?}",
+            load.problems
+        );
+    }
+
+    #[test]
+    fn loader_refuses_rule_missing_last_fix() {
+        // The message table lacks `last_fix`: the loader refuses.
+        let messages = cadence_messages().replace(
+            "last_fix = \"Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence\"\n",
+            "",
+        );
+        let problems = load_with_rule(
+            &format!(
+                "{}\n{}",
+                cadence_rule("cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\n"),
+                severity_entry()
+            ),
+            &messages,
+        );
+        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+    }
+
+    #[test]
+    fn loader_refuses_empty_event_verbs() {
+        let problems = load_with_rule(
+            &format!(
+                "{}\n{}",
+                cadence_rule("cadence_field = \"cadence\"\nevent_verbs = []\n"),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+    }
+
+    /// #495: a person with no cadence value is skipped, not warned.
+    #[test]
+    fn cadence_rule_no_cadence_field_skipped() {
+        let manifest_text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+{}
+
+[[checks.severity]]
+key = "example-pack.cadence_overdue"
+default = "warning"
+
+{}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+"#,
+            cadence_rule("cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\n"),
+            cadence_messages()
+        );
+        let manifest = parse_manifest_external(&manifest_text).unwrap();
+        // A vault whose person has no cadence field at all.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("people/p-01J9Z3K4QF0000000000000000")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("people/p-01J9Z3K4QF0000000000000000/profile.md"),
+            "---\nid: p-01J9Z3K4QF0000000000000000\ntype: person\nname: Ada Example\n---\n\nFake person.\n",
+        )
+        .unwrap();
+        let vault = load_vault(dir.path()).unwrap();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert!(out.is_empty(), "no cadence → skipped: {out:?}");
     }
 }

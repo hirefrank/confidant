@@ -1162,22 +1162,29 @@ default_fix = "{fix}"
 
     #[test]
     fn external_rejects_rule_code_not_declared() {
-        // With an empty KNOWN_RULE_KINDS, the kind check fires first.
-        // Once kinds are added, this will verify the code-must-be-declared check.
+        // #442 added "cadence-overdue" as a kind, so the
+        // code-must-be-declared check now fires for it.
         let text = valid_v2_toml()
             + "\n[[rules]]\nid = \"my_rule\"\nkind = \"cadence-overdue\"\ncode = \"E_UNDECLARED\"\n";
         let err = parse_manifest_external(&text).unwrap_err();
-        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("emits code 'E_UNDECLARED' which is not in finding_codes"),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn external_rejects_rule_severity_key_undeclared() {
-        // With an empty KNOWN_RULE_KINDS, the kind check fires first.
-        // Once kinds are added, this will verify the severity_key check.
+        // #442 added "cadence-overdue" as a kind, so the declared
+        // severity_key check now fires for it.
         let text = valid_v2_toml()
             + "\n[[rules]]\nid = \"my_rule\"\nkind = \"cadence-overdue\"\ncode = \"E_EXAMPLE_FIELD\"\nseverity_key = \"example-pack.undeclared\"\n";
         let err = parse_manifest_external(&text).unwrap_err();
-        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
+        assert!(
+            err.to_string().contains("names undeclared severity_key"),
+            "{err:?}"
+        );
     }
 
     #[test]

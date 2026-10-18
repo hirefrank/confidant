@@ -467,11 +467,72 @@ own issue appends its section with the parameter table:
 
 | Kind | Spec issue | Reproduces |
 |---|---|---|
-| *(none yet)* | — | — |
+| `cadence-overdue` | #442 | `personal@0.1`'s keep-in-touch rule |
 
-(Planned: `cadence-overdue` #442, `date-upcoming` #443, `note-ref`
-#458, `ledger-balance` #446, `session-checks` #447, `activity-gap`
-#448.)
+(Planned: `date-upcoming` #443, `note-ref` #458, `ledger-balance`
+#446, `session-checks` #447, `activity-gap` #448.)
+
+#### Kind `cadence-overdue` (#442)
+
+Warn when a person's last contact is older than their cadence window.
+Reproduces `personal@0.1`'s keep-in-touch rule (including the merge
+semantics: the canonical person's own cadence value first, else the
+first merged member's; contacts from any merged member count).
+
+One divergence from `personal@0.1` (accepted, per §13.4 rule 7 / PD8):
+rules read ledger entries only, so **dated `interaction` records do not
+count as contact** for a declarative pack, while the compiled pack
+folds them in. A vault that relies on interaction records will see
+extra warnings from the declarative pack; full parity needs either a
+further Frank decision or an accepted divergence (#444).
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `cadence_field` | string | One of the pack's own `[[fields]]` entries whose `grammar` is `"cadence"`. The field value is the window in days (`<N>d`, 1..=3650). |
+| `event_verbs` | list of strings, non-empty | Ledger verbs that count as contact. Read-only access to ledger metadata (date, verb, opaque id) — never note bodies, never `no-ai` content (PD8). |
+
+Message variants the pack's `[messages."W_CADENCE_OVERDUE"]` table must
+declare (the loader refuses a rule whose table lacks one):
+
+| Variant | Placeholders | Meaning |
+|---|---|---|
+| `last` | `id`, `start`, `d`, `cadence_days` | There was contact, but older than the window. `start` = as_of − `cadence_days` days. |
+| `none` | `id`, `cadence_days` | No contact on record at all. |
+| `last_fix` | `id` | Fix text for `last`. |
+| `none_fix` | `id` | Fix text for `none`. |
+
+Evaluation, per canonical person in record order:
+
+1. The person's cadence window: their own `cadence_field` value first,
+   else the first merged member's (members are in deterministic
+   record order). A person with no cadence value anywhere in their
+   merge group is skipped.
+2. Last contact: the latest ledger date `<= as_of` among entries whose
+   verb is in `event_verbs`, for the canonical person or any merged
+   member.
+3. Not overdue when the last contact exists and `as_of − last` is at
+   most the window. Otherwise emit `last` (with `start`), or `none`
+   when there is no contact.
+4. Severity comes from `severity_key` (`off` skips the rule). The
+   finding's file is the person's record path, `id` the canonical
+   person.
+
+Worked example:
+
+```toml
+[[rules]]
+id = "cadence"
+kind = "cadence-overdue"
+code = "W_CADENCE_OVERDUE"
+severity_key = "example-pack.cadence_overdue"
+cadence_field = "cadence"
+event_verbs = ["touch", "session"]
+```
+
+With `as_of = 2026-10-08`, a person `p-01M…` whose record says
+`cadence: 30d` and whose last `touch` is `2026-08-29` is 40 days stale:
+one warning, `last` variant, `start = 2026-09-08`. A touch on
+`2026-09-08` (exactly 30 days) is *not* overdue.
 
 ### 13.3. Names
 
