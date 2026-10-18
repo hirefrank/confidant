@@ -1176,6 +1176,20 @@ fn cmd_pack_add(
     from_dir: Option<&Path>,
     subdir: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
+    // The pack reader, manifest parser and git all quote untrusted
+    // repository text; escape it before any error reaches the terminal or
+    // the JSON error envelope (#499).
+    cmd_pack_add_inner(cli, vault_root, url, from_dir, subdir)
+        .map_err(pack_fetch::escape_domain_error)
+}
+
+fn cmd_pack_add_inner(
+    cli: &Cli,
+    vault_root: Option<&Path>,
+    url: Option<&str>,
+    from_dir: Option<&Path>,
+    subdir: Option<&str>,
+) -> anyhow::Result<ExitCode> {
     let source = pack_fetch::parse_add_source(url, from_dir)?;
     let fetched = pack_fetch::fetch(&source, subdir.unwrap_or(""))?;
     let report = pack_fetch::describe(&fetched)?;
@@ -1189,13 +1203,10 @@ fn cmd_pack_add(
         // hide the lines the operator is meant to read (PD10).
         println!(
             "pack    {}@{}",
-            pack_fetch::sanitize_untrusted(&report.name),
-            pack_fetch::sanitize_untrusted(&report.version)
+            pack_fetch::escape_line(&report.name),
+            pack_fetch::escape_line(&report.version)
         );
-        println!(
-            "source  {}",
-            pack_fetch::sanitize_untrusted(&fetched.source)
-        );
+        println!("source  {}", pack_fetch::escape_line(&fetched.source));
         println!(
             "rev     {}",
             if fetched.rev.is_empty() {
@@ -1209,7 +1220,7 @@ fn cmd_pack_add(
             if fetched.subdir.is_empty() {
                 "(root)".to_string()
             } else {
-                pack_fetch::sanitize_untrusted(&fetched.subdir)
+                pack_fetch::escape_line(&fetched.subdir)
             }
         );
         for line in report.human_lines() {

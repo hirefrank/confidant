@@ -355,6 +355,18 @@ impl DomainError {
         self.fix.as_deref()
     }
 
+    /// Escape control and Unicode format characters in the message, fix and
+    /// file. Used at the `pack add` boundary: the pack reader, manifest
+    /// parser and git stderr all quote untrusted repository text, and that
+    /// text reaches the operator's terminal (#499).
+    pub fn escape_untrusted(mut self) -> Self {
+        use crate::packs::untrusted::escape_line;
+        self.message = escape_line(&self.message);
+        self.fix = self.fix.map(|fix| escape_line(&fix));
+        self.file = self.file.map(|file| escape_line(&file));
+        self
+    }
+
     /// Process exit code: 2 for usage, 1 otherwise.
     pub fn exit_code(&self) -> i32 {
         if self.kind == ErrorKind::Usage {

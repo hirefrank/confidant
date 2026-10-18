@@ -52,23 +52,20 @@ fn is_safe_ref(git_ref: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~' | '^'))
 }
 
-/// Escape control characters (other than newline and tab) in text that came
-/// from an untrusted pack.
-///
-/// The report is the review gate (PD10): a hostile `SKILL.md`, file name or
-/// git `remote:` line carrying ANSI sequences could conceal or overwrite the
-/// lines the operator is supposed to read. `--json` needs no help — serde
-/// escapes them — so this is for the human output only.
-pub(crate) fn sanitize_untrusted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_control() && ch != '\n' && ch != '\t' {
-            out.extend(ch.escape_default());
-        } else {
-            out.push(ch);
-        }
+// Untrusted pack text is escaped in core so the pack reader and the CLI use
+// the same rules (#499). `escape_line` is for one-line values; `escape_text`
+// is for multi-line prose (a `SKILL.md` body).
+pub(crate) use confidant_core::packs::untrusted::{escape_line, escape_text};
+
+/// Escape untrusted text in an error before it reaches stderr or the `--json`
+/// error envelope. `pack add` quotes file names, manifest values and git
+/// stderr from an untrusted repository; a control character or bidi override
+/// must not hide the failure it caused (#499).
+pub(crate) fn escape_domain_error(err: anyhow::Error) -> anyhow::Error {
+    match DomainError::of(&err) {
+        Some(domain) => anyhow::Error::new(domain.clone().escape_untrusted()),
+        None => anyhow::Error::new(DomainError::internal(escape_line(&format!("{err:#}")))),
     }
-    out
 }
 
 /// Canonicalise `dir` and require it to live inside `root`.
@@ -266,7 +263,7 @@ fn run_git(args: &[String], cwd: Option<&Path>, what: &str) -> anyhow::Result<St
                     }
                     // Untrusted: git prints the remote's own text here, so
                     // control sequences must not reach the terminal.
-                    let detail = sanitize_untrusted(stderr.trim().lines().last().unwrap_or(""));
+                    let detail = escape_line(stderr.trim().lines().last().unwrap_or(""));
                     return Err(anyhow::Error::new(DomainError::pack_invalid(format!(
                         "{what} failed{}",
                         if detail.is_empty() {
@@ -434,7 +431,7 @@ pub(crate) fn describe(fetched: &Fetched) -> anyhow::Result<PackReport> {
     let skill_bytes = dir.files.get(&manifest.pack.skill).ok_or_else(|| {
         anyhow::Error::new(DomainError::pack_invalid(format!(
             "the pack directory has no {}",
-            manifest.pack.skill
+            escape_line(&manifest.pack.skill)
         )))
     })?;
     // Fail closed: an empty report while the vault would receive the real
@@ -443,7 +440,7 @@ pub(crate) fn describe(fetched: &Fetched) -> anyhow::Result<PackReport> {
         .map_err(|_| {
             anyhow::Error::new(DomainError::pack_invalid(format!(
                 "{} is not valid UTF-8",
-                manifest.pack.skill
+                escape_line(&manifest.pack.skill)
             )))
         })?
         .to_string();
@@ -464,28 +461,42 @@ pub(crate) fn describe(fetched: &Fetched) -> anyhow::Result<PackReport> {
     })
 }
 
+/// Comma-join a claim list, or say `(none)`. The full list is part of the
+/// PD10 review gate (#499).
+fn join_claims(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    if items.is_empty() {
+        "(none)".to_owned()
+    } else {
+        items.join(", ")
+    }
+}
+
 impl PackReport {
-    /// The `claims` object: every claim the pack makes, by name.
+    /// The `claims` object: every claim the pack makes, by name. Values are
+    /// escaped as one-line report text (#499); this is a review payload, not
+    /// the bytes that would be installed.
     pub(crate) fn claims_json(&self) -> serde_json::Value {
         let m = &self.manifest;
         serde_json::json!({
-            "verbs": m.verbs.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
-            "fields": m.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
-            "record_types": m.record_types.clone(),
-            "edge_kinds": m.edge_kinds.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
-            "balance_metrics": m.balance_metrics.clone(),
-            "finding_codes": m.finding_codes.clone(),
+            "verbs": m.verbs.iter().map(|v| escape_line(&v.name)).collect::<Vec<_>>(),
+            "fields": m.fields.iter().map(|f| escape_line(&f.name)).collect::<Vec<_>>(),
+            "record_types": m.record_types.iter().map(|r| escape_line(r)).collect::<Vec<_>>(),
+            "edge_kinds": m.edge_kinds.iter().map(|e| escape_line(&e.name)).collect::<Vec<_>>(),
+            "balance_metrics": m.balance_metrics.iter().map(|b| escape_line(b)).collect::<Vec<_>>(),
+            "finding_codes": m.finding_codes.iter().map(|c| escape_line(c)).collect::<Vec<_>>(),
             "checks_keys": m
                 .checks
                 .severity
                 .iter()
-                .map(|s| s.key.clone())
-                .chain(m.checks.int.iter().map(|i| i.key.clone()))
+                .map(|s| escape_line(&s.key))
+                .chain(m.checks.int.iter().map(|i| escape_line(&i.key)))
                 .collect::<Vec<_>>(),
         })
     }
 
-    /// The `rules` array: id, kind, code and severity key per `[[rules]]`.
+    /// The `rules` array: id, kind, code and severity key per `[[rules]]`,
+    /// escaped for the report (#499).
     pub(crate) fn rules_json(&self) -> serde_json::Value {
         serde_json::Value::Array(
             self.manifest
@@ -493,10 +504,10 @@ impl PackReport {
                 .iter()
                 .map(|r| {
                     serde_json::json!({
-                        "id": r.id,
-                        "kind": r.kind,
-                        "code": r.code,
-                        "severity_key": r.severity_key,
+                        "id": escape_line(&r.id),
+                        "kind": escape_line(&r.kind),
+                        "code": escape_line(&r.code),
+                        "severity_key": r.severity_key.as_deref().map(escape_line),
                     })
                 })
                 .collect(),
@@ -521,26 +532,79 @@ impl PackReport {
                 m.finding_codes.len()
             ),
         ];
+        // PD10: the full claim list is part of the review gate, not just the
+        // counts. Every value here is untrusted manifest text, so it is
+        // escaped for one line (#499).
+        lines.push(format!(
+            "  verbs          {}",
+            join_claims(m.verbs.iter().map(|v| match v.id_type {
+                // `package` is the only ID prefix without a record type.
+                Some(id_type) => format!(
+                    "{} ({})",
+                    escape_line(&v.name),
+                    id_type.record_type().unwrap_or("package")
+                ),
+                None => escape_line(&v.name),
+            }))
+        ));
+        lines.push(format!(
+            "  fields         {}",
+            join_claims(m.fields.iter().map(|f| format!(
+                "{} ({})",
+                escape_line(&f.name),
+                escape_line(&f.grammar)
+            )))
+        ));
+        lines.push(format!(
+            "  record types   {}",
+            join_claims(m.record_types.iter().map(|r| escape_line(r)))
+        ));
+        lines.push(format!(
+            "  edge kinds     {}",
+            join_claims(m.edge_kinds.iter().map(|e| format!(
+                "{} ({})",
+                escape_line(&e.name),
+                if e.symmetric { "symmetric" } else { "directed" }
+            )))
+        ));
+        lines.push(format!(
+            "  metrics        {}",
+            join_claims(m.balance_metrics.iter().map(|b| escape_line(b)))
+        ));
+        lines.push(format!(
+            "  finding codes  {}",
+            join_claims(m.finding_codes.iter().map(|c| escape_line(c)))
+        ));
+        lines.push(format!(
+            "  checks keys    {}",
+            join_claims(
+                m.checks
+                    .severity
+                    .iter()
+                    .map(|s| escape_line(&s.key))
+                    .chain(m.checks.int.iter().map(|i| escape_line(&i.key)))
+            )
+        ));
         for r in &m.rules {
             lines.push(format!(
                 "rule    {} (kind {}, code {}, severity {})",
-                r.id,
-                r.kind,
-                r.code,
-                r.severity_key.as_deref().unwrap_or("(fixed)")
+                escape_line(&r.id),
+                escape_line(&r.kind),
+                escape_line(&r.code),
+                escape_line(r.severity_key.as_deref().unwrap_or("(fixed)"))
             ));
         }
         lines.push(format!("files   {} file(s)", self.files.len()));
         for (path, bytes) in &self.files {
-            lines.push(format!("  {}  {bytes} bytes", sanitize_untrusted(path)));
+            lines.push(format!("  {}  {bytes} bytes", escape_line(path)));
         }
         lines.push(format!(
             "skill   {} ({} bytes):",
-            sanitize_untrusted(&m.pack.skill),
+            escape_line(&m.pack.skill),
             self.skill_text.len()
         ));
         for line in self.skill_text.lines() {
-            lines.push(format!("  {}", sanitize_untrusted(line)));
+            lines.push(format!("  {}", escape_text(line)));
         }
         lines
     }
@@ -552,11 +616,11 @@ impl PackReport {
             "command": "pack-add",
             "dry_run": true,
             "pack": {
-                "name": &self.name,
-                "version": &self.version,
-                "source": source,
-                "rev": rev,
-                "subdir": subdir,
+                "name": escape_line(&self.name),
+                "version": escape_line(&self.version),
+                "source": escape_line(source),
+                "rev": escape_line(rev),
+                "subdir": escape_line(subdir),
                 "hash": &self.hash,
             },
             "claims": self.claims_json(),
@@ -564,9 +628,9 @@ impl PackReport {
             "files": self
                 .files
                 .iter()
-                .map(|(path, bytes)| serde_json::json!({"path": path, "bytes": bytes}))
+                .map(|(path, bytes)| serde_json::json!({"path": escape_line(path), "bytes": bytes}))
                 .collect::<Vec<_>>(),
-            "skill_text": &self.skill_text,
+            "skill_text": escape_text(&self.skill_text),
         })
     }
 }
@@ -628,16 +692,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_untrusted_escapes_control_characters() {
+    fn report_escaping_breaks_lines_in_fields_and_keeps_them_in_prose() {
         // A conceal sequence in a SKILL.md must not reach the terminal raw.
-        let escaped = sanitize_untrusted("safe\u{1b}[8mhidden\u{1b}[0m");
+        let escaped = escape_line("safe\u{1b}[8mhidden\u{1b}[0m");
         assert!(
             !escaped.contains('\u{1b}'),
             "raw escape survived: {escaped}"
         );
         assert!(escaped.contains("hidden"), "{escaped}");
-        // Newlines and tabs survive, so the report still reads.
-        assert_eq!(sanitize_untrusted("a\nb\tc"), "a\nb\tc");
+        // A single-line field must not inject lines; prose keeps them.
+        assert_eq!(escape_line("a\nb\tc"), "a\\nb\\tc");
+        assert_eq!(escape_text("a\nb\tc"), "a\nb\tc");
     }
 
     #[test]

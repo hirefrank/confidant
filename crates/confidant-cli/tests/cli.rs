@@ -1040,6 +1040,198 @@ fn pack_add_json_has_claims_rules_files_and_skill_text() {
     assert_eq!(v["skill_text"], "# Example pack skill.\n");
 }
 
+/// A v2 manifest whose claim names and skill prose carry hostile text:
+/// a bidi override, a bidi isolate, a newline in a field name and an ANSI
+/// conceal sequence. Fake data only (#499).
+#[cfg(unix)]
+fn hostile_pack_dir() -> tempfile::TempDir {
+    let bidi = '\u{202e}';
+    let isolate = '\u{2066}';
+    let escape = '\u{1b}';
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("manifest.toml"),
+        format!(
+            "manifest_version = 2\n\
+             record_types = [\"bad{bidi}record\"]\n\
+             balance_metrics = [\"bad{bidi}metric\"]\n\
+             finding_codes = [\"E_FRONTMATTER\", \"W_EXAMPLE_UNSAFE\"]\n\
+             \n\
+             [pack]\n\
+             name = \"example-pack\"\n\
+             version = \"0.1\"\n\
+             skill = \"SKILL.md\"\n\
+             requires_spec = [\"0.1\"]\n\
+             \n\
+             [[verbs]]\n\
+             name = \"greet\"\n\
+             id_type = \"person\"\n\
+             \n\
+             [[fields]]\n\
+             name = \"bad{bidi}\\nfield\"\n\
+             grammar = \"non-empty-string\"\n\
+             \n\
+             [[fields]]\n\
+             name = \"birthday\"\n\
+             grammar = \"recurring-date\"\n\
+             \n\
+             [[edge_kinds]]\n\
+             name = \"buddy\"\n\
+             symmetric = true\n\
+             \n\
+             [[checks.severity]]\n\
+             key = \"example-pack.bad{bidi}key\"\n\
+             default = \"warning\"\n\
+             \n\
+             [messages.\"E_FRONTMATTER\"]\n\
+             default = \"front matter\"\n\
+             \n\
+             [messages.\"W_EXAMPLE_UNSAFE\"]\n\
+             default = \"unsafe\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("SKILL.md"),
+        format!("# Skill\nline{isolate}two\nhidden{escape}[8mtext\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("0.1.md"), "# Contract\n").unwrap();
+    std::fs::write(dir.path().join(format!("README-{bidi}evil")), "x").unwrap();
+    std::fs::write(dir.path().join(format!("README-{escape}hidden")), "x").unwrap();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_escapes_untrusted_report_text_and_lists_every_claim() {
+    let pack = hostile_pack_dir();
+    let bidi = '\u{202e}';
+    let isolate = '\u{2066}';
+    let escape = '\u{1b}';
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout {stdout}\nstderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for raw in [bidi, isolate, escape] {
+        assert!(
+            !stdout.contains(raw),
+            "raw {raw:?} reached the report:\n{stdout}"
+        );
+    }
+    // One-line values are escaped, including the newline in a field name.
+    assert!(stdout.contains("bad\\u{202e}\\nfield"), "{stdout}");
+    assert!(stdout.contains("bad\\u{202e}record"), "{stdout}");
+    assert!(stdout.contains("bad\\u{202e}metric"), "{stdout}");
+    assert!(stdout.contains("example-pack.bad\\u{202e}key"), "{stdout}");
+    // PD10: the full claim list, not just counts.
+    assert!(stdout.contains("greet (person)"), "{stdout}");
+    assert!(stdout.contains("birthday (recurring-date)"), "{stdout}");
+    assert!(stdout.contains("buddy (symmetric)"), "{stdout}");
+    assert!(stdout.contains("E_FRONTMATTER"), "{stdout}");
+    assert!(stdout.contains("W_EXAMPLE_UNSAFE"), "{stdout}");
+    // File names and skill prose are escaped too.
+    assert!(stdout.contains("README-\\u{202e}evil"), "{stdout}");
+    assert!(stdout.contains("line\\u{2066}two"), "{stdout}");
+
+    // The JSON review payload is escaped as well: an agent reading it must
+    // see the same markers, not raw bidi.
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let raw = String::from_utf8_lossy(&out.stdout);
+    for forbidden in [bidi, isolate, escape] {
+        assert!(
+            !raw.contains(forbidden),
+            "raw {forbidden:?} reached the JSON report:\n{raw}"
+        );
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["claims"]["fields"],
+        serde_json::json!(["bad\\u{202e}\\nfield", "birthday"])
+    );
+    assert_eq!(
+        v["claims"]["record_types"],
+        serde_json::json!(["bad\\u{202e}record"])
+    );
+    let files = v["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|f| f["path"] == "README-\\u{202e}evil"),
+        "{files:?}"
+    );
+    let skill = v["skill_text"].as_str().unwrap();
+    assert!(skill.contains("line\\u{2066}two"), "{skill:?}");
+    assert!(
+        skill.contains('\n'),
+        "prose newlines must survive: {skill:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_escapes_untrusted_errors() {
+    let bidi = '\u{202e}';
+    // An unallowed file name: the reader quotes it in the error.
+    let pack = fake_pack_dir(&[]);
+    std::fs::write(pack.path().join(format!("evil{bidi}.txt")), "x").unwrap();
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(bidi), "raw bidi in stderr: {stderr}");
+    assert!(stderr.contains("\\u{202e}"), "{stderr}");
+    assert!(stderr.contains("not an allowed pack file"), "{stderr}");
+
+    // A manifest error that quotes an untrusted skill name.
+    let pack = tempfile::tempdir().unwrap();
+    std::fs::write(
+        pack.path().join("manifest.toml"),
+        format!(
+            "manifest_version = 2\n\
+             record_types = []\n\
+             balance_metrics = []\n\
+             finding_codes = []\n\
+             \n\
+             [pack]\n\
+             name = \"example-pack\"\n\
+             version = \"0.1\"\n\
+             skill = \"evil{bidi}..\"\n\
+             requires_spec = [\"0.1\"]\n\
+             \n\
+             [messages]\n"
+        ),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(bidi), "raw bidi in stderr: {stderr}");
+    assert!(stderr.contains("\\u{202e}"), "{stderr}");
+    assert!(stderr.contains("plain file name"), "{stderr}");
+}
+
 #[test]
 fn pack_add_rejects_non_https_schemes() {
     for url in [

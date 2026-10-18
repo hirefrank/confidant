@@ -31,6 +31,7 @@ pub mod lock;
 pub mod manifest;
 pub mod personal;
 pub mod registry;
+pub mod untrusted;
 
 pub use registry::PackRegistry;
 
