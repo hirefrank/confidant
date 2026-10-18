@@ -86,7 +86,7 @@ they are the ones to double-check wording on before submitting.
 
 | # | Criterion | Level | Status | Evidence |
 |---|---|---|---|---|
-| 31 | `build` — working automatic build system | MUST | Met | Cargo workspace; `cargo build`/`cargo install`; CI builds on ubuntu/macos/windows; `release.yml` (cargo-dist) builds release binaries. |
+| 31 | `build` — working automatic build system | MUST | Met | Cargo workspace; `cargo build`/`cargo install`; CI builds on ubuntu/macos; `release.yml` (cargo-dist) builds release binaries for macOS and Linux (Windows via WSL2). |
 | 32 | `build_common_tools` — common build tools | SUGGESTED | Met | `cargo`/`rustc` (rustup). |
 | 33 | `build_floss_tools` — buildable with only FLOSS tools | SHOULD | Met | Rust toolchain, Cargo, cargo-dist — all FLOSS. |
 | 34 | `test` — automated FLOSS test suite, how to run it documented | MUST | Met | `cargo test --workspace --all-features --locked`; documented in `CONTRIBUTING.md` and `AGENTS.md`; run in `.github/workflows/ci.yml`. |

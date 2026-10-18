@@ -41,6 +41,10 @@ confidant setup --agent auto
 This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli).
 Prebuilt binaries and shell installers are on the
 [GitHub Releases](https://github.com/hirefrank/confidant/releases) page.
+Supported platforms: **macOS** (Apple Silicon and Intel) and **Linux**
+(x86_64). Windows users run Confidant under
+[WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) — native
+Windows builds are not provided.
 `confidant update` keeps the install current (re-run the installer or
 `cargo install confidant-cli`, then `confidant setup` to re-link).
 
