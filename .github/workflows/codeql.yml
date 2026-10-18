@@ -1,6 +1,7 @@
 name: CodeQL
 
-# Scorecard SAST check (#325): static analysis on every push and PR to main.
+# Scorecard SAST check (#325): static analysis on push to main and on
+# non-draft PRs (drafts are never merged, so the score is unaffected).
 # Score builds up as new commits get checked.
 # Rust extraction needs no build (build-mode: none).
 
@@ -9,6 +10,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `ready_for_review` is not in the default set; without it a PR whose last
+    # push happened while it was a draft would merge without a run on its head.
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Cancel superseded runs on the same ref: a new push to a PR, or a quick
+# succession of merges to main. The SAST score reads the PR head's completed
+# run, so cancelling older refs does not change it.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -16,6 +27,10 @@ permissions:
 jobs:
   analyze:
     name: Analyze (rust)
+    # Draft PRs are never merged, so pushing to one cannot leave a merged head
+    # unanalysed; the `ready_for_review` trigger gives the final head its run.
+    # The SAST score reads merged PR heads only, so this skips no score.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     permissions:
       actions: read
