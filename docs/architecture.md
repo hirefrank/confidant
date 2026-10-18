@@ -368,7 +368,7 @@ registry, no signing in v1. External packs affect `check` only.
 **Decision.** Run checks on every push, and release only when a version tag is pushed.
 
 - **Every push and pull request:** `cargo fmt --check`, `clippy` with warnings treated as errors, and the tests. Also `confidant check` on the demo vault, an encrypt-then-decrypt round-trip test, format-spec compatibility tests against fixture vaults, and dependency audits (`cargo deny`, `cargo audit`). Runs on Linux and macOS.
-- **Version tag (for example `v0.1.0`):** cargo-dist builds binaries for macOS (Apple Silicon and Intel), Linux and Windows. It publishes a GitHub Release with SHA-256 checksums, a Homebrew formula and shell installers, and also publishes to crates.io. Builds carry build-provenance attestations so users can check that a binary came from this repo's CI. macOS notarization is added once there are outside users.
+- **Version tag (for example `v0.1.0`):** cargo-dist builds binaries for macOS (Apple Silicon and Intel) and Linux (x86_64). It publishes a GitHub Release with SHA-256 checksums, a Homebrew formula and shell installers, and also publishes to crates.io. Builds carry build-provenance attestations so users can check that a binary came from this repo's CI. macOS notarization is added once there are outside users. Windows is supported via WSL2; no native Windows binaries are built.
 - **Main is protected:** merges need CI to pass, and release tags come only from main.
 - **CI never holds vault keys.** Tests use the demo vault and throwaway keys generated during the run.
 

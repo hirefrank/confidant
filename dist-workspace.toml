@@ -8,10 +8,11 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
+installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-# ADR-14: macOS (Apple Silicon + Intel), Linux (x86_64), Windows.
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# ADR-14 (as amended by #502): macOS (Apple Silicon + Intel), Linux (x86_64).
+# Windows users run Confidant under WSL2; no native Windows target.
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
