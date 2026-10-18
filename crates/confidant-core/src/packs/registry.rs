@@ -49,6 +49,16 @@ impl PackRegistry {
         &self.packs
     }
 
+    /// The agent-facing skill text the registry's pack `name` carries, if
+    /// any (#445). Compiled packs return `None` (their text is embedded in
+    /// the CLI); an external pack returns its vendored skill file.
+    pub fn skill_text(&self, name: &str) -> Option<&'static str> {
+        self.packs
+            .iter()
+            .find(|p| p.name() == name)
+            .and_then(|p| p.skill_text())
+    }
+
     /// The enabled packs for a vault's `packs = [...]` list, each at most
     /// once (a duplicated listing folds once), plus the listed names no
     /// pack in this registry implements. Order follows the config list.

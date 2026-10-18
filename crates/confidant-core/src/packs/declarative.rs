@@ -1166,6 +1166,47 @@ default = "test rule"
         let vault = fixture_vault("", None);
         assert!(vault.records.values().all(|r| r.kind == RecordKind::Person));
     }
+
+    /// PD9 (#445): a declarative pack ships text and data only. This scan
+    /// fails if any evaluator source ever grows a file, network, or process
+    /// call. The sources are `include_str!` so the scan itself reads no
+    /// files, and `dir.rs` is not scanned: it is the pack module's one
+    /// legitimate filesystem reader (the evaluator reaches it only through
+    /// its API).
+    ///
+    /// Test modules are excluded: they build fixtures with `std::fs` by
+    /// design. The split marker matches `#[cfg(test)]` followed by `mod `
+    /// (the convention: the trailing test modules, not the small test-only
+    /// hook earlier in the file).
+    ///
+    /// `#[test]` files live in this module; a future `packs/rules/*.rs`
+    /// module must be added to `EVALUATOR_SOURCES` by hand — a compile-time
+    /// scan cannot glob a directory.
+    #[test]
+    fn evaluator_sources_have_no_io_apis() {
+        const EVALUATOR_SOURCES: &[(&str, &str)] = &[
+            ("packs/declarative.rs", include_str!("declarative.rs")),
+            ("packs/external.rs", include_str!("external.rs")),
+        ];
+        const FORBIDDEN: &[&str] = &[
+            "std::net",
+            "std::process",
+            "std::fs",
+            "tokio",
+            "reqwest",
+            "Command::new",
+            "std::env::var",
+        ];
+        for (name, source) in EVALUATOR_SOURCES {
+            let production = source.split("#[cfg(test)]\nmod ").next().unwrap_or(source);
+            for needle in FORBIDDEN {
+                assert!(
+                    !production.contains(needle),
+                    "{name} mentions {needle:?}; evaluator sources must do no I/O (PD9, #445)"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

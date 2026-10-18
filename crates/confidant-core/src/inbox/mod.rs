@@ -640,6 +640,32 @@ mod tests {
         assert_eq!(DomainError::of(&err).unwrap().code(), "E_INBOX_ITEM");
     }
 
+    /// PD10 (#445): pack install state is operator-only. An inbox item may
+    /// never write under `packs/`, nor to `confidant.lock` or
+    /// `confidant.toml` — otherwise an outside device could rewrite the
+    /// operator's pack pins or vendored text. Record paths are validated at
+    /// parse time, so the item is rejected before the drain planner ever
+    /// sees it.
+    #[test]
+    fn inbox_rejects_record_items_targeting_packs_dir_and_lockfile() {
+        for raw in [
+            "packs/example-pack@0.1/SKILL.md",
+            "packs/example-pack@0.1/manifest.toml",
+            "confidant.lock",
+            "confidant.toml",
+        ] {
+            let text = format!("confidant-inbox/1\nkind: record\npath: {raw}\n---\nfoo\n");
+            let err = parse_item("x", &text).unwrap_err();
+            let domain = DomainError::of(&err).unwrap();
+            assert_eq!(domain.code(), "E_INBOX_ITEM", "raw={raw}");
+            assert!(
+                domain.message().contains("record path must live under"),
+                "raw={raw}: {}",
+                domain.message()
+            );
+        }
+    }
+
     #[test]
     fn rejects_non_markdown_record() {
         let text = "confidant-inbox/1\nkind: record\npath: people/x.txt\n---\nfoo\n";

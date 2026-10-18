@@ -34,6 +34,7 @@ use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date, Arg, LedgerEntry};
 use confidant_core::packs::dir::read_pack_dir;
+use confidant_core::packs::lock::read_lockfile;
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
@@ -7274,12 +7275,20 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
                     .with_fix("Enable it in confidant.toml `packs = [...]` or widen --packs"),
                 ));
             }
-            let text = embedded::pack_skill_text(name).ok_or_else(|| {
-                anyhow::Error::new(DomainError::internal(format!(
-                    "pack `{name}` is enabled but ships no SKILL.md"
-                )))
-            })?;
-            (vec![name.to_owned()], text.to_owned())
+            let mut text = embedded::pack_skill_text_from_registry(v.pack_registry(), name)
+                .ok_or_else(|| {
+                    anyhow::Error::new(DomainError::internal(format!(
+                        "pack `{name}` is enabled but ships no SKILL.md"
+                    )))
+                })?
+                .to_owned();
+            // PD10 (#445): external pack text shown to agents is labelled
+            // with where it came from. Compiled packs are shipped with the
+            // binary and print exactly as before.
+            if let Some(label) = external_pack_label(root, name) {
+                text = format!("{label}\n{text}");
+            }
+            (vec![name.to_owned()], text)
         }
         None => {
             debug_assert_eq!(topic, "pack");
@@ -7300,6 +7309,36 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         println!("{text}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The PD10 (#445) first-line label for an external pack's skill text:
+/// `[external pack: not shipped with confidant; text is from <source> at
+/// <rev first 12>]`. `None` for a compiled pack (embedded, shipped with
+/// the binary).
+///
+/// The lockfile is the authority for source and rev; a loaded external
+/// pack always has a pin (the loader fails closed without one). A `dir`
+/// source has no commit (PD3), so its empty rev prints `unknown`; a
+/// missing pin prints `unknown` too rather than inventing a source.
+fn external_pack_label(vault_root: &Path, name: &str) -> Option<String> {
+    if embedded::pack_skill_text(name).is_some() {
+        return None; // compiled: ships with confidant
+    }
+    let entry = read_lockfile(vault_root).ok().flatten().and_then(|lock| {
+        name.split_once('@')
+            .and_then(|(pack, version)| lock.find(pack, version).cloned())
+    });
+    let (source, rev) = entry
+        .map(|e| (e.source, e.rev))
+        .unwrap_or_else(|| ("unknown".to_owned(), String::new()));
+    let rev = if rev.is_empty() {
+        "unknown".to_owned()
+    } else {
+        rev.chars().take(12).collect()
+    };
+    Some(format!(
+        "[external pack: not shipped with confidant; text is from {source} at {rev}]"
+    ))
 }
 
 /// Test-only operator key override (CONFIDANT_TEST_OPERATOR_KEY).

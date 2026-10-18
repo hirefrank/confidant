@@ -5469,11 +5469,10 @@ use confidant_core::packs::dir::read_pack_dir;
 /// Vendor a minimal valid external pack into `dir` and return the
 /// canonical tree hash the lockfile must pin (all fake data).
 fn install_external_pack(root: &Path, name: &str, version: &str, verb: &str) -> String {
-    let pack_dir = root.join(format!("packs/{name}@{version}"));
-    fs::create_dir_all(&pack_dir).unwrap();
-    write(
+    install_external_pack_with_manifest(
         root,
-        &format!("packs/{name}@{version}/manifest.toml"),
+        name,
+        version,
         &format!(
             r#"manifest_version = 2
 record_types = []
@@ -5494,12 +5493,29 @@ name = "{verb}"
 "#,
             GREET_CODE = "GREET_STALE",
         ),
-    );
+        &format!("# {name} pack.\n\nVerb `{verb}`: fake skill text.\n"),
+    )
+}
+
+/// Vendor a pack from an explicit manifest and skill body; returns the
+/// canonical tree hash for the pin. Panics when the fixture itself is
+/// invalid — use [`unusable_external_pack_hash`] for a manifest that is
+/// expected to be refused.
+fn install_external_pack_with_manifest(
+    root: &Path,
+    name: &str,
+    version: &str,
+    manifest: &str,
+    skill: &str,
+) -> String {
+    let pack_dir = root.join(format!("packs/{name}@{version}"));
+    fs::create_dir_all(&pack_dir).unwrap();
     write(
         root,
-        &format!("packs/{name}@{version}/SKILL.md"),
-        &format!("# {name} pack.\n\nVerb `{verb}`: fake skill text.\n"),
+        &format!("packs/{name}@{version}/manifest.toml"),
+        manifest,
     );
+    write(root, &format!("packs/{name}@{version}/SKILL.md"), skill);
     write(
         root,
         &format!("packs/{name}@{version}/{version}.md"),
@@ -5508,6 +5524,13 @@ name = "{verb}"
     read_pack_dir(&pack_dir)
         .expect("fixture pack dir must read")
         .hash
+}
+
+/// A well-formed but unusable pin for a fixture whose manifest is expected
+/// to be refused: `read_pack_dir` rejects the pack before any hash compare,
+/// so the value only has to look like `sha256:<64 hex>`.
+fn unusable_external_pack_hash() -> String {
+    format!("sha256:{}", "0".repeat(64))
 }
 
 /// Write a lockfile pinning `name@version` to `hash`.
@@ -5948,6 +5971,169 @@ default = "stale greeting"
     assert!(
         found.contains(&"E_UNKNOWN_VERB".to_string()),
         "an unparseable manifest's verbs cannot be known: {json:?}"
+    );
+}
+
+/// #445 (PD8 rules 1-4), re-asserted through `check`: a pack that claims a
+/// core verb, a core edge kind or a core finding code is refused at load,
+/// so the vault reports one `E_PACK_INVALID` and the pack folds nothing.
+/// The forged core code must never surface as a finding.
+#[test]
+fn external_pack_cannot_claim_core_verb_edge_or_code() {
+    let make_manifest = |claims: &str, codes: &str, messages: &str| {
+        format!(
+            "manifest_version = 2\n\
+             record_types = []\n\
+             balance_metrics = []\n\
+             finding_codes = [{codes}]\n\
+             \n\
+             [pack]\n\
+             name = \"example-pack\"\n\
+             version = \"0.1\"\n\
+             skill = \"SKILL.md\"\n\
+             requires_spec = [\"0.1\"]\n\
+             {claims}\n\
+             {messages}\n"
+        )
+    };
+    let own_messages = "[messages.\"W_EXAMPLE_CODE\"]\ndefault = \"example\"\n";
+    let cases = [
+        (
+            "core verb",
+            make_manifest(
+                "[[verbs]]\nname = \"touch\"\n",
+                "\"W_EXAMPLE_CODE\"",
+                own_messages,
+            ),
+        ),
+        (
+            "core edge kind",
+            make_manifest(
+                "[[edge_kinds]]\nname = \"married\"\nsymmetric = true\n",
+                "\"W_EXAMPLE_CODE\"",
+                own_messages,
+            ),
+        ),
+        (
+            "core finding code",
+            make_manifest(
+                "",
+                "\"E_PACK_HASH\"",
+                "[messages.\"E_PACK_HASH\"]\ndefault = \"forged\"\n",
+            ),
+        ),
+    ];
+    for (label, manifest) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        person(dir.path(), ADA, "Ada Example");
+        install_external_pack_raw(dir.path(), "example-pack", "0.1", &manifest);
+        install_lockfile(
+            dir.path(),
+            "example-pack",
+            "0.1",
+            &unusable_external_pack_hash(),
+        );
+        external_vault_toml(
+            dir.path(),
+            "\"coaching@0.1\", \"example-pack@0.1\"",
+            DEFAULT_CHECKS,
+        );
+
+        let json = report_json(dir.path(), None);
+        assert!(
+            codes(&json).contains(&"E_PACK_INVALID".to_string()),
+            "{label} claim must be E_PACK_INVALID: {json:?}"
+        );
+        // The pack's claimed code never fires (a forged core code would be
+        // the dangerous case).
+        assert!(
+            !codes(&json).contains(&"E_PACK_HASH".to_string()),
+            "a pack's forged core code must never surface: {json:?}"
+        );
+    }
+}
+
+/// #445 (PD8 rule 6): a rule parameter may only name one of the pack's own
+/// declared fields. Through `check` an installed pack whose rule names an
+/// undeclared field is refused at load (`E_PACK_INVALID`) and its rule
+/// never runs.
+#[test]
+fn external_pack_rules_cannot_name_undeclared_field() {
+    let dir = tempfile::tempdir().unwrap();
+    person_with_cadence(dir.path(), ADA);
+    let hash = install_external_pack_with_manifest(
+        dir.path(),
+        "example-pack",
+        "0.1",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.severity]]
+key = "example-pack.cadence_overdue"
+default = "warning"
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+[[rules]]
+id = "cadence"
+kind = "cadence-overdue"
+code = "W_EXAMPLE_CADENCE"
+severity_key = "example-pack.cadence_overdue"
+cadence_field = "ghost"
+event_verbs = ["touch"]
+
+[messages."W_EXAMPLE_CADENCE"]
+last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+"#,
+        "# example pack.\n\nCadence rule (fake).\n",
+    );
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_INVALID".to_string()),
+        "an undeclared field in a rule must be E_PACK_INVALID: {json:?}"
+    );
+    assert!(
+        !codes(&json).contains(&"W_EXAMPLE_CADENCE".to_string()),
+        "a refused rule must never run: {json:?}"
+    );
+}
+
+/// Write a pack directory verbatim (no validation): for fixtures whose
+/// manifest is expected to be refused by `read_pack_dir`. Fake data only.
+fn install_external_pack_raw(root: &Path, name: &str, version: &str, manifest: &str) {
+    write(
+        root,
+        &format!("packs/{name}@{version}/manifest.toml"),
+        manifest,
+    );
+    write(
+        root,
+        &format!("packs/{name}@{version}/SKILL.md"),
+        "# example pack.\n",
     );
 }
 

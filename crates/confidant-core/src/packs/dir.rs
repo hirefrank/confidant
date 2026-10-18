@@ -30,7 +30,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::DomainError;
-use crate::packs::manifest::parse_manifest_external;
+use crate::packs::manifest::{parse_manifest_external, PackManifest};
 
 /// Maximum number of files in a pack directory.
 const MAX_FILES: usize = 200;
@@ -313,6 +313,35 @@ pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
 
     let hash = tree_hash(&files);
     Ok(PackDir { files, hash })
+}
+
+/// Best-effort parse of a vendored `manifest.toml` for problem paths only
+/// (#438/#445): the success path parses the bytes `read_pack_dir` hashed
+/// instead, so what is loaded is exactly what was verified.
+///
+/// The read is vetted: only a regular file (never a symlink —
+/// `read_pack_dir` would reject one), at most [`MAX_FILE_SIZE`] (the same
+/// bound the walk uses per file), so a hostile pack cannot hang or OOM
+/// `check`. File contents are used for parsing only, never reported.
+///
+/// This is here — the pack module's one filesystem reader — so the
+/// evaluator sources (`declarative.rs`, `external.rs`) stay free of I/O
+/// (PD9); `evaluator_sources_have_no_io_apis` enforces that.
+pub fn read_manifest_best_effort(dir: &Path) -> Option<PackManifest> {
+    let path = dir.join("manifest.toml");
+    // `symlink_metadata` never follows the link, so a symlinked
+    // manifest.toml (or any non-regular file) is refused on every
+    // platform — `read_pack_dir` rejects symlinks outright, and this
+    // best-effort read must not be a way around that.
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    if meta.len() > MAX_FILE_SIZE {
+        return None;
+    }
+    let text = fs::read_to_string(&path).ok()?;
+    parse_manifest_external(&text).ok()
 }
 
 #[cfg(test)]

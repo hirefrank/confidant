@@ -30,6 +30,19 @@ pub fn pack_skill_text(pack_name: &str) -> Option<&'static str> {
         .and_then(|f| f.contents_utf8())
 }
 
+/// Agent-facing skill text for a pack in the vault's pack registry (#445):
+/// compiled packs serve their embedded text; a loaded external pack serves
+/// the vendored `[pack].skill` text it carries (`Pack::skill_text`, #438).
+/// `None` when the pack is in neither.
+pub fn pack_skill_text_from_registry(
+    registry: &confidant_core::packs::PackRegistry,
+    pack_name: &str,
+) -> Option<&'static str> {
+    registry
+        .skill_text(pack_name)
+        .or_else(|| pack_skill_text(pack_name))
+}
+
 /// Combined skill text for packs in scope, in the order given: one
 /// section per pack, generated at serve time from the enabled packs
 /// (#189). `None` when any pack ships no skill text.
