@@ -472,6 +472,8 @@ mod tests {
             "record_show",
             "record_edit",
             "record_resolve",
+            "pack",
+            "pack_add",
             "for_edit",
             "show",
             "edit",

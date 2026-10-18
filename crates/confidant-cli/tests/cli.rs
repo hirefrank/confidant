@@ -928,3 +928,168 @@ fn find_text_hint_goes_to_stderr() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("qmd-search"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// #439: `confidant pack add` (fetch, validate, review report; writes nothing)
+// ---------------------------------------------------------------------------
+
+/// A minimal valid v2 pack directory. Fake data only.
+fn fake_pack_dir(extra: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("manifest.toml"),
+        "manifest_version = 2\n\
+         record_types = []\n\
+         balance_metrics = []\n\
+         finding_codes = [\"E_EXAMPLE_FIELD\"]\n\
+         \n\
+         [pack]\n\
+         name = \"example-pack\"\n\
+         version = \"0.1\"\n\
+         skill = \"SKILL.md\"\n\
+         requires_spec = [\"0.1\"]\n\
+         \n\
+         [messages.\"E_EXAMPLE_FIELD\"]\n\
+         default = \"example field\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("SKILL.md"), "# Example pack skill.\n").unwrap();
+    std::fs::write(dir.path().join("0.1.md"), "# Example pack contract.\n").unwrap();
+    for (name, content) in extra {
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+    dir
+}
+
+/// A directory that is a git repo but not a vault: `pack add` needs no vault.
+fn empty_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Command::new("git")
+        .current_dir(dir.path())
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    dir
+}
+
+#[test]
+fn pack_add_from_dir_prints_report_and_writes_nothing() {
+    let pack = fake_pack_dir(&[]);
+    let vault = empty_repo();
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout {stdout}");
+    assert!(stdout.contains("example-pack@0.1"), "{stdout}");
+    assert!(stdout.contains("sha256:"), "{stdout}");
+    assert!(stdout.contains("# Example pack skill."), "{stdout}");
+
+    // Nothing was written: the vault repo is still clean and the pack dir
+    // still has exactly its three files.
+    let status = Command::new("git")
+        .current_dir(vault.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "vault touched: {:?}",
+        status.stdout
+    );
+    assert_eq!(std::fs::read_dir(pack.path()).unwrap().count(), 3);
+}
+
+#[test]
+fn pack_add_json_has_claims_rules_files_and_skill_text() {
+    let pack = fake_pack_dir(&[]);
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "pack-add");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["pack"]["name"], "example-pack");
+    assert_eq!(v["pack"]["version"], "0.1");
+    assert_eq!(v["pack"]["source"], "dir");
+    assert_eq!(v["pack"]["rev"], "");
+    assert!(v["pack"]["hash"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(
+        v["claims"]["finding_codes"],
+        serde_json::json!(["E_EXAMPLE_FIELD"])
+    );
+    assert_eq!(v["claims"]["verbs"], serde_json::json!([]));
+    assert_eq!(v["rules"], serde_json::json!([]));
+    let files = v["files"].as_array().unwrap();
+    assert!(files.iter().any(|f| f["path"] == "SKILL.md"));
+    assert_eq!(v["skill_text"], "# Example pack skill.\n");
+}
+
+#[test]
+fn pack_add_rejects_non_https_schemes() {
+    for url in [
+        "http://example.invalid/x.git",
+        "ssh://git@example.invalid/x.git",
+        "git://example.invalid/x.git",
+        "file:///tmp/x",
+        "git@example.invalid:x/y.git",
+    ] {
+        let out = Command::new(bin())
+            .args(["pack", "add", url, "--no-input"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{url}");
+    }
+}
+
+#[test]
+fn pack_add_rejects_credentials_in_url() {
+    let out = Command::new(bin())
+        .args([
+            "pack",
+            "add",
+            "https://ada:hunter2@example.invalid/x.git",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("hunter2"), "password echoed: {stderr}");
+}
+
+#[test]
+fn pack_add_invalid_pack_dir_exits_1() {
+    // An extra executable-looking file is not in the PD7 allowlist, and a
+    // subdirectory is refused outright: either way the pack is invalid.
+    let pack = fake_pack_dir(&[("bin/run.sh", "#!/bin/sh\n")]);
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
+}
