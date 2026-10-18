@@ -25,6 +25,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   field list and the `touch` kind grammar; `personal@0.1` delegates to them
   (#510). `context --json` output is unchanged, and the declarative
   `personal@0.2` pack can serve the same view after the #444 cutover.
+- `record add` mirrors a `touch` ledger line for an interaction's primary
+  `person:` as well as for each `with:` participant, in the same commit, so a
+  logged interaction counts as contact for everyone on it (#505). The rules
+  stay ledger-only: a hand-written interaction with no mirrored line still
+  does not count.
 
 ## [0.5.0] - 2026-10-18
 

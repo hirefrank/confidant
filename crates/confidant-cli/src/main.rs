@@ -3837,18 +3837,21 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     }
     let contents = confidant_core::format_record(&rec);
     let id = rec.id.to_string();
-    // #179: a multi-person interaction mirrors one minimal touchpoint per
-    // `with:` participant (date + own id, nothing else) so each
-    // participant's cadence updates. The touchpoints land in the same
-    // write (same commit) as the interaction record. The writer validates
-    // shape (parse, person prefix, not the primary, no duplicates);
-    // existence is `check`'s job (keyed check), like every other
-    // front-matter reference.
+    // #179/#505: an interaction mirrors one minimal touchpoint per person
+    // involved (date + own id, nothing else) so cadence updates: one for the
+    // primary `person:` and one per `with:` participant. A logged interaction
+    // therefore counts as contact for everyone on it, while the check rules
+    // stay ledger-only. The touchpoints land in the same write (same commit)
+    // as the interaction record. The writer validates shape (parse, person
+    // prefix, not the primary, no duplicates); existence is `check`'s job
+    // (keyed check), like every other front-matter reference.
     let mut touch_lines: Vec<String> = Vec::new();
     let mut touch_change: Option<FileChange> = None;
     if rec.kind == RecordKind::Interaction {
+        let primary = rec.person();
+        let mut with: Vec<RecordId> = Vec::new();
         if let Some(raw) = rec.field("with") {
-            let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
+            with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
                 anyhow::Error::new(
                     DomainError::invalid(
                         "front matter key 'with' is not a bracketed list of person IDs",
@@ -3856,42 +3859,55 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
                     .with_fix("Use with: [p-<ULID>, p-<ULID>]"),
                 )
             })?;
-            if !with.is_empty() {
-                let date_raw = rec.field("date").ok_or_else(|| {
-                    anyhow::Error::new(
-                        DomainError::invalid(
-                            "interaction with with: needs a date (touchpoints are dated)",
-                        )
-                        .with_fix("Add date: YYYY-MM-DD to the interaction"),
-                    )
-                })?;
-                let date = parse_strict_date(date_raw).ok_or_else(|| {
-                    anyhow::Error::new(DomainError::invalid("interaction date is not YYYY-MM-DD"))
-                })?;
-                let primary = rec.person();
-                let mut seen: Vec<RecordId> = Vec::new();
-                for participant in &with {
-                    if participant.prefix() != Prefix::Person {
-                        return Err(anyhow::Error::new(
-                            DomainError::invalid("with: entries must be person ids")
-                                .with_fix("Use p-<ULID> ids in with:"),
-                        ));
-                    }
-                    if Some(participant) == primary.as_ref() {
-                        return Err(anyhow::Error::new(
-                            DomainError::invalid("with: lists the interaction's own person")
-                                .with_fix("Remove the primary person from with:"),
-                        ));
-                    }
-                    if seen.contains(participant) {
-                        return Err(anyhow::Error::new(
-                            DomainError::invalid("with: lists the same participant twice")
-                                .with_fix("List each participant once in with:"),
-                        ));
-                    }
-                    seen.push(participant.clone());
-                    touch_lines.push(format!("{date} touch {participant}"));
+            let mut seen: Vec<RecordId> = Vec::new();
+            for participant in &with {
+                if participant.prefix() != Prefix::Person {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: entries must be person ids")
+                            .with_fix("Use p-<ULID> ids in with:"),
+                    ));
                 }
+                if Some(participant) == primary.as_ref() {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the interaction's own person")
+                            .with_fix("Remove the primary person from with:"),
+                    ));
+                }
+                if seen.contains(participant) {
+                    return Err(anyhow::Error::new(
+                        DomainError::invalid("with: lists the same participant twice")
+                            .with_fix("List each participant once in with:"),
+                    ));
+                }
+                seen.push(participant.clone());
+            }
+        }
+        // A `with:` list keeps the hard date requirement (#179). A
+        // primary-only interaction mirrors only when it carries a usable
+        // date; a dateless one still writes, it just counts as no contact.
+        let date = if with.is_empty() {
+            rec.field("date").and_then(parse_strict_date)
+        } else {
+            let date_raw = rec.field("date").ok_or_else(|| {
+                anyhow::Error::new(
+                    DomainError::invalid(
+                        "interaction with with: needs a date (touchpoints are dated)",
+                    )
+                    .with_fix("Add date: YYYY-MM-DD to the interaction"),
+                )
+            })?;
+            Some(parse_strict_date(date_raw).ok_or_else(|| {
+                anyhow::Error::new(DomainError::invalid("interaction date is not YYYY-MM-DD"))
+            })?)
+        };
+        if let Some(date) = date {
+            if let Some(primary) = &primary {
+                touch_lines.push(format!("{date} touch {primary}"));
+            }
+            for participant in &with {
+                touch_lines.push(format!("{date} touch {participant}"));
+            }
+            if !touch_lines.is_empty() {
                 touch_change = Some(FileChange::AppendLines {
                     path: month_path(&date),
                     lines: touch_lines.clone(),
@@ -3926,7 +3942,8 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     if !created_keys.is_empty() {
         extra["created_keys"] = serde_json::json!(created_keys);
     }
-    // #179: the mirrored touchpoints, only when any were written.
+    // #179/#505: the mirrored touchpoints (primary first, then `with:`
+    // participants), only when any were written.
     if !touch_lines.is_empty() {
         extra["touchpoints"] = serde_json::json!(touch_lines);
     }

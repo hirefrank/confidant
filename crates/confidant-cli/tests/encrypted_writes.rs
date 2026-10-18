@@ -2076,9 +2076,10 @@ fn record_add_edge_encrypts_under_shared_key() {
 
 #[test]
 fn record_add_interaction_with_mirrors_touchpoints() {
-    // #179 Q3: one minimal touchpoint per `with:` participant — date +
-    // own id only, no other participant ids, no primary id, no
-    // interaction id — in the same write as the interaction record.
+    // #179 Q3 + #505: one minimal touchpoint per person on the interaction —
+    // the primary `person:` first, then each `with:` participant; date + own
+    // id only, no other participant ids, no interaction id — in the same
+    // write as the interaction record.
     let h = Harness::new();
     h.keyed(PERSON);
     let out = h.init_client(PERSON2);
@@ -2113,7 +2114,10 @@ fn record_add_interaction_with_mirrors_touchpoints() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         v["touchpoints"],
-        serde_json::json!([format!("2026-10-06 touch {PERSON2}")]),
+        serde_json::json!([
+            format!("2026-10-06 touch {PERSON}"),
+            format!("2026-10-06 touch {PERSON2}")
+        ]),
         "{v}"
     );
 
@@ -2127,19 +2131,22 @@ fn record_add_interaction_with_mirrors_touchpoints() {
     );
     assert!(!text.contains(PERSON2), "with: list leaked to outer header");
 
-    // The ledger carries exactly one touchpoint line for the participant.
+    // The ledger carries exactly the two expected touchpoint lines, whole
+    // lines: a participant line naming the primary (or any other id) would
+    // fail here, as would a duplicate.
     let ledger = std::fs::read_to_string(h.vault.join("ledger/2026/10.cfd")).unwrap();
-    assert!(
-        ledger.contains(&format!("2026-10-06 touch {PERSON2}\n")),
-        "touchpoint missing from ledger:\n{ledger}"
+    let ledger_lines: Vec<String> = ledger.lines().map(str::to_owned).collect();
+    assert_eq!(
+        ledger_lines,
+        vec![
+            format!("2026-10-06 touch {PERSON}"),
+            format!("2026-10-06 touch {PERSON2}"),
+        ],
+        "the ledger must carry exactly the mirrored touchpoints:\n{ledger}"
     );
     assert!(
         !ledger.contains(IXN),
         "touchpoint must not carry the interaction id:\n{ledger}"
-    );
-    assert!(
-        !ledger.contains(&format!("touch {PERSON} ")),
-        "touchpoint must not carry the primary id:\n{ledger}"
     );
 }
 

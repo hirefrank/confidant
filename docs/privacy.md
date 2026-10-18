@@ -208,6 +208,15 @@ the *primary* and someone else is only in `with:` — loses the whole
 interaction from the participant's view, because it is under A's destroyed
 key; that is the #179 design.
 
+Since #505 `record add` also mirrors a `touch` line for an interaction's
+primary person, not only for `with:` participants. A logged interaction
+therefore puts its exact date and the primary's opaque id in the plaintext
+ledger, where before that date lived only in the ciphertext (plus the
+commit time). It is the same shape a `with:` line already had — a date and
+one opaque id, no other participant, no interaction id, no content — and
+the same trade #179 accepted. An interaction written before #505, or
+hand-written, may carry no such line.
+
 For when per-pack *keys* would be needed, see
 `docs/per-pack-keys-design-note.md`.
 

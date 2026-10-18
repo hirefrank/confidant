@@ -486,12 +486,13 @@ Reproduces `personal@0.1`'s keep-in-touch rule (including the merge
 semantics: the canonical person's own cadence value first, else the
 first merged member's; contacts from any merged member count).
 
-One divergence from `personal@0.1` (accepted, per §13.4 rule 7 / PD8):
-rules read ledger entries only, so **dated `interaction` records do not
-count as contact** for a declarative pack, while the compiled pack
-folds them in. A vault that relies on interaction records will see
-extra warnings from the declarative pack; full parity needs either a
-further Frank decision or an accepted divergence (#444).
+One narrowed divergence remains (accepted, per §13.4 rule 7 / PD8):
+rules read ledger entries only, so an interaction with no mirrored
+`touch` line — hand-written, or written before the primary mirror
+landed — counts for compiled `personal@0.1` but not for a declarative
+pack. `record add` mirrors a line for the primary person as well as for
+`with:` participants, so a newly logged interaction counts for both
+(#505).
 
 | Parameter | Type | Meaning |
 |---|---|---|
