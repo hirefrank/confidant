@@ -510,6 +510,57 @@ mod tests {
         );
     }
 
+    /// PD10 (#445): pack install/update/remove is operator-only, never
+    /// reachable over MCP. The whitelist is the only way MCP can invoke the
+    /// CLI (`call_tool` maps known names to argv and rejects everything
+    /// else), so asserting no such tool is listed — and that a call by name
+    /// is refused — pins the property.
+    #[test]
+    fn mcp_whitelist_has_no_pack_tools() {
+        let whitelist = tools();
+        let names: Vec<&str> = whitelist
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for forbidden in [
+            "pack",
+            "pack_add",
+            "pack_list",
+            "pack_verify",
+            "pack_remove",
+            "pack_update",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden:?} is exposed over MCP: {names:?}"
+            );
+            // An agent asking for it by name is refused (an `isError` tool
+            // result, not a JSON-RPC error).
+            let resp = handle(
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"{forbidden}","arguments":{{}}}}}}"#
+                ),
+                Path::new("/tmp"),
+                &None,
+            )
+            .unwrap();
+            assert_eq!(
+                resp["result"]["isError"], true,
+                "{forbidden} must be refused: {resp}"
+            );
+            assert!(
+                resp["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unknown tool"),
+                "{forbidden}: {resp}"
+            );
+        }
+        // `pack_skill` is the one pack-shaped tool and it only reads skill
+        // text; it is not an install path.
+        assert!(names.contains(&"pack_skill"));
+    }
+
     #[test]
     fn tools_list_names_all_tools() {
         let resp = handle(

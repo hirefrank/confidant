@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use confidant_core::packs::dir::read_pack_dir;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_confidant")
 }
@@ -565,6 +567,108 @@ fn help_pack_coaching_json_envelope() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["packs"], serde_json::json!(["coaching@0.1"]));
     assert!(v["skill"].as_str().unwrap().contains("E_PAID_SESSION_GAP"));
+}
+
+/// A minimal valid v2 manifest for the external help fixture.
+const EXTERNAL_HELP_MANIFEST: &str = "manifest_version = 2\n\
+     record_types = []\n\
+     balance_metrics = []\n\
+     finding_codes = [\"E_EXAMPLE_FIELD\"]\n\
+     \n\
+     [pack]\n\
+     name = \"example-pack\"\n\
+     version = \"0.1\"\n\
+     skill = \"SKILL.md\"\n\
+     requires_spec = [\"0.1\"]\n\
+     \n\
+     [messages.\"E_EXAMPLE_FIELD\"]\n\
+     default = \"example field\"\n";
+
+/// A non-git vault with `example-pack@0.1` vendored, pinned and enabled,
+/// plus the vendored skill text. Fake data only.
+fn external_help_vault() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    let pack_dir = dir.path().join("packs/example-pack@0.1");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(pack_dir.join("manifest.toml"), EXTERNAL_HELP_MANIFEST).unwrap();
+    let skill = "# Example pack skill.\n\nFake external text.\n";
+    std::fs::write(pack_dir.join("SKILL.md"), skill).unwrap();
+    std::fs::write(pack_dir.join("0.1.md"), "# Contract.\n").unwrap();
+    let hash = read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash;
+    std::fs::write(
+        dir.path().join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"https://example.invalid/org/example-pack.git\"\nrev = \"0123456789abcdef0123456789abcdef01234567\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+    (dir, skill.to_owned())
+}
+
+/// PD10 (#445): external pack text shown to agents is labelled as external
+/// on its first line, with where it came from. The label leads both the
+/// plain and the `--json` (agent-facing) output.
+#[test]
+fn help_pack_external_is_labelled() {
+    let (vault, skill) = external_help_vault();
+    let label = "[external pack: not shipped with confidant; text is from \
+                 https://example.invalid/org/example-pack.git at 0123456789ab]";
+    let out = Command::new(bin())
+        .args(["help", "pack:example-pack@0.1", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with(label), "{stdout:?}");
+    assert!(stdout.contains(&skill), "vendored text missing: {stdout:?}");
+
+    let out = Command::new(bin())
+        .args(["help", "pack:example-pack@0.1", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["skill"].as_str().unwrap().starts_with(label),
+        "the agent-facing JSON must carry the label: {v}"
+    );
+}
+
+/// PD10 (#445) acceptance: a compiled pack's skill output is unchanged
+/// byte for byte — it ships with the binary, so it gets no label.
+#[test]
+fn help_pack_compiled_is_unlabelled() {
+    let out = Command::new(bin())
+        .args(["help", "pack:coaching@0.1", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let shipped = include_str!("../pack-skills/coaching/SKILL.md");
+    assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
+    assert_eq!(
+        stdout,
+        format!("{shipped}\n"),
+        "compiled skill output must be byte-identical to the shipped text"
+    );
 }
 
 #[test]
@@ -1901,6 +2005,72 @@ fn pack_add_invalid_pack_dir_exits_1() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
+}
+
+/// #445 (PD7/PD8): packs ship text and data only. A pack carrying a script
+/// file is refused at install (`pack add --from-dir`) and at load
+/// (`check` over an already-vendored pack) — both `E_PACK_INVALID`, and
+/// install writes nothing.
+#[cfg(unix)]
+#[test]
+fn external_pack_with_script_file_rejected_at_load_and_install() {
+    let vault = git_vault();
+    let pack = fake_pack_dir(&[("run.sh", "#!/bin/sh\n")]);
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
+    assert!(
+        !vault.path().join("packs").exists(),
+        "a refused pack must not be vendored"
+    );
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+
+    // Load side: vendor the same pack behind a well-formed pin and run
+    // `check`, which refuses the script and folds nothing.
+    let vendored = tempfile::tempdir().unwrap();
+    std::fs::write(
+        vendored.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    let dst = vendored.path().join("packs/example-pack@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(pack.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+    }
+    std::fs::write(
+        vendored.path().join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"sha256:{}\"\n",
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vendored.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let invalid = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "E_PACK_INVALID")
+        .unwrap_or_else(|| panic!("script file must be E_PACK_INVALID: {v}"));
+    assert_eq!(
+        invalid["file"], "packs/example-pack@0.1",
+        "the finding points at the vendored path: {v}"
+    );
 }
 
 #[test]

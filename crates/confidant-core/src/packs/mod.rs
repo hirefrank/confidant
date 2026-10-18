@@ -159,6 +159,14 @@ pub trait Pack: Send + Sync {
         sourced: &SourcedEntry,
         findings: &mut Vec<Finding>,
     );
+    /// Agent-facing skill text this pack carries, if any (#445). Compiled
+    /// packs return `None`: their text ships embedded in the CLI
+    /// (`crates/confidant-cli/pack-skills/`). An external pack returns its
+    /// vendored `[pack].skill` file (PD7: text and data only). Defaults to
+    /// none.
+    fn skill_text(&self) -> Option<&'static str> {
+        None
+    }
     /// Per-person state for `context`, if this pack has any. Defaults to
     /// `None`. `canonical` is the merge-canonical person ID.
     fn context_view(

@@ -105,8 +105,9 @@ fn leak_str(s: String) -> &'static str {
 /// `'static` field references copied out per call.
 pub struct ExternalPack {
     manifest: &'static PackManifest,
-    /// The vendored `[pack].skill` file text.
-    skill_text: String,
+    /// The vendored `[pack].skill` file text (leaked once with the pack,
+    /// so [`Pack::skill_text`] can hand out `&'static str`).
+    skill_text: &'static str,
     name: &'static str,
     verbs: &'static [&'static str],
     verb_id_types: Vec<(&'static str, Prefix)>,
@@ -161,7 +162,7 @@ impl ExternalPack {
             .collect();
         Box::leak(Box::new(ExternalPack {
             manifest: Box::leak(Box::new(manifest)),
-            skill_text,
+            skill_text: leak_str(skill_text),
             name,
             verbs: Box::leak(verbs.into_boxed_slice()),
             verb_id_types,
@@ -176,12 +177,6 @@ impl ExternalPack {
     /// The pack's manifest (leaked once with the pack).
     pub fn pack_manifest(&self) -> &PackManifest {
         self.manifest
-    }
-
-    /// The vendored `[pack].skill` file text (used by #441 and the
-    /// agent-facing contract; never printed by `check`).
-    pub fn skill_text(&self) -> &str {
-        &self.skill_text
     }
 }
 
@@ -220,6 +215,12 @@ impl Pack for ExternalPack {
             .iter()
             .find(|(v, _)| *v == verb)
             .map(|(_, prefix)| *prefix)
+    }
+
+    /// The vendored `[pack].skill` text (#445): external pack text shown
+    /// to agents, labelled as external by the CLI (PD10).
+    fn skill_text(&self) -> Option<&'static str> {
+        Some(self.skill_text)
     }
 
     /// PD16: an external pack folds an empty state; only the merge view
@@ -298,38 +299,13 @@ fn manifest_from_packed(packed: &crate::packs::dir::PackDir) -> Option<PackManif
 }
 
 /// Best-effort vendored-manifest verbs for a problem path: the read is
-/// vetted (see [`vendored_manifest_text`]); an unusable read degrades
-/// to no known verbs rather than following a link.
+/// vetted (see [`crate::packs::dir::read_manifest_best_effort`]); an
+/// unusable read degrades to no known verbs rather than following a link.
+/// The read itself lives in `dir.rs` — the pack module's one filesystem
+/// reader — so this evaluator source stays free of I/O (PD9, #445).
 fn best_effort_manifest_verbs(dir: &std::path::Path) -> Vec<String> {
-    manifest_verb_names(vendored_manifest_text(dir).as_ref())
+    manifest_verb_names(crate::packs::dir::read_manifest_best_effort(dir).as_ref())
 }
-
-/// Best-effort parse of the vendored `manifest.toml` for problem paths
-/// only (the success path parses the hashed bytes instead, so what is
-/// loaded is exactly what was verified). The read is vetted: only a
-/// regular file (never a symlink — `read_pack_dir` would reject one),
-/// at most `MAX_MANIFEST_BYTES` (the same bound `read_pack_dir` uses
-/// per file), so a hostile pack cannot hang or OOM `check`. File
-/// contents are used for parsing only, never reported.
-fn vendored_manifest_text(dir: &std::path::Path) -> Option<PackManifest> {
-    let path = dir.join("manifest.toml");
-    // `symlink_metadata` never follows the link, so a symlinked
-    // manifest.toml (or any non-regular file) is refused on every
-    // platform — `read_pack_dir` rejects symlinks outright, and this
-    // best-effort read must not be a way around that.
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    if meta.len() > MAX_MANIFEST_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    parse_manifest_external(&text).ok()
-}
-
-/// The per-file size bound `read_pack_dir` enforces (1 MiB).
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// Vendored pack directory relative to the vault root: `packs/<name>@<version>`.
 fn vendored_rel(name: &str, version: &str) -> String {
