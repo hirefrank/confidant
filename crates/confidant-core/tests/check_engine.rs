@@ -7335,3 +7335,466 @@ fn personal_0_2_values_do_not_echo_in_findings() {
         "{json:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #510: core-owned personal context view, private fields and touch grammar
+// ---------------------------------------------------------------------------
+
+use confidant_core::context::build_context;
+use confidant_core::context::personal::{
+    build_personal_view, strip_private_fields, PRIVATE_CONTEXT_FIELDS,
+};
+use confidant_core::packs::manifest::{parse_manifest, FieldDecl};
+use confidant_core::scope::PackScope;
+
+/// The full `personal@0.2` field list as the core view builder consumes it
+/// (the fixture manifest from #509, parsed through the real loader).
+fn fields_0_2() -> Vec<FieldDecl> {
+    let text = format!(
+        r#"manifest_version = 1
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER"]
+
+[pack]
+name = "personal-fixture"
+version = "0.2"
+skill = "SKILL.md"
+
+{SCHEMA_0_2_FIELDS}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+"#
+    );
+    parse_manifest(&text)
+        .expect("0.2 field fixture parses")
+        .fields
+}
+
+/// The compiled personal pack's view for a person, via `context`.
+fn personal_view(root: &Path, person: &str) -> Value {
+    let vault = load_vault(root).unwrap();
+    let id = confidant_core::id::RecordId::parse(person).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All).unwrap();
+    bundle
+        .packs
+        .get("personal@0.1")
+        .expect("personal@0.1 view")
+        .clone()
+}
+
+/// The core builder's view for a person against the 0.2 field list.
+fn personal_view_0_2(root: &Path, person: &str, as_of: &str) -> Value {
+    let vault = load_vault(root).unwrap();
+    let id = confidant_core::id::RecordId::parse(person).unwrap();
+    let as_of = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").unwrap();
+    build_personal_view(&vault, &id, &id, as_of, &fields_0_2()).expect("view serializes")
+}
+
+/// A person carrying the whole 0.2 field set (fake data). `no_ai` adds
+/// `no-ai: true`.
+fn write_full_0_2_person(root: &Path, no_ai: bool) {
+    let flag = if no_ai { "no-ai: true\n" } else { "" };
+    write(
+        root,
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n{flag}\
+             title: Staff Engineer\n\
+             company: Example Co\n\
+             location: Lisbon\n\
+             emails: [ada@example.com, ada2@example.com]\n\
+             phones: [+15550000000]\n\
+             links: [linkedin:https://example.test/ada, site:https://example.test/a:b]\n\
+             tags: [friend, work/finance]\n\
+             birthday: --05-14\n\
+             dates: [anniversary:2020-06-15]\n\
+             relationship: friend\n\
+             cadence: 30d\n\
+             snooze_until: 2026-10-20\n\
+             ---\n\nFake person.\n"
+        ),
+    );
+}
+
+/// Structural golden for a demo-vault person: the `personal@0.1` entry keeps
+/// today's shape (the pack key moves to `personal@0.2` at the #444 cutover,
+/// not here). Demo Ada has no declared personal field, so only derived keys
+/// appear; the 2026-10-08 session is her last contact.
+#[test]
+fn context_view_shape_is_stable() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+    assert_eq!(
+        personal_view(&root, ADA),
+        json!({
+            "last_touch": "2026-10-08",
+            "days_since_touch": 0,
+            "overdue": false,
+            "recent_touches": [],
+        })
+    );
+}
+
+/// The 0.2 declared fields reach the view under their declared names, with
+/// the grammar-driven shapes and the derived cadence/snooze keys.
+#[test]
+fn context_view_0_2_declared_fields_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write_full_0_2_person(dir.path(), false);
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-06 touch {ADA} call\n"),
+    );
+    assert_eq!(
+        personal_view_0_2(dir.path(), ADA, "2026-10-08"),
+        json!({
+            "title": "Staff Engineer",
+            "company": "Example Co",
+            "location": "Lisbon",
+            "emails": ["ada@example.com", "ada2@example.com"],
+            "phones": ["+15550000000"],
+            "links": [
+                {"label": "linkedin", "value": "https://example.test/ada"},
+                {"label": "site", "value": "https://example.test/a:b"},
+            ],
+            "tags": ["friend", "work/finance"],
+            "birthday": "--05-14",
+            "dates": [{"label": "anniversary", "date": "2020-06-15"}],
+            "relationship": "friend",
+            "cadence_days": 30,
+            "snooze_until": "2026-10-20",
+            "last_touch": "2026-10-06",
+            "days_since_touch": 2,
+            "overdue": false,
+            "recent_touches": [{"date": "2026-10-06", "kind": "call"}],
+        })
+    );
+}
+
+/// A field takes the canonical person's own value first, else the first
+/// merged member's in record order; a merged-away id's own view folds onto
+/// the canonical person.
+#[test]
+fn context_view_merged_person_uses_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    // 0.2 field names: the builder is driven by the declared field list.
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nrelationship: friend\n---\n\nFake person.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea Demo\nrelationship: family\nbirthday: --02-02\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {BEA} into {ADA}\n2026-10-05 touch {BEA} call\n"),
+    );
+
+    let vault = load_vault(dir.path()).unwrap();
+    let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let bea = confidant_core::id::RecordId::parse(BEA).unwrap();
+    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let fields = fields_0_2();
+    let view = build_personal_view(&vault, &ada, &ada, as_of, &fields).unwrap();
+
+    // Ada's own relationship wins over Bea's.
+    assert_eq!(view["relationship"], "friend", "{view}");
+    // Fields Ada lacks come from the merged member.
+    assert_eq!(view["birthday"], "--02-02", "{view}");
+    assert_eq!(view["cadence_days"], 30, "{view}");
+    // The merged-away member's touch counts for the canonical person.
+    assert_eq!(view["last_touch"], "2026-10-05", "{view}");
+
+    // Asking for the merged-away id serves the same canonical view.
+    let folded = build_personal_view(&vault, &bea, &ada, as_of, &fields).unwrap();
+    assert_eq!(folded, view);
+}
+
+/// A `no-ai` person never shows their declared PII fields, but keeps the
+/// derived cadence state so an agent can see why no nudge fired.
+#[test]
+fn context_view_cleared_person_hides_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: true\n\
+             birthday: --05-14\nrelationship_to_me: friend\n\
+             dates: [anniversary:2020-06-15]\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    let view = personal_view(dir.path(), ADA);
+    for field in ["birthday", "relationship_to_me", "dates"] {
+        assert!(view.get(field).is_none(), "{field} leaked: {view}");
+    }
+    // The derived cadence state stays: 30d cadence, no contact at all, so
+    // the person reads as overdue (same as before #510).
+    assert_eq!(view["cadence_days"], 30, "{view}");
+    assert_eq!(view["overdue"], true, "{view}");
+}
+
+/// Merge-group clearing still applies (the `search.rs` fixpoint): a visible
+/// person merged with a `no-ai` peer is uncleared, so their PII hides too.
+#[test]
+fn context_view_cleared_merge_peer_hides_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: --05-14\n---\n\nFake person.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea Demo\nno-ai: true\n---\n\nFake person.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {BEA} into {ADA}\n"),
+    );
+    let view = personal_view(dir.path(), ADA);
+    assert!(view.get("birthday").is_none(), "{view}");
+}
+
+/// A `no-ai` person keeps **no** declared field except the explicit
+/// `no-ai` allowlist: the 0.2 field set is denied by default, so `title`
+/// and `company` cannot leak and a field a later manifest adds cannot
+/// either. Only the derived cadence/touch metadata (plus `snooze_until`)
+/// survives.
+#[test]
+fn context_view_cleared_person_hides_every_0_2_field() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write_full_0_2_person(dir.path(), true);
+    let view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    for field in [
+        "title",
+        "company",
+        "location",
+        "emails",
+        "phones",
+        "links",
+        "tags",
+        "birthday",
+        "dates",
+        "relationship",
+    ] {
+        assert!(
+            view.get(field).is_none(),
+            "{field} leaked for a no-ai person: {view}"
+        );
+    }
+    // Deny by default: the whole view is the derived state plus the snooze.
+    // `cadence_days` / `overdue` remain, and the kept `snooze_until` still
+    // suppresses the nudge (as_of 2026-10-08 < 2026-10-20).
+    assert_eq!(
+        view,
+        json!({
+            "snooze_until": "2026-10-20",
+            "cadence_days": 30,
+            "overdue": false,
+            "recent_touches": [],
+        }),
+        "{view}"
+    );
+}
+
+/// The no-ai guarantee is unchanged by #510: a cleared person's record
+/// content never appears. The logged interaction's name and body are record
+/// content and stay hidden; ledger-derived date+kind touch metadata is not
+/// content, so (as before #510) the opaque touchpoints stay. The issue names
+/// this `..._hides_touches`; the tests pin what the code actually guarantees.
+#[test]
+fn context_view_cleared_person_hides_touch_content() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: true\n---\n\nAI_HIDDEN_PROFILE.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: AI_HIDDEN_IXN\ndate: 2026-10-05\nperson: {ADA}\n---\n\nAI_HIDDEN_BODY.\n"
+        ),
+    );
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 touch {ADA} call\n"),
+    );
+
+    let vault = load_vault(dir.path()).unwrap();
+    let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let bundle = build_context(&vault, &ada, true, &PackScope::All).unwrap();
+    assert!(bundle.person.name.is_none());
+    assert!(bundle.person.profile.is_none());
+    assert!(bundle.interactions.is_empty(), "{:?}", bundle.interactions);
+    let dumped = serde_json::to_string(&bundle).unwrap();
+    for leak in ["AI_HIDDEN_PROFILE", "AI_HIDDEN_IXN", "AI_HIDDEN_BODY"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    // Opaque ledger metadata stays, exactly as before #510.
+    assert_eq!(bundle.touchpoints.len(), 1, "{:?}", bundle.touchpoints);
+    assert_eq!(bundle.touchpoints[0].date, "2026-10-05");
+}
+
+/// `--exclude-private` strips every PII field in the core list, including the
+/// 0.2 additions, and keeps `title`, `company`, `cadence_days` and
+/// `snooze_until`.
+#[test]
+fn context_exclude_private_strips_all_declared_pii_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write_full_0_2_person(dir.path(), false);
+
+    let mut view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    let pii = [
+        "location",
+        "emails",
+        "phones",
+        "links",
+        "tags",
+        "birthday",
+        "dates",
+        "relationship",
+    ];
+    for field in pii {
+        assert!(view.get(field).is_some(), "{field} missing: {view}");
+        assert!(
+            PRIVATE_CONTEXT_FIELDS.contains(&field),
+            "{field} must be in the core private list"
+        );
+    }
+    strip_private_fields(&mut view);
+    for field in pii {
+        assert!(view.get(field).is_none(), "{field} not stripped: {view}");
+    }
+    // Non-PII stays, so the cadence state that drove a nudge is still visible.
+    assert_eq!(view["title"], "Staff Engineer", "{view}");
+    assert_eq!(view["company"], "Example Co", "{view}");
+    assert_eq!(view["cadence_days"], 30, "{view}");
+    assert_eq!(view["snooze_until"], "2026-10-20", "{view}");
+    for field in ["title", "company", "cadence", "snooze_until"] {
+        assert!(
+            !PRIVATE_CONTEXT_FIELDS.contains(&field),
+            "{field} must not be in the core private list"
+        );
+    }
+}
+
+/// `recent_touches` keeps the newest ten, date descending then kind ascending.
+#[test]
+fn context_recent_touches_last_10_and_order() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = [\"personal@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-12-31\"\n",
+    );
+    write_full_0_2_person(dir.path(), false);
+    let mut ledger = String::new();
+    for day in 1..=12 {
+        ledger.push_str(&format!("2026-10-{day:02} touch {ADA} call\n"));
+    }
+    // A same-date tie sorts by kind (`call` before `gift`).
+    ledger.push_str(&format!("2026-10-12 touch {ADA} gift\n"));
+    write(dir.path(), "ledger/2026/10.cfd", &ledger);
+
+    let view = personal_view_0_2(dir.path(), ADA, "2026-12-31");
+    let recent = view["recent_touches"].as_array().unwrap();
+    assert_eq!(recent.len(), 10, "{view}");
+    assert_eq!(recent[0], json!({"date": "2026-10-12", "kind": "call"}));
+    assert_eq!(recent[1], json!({"date": "2026-10-12", "kind": "gift"}));
+    assert_eq!(recent[9], json!({"date": "2026-10-04", "kind": "call"}));
+    // The three oldest fall outside the ten.
+    assert!(!recent.iter().any(|t| t["date"] == "2026-10-03"), "{view}");
+}
+
+/// Every rejected `touch` argument form routes through the core grammar: a
+/// malformed line is `E_TOUCH_MALFORMED` while an enabled pack is on, and a
+/// disabled pack's valid shape is `W_PACK_ORPHAN`.
+#[test]
+fn touch_args_table_malformed_and_orphan() {
+    for args in [
+        "smoke",
+        "coffee",
+        "call extra",
+        "call bogus:x",
+        "kind:call tail",
+    ] {
+        let dir = personal_vault();
+        person(dir.path(), ADA, "Ada Example");
+        write(
+            dir.path(),
+            "ledger/2026/10.cfd",
+            &format!("2026-10-01 touch {ADA} {args}\n"),
+        );
+        let json = report_json(dir.path(), None);
+        assert_eq!(
+            codes(&json),
+            vec!["E_TOUCH_MALFORMED"],
+            "{args} must be malformed: {json}"
+        );
+    }
+
+    // Disabled pack: the positional `log touch` shape is a valid pack shape
+    // (`W_PACK_ORPHAN`), a bad kind is still malformed.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n"),
+    );
+    let orphan = report_json(dir.path(), None);
+    assert!(
+        codes(&orphan).contains(&"W_PACK_ORPHAN".to_owned()),
+        "{orphan}"
+    );
+
+    let dir2 = tempfile::tempdir().unwrap();
+    write(
+        dir2.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir2.path(), ADA, "Ada Example");
+    write(
+        dir2.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} coffee\n"),
+    );
+    let malformed = report_json(dir2.path(), None);
+    assert_eq!(codes(&malformed), vec!["E_TOUCH_MALFORMED"], "{malformed}");
+}

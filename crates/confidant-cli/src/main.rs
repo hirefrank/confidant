@@ -32,7 +32,7 @@ use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
-use confidant_core::ledger::{parse_duration_minutes, parse_strict_date, Arg, LedgerEntry};
+use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::packs::dir::read_pack_dir;
 use confidant_core::packs::lock::read_lockfile;
 use confidant_core::record::{main_record_path, Record, RecordKind};
@@ -211,7 +211,9 @@ enum Command {
     Context {
         /// Opaque person id (p-…).
         person: String,
-        /// Strip private data (name, profile, bodies).
+        /// Strip private data: name, profile, bodies, and the personal pack's
+        /// PII fields (`birthday`, `dates`, `relationship`, `location`,
+        /// `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
     },
@@ -3205,29 +3207,29 @@ fn cmd_log_touch(
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    // Find the pack that owns the `touch` verb (#185/#323) — the same routing
-    // `check` uses — instead of gating on a hardcoded pack name.
-    let Some(owner) = enabled.iter().find(|p| p.verbs().contains(&"touch")) else {
+    // #510: keep today's gate until #444 — the pack that owns `touch` is
+    // still the enable switch — but name the owner from the registry instead
+    // of hardcoding it, so #444 only deletes the gate.
+    if !enabled.iter().any(|p| p.verbs().contains(&"touch")) {
+        let owner = vault
+            .pack_registry()
+            .all()
+            .iter()
+            .find(|p| p.verbs().contains(&"touch"))
+            .map(|p| p.name())
+            .unwrap_or("the pack that owns `touch`");
         return Err(anyhow::Error::new(
-            DomainError::invalid("log touch requires pack personal@0.1")
-                .with_fix("Add \"personal@0.1\" to packs in confidant.toml"),
+            DomainError::invalid(format!("log touch requires pack {owner}"))
+                .with_fix(format!("Add \"{owner}\" to packs in confidant.toml")),
         ));
-    };
+    }
     let person = parse_person_arg(&vault, person_raw)?;
-    // Validate the kind through the owning pack's trait. A synthetic
-    // single-token entry exercises exactly the `log touch` kind grammar:
-    // `validate_touch_args_enabled` on one token is `is_valid_touch_kind`.
-    let probe = LedgerEntry {
-        date: chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("probe date"),
-        verb: "touch".to_owned(),
-        id: RecordId::new(Prefix::Person, confidant_core::write::new_ulid())
-            .map_err(|e| anyhow::anyhow!("generated bad probe id: {e}"))?,
-        args: vec![Arg::Token(kind.to_owned())],
-        comment: None,
-    };
-    if !owner.validate_verb_args("touch", &probe).unwrap_or(true) {
+    // #510: the kind grammar is core-owned; validate against the core list
+    // directly instead of probing the owning pack's trait.
+    if !confidant_core::touch::is_valid_touch_kind(kind) {
         return Err(anyhow::Error::new(DomainError::usage(format!(
-            "bad touch kind '{kind}'; use one of: call, text, email, meet, meal, event, gift, other"
+            "bad touch kind '{kind}'; use one of: {}",
+            confidant_core::touch::TOUCH_KINDS.join(", ")
         ))));
     }
     let date = parse_date_arg(&date_raw)?;

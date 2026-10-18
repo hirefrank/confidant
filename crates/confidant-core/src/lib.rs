@@ -23,6 +23,7 @@ pub mod paths;
 pub mod record;
 pub mod schema;
 pub mod search;
+pub mod touch;
 pub mod vault;
 pub mod write;
 
