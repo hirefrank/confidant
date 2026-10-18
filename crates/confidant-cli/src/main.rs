@@ -1164,7 +1164,6 @@ fn vault_json(root: Option<&Path>) -> Value {
     }
 }
 
-/// Standard `--json` envelope for successful command output.
 /// Fetch a candidate pack, validate it, and print a review report (#439).
 ///
 /// Read-only: the fetch happens in a temp directory and nothing under the
@@ -1184,8 +1183,19 @@ fn cmd_pack_add(
         let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
         print_json(&ok_envelope(vault_root, payload))?;
     } else {
-        println!("pack    {}@{}", report.name, report.version);
-        println!("source  {}", fetched.source);
+        // Everything here except `rev` (40 hex) and `hash` (ours) comes from
+        // an untrusted repository, so control characters are escaped before
+        // they reach the terminal: a hostile SKILL.md must not be able to
+        // hide the lines the operator is meant to read (PD10).
+        println!(
+            "pack    {}@{}",
+            pack_fetch::sanitize_untrusted(&report.name),
+            pack_fetch::sanitize_untrusted(&report.version)
+        );
+        println!(
+            "source  {}",
+            pack_fetch::sanitize_untrusted(&fetched.source)
+        );
         println!(
             "rev     {}",
             if fetched.rev.is_empty() {
@@ -1197,9 +1207,9 @@ fn cmd_pack_add(
         println!(
             "subdir  {}",
             if fetched.subdir.is_empty() {
-                "(root)"
+                "(root)".to_string()
             } else {
-                fetched.subdir.as_str()
+                pack_fetch::sanitize_untrusted(&fetched.subdir)
             }
         );
         for line in report.human_lines() {
@@ -1210,6 +1220,7 @@ fn cmd_pack_add(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Standard `--json` envelope for successful command output.
 fn ok_envelope(root: Option<&Path>, extra: Value) -> Value {
     let mut map = serde_json::Map::new();
     if let Value::Object(obj) = extra {

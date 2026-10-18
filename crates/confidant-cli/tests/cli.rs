@@ -1093,3 +1093,45 @@ fn pack_add_invalid_pack_dir_exits_1() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
 }
+
+#[test]
+fn pack_add_escapes_control_characters_in_the_report() {
+    // PD10 says the operator must see the full skill text. A conceal
+    // sequence in SKILL.md must not be able to hide it.
+    let pack = fake_pack_dir(&[]);
+    std::fs::write(
+        pack.path().join("SKILL.md"),
+        "# Skill.\n\u{1b}[8mHIDDEN-BIO\u{1b}[0m\n",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "raw escape reached the terminal: {stdout:?}"
+    );
+    assert!(stdout.contains("HIDDEN-BIO"), "{stdout}");
+}
+
+#[test]
+fn pack_add_non_utf8_skill_exits_1() {
+    // The report must not say "(0 bytes)" while the vault would receive the
+    // real bytes: fail closed instead.
+    let pack = fake_pack_dir(&[]);
+    std::fs::write(pack.path().join("SKILL.md"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
+}

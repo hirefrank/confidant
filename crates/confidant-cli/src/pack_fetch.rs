@@ -52,6 +52,48 @@ fn is_safe_ref(git_ref: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~' | '^'))
 }
 
+/// Escape control characters (other than newline and tab) in text that came
+/// from an untrusted pack.
+///
+/// The report is the review gate (PD10): a hostile `SKILL.md`, file name or
+/// git `remote:` line carrying ANSI sequences could conceal or overwrite the
+/// lines the operator is supposed to read. `--json` needs no help — serde
+/// escapes them — so this is for the human output only.
+pub(crate) fn sanitize_untrusted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Canonicalise `dir` and require it to live inside `root`.
+///
+/// Covers `--subdir` pointing through a symlinked component (a repo can ship
+/// `pk -> /elsewhere`), which the lexical check cannot see.
+pub(crate) fn ensure_inside(root: &Path, dir: &Path) -> anyhow::Result<PathBuf> {
+    let real_root = std::fs::canonicalize(root).map_err(|e| {
+        anyhow::Error::new(DomainError::pack_invalid(format!(
+            "cannot resolve the fetched directory: {e}"
+        )))
+    })?;
+    let real_dir = std::fs::canonicalize(dir).map_err(|e| {
+        anyhow::Error::new(DomainError::pack_invalid(format!(
+            "cannot resolve the pack directory: {e}"
+        )))
+    })?;
+    if !real_dir.starts_with(&real_root) {
+        return Err(anyhow::Error::new(DomainError::pack_invalid(
+            "the pack directory resolves outside the fetched repository",
+        )));
+    }
+    Ok(real_dir)
+}
+
 /// A subdir must stay inside the fetched directory.
 pub(crate) fn is_safe_subdir(subdir: &str) -> bool {
     let path = Path::new(subdir);
@@ -130,19 +172,23 @@ pub(crate) fn parse_add_source(
     }
 }
 
-/// The `git clone` argv for `url` into `dest`, locked down per PD3.
-///
-/// Exposed for the unit test that locks the flags in place: a hostile repo
-/// must not be able to run hooks, fetch submodules, or redirect the
-/// transport.
-pub(crate) fn clone_argv(url: &str, dest: &Path) -> Vec<String> {
+/// Applied to *every* `git` invocation, not only the clone (PD3): a
+/// `post-checkout` hook from the operator's global config, a transport
+/// helper other than https, or a recursed submodule must not be reachable
+/// from the `#<ref>` path either. `protocol.allow=never` must precede
+/// `protocol.https.allow=always`.
+pub(crate) const LOCKDOWN: [&str; 6] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.https.allow=always",
+];
+
+/// The `git clone` arguments for `url` into `dest`.
+pub(crate) fn clone_args(url: &str, dest: &Path) -> Vec<String> {
     [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "protocol.allow=never",
-        "-c",
-        "protocol.https.allow=always",
         "clone",
         "--depth",
         "1",
@@ -153,6 +199,22 @@ pub(crate) fn clone_argv(url: &str, dest: &Path) -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .chain(std::iter::once(dest.display().to_string()))
+    .collect()
+}
+
+/// The `git fetch` arguments resolving one `#<ref>`.
+pub(crate) fn fetch_args(git_ref: &str) -> Vec<String> {
+    [
+        "fetch",
+        "--depth",
+        "1",
+        "--no-recurse-submodules",
+        "--quiet",
+        "origin",
+        git_ref,
+    ]
+    .into_iter()
+    .map(str::to_string)
     .collect()
 }
 
@@ -171,6 +233,7 @@ fn git_command(args: &[String], cwd: Option<&Path>) -> Command {
     for (key, value) in fetch_env() {
         cmd.env(key, value);
     }
+    cmd.args(LOCKDOWN);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -201,7 +264,9 @@ fn run_git(args: &[String], cwd: Option<&Path>, what: &str) -> anyhow::Result<St
                         use std::io::Read as _;
                         let _ = err.read_to_string(&mut stderr);
                     }
-                    let detail = stderr.trim().lines().last().unwrap_or("").to_string();
+                    // Untrusted: git prints the remote's own text here, so
+                    // control sequences must not reach the terminal.
+                    let detail = sanitize_untrusted(stderr.trim().lines().last().unwrap_or(""));
                     return Err(anyhow::Error::new(DomainError::pack_invalid(format!(
                         "{what} failed{}",
                         if detail.is_empty() {
@@ -285,7 +350,7 @@ pub(crate) fn fetch(source: &Source, subdir: &str) -> anyhow::Result<Fetched> {
                 })?;
             let checkout = temp.path().join("checkout");
             run_git(
-                &clone_argv(url, &checkout),
+                &clone_args(url, &checkout),
                 None,
                 "fetching the pack repository",
             )?;
@@ -297,15 +362,11 @@ pub(crate) fn fetch(source: &Source, subdir: &str) -> anyhow::Result<Fetched> {
                     run_git(&args, Some(&checkout), "resolving HEAD")?
                 }
                 Some(r) => {
-                    let fetch = vec![
-                        "fetch".to_string(),
-                        "--depth".to_string(),
-                        "1".to_string(),
-                        "--quiet".to_string(),
-                        "origin".to_string(),
-                        r.clone(),
-                    ];
-                    run_git(&fetch, Some(&checkout), "fetching the requested ref")?;
+                    run_git(
+                        &fetch_args(r),
+                        Some(&checkout),
+                        "fetching the requested ref",
+                    )?;
                     let checkout_args = vec![
                         "checkout".to_string(),
                         "--quiet".to_string(),
@@ -324,9 +385,11 @@ pub(crate) fn fetch(source: &Source, subdir: &str) -> anyhow::Result<Fetched> {
                 ))));
             }
             let pack_dir = if subdir.is_empty() {
-                checkout
+                checkout.clone()
             } else {
-                checkout.join(subdir)
+                // Resolve symlinks: a repo can ship `pk -> /elsewhere`, and
+                // the lexical check cannot see that.
+                ensure_inside(&checkout, &checkout.join(subdir))?
             };
             Ok(Fetched {
                 _temp: Some(temp),
@@ -368,12 +431,22 @@ pub(crate) fn describe(fetched: &Fetched) -> anyhow::Result<PackReport> {
     })?;
     let manifest = parse_manifest_external(text).map_err(anyhow::Error::new)?;
 
-    let skill_text = dir
-        .files
-        .get(&manifest.pack.skill)
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .map(str::to_string)
-        .unwrap_or_default();
+    let skill_bytes = dir.files.get(&manifest.pack.skill).ok_or_else(|| {
+        anyhow::Error::new(DomainError::pack_invalid(format!(
+            "the pack directory has no {}",
+            manifest.pack.skill
+        )))
+    })?;
+    // Fail closed: an empty report while the vault would receive the real
+    // bytes is exactly the review that must not happen.
+    let skill_text = std::str::from_utf8(skill_bytes)
+        .map_err(|_| {
+            anyhow::Error::new(DomainError::pack_invalid(format!(
+                "{} is not valid UTF-8",
+                manifest.pack.skill
+            )))
+        })?
+        .to_string();
 
     let files = dir
         .files
@@ -459,15 +532,15 @@ impl PackReport {
         }
         lines.push(format!("files   {} file(s)", self.files.len()));
         for (path, bytes) in &self.files {
-            lines.push(format!("  {path}  {bytes} bytes"));
+            lines.push(format!("  {}  {bytes} bytes", sanitize_untrusted(path)));
         }
         lines.push(format!(
             "skill   {} ({} bytes):",
-            m.pack.skill,
+            sanitize_untrusted(&m.pack.skill),
             self.skill_text.len()
         ));
         for line in self.skill_text.lines() {
-            lines.push(format!("  {line}"));
+            lines.push(format!("  {}", sanitize_untrusted(line)));
         }
         lines
     }
@@ -502,22 +575,87 @@ impl PackReport {
 mod tests {
     use super::*;
 
+    fn command_args(args: &[String]) -> String {
+        git_command(args, None)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
-    fn clone_argv_is_locked_down() {
-        let argv = clone_argv("https://example.invalid/x.git", Path::new("/tmp/checkout"));
-        let joined = argv.join(" ");
-        for expected in [
-            "core.hooksPath=/dev/null",
-            "protocol.allow=never",
-            "protocol.https.allow=always",
-            "--depth 1",
-            "--no-recurse-submodules",
+    fn every_git_call_is_locked_down() {
+        // PD3 covers *every* invocation, not just the clone: the `#<ref>`
+        // path runs fetch/checkout/rev-parse, and a global `post-checkout`
+        // hook or a recursed submodule must not be reachable through them.
+        let clone = command_args(&clone_args(
             "https://example.invalid/x.git",
-        ] {
-            assert!(joined.contains(expected), "missing {expected} in {joined}");
+            Path::new("/tmp/checkout"),
+        ));
+        let fetch = command_args(&fetch_args("v0.1.0"));
+        for joined in [&clone, &fetch] {
+            for expected in [
+                "core.hooksPath=/dev/null",
+                "protocol.allow=never",
+                "protocol.https.allow=always",
+            ] {
+                assert!(joined.contains(expected), "missing {expected} in {joined}");
+            }
         }
-        assert_eq!(argv.last().unwrap(), "/tmp/checkout");
+        // `protocol.allow=never` must come before the https allowance.
+        assert!(
+            clone.find("protocol.allow=never") < clone.find("protocol.https.allow=always"),
+            "{clone}"
+        );
+        for expected in ["--depth 1", "--no-recurse-submodules", "origin v0.1.0"] {
+            assert!(fetch.contains(expected), "missing {expected} in {fetch}");
+        }
+        for expected in ["--depth 1", "--no-recurse-submodules", "/tmp/checkout"] {
+            assert!(clone.contains(expected), "missing {expected} in {clone}");
+        }
+        // And the environment is still prompt-free.
+        let envs: Vec<_> = git_command(&fetch_args("v0.1.0"), None)
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&("GIT_TERMINAL_PROMPT".to_string(), Some("0".to_string()))));
         assert_eq!(fetch_env(), vec![("GIT_TERMINAL_PROMPT", "0")]);
+    }
+
+    #[test]
+    fn sanitize_untrusted_escapes_control_characters() {
+        // A conceal sequence in a SKILL.md must not reach the terminal raw.
+        let escaped = sanitize_untrusted("safe\u{1b}[8mhidden\u{1b}[0m");
+        assert!(
+            !escaped.contains('\u{1b}'),
+            "raw escape survived: {escaped}"
+        );
+        assert!(escaped.contains("hidden"), "{escaped}");
+        // Newlines and tabs survive, so the report still reads.
+        assert_eq!(sanitize_untrusted("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_inside_refuses_a_symlinked_escape() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("SKILL.md"), "x").unwrap();
+        let link = root.path().join("pk");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+
+        let err = ensure_inside(root.path(), &link).expect_err("escape must be refused");
+        assert!(DomainError::of(&err).unwrap().message().contains("outside"));
+
+        // A real subdirectory is fine.
+        let inside = root.path().join("packs");
+        std::fs::create_dir(&inside).unwrap();
+        assert!(ensure_inside(root.path(), &inside).is_ok());
     }
 
     #[test]
