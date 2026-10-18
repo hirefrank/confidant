@@ -578,15 +578,16 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         );
     }
 
+    // The set borrows every claim string: pack verbs are already
+    // `'static` and problem-pack verbs live in `vault` for the whole run,
+    // so nothing needs leaking (#497 item 1).
     let mut known_verbs = known_verbs(&enabled_packs);
     // Problem packs are not folded, but their claimed verbs stay known
     // (spec/pack-lock.md §5) so the failure does not cascade into
-    // E_UNKNOWN_VERB noise. Verbs leak into the `&'static str` set.
+    // E_UNKNOWN_VERB noise.
     for problem in &vault.pack_problems {
         for verb in &problem.known_verbs {
-            // The set holds `'static` strs (pack claims); leak the verb
-            // name once so it fits.
-            known_verbs.insert(Box::leak(verb.clone().into_boxed_str()));
+            known_verbs.insert(verb.as_str());
         }
     }
     let orphans = vault.pack_registry().orphan_owners(&enabled_packs);
@@ -767,12 +768,17 @@ pub fn pack_snapshots(
         .collect()
 }
 
-fn known_verbs(enabled_packs: &[&dyn Pack]) -> HashSet<&'static str> {
+/// The verb names a vault may use, borrowing from the packs and the
+/// core list rather than leaking copies (#497 item 1). The `'a` lifetime
+/// is unconstrained because the pack trait's `'static` claims coerce to
+/// it; the caller unifies it with the `vault` borrow it also inserts.
+fn known_verbs<'a>(enabled_packs: &[&dyn Pack]) -> HashSet<&'a str> {
     // `touch` is core (#179): a mirrored touchpoint carries only a date
     // and the participant's own id, no pack data.
-    let mut verbs = HashSet::from(["alias", "merge", "stage", "balance", "touch"]);
+    let mut verbs: HashSet<&'a str> =
+        HashSet::from(["alias", "merge", "stage", "balance", "touch"]);
     for pack in enabled_packs {
-        verbs.extend(pack.verbs());
+        verbs.extend(pack.verbs().iter().copied());
     }
     verbs
 }
