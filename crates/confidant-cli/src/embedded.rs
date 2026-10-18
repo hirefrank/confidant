@@ -45,8 +45,18 @@ pub fn pack_skill_text_from_registry(
 
 /// Combined skill text for packs in scope, in the order given: one
 /// section per pack, generated at serve time from the enabled packs
-/// (#189). `None` when any pack ships no skill text.
-pub fn combined_pack_skill(pack_names: &[&str]) -> Option<String> {
+/// (#189, #523). Text resolves through the vault's `registry` via
+/// [`pack_skill_text_from_registry`], so a loaded external pack serves its
+/// vendored text while a compiled pack keeps its embedded copy. `label`
+/// returns the optional first line for a pack (the #445 external label,
+/// keyed by pack name); `None` for compiled packs, so a compiled-only
+/// vault prints byte for byte what it printed before. `None` when any
+/// pack ships no skill text.
+pub fn combined_pack_skill(
+    registry: &confidant_core::packs::PackRegistry,
+    pack_names: &[&str],
+    label: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     let mut out = String::from("# Pack skills for this vault\n\n");
     out.push_str(&format!(
         "Packs in scope: {}\n",
@@ -57,10 +67,14 @@ pub fn combined_pack_skill(pack_names: &[&str]) -> Option<String> {
         }
     ));
     for name in pack_names {
-        let text = pack_skill_text(name)?;
+        let text = pack_skill_text_from_registry(registry, name)?;
         out.push_str("\n---\n\n## ");
         out.push_str(name);
         out.push_str("\n\n");
+        if let Some(label) = label(name) {
+            out.push_str(&label);
+            out.push('\n');
+        }
         out.push_str(text);
     }
     Some(out)
@@ -240,13 +254,33 @@ mod tests {
 
     #[test]
     fn combined_pack_skill_lists_packs_in_scope() {
-        let combined = combined_pack_skill(&["coaching@0.1"]).unwrap();
+        let registry = confidant_core::packs::PackRegistry::compiled();
+        let combined = combined_pack_skill(&registry, &["coaching@0.1"], |_| None).unwrap();
         assert!(combined.contains("Packs in scope: coaching@0.1"));
         assert!(combined.contains("## coaching@0.1"));
         // The embedded copy is the served copy: spot-check content.
         assert!(combined.contains("E_OPEN_MALFORMED"));
-        assert!(combined_pack_skill(&["nope@9.9"]).is_none());
-        let empty = combined_pack_skill(&[]).unwrap();
+        assert!(combined_pack_skill(&registry, &["nope@9.9"], |_| None).is_none());
+        let empty = combined_pack_skill(&registry, &[], |_| None).unwrap();
         assert!(empty.contains("Packs in scope: (none)"));
+    }
+
+    /// #523: a per-pack label (the #445 external label) leads that pack's
+    /// section, right after its heading, and only for the labelled pack.
+    #[test]
+    fn combined_pack_skill_labels_labelled_packs_only() {
+        let registry = confidant_core::packs::PackRegistry::compiled();
+        let combined = combined_pack_skill(&registry, &["coaching@0.1", "personal@0.1"], |name| {
+            (name == "personal@0.1").then(|| "[external pack: test]".to_owned())
+        })
+        .unwrap();
+        assert!(
+            combined.contains("## personal@0.1\n\n[external pack: test]\n"),
+            "{combined}"
+        );
+        assert!(
+            !combined.contains("## coaching@0.1\n\n[external pack:"),
+            "a compiled pack must not gain a label: {combined}"
+        );
     }
 }
