@@ -23,6 +23,34 @@ use crate::record::has_conflict_markers;
 /// The only lockfile format version this loader implements (PD5).
 const LOCK_VERSION: u8 = 1;
 
+/// Whether `id` is a `name@version` pin that may join an agent-readable
+/// finding message (the #490 echo carve-out).
+///
+/// Stricter than the lockfile's own version rule (non-empty, no surrounding
+/// whitespace): that rule alone would pass operator free text such as
+/// `ada@example.com` straight into `E_PACK_UNKNOWN` (#501). A pin must have
+/// a valid pack name and a version that *looks* like a version: an ASCII
+/// digit first byte, then only `[0-9A-Za-z.+-]`. A non-version-like version
+/// (`nightly`) fails closed to the name-free message; that only costs
+/// detail, never leaks.
+pub(crate) fn is_valid_pack_pin(id: &str) -> bool {
+    match id.split_once('@') {
+        Some((name, version)) => is_valid_pack_name(name) && is_version_like(version),
+        None => false,
+    }
+}
+
+/// A version that can safely join a message: an ASCII digit first byte, then
+/// `[0-9A-Za-z.+-]`, at most 64 bytes.
+fn is_version_like(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version.as_bytes()[0].is_ascii_digit()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
 /// One pinned pack: `name@version` resolved to `source` at `rev`,
 /// vendored under `packs/<name>@<version>/` with the canonical tree hash
 /// `hash` (PD5, PD6).
@@ -824,5 +852,22 @@ mod tests {
         let text = one_entry_text("\"dir\"", "\"\"", "\"\"", &format!("\"{HASH}\""))
             .replace("name = \"example-pack\"", "name = \" example-pack\"");
         assert!(Lockfile::parse(&text).is_err());
+    }
+
+    #[test]
+    fn echoable_pin_is_stricter_than_the_lockfile_rule() {
+        // A real pin may echo (#490).
+        assert!(is_valid_pack_pin("example-pack@0.1"));
+        assert!(is_valid_pack_pin("example-pack@0.2.0-rc.1"));
+        // Operator free text the lockfile rule alone would pass: the version
+        // half is not version-like (#501).
+        assert!(!is_valid_pack_pin("ada@example.com"));
+        assert!(!is_valid_pack_pin("example-pack@nightly"));
+        assert!(!is_valid_pack_pin("example-pack@0.1\nevil"));
+        // Not a pin at all.
+        assert!(!is_valid_pack_pin("justaname"));
+        assert!(!is_valid_pack_pin("Upper@0.1"));
+        assert!(!is_valid_pack_pin("@0.1"));
+        assert!(!is_valid_pack_pin("example-pack@"));
     }
 }
