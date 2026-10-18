@@ -173,15 +173,10 @@ fn check<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
 }
 
 /// Remove a skill entry regardless of shape: a file or directory symlink,
-/// or a real directory (the Windows copy fallback when setup can't symlink).
-/// `remove_file` unlinks both symlink kinds on unix, but on Windows a
-/// directory symlink needs `remove_dir` ("Access is denied" otherwise).
+/// or a real directory (the `--copy` fallback when setup can't symlink).
+/// `remove_file` unlinks both symlink kinds on unix.
 fn remove_skill_entry(link: &std::path::Path) {
     if link.is_symlink() {
-        #[cfg(windows)]
-        if link.is_dir() {
-            return std::fs::remove_dir(link).unwrap();
-        }
         std::fs::remove_file(link).unwrap();
     } else if link.is_dir() {
         std::fs::remove_dir_all(link).unwrap();

@@ -189,10 +189,7 @@ fn setup_preserves_foreign_symlinks() {
     let foreign_target = PathBuf::from(env.home.clone()).join("foreign-skills");
     std::fs::create_dir_all(foreign_target.join("portal-sync")).unwrap();
     let dest = PathBuf::from(env.skills.clone()).join("portal-sync");
-    #[cfg(unix)]
     std::os::unix::fs::symlink(foreign_target.join("portal-sync"), &dest).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(foreign_target.join("portal-sync"), &dest).unwrap();
 
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");

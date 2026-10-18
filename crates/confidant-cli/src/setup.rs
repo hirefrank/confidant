@@ -21,10 +21,10 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("agents", ".agents/skills"),
 ];
 
-/// Marker file identifying a directory confidant copied (via `--copy` or
-/// the Windows symlink fallback). Contents are the CLI version that wrote
-/// it. Together with "symlink under our skills root" this is the ownership
-/// rule: only owned entries are replaced or re-pointed without `--force`.
+/// Marker file identifying a directory confidant copied via `--copy`.
+/// Contents are the CLI version that wrote it. Together with "symlink under
+/// our skills root" this is the ownership rule: only owned entries are
+/// replaced or re-pointed without `--force`.
 pub const MANAGED_MARKER: &str = ".confidant-managed";
 
 pub fn home_dir() -> anyhow::Result<PathBuf> {
@@ -134,7 +134,6 @@ pub fn materialize_current() -> anyhow::Result<PathBuf> {
     Ok(target)
 }
 
-#[cfg(unix)]
 fn set_executable_on_bins(root: &Path) {
     // Walk the tree; every dir named `bin` gets its files +x'd recursively.
     let mut stack = vec![root.to_path_buf()];
@@ -155,10 +154,6 @@ fn set_executable_on_bins(root: &Path) {
     }
 }
 
-#[cfg(not(unix))]
-fn set_executable_on_bins(_root: &Path) {}
-
-#[cfg(unix)]
 fn set_executable_recursive(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut stack = vec![dir.to_path_buf()];
@@ -255,40 +250,13 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn create_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dest)
 }
 
-#[cfg(windows)]
-fn create_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(src, dest)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "symlinks not supported ({} -> {})",
-            src.display(),
-            dest.display()
-        ),
-    ))
-}
-
-/// Remove a symlink without following it. On Windows, `remove_file` cannot
-/// unlink a directory symlink ("Access is denied"); those need `remove_dir`.
-/// (Our skills are always directories, so a bare `remove_file` silently
-/// fails on every Windows re-point, leaving a stale link that breaks the
-/// subsequent create and poisons the copy fallback.) Callers only pass
-/// paths already checked with `is_symlink`.
+/// Remove a symlink without following it. Callers only pass paths already
+/// checked with `is_symlink`.
 fn remove_symlink(path: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    if path.is_dir() {
-        // is_dir follows the link, so this is a directory symlink.
-        return std::fs::remove_dir(path);
-    }
     std::fs::remove_file(path)
 }
 
@@ -325,10 +293,9 @@ fn path_under(path: &Path, root: &Path) -> bool {
 
 /// "Confidant owns `<parent>/<id>`": the entry is a symlink whose resolved
 /// target sits under `skills_root` (`confidant_home()/skills/`), or a real
-/// directory carrying the `.confidant-managed` marker (written by `--copy`
-/// and by the symlink-failure fallback). Only owned entries are replaced
-/// or re-pointed without `--force`; `--force` is the only path that touches
-/// unowned entries.
+/// directory carrying the `.confidant-managed` marker (written by `--copy`).
+/// Only owned entries are replaced or re-pointed without `--force`;
+/// `--force` is the only path that touches unowned entries.
 fn is_owned(dest: &Path, skills_root: &Path) -> bool {
     if let Ok(target) = std::fs::read_link(dest) {
         let resolved = if target.is_absolute() {
@@ -413,23 +380,11 @@ fn install_skill(
             lines.push(format!("linked  {} -> {}", dest.display(), src.display()));
             Ok((outcome, lines.clone()))
         }
-        Err(e) => {
-            // Windows without admin/Developer Mode (or any symlink failure):
-            // fall back to a copy so the install still works. The marker
-            // makes the copy owned, so later updates can replace it.
-            lines.push(format!(
-                "warning: cannot symlink {} -> {} ({e}); copying instead",
-                dest.display(),
-                src.display()
-            ));
-            copy_dir_recursive(src, dest).map_err(|e| {
-                anyhow::anyhow!("cannot copy {} to {}: {e}", src.display(), dest.display())
-            })?;
-            write_managed_marker(dest)
-                .map_err(|e| anyhow::anyhow!("cannot write marker in {}: {e}", dest.display()))?;
-            lines.push(format!("copied  {}", dest.display()));
-            Ok((LinkOutcome::Copied, lines.clone()))
-        }
+        Err(e) => Err(anyhow::anyhow!(
+            "cannot symlink {} -> {}: {e}",
+            dest.display(),
+            src.display()
+        )),
     }
 }
 
