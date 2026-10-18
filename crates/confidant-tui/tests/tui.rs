@@ -64,6 +64,27 @@ fn confidant_bin() -> PathBuf {
     .clone()
 }
 
+/// Absolute path of the `python3` the test process would run, resolved once
+/// through the interpreter's own `sys.executable`. The live search test
+/// hands its child a `PATH` holding no host entries (#514), so `python3`
+/// has to be named by path rather than looked up through it.
+fn python3() -> String {
+    static PYTHON: OnceLock<String> = OnceLock::new();
+    PYTHON
+        .get_or_init(|| {
+            let out = Command::new("python3")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("python3 must be runnable for the live search test");
+            assert!(out.status.success(), "python3 -c failed: {out:?}");
+            String::from_utf8(out.stdout)
+                .expect("python3 prints UTF-8")
+                .trim()
+                .to_owned()
+        })
+        .clone()
+}
+
 fn render_to_string<R: Runner>(app: &App<R>) -> String {
     let backend = TestBackend::new(WIDTH, HEIGHT);
     let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
@@ -244,7 +265,15 @@ fn search_context_and_doctor_views_snapshot() {
         .with_response("context", 0, context_json)
         .with_response("doctor", 0, doctor_json);
 
+    // #514: pin the vault root to an empty directory so `qmd_available()`
+    // is deterministically false — no `.confidant/qmd-corpus` under the
+    // root — whatever the host has on PATH or in `CONFIDANT_VAULT`.
+    // Otherwise `/` would default the Search tab to qmd-ranked mode, the
+    // fake `find` response below would never be used, and nothing would
+    // render. The dir must outlive the app.
+    let vault_root = tempfile::tempdir().expect("temp vault dir");
     let mut app = App::new(fake);
+    app.set_vault_root(vault_root.path().to_path_buf());
 
     // Unified Search tab (#387): switch with `5`, toggle exact literal
     // scan with `e`, then press `/`, type, Enter.
@@ -1357,8 +1386,9 @@ fn search_missing_skill_shows_alert_never_falls_back_silently() {
 
 #[test]
 fn search_live_fallback_against_demo_vault_without_qmd() {
-    // The real qmd-query.py against the demo vault. `qmd` is not installed in
-    // CI, so the script takes its find-fallback path.
+    // The real qmd-query.py against the demo vault, with `qmd` hidden from
+    // the child's `PATH` (#514), so the script takes its find-fallback path
+    // on any host, not just CI.
     let script = repo_root().join("crates/confidant-cli/skills/qmd-search/bin/qmd-query.py");
     assert!(
         script.is_file(),
@@ -1372,18 +1402,20 @@ fn search_live_fallback_against_demo_vault_without_qmd() {
         .and_then(|p| p.parent())
         .expect("target/debug")
         .to_path_buf();
-    // The script finds `confidant` via shutil.which: put target/debug on PATH.
-    let path = format!(
-        "{}:{}",
-        target_debug.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    // #514: the child `PATH` is `target/debug` (so the script's
+    // `shutil.which("confidant")` resolves) plus a known-empty directory,
+    // never the host `PATH`. A host `qmd` therefore stays invisible and the
+    // script must blame the missing qmd, not a missing index. `python3` has
+    // to be named by absolute path since no host entry carries it.
+    let empty = tempfile::tempdir().expect("temp PATH dir");
+    let path = format!("{}:{}", target_debug.display(), empty.path().display());
+    let python = python3();
     let runner = ProcessRunner::new(confidant_bin(), Some(demo_vault()))
         .with_env("PATH", path)
         .with_env("CONFIDANT_OFFLINE", "1");
     let raw = runner
         .run_program(
-            "python3",
+            &python,
             &[
                 &script.display().to_string(),
                 "--vault",
