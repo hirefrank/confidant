@@ -44,8 +44,14 @@ const CORE_VERBS_V2: &[&str] = &["alias", "merge", "stage", "balance", "touch"];
 /// Core record types no external pack may claim (PD8 rule 2).
 const CORE_RECORD_TYPES: &[&str] = &["person", "org", "deal", "interaction", "note", "edge"];
 
-/// Pack names reserved for the compiled packs (PD14).
+/// Pack names reserved for compiled packs (PD14).
 const RESERVED_PACK_NAMES: &[&str] = &["coaching", "personal"];
+
+/// Whether `name` is reserved for a compiled pack (PD14). An external pack
+/// cannot be installed under a reserved name (#440).
+pub fn is_reserved_pack_name(name: &str) -> bool {
+    RESERVED_PACK_NAMES.contains(&name)
+}
 
 /// Check a pack name against the v2 grammar `^[a-z][a-z0-9-]{1,31}$`.
 /// PD14: an external pack name matches `^[a-z][a-z0-9-]{1,31}$` (2..32

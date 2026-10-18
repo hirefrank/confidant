@@ -33,6 +33,7 @@ use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date, Arg, LedgerEntry};
+use confidant_core::packs::dir::read_pack_dir;
 use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
@@ -44,6 +45,25 @@ use confidant_core::{check_vault, load_vault, search, CheckOptions};
 use confidant_core::{ContentHook, ContentOutcome};
 use serde_json::Value;
 use zeroize::Zeroizing;
+
+/// Attach a `DomainError` fix hint to an `anyhow::Error`.
+///
+/// `DomainError::with_fix` returns the domain error, so
+/// `anyhow::Error::new(DomainError::…)` would lose it. This keeps the fix on
+/// the common `Err(anyhow::Error::new(DomainError::…).with_fix(…))` shape.
+/// A non-`DomainError` error is returned unchanged (it has no fix slot).
+trait FixExt {
+    fn with_fix(self, fix: &str) -> Self;
+}
+
+impl FixExt for anyhow::Error {
+    fn with_fix(self, fix: &str) -> Self {
+        match DomainError::of(&self) {
+            Some(domain) => anyhow::Error::new(domain.clone().with_fix(fix)),
+            None => self,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -456,7 +476,9 @@ enum LogAction {
 enum PackAction {
     /// Fetch a candidate pack, validate it, and print a review report.
     ///
-    /// Writes nothing to the vault: applying a pack is a separate step.
+    /// Writes nothing to the vault unless `--yes` is given: with it, the
+    /// reviewed files are vendored, pinned in `confidant.lock`, added to
+    /// `packs` in `confidant.toml`, checked and committed once (PD10).
     Add {
         /// `https://` git URL, optionally `#<ref>` (tag, branch or commit).
         url: Option<String>,
@@ -466,6 +488,38 @@ enum PackAction {
         /// Path inside the fetched repository holding the pack.
         #[arg(long)]
         subdir: Option<String>,
+        /// Apply the install (vendor, lock, add to `packs`, commit).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List installed external packs and their verification status.
+    List,
+    /// Verify vendored pack files against `confidant.lock` (exit 1 on mismatch).
+    Verify {
+        /// Only this pack (default: every installed pack).
+        name: Option<String>,
+    },
+    /// Remove an installed pack: files, lockfile entry and `packs` entry.
+    Remove {
+        /// Pack name as installed (without `@version`).
+        name: String,
+        /// Apply the removal.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Update an installed pack to a new rev, printing the diff first.
+    Update {
+        /// Pack name as installed (without `@version`).
+        name: String,
+        /// New git rev: a full 40-hex commit, or a tag/branch name.
+        #[arg(long)]
+        rev: Option<String>,
+        /// Update from a local directory instead of the network.
+        #[arg(long)]
+        from_dir: Option<PathBuf>,
+        /// Apply the update.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -932,13 +986,40 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 url,
                 from_dir,
                 subdir,
+                yes,
             } => cmd_pack_add(
                 &cli,
                 vault_root.as_deref(),
                 url.as_deref(),
                 from_dir.as_deref(),
                 subdir.as_deref(),
+                *yes,
             ),
+            PackAction::List => {
+                cmd_pack_list(&cli, vault_root.as_deref()).map_err(pack_fetch::escape_domain_error)
+            }
+            PackAction::Verify { name } => {
+                cmd_pack_verify(&cli, vault_root.as_deref(), name.as_deref())
+                    .map_err(pack_fetch::escape_domain_error)
+            }
+            PackAction::Remove { name, yes } => {
+                cmd_pack_remove(&cli, vault_root.as_deref(), name.clone(), *yes)
+                    .map_err(pack_fetch::escape_domain_error)
+            }
+            PackAction::Update {
+                name,
+                rev,
+                from_dir,
+                yes,
+            } => cmd_pack_update(
+                &cli,
+                vault_root.as_deref(),
+                name.clone(),
+                rev.as_deref(),
+                from_dir.as_deref(),
+                *yes,
+            )
+            .map_err(pack_fetch::escape_domain_error),
         },
         Command::Record { action } => {
             let root = vault_root.unwrap();
@@ -1164,22 +1245,24 @@ fn vault_json(root: Option<&Path>) -> Value {
     }
 }
 
-/// Fetch a candidate pack, validate it, and print a review report (#439).
+/// Fetch a candidate pack, validate it, and print a review report (#439),
+/// or apply the install with `--yes` (#440).
 ///
-/// Read-only: the fetch happens in a temp directory and nothing under the
-/// vault is created. Operator-only: `pack` is not in the MCP tool
-/// whitelist.
+/// Without `--yes` it is read-only: the fetch happens in a temp directory and
+/// nothing under the vault is created. Operator-only: `pack` is not in the
+/// MCP tool whitelist.
 fn cmd_pack_add(
     cli: &Cli,
     vault_root: Option<&Path>,
     url: Option<&str>,
     from_dir: Option<&Path>,
     subdir: Option<&str>,
+    yes: bool,
 ) -> anyhow::Result<ExitCode> {
     // The pack reader, manifest parser and git all quote untrusted
     // repository text; escape it before any error reaches the terminal or
     // the JSON error envelope (#499).
-    cmd_pack_add_inner(cli, vault_root, url, from_dir, subdir)
+    cmd_pack_add_inner(cli, vault_root, url, from_dir, subdir, yes)
         .map_err(pack_fetch::escape_domain_error)
 }
 
@@ -1189,10 +1272,90 @@ fn cmd_pack_add_inner(
     url: Option<&str>,
     from_dir: Option<&Path>,
     subdir: Option<&str>,
+    yes: bool,
 ) -> anyhow::Result<ExitCode> {
     let source = pack_fetch::parse_add_source(url, from_dir)?;
     let fetched = pack_fetch::fetch(&source, subdir.unwrap_or(""))?;
     let report = pack_fetch::describe(&fetched)?;
+    // A reserved or compiled name can never be installed from outside the
+    // binary (PD14), so refuse before the report either way.
+    refuse_uninstallable(&report.name, &report.version)?;
+
+    if yes {
+        let root = vault_root_required(vault_root, "pack add --yes")?;
+        let lock = read_lockfile_or_empty(root)?;
+        if let Some(entry) = lock.find(&report.name, &report.version) {
+            if entry.hash == report.hash {
+                // Same pin, same bytes: nothing to write (PD10 idempotence).
+                if cli.json {
+                    print_json(&ok_envelope(
+                        Some(root),
+                        serde_json::json!({
+                            "command": "pack-add",
+                            "unchanged": true,
+                            "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+                        }),
+                    ))?;
+                } else {
+                    println!(
+                        "{}@{} is already installed at this hash; nothing to do",
+                        pack_fetch::escape_line(&report.name),
+                        pack_fetch::escape_line(&report.version)
+                    );
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "{}@{} is already installed with a different hash",
+                report.name, report.version
+            )))
+            .with_fix("Use `confidant pack update <name> --rev <ref>` to move it"));
+        }
+        // One version at a time: installing a second version of the same name
+        // side by side leaves `pack update` unable to tell which to move, so
+        // refuse up front and point at `update` (which replaces in place).
+        if let Some(other) = lock.packs.iter().find(|e| e.name == report.name) {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "{}@{} is already installed; {}@{} cannot be added alongside it",
+                report.name, other.version, report.name, report.version
+            )))
+            .with_fix(
+                "Use `confidant pack update <name> --rev <ref>` to replace the installed version",
+            ));
+        }
+        let files = read_pack_dir(&fetched.pack_dir).map_err(anyhow::Error::new)?;
+        // Pin the reviewed bytes to the written bytes: `report` came from an
+        // earlier read of the same directory, so a `--from-dir` source that
+        // changed in between must be refused rather than vendored un-reviewed.
+        if files.hash != report.hash {
+            return Err(anyhow::Error::new(DomainError::conflict(
+                "the pack directory changed between the review and the write",
+            ))
+            .with_fix("Re-run `confidant pack add` and review the report again"));
+        }
+        let changes = install_changes(root, &report, &files, &fetched, None)?;
+        let summary = format!(
+            "pack: add {}@{} ({})",
+            report.name,
+            report.version,
+            short_hash(&report.hash)
+        );
+        let pending = PendingWrite {
+            changes,
+            canonical_request: summary.clone(),
+            summary,
+        };
+        let outcome = apply_write(root, pending, &write_options(cli))?;
+        return finish_write(
+            cli,
+            root,
+            "pack-add",
+            outcome,
+            serde_json::json!({
+                "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+            }),
+        );
+    }
     if cli.json {
         let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
         print_json(&ok_envelope(vault_root, payload))?;
@@ -1229,6 +1392,579 @@ fn cmd_pack_add_inner(
         println!("nothing was written: applying a pack is a separate step");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// pack install / list / verify / remove / update (#440)
+// ---------------------------------------------------------------------------
+
+/// The vault root, or a clear error for a command that needs one.
+fn vault_root_required<'a>(root: Option<&'a Path>, what: &str) -> anyhow::Result<&'a Path> {
+    root.ok_or_else(|| {
+        anyhow::Error::new(DomainError::vault_not_found()).context(format!("{what} needs a vault"))
+    })
+}
+
+/// Refuse to install a reserved (`coaching`, `personal`) or compiled pack
+/// (PD14). Both can only come from the binary.
+fn refuse_uninstallable(name: &str, version: &str) -> anyhow::Result<()> {
+    use confidant_core::packs::manifest::is_reserved_pack_name;
+    if is_reserved_pack_name(name) {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "pack name '{name}' is reserved for a compiled pack"
+        )))
+        .with_fix("Choose a different pack name"));
+    }
+    let listed = format!("{name}@{version}");
+    if confidant_core::packs::registry::PackRegistry::compiled()
+        .all()
+        .iter()
+        .any(|p| p.name() == listed)
+    {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "{listed} is compiled into this binary"
+        )))
+        .with_fix("Remove the listing; a compiled pack is always available"));
+    }
+    Ok(())
+}
+
+/// `<vault>/confidant.lock`, parsed; an absent file is an empty lockfile.
+fn read_lockfile_or_empty(root: &Path) -> anyhow::Result<confidant_core::packs::lock::Lockfile> {
+    match std::fs::read_to_string(root.join("confidant.lock")) {
+        Ok(text) => confidant_core::packs::lock::Lockfile::parse(&text).map_err(anyhow::Error::new),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(confidant_core::packs::lock::Lockfile { packs: Vec::new() })
+        }
+        Err(e) => Err(anyhow::anyhow!("cannot read confidant.lock: {e}")),
+    }
+}
+
+fn read_config_text(root: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(root.join("confidant.toml"))
+        .map_err(|e| anyhow::anyhow!("cannot read confidant.toml: {e}"))
+}
+
+/// Vendored directory for a pack, relative to the vault root.
+fn vendored_rel(name: &str, version: &str) -> String {
+    format!("packs/{name}@{version}")
+}
+
+/// The first 12 hex characters of a `sha256:<hex>` hash, for a commit subject
+/// or report header. Slicing the whole string would show only the prefix
+/// (`sha256:abcde`), because the algorithm label is 7 bytes long.
+fn short_hash(hash: &str) -> String {
+    hash.strip_prefix("sha256:")
+        .unwrap_or(hash)
+        .chars()
+        .take(12)
+        .collect()
+}
+
+/// One change set that installs `report`'s files and pins them: the vendored
+/// tree, the lockfile entry, and the `packs` listing (PD4/PD5/PD10).
+///
+/// `replace` is an existing `name@version` this install supersedes (an
+/// update): its lock entry drops and its `packs` listing is replaced, so the
+/// config is rewritten exactly once.
+fn install_changes(
+    root: &Path,
+    report: &pack_fetch::PackReport,
+    files: &confidant_core::packs::dir::PackDir,
+    fetched: &pack_fetch::Fetched,
+    replace: Option<&str>,
+) -> anyhow::Result<Vec<FileChange>> {
+    let base = vendored_rel(&report.name, &report.version);
+    let mut changes: Vec<FileChange> = files
+        .files
+        .iter()
+        .map(|(rel, bytes)| FileChange::WriteBytes {
+            path: PathBuf::from(format!("{base}/{rel}")),
+            contents: bytes.clone(),
+        })
+        .collect();
+
+    let mut lock = read_lockfile_or_empty(root)?;
+    if let Some(old) = replace {
+        if let Some((name, version)) = old.split_once('@') {
+            lock.remove(name, version);
+        }
+    }
+    lock.upsert(confidant_core::packs::lock::LockEntry {
+        name: report.name.clone(),
+        version: report.version.clone(),
+        source: fetched.source.clone(),
+        rev: fetched.rev.clone(),
+        subdir: fetched.subdir.clone(),
+        hash: report.hash.clone(),
+    });
+    changes.push(FileChange::WriteFile {
+        path: PathBuf::from("confidant.lock"),
+        contents: lock.to_toml(),
+    });
+
+    let cfg_text = read_config_text(root)?;
+    let mut packs = confidant_core::config::VaultConfig::parse(&cfg_text)
+        .map_err(anyhow::Error::new)?
+        .packs;
+    if let Some(old) = replace {
+        packs.retain(|p| p != old);
+    }
+    let listed = format!("{}@{}", report.name, report.version);
+    if !packs.contains(&listed) {
+        packs.push(listed);
+    }
+    changes.push(FileChange::WriteFile {
+        path: PathBuf::from("confidant.toml"),
+        contents: confidant_core::config::VaultConfig::set_packs(&cfg_text, &packs)
+            .map_err(anyhow::Error::new)?,
+    });
+    Ok(changes)
+}
+
+/// `DeleteFile` changes for every regular file in a vendored pack dir.
+///
+/// Lists with [`confidant_core::paths::read_dir`], which refuses to follow a
+/// symbolic link at any depth, and skips anything that is not a regular file,
+/// so a planted `packs/<id>` (or `packs/`) symlink can never steer a delete
+/// into files outside the vault (#440). A missing vendored tree is not an
+/// error — removal must still clean up the lockfile and listing — but an
+/// unlistable one is.
+fn delete_vendored_changes(
+    root: &Path,
+    name: &str,
+    version: &str,
+) -> anyhow::Result<Vec<FileChange>> {
+    let rel = vendored_rel(name, version);
+    let rel_path = Path::new(&rel);
+    let listing = match confidant_core::paths::read_dir(root, rel_path) {
+        Ok(listing) => listing,
+        Err(error) => {
+            // A missing vendored tree is not an error — removal must still
+            // clean up the lockfile and listing. Anything else (a symlink,
+            // an unreadable tree) fails closed rather than guessing.
+            if !confidant_core::paths::exists(root, rel_path).unwrap_or(true) {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        }
+    };
+    if let Some((entry, cause)) = listing.errors.first() {
+        return Err(anyhow::Error::new(
+            DomainError::pack_invalid(format!(
+                "cannot list {}: {}: {cause}",
+                pack_fetch::escape_line(&rel),
+                pack_fetch::escape_line(entry)
+            ))
+            .with_fix("Restore the vendored tree (git checkout -- packs) and retry"),
+        ));
+    }
+    let mut out = Vec::new();
+    for entry in listing.entries {
+        if entry.kind.is_file() {
+            out.push(FileChange::DeleteFile {
+                path: PathBuf::from(&rel).join(&entry.name),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Verification status of one installed pack (PD12: fail closed).
+struct PackStatus {
+    name: String,
+    version: String,
+    source: String,
+    rev: String,
+    hash: String,
+    status: &'static str,
+}
+
+impl PackStatus {
+    fn verify(root: &Path, entry: &confidant_core::packs::lock::LockEntry) -> Self {
+        let dir = root.join(vendored_rel(&entry.name, &entry.version));
+        let status = match read_pack_dir(&dir) {
+            Ok(packed) if packed.hash == entry.hash => "ok",
+            Ok(_) => "tampered",
+            Err(_) if !dir.exists() => "missing",
+            Err(_) => "invalid",
+        };
+        Self {
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            source: entry.source.clone(),
+            rev: entry.rev.clone(),
+            hash: entry.hash.clone(),
+            status,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "version": self.version,
+            "source": self.source,
+            "rev": self.rev,
+            "hash": self.hash,
+            "status": self.status,
+        })
+    }
+
+    fn print_human(&self) {
+        println!(
+            "{:<20} {:<8} {:<8} {:<12} {}",
+            pack_fetch::escape_line(&self.name),
+            pack_fetch::escape_line(&self.version),
+            self.status,
+            if self.rev.is_empty() {
+                "(dir)".to_owned()
+            } else {
+                // A hand-edited non-ASCII rev must not panic a byte slice.
+                self.rev.chars().take(8).collect()
+            },
+            pack_fetch::escape_line(&self.source)
+        );
+    }
+}
+
+/// `pack list`: installed packs and their verification status. Read-only and
+/// offline.
+fn cmd_pack_list(cli: &Cli, vault_root: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let root = vault_root_required(vault_root, "pack list")?;
+    let lock = read_lockfile_or_empty(root)?;
+    let statuses: Vec<PackStatus> = lock
+        .packs
+        .iter()
+        .map(|e| PackStatus::verify(root, e))
+        .collect();
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "pack-list",
+                "packs": statuses.iter().map(PackStatus::to_json).collect::<Vec<_>>(),
+            }),
+        ))?;
+    } else if statuses.is_empty() {
+        println!("no external packs installed");
+    } else {
+        for status in &statuses {
+            status.print_human();
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `pack verify [name]`: re-hash the vendored trees against the lockfile.
+/// Exit 1 on any mismatch.
+fn cmd_pack_verify(
+    cli: &Cli,
+    vault_root: Option<&Path>,
+    name: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let root = vault_root_required(vault_root, "pack verify")?;
+    let lock = read_lockfile_or_empty(root)?;
+    let selected: Vec<&confidant_core::packs::lock::LockEntry> = match name {
+        Some(name) => {
+            let matching: Vec<_> = lock.packs.iter().filter(|e| e.name == name).collect();
+            if matching.is_empty() {
+                return Err(anyhow::Error::new(DomainError::not_found(format!(
+                    "pack '{name}' is not installed"
+                )))
+                .with_fix("Run `confidant pack list` to see installed packs"));
+            }
+            matching
+        }
+        None => lock.packs.iter().collect(),
+    };
+    let statuses: Vec<PackStatus> = selected
+        .iter()
+        .map(|e| PackStatus::verify(root, e))
+        .collect();
+    let ok = statuses.iter().all(|s| s.status == "ok");
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "pack-verify",
+                "ok": ok,
+                "packs": statuses.iter().map(PackStatus::to_json).collect::<Vec<_>>(),
+            }),
+        ))?;
+    } else if statuses.is_empty() {
+        println!("no external packs installed");
+    } else {
+        for status in &statuses {
+            status.print_human();
+        }
+        if !ok {
+            eprintln!(
+                "pack verify: a vendored tree does not match confidant.lock; \
+                 reinstall with `confidant pack add` or fix the lockfile"
+            );
+        }
+    }
+    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+}
+
+/// `pack remove <name>`: delete the vendored files, the lockfile entries and
+/// the `packs` listing. Needs `--yes`.
+fn cmd_pack_remove(
+    cli: &Cli,
+    vault_root: Option<&Path>,
+    name: String,
+    yes: bool,
+) -> anyhow::Result<ExitCode> {
+    let root = vault_root_required(vault_root, "pack remove")?;
+    let mut lock = read_lockfile_or_empty(root)?;
+    let entries: Vec<confidant_core::packs::lock::LockEntry> = lock
+        .packs
+        .iter()
+        .filter(|e| e.name == name)
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return Err(anyhow::Error::new(DomainError::not_found(format!(
+            "pack '{name}' is not installed"
+        )))
+        .with_fix("Run `confidant pack list` to see installed packs"));
+    }
+    let listed: Vec<String> = entries
+        .iter()
+        .map(|e| format!("{}@{}", e.name, e.version))
+        .collect();
+
+    if !yes {
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "command": "pack-remove",
+                    "dry_run": true,
+                    "would_remove": listed,
+                }),
+            ))?;
+        } else {
+            println!("would remove (pass --yes to apply):");
+            for id in &listed {
+                // A hand-edited lockfile id must not be able to hide itself.
+                println!("  {}", pack_fetch::escape_line(id));
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut changes = Vec::new();
+    for entry in &entries {
+        changes.extend(delete_vendored_changes(root, &entry.name, &entry.version)?);
+        lock.remove(&entry.name, &entry.version);
+    }
+    changes.push(FileChange::WriteFile {
+        path: PathBuf::from("confidant.lock"),
+        contents: lock.to_toml(),
+    });
+    let cfg_text = read_config_text(root)?;
+    let mut packs = confidant_core::config::VaultConfig::parse(&cfg_text)
+        .map_err(anyhow::Error::new)?
+        .packs;
+    let removed: std::collections::HashSet<&String> = listed.iter().collect();
+    packs.retain(|p| !removed.contains(p));
+    changes.push(FileChange::WriteFile {
+        path: PathBuf::from("confidant.toml"),
+        contents: confidant_core::config::VaultConfig::set_packs(&cfg_text, &packs)
+            .map_err(anyhow::Error::new)?,
+    });
+
+    let summary = format!("pack: remove {}", listed.join(", "));
+    let pending = PendingWrite {
+        changes,
+        canonical_request: summary.clone(),
+        summary,
+    };
+    let outcome = apply_write(root, pending, &write_options(cli))?;
+    if matches!(outcome, WriteOutcome::Applied { .. }) {
+        for entry in &entries {
+            let _ = std::fs::remove_dir(root.join(vendored_rel(&entry.name, &entry.version)));
+        }
+    }
+    finish_write(
+        cli,
+        root,
+        "pack-remove",
+        outcome,
+        serde_json::json!({ "removed": listed }),
+    )
+}
+
+/// `pack update <name> --rev <ref>`: re-fetch a new rev, print the diff, and
+/// (with `--yes`) re-vendor, re-pin and commit.
+fn cmd_pack_update(
+    cli: &Cli,
+    vault_root: Option<&Path>,
+    name: String,
+    rev: Option<&str>,
+    from_dir: Option<&Path>,
+    yes: bool,
+) -> anyhow::Result<ExitCode> {
+    let root = vault_root_required(vault_root, "pack update")?;
+    let lock = read_lockfile_or_empty(root)?;
+    let matching: Vec<&confidant_core::packs::lock::LockEntry> =
+        lock.packs.iter().filter(|e| e.name == name).collect();
+    let entry = match matching.as_slice() {
+        [] => {
+            return Err(anyhow::Error::new(DomainError::not_found(format!(
+                "pack '{name}' is not installed"
+            )))
+            .with_fix("Run `confidant pack list` to see installed packs"))
+        }
+        [entry] => *entry,
+        _ => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "pack '{name}' is installed at more than one version"
+            )))
+            .with_fix("Remove the version you do not want, then update again"))
+        }
+    };
+    let source = match (rev, from_dir) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "pass either --rev or --from-dir, not both",
+            ))
+            .with_fix(
+                "Use `pack update <name> --rev <ref>` or `pack update <name> --from-dir <path>`",
+            ))
+        }
+        (None, None) => {
+            return Err(anyhow::Error::new(DomainError::usage(
+                "pack update needs --rev or --from-dir",
+            ))
+            .with_fix(
+                "Use `pack update <name> --rev <ref>` or `pack update <name> --from-dir <path>`",
+            ))
+        }
+        (Some(rev), None) => {
+            if entry.source == "dir" {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "pack '{name}' was installed from a directory, so it has no git source to fetch --rev from"
+                )))
+                .with_fix("Use `pack update <name> --from-dir <path>` instead"));
+            }
+            pack_fetch::Source::Https {
+                url: entry.source.clone(),
+                git_ref: Some(rev.to_owned()),
+            }
+        }
+        (None, Some(dir)) => pack_fetch::parse_add_source(None, Some(dir))?,
+    };
+    let fetched = pack_fetch::fetch(&source, &entry.subdir)?;
+    let report = pack_fetch::describe(&fetched)?;
+    refuse_uninstallable(&report.name, &report.version)?;
+    if report.name != entry.name {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "the fetched pack is {}, not {}",
+            report.name, entry.name
+        )))
+        .with_fix("Update that pack instead, or add this one"));
+    }
+
+    let old_dir = root.join(vendored_rel(&entry.name, &entry.version));
+    let diff = pack_fetch::diff_dirs(&old_dir, &fetched.pack_dir)?;
+    let new_files = read_pack_dir(&fetched.pack_dir).map_err(anyhow::Error::new)?;
+    if new_files.hash != report.hash {
+        return Err(anyhow::Error::new(DomainError::conflict(
+            "the pack directory changed between the review and the write",
+        ))
+        .with_fix("Re-run `confidant pack update` and review the diff again"));
+    }
+
+    // `--from-dir` on a git-installed pack rewrites the lock `source` to
+    // `dir` and drops the rev: say so, rather than silently losing the pin.
+    let source_changed = entry.source != fetched.source;
+    if source_changed && !cli.json {
+        println!(
+            "note    the lock source changes from {} to {}",
+            pack_fetch::escape_line(&entry.source),
+            pack_fetch::escape_line(&fetched.source)
+        );
+    }
+
+    if !yes {
+        // Review gate before applying (PD10): the diff is the whole point of
+        // an update.
+        let escaped_diff = pack_fetch::escape_text(&diff);
+        if cli.json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "command": "pack-update",
+                    "dry_run": true,
+                    "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+                    "from_version": entry.version,
+                    "source_changed": source_changed,
+                    "diff": diff,
+                }),
+            ))?;
+        } else {
+            println!(
+                "{}: {}@{} -> {}@{} ({}..)",
+                pack_fetch::escape_line(&report.name),
+                pack_fetch::escape_line(&entry.name),
+                pack_fetch::escape_line(&entry.version),
+                pack_fetch::escape_line(&report.name),
+                pack_fetch::escape_line(&report.version),
+                short_hash(&report.hash)
+            );
+            // The diff is `git diff --no-index` over untrusted files: escape
+            // control and bidi characters so a hostile pack cannot hide or
+            // reorder the lines the operator reviews (#499/PD10).
+            print!("{escaped_diff}");
+            println!("pass --yes to apply");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Re-vendor: clear the old version's files, then write the new tree and
+    // rewrite `confidant.lock`/`confidant.toml` once (the old listing is
+    // replaced, not appended).
+    let mut changes = delete_vendored_changes(root, &entry.name, &entry.version)?;
+    let replace = format!("{}@{}", entry.name, entry.version);
+    changes.extend(install_changes(
+        root,
+        &report,
+        &new_files,
+        &fetched,
+        Some(&replace),
+    )?);
+    let summary = format!(
+        "pack: update {}@{} -> {}@{} ({})",
+        entry.name,
+        entry.version,
+        report.name,
+        report.version,
+        short_hash(&report.hash)
+    );
+    let pending = PendingWrite {
+        changes,
+        canonical_request: summary.clone(),
+        summary,
+    };
+    let outcome = apply_write(root, pending, &write_options(cli))?;
+    // A version change leaves the old, now-empty directory behind (git does
+    // not track directories). Best-effort cleanup after a successful apply.
+    if report.version != entry.version && matches!(outcome, WriteOutcome::Applied { .. }) {
+        let _ = std::fs::remove_dir(root.join(vendored_rel(&entry.name, &entry.version)));
+    }
+    finish_write(
+        cli,
+        root,
+        "pack-update",
+        outcome,
+        serde_json::json!({
+            "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+            "from_version": entry.version,
+            "source_changed": source_changed,
+        }),
+    )
 }
 
 /// Standard `--json` envelope for successful command output.

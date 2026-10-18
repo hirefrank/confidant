@@ -48,14 +48,23 @@ pub enum FileChange {
     AppendLines { path: PathBuf, lines: Vec<String> },
     /// Replace (or create) a file with these contents.
     WriteFile { path: PathBuf, contents: String },
+    /// Replace (or create) a file with raw bytes. A pack's vendored tree is
+    /// covered byte-for-byte by its canonical hash, so it cannot go through
+    /// the `String` variant (#440).
+    WriteBytes { path: PathBuf, contents: Vec<u8> },
+    /// Delete a file. Deleting an absent file is a no-op, so rollback and
+    /// idempotent retries are safe.
+    DeleteFile { path: PathBuf },
 }
 
 impl FileChange {
     /// Vault-relative path this change touches.
     pub fn path(&self) -> &Path {
         match self {
-            FileChange::AppendLines { path, .. } => path,
-            FileChange::WriteFile { path, .. } => path,
+            FileChange::AppendLines { path, .. }
+            | FileChange::WriteFile { path, .. }
+            | FileChange::WriteBytes { path, .. }
+            | FileChange::DeleteFile { path } => path,
         }
     }
 }
@@ -344,6 +353,16 @@ fn apply_write_inner(
                     action: "write".to_string(),
                     content: contents.clone(),
                 },
+                FileChange::WriteBytes { path, contents } => DryRunFile {
+                    path: path.display().to_string(),
+                    action: "write".to_string(),
+                    content: String::from_utf8_lossy(contents).into_owned(),
+                },
+                FileChange::DeleteFile { path } => DryRunFile {
+                    path: path.display().to_string(),
+                    action: "delete".to_string(),
+                    content: String::new(),
+                },
             })
             .collect();
         return Ok(WriteOutcome::DryRun { preview });
@@ -388,6 +407,10 @@ fn apply_write_inner(
         FileChange::WriteFile { path, contents } => {
             crate::paths::read_to_string(root, path).is_ok_and(|on_disk| on_disk == *contents)
         }
+        FileChange::WriteBytes { path, contents } => {
+            crate::paths::read_bytes(root, path).is_ok_and(|on_disk| on_disk == *contents)
+        }
+        FileChange::DeleteFile { path } => !crate::paths::exists(root, path).unwrap_or(true),
         // An append always changes its file; keep those on the normal path.
         FileChange::AppendLines { .. } => false,
     });
@@ -400,31 +423,40 @@ fn apply_write_inner(
     // reused envelope (#406) keeps its ciphertext byte-for-byte, and the
     // `files` list names only real rewrites, so the JSON `files` and the
     // commit diff (`git show --stat`) agree.
-    let mut snapshots: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for change in &pending.changes {
         let rel = change.path();
-        let existing = crate::paths::read_to_string(root, rel).ok();
-        if let Some(ref text) = existing {
-            if crate::record::has_conflict_markers(text) {
-                return Err(anyhow::Error::new(
-                    DomainError::new(
-                        ErrorKind::Conflict,
-                        format!(
-                            "{} has unresolved merge conflicts; writes are blocked",
-                            rel.display()
-                        ),
-                    )
-                    .with_fix("Resolve the conflict markers (git mergetool), then retry"),
-                ));
+        // No-follow read: a planted symlink or FIFO at `rel` must not be
+        // traversed or allowed to block the write (#440).
+        let existing = crate::paths::read_bytes(root, rel).ok();
+        if let Some(bytes) = &existing {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                if crate::record::has_conflict_markers(text) {
+                    return Err(anyhow::Error::new(
+                        DomainError::new(
+                            ErrorKind::Conflict,
+                            format!(
+                                "{} has unresolved merge conflicts; writes are blocked",
+                                rel.display()
+                            ),
+                        )
+                        .with_fix("Resolve the conflict markers (git mergetool), then retry"),
+                    ));
+                }
             }
         }
         let rewrites = match change {
             FileChange::WriteFile { contents, .. } => {
-                existing.as_deref() != Some(contents.as_str())
+                existing.as_deref() != Some(contents.as_bytes())
+            }
+            FileChange::WriteBytes { contents, .. } => {
+                existing.as_deref() != Some(contents.as_slice())
             }
             // An append always changes its file (same rule as step 3b).
             FileChange::AppendLines { .. } => true,
+            // Deleting an absent file changes nothing.
+            FileChange::DeleteFile { .. } => existing.is_some(),
         };
         if rewrites {
             changed.push(rel.display().to_string());
@@ -457,6 +489,20 @@ fn apply_write_inner(
                 crate::paths::write_replace(root, path, contents.as_bytes())
                     .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
             }
+            FileChange::WriteBytes { path, contents } => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        crate::paths::ensure_directory(root, parent)
+                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
+                    }
+                }
+                crate::paths::write_replace(root, path, contents)
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
+            }
+            FileChange::DeleteFile { path } => {
+                crate::paths::remove_file(root, path)
+                    .map_err(|e| anyhow::anyhow!("cannot delete {}: {e:#}", path.display()))?;
+            }
         }
     }
 
@@ -466,11 +512,11 @@ fn apply_write_inner(
     if !post.ok {
         for (rel, orig) in snapshots {
             match orig {
-                Some(text) => {
-                    let _ = crate::paths::write_replace(root, &rel, text.as_bytes());
+                Some(bytes) => {
+                    let _ = crate::paths::write_replace(root, &rel, &bytes);
                 }
                 None => {
-                    let _ = std::fs::remove_file(root.join(&rel));
+                    let _ = crate::paths::remove_file(root, &rel);
                 }
             }
         }

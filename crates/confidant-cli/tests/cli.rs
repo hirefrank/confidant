@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> &'static str {
@@ -1262,6 +1262,591 @@ fn pack_add_escapes_untrusted_errors() {
     assert!(!stderr.contains(bidi), "raw bidi in stderr: {stderr}");
     assert!(stderr.contains("\\u{202e}"), "{stderr}");
     assert!(stderr.contains("plain file name"), "{stderr}");
+}
+
+// #440: applying, listing, verifying updating and removing packs.
+
+/// Run git in `dir`, asserting success; returns stdout.
+#[cfg(unix)]
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A minimal git vault with an empty `packs` list and a comment to preserve.
+#[cfg(unix)]
+fn git_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\n# keep this comment above packs\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    git(dir.path(), &["init", "-q"]);
+    // The write layer checks the repo's identity before committing; CI has no
+    // global git identity, so set it locally.
+    git(dir.path(), &["config", "user.name", "Test"]);
+    git(
+        dir.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git(dir.path(), &["add", "-A"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    dir
+}
+
+/// A minimal valid v2 pack directory at `name@version`, optionally claiming
+/// `verb` (to provoke a conflict) and with `skill` as the SKILL.md body.
+#[cfg(unix)]
+fn versioned_pack(name: &str, version: &str, skill: &str, verb: Option<&str>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let verbs = match verb {
+        Some(v) => format!("\n[[verbs]]\nname = \"{v}\"\nid_type = \"person\"\n"),
+        None => String::new(),
+    };
+    std::fs::write(
+        dir.path().join("manifest.toml"),
+        format!(
+            "manifest_version = 2\n\
+             record_types = []\n\
+             balance_metrics = []\n\
+             finding_codes = [\"E_FRONTMATTER\"]\n\
+             \n\
+             [pack]\n\
+             name = \"{name}\"\n\
+             version = \"{version}\"\n\
+             skill = \"SKILL.md\"\n\
+             requires_spec = [\"0.1\"]\n\
+             {verbs}\n\
+             [messages.\"E_FRONTMATTER\"]\n\
+             default = \"front matter\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("SKILL.md"), skill).unwrap();
+    std::fs::write(
+        dir.path().join(format!("{version}.md")),
+        format!("# Contract {version}\n"),
+    )
+    .unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn pack_add(pack: &Path, vault: &Path, yes: bool) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.args(["pack", "add", "--from-dir"])
+        .arg(pack)
+        .arg("--vault")
+        .arg(vault);
+    if yes {
+        cmd.arg("--yes");
+    }
+    cmd.arg("--no-input").output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_without_yes_changes_nothing() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    let out = pack_add(pack.path(), vault.path(), false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("nothing was written"), "{stdout}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+    assert!(!vault.path().join("packs").exists());
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_yes_vendors_locks_and_commits() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill v1\n", None);
+    let out = pack_add(pack.path(), vault.path(), true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("committed"), "{stdout}");
+
+    let names = git(vault.path(), &["show", "--name-only", "--format=", "HEAD"]);
+    for expected in [
+        "confidant.lock",
+        "confidant.toml",
+        "packs/example-pack@0.1/manifest.toml",
+        "packs/example-pack@0.1/SKILL.md",
+        "packs/example-pack@0.1/0.1.md",
+    ] {
+        assert!(names.contains(expected), "missing {expected} in {names}");
+    }
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    // The comment above `packs` survives `toml_edit` (#440).
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("keep this comment above packs"), "{cfg}");
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+
+    // verify / list / check agree it is installed and clean.
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{verify:?}");
+    let list = Command::new(bin())
+        .args(["pack", "list", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["packs"][0]["name"], "example-pack");
+    assert_eq!(v["packs"][0]["status"], "ok");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+
+    // Same pin, same bytes: idempotent, no new commit.
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already installed"));
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_same_version_different_hash_refused() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# one\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    std::fs::write(pack.path().join("SKILL.md"), "# two\n").unwrap();
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("different hash"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_refuses_reserved_names() {
+    let vault = git_vault();
+    // `coaching` is reserved for the compiled pack (PD14).
+    let pack = versioned_pack("coaching", "0.9", "# nope\n", None);
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("reserved"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_check_failure_rolls_back() {
+    let vault = git_vault();
+    // coaching@0.1 owns the `session` verb; a pack claiming it conflicts.
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "enable coaching",
+        ],
+    );
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let pack = versioned_pack("example-pack", "0.1", "# conflict\n", Some("session"));
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+
+    // Rolled back: no vendored files, no lock, packs list unchanged, tree clean.
+    assert!(!vault
+        .path()
+        .join("packs/example-pack@0.1/manifest.toml")
+        .exists());
+    assert!(!vault.path().join("confidant.lock").exists());
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_update_shows_diff_then_applies_a_version_change() {
+    let vault = git_vault();
+    let v1 = versioned_pack("example-pack", "0.1", "# one\n", None);
+    let v2 = versioned_pack("example-pack", "0.2", "# two\n", None);
+    assert!(pack_add(v1.path(), vault.path(), true).status.success());
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+
+    // Without --yes: the diff is printed, nothing changes.
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(v2.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .arg("--no-input")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("-version = \"0.1\""), "{stdout}");
+    assert!(stdout.contains("+version = \"0.2\""), "{stdout}");
+    assert!(stdout.contains("pass --yes"), "{stdout}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+
+    // With --yes: re-vendored at 0.2, old dir gone, one pin.
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(v2.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(vault
+        .path()
+        .join("packs/example-pack@0.2/SKILL.md")
+        .exists());
+    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.2\"]"), "{cfg}");
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert_eq!(lock.matches("[[pack]]").count(), 1, "{lock}");
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{verify:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_update_escapes_the_diff() {
+    // A fetched pack file is untrusted: ANSI and bidi in its SKILL.md must
+    // not be able to hide or reorder the lines the operator reviews before
+    // `--yes` (PD10).
+    let vault = git_vault();
+    let v1 = versioned_pack("example-pack", "0.1", "# harmless\n", None);
+    assert!(pack_add(v1.path(), vault.path(), true).status.success());
+    let bidi = '\u{202e}';
+    let escape = '\u{1b}';
+    let v2 = versioned_pack(
+        "example-pack",
+        "0.2",
+        &format!("# Skill\nhidden{escape}[8mtext{escape}[0m\n{bidi}reordered\n"),
+        None,
+    );
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(v2.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .arg("--no-input")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("pass --yes"), "{stdout}");
+    assert!(
+        !stdout.contains(escape),
+        "raw ESC in the reviewed diff: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains(bidi),
+        "raw bidi in the reviewed diff: {stdout:?}"
+    );
+    assert!(stdout.contains("\\u{1b}"), "{stdout}");
+    assert!(stdout.contains("\\u{202e}"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_update_same_version_replaces_content() {
+    // A same-version update is the case where `DeleteFile` and `WriteBytes`
+    // hit the same path in one change set.
+    let vault = git_vault();
+    let v1 = versioned_pack("example-pack", "0.1", "# one\n", None);
+    assert!(pack_add(v1.path(), vault.path(), true).status.success());
+    let v1b = versioned_pack("example-pack", "0.1", "# one changed\n", None);
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(v1b.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let skill =
+        std::fs::read_to_string(vault.path().join("packs/example-pack@0.1/SKILL.md")).unwrap();
+    assert_eq!(skill, "# one changed\n");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{verify:?}");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_update_from_dir_notes_a_lock_source_change() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# one\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    // Pretend the pack was installed from git, then update it from a
+    // directory: the lock source becomes `dir`, which must be reported.
+    let lock_path = vault.path().join("confidant.lock");
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let rev = "0123456789abcdef0123456789abcdef01234567";
+    let lock = lock
+        .replace(
+            "source = \"dir\"",
+            "source = \"https://example.invalid/pack.git\"",
+        )
+        .replace("rev = \"\"", &format!("rev = \"{rev}\""));
+    std::fs::write(&lock_path, &lock).unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "pin from git",
+        ],
+    );
+
+    let updated = versioned_pack("example-pack", "0.2", "# two\n", None);
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(updated.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .arg("--no-input")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("lock source changes"), "{stdout}");
+    assert!(
+        stdout.contains("https://example.invalid/pack.git"),
+        "{stdout}"
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(updated.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["source_changed"], true, "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_refuses_a_second_version_of_the_same_name() {
+    let vault = git_vault();
+    let v1 = versioned_pack("example-pack", "0.1", "# one\n", None);
+    let v2 = versioned_pack("example-pack", "0.2", "# two\n", None);
+    assert!(pack_add(v1.path(), vault.path(), true).status.success());
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = pack_add(v2.path(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("0.1"), "{stderr}");
+    assert!(stderr.contains("pack update"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert!(!vault.path().join("packs/example-pack@0.2").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_remove_refuses_a_symlinked_pack_dir() {
+    // A synced vault can plant `packs/<id>` as a symlink out of the vault.
+    // Removal must refuse to follow it and must never delete the files it
+    // points at (#440).
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("victim.txt"), "keep me\n").unwrap();
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    std::fs::remove_dir_all(&vendored).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &vendored).unwrap();
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+        "keep me\n",
+        "a file outside the vault was deleted"
+    );
+    // Nothing was committed and the lockfile still pins the pack.
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert!(lock.contains("[[pack]]"), "{lock}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_remove_yes_deletes_files_lock_and_entry() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    // Dry run first: nothing changes.
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .arg("--no-input")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("would remove"));
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!vault
+        .path()
+        .join("packs/example-pack@0.1/SKILL.md")
+        .exists());
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert!(!lock.contains("[[pack]]"), "{lock}");
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_list_and_verify_report_tampering() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    // Healthy: verify exits 0.
+    let ok = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert_eq!(ok.status.code(), Some(0));
+
+    // Tampered: verify exits 1, list reports the status, check reports the code.
+    std::fs::write(
+        vault.path().join("packs/example-pack@0.1/SKILL.md"),
+        "# tampered\n",
+    )
+    .unwrap();
+    let bad = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+    let list = Command::new(bin())
+        .args(["pack", "list", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["packs"][0]["status"], "tampered");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&check.stdout).contains("E_PACK_HASH"),
+        "{check:?}"
+    );
 }
 
 #[test]

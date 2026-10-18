@@ -235,8 +235,11 @@ fn create_directory_all(root: &Path, relative: &Path) -> Result<Directory> {
     Ok(directory)
 }
 
-/// Read a UTF-8 file beneath `root` without following symlinks.
-pub fn read_to_string(root: &Path, relative: &Path) -> Result<String> {
+/// Read the bytes of a file beneath `root` without following symlinks.
+///
+/// The file is opened with `O_NONBLOCK` (part of the module's safe flags),
+/// so a planted FIFO at `relative` cannot stall the read (#440).
+pub fn read_bytes(root: &Path, relative: &Path) -> Result<Vec<u8>> {
     let (parent, name) = split_parent(relative)?;
     let directory = if parent.as_os_str().is_empty() {
         Directory::open_root(root).map_err(|error| {
@@ -268,12 +271,107 @@ pub fn read_to_string(root: &Path, relative: &Path) -> Result<String> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .with_context(|| format!("could not read {}", relative.display()))?;
+    Ok(buf)
+}
+
+/// Read a UTF-8 file beneath `root` without following symlinks.
+pub fn read_to_string(root: &Path, relative: &Path) -> Result<String> {
+    let buf = read_bytes(root, relative)?;
     String::from_utf8(buf).map_err(|_| {
         anyhow!(DomainError::invalid(format!(
             "'{}' is not valid UTF-8",
             relative.display()
         )))
     })
+}
+
+/// Whether an error is (or wraps) an `io::ErrorKind::NotFound`.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::NotFound)
+    })
+}
+
+/// Remove `relative` beneath `root` without following symlinks.
+///
+/// Parents are opened component by component with `openat`/`O_NOFOLLOW` and
+/// the final component is removed with `unlinkat`, so a planted symlink at
+/// any depth is refused rather than followed into the file it points at
+/// (#440). Removing a file (or a whole missing parent chain) that is not
+/// there is a no-op: rollback and idempotent retries stay safe.
+pub fn remove_file(root: &Path, relative: &Path) -> Result<()> {
+    let (parent, name) = split_parent(relative)?;
+    let directory = if parent.as_os_str().is_empty() {
+        Directory::open_root(root).map_err(|error| {
+            io_failure(error, "vault root", "could not open the vault root".into())
+        })?
+    } else {
+        match open_directory(root, parent) {
+            Ok(directory) => directory,
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    };
+    match directory.child_kind(name) {
+        Ok(EntryKind::Symlink) => Err(refuse_symlink(&display_name(name))),
+        Ok(EntryKind::Directory) | Ok(EntryKind::Other) => {
+            Err(refuse_not_regular(&relative.display().to_string()))
+        }
+        Ok(EntryKind::File) => {
+            directory.unlink_child(name).map_err(|error| {
+                io_failure(
+                    error,
+                    &relative.display().to_string(),
+                    format!("could not delete {}", relative.display()),
+                )
+            })?;
+            directory.sync().with_context(|| {
+                format!(
+                    "could not sync the directory holding {}",
+                    relative.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_failure(
+            error,
+            &relative.display().to_string(),
+            format!("could not stat {}", relative.display()),
+        )),
+    }
+}
+
+/// Whether `relative` exists beneath `root`, without following symlinks in
+/// any parent component.
+///
+/// A missing file or a missing parent chain is `Ok(false)`. A final symbolic
+/// link reports `Ok(true)`: callers that act on it fail closed (the write
+/// layer refuses to follow it) rather than silently skipping the path.
+pub fn exists(root: &Path, relative: &Path) -> Result<bool> {
+    let (parent, name) = split_parent(relative)?;
+    let directory = if parent.as_os_str().is_empty() {
+        Directory::open_root(root).map_err(|error| {
+            io_failure(error, "vault root", "could not open the vault root".into())
+        })?
+    } else {
+        match open_directory(root, parent) {
+            Ok(directory) => directory,
+            Err(error) if is_not_found(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    };
+    match directory.child_kind(name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_failure(
+            error,
+            &relative.display().to_string(),
+            format!("could not stat {}", relative.display()),
+        )),
+    }
 }
 
 /// Result of listing a directory without following it.
@@ -681,8 +779,8 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
-    use super::{components, read_to_string, write_replace};
-    use super::{read_dir, resolve, EntryKind};
+    use super::{components, read_bytes, read_to_string, remove_file, write_replace};
+    use super::{exists, read_dir, resolve, EntryKind};
     use std::fs;
     use std::path::Path;
 
@@ -756,5 +854,47 @@ mod tests {
             .collect();
         assert!(kinds.contains(&("ok.txt", EntryKind::File, true)));
         assert!(kinds.contains(&("s", EntryKind::Symlink, true)));
+    }
+
+    #[test]
+    fn remove_file_is_a_noop_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file, absent parent chain: both no-ops.
+        remove_file(dir.path(), Path::new("nope.txt")).unwrap();
+        remove_file(dir.path(), Path::new("nope/also-nope.txt")).unwrap();
+        assert!(!exists(dir.path(), Path::new("nope.txt")).unwrap());
+        assert!(!exists(dir.path(), Path::new("nope/also-nope.txt")).unwrap());
+        write_replace(dir.path(), Path::new("gone.txt"), b"x").unwrap();
+        assert!(exists(dir.path(), Path::new("gone.txt")).unwrap());
+        remove_file(dir.path(), Path::new("gone.txt")).unwrap();
+        assert!(!exists(dir.path(), Path::new("gone.txt")).unwrap());
+        assert!(!dir.path().join("gone.txt").exists());
+    }
+
+    #[test]
+    fn remove_and_read_refuse_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("victim.txt"), "keep").unwrap();
+        // A symlinked directory in the middle: neither read nor remove may
+        // follow it into the file it points at.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        assert!(read_bytes(dir.path(), Path::new("link/victim.txt")).is_err());
+        assert!(remove_file(dir.path(), Path::new("link/victim.txt")).is_err());
+        assert!(exists(dir.path(), Path::new("link/victim.txt")).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep"
+        );
+        // A symlinked file is refused as well, and exists() still reports it.
+        std::os::unix::fs::symlink(outside.path().join("victim.txt"), dir.path().join("f"))
+            .unwrap();
+        assert!(read_bytes(dir.path(), Path::new("f")).is_err());
+        assert!(remove_file(dir.path(), Path::new("f")).is_err());
+        assert!(exists(dir.path(), Path::new("f")).unwrap());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep"
+        );
     }
 }

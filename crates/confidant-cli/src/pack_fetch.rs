@@ -68,6 +68,28 @@ pub(crate) fn escape_domain_error(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Unified diff between two pack directories, for `pack update` (PD10: the
+/// operator reviews the change before applying). Shells out to
+/// `git diff --no-index` so there is no new dependency; exit code 1 means
+/// "differences", which is the normal case.
+pub(crate) fn diff_dirs(old: &Path, new: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--no-index", "--no-color", "--"])
+        .arg(old)
+        .arg(new)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run git diff: {e}"))?;
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => Err(DomainError::pack_invalid(format!(
+            "git diff --no-index failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .into()),
+    }
+}
+
 /// Canonicalise `dir` and require it to live inside `root`.
 ///
 /// Covers `--subdir` pointing through a symlinked component (a repo can ship
