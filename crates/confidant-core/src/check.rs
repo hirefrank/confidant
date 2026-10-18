@@ -526,27 +526,33 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         }
     }
 
+    let spec_ok = vault.config.spec == SPEC_VERSION;
     let (enabled_packs, unknown_packs) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    for listed in &unknown_packs {
-        // #438: a listed pack that exists but failed to load becomes its
-        // specific finding (fail closed, PD12; problem packs are not
-        // folded). One that is neither compiled nor resolvable at all
-        // stays E_PACK_UNKNOWN.
-        match vault.pack_problems.iter().find(|p| p.name == *listed) {
-            Some(problem) => findings.push(pack_problem_finding(problem)),
-            None => findings.push(
-                Finding::new(
-                    FindingCode::PackUnknown,
-                    Severity::Error,
-                    "unknown pack".to_owned(),
-                )
-                .at_file("confidant.toml")
-                .with_fix("Remove the pack or use a CLI that implements it"),
-            ),
+    // #497: on an unsupported spec external packs are never resolved (see
+    // `vault.rs`), so the compiled-only registry would report every listed
+    // external as `E_PACK_UNKNOWN` — noise on top of the spec finding,
+    // which already fails `check` and returns below.
+    if spec_ok {
+        for listed in &unknown_packs {
+            // #438: a listed pack that exists but failed to load becomes its
+            // specific finding (fail closed, PD12; problem packs are not
+            // folded). One that is neither compiled nor resolvable at all
+            // stays E_PACK_UNKNOWN.
+            match vault.pack_problems.iter().find(|p| p.name == *listed) {
+                Some(problem) => findings.push(pack_problem_finding(problem)),
+                None => findings.push(
+                    Finding::new(
+                        FindingCode::PackUnknown,
+                        Severity::Error,
+                        "unknown pack".to_owned(),
+                    )
+                    .at_file("confidant.toml")
+                    .with_fix("Remove the pack or use a CLI that implements it"),
+                ),
+            }
         }
     }
 
-    let spec_ok = vault.config.spec == SPEC_VERSION;
     if !spec_ok {
         sort_findings(&mut findings);
         return finish_report(vault, options, findings);
