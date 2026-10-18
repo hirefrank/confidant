@@ -10,6 +10,13 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on the same ref: a new push to a PR, or a quick
+# succession of merges to main. The SAST score reads the PR head's completed
+# run, so cancelling older refs does not change it.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
