@@ -5880,3 +5880,346 @@ default = "stale greeting"
         "an unparseable manifest's verbs cannot be known: {json:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declarative rule kind: cadence-overdue (#442)
+// ---------------------------------------------------------------------------
+
+/// Vendor a declarative pack whose cadence rule mirrors personal@0.1's
+/// (templates verbatim from packs/personal/manifest.toml), and return
+/// the lockfile hash for it.
+fn install_cadence_pack(root: &Path) -> String {
+    let pack_dir = root.join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        root,
+        "packs/example-pack@0.1/manifest.toml",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.severity]]
+key = "example-pack.cadence_overdue"
+default = "warning"
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+[[rules]]
+id = "cadence"
+kind = "cadence-overdue"
+code = "W_EXAMPLE_CADENCE"
+severity_key = "example-pack.cadence_overdue"
+cadence_field = "cadence"
+event_verbs = ["touch", "session"]
+
+[messages."W_EXAMPLE_CADENCE"]
+last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
+last_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+none = "person {id} has no touchpoint logged (cadence {cadence_days}d)"
+none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cadence"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+"#,
+    );
+    write(
+        root,
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n\nCadence rule (fake).\n",
+    );
+    read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash
+}
+
+/// Run `check` over a person with a `cadence` field and the given
+/// ledger (per monthly file), twice: once enabled through compiled
+/// `personal@0.1`, once through the declarative pack above. The
+/// `W_CADENCE_OVERDUE` findings — code, severity, message, fix, file,
+/// id — must match exactly; that is the parity the declarative kind
+/// promises (#442). Everything else in each report legitimately
+/// differs (the compiled run enables personal@0.1; the declarative run
+/// enables the example pack, whose `touch` verb claims stay with the
+/// disabled compiled pack as `W_PACK_ORPHAN`s).
+fn assert_cadence_parity(
+    ledger_files: &[(&str, String)],
+    operator_personal: &str,
+    operator_declarative: &str,
+    ada_has_cadence: bool,
+    extra_setup: impl Fn(&Path),
+) -> (Value, Value) {
+    let setup = |root: &Path, packs: &str, operator: &str, declarative: bool| -> Value {
+        write(
+            root,
+            "confidant.toml",
+            &PERSONAL_TOML
+                .replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]"))
+                .replace(
+                    "as_of = \"2026-10-08\"",
+                    &format!("as_of = \"2026-10-08\"\n{operator}"),
+                ),
+        );
+        if ada_has_cadence {
+            person_with_cadence(root, ADA);
+        } else {
+            // Ada still exists as a record, just without a `cadence` value,
+            // so the rule must take it from a merged member (the find_map
+            // fallback) rather than skipping a missing canonical person.
+            person_without_cadence(root, ADA);
+        }
+        for (rel, content) in ledger_files {
+            write(root, rel, content);
+        }
+        if declarative {
+            let hash = install_cadence_pack(root);
+            install_lockfile(root, "example-pack", "0.1", &hash);
+        }
+        extra_setup(root);
+        report_json(root, None)
+    };
+    let personal = setup(
+        tempfile::tempdir().unwrap().path(),
+        "\"personal@0.1\"",
+        operator_personal,
+        false,
+    );
+    let dir2 = tempfile::tempdir().unwrap();
+    let declarative = setup(
+        dir2.path(),
+        "\"example-pack@0.1\"",
+        operator_declarative,
+        true,
+    );
+
+    // Parity covers code-agnostic content: severity, message, fix,
+    // file, id. The code itself is pack-own on the declarative side by
+    // design (the #494 review refuses a builtin as a rule's code);
+    // whether the declarative copies may emit the compiled codes
+    // verbatim is Frank's call (#490), and #444 depends on it.
+    let cadence_findings = |v: &Value| -> Vec<String> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == "W_CADENCE_OVERDUE" || f["code"] == "W_EXAMPLE_CADENCE")
+            .map(|f| {
+                format!(
+                    "{}/{}/{}/{}/{:?}",
+                    f["severity"], f["message"], f["fix"], f["file"], f["id"]
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        cadence_findings(&personal),
+        cadence_findings(&declarative),
+        "declarative parity failed:\npersonal: {personal:?}\ndeclarative: {declarative:?}"
+    );
+    (personal, declarative)
+}
+
+/// Person record with the pack's cadence field.
+fn person_with_cadence(root: &Path, id: &str) {
+    write(
+        root,
+        &format!("people/{id}/profile.md"),
+        &format!(
+            "---\nid: {id}\ntype: person\nname: Ada Example\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+}
+
+/// Person record without the pack's cadence field: the merged-member
+/// fallback has to supply it, or the person is skipped.
+fn person_without_cadence(root: &Path, id: &str) {
+    write(
+        root,
+        &format!("people/{id}/profile.md"),
+        &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+    );
+}
+
+#[test]
+fn cadence_rule_overdue_with_last_contact() {
+    // Last touch 40 days before as_of (2026-10-08): overdue, `last`
+    // variant, start = as_of - 30d.
+    let ledger = vec![(
+        "ledger/2026/08.cfd",
+        format!("2026-08-29 touch {ADA} call\n"),
+    )];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
+    let findings = personal["findings"].as_array().unwrap();
+    let overdue: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["code"] == "W_CADENCE_OVERDUE")
+        .collect();
+    assert_eq!(overdue.len(), 1, "{personal:?}");
+    assert_eq!(overdue[0]["severity"], "warning");
+    assert_eq!(
+        overdue[0]["code"], "W_CADENCE_OVERDUE",
+        "compiled side keeps the builtin code"
+    );
+    let message = overdue[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2026-09-08") && message.contains("2026-08-29") && message.contains("30d"),
+        "start = as_of - cadence, d = last: {message}"
+    );
+}
+
+#[test]
+fn cadence_rule_overdue_no_contact() {
+    // No touchpoint at all: the `none` variant.
+    let (personal, _) = assert_cadence_parity(&[], "", "", true, |_| {});
+    let findings = personal["findings"].as_array().unwrap();
+    let overdue: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["code"] == "W_CADENCE_OVERDUE")
+        .collect();
+    assert_eq!(overdue.len(), 1, "{personal:?}");
+    assert!(
+        overdue[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no touchpoint logged"),
+        "none variant: {personal:?}"
+    );
+}
+
+#[test]
+fn cadence_rule_exactly_on_boundary_not_overdue() {
+    // as_of - last == 30 exactly: inside the window (not overdue).
+    let ledger = vec![(
+        "ledger/2026/09.cfd",
+        format!("2026-09-08 touch {ADA} call\n"),
+    )];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
+    assert!(
+        !codes(&personal)
+            .iter()
+            .any(|c| c == "W_CADENCE_OVERDUE" || c == "W_EXAMPLE_CADENCE"),
+        "{personal:?}"
+    );
+}
+
+#[test]
+fn cadence_rule_session_counts_as_contact() {
+    // event_verbs includes session: a session within the window
+    // suppresses the nudge (#227 Q2).
+    let ledger = vec![(
+        "ledger/2026/10.cfd",
+        format!("2026-10-02 session {ADA} 60m paid\n"),
+    )];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
+    assert!(
+        !codes(&personal)
+            .iter()
+            .any(|c| c == "W_CADENCE_OVERDUE" || c == "W_EXAMPLE_CADENCE"),
+        "{personal:?}"
+    );
+}
+
+#[test]
+fn cadence_rule_merged_person_uses_merged_cadence_and_contact() {
+    // Bea (the merged member) holds the cadence and the only contact, and
+    // that contact is 40 days before as_of (2026-10-08): overdue. Ada
+    // (canonical) has a profile but no `cadence`, so the finding can only
+    // come from the find_map fallback taking Bea's cadence — if that
+    // branch were deleted, Ada would be skipped and nothing would fire.
+    let ledger = vec![
+        (
+            "ledger/2026/08.cfd",
+            format!("2026-08-29 touch {BEA} call\n"),
+        ),
+        (
+            "ledger/2026/10.cfd",
+            format!("2026-10-01 merge {BEA} into {ADA}\n"),
+        ),
+    ];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", false, |root| {
+        write(
+            root,
+            &format!("people/{BEA}/profile.md"),
+            &format!(
+                "---\nid: {BEA}\ntype: person\nname: Bea Demo\ncadence: 30d\n---\n\nFake person.\n"
+            ),
+        );
+    });
+    let overdue: Vec<&Value> = personal["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_CADENCE_OVERDUE")
+        .collect();
+    assert_eq!(overdue.len(), 1, "{personal:?}");
+    assert_eq!(overdue[0]["id"], ADA);
+    let message = overdue[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2026-09-08") && message.contains("2026-08-29"),
+        "fallback cadence -> start = as_of - 30d, d = Bea's touch: {message}"
+    );
+}
+
+#[test]
+fn cadence_rule_merged_person_recent_contact_not_overdue() {
+    // Same merged shape, but Bea's touch is inside the 30d window: the
+    // fallback cadence applies and nothing is overdue.
+    let ledger = vec![(
+        "ledger/2026/10.cfd",
+        format!("2026-10-01 merge {BEA} into {ADA}\n2026-10-03 touch {BEA} call\n"),
+    )];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", false, |root| {
+        write(
+            root,
+            &format!("people/{BEA}/profile.md"),
+            &format!(
+                "---\nid: {BEA}\ntype: person\nname: Bea Demo\ncadence: 30d\n---\n\nFake person.\n"
+            ),
+        );
+    });
+    assert!(
+        !codes(&personal)
+            .iter()
+            .any(|c| c == "W_CADENCE_OVERDUE" || c == "W_EXAMPLE_CADENCE"),
+        "{personal:?}"
+    );
+}
+
+#[test]
+fn cadence_rule_severity_off_and_error_from_config() {
+    // `off` skips the rule; `error` escalates it — the same override
+    // keys work for the declarative pack as for the compiled one, and
+    // the parity helper proves the compiled analogue behaves the same.
+    let ledger = vec![(
+        "ledger/2026/08.cfd",
+        format!("2026-08-29 touch {ADA} call\n"),
+    )];
+
+    let (personal_off, _) = assert_cadence_parity(
+        &ledger,
+        "personal.cadence_overdue = \"off\"\n",
+        "example-pack.cadence_overdue = \"off\"\n",
+        true,
+        |_| {},
+    );
+    assert!(codes(&personal_off).is_empty(), "{personal_off:?}");
+
+    let (personal_err, _) = assert_cadence_parity(
+        &ledger,
+        "personal.cadence_overdue = \"error\"\n",
+        "example-pack.cadence_overdue = \"error\"\n",
+        true,
+        |_| {},
+    );
+    let findings = personal_err["findings"].as_array().unwrap();
+    assert_eq!(findings[0]["severity"], "error", "{personal_err:?}");
+}
