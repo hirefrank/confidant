@@ -87,7 +87,15 @@ pub fn tree_hash(files: &BTreeMap<String, Vec<u8>>) -> String {
 /// Error for a pack directory problem, naming the relative path (never an
 /// absolute path) and suggesting a fix.
 fn pack_dir_err(path: &str, message: impl Into<String>, fix: impl Into<String>) -> DomainError {
-    DomainError::pack_invalid(format!("pack file '{path}': {}", message.into())).with_fix(fix)
+    // A pack's file names are untrusted: escape before they reach a
+    // terminal, so a control character or bidi override in a name cannot
+    // hide the error it caused (#499).
+    DomainError::pack_invalid(format!(
+        "pack file '{}': {}",
+        crate::packs::untrusted::escape_line(path),
+        message.into()
+    ))
+    .with_fix(fix)
 }
 
 /// Convert a directory entry name to UTF-8, rejecting names that are not
