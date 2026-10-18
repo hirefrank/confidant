@@ -5892,6 +5892,11 @@ fn assert_cadence_parity(
         );
         if ada_has_cadence {
             person_with_cadence(root, ADA);
+        } else {
+            // Ada still exists as a record, just without a `cadence` value,
+            // so the rule must take it from a merged member (the find_map
+            // fallback) rather than skipping a missing canonical person.
+            person_without_cadence(root, ADA);
         }
         for (rel, content) in ledger_files {
             write(root, rel, content);
@@ -5952,6 +5957,16 @@ fn person_with_cadence(root: &Path, id: &str) {
         &format!(
             "---\nid: {id}\ntype: person\nname: Ada Example\ncadence: 30d\n---\n\nFake person.\n"
         ),
+    );
+}
+
+/// Person record without the pack's cadence field: the merged-member
+/// fallback has to supply it, or the person is skipped.
+fn person_without_cadence(root: &Path, id: &str) {
+    write(
+        root,
+        &format!("people/{id}/profile.md"),
+        &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
     );
 }
 
@@ -6036,11 +6051,49 @@ fn cadence_rule_session_counts_as_contact() {
 
 #[test]
 fn cadence_rule_merged_person_uses_merged_cadence_and_contact() {
-    // Bea (the merged member) holds the cadence AND the recent touch;
-    // Ada (canonical) has neither: `ada_has_cadence = false` skips her
-    // profile, so the rule must take cadence and contact from the
-    // merged member — exercising the find_map fallback, not the
-    // canonical person's own value.
+    // Bea (the merged member) holds the cadence and the only contact, and
+    // that contact is 40 days before as_of (2026-10-08): overdue. Ada
+    // (canonical) has a profile but no `cadence`, so the finding can only
+    // come from the find_map fallback taking Bea's cadence — if that
+    // branch were deleted, Ada would be skipped and nothing would fire.
+    let ledger = vec![
+        (
+            "ledger/2026/08.cfd",
+            format!("2026-08-29 touch {BEA} call\n"),
+        ),
+        (
+            "ledger/2026/10.cfd",
+            format!("2026-10-01 merge {BEA} into {ADA}\n"),
+        ),
+    ];
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", false, |root| {
+        write(
+            root,
+            &format!("people/{BEA}/profile.md"),
+            &format!(
+                "---\nid: {BEA}\ntype: person\nname: Bea Demo\ncadence: 30d\n---\n\nFake person.\n"
+            ),
+        );
+    });
+    let overdue: Vec<&Value> = personal["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_CADENCE_OVERDUE")
+        .collect();
+    assert_eq!(overdue.len(), 1, "{personal:?}");
+    assert_eq!(overdue[0]["id"], ADA);
+    let message = overdue[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2026-09-08") && message.contains("2026-08-29"),
+        "fallback cadence -> start = as_of - 30d, d = Bea's touch: {message}"
+    );
+}
+
+#[test]
+fn cadence_rule_merged_person_recent_contact_not_overdue() {
+    // Same merged shape, but Bea's touch is inside the 30d window: the
+    // fallback cadence applies and nothing is overdue.
     let ledger = vec![(
         "ledger/2026/10.cfd",
         format!("2026-10-01 merge {BEA} into {ADA}\n2026-10-03 touch {BEA} call\n"),
