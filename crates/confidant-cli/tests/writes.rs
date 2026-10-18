@@ -1598,7 +1598,7 @@ fn log_touch_writes_one_commit_and_appears_in_context() {
         "log",
         "touch",
         PERSON,
-        "coffee",
+        "meal",
         "--date",
         "2026-10-05",
         "--json",
@@ -1613,7 +1613,7 @@ fn log_touch_writes_one_commit_and_appears_in_context() {
     let (ok, ctx) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
     assert!(ok, "{ctx}");
     assert_eq!(ctx["touchpoints"].as_array().unwrap().len(), 1, "{ctx}");
-    assert_eq!(ctx["touchpoints"][0]["kind"], "coffee");
+    assert_eq!(ctx["touchpoints"][0]["kind"], "meal");
 }
 
 #[test]
@@ -1646,6 +1646,45 @@ fn log_touch_bad_kind_is_usage_error() {
     ]);
     assert!(!ok, "{v}");
     assert_eq!(v["error"]["code"], "usage_error");
+}
+
+/// #509: `coffee` was removed from the v1 kind list (replaced by `meal`,
+/// no alias); a removed kind is a usage error that lists the new kinds.
+#[test]
+fn log_touch_rejects_coffee_and_lists_v1_kinds() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let toml_path = root.join("confidant.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    std::fs::write(
+        &toml_path,
+        toml.replace(
+            "packs = [\"coaching@0.1\"]",
+            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "enable personal"]);
+
+    let (ok, v) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "coffee",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "usage_error");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("call, text, email, meet, meal, event, gift, other"),
+        "the error must list the v1 kinds: {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------

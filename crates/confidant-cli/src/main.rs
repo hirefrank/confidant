@@ -450,11 +450,11 @@ enum LogAction {
         #[arg(long)]
         fallback_inbox: bool,
     },
-    /// Append a personal touchpoint ledger line, e.g. `log touch p-… coffee`.
+    /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
         /// Opaque person id (p-…).
         person: String,
-        /// Touchpoint kind: call, text, coffee, gift, or meet.
+        /// Touchpoint kind: call, text, email, meet, meal, event, gift, or other.
         kind: String,
         /// Touchpoint date YYYY-MM-DD (default today).
         #[arg(long)]
@@ -3227,7 +3227,7 @@ fn cmd_log_touch(
     };
     if !owner.validate_verb_args("touch", &probe).unwrap_or(true) {
         return Err(anyhow::Error::new(DomainError::usage(format!(
-            "bad touch kind '{kind}'; use one of: call, text, coffee, gift, meet"
+            "bad touch kind '{kind}'; use one of: call, text, email, meet, meal, event, gift, other"
         ))));
     }
     let date = parse_date_arg(&date_raw)?;

@@ -56,7 +56,7 @@ present, for CI users who want the stricter gate.
 | `E_SELF_EDGE` | error | | An edge links a person to themself (`a` and `b` are the same id). |
 | `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. |
 | `E_UNKNOWN_EDGE_KIND` | error | | An edge `kind` is not in the closed kind list (core kinds plus enabled packs' kinds). A kind owned by a disabled pack is `W_PACK_ORPHAN` instead. |
-| `E_TOUCH_MALFORMED` | error | | A `touch` ledger line is malformed: without `personal@0.1` it may carry only an optional `kind:NAME` pair; with `personal@0.1` it carries either `[kind:call\|text\|coffee\|gift\|meet]` or `<call\|text\|coffee\|gift\|meet> [note:NOTE-ID] [src:PROVENANCE]`. |
+| `E_TOUCH_MALFORMED` | error | | A `touch` ledger line is malformed: without `personal@0.1` it may carry only an optional `kind:NAME` pair; with `personal@0.1` it carries either `[kind:call\|text\|email\|meet\|meal\|event\|gift\|other]` or `<call\|text\|email\|meet\|meal\|event\|gift\|other> [note:NOTE-ID] [src:PROVENANCE]`. |
 | `W_CADENCE_OVERDUE` | warning | `personal.cadence_overdue` | A person with `cadence: <N>d` has no touchpoint (`touch`, `session`, or dated `interaction`) on or after `as_of - N days` (`personal@0.1`). |
 | `W_DATE_UPCOMING` | warning | `personal.date_upcoming` | A person's `birthday` or an entry in `dates` occurs within `0..=personal.date_upcoming_days` days of `as_of` (`personal@0.1`). |
 | `E_DUPLICATE_SRC` | error | | The same `src:` provenance appears on two ledger lines. The message does not echo the `src:` value. |
