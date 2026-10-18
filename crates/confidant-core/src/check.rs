@@ -24,6 +24,9 @@ use crate::error::DomainError;
 use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
 use crate::packs::{find_conflict, OrphanOwners, Pack, PackState, CORE_EDGE_KINDS};
+
+/// #438: external pack problems, for the fail-closed finding conversion.
+use crate::packs::external as packs_external;
 use crate::record::{parse_ref_id, parse_with_list, FrontmatterRef, RecordKind};
 use crate::vault::Vault;
 
@@ -79,6 +82,7 @@ pub enum FindingCode {
     PackOrphan,
     PackHash,
     PackInvalid,
+    PackVersion,
     InvalidId,
     InvalidFilename,
     IdPathMismatch,
@@ -132,6 +136,7 @@ impl FindingCode {
             Self::PackOrphan => "W_PACK_ORPHAN",
             Self::PackHash => "E_PACK_HASH",
             Self::PackInvalid => "E_PACK_INVALID",
+            Self::PackVersion => "E_PACK_VERSION",
             Self::InvalidId => "E_INVALID_ID",
             Self::InvalidFilename => "E_INVALID_FILENAME",
             Self::IdPathMismatch => "E_ID_PATH_MISMATCH",
@@ -186,6 +191,7 @@ impl FindingCode {
         "W_PACK_ORPHAN",
         "E_PACK_HASH",
         "E_PACK_INVALID",
+        "E_PACK_VERSION",
         "E_INVALID_ID",
         "E_INVALID_FILENAME",
         "E_ID_PATH_MISMATCH",
@@ -439,16 +445,23 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     }
 
     let (enabled_packs, unknown_packs) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    for _ in &unknown_packs {
-        findings.push(
-            Finding::new(
-                FindingCode::PackUnknown,
-                Severity::Error,
-                "unknown pack".to_owned(),
-            )
-            .at_file("confidant.toml")
-            .with_fix("Remove the pack or use a CLI that implements it"),
-        );
+    for listed in &unknown_packs {
+        // #438: a listed pack that exists but failed to load becomes its
+        // specific finding (fail closed, PD12; problem packs are not
+        // folded). One that is neither compiled nor resolvable at all
+        // stays E_PACK_UNKNOWN.
+        match vault.pack_problems.iter().find(|p| p.name == *listed) {
+            Some(problem) => findings.push(pack_problem_finding(problem)),
+            None => findings.push(
+                Finding::new(
+                    FindingCode::PackUnknown,
+                    Severity::Error,
+                    "unknown pack".to_owned(),
+                )
+                .at_file("confidant.toml")
+                .with_fix("Remove the pack or use a CLI that implements it"),
+            ),
+        }
     }
 
     let spec_ok = vault.config.spec == SPEC_VERSION;
@@ -477,7 +490,17 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
         );
     }
 
-    let known_verbs = known_verbs(&enabled_packs);
+    let mut known_verbs = known_verbs(&enabled_packs);
+    // Problem packs are not folded, but their claimed verbs stay known
+    // (spec/pack-lock.md §5) so the failure does not cascade into
+    // E_UNKNOWN_VERB noise. Verbs leak into the `&'static str` set.
+    for problem in &vault.pack_problems {
+        for verb in &problem.known_verbs {
+            // The set holds `'static` strs (pack claims); leak the verb
+            // name once so it fits.
+            known_verbs.insert(Box::leak(verb.clone().into_boxed_str()));
+        }
+    }
     let orphans = vault.pack_registry().orphan_owners(&enabled_packs);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
@@ -512,6 +535,43 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
 
     sort_findings(&mut findings);
     finish_report(vault, options, findings)
+}
+
+/// #438: one failed external-pack load becomes its stable finding (PD12,
+/// fail closed). Messages stay generic and name-free: the privacy
+/// contract keeps operator-authored free text (a pack id listed in
+/// `confidant.toml`) out of findings (`check_messages_do_not_echo_
+/// vault_free_text`), and AGENTS.md rule 7 gates finding-semantics
+/// changes behind a review — the `[pack-install-review]` question asks
+/// whether the pack name may join the message once approved. The code
+/// and fix identify the failure; the config list names the packs.
+fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
+    use packs_external::PackProblemKind as Kind;
+    let (code, message, fix) = match problem.kind {
+        Kind::Unknown => (
+            FindingCode::PackUnknown,
+            "an external pack listed in confidant.toml has no lockfile pin",
+            "Run `confidant pack add <https-url>` or remove the pack",
+        ),
+        Kind::Hash => (
+            FindingCode::PackHash,
+            "an external pack's vendored files do not match its lockfile pin",
+            "Reinstall the pack (`confidant pack add`) or fix confidant.lock",
+        ),
+        Kind::Invalid => (
+            FindingCode::PackInvalid,
+            "an external pack's manifest or contents fail validation",
+            "Fix the vendored files or reinstall the pack",
+        ),
+        Kind::Version => (
+            FindingCode::PackVersion,
+            "an external pack's spec compatibility does not include this vault",
+            "Upgrade this CLI or pin a version the pack supports",
+        ),
+    };
+    Finding::new(code, Severity::Error, message.to_owned())
+        .at_file("confidant.toml")
+        .with_fix(fix)
 }
 
 fn finish_report(vault: &Vault, options: &CheckOptions, findings: Vec<Finding>) -> CheckReport {
@@ -1722,6 +1782,7 @@ mod tests {
             FindingCode::PackOrphan,
             FindingCode::PackHash,
             FindingCode::PackInvalid,
+            FindingCode::PackVersion,
             FindingCode::InvalidId,
             FindingCode::InvalidFilename,
             FindingCode::IdPathMismatch,
@@ -1772,6 +1833,7 @@ mod tests {
                 | FindingCode::PackOrphan
                 | FindingCode::PackHash
                 | FindingCode::PackInvalid
+                | FindingCode::PackVersion
                 | FindingCode::InvalidId
                 | FindingCode::InvalidFilename
                 | FindingCode::IdPathMismatch

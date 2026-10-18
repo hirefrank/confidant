@@ -23,6 +23,7 @@ use crate::vault::{SourcedEntry, Vault};
 
 pub mod coaching;
 pub mod dir;
+pub mod external;
 pub mod grammars;
 pub mod groups;
 pub mod lock;

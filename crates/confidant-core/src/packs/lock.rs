@@ -51,6 +51,21 @@ impl LockEntry {
     pub fn id(&self) -> String {
         format!("{}@{}", self.name, self.version)
     }
+
+    /// Validate the entry's fields (PD5). Writers (#440) call this
+    /// before serializing, so a lockfile this module writes is always
+    /// one its own reader accepts; `upsert`/`to_bytes` stay infallible.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let toml = LockEntryToml {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            source: self.source.clone(),
+            rev: self.rev.clone(),
+            subdir: self.subdir.clone(),
+            hash: self.hash.clone(),
+        };
+        toml.validate(0).map(|_| ())
+    }
 }
 
 /// The parsed `confidant.lock`, always in canonical (sorted) order.
@@ -216,12 +231,7 @@ impl LockEntryToml {
     fn validate(self, index: usize) -> Result<LockEntry, DomainError> {
         let entry_name = format!("pack[{index}] name '{}'", self.name);
         let label = |detail: String| lockfile_err(format!("confidant.lock {entry_name}: {detail}"));
-        if self.name.trim() != self.name || self.name.is_empty() {
-            return Err(label(
-                "name must be a non-empty pack name without surrounding whitespace".to_owned(),
-            )
-            .with_fix("Give the entry the pack name, e.g. name = \"example-pack\""));
-        }
+        // The grammar check covers emptiness and whitespace (PD14).
         if !is_valid_pack_name(&self.name) {
             return Err(label(format!(
                 "name '{}' is not a valid pack name (must match ^[a-z][a-z0-9-]{{1,31}}$)",
@@ -246,6 +256,14 @@ impl LockEntryToml {
             .with_fix(
                 "Pin the https:// source the pack was installed from, or \"dir\" for --from-dir",
             ));
+        }
+        if is_https && url_has_userinfo(&self.source) {
+            // `https://user:token@host/...` would commit credentials to
+            // the vault (spec §1: plaintext, no private data).
+            return Err(
+                label("source must not embed credentials (user:token@host)".to_owned())
+                    .with_fix("Use a credential-free https URL; git supplies credentials itself"),
+            );
         }
 
         if is_dir_source {
@@ -315,6 +333,16 @@ fn is_sha256_hex(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Does the URL carry userinfo (`https://user:token@host/…`)? The
+/// authority part runs from after the scheme to the first `/`.
+fn url_has_userinfo(source: &str) -> bool {
+    let after_scheme = source.strip_prefix("https://").unwrap_or(source);
+    match after_scheme.find('/') {
+        Some(end) => after_scheme[..end].contains('@'),
+        None => after_scheme.contains('@'),
+    }
+}
+
 /// Why `subdir` is not a safe relative path inside the source repo.
 /// Absolute, `.`/`..`, and empty segments are refused; the repo-root
 /// form is the empty string, which never reaches this check.
@@ -325,6 +353,18 @@ fn subdir_problem(subdir: &str) -> Option<&'static str> {
     }
     if subdir.starts_with('/') {
         return Some("it is absolute");
+    }
+    // Windows is a target: a `\` or a drive/colon prefix must never be
+    // interpreted as a separator or device when #440 joins paths, and
+    // control characters (incl. NUL) have no business in a path.
+    if subdir.contains('\\') {
+        return Some("it contains a backslash; use '/' separators");
+    }
+    if subdir.contains(':') {
+        return Some("it contains a ':' (Windows drive/colon prefix)");
+    }
+    if subdir.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Some("it contains control characters");
     }
     if subdir.split('/').any(|c| matches!(c, "." | ".." | "")) {
         return Some("every segment must be a real directory name (no '.'/'..', no empty segments, no trailing slash)");
@@ -708,5 +748,81 @@ mod tests {
         lf.upsert(https_entry("example-pack", "0.1"));
         std::fs::write(dir.path().join("confidant.lock"), lf.to_toml()).unwrap();
         assert_eq!(read_lockfile(dir.path()).unwrap(), Some(lf));
+    }
+
+    #[test]
+    fn rejects_source_with_userinfo() {
+        let text = one_entry_text(
+            "\"https://user:token@example.invalid/o/p.git\"",
+            &format!("\"{REV}\""),
+            "\"\"",
+            &format!("\"{HASH}\""),
+        );
+        let err = Lockfile::parse(&text).expect_err("credentials must be refused");
+        assert!(
+            format!("{err}").contains("must not embed credentials"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_credential_free_source_with_at_in_path() {
+        // An `@` after the authority (repo path) is fine.
+        let text = one_entry_text(
+            "\"https://example.invalid/org/p@ack.git\"",
+            &format!("\"{REV}\""),
+            "\"\"",
+            &format!("\"{HASH}\""),
+        );
+        Lockfile::parse(&text).expect("userinfo check applies to the authority only");
+    }
+
+    #[test]
+    fn rejects_subdir_with_backslash_or_colon() {
+        for bad in ["a\\\\..\\\\..\\\\x", "C:foo"] {
+            let text = one_entry_text(
+                "\"https://example.invalid/o/p.git\"",
+                &format!("\"{REV}\""),
+                &format!("\"{bad}\""),
+                &format!("\"{HASH}\""),
+            );
+            let err = Lockfile::parse(&text).expect_err("must refuse");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("backslash") || msg.contains("':'"),
+                "{bad}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_subdir_with_control_chars() {
+        let text = one_entry_text(
+            "\"https://example.invalid/o/p.git\"",
+            &format!("\"{REV}\""),
+            "\"a\\u0001b\"",
+            &format!("\"{HASH}\""),
+        );
+        let err = Lockfile::parse(&text).expect_err("must refuse");
+        assert!(format!("{err}").contains("control characters"), "{err}");
+    }
+
+    #[test]
+    fn entry_validate_mirrors_parse_validation() {
+        let mut e = https_entry("example-pack", "0.1");
+        assert!(e.validate().is_ok());
+        e.hash = "sha256:short".to_owned();
+        assert!(e.validate().is_err());
+        e.hash = HASH.to_owned();
+        e.rev = "ZZ".to_owned();
+        assert!(e.validate().is_err());
+    }
+
+    #[test]
+    fn name_whitespace_check_is_covered_by_grammar() {
+        // The removed pre-check is subsumed: whitespace fails the grammar.
+        let text = one_entry_text("\"dir\"", "\"\"", "\"\"", &format!("\"{HASH}\""))
+            .replace("name = \"example-pack\"", "name = \" example-pack\"");
+        assert!(Lockfile::parse(&text).is_err());
     }
 }
