@@ -5520,9 +5520,7 @@ fn external_pack_installed_checks_clean() {
 fn external_pack_claiming_enabled_pack_verb_is_a_conflict() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    let manifest = fs::read_to_string(dir.path().join("packs/example-pack@0.1/manifest.toml"));
-    let _ = manifest;
-    // Vendor a pack whose verb is core (`session`): PD8 limit.
+    // Vendor a pack whose verb collides with coaching's (`session`).
     let pack_dir = dir.path().join("packs/example-pack@0.1");
     fs::create_dir_all(&pack_dir).unwrap();
     write(
@@ -5619,6 +5617,23 @@ fn external_pack_problems_report_their_codes() {
         "{json:?}"
     );
 
+    // Invalid: an unlisted file inside the vendored dir (PD7).
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/bin/run.sh",
+        "#!/bin/sh\n",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_INVALID".to_string()),
+        "{json:?}"
+    );
+    // Cleanup for the next case: remove the unlisted file.
+    fs::remove_file(dir.path().join("packs/example-pack@0.1/bin/run.sh")).unwrap();
+    fs::remove_dir(dir.path().join("packs/example-pack@0.1/bin")).unwrap();
+
     // Wrong spec listed in the manifest (reinstall with mismatched pin).
     let pack_dir = dir.path().join("packs/example-pack@0.1");
     fs::create_dir_all(&pack_dir).unwrap();
@@ -5693,5 +5708,50 @@ fn packs_dir_contents_are_not_records() {
     assert!(
         !dumped.contains("Not A Record"),
         "pack contents must not leak: {dumped}"
+    );
+}
+
+/// #493 review blocker: a symlinked vendored `manifest.toml` must not
+/// be followed — the pack fails closed (`E_PACK_INVALID` via
+/// `read_pack_dir`'s symlink rejection), and the best-effort verb read
+/// on problem paths does not follow the link either. Unix only (symlink
+/// creation needs it).
+#[cfg(unix)]
+#[test]
+fn vendored_manifest_symlink_is_refused_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    // Install a real pack, then replace manifest.toml with a symlink to
+    // a file OUTSIDE the vault holding a valid manifest: if the loader
+    // followed it, the pack would load; refusing is the contract.
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"example-pack@0.1\"",
+        DEFAULT_CHECKS,
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("manifest.toml"),
+        "manifest_version = 2\n",
+    )
+    .unwrap();
+    let manifest_path = dir.path().join("packs/example-pack@0.1/manifest.toml");
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("manifest.toml"), &manifest_path).unwrap();
+
+    let json = report_json(dir.path(), None);
+    let found = codes(&json);
+    assert!(
+        found.contains(&"E_PACK_INVALID".to_string()) || found.contains(&"E_PACK_HASH".to_string()),
+        "a symlinked vendored manifest must fail closed: {json:?}"
+    );
+    // The pack must NOT have loaded from the outside file.
+    let dumped = serde_json::to_string(&json).unwrap();
+    assert!(
+        !dumped.contains("greet verb loaded"),
+        "symlink must not be followed: {dumped}"
     );
 }

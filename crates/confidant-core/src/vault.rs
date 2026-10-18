@@ -156,22 +156,43 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     // keys the external manifests declare (#433). On an unsupported
     // spec, external packs are not resolved at all: the spec finding
     // already fails `check`, and loading would only stack noise.
-    let (pack_registry, pack_problems, external_manifests) = if config.spec == SPEC_VERSION {
-        let compiled = PackRegistry::compiled();
-        let load =
-            packs_external::load_external_packs(root, &config.spec, &config.packs, &compiled);
-        let mut registry = compiled;
-        for pack in &load.packs {
-            registry.register(*pack);
-        }
-        (registry, load.problems, load.manifests)
-    } else {
-        (PackRegistry::compiled(), Vec::new(), Vec::new())
-    };
+    let (pack_registry, pack_problems, external_manifests, lockfile_error) =
+        if config.spec == SPEC_VERSION {
+            let compiled = PackRegistry::compiled();
+            let load =
+                packs_external::load_external_packs(root, &config.spec, &config.packs, &compiled);
+            let mut registry = compiled;
+            for pack in &load.packs {
+                registry.register(*pack);
+            }
+            (registry, load.problems, load.manifests, load.lockfile_error)
+        } else {
+            (PackRegistry::compiled(), Vec::new(), Vec::new(), false)
+        };
 
     let mut manifests = crate::packs::pack_manifests_for_config();
     manifests.extend(external_manifests);
     let mut findings = config.config_findings_with(&manifests);
+
+    // #493 review: a broken lockfile is one finding covering the whole
+    // external list (mapped to E_PACK_INVALID), not one Unknown per
+    // listed pack pointing at `pack add` while the file itself is
+    // broken. The message is generic: the lockfile's own parse errors
+    // can quote operator free text, which findings never echo.
+    if lockfile_error {
+        findings.push(
+            Finding::new(
+                FindingCode::PackInvalid,
+                Severity::Error,
+                "confidant.lock could not be read or parsed; external packs are not loaded"
+                    .to_owned(),
+            )
+            .at_file("confidant.lock")
+            .with_fix(
+                "Fix the lockfile (lock_version = 1, one [[pack]] per pinned pack, see spec/pack-lock.md), then re-run",
+            ),
+        );
+    }
     let mut records = BTreeMap::new();
     let mut path_ids = BTreeSet::new();
     let mut conflicted_ids = BTreeSet::new();

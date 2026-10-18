@@ -70,8 +70,15 @@ pub struct ExternalLoad {
     /// The loaded packs' leaked manifests (config order), for the
     /// `[checks]` key handling (#433/#438) and the evaluator (#441).
     pub manifests: Vec<&'static PackManifest>,
-    /// The listed packs that failed to load, fail closed.
+    /// The listed packs that failed to load, fail closed. Empty when
+    /// `lockfile_error` is set: the lockfile finding covers the whole
+    /// list, and per-pack `Unknown`s would only stack noise on top of
+    /// it (each pack gets its finding from the one broken pin).
     pub problems: Vec<PackProblem>,
+    /// `confidant.lock` exists but could not be read or parsed. One
+    /// finding (mapped to `E_PACK_INVALID` by `check.rs`) covers every
+    /// listed external pack; no per-pack findings are produced.
+    pub lockfile_error: bool,
 }
 
 impl std::fmt::Debug for ExternalLoad {
@@ -276,13 +283,47 @@ fn manifest_verb_names(manifest: Option<&PackManifest>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Read the vendored `manifest.toml` text (best effort; file contents
-/// are used for parsing only, never reported).
-fn vendored_manifest_text(dir: &std::path::Path) -> Option<PackManifest> {
-    std::fs::read_to_string(dir.join("manifest.toml"))
-        .ok()
-        .and_then(|text| parse_manifest_external(&text).ok())
+/// Parse the vendored manifest from the bytes `read_pack_dir` hashed
+/// and vetted — the success path's only manifest source.
+fn manifest_from_packed(packed: &crate::packs::dir::PackDir) -> Option<PackManifest> {
+    let bytes = packed.files.get("manifest.toml")?;
+    let text = String::from_utf8(bytes.clone()).ok()?;
+    parse_manifest_external(&text).ok()
 }
+
+/// Best-effort vendored-manifest verbs for a problem path: the read is
+/// vetted (see [`vendored_manifest_text`]); an unusable read degrades
+/// to no known verbs rather than following a link.
+fn best_effort_manifest_verbs(dir: &std::path::Path) -> Vec<String> {
+    manifest_verb_names(vendored_manifest_text(dir).as_ref())
+}
+
+/// Best-effort parse of the vendored `manifest.toml` for problem paths
+/// only (the success path parses the hashed bytes instead, so what is
+/// loaded is exactly what was verified). The read is vetted: only a
+/// regular file (never a symlink — `read_pack_dir` would reject one),
+/// at most `MAX_MANIFEST_BYTES` (the same bound `read_pack_dir` uses
+/// per file), so a hostile pack cannot hang or OOM `check`. File
+/// contents are used for parsing only, never reported.
+fn vendored_manifest_text(dir: &std::path::Path) -> Option<PackManifest> {
+    let path = dir.join("manifest.toml");
+    // `symlink_metadata` never follows the link, so a symlinked
+    // manifest.toml (or any non-regular file) is refused on every
+    // platform — `read_pack_dir` rejects symlinks outright, and this
+    // best-effort read must not be a way around that.
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    if meta.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    parse_manifest_external(&text).ok()
+}
+
+/// The per-file size bound `read_pack_dir` enforces (1 MiB).
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// Vendored pack directory relative to the vault root: `packs/<name>@<version>`.
 fn vendored_rel(name: &str, version: &str) -> String {
@@ -320,21 +361,16 @@ pub fn load_external_packs(
     let lock = match read_lockfile(root) {
         Ok(Some(lock)) => lock,
         Ok(None) => Lockfile::default(),
-        Err(err) => {
-            let problems = names
-                .iter()
-                .filter(|listed| !is_compiled(listed))
-                .map(|listed| PackProblem {
-                    name: listed.clone(),
-                    kind: PackProblemKind::Unknown,
-                    detail: format!("confidant.lock cannot be read: {err}"),
-                    known_verbs: Vec::new(),
-                })
-                .collect();
+        Err(_err) => {
+            // The broken pin covers the whole list: one lockfile finding
+            // (mapped to E_PACK_INVALID by check.rs), no per-pack
+            // findings (#493 review). The error's own text can quote
+            // operator free text, so it never reaches a finding.
             return ExternalLoad {
                 packs: Vec::new(),
                 manifests: Vec::new(),
-                problems,
+                problems: Vec::new(),
+                lockfile_error: true,
             };
         }
     };
@@ -386,8 +422,6 @@ pub fn load_external_packs(
             });
             continue;
         }
-        let vendored_manifest = vendored_manifest_text(&dir);
-
         // (c)/(e) read_pack_dir error -> Invalid.
         let packed = match read_pack_dir(&dir) {
             Ok(packed) => packed,
@@ -396,7 +430,7 @@ pub fn load_external_packs(
                     name: listed.clone(),
                     kind: PackProblemKind::Invalid,
                     detail: err.to_string(),
-                    known_verbs: manifest_verb_names(vendored_manifest.as_ref()),
+                    known_verbs: best_effort_manifest_verbs(&dir),
                 });
                 continue;
             }
@@ -404,8 +438,10 @@ pub fn load_external_packs(
 
         // (d) Hash differs from the lock pin -> Hash. The vendored
         // (unverified) manifest still sells the verbs; the content is
-        // not trusted for anything else.
+        // not trusted for anything else. The manifest comes from the
+        // bytes `read_pack_dir` hashed (never a fresh, unvetted read).
         if packed.hash != entry.hash {
+            let vendored_manifest = manifest_from_packed(&packed);
             problems.push(PackProblem {
                 name: listed.clone(),
                 kind: PackProblemKind::Hash,
@@ -418,16 +454,21 @@ pub fn load_external_packs(
             continue;
         }
 
-        // Note: `read_pack_dir` could not have succeeded without parsing
-        // `manifest.toml`, so the manifest here is always `Some`.
-        let Some(manifest) = vendored_manifest else {
-            problems.push(PackProblem {
-                name: listed.clone(),
-                kind: PackProblemKind::Invalid,
-                detail: "the vendored manifest.toml does not parse".to_owned(),
-                known_verbs: Vec::new(),
-            });
-            continue;
+        // `read_pack_dir` hashed and vetted the files, but this module's
+        // own schema validation is the gate: parse the manifest from the
+        // hashed bytes so the loaded manifest is exactly the verified
+        // content.
+        let manifest = match manifest_from_packed(&packed) {
+            Some(manifest) => manifest,
+            None => {
+                problems.push(PackProblem {
+                    name: listed.clone(),
+                    kind: PackProblemKind::Invalid,
+                    detail: "the vendored manifest.toml does not parse".to_owned(),
+                    known_verbs: Vec::new(),
+                });
+                continue;
+            }
         };
 
         // (f) Identity mismatch -> Invalid.
@@ -473,6 +514,7 @@ pub fn load_external_packs(
         packs,
         manifests,
         problems,
+        lockfile_error: false,
     }
 }
 
@@ -570,7 +612,11 @@ grammar = "non-empty-string"
     }
 
     #[test]
-    fn unreadable_lockfile_fails_every_external_closed() {
+    fn unreadable_lockfile_is_one_finding_not_per_pack() {
+        // A broken pin covers the whole list: one lockfile problem (the
+        // loader maps it to E_PACK_INVALID), no per-pack Unknowns that
+        // would point the operator at `pack add` while the file itself
+        // is broken (review of #493).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("confidant.lock"), "lock_version = 999\n").unwrap();
         let compiled = PackRegistry::compiled();
@@ -580,11 +626,8 @@ grammar = "non-empty-string"
             &["a@1".to_owned(), "b@2".to_owned()],
             &compiled,
         );
-        assert_eq!(load.problems.len(), 2);
-        assert!(load
-            .problems
-            .iter()
-            .all(|p| p.kind == PackProblemKind::Unknown));
+        assert!(load.lockfile_error, "{:?}", load.lockfile_error);
+        assert!(load.problems.is_empty(), "{:?}", load.problems);
     }
 
     #[test]
