@@ -548,14 +548,28 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
 fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
     use packs_external::PackProblemKind as Kind;
     let (code, message, fix) = match problem.kind {
-        Kind::Unknown => (
-            FindingCode::PackUnknown,
-            format!(
-                "external pack {} listed in confidant.toml has no lockfile pin",
-                problem.name
-            ),
-            "Run `confidant pack add <https-url>` or remove the pack",
-        ),
+        Kind::Unknown => {
+            // The echo carve-out (#490) is for a real `name@version` pin
+            // only. `load_external_packs` also emits `Unknown` for a listed
+            // id that is not of that shape (no `@`), and that raw string is
+            // operator free text and must stay name-free.
+            let is_pin = problem
+                .name
+                .split_once('@')
+                .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty());
+            (
+                FindingCode::PackUnknown,
+                if is_pin {
+                    format!(
+                        "external pack {} listed in confidant.toml has no lockfile pin",
+                        problem.name
+                    )
+                } else {
+                    "a pack listed in confidant.toml is not a name@version pin".to_owned()
+                },
+                "Run `confidant pack add <https-url>` or remove the pack",
+            )
+        }
         Kind::Hash => (
             FindingCode::PackHash,
             format!(

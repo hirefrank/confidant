@@ -5592,6 +5592,35 @@ name = "session"
 /// `confidant.toml`; `E_PACK_HASH`/`E_PACK_INVALID` also point at the
 /// vendored path in `file`. Record/ledger free text still never echoes.
 #[test]
+fn external_pack_malformed_id_does_not_echo() {
+    // A listed id that is not `name@version` is operator free text, not a
+    // pin: it must stay out of findings even though the pin carve-out
+    // (#490) lets a real pin echo.
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    external_vault_toml(
+        dir.path(),
+        "\"coaching@0.1\", \"justaname\"",
+        DEFAULT_CHECKS,
+    );
+    let json = report_json(dir.path(), None);
+    let unknown = finding_by_code(&json, "E_PACK_UNKNOWN");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .unwrap()
+            .contains("name@version"),
+        "{}",
+        unknown["message"]
+    );
+    let dumped = serde_json::to_string(&json).unwrap();
+    assert!(
+        !dumped.contains("justaname"),
+        "malformed id echoed: {dumped}"
+    );
+}
+
+#[test]
 fn external_pack_problems_report_their_codes() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
