@@ -3,16 +3,14 @@
 //
 // Refuse symbolic links, classify directory entries without following them,
 // and write atomically via a uniquely named temporary file plus rename.
-// Unix (including macOS) uses the openat / O_NOFOLLOW walk. The portable
-// symlink_metadata walk is compiled only for non-Unix targets (ADR-13).
+// Each component is opened with `openat` and `O_NOFOLLOW`.
 
 //! Symlink-safe access to files beneath a vault root.
 //!
 //! Every file Confidant reads or writes lives beneath one vault root. A path
 //! is never handed to the operating system as a single string that might
-//! contain `..` or a planted symlink. On Unix each component is opened with
-//! `openat` and `O_NOFOLLOW`. Elsewhere each component is checked with
-//! `symlink_metadata` before descending.
+//! contain `..` or a planted symlink. Each component is opened with
+//! `openat` and `O_NOFOLLOW`.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -375,15 +373,8 @@ pub fn write_replace(root: &Path, relative: &Path, contents: &[u8]) -> Result<()
             }
         };
         if let Some(mode) = existing_mode {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = mode;
-            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
         }
         let staged = file
             .write_all(contents)
@@ -450,13 +441,11 @@ pub fn skip_walk_entry(name: &str, kind: EntryKind) -> bool {
 }
 
 /// A directory reached without following a symbolic link.
-#[cfg(unix)]
 struct Directory {
     descriptor: std::os::fd::OwnedFd,
     path: PathBuf,
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 mod unix {
     use std::ffi::{CString, OsStr, OsString};
@@ -690,141 +679,12 @@ mod unix {
     }
 }
 
-/// Portable fallback used only where `openat` is unavailable.
-#[cfg(not(unix))]
-struct Directory {
-    path: PathBuf,
-}
-
-#[cfg(not(unix))]
-mod portable {
-    use std::ffi::OsStr;
-    use std::fs::{File, OpenOptions};
-    use std::io;
-    use std::path::{Path, PathBuf};
-
-    use super::{Directory, EntryKind};
-
-    type ChildListing = Vec<Result<(std::ffi::OsString, EntryKind), (String, io::Error)>>;
-
-    fn kind_of(path: &Path) -> io::Result<EntryKind> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        Ok(EntryKind::from_metadata(&metadata))
-    }
-
-    impl Directory {
-        pub(super) fn open_root(path: &Path) -> io::Result<Self> {
-            match kind_of(path)? {
-                EntryKind::Directory => Ok(Self {
-                    path: path.to_path_buf(),
-                }),
-                _ => Err(io::Error::other("the vault root is not a directory")),
-            }
-        }
-
-        pub(super) fn open_child_directory(&self, name: &OsStr) -> io::Result<Self> {
-            let path = self.path.join(name);
-            match kind_of(&path)? {
-                EntryKind::Directory => Ok(Self { path }),
-                EntryKind::Symlink => Err(io::Error::other("component is a symbolic link")),
-                _ => Err(io::Error::other("component is not a directory")),
-            }
-        }
-
-        pub(super) fn create_child_directory(&self, name: &OsStr) -> io::Result<()> {
-            std::fs::create_dir(self.path.join(name))
-        }
-
-        fn checked_child(&self, name: &OsStr) -> io::Result<PathBuf> {
-            let path = self.path.join(name);
-            match kind_of(&path) {
-                Ok(EntryKind::Symlink) => Err(io::Error::other("entry is a symbolic link")),
-                Ok(_) => Ok(path),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
-                Err(error) => Err(error),
-            }
-        }
-
-        pub(super) fn open_child_file(&self, name: &OsStr) -> io::Result<File> {
-            File::open(self.checked_child(name)?)
-        }
-
-        pub(super) fn create_child_file(&self, name: &OsStr) -> io::Result<File> {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(self.checked_child(name)?)
-        }
-
-        pub(super) fn child_kind(&self, name: &OsStr) -> io::Result<EntryKind> {
-            kind_of(&self.path.join(name))
-        }
-
-        pub(super) fn child_mode(&self, name: &OsStr) -> io::Result<u32> {
-            let metadata = std::fs::symlink_metadata(self.path.join(name))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                Ok(metadata.permissions().mode() & 0o7777)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = metadata;
-                Ok(0o600)
-            }
-        }
-
-        pub(super) fn read_children(&self) -> io::Result<ChildListing> {
-            let mut out = Vec::new();
-            for ent in std::fs::read_dir(&self.path)? {
-                match ent {
-                    Err(error) => out.push(Err(("<entry>".to_owned(), error))),
-                    Ok(ent) => {
-                        let os_name = ent.file_name();
-                        match self.child_kind(&os_name) {
-                            Ok(kind) => out.push(Ok((os_name, kind))),
-                            Err(error) => {
-                                out.push(Err((os_name.to_string_lossy().into_owned(), error)))
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(out)
-        }
-
-        pub(super) fn rename_child(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
-            std::fs::rename(self.checked_child(from)?, self.checked_child(to)?)
-        }
-
-        pub(super) fn unlink_child(&self, name: &OsStr) -> io::Result<()> {
-            std::fs::remove_file(self.checked_child(name)?)
-        }
-
-        pub(super) fn sync(&self) -> io::Result<()> {
-            if let Ok(dir) = File::open(&self.path) {
-                let _ = dir.sync_all();
-            }
-            Ok(())
-        }
-
-        pub(super) fn resolved(&self) -> &Path {
-            &self.path
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{components, read_to_string, write_replace};
+    use super::{read_dir, resolve, EntryKind};
     use std::fs;
     use std::path::Path;
-    // Only the `#[cfg(unix)]` tests below use these. Importing them
-    // unconditionally fails the Windows build of the test target: those
-    // tests are compiled out there, so the imports are unused and CI sets
-    // `-D warnings`.
-    #[cfg(unix)]
-    use super::{read_dir, resolve, EntryKind};
 
     #[test]
     fn rejects_parent_components() {
@@ -852,7 +712,6 @@ mod tests {
         assert_eq!(leftovers.len(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn write_replace_keeps_existing_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -870,7 +729,6 @@ mod tests {
         assert_eq!(read_to_string(dir.path(), rel).unwrap(), "second");
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_symlink_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -885,7 +743,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "secret");
     }
 
-    #[cfg(unix)]
     #[test]
     fn lists_without_following() {
         let dir = tempfile::tempdir().unwrap();

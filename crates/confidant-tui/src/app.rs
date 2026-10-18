@@ -1770,12 +1770,8 @@ fn qmd_available_on(
     path_var: Option<&std::ffi::OsStr>,
     vault_root: Option<&std::path::Path>,
 ) -> bool {
-    let on_path = path_var.is_some_and(|paths| {
-        std::env::split_paths(paths).any(|dir| {
-            dir.join(if cfg!(windows) { "qmd.exe" } else { "qmd" })
-                .is_file()
-        })
-    });
+    let on_path = path_var
+        .is_some_and(|paths| std::env::split_paths(paths).any(|dir| dir.join("qmd").is_file()));
     if !on_path {
         return false;
     }
@@ -1796,7 +1792,7 @@ mod tests {
         let vault = tmp.path().join("vault");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::create_dir_all(vault.join(".confidant/qmd-corpus")).unwrap();
-        let qmd_name = if cfg!(windows) { "qmd.exe" } else { "qmd" };
+        let qmd_name = "qmd";
         let path_var = std::ffi::OsString::from(bin_dir.as_os_str());
 
         // qmd file missing -> not available.

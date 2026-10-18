@@ -44,11 +44,7 @@ fn confidant_bin() -> PathBuf {
             .parent()
             .and_then(|p| p.parent())
             .expect("target/debug directory");
-        let bin_name = if cfg!(windows) {
-            "confidant.exe"
-        } else {
-            "confidant"
-        };
+        let bin_name = "confidant";
         let candidate = target_debug.join(bin_name);
         if !candidate.exists() {
             let status = Command::new(env!("CARGO"))

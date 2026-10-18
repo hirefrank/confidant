@@ -235,25 +235,15 @@ pub fn replace(
 fn write_file_0600_create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Load and validate the trust anchor.
@@ -307,37 +297,29 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
     let anchor = anchor_from_text(&text, &trust_path)?;
 
     // Permission warnings are unix-only: on other platforms there is nothing
-    // to check. Building the vec inside the cfg'd block keeps `mut` from
-    // tripping `-D warnings` (unused_mut) on Windows.
+    // Check loose file permissions and warn.
     let warnings: Vec<Warning> = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut warnings = Vec::new();
-            if let Ok(meta) = std::fs::metadata(config_dir) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode != 0o700 {
-                    warnings.push(Warning::LooseDirPermissions {
-                        path: config_dir.to_path_buf(),
-                        mode,
-                    });
-                }
+        use std::os::unix::fs::PermissionsExt;
+        let mut warnings = Vec::new();
+        if let Ok(meta) = std::fs::metadata(config_dir) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o700 {
+                warnings.push(Warning::LooseDirPermissions {
+                    path: config_dir.to_path_buf(),
+                    mode,
+                });
             }
-            if let Ok(meta) = std::fs::metadata(&trust_path) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode != 0o600 {
-                    warnings.push(Warning::LooseFilePermissions {
-                        path: trust_path.clone(),
-                        mode,
-                    });
-                }
+        }
+        if let Ok(meta) = std::fs::metadata(&trust_path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                warnings.push(Warning::LooseFilePermissions {
+                    path: trust_path.clone(),
+                    mode,
+                });
             }
-            warnings
         }
-        #[cfg(not(unix))]
-        {
-            Vec::new()
-        }
+        warnings
     };
 
     Ok((anchor, warnings))

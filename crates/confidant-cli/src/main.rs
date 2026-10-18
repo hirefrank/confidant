@@ -1639,23 +1639,16 @@ fn record_file_is_envelope(root: &Path, rel: &str) -> bool {
 /// Write a corpus file with mode `0600` from the start, so plaintext never
 /// exists with default (world-readable) permissions.
 fn write_corpus_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(contents)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents)?;
+    Ok(())
 }
 
 /// Corpus dirs `0700`, files `0600` (B3). Applied recursively after the
@@ -1663,23 +1656,16 @@ fn write_corpus_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// paths (the corpus root and files are already created with their final
 /// mode; this re-asserts it).
 fn harden_corpus_permissions(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                harden_corpus_permissions(&entry.path())?;
-            } else if file_type.is_file() {
-                std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
-            }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            harden_corpus_permissions(&entry.path())?;
+        } else if file_type.is_file() {
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
     }
     Ok(())
 }
@@ -2692,9 +2678,8 @@ fn offer_exe_path() -> PathBuf {
 
 /// Whether `update` may offer to run the update command itself (#376): the
 /// install method must be known and replacing the running binary must be
-/// safe. Windows cannot overwrite a running exe, so there `update` only
-/// ever prints the command. `self_replace_safe` is injected for tests;
-/// production passes `!cfg!(windows)`.
+/// safe. `self_replace_safe` is injected for tests; production passes `true`
+/// (unix always allows overwriting the running binary).
 fn offerable_update(method: InstallMethod, self_replace_safe: bool) -> bool {
     method.run_spec().is_some() && self_replace_safe
 }
@@ -3528,16 +3513,8 @@ fn cmd_record_resolve(
         return print_merge_result(cli, root, &id, &outcome, rekeyed);
     }
     if edit {
-        // #487 item 2: on non-unix the real `--edit` refuses as unsupported
-        // (`cmd_resolve_edit` never compiles there); the dry run refuses in
-        // step instead of reporting a write it could never perform.
-        #[cfg(not(unix))]
-        if cli.dry_run {
-            return unsupported_edit_error();
-        }
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
         // `load_sides` is the same decrypt check the real edit would do.
-        #[cfg(unix)]
         if cli.dry_run {
             let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
             return print_resolve_dry_run(
@@ -3806,15 +3783,8 @@ fn cmd_record_resolve_from_inbox(
         return print_merge_result(cli, root, id, &outcome, rekeyed);
     }
     if edit {
-        // #487 item 2: the from-inbox edit path refuses on non-unix
-        // (`cmd_resolve_edit_from_inbox`); the dry run refuses in step.
-        #[cfg(not(unix))]
-        if cli.dry_run {
-            return unsupported_edit_error();
-        }
         // #465: `--dry-run --edit` writes no scratch and installs nothing;
         // the editor path is the same otherwise (#457).
-        #[cfg(unix)]
         if cli.dry_run {
             return print_resolve_dry_run(
                 cli,
@@ -3842,7 +3812,6 @@ fn cmd_record_resolve_from_inbox(
 /// the operator's editor, with the inbox item as the theirs side.
 ///
 /// Reuses #455's scratch/edit/apply machinery; only the sides differ.
-#[cfg(unix)]
 fn cmd_resolve_edit_from_inbox(
     cli: &Cli,
     root: &Path,
@@ -3891,33 +3860,6 @@ fn cmd_resolve_edit_from_inbox(
     let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
     guard.cleanup();
     print_merge_result(cli, root, id, &outcome, rekeyed)
-}
-
-/// `--edit` needs 0600/0700 file modes; refuse on non-unix (CD5).
-#[cfg(not(unix))]
-fn cmd_resolve_edit_from_inbox(
-    _cli: &Cli,
-    _root: &Path,
-    _vault: &confidant_core::vault::Vault,
-    _id: &RecordId,
-    _id_raw: &str,
-    _sides: &record_resolve::LoadedSides,
-) -> anyhow::Result<ExitCode> {
-    unsupported_edit_error()
-}
-
-/// `--edit` needs 0600/0700 file modes: the non-unix arms refuse with this.
-///
-/// Deliberately not platform-gated, so a mistake in the error construction
-/// fails the ordinary Linux build (and pull-request CI) instead of only the
-/// Windows lane, which runs on push to `main`. On unix the two callers are
-/// compiled out, hence the `allow`.
-#[cfg_attr(unix, allow(dead_code))]
-fn unsupported_edit_error() -> anyhow::Result<ExitCode> {
-    Err(anyhow::Error::new(
-        DomainError::usage("`record resolve --edit` is not supported on this platform")
-            .with_fix("Use --merged-file with a file outside the vault"),
-    ))
 }
 
 fn print_merge_result(
@@ -4051,7 +3993,6 @@ fn print_resolve_dry_run(
 /// exits, the merged text goes through the shared validate → re-encrypt →
 /// stage path. Scratch is zero-overwritten and removed on every exit path
 /// via `ScratchGuard` (explicit on success, drop on error).
-#[cfg(unix)]
 fn cmd_resolve_edit(
     cli: &Cli,
     root: &Path,
@@ -4104,19 +4045,6 @@ fn cmd_resolve_edit(
     // Explicit cleanup on the success path (drop after is a no-op).
     guard.cleanup();
     print_merge_result(cli, root, id, &outcome, rekeyed)
-}
-
-/// `--edit` needs 0600/0700 file modes; refuse rather than falling back
-/// to insecure permissions on non-unix (CD5).
-#[cfg(not(unix))]
-fn cmd_resolve_edit(
-    _cli: &Cli,
-    _root: &Path,
-    _vault: &confidant_core::vault::Vault,
-    _id: &RecordId,
-    _id_raw: &str,
-) -> anyhow::Result<ExitCode> {
-    unsupported_edit_error()
 }
 
 /// Parameters for [`prepare_record_write`], bundled to keep the
@@ -6336,7 +6264,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                         (method.update_command(), method.run_spec())
                     {
                         println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
-                        if offerable_update(method, !cfg!(windows))
+                        if offerable_update(method, true)
                             && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
                         {
                             match run_offered_command(cmd, program, args) {
@@ -6454,24 +6382,12 @@ fn cmd_routing(cli: &Cli) -> anyhow::Result<ExitCode> {
 }
 
 /// Find `name` on `PATH`, returning the full path of the first match.
-/// Checks the platform executable suffix on Windows (`.exe`).
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            // npm shims install as `.cmd`/`.bat` (and `.exe` for some
-            // packages): `qmd` on Windows is typically `qmd.cmd`.
-            for ext in ["exe", "cmd", "bat"] {
-                let shim = dir.join(format!("{name}.{ext}"));
-                if shim.is_file() {
-                    return Some(shim);
-                }
-            }
         }
     }
     None
@@ -7341,35 +7257,23 @@ fn cmd_keys_device_add_initiate(
     } else if let Some(path) = output {
         // 0644 explicit: the request carries only the public key + label,
         // safe to transfer. Deliberate, not a default.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(document.as_bytes())
-                })
-                .map_err(|e| {
-                    anyhow::Error::new(DomainError::invalid(format!(
-                        "cannot write device-add request to {}: {e}",
-                        path.display()
-                    )))
-                })?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(path, &document).map_err(|e| {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(document.as_bytes())
+            })
+            .map_err(|e| {
                 anyhow::Error::new(DomainError::invalid(format!(
                     "cannot write device-add request to {}: {e}",
                     path.display()
                 )))
             })?;
-        }
         eprintln!("wrote device-add request to {}", path.display());
     } else {
         print!("{document}");
@@ -8312,21 +8216,14 @@ fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow
         std::fs::create_dir_all(parent)?;
     }
     // 0600 from creation: it names the shredded client (opaque id, but still).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)?
-            .write_all(content.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, content)?;
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(content.as_bytes())?;
     Ok(())
 }
 
@@ -9251,7 +9148,7 @@ mod tests {
     #[test]
     fn offerable_update_needs_known_method_and_safe_replacement() {
         assert!(offerable_update(InstallMethod::CargoInstall, true));
-        // Windows cannot overwrite a running exe: print only.
+        // Unsafe replacement: print only.
         assert!(!offerable_update(InstallMethod::CargoInstall, false));
         // Unknown method: nothing to run.
         assert!(!offerable_update(InstallMethod::Unknown, true));
