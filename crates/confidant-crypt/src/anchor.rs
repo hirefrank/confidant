@@ -296,7 +296,6 @@ pub fn load(config_dir: &Path, vault_path: &Path) -> Result<(Anchor, Vec<Warning
     })?;
     let anchor = anchor_from_text(&text, &trust_path)?;
 
-    // Permission warnings are unix-only: on other platforms there is nothing
     // Check loose file permissions and warn.
     let warnings: Vec<Warning> = {
         use std::os::unix::fs::PermissionsExt;
