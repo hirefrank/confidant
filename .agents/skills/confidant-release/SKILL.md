@@ -59,8 +59,8 @@ and skip crates.io.
 ### 3. Verify
 
 - `gh run watch` on the Release workflow, or check
-  `gh release view vX.Y.Z`: dist binaries (macOS arm64 + Intel, Linux,
-  Windows), shell/powershell/homebrew installers, SHA-256 checksums.
+  `gh release view vX.Y.Z`: dist binaries (macOS arm64 + Intel, Linux),
+  shell/homebrew installers, SHA-256 checksums.
 - Build-provenance attestations: `gh attestation verify`.
 - crates.io: `confidant-crypt`, then `confidant-core`, then
   `confidant-cli` appear at the new version (trusted publishing via
