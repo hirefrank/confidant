@@ -11,6 +11,7 @@
 
 mod embedded;
 mod mcp;
+mod pack_fetch;
 mod record_crypto;
 mod record_decrypt;
 mod record_resolve;
@@ -177,6 +178,13 @@ enum Command {
     Record {
         #[command(subcommand)]
         action: RecordAction,
+    },
+    /// Fetch and review a candidate pack (read-only; writes nothing).
+    ///
+    /// Operator-only: `pack` is not in the MCP tool whitelist.
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
     },
     /// Context bundle for one person (honors no-ai).
     Context {
@@ -445,6 +453,23 @@ enum LogAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum PackAction {
+    /// Fetch a candidate pack, validate it, and print a review report.
+    ///
+    /// Writes nothing to the vault: applying a pack is a separate step.
+    Add {
+        /// `https://` git URL, optionally `#<ref>` (tag, branch or commit).
+        url: Option<String>,
+        /// Fetch from a local directory instead of the network.
+        #[arg(long)]
+        from_dir: Option<PathBuf>,
+        /// Path inside the fetched repository holding the pack.
+        #[arg(long)]
+        subdir: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RecordAction {
     /// Add a record from a markdown file (front matter must include id and type).
     Add {
@@ -612,6 +637,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Routing
             | Command::Tui { .. }
             | Command::BenchGen { .. }
+            | Command::Pack { .. }
             | Command::Keys {
                 action: KeysAction::DeviceAdd { initiate: true, .. },
             }
@@ -901,6 +927,19 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 } => cmd_note_add(&cli, &root, person, date.clone(), *no_ai, body_file),
             }
         }
+        Command::Pack { action } => match action {
+            PackAction::Add {
+                url,
+                from_dir,
+                subdir,
+            } => cmd_pack_add(
+                &cli,
+                vault_root.as_deref(),
+                url.as_deref(),
+                from_dir.as_deref(),
+                subdir.as_deref(),
+            ),
+        },
         Command::Record { action } => {
             let root = vault_root.unwrap();
             match action {
@@ -1123,6 +1162,62 @@ fn vault_json(root: Option<&Path>) -> Value {
         Some(p) => Value::String(p.display().to_string()),
         None => Value::Null,
     }
+}
+
+/// Fetch a candidate pack, validate it, and print a review report (#439).
+///
+/// Read-only: the fetch happens in a temp directory and nothing under the
+/// vault is created. Operator-only: `pack` is not in the MCP tool
+/// whitelist.
+fn cmd_pack_add(
+    cli: &Cli,
+    vault_root: Option<&Path>,
+    url: Option<&str>,
+    from_dir: Option<&Path>,
+    subdir: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let source = pack_fetch::parse_add_source(url, from_dir)?;
+    let fetched = pack_fetch::fetch(&source, subdir.unwrap_or(""))?;
+    let report = pack_fetch::describe(&fetched)?;
+    if cli.json {
+        let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
+        print_json(&ok_envelope(vault_root, payload))?;
+    } else {
+        // Everything here except `rev` (40 hex) and `hash` (ours) comes from
+        // an untrusted repository, so control characters are escaped before
+        // they reach the terminal: a hostile SKILL.md must not be able to
+        // hide the lines the operator is meant to read (PD10).
+        println!(
+            "pack    {}@{}",
+            pack_fetch::sanitize_untrusted(&report.name),
+            pack_fetch::sanitize_untrusted(&report.version)
+        );
+        println!(
+            "source  {}",
+            pack_fetch::sanitize_untrusted(&fetched.source)
+        );
+        println!(
+            "rev     {}",
+            if fetched.rev.is_empty() {
+                "(none: local directory)"
+            } else {
+                fetched.rev.as_str()
+            }
+        );
+        println!(
+            "subdir  {}",
+            if fetched.subdir.is_empty() {
+                "(root)".to_string()
+            } else {
+                pack_fetch::sanitize_untrusted(&fetched.subdir)
+            }
+        );
+        for line in report.human_lines() {
+            println!("{line}");
+        }
+        println!("nothing was written: applying a pack is a separate step");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Standard `--json` envelope for successful command output.
