@@ -8,6 +8,74 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-18
+
+**Disclosure:** the milestone 2 encryption has had no outside review
+([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
+other people's client data in a vault until the audit lands.
+
+**Breaking:** native Windows is no longer a supported target. macOS and
+Linux are supported as-is; Windows users run Confidant under WSL2.
+
+### Added
+- External packs: a pack with no compiled Rust can be listed in
+  `confidant.toml` and resolved from the vault's own install state. The pack
+  registry is a runtime value now (#432); the spec covers manifest v2, the
+  rule-kind framework, the lockfile, and the vendored layout (#431); a v2
+  manifest adds `requires_spec`, `[[rules]]` and the capability limits
+  (#435); `confidant.lock` pins `name@version` to a content hash with a
+  byte-stable canonical form (#437); a pack directory reader computes the
+  canonical tree hash behind the file-count and size limits (#436); and
+  loading at check time fails closed to `E_PACK_UNKNOWN` /
+  `E_PACK_HASH` / `E_PACK_INVALID` / `E_PACK_VERSION` findings, so a problem
+  pack never folds (#438, #434).
+- `confidant pack add <https-url>[#<ref>] [--from-dir <dir>] [--subdir <path>]`:
+  fetches a candidate pack into a temp directory, validates it with the same
+  reader the loader uses, and prints a review report. It writes nothing to
+  the vault and stays off the MCP whitelist (#439).
+- Declarative pack checks: a manifest declares rules and a named rule kind
+  implemented once in Rust evaluates them, validated at pack load so a bad
+  rule fails closed before anything folds (#441). First kind:
+  `cadence-overdue`, matching `personal@0.1`'s keep-in-touch semantics
+  (#442).
+- Conflict resolution: split a git-conflicted file into its two sides
+  (#451); `record resolve <id> --show` prints both decrypted sides (#453);
+  `--take ours/theirs` installs the chosen side byte for byte (#454);
+  `--merged-file` and `--edit` hand-merge paths (#455); a Conflicts tab in
+  the TUI that reviews both sides and picks or hand-merges (#456); and
+  `record resolve --from-inbox` with `inbox --discard` for an inbox item
+  targeting an existing record (#457).
+
+### Changed
+- Native Windows is unsupported (#502): the dist targets, powershell
+  installer and Windows CI jobs are gone (#506), the Windows-only code
+  paths are removed (#503, #507), and the remaining docs follow (#508).
+- External-pack problem findings name the pack and version;
+  `E_PACK_UNKNOWN` echoes the id only when it is a well-formed
+  `name@version` pin (#500, #511).
+- `[checks]` keys come from the loaded pack manifests, so a pack's own keys
+  work with no per-pack code; a typo under a known pack name is `E_CONFIG`
+  again instead of a silent fall-through to the default (#433).
+- `check` says an encrypted `E_MERGE_CONFLICT` record has two versions and
+  points at `record resolve`; every other conflicted file keeps the generic
+  message (#452). A merge that still contains conflict markers is refused
+  (#473).
+- `record resolve --from-inbox` write actions run the drain's signed-tip
+  trust check against the tip that was read, honour `--allow-unsigned`
+  like the drain, and refuse on a moved tip with `E_INBOX_RACE` (#457).
+- `cargo deny` exempts the unmaintained `zvariant` / `zbus_names` /
+  `zvariant_derive` advisories, reached only through the Linux keyring
+  backend, and drops a stale ignore (#469).
+
+### Fixed
+- `record resolve` honours the global `--dry-run` on every write path
+  (`--take`, `--merged-file`, `--edit`, and their `--from-inbox` variants),
+  running its read-only validation and reporting what it would do without
+  touching the vault, index, scratch, or inbox (#465).
+- Inbox item bodies keep their final newline, so a drained record matches
+  the canonical form and `record resolve --take theirs` no longer reports a
+  spurious `E_INBOX_CONFLICT` (#457).
+
 ## [0.4.0] - 2026-10-16
 
 **Disclosure:** the milestone 2 encryption has had no outside review
@@ -190,7 +258,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/hirefrank/confidant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hirefrank/confidant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hirefrank/confidant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/hirefrank/confidant/compare/v0.2.0...v0.3.0
