@@ -26,10 +26,17 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// still rejects 2.
 pub const MANIFEST_VERSION_V2: u32 = 2;
 
-/// Rule kinds an external pack may declare (`[[rules]]`). Starts empty;
-/// each kind's own issue appends its name (PD1). Until a kind lands, any
+/// Rule kinds an external pack may declare (`[[rules]]`). Derived from
+/// the evaluator's registered kinds (#441) so the manifest's list and
+/// what actually runs cannot drift. Starts empty; each kind's own issue
+/// appends its kind to `rule_kinds()` (PD1). Until a kind lands, any
 /// `[[rules]]` entry is rejected as an unknown kind.
-pub const KNOWN_RULE_KINDS: &[&str] = &[];
+pub fn known_rule_kinds() -> Vec<&'static str> {
+    crate::packs::declarative::registered_rule_kinds()
+        .iter()
+        .map(|k| k.name())
+        .collect()
+}
 
 /// Core ledger verbs no external pack may claim (PD8 rule 1).
 const CORE_VERBS_V2: &[&str] = &["alias", "merge", "stage", "balance", "touch"];
@@ -315,6 +322,7 @@ impl PackManifest {
             ))
             .with_fix("Set manifest_version = 1 or upgrade the CLI"));
         }
+
         self.validate_common()
     }
 
@@ -366,11 +374,14 @@ impl PackManifest {
 
         // PD13: every finding_codes entry must pass the shape and collision
         // rules. Leak once at load time (same Box::leak pattern as #434).
+        // A builtin code is allowed as an *emission claim* (#441): the v2
+        // spec example (spec/pack-manifest.md §2) lists `E_FRONTMATTER`
+        // this way, with the pack supplying only a template shell.
         for code in &self.finding_codes {
             let leaked: &'static str = Box::leak(code.clone().into_boxed_str());
-            FindingCode::from_pack_str(leaked).map_err(|e| {
+            FindingCode::from_pack_str_or_builtin(leaked).map_err(|e| {
                 manifest_err(format!("finding code '{code}' is invalid: {e}")).with_fix(
-                    "Codes must match ^[EW]_[A-Z0-9_]{2,40}$ and must not collide with an existing code",
+                    "Codes must match ^[EW]_[A-Z0-9_]{2,40}$; a pack-own code must not collide with an existing code",
                 )
             })?;
         }
@@ -446,7 +457,19 @@ impl PackManifest {
             .map(|s| s.key.as_str())
             .collect();
         for rule in &self.rules {
-            if !KNOWN_RULE_KINDS.contains(&rule.kind.as_str()) {
+            // A rule's code must be a pack-own code (#494 review): a
+            // builtin as a rule's code would let a pack emit core
+            // security findings with a re-worded meaning.
+            if FindingCode::is_builtin_code(&rule.code) {
+                return Err(manifest_err(format!(
+                    "rule '{}' emits builtin code '{}'; a rule's code must be a pack-own code",
+                    rule.id, rule.code
+                ))
+                .with_fix(
+                    "Declare a pack-own code (e.g. W_<PACK>_<RULE>) in finding_codes and use it",
+                ));
+            }
+            if !known_rule_kinds().contains(&rule.kind.as_str()) {
                 return Err(manifest_err(format!(
                     "rule '{}' has unknown rule kind '{}'",
                     rule.id, rule.kind
@@ -469,6 +492,18 @@ impl PackManifest {
                     .with_fix("Declare the key in [[checks.severity]] or omit severity_key"));
                 }
             }
+        }
+
+        // Fields: validating declared fields emits `E_FRONTMATTER`
+        // through the pack's own message template (#441), so a pack that
+        // declares fields must declare that code and template.
+        if !self.fields.is_empty() && !self.finding_codes.iter().any(|c| c == "E_FRONTMATTER") {
+            return Err(manifest_err(
+                "a pack that declares fields must list E_FRONTMATTER in finding_codes",
+            )
+            .with_fix(
+                "Add \"E_FRONTMATTER\" to finding_codes and a [messages.\"E_FRONTMATTER\"] table with a `default` variant",
+            ));
         }
 
         self.validate_common()
@@ -986,7 +1021,7 @@ manifest_version = 2
 
 record_types = []
 balance_metrics = []
-finding_codes = ["E_EXAMPLE_FIELD"]
+finding_codes = ["E_FRONTMATTER", "E_EXAMPLE_FIELD"]
 
 [pack]
 name = "example-pack"
@@ -1002,6 +1037,10 @@ grammar = "non-empty-string"
 [[checks.severity]]
 key = "example-pack.example_rule"
 default = "warning"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
 
 [messages."E_EXAMPLE_FIELD"]
 default = "example field '{key}' {problem}"
@@ -1092,16 +1131,13 @@ default_fix = "{fix}"
     }
 
     #[test]
-    fn external_rejects_core_finding_code() {
-        // E_PARSE is a builtin code; external packs cannot claim it.
-        let text = valid_v2_toml()
-            .replace(
-                "finding_codes = [\"E_EXAMPLE_FIELD\"]",
-                "finding_codes = [\"E_PARSE\"]",
-            )
-            .replace("[messages.\"E_EXAMPLE_FIELD\"]", "[messages.\"E_PARSE\"]");
-        let err = parse_manifest_external(&text).unwrap_err();
-        assert!(err.to_string().contains("collides"), "{err:?}");
+    fn external_accepts_builtin_code_as_emission_claim() {
+        // #441: a builtin code in finding_codes is an emission claim
+        // (the pack emits it with its own template shell) — the v2 spec
+        // example lists E_FRONTMATTER exactly this way. The semantics
+        // stay core's; the fixture itself proves E_FRONTMATTER parses.
+        let m = parse_manifest_external(&valid_v2_toml()).unwrap();
+        assert!(m.finding_codes.iter().any(|c| c == "E_FRONTMATTER"));
     }
 
     #[test]

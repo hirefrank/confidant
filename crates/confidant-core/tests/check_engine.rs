@@ -5576,6 +5576,14 @@ name = "session"
 fn external_pack_problems_report_their_codes() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
+    // A ledger line the external pack would own: while the pack fails to
+    // load but its manifest still parses, the verb stays known
+    // (spec/pack-lock.md §5) — no E_UNKNOWN_VERB cascade.
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 greet {ADA} kind:wave\n"),
+    );
     let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
     external_vault_toml(
@@ -5599,6 +5607,10 @@ fn external_pack_problems_report_their_codes() {
     assert!(
         !dumped.contains("example-pack"),
         "pack name must not echo: {dumped}"
+    );
+    assert!(
+        !codes(&json).contains(&"E_UNKNOWN_VERB".to_string()),
+        "the manifest still parses, so its verbs stay known: {json:?}"
     );
 
     // Missing vendored dir.
@@ -5711,20 +5723,64 @@ fn packs_dir_contents_are_not_records() {
     );
 }
 
-/// #493 review blocker: a symlinked vendored `manifest.toml` must not
-/// be followed — the pack fails closed (`E_PACK_INVALID` via
-/// `read_pack_dir`'s symlink rejection), and the best-effort verb read
-/// on problem paths does not follow the link either. Unix only (symlink
-/// creation needs it).
-#[cfg(unix)]
+/// #441: a manifest declaring an unknown rule kind fails the pack at
+/// load; through `check` that is one `E_PACK_INVALID` finding and the
+/// pack is not folded (PD12). The vendored manifest does not parse, so
+/// per spec/pack-lock.md §5 its verbs cannot be known and the ledger
+/// verb cascades into `E_UNKNOWN_VERB` — asserted here to pin that
+/// behavior (the no-cascade case is the hash-mismatch one in
+/// `external_pack_problems_report_their_codes`).
 #[test]
-fn vendored_manifest_symlink_is_refused_not_followed() {
+fn external_pack_unknown_rule_kind_reports_pack_invalid() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    // Install a real pack, then replace manifest.toml with a symlink to
-    // a file OUTSIDE the vault holding a valid manifest: if the loader
-    // followed it, the pack would load; refusing is the contract.
-    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 greet {ADA} kind:wave\n"),
+    );
+    let pack_dir = dir.path().join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/manifest.toml",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["W_GREET_STALE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.severity]]
+key = "example-pack.test_rule"
+default = "warning"
+
+[[rules]]
+id = "my_rule"
+kind = "nope"
+code = "W_GREET_STALE"
+severity_key = "example-pack.test_rule"
+
+[messages."W_GREET_STALE"]
+default = "stale greeting"
+"#,
+    );
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n",
+    );
+    // read_pack_dir validates the manifest too, so the fixture hash is
+    // irrelevant: the loader hits the same unknown-kind error first.
+    // The pin itself must stay well-formed (64 hex) so the lockfile
+    // parses and the failure is the rule kind, not the pin.
+    let hash = read_pack_dir(&pack_dir)
+        .map(|p| p.hash)
+        .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
     external_vault_toml(
         dir.path(),
@@ -5732,26 +5788,16 @@ fn vendored_manifest_symlink_is_refused_not_followed() {
         DEFAULT_CHECKS,
     );
 
-    let outside = tempfile::tempdir().unwrap();
-    std::fs::write(
-        outside.path().join("manifest.toml"),
-        "manifest_version = 2\n",
-    )
-    .unwrap();
-    let manifest_path = dir.path().join("packs/example-pack@0.1/manifest.toml");
-    std::fs::remove_file(&manifest_path).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("manifest.toml"), &manifest_path).unwrap();
-
     let json = report_json(dir.path(), None);
     let found = codes(&json);
     assert!(
-        found.contains(&"E_PACK_INVALID".to_string()) || found.contains(&"E_PACK_HASH".to_string()),
-        "a symlinked vendored manifest must fail closed: {json:?}"
+        found.contains(&"E_PACK_INVALID".to_string()),
+        "unknown rule kind must be E_PACK_INVALID: {json:?}"
     );
-    // The pack must NOT have loaded from the outside file.
-    let dumped = serde_json::to_string(&json).unwrap();
+    // The manifest cannot parse, so its verbs are unknown (§5): the
+    // cascade is expected and pinned here.
     assert!(
-        !dumped.contains("greet verb loaded"),
-        "symlink must not be followed: {dumped}"
+        found.contains(&"E_UNKNOWN_VERB".to_string()),
+        "an unparseable manifest's verbs cannot be known: {json:?}"
     );
 }

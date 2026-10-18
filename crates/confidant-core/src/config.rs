@@ -166,7 +166,10 @@ impl ChecksConfig {
     }
 }
 
-fn parse_severity_token(s: &str) -> Result<Option<Severity>, ()> {
+/// Token to severity; `off` is `Ok(None)`, an unknown token is `Err`.
+/// `pub(crate)`: the manifest loader's severity default and the
+/// declarative evaluator (#441) both parse it.
+pub(crate) fn parse_severity_token(s: &str) -> Result<Option<Severity>, ()> {
     match s {
         "error" => Ok(Some(Severity::Error)),
         "warning" => Ok(Some(Severity::Warning)),
