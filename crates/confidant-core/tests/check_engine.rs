@@ -5876,6 +5876,7 @@ fn assert_cadence_parity(
     ledger_files: &[(&str, String)],
     operator_personal: &str,
     operator_declarative: &str,
+    ada_has_cadence: bool,
     extra_setup: impl Fn(&Path),
 ) -> (Value, Value) {
     let setup = |root: &Path, packs: &str, operator: &str, declarative: bool| -> Value {
@@ -5889,7 +5890,9 @@ fn assert_cadence_parity(
                     &format!("as_of = \"2026-10-08\"\n{operator}"),
                 ),
         );
-        person_with_cadence(root, ADA);
+        if ada_has_cadence {
+            person_with_cadence(root, ADA);
+        }
         for (rel, content) in ledger_files {
             write(root, rel, content);
         }
@@ -5960,7 +5963,7 @@ fn cadence_rule_overdue_with_last_contact() {
         "ledger/2026/08.cfd",
         format!("2026-08-29 touch {ADA} call\n"),
     )];
-    let (personal, _) = assert_cadence_parity(&ledger, "", "", |_| {});
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
     let findings = personal["findings"].as_array().unwrap();
     let overdue: Vec<&Value> = findings
         .iter()
@@ -5982,7 +5985,7 @@ fn cadence_rule_overdue_with_last_contact() {
 #[test]
 fn cadence_rule_overdue_no_contact() {
     // No touchpoint at all: the `none` variant.
-    let (personal, _) = assert_cadence_parity(&[], "", "", |_| {});
+    let (personal, _) = assert_cadence_parity(&[], "", "", true, |_| {});
     let findings = personal["findings"].as_array().unwrap();
     let overdue: Vec<&Value> = findings
         .iter()
@@ -6005,7 +6008,7 @@ fn cadence_rule_exactly_on_boundary_not_overdue() {
         "ledger/2026/09.cfd",
         format!("2026-09-08 touch {ADA} call\n"),
     )];
-    let (personal, _) = assert_cadence_parity(&ledger, "", "", |_| {});
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
     assert!(
         !codes(&personal)
             .iter()
@@ -6022,7 +6025,7 @@ fn cadence_rule_session_counts_as_contact() {
         "ledger/2026/10.cfd",
         format!("2026-10-02 session {ADA} 60m paid\n"),
     )];
-    let (personal, _) = assert_cadence_parity(&ledger, "", "", |_| {});
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
     assert!(
         !codes(&personal)
             .iter()
@@ -6034,15 +6037,15 @@ fn cadence_rule_session_counts_as_contact() {
 #[test]
 fn cadence_rule_merged_person_uses_merged_cadence_and_contact() {
     // Bea (the merged member) holds the cadence AND the recent touch;
-    // Ada (canonical) has neither. A merge line folds Bea into Ada
-    // before as_of, so the rule must take cadence and contact from the
+    // Ada (canonical) has neither: `ada_has_cadence = false` skips her
+    // profile, so the rule must take cadence and contact from the
     // merged member — exercising the find_map fallback, not the
     // canonical person's own value.
     let ledger = vec![(
         "ledger/2026/10.cfd",
         format!("2026-10-01 merge {BEA} into {ADA}\n2026-10-03 touch {BEA} call\n"),
     )];
-    let (personal, _) = assert_cadence_parity(&ledger, "", "", |root| {
+    let (personal, _) = assert_cadence_parity(&ledger, "", "", false, |root| {
         write(
             root,
             &format!("people/{BEA}/profile.md"),
@@ -6073,6 +6076,7 @@ fn cadence_rule_severity_off_and_error_from_config() {
         &ledger,
         "personal.cadence_overdue = \"off\"\n",
         "example-pack.cadence_overdue = \"off\"\n",
+        true,
         |_| {},
     );
     assert!(codes(&personal_off).is_empty(), "{personal_off:?}");
@@ -6081,6 +6085,7 @@ fn cadence_rule_severity_off_and_error_from_config() {
         &ledger,
         "personal.cadence_overdue = \"error\"\n",
         "example-pack.cadence_overdue = \"error\"\n",
+        true,
         |_| {},
     );
     let findings = personal_err["findings"].as_array().unwrap();

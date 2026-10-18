@@ -941,20 +941,20 @@ mod cadence_kind_tests {
     use super::*;
     use crate::load_vault;
     use crate::packs::dir::read_pack_dir;
-    use crate::packs::external::load_external_packs;
+    use crate::packs::external::{load_external_packs, PackProblem, PackProblemKind};
     use crate::packs::lock::Lockfile;
     use crate::packs::manifest::parse_manifest_external;
     use crate::packs::registry::PackRegistry;
 
     /// Vendor a pack whose cadence rule has the given manifest body
-    /// (params vary per test) and return the loader's problem kinds.
-    fn load_with_rule(rules: &str, messages: &str) -> Vec<String> {
+    /// (params vary per test) and return the loader's problems.
+    fn load_with_rule(rules: &str, messages: &str) -> Vec<PackProblem> {
         let dir = tempfile::tempdir().unwrap();
         let text = format!(
             r#"manifest_version = 2
 record_types = []
 balance_metrics = []
-finding_codes = ["E_FRONTMATTER"]
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
 
 [pack]
 name = "example-pack"
@@ -1000,9 +1000,6 @@ default_fix = "{{fix}}"
             &compiled,
         );
         load.problems
-            .iter()
-            .map(|p| format!("{:?}", p.kind))
-            .collect()
     }
 
     fn cadence_rule(params: &str) -> String {
@@ -1025,9 +1022,24 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
             .to_owned()
     }
 
+    /// Assert the pack fails closed with a single `Invalid` problem
+    /// whose detail names the bad parameter.
+    fn assert_loader_refuses(problems: &[PackProblem], detail_snippet: &str) {
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            matches!(problems[0].kind, PackProblemKind::Invalid),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].detail.contains(detail_snippet),
+            "detail missing {detail_snippet:?}: {}",
+            problems[0].detail
+        );
+    }
+
     /// #495: the loader negatives — each bad parameter makes the pack
     /// fail closed with an `Invalid` problem (an `E_PACK_INVALID`
-    /// finding through `check`).
+    /// finding through `check`), and the detail names the parameter.
     #[test]
     fn loader_refuses_undeclared_cadence_field() {
         let problems = load_with_rule(
@@ -1038,7 +1050,22 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
             ),
             &cadence_messages(),
         );
-        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+        assert_loader_refuses(&problems, "is not one of the pack's declared fields");
+    }
+
+    /// #495: the positive control — the same fixture with valid
+    /// parameters loads with no problems.
+    #[test]
+    fn loader_accepts_valid_cadence_rule() {
+        let problems = load_with_rule(
+            &format!(
+                "{}\n{}",
+                cadence_rule("cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\n"),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[test]
@@ -1050,7 +1077,7 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
             r#"manifest_version = 2
 record_types = []
 balance_metrics = []
-finding_codes = ["E_FRONTMATTER"]
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
 
 [pack]
 name = "example-pack"
@@ -1069,6 +1096,10 @@ key = "example-pack.cadence_overdue"
 default = "warning"
 
 {msg}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
 "#,
             msg = cadence_messages()
         );
@@ -1097,15 +1128,7 @@ default = "warning"
             &["example-pack@0.1".to_owned()],
             &compiled,
         );
-        assert_eq!(
-            load.problems
-                .iter()
-                .map(|p| format!("{:?}", p.kind))
-                .collect::<Vec<_>>(),
-            vec!["Invalid"],
-            "{:?}",
-            load.problems
-        );
+        assert_loader_refuses(&load.problems, "has grammar 'recurring-date'");
     }
 
     #[test]
@@ -1123,7 +1146,7 @@ default = "warning"
             ),
             &messages,
         );
-        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+        assert_loader_refuses(&problems, "has no 'last_fix' variant");
     }
 
     #[test]
@@ -1136,7 +1159,7 @@ default = "warning"
             ),
             &cadence_messages(),
         );
-        assert_eq!(problems, vec!["Invalid"], "{problems:?}");
+        assert_loader_refuses(&problems, "event_verbs must not be empty");
     }
 
     /// #495: a person with no cadence value is skipped, not warned.
