@@ -154,7 +154,9 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
 Keys are namespaced `<pack-name>.<rule>` (e.g.
 `personal.cadence_overdue`), matching today's dotted keys. A pack may
 only declare keys under its own name; the loader rejects others. The
-`as_of` top-level key stays core-owned.
+`as_of` top-level key stays core-owned. A `[[checks.int]]` key's
+`default` is a non-negative whole value (a window in days, a count);
+the loader rejects a negative one.
 
 ### Balance metrics
 
@@ -507,13 +509,12 @@ declare (the loader refuses a rule whose table lacks one):
 | `last_fix` | `id` | Fix text for `last`. |
 | `none_fix` | `id` | Fix text for `none`. |
 
-Evaluation, per canonical person in record order:
+Evaluation, per canonical person in id order:
 
 1. The person's cadence window: their own `cadence_field` value first,
-   else the first merged member's (members are in deterministic
-   record order). A person with no cadence value anywhere in their
-   merge group is skipped, as is a person whose cadence value is
-   `never`.
+   else the first merged member's (members are in id order). A person
+   with no cadence value anywhere in their merge group is skipped, as is
+   a person whose cadence value is `never`.
 2. When `snooze_field` is set and the canonical person's own field
    holds a date later than `as_of`, the person is skipped. A value on
    `as_of` or earlier has no effect.
@@ -553,7 +554,7 @@ parsing and next-occurrence math are core's (`recurring-date` /
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `date_fields` | list of strings, non-empty | The pack's own `[[fields]]` entries whose `grammar` is `"recurring-date"` (one date) or `"dates-list"` (one date per entry). Findings follow this order. |
+| `date_fields` | list of strings, non-empty | The pack's own `[[fields]]` entries whose `grammar` is `"recurring-date"` (one date) or `"dates-list"` (one date per entry); entries must be unique. Findings follow this order. |
 | `window_key` | string | A declared `[[checks.int]]` key holding the window in days. Resolved as the operator's `[checks]` value when set, else the manifest's declared default. |
 
 Message variants the pack's `[messages."<CODE>"]` table must declare (the
@@ -564,7 +565,7 @@ loader refuses a rule whose table lacks one):
 | `default` | `id`, `occ`, `delta` | The next occurrence `occ` of one of the person's dates is `delta` days from `as_of`. |
 | `default_fix` | `id` | Fix text. |
 
-Evaluation, per canonical person in record order:
+Evaluation, per canonical person in id order:
 
 1. Collect the recurring dates from every field in `date_fields`, in that
    order: a `recurring-date` field gives one date, a `dates-list` field

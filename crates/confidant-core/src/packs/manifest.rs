@@ -589,6 +589,18 @@ impl PackManifest {
                 )));
             }
         }
+        // Int defaults are whole values (windows, counts); a negative one
+        // is a manifest mistake, refused here rather than silently folded
+        // to 0 at evaluation (#528).
+        for check in &self.checks.int {
+            if check.default < 0 {
+                return Err(manifest_err(format!(
+                    "checks key '{}' has negative int default {}; expected 0 or more",
+                    check.key, check.default
+                ))
+                .with_fix("Int check defaults are whole values (days, counts); use 0 or more"));
+            }
+        }
 
         // Every finding code needs a [messages.<CODE>] table with at least
         // one variant, and every [messages] key must be a finding code —
@@ -989,6 +1001,44 @@ default = "x"
         let text = valid_toml().replace("default = \"warning\"", "default = \"loud\"");
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("bad severity"), "{err:?}");
+    }
+
+    /// #528: a negative int default is refused at load. Without this the
+    /// rule's window would silently fold to 0 at evaluation.
+    #[test]
+    fn rejects_negative_int_default() {
+        let text = valid_toml().replace("default = 7", "default = -1");
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("negative int default"), "{err:?}");
+        assert!(err.to_string().contains("expected 0 or more"), "{err:?}");
+    }
+
+    /// #528: the same refusal applies to external (v2) manifests, which
+    /// run the shared `validate_common` checks. Rules — and so the
+    /// `window_key` resolution this protects — only exist on v2.
+    #[test]
+    fn rejects_negative_int_default_external() {
+        let text = r#"
+manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_WRONG"]
+
+[pack]
+name = "example-test"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.int]]
+key = "example-test.window_days"
+default = -1
+
+[messages."E_WRONG"]
+default = "wrong {id}"
+"#;
+        let err = parse_manifest_external(text).unwrap_err();
+        assert!(err.to_string().contains("negative int default"), "{err:?}");
     }
 
     #[test]
