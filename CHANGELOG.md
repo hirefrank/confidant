@@ -26,7 +26,7 @@ Linux are supported as-is; Windows users run Confidant under WSL2.
   (#435); `confidant.lock` pins `name@version` to a content hash with a
   byte-stable canonical form (#437); a pack directory reader computes the
   canonical tree hash behind the file-count and size limits (#436); and
-  loading at check time fails closed to name-free `E_PACK_UNKNOWN` /
+  loading at check time fails closed to `E_PACK_UNKNOWN` /
   `E_PACK_HASH` / `E_PACK_INVALID` / `E_PACK_VERSION` findings, so a problem
   pack never folds (#438, #434).
 - `confidant pack add <https-url>[#<ref>] [--from-dir <dir>] [--subdir <path>]`:
@@ -47,9 +47,12 @@ Linux are supported as-is; Windows users run Confidant under WSL2.
   targeting an existing record (#457).
 
 ### Changed
-- Native Windows is unsupported (#502): the dist target set and powershell
-  installer are gone (#506), the Windows-only code paths are removed
-  (#503, #507), and the docs and CI jobs follow (#508).
+- Native Windows is unsupported (#502): the dist targets, powershell
+  installer and Windows CI jobs are gone (#506), the Windows-only code
+  paths are removed (#503, #507), and the remaining docs follow (#508).
+- External-pack problem findings name the pack and version;
+  `E_PACK_UNKNOWN` echoes the id only when it is a well-formed
+  `name@version` pin (#500, #511).
 - `[checks]` keys come from the loaded pack manifests, so a pack's own keys
   work with no per-pack code; a typo under a known pack name is `E_CONFIG`
   again instead of a silent fall-through to the default (#433).
