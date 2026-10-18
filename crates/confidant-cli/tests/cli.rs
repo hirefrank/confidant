@@ -775,24 +775,56 @@ fn tui_forwards_explicit_vault_flag() {
     );
 }
 
+/// Fake `confidant-tui` that exits `code`, written once and made executable
+/// before it is ever run. The exit-code test must not rewrite an executable
+/// script in place: on a loaded runner that can fail with ETXTBSY, and the
+/// launcher then reports 1 instead of the child's code (#488).
+#[cfg(unix)]
+fn write_fake_tui_exit(dir: &std::path::Path, code: i32) {
+    let script = dir.join("confidant-tui");
+    std::fs::write(&script, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn tui_propagates_child_exit_code() {
     let dir = tempfile::tempdir().unwrap();
-    write_fake_tui(dir.path());
-    // Replace the fake with one that exits 3.
-    std::fs::write(dir.path().join("confidant-tui"), "#!/bin/sh\nexit 3\n").unwrap();
+    write_fake_tui_exit(dir.path(), 3);
     let path = format!(
         "{}:{}",
         dir.path().display(),
         std::env::var("PATH").unwrap()
     );
-    let out = Command::new(bin())
-        .args(["tui"])
-        .env("PATH", &path)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(3));
+    // A transient spawn failure on a loaded runner (e.g. EAGAIN) surfaces as
+    // the launcher's exit 1, not the child's 3. Retry that case only; a real
+    // propagation regression still fails every attempt. The assertion carries
+    // stdout/stderr so the next failure says which one it was (#488).
+    let mut out = None;
+    for attempt in 0..3 {
+        let o = Command::new(bin())
+            .args(["tui"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        let code = o.status.code();
+        out = Some(o);
+        if code == Some(3) {
+            break;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let out = out.unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected the TUI's exit code; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // #386: `find --json` carries an optional ranked-search hint only when qmd
