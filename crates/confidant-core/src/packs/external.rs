@@ -19,6 +19,9 @@
 //! (`SKILL.md`, manifest), and error details carry vault-relative ids
 //! and counts only, never file contents (PD7).
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use chrono::NaiveDate;
 
 use crate::check::Finding;
@@ -95,6 +98,38 @@ impl std::fmt::Debug for ExternalLoad {
 
 fn leak_str(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
+}
+
+/// Interned external packs, keyed by `(name@version, verified content
+/// hash)`. `ExternalPack` and its claims are leaked to satisfy the `Pack`
+/// trait's `'static` returns; without interning, every vault load in a
+/// long-lived TUI/MCP process leaks another copy. A second load of the
+/// same bytes reuses the first instance, so the map grows once per
+/// distinct `(name@version, hash)` and stops (#497 item 1).
+type PackCache = HashMap<(String, String), &'static ExternalPack>;
+
+fn pack_cache() -> &'static Mutex<PackCache> {
+    static CACHE: LazyLock<Mutex<PackCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    &CACHE
+}
+
+/// The already-interned pack for `key`, if this process built it.
+fn interned_pack(key: &(String, String)) -> Option<&'static ExternalPack> {
+    pack_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .copied()
+}
+
+/// Intern `pack` under `key`. A concurrent loader may have won the race;
+/// keep the instance already in the map so every caller gets the same
+/// `&'static` pack (identity checks and tests compare pointers).
+fn intern_pack(key: (String, String), pack: &'static ExternalPack) -> &'static ExternalPack {
+    let mut cache = pack_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.entry(key).or_insert(pack)
 }
 
 /// An external pack registered at runtime: a validated, spec-compatible
@@ -290,6 +325,26 @@ fn manifest_verb_names(manifest: Option<&PackManifest>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The `Version` problem when `manifest` does not list `spec` in
+/// `requires_spec`, else `None`. Factored out because the interned-pack
+/// fast path must re-run this one check: the cache key is
+/// `(name@version, hash)`, which does not include the vault spec, and a
+/// long-lived process can load vaults on different specs.
+fn spec_requires_problem(manifest: &PackManifest, listed: &str, spec: &str) -> Option<PackProblem> {
+    if manifest.pack.requires_spec.iter().any(|req| req == spec) {
+        return None;
+    }
+    Some(PackProblem {
+        name: listed.to_owned(),
+        kind: PackProblemKind::Version,
+        detail: format!(
+            "the pack requires spec {:?}, but the vault uses {spec}",
+            manifest.pack.requires_spec
+        ),
+        known_verbs: manifest_verb_names(Some(manifest)),
+    })
+}
+
 /// Parse the vendored manifest from the bytes `read_pack_dir` hashed
 /// and vetted — the success path's only manifest source.
 fn manifest_from_packed(packed: &crate::packs::dir::PackDir) -> Option<PackManifest> {
@@ -436,6 +491,26 @@ pub fn load_external_packs(
             continue;
         }
 
+        // Intern by `(name@version, content hash)`: the same verified
+        // bytes loaded twice in one process — a long-lived TUI/MCP server
+        // re-reading the vault — reuse the first leaked instance instead
+        // of leaking another (#497 item 1). The key is known before the
+        // manifest is parsed, so a repeat load also skips the parse-time
+        // leaks inside `parse_manifest_external`. Identity and rule
+        // validation already passed for these exact bytes and this exact
+        // listing; only the vault spec can differ between loads, so the
+        // fast path re-checks that one condition.
+        let intern_key = (listed.clone(), packed.hash.clone());
+        if let Some(pack) = interned_pack(&intern_key) {
+            if let Some(problem) = spec_requires_problem(pack.pack_manifest(), listed, spec) {
+                problems.push(problem);
+                continue;
+            }
+            manifests.push(pack.pack_manifest());
+            packs.push(pack);
+            continue;
+        }
+
         // `read_pack_dir` hashed and vetted the files, but this module's
         // own schema validation is the gate: parse the manifest from the
         // hashed bytes so the loaded manifest is exactly the verified
@@ -468,16 +543,8 @@ pub fn load_external_packs(
         }
 
         // (g) Spec compatibility -> Version.
-        if !manifest.pack.requires_spec.iter().any(|req| req == spec) {
-            problems.push(PackProblem {
-                name: listed.clone(),
-                kind: PackProblemKind::Version,
-                detail: format!(
-                    "the pack requires spec {:?}, but the vault uses {spec}",
-                    manifest.pack.requires_spec
-                ),
-                known_verbs: manifest_verb_names(Some(&manifest)),
-            });
+        if let Some(problem) = spec_requires_problem(&manifest, listed, spec) {
+            problems.push(problem);
             continue;
         }
 
@@ -502,13 +569,14 @@ pub fn load_external_packs(
         }
 
         // Load: leak the claims once, keep the skill text and manifest
-        // for the declarative evaluator (#441).
+        // for the declarative evaluator (#441). Interning keys the leak on
+        // the verified bytes so a reload reuses it.
         let skill_text = packed
             .files
             .get(&manifest.pack.skill)
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
             .unwrap_or_default();
-        let pack = ExternalPack::build(manifest, skill_text);
+        let pack = intern_pack(intern_key, ExternalPack::build(manifest, skill_text));
         packs.push(pack);
         manifests.push(pack.pack_manifest());
     }
@@ -557,6 +625,78 @@ grammar = "non-empty-string"
     fn fixture_manifest_parses() {
         let m = parse_manifest_external(MANIFEST).expect("the test manifest fixture must parse");
         assert_eq!(m.pack.name, "example-pack");
+    }
+
+    /// Vendor a valid `example-pack@0.1` (the `MANIFEST` fixture) whose
+    /// lockfile pin matches its canonical tree hash, and return the vault
+    /// root. The `TempDir` must stay alive for the load to find the
+    /// files.
+    fn vendored_pack() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let pack_dir = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("manifest.toml"), MANIFEST).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# example pack.\n").unwrap();
+        let hash = read_pack_dir(&pack_dir)
+            .expect("vendored pack dir reads")
+            .hash;
+        let mut lock = Lockfile::default();
+        lock.upsert(crate::packs::lock::LockEntry {
+            name: "example-pack".to_owned(),
+            version: "0.1".to_owned(),
+            source: "https://example.invalid/org/example-pack.git".to_owned(),
+            rev: LOCK_REV.to_owned(),
+            subdir: String::new(),
+            hash,
+        });
+        std::fs::write(dir.path().join("confidant.lock"), lock.to_toml()).unwrap();
+        dir
+    }
+
+    /// #497 item 1: a second load of the same verified bytes — the same
+    /// vault re-read by a long-lived TUI/MCP process — must reuse the
+    /// interned pack and manifest, not leak a second instance.
+    #[test]
+    fn reload_reuses_interned_pack_instance() {
+        let dir = vendored_pack();
+        let compiled = PackRegistry::compiled();
+        let listed = ["example-pack@0.1".to_owned()];
+
+        let first = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        assert_eq!(first.problems.len(), 0, "{:?}", first.problems);
+        assert_eq!(first.packs.len(), 1);
+
+        let second = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        assert_eq!(second.problems.len(), 0, "{:?}", second.problems);
+        assert_eq!(second.packs.len(), 1);
+
+        assert!(
+            std::ptr::eq(first.packs[0], second.packs[0]),
+            "the second load must reuse the interned pack instance"
+        );
+        assert!(
+            std::ptr::eq(first.manifests[0], second.manifests[0]),
+            "the second load must reuse the interned manifest"
+        );
+    }
+
+    /// The intern key excludes the vault spec, so the fast path must
+    /// still re-check `requires_spec`: loading the same bytes under an
+    /// unsupported spec yields `Version` (mapped to `E_PACK_VERSION` by
+    /// `check.rs`), never a silent reuse.
+    #[test]
+    fn reload_still_reports_spec_version_problem() {
+        let dir = vendored_pack();
+        let compiled = PackRegistry::compiled();
+        let listed = ["example-pack@0.1".to_owned()];
+
+        let ok = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        assert_eq!(ok.packs.len(), 1, "{:?}", ok.problems);
+
+        let bad = load_external_packs(dir.path(), "9.9", &listed, &compiled);
+        assert!(bad.packs.is_empty());
+        assert_eq!(bad.problems.len(), 1, "{:?}", bad.problems);
+        assert_eq!(bad.problems[0].kind, PackProblemKind::Version);
     }
 
     #[test]
