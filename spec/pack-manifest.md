@@ -468,9 +468,10 @@ own issue appends its section with the parameter table:
 | Kind | Spec issue | Reproduces |
 |---|---|---|
 | `cadence-overdue` | #442 | `personal@0.1`'s keep-in-touch rule |
+| `date-upcoming` | #443 | `personal@0.1`'s upcoming-dates rule |
 
-(Planned: `date-upcoming` #443, `note-ref` #458, `ledger-balance`
-#446, `session-checks` #447, `activity-gap` #448.)
+(Planned: `note-ref` #458, `ledger-balance` #446, `session-checks` #447,
+`activity-gap` #448.)
 
 #### Kind `cadence-overdue` (#442)
 
@@ -533,6 +534,59 @@ With `as_of = 2026-10-08`, a person `p-01M…` whose record says
 `cadence: 30d` and whose last `touch` is `2026-08-29` is 40 days stale:
 one warning, `last` variant, `start = 2026-09-08`. A touch on
 `2026-09-08` (exactly 30 days) is *not* overdue.
+
+#### Kind `date-upcoming` (#443)
+
+Warn when one of a person's recurring dates falls within the next
+`window` days. Reproduces `personal@0.1`'s upcoming-dates rule; the date
+parsing and next-occurrence math are core's (`recurring-date` /
+`dates-list` grammars), never reimplemented per pack.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `date_fields` | list of strings, non-empty | The pack's own `[[fields]]` entries whose `grammar` is `"recurring-date"` (one date) or `"dates-list"` (one date per entry). Findings follow this order. |
+| `window_key` | string | A declared `[[checks.int]]` key holding the window in days. Resolved as the operator's `[checks]` value when set, else the manifest's declared default. |
+
+Message variants the pack's `[messages."<CODE>"]` table must declare (the
+loader refuses a rule whose table lacks one):
+
+| Variant | Placeholders | Meaning |
+|---|---|---|
+| `default` | `id`, `occ`, `delta` | The next occurrence `occ` of one of the person's dates is `delta` days from `as_of`. |
+| `default_fix` | `id` | Fix text. |
+
+Evaluation, per canonical person in record order:
+
+1. Collect the recurring dates from every field in `date_fields`, in that
+   order: a `recurring-date` field gives one date, a `dates-list` field
+   gives one per entry. Only the canonical person's own record is read:
+   like the compiled rule, a merged member's dates do not carry over.
+2. For each date, take its next occurrence on or after `as_of`. (An event
+   with a year occurs no earlier than that year; `--02-29` occurs only in
+   leap years.)
+3. Emit when `0 <= delta <= window`, where `delta` is the whole-day
+   difference `occ − as_of`. Invalid field values are already reported as
+   `E_FRONTMATTER`; they contribute no date here.
+4. Severity comes from `severity_key` (`off` skips the rule). The
+   finding's file is the person's record path and `id` the canonical
+   person.
+
+Worked example:
+
+```toml
+[[rules]]
+id = "dates"
+kind = "date-upcoming"
+code = "W_DATE_UPCOMING"
+severity_key = "example-pack.date_upcoming"
+date_fields = ["birthday", "dates"]
+window_key = "example-pack.date_upcoming_days"
+```
+
+With `as_of = 2026-10-16`, a `window_key` value of `7` and a person whose
+`birthday` is `--10-20`, the next occurrence is `2026-10-20`: one warning,
+`default` variant, `delta = 4`. A birthday of `--10-25` (delta 9) is
+outside the window and emits nothing.
 
 ### 13.3. Names
 

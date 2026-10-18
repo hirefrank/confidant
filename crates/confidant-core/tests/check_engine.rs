@@ -6258,3 +6258,287 @@ fn cadence_rule_severity_off_and_error_from_config() {
     let findings = personal_err["findings"].as_array().unwrap();
     assert_eq!(findings[0]["severity"], "error", "{personal_err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Declarative rule kind: date-upcoming (#443)
+// ---------------------------------------------------------------------------
+
+/// Vendor a declarative pack whose date rule mirrors personal@0.1's
+/// (templates verbatim from packs/personal/manifest.toml), with the
+/// `example-pack.date_upcoming_days` window default given. Returns the
+/// lockfile hash.
+fn install_date_pack(root: &Path, window_default: i64) -> String {
+    let pack_dir = root.join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        root,
+        "packs/example-pack@0.1/manifest.toml",
+        &format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_DATE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[fields]]
+name = "birthday"
+grammar = "recurring-date"
+
+[[fields]]
+name = "dates"
+grammar = "dates-list"
+
+[[checks.severity]]
+key = "example-pack.date_upcoming"
+default = "warning"
+
+[[checks.int]]
+key = "example-pack.date_upcoming_days"
+default = {window_default}
+
+[[rules]]
+id = "dates"
+kind = "date-upcoming"
+code = "W_EXAMPLE_DATE"
+severity_key = "example-pack.date_upcoming"
+date_fields = ["birthday", "dates"]
+window_key = "example-pack.date_upcoming_days"
+
+[messages."W_EXAMPLE_DATE"]
+default = "upcoming date for {{id}} on {{occ}} (in {{delta}}d)"
+default_fix = "Reach out to {{id}} or set `[checks] personal.date_upcoming = \"off\"`"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+"#
+        ),
+    );
+    write(
+        root,
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n\nDate rule (fake).\n",
+    );
+    read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash
+}
+
+/// Run `check` over a person with the given front-matter fields, on two
+/// vaults: compiled `personal@0.1` and the declarative pack above, both at
+/// `as_of`. The `W_DATE_UPCOMING` findings — code-agnostic content
+/// (severity, message, fix, file, id) — must match exactly; the code itself
+/// stays pack-own on the declarative side by design (#494/#490), exactly as
+/// #442's cadence parity documents. Returns both reports.
+fn assert_date_parity(
+    as_of: &str,
+    person_fields: &str,
+    operator_personal: &str,
+    operator_declarative: &str,
+    window_default: i64,
+) -> (Value, Value) {
+    let setup = |root: &Path, packs: &str, operator: &str, declarative: bool| -> Value {
+        write(
+            root,
+            "confidant.toml",
+            &PERSONAL_TOML
+                .replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]"))
+                .replace(
+                    "as_of = \"2026-10-08\"",
+                    &format!("as_of = \"{as_of}\"\n{operator}"),
+                ),
+        );
+        write(
+            root,
+            &format!("people/{ADA}/profile.md"),
+            &format!(
+                "---\nid: {ADA}\ntype: person\nname: Ada Example\n{person_fields}---\n\nFake person.\n"
+            ),
+        );
+        if declarative {
+            let hash = install_date_pack(root, window_default);
+            install_lockfile(root, "example-pack", "0.1", &hash);
+        }
+        report_json(root, None)
+    };
+    let personal = setup(
+        tempfile::tempdir().unwrap().path(),
+        "\"personal@0.1\"",
+        operator_personal,
+        false,
+    );
+    let dir2 = tempfile::tempdir().unwrap();
+    let declarative = setup(
+        dir2.path(),
+        "\"example-pack@0.1\"",
+        operator_declarative,
+        true,
+    );
+
+    let date_findings = |v: &Value| -> Vec<String> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == "W_DATE_UPCOMING" || f["code"] == "W_EXAMPLE_DATE")
+            .map(|f| {
+                format!(
+                    "{}/{}/{}/{}/{:?}",
+                    f["severity"], f["message"], f["fix"], f["file"], f["id"]
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        date_findings(&personal),
+        date_findings(&declarative),
+        "declarative parity failed:\npersonal: {personal:?}\ndeclarative: {declarative:?}"
+    );
+    (personal, declarative)
+}
+
+/// The `W_DATE_UPCOMING` findings of a compiled-personal report.
+fn date_upcoming(v: &Value) -> Vec<&Value> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_DATE_UPCOMING")
+        .collect()
+}
+
+#[test]
+fn date_rule_birthday_inside_window() {
+    // `--10-20` seen from 2026-10-16 with a 7-day window: delta 4.
+    let (personal, _) = assert_date_parity("2026-10-16", "birthday: --10-20\n", "", "", 7);
+    let findings = date_upcoming(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert_eq!(findings[0]["severity"], "warning");
+    let message = findings[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2026-10-20") && message.contains("(in 4d)"),
+        "occ = next occurrence, delta = days away: {message}"
+    );
+}
+
+#[test]
+fn date_rule_birthday_outside_window() {
+    // `--10-28` is 12 days out: outside the default 7-day window.
+    let (personal, _) = assert_date_parity("2026-10-16", "birthday: --10-28\n", "", "", 7);
+    assert!(date_upcoming(&personal).is_empty(), "{personal:?}");
+}
+
+#[test]
+fn date_rule_today_is_delta_zero() {
+    // The date is today: `delta = 0` is inside the window (inclusive).
+    let (personal, _) = assert_date_parity("2026-10-16", "birthday: --10-16\n", "", "", 7);
+    let findings = date_upcoming(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0]["message"].as_str().unwrap().contains("(in 0d)"),
+        "{personal:?}"
+    );
+}
+
+#[test]
+fn date_rule_year_wrap() {
+    // `--01-02` seen from 2026-12-30: next occurrence is 2027-01-02, three
+    // days out and inside the 7-day window.
+    let (personal, _) = assert_date_parity("2026-12-30", "birthday: --01-02\n", "", "", 7);
+    let findings = date_upcoming(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    let message = findings[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2027-01-02") && message.contains("(in 3d)"),
+        "year wrap: {message}"
+    );
+}
+
+#[test]
+fn date_rule_leap_day_in_non_leap_year() {
+    // `--02-29` seen from 2026-02-27: the next occurrence is 2028-02-29
+    // (well outside a 7-day window). The oracle is the shared parser, so
+    // the kind cannot diverge from `RecurringDate`.
+    use confidant_core::packs::grammars::RecurringDate;
+    let oracle = RecurringDate::parse("birthday", "--02-29")
+        .unwrap()
+        .next_occurrence_on_or_after(chrono::NaiveDate::from_ymd_opt(2026, 2, 27).unwrap());
+    assert_eq!(
+        oracle,
+        Some(chrono::NaiveDate::from_ymd_opt(2028, 2, 29).unwrap())
+    );
+    let (personal, _) = assert_date_parity("2026-02-27", "birthday: --02-29\n", "", "", 7);
+    assert!(date_upcoming(&personal).is_empty(), "{personal:?}");
+}
+
+#[test]
+fn date_rule_dates_list_multiple_entries() {
+    // Two entries inside a 14-day window: one finding each, in
+    // field order (the list order), deterministically.
+    let (personal, _) = assert_date_parity(
+        "2026-10-16",
+        "dates: [anniv:2020-10-18, grad:--10-30]\n",
+        "personal.date_upcoming_days = 14\n",
+        "",
+        14,
+    );
+    let findings = date_upcoming(&personal);
+    assert_eq!(findings.len(), 2, "{personal:?}");
+    let messages: Vec<&str> = findings
+        .iter()
+        .map(|f| f["message"].as_str().unwrap())
+        .collect();
+    assert!(
+        messages[0].contains("2026-10-18")
+            && messages[0].contains("(in 2d)")
+            && messages[1].contains("2026-10-30")
+            && messages[1].contains("(in 14d)"),
+        "list order, one finding per entry: {messages:?}"
+    );
+}
+
+#[test]
+fn date_rule_window_from_config_override() {
+    // `--11-10` is 25 days out: outside the manifest's 7-day default, but
+    // inside the operator's 30-day override on both sides.
+    let (personal, _) = assert_date_parity(
+        "2026-10-16",
+        "birthday: --11-10\n",
+        "personal.date_upcoming_days = 30\n",
+        "example-pack.date_upcoming_days = 30\n",
+        7,
+    );
+    let findings = date_upcoming(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("(in 25d)"),
+        "{personal:?}"
+    );
+}
+
+#[test]
+fn date_rule_severity_off() {
+    // `off` skips the rule on both sides.
+    let (personal_off, declarative_off) = assert_date_parity(
+        "2026-10-16",
+        "birthday: --10-20\n",
+        "personal.date_upcoming = \"off\"\n",
+        "example-pack.date_upcoming = \"off\"\n",
+        7,
+    );
+    assert!(date_upcoming(&personal_off).is_empty(), "{personal_off:?}");
+    assert!(
+        !codes(&declarative_off)
+            .iter()
+            .any(|c| c == "W_EXAMPLE_DATE"),
+        "{declarative_off:?}"
+    );
+}

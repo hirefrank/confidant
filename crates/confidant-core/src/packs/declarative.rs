@@ -36,7 +36,9 @@ use crate::check::{Finding, FindingCode, Severity};
 use crate::config::parse_severity_token;
 use crate::error::DomainError;
 use crate::id::RecordId;
-use crate::packs::grammars::{parse_field_grammar, FieldValue};
+use crate::packs::grammars::{
+    parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_DATES_LIST, GRAMMAR_RECURRING_DATE,
+};
 use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, RuleDecl};
 use crate::record::Record;
@@ -90,8 +92,9 @@ static TEST_REGISTRY: Mutex<Option<Vec<&'static dyn RuleKind>>> = Mutex::new(Non
 /// [`with_rule_kinds_for_test`].
 pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
     // The kind implementations live in Rust (PD1); each kind's issue
-    // appends its static here. #442: `cadence-overdue`.
-    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE];
+    // appends its static here. #442: `cadence-overdue`; #443:
+    // `date-upcoming`.
+    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE, &DATE_UPCOMING];
     kinds.extend(
         TEST_REGISTRY
             .lock()
@@ -565,6 +568,228 @@ fn vault_persons(vault: &Vault) -> Vec<&crate::record::Record> {
 
 static CADENCE_OVERDUE: CadenceOverdueKind = CadenceOverdueKind;
 
+// ---------------------------------------------------------------------------
+// Rule kinds (#443: date-upcoming)
+// ---------------------------------------------------------------------------
+
+/// `date-upcoming` (#443): for each merge-canonical person, warn when one
+/// of the pack's recurring-date fields has its next occurrence within the
+/// configured lookahead window. Reproduces `personal@0.1`'s upcoming-dates
+/// rule (including its date math: the parsers and
+/// [`RecurringDate::next_occurrence_on_or_after`] are reused, never
+/// reimplemented).
+///
+/// Parameters (spec/pack-manifest.md): `date_fields` lists the pack's own
+/// declared fields with grammar `recurring-date` (one date) or
+/// `dates-list` (one per entry), in the order findings are emitted;
+/// `window_key` names a declared `[[checks.int]]` key holding the window
+/// in days, measured from `as_of`. Severity comes from `severity_key`; an
+/// off rule is skipped before evaluation.
+pub(crate) struct DateUpcomingKind;
+
+impl RuleKind for DateUpcomingKind {
+    fn name(&self) -> &'static str {
+        "date-upcoming"
+    }
+
+    /// Parameter validation (#443): `date_fields` must be a non-empty list
+    /// of the pack's own `[[fields]]` entries with grammar
+    /// `recurring-date` or `dates-list`; `window_key` must name a declared
+    /// `[[checks.int]]` key; the message table must declare
+    /// `default` and `default_fix`.
+    fn validate(&self, rule: &RuleDecl, manifest: &PackManifest) -> Result<(), DomainError> {
+        let err = |detail: String| DomainError::config(format!("rule '{}': {detail}", rule.id));
+        let fix_hint = "Set date_fields = [\"birthday\", \"dates\"]";
+        let Some(fields) = rule.params.get("date_fields").and_then(|v| v.as_array()) else {
+            return Err(err(
+                "the date_fields parameter is missing (it lists the pack's recurring-date fields)"
+                    .to_owned(),
+            )
+            .with_fix(fix_hint));
+        };
+        if fields.is_empty() {
+            return Err(err("date_fields must not be empty".to_owned()).with_fix(fix_hint));
+        }
+        for field in fields {
+            let Some(name) = field.as_str() else {
+                return Err(
+                    err("every date_fields entry must be a string".to_owned()).with_fix(fix_hint)
+                );
+            };
+            if name.trim().is_empty() {
+                return Err(err(
+                    "every date_fields entry must be a non-empty field name".to_owned()
+                )
+                .with_fix(fix_hint));
+            }
+            let decl = manifest
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .ok_or_else(|| {
+                    err(format!(
+                        "date_fields entry '{name}' is not one of the pack's declared fields"
+                    ))
+                    .with_fix("Declare the field in [[fields]] or use its declared name")
+                })?;
+            match decl.grammar.as_str() {
+                GRAMMAR_RECURRING_DATE | GRAMMAR_DATES_LIST => {}
+                other => {
+                    return Err(err(format!(
+                        "date_fields entry '{name}' has grammar '{other}', not \"recurring-date\" or \"dates-list\""
+                    ))
+                    .with_fix(
+                        "Use a field declared with grammar = \"recurring-date\" or \"dates-list\"",
+                    ));
+                }
+            }
+        }
+
+        let Some(window_key) = rule.params.get("window_key").and_then(|v| v.as_str()) else {
+            return Err(err(
+                "the window_key parameter is missing (it names the pack's window check)".to_owned(),
+            )
+            .with_fix("Set window_key to a declared [[checks.int]] key"));
+        };
+        if window_key.trim().is_empty() {
+            return Err(err("window_key must be a non-empty key".to_owned())
+                .with_fix("Set window_key to a declared [[checks.int]] key"));
+        }
+        if !manifest.checks.int.iter().any(|i| i.key == window_key) {
+            return Err(err(format!(
+                "window_key '{window_key}' is not a declared [[checks.int]] key"
+            ))
+            .with_fix("Declare the key in [[checks.int]] or use its declared key"));
+        }
+
+        if !manifest
+            .messages
+            .get(&rule.code)
+            .is_some_and(|m| m.contains_key("default"))
+        {
+            return Err(err(format!(
+                "the manifest's [messages.{}] table has no 'default' variant",
+                rule.code
+            ))
+            .with_fix("Add the variant template (see spec/pack-manifest.md)"));
+        }
+        if !manifest
+            .messages
+            .get(&rule.code)
+            .is_some_and(|m| m.contains_key("default_fix"))
+        {
+            return Err(err(format!(
+                "the manifest's [messages.{}] table has no 'default_fix' variant",
+                rule.code
+            ))
+            .with_fix("Add the fix template (see spec/pack-manifest.md)"));
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, ctx: &RuleCtx, rule: &RuleDecl, out: &mut Vec<Finding>) {
+        let date_fields: Vec<&str> = rule
+            .params
+            .get("date_fields")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let window_key = rule
+            .params
+            .get("window_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let window = resolve_int_check(ctx, window_key);
+        let window_i = i64::try_from(window).unwrap_or(i64::MAX);
+        let Ok(code) = FindingCode::from_pack_str_or_builtin(intern_str(&rule.code)) else {
+            return; // the loader validated the code; unreachable
+        };
+
+        // Canonical persons in deterministic order (merge-aware), reading
+        // only their own record's fields — the compiled rule does the
+        // same (a merged member's dates do not carry over).
+        let mut canonical_people: BTreeMap<RecordId, &Record> = BTreeMap::new();
+        for rec in vault_persons(ctx.vault) {
+            let canon = ctx.merges.canonical_on(&rec.id, ctx.as_of);
+            if canon == rec.id {
+                canonical_people.insert(canon, rec);
+            }
+        }
+
+        for (id, rec) in canonical_people {
+            // Each field's grammar decides one date or a list of them;
+            // values that do not parse are already reported by the
+            // field-grammar phase, so here they contribute nothing.
+            let mut dates: Vec<RecurringDate> = Vec::new();
+            for name in &date_fields {
+                let Some(raw) = rec.field(name) else {
+                    continue;
+                };
+                let grammar = ctx
+                    .manifest
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .map(|f| f.grammar.as_str())
+                    .unwrap_or_default();
+                match parse_field_grammar(grammar, *name, raw) {
+                    Some(FieldValue::RecurringDate(date)) => dates.push(date),
+                    Some(FieldValue::DatesList(list)) => dates.extend(list),
+                    _ => {}
+                }
+            }
+            for date in dates {
+                let Some(occ) = date.next_occurrence_on_or_after(ctx.as_of) else {
+                    continue;
+                };
+                let delta = occ.signed_duration_since(ctx.as_of).num_days();
+                if !(0..=window_i).contains(&delta) {
+                    continue;
+                }
+                out.push(
+                    Finding::new(
+                        code,
+                        ctx.severity,
+                        ctx.manifest.render_message(
+                            &rule.code,
+                            "default",
+                            &[("id", &id), ("occ", &occ), ("delta", &delta)],
+                        ),
+                    )
+                    .at_file(&rec.path)
+                    .for_id(id.clone())
+                    .with_fix(
+                        ctx.manifest
+                            .render_fix(&rule.code, "default", &[("id", &id)])
+                            .unwrap_or_default(),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Resolve a declared int check's value: the operator's `[checks]`
+/// override first (seeded into `vault.config` by the vault's config
+/// pass), else the manifest's declared default. External packs' int
+/// defaults are not seeded into `vault.config` by `VaultConfig::parse`
+/// (only compiled manifests are), so the manifest fallback keeps a
+/// declared `window_key` meaningful for them.
+fn resolve_int_check(ctx: &RuleCtx, key: &str) -> u64 {
+    if let Some(value) = ctx.vault.config.checks.int(key) {
+        return value;
+    }
+    ctx.manifest
+        .checks
+        .int
+        .iter()
+        .find(|i| i.key == key)
+        .map(|i| u64::try_from(i.default).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+static DATE_UPCOMING: DateUpcomingKind = DateUpcomingKind;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,7 +1026,15 @@ default = "test rule"
                 // The manifest list is derived from the registered
                 // kinds: production kinds first, then the test hook's.
                 let names = crate::packs::manifest::known_rule_kinds();
-                assert_eq!(names, vec!["cadence-overdue", "test-rule", "other-rule"]);
+                assert_eq!(
+                    names,
+                    vec![
+                        "cadence-overdue",
+                        "date-upcoming",
+                        "test-rule",
+                        "other-rule"
+                    ]
+                );
             },
         );
         // Outside the hook only the production kinds remain. Run this
@@ -810,7 +1043,7 @@ default = "test rule"
         crate::packs::declarative::with_rule_kinds_for_test(vec![], || {
             assert_eq!(
                 crate::packs::manifest::known_rule_kinds(),
-                vec!["cadence-overdue"]
+                vec!["cadence-overdue", "date-upcoming"]
             );
         });
     }
@@ -1215,5 +1448,237 @@ default_fix = "{{fix}}"
         let mut out = Vec::new();
         run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
         assert!(out.is_empty(), "no cadence → skipped: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod date_kind_tests {
+    use super::tests::{as_of, empty_merges};
+    use super::*;
+    use crate::load_vault;
+    use crate::packs::dir::read_pack_dir;
+    use crate::packs::external::{load_external_packs, PackProblem, PackProblemKind};
+    use crate::packs::lock::Lockfile;
+    use crate::packs::manifest::parse_manifest_external;
+    use crate::packs::registry::PackRegistry;
+
+    /// Vendor a pack whose date rule has the given manifest body and
+    /// `[[fields]]` entries, and return the loader's problems.
+    fn load_with_date_rule(fields: &str, rules: &str, messages: &str) -> Vec<PackProblem> {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_DATE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+{fields}
+
+{rules}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+
+{messages}
+"#
+        );
+        let pack_dir = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("manifest.toml"), text).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# example pack.\n").unwrap();
+        let hash = read_pack_dir(&pack_dir)
+            .map(|p| p.hash)
+            .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
+        let mut lock = Lockfile::default();
+        lock.upsert(crate::packs::lock::LockEntry {
+            name: "example-pack".to_owned(),
+            version: "0.1".to_owned(),
+            source: "https://example.invalid/org/example-pack.git".to_owned(),
+            rev: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            subdir: String::new(),
+            hash,
+        });
+        std::fs::write(dir.path().join("confidant.lock"), lock.to_toml()).unwrap();
+        let compiled = PackRegistry::compiled();
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["example-pack@0.1".to_owned()],
+            &compiled,
+        );
+        load.problems
+    }
+
+    fn severity_entry() -> String {
+        "[[checks.severity]]\nkey = \"example-pack.date_upcoming\"\ndefault = \"warning\"\n"
+            .to_owned()
+    }
+
+    fn int_entry() -> String {
+        "[[checks.int]]\nkey = \"example-pack.date_upcoming_days\"\ndefault = 7\n".to_owned()
+    }
+
+    fn date_messages() -> String {
+        r#"[messages."W_EXAMPLE_DATE"]
+default = "upcoming date for {id} on {occ} (in {delta}d)"
+default_fix = "Reach out to {id} or set `[checks] personal.date_upcoming = \"off\"`""#
+            .to_owned()
+    }
+
+    fn assert_loader_refuses(problems: &[PackProblem], detail_snippet: &str) {
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            matches!(problems[0].kind, PackProblemKind::Invalid),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].detail.contains(detail_snippet),
+            "detail missing {detail_snippet:?}: {}",
+            problems[0].detail
+        );
+    }
+
+    fn valid_fields() -> &'static str {
+        "[[fields]]\nname = \"birthday\"\ngrammar = \"recurring-date\"\n\n[[fields]]\nname = \"dates\"\ngrammar = \"dates-list\"\n"
+    }
+
+    fn date_rule(params: &str) -> String {
+        format!(
+            "[[rules]]\nid = \"dates\"\nkind = \"date-upcoming\"\ncode = \"W_EXAMPLE_DATE\"\nseverity_key = \"example-pack.date_upcoming\"\n{params}"
+        )
+    }
+
+    fn valid_params() -> &'static str {
+        "date_fields = [\"birthday\", \"dates\"]\nwindow_key = \"example-pack.date_upcoming_days\"\n"
+    }
+
+    #[test]
+    fn loader_accepts_valid_date_rule() {
+        let problems = load_with_date_rule(
+            valid_fields(),
+            &format!("{}\n{}", date_rule(valid_params()), severity_entry()),
+            &format!("{}\n{}", int_entry(), date_messages()),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn loader_refuses_undeclared_date_field() {
+        let problems = load_with_date_rule(
+            valid_fields(),
+            &format!(
+                "{}\n{}",
+                date_rule(
+                    "date_fields = [\"ghost\"]\nwindow_key = \"example-pack.date_upcoming_days\"\n"
+                ),
+                severity_entry()
+            ),
+            &format!("{}\n{}", int_entry(), date_messages()),
+        );
+        assert_loader_refuses(&problems, "is not one of the pack's declared fields");
+    }
+
+    #[test]
+    fn loader_refuses_date_field_with_wrong_grammar() {
+        // The pack declares `birthday` with grammar "cadence": not usable
+        // as a date field.
+        let problems = load_with_date_rule(
+            "[[fields]]\nname = \"birthday\"\ngrammar = \"cadence\"\n",
+            &format!("{}\n{}", date_rule(valid_params()), severity_entry()),
+            &format!("{}\n{}", int_entry(), date_messages()),
+        );
+        assert_loader_refuses(&problems, "has grammar 'cadence'");
+    }
+
+    #[test]
+    fn loader_refuses_missing_window_key() {
+        let problems = load_with_date_rule(
+            valid_fields(),
+            &format!(
+                "{}\n{}",
+                date_rule(
+                    "date_fields = [\"birthday\", \"dates\"]\nwindow_key = \"example-pack.nope\"\n"
+                ),
+                severity_entry()
+            ),
+            &format!("{}\n{}", int_entry(), date_messages()),
+        );
+        assert_loader_refuses(&problems, "is not a declared [[checks.int]] key");
+    }
+
+    #[test]
+    fn loader_refuses_missing_default_fix_variant() {
+        let messages = date_messages().replace(
+            "default_fix = \"Reach out to {id} or set `[checks] personal.date_upcoming = \\\"off\\\"`\"",
+            "",
+        );
+        let problems = load_with_date_rule(
+            valid_fields(),
+            &format!("{}\n{}", date_rule(valid_params()), severity_entry()),
+            &format!("{}\n{}", int_entry(), messages),
+        );
+        assert_loader_refuses(&problems, "has no 'default_fix' variant");
+    }
+
+    /// #443: a person with no date fields at all is skipped.
+    #[test]
+    fn date_rule_no_dates_skipped() {
+        let manifest_text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_DATE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+{fields}
+
+{rules}
+
+{severity}
+
+{ints}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+
+{messages}
+"#,
+            fields = valid_fields(),
+            rules = date_rule(valid_params()),
+            severity = severity_entry(),
+            ints = int_entry(),
+            messages = date_messages(),
+        );
+        let manifest = parse_manifest_external(&manifest_text).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("people/p-01J9Z3K4QF0000000000000000")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("people/p-01J9Z3K4QF0000000000000000/profile.md"),
+            "---\nid: p-01J9Z3K4QF0000000000000000\ntype: person\nname: Ada Example\n---\n\nFake person.\n",
+        )
+        .unwrap();
+        let vault = load_vault(dir.path()).unwrap();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert!(out.is_empty(), "no dates → skipped: {out:?}");
     }
 }
