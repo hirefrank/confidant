@@ -131,7 +131,7 @@ domain.
   birthdays, relationship edges (`friend`, `family`, `sibling`, `partner`,
   `parent`, `mentor`), keep-in-touch cadence (`W_CADENCE_OVERDUE`), upcoming
   important dates (`W_DATE_UPCOMING`), and the `touch` ledger verb
-  (`confidant log touch <person> call|text|coffee|gift|meet`) for lightweight
+  (`confidant log touch <person> call|text|email|meet|meal|event|gift|other`) for lightweight
   touchpoints. Both cadence and date nudges are warning-level and never block
   a write.
 - **Multi-pack vaults** ([issue #173](https://github.com/hirefrank/confidant/issues/173)):

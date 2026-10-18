@@ -37,7 +37,8 @@ use crate::config::parse_severity_token;
 use crate::error::DomainError;
 use crate::id::{Prefix, RecordId};
 use crate::packs::grammars::{
-    parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_DATES_LIST, GRAMMAR_RECURRING_DATE,
+    parse_field_grammar, Cadence, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATE,
+    GRAMMAR_DATES_LIST, GRAMMAR_RECURRING_DATE,
 };
 use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, RuleDecl, MANIFEST_VERSION_V2};
@@ -336,10 +337,13 @@ fn push_external_field_error(
 /// `cadence-overdue` (#442): for each merge-canonical person, warn when
 /// the last contact older than the person's cadence window. Parameters
 /// (spec/pack-manifest.md): `cadence_field` names one of the pack's own
-/// declared fields with grammar `cadence`; `event_verbs` lists the
-/// ledger verbs that count as contact (read-only access to ledger
-/// metadata: date, verb, opaque id — PD8). Severity comes from
-/// `severity_key`; an off rule is skipped before evaluation.
+/// declared fields with grammar `cadence` (whose value may be `never`,
+/// which skips the person); `event_verbs` lists the ledger verbs that
+/// count as contact (read-only access to ledger metadata: date, verb,
+/// opaque id — PD8); optional `snooze_field` names one of the pack's own
+/// declared fields with grammar `date`, and while `as_of <` its value
+/// the person is skipped. Severity comes from `severity_key`; an off
+/// rule is skipped before evaluation.
 pub(crate) struct CadenceOverdueKind;
 
 impl RuleKind for CadenceOverdueKind {
@@ -349,8 +353,10 @@ impl RuleKind for CadenceOverdueKind {
 
     /// Parameter validation (#442): `cadence_field` must name one of the
     /// pack's own `[[fields]]` entries with grammar `cadence`;
-    /// `event_verbs` must be a non-empty list of non-empty strings; the
-    /// message table must declare `last`, `none`, `last_fix`, `none_fix`.
+    /// `event_verbs` must be a non-empty list of non-empty strings;
+    /// optional `snooze_field` must name one of the pack's own
+    /// `[[fields]]` entries with grammar `date`; the message table must
+    /// declare `last`, `none`, `last_fix`, `none_fix`.
     fn validate(&self, rule: &RuleDecl, manifest: &PackManifest) -> Result<(), DomainError> {
         let err = |detail: String| DomainError::config(format!("rule '{}': {detail}", rule.id));
         let Some(cadence_field) = rule.params.get("cadence_field").and_then(|v| v.as_str()) else {
@@ -370,12 +376,48 @@ impl RuleKind for CadenceOverdueKind {
                 ))
                 .with_fix("Declare the field in [[fields]] or use its declared name")
             })?;
-        if field.grammar != "cadence" {
+        if field.grammar != GRAMMAR_CADENCE {
             return Err(err(format!(
                 "cadence_field '{}' has grammar '{}', not \"cadence\"",
                 cadence_field, field.grammar
             ))
             .with_fix("Use a field declared with grammar = \"cadence\""));
+        }
+        if let Some(snooze) = rule.params.get("snooze_field") {
+            let Some(snooze_field) = snooze.as_str() else {
+                return Err(err(
+                    "the snooze_field parameter must be a field name string".to_owned()
+                )
+                .with_fix(
+                    "Set snooze_field to a [[fields]] entry with grammar \"date\", or omit it",
+                ));
+            };
+            if snooze_field.trim().is_empty() {
+                return Err(
+                    err("snooze_field must be a non-empty field name".to_owned()).with_fix(
+                        "Set snooze_field to a [[fields]] entry with grammar \"date\", or omit it",
+                    ),
+                );
+            }
+            let field = manifest
+                .fields
+                .iter()
+                .find(|f| f.name == snooze_field)
+                .ok_or_else(|| {
+                    err(format!(
+                        "snooze_field '{snooze_field}' is not one of the pack's declared fields"
+                    ))
+                    .with_fix(
+                        "Declare the field in [[fields]] with grammar \"date\", or omit snooze_field",
+                    )
+                })?;
+            if field.grammar != GRAMMAR_DATE {
+                return Err(err(format!(
+                    "snooze_field '{}' has grammar '{}', not \"date\"",
+                    snooze_field, field.grammar
+                ))
+                .with_fix("Use a field declared with grammar = \"date\""));
+            }
         }
         let verbs = rule
             .params
@@ -449,13 +491,13 @@ impl RuleKind for CadenceOverdueKind {
         //    Invalid values are already reported by the field-grammar
         //    validation phase; here a missing/invalid value is "no
         //    cadence", which skips the person.
-        let mut cadence: HashMap<RecordId, u32> = HashMap::new();
+        let mut cadence: HashMap<RecordId, Cadence> = HashMap::new();
         for rec in vault_persons(ctx.vault) {
             if let Some(raw) = rec.field(cadence_field) {
-                if let Some(FieldValue::CadenceDays(days)) =
-                    parse_field_grammar("cadence", cadence_field, raw)
+                if let Some(FieldValue::Cadence(value)) =
+                    parse_field_grammar(GRAMMAR_CADENCE, cadence_field, raw)
                 {
-                    cadence.insert(rec.id.clone(), days);
+                    cadence.insert(rec.id.clone(), value);
                 }
             }
         }
@@ -483,13 +525,35 @@ impl RuleKind for CadenceOverdueKind {
             // The person's own cadence first, else the first merged
             // member that has one (group members are sorted).
             let members: &[RecordId] = groups.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
-            let Some(cadence_days) = cadence
+            let Some(cadence_value) = cadence
                 .get(&id)
                 .copied()
                 .or_else(|| members.iter().find_map(|m| cadence.get(m).copied()))
             else {
                 continue;
             };
+            // `cadence: never` is a valid value meaning the person is
+            // never overdue: skip them (no finding, no none variant).
+            let cadence_days = match cadence_value {
+                Cadence::Never => continue,
+                Cadence::Days(days) => days,
+            };
+
+            // An active `snooze_until` suppresses the nudge while
+            // `as_of < snooze_until`; the person is eligible again on the
+            // date itself, and a past date has no effect. Only the
+            // canonical person's own record is read.
+            if let Some(snooze_field) = rule.params.get("snooze_field").and_then(|v| v.as_str()) {
+                if let Some(raw) = rec.field(snooze_field) {
+                    if let Some(FieldValue::Date(until)) =
+                        parse_field_grammar(GRAMMAR_DATE, snooze_field, raw)
+                    {
+                        if ctx.as_of < until {
+                            continue;
+                        }
+                    }
+                }
+            }
 
             // 4. Last contact: latest ledger date <= as_of whose verb is
             //    one of event_verbs, for the person or a merged member.
@@ -1498,6 +1562,16 @@ mod cadence_kind_tests {
     /// Vendor a pack whose cadence rule has the given manifest body
     /// (params vary per test) and return the loader's problems.
     fn load_with_rule(rules: &str, messages: &str) -> Vec<PackProblem> {
+        load_with_fields_and_rule(
+            "[[fields]]\nname = \"cadence\"\ngrammar = \"cadence\"\n",
+            rules,
+            messages,
+        )
+    }
+
+    /// Like [`load_with_rule`] but with caller-supplied `[[fields]]`
+    /// (needed for the `snooze_field` cases, which declare a `date` field).
+    fn load_with_fields_and_rule(fields: &str, rules: &str, messages: &str) -> Vec<PackProblem> {
         let dir = tempfile::tempdir().unwrap();
         let text = format!(
             r#"manifest_version = 2
@@ -1511,9 +1585,7 @@ version = "0.1"
 skill = "SKILL.md"
 requires_spec = ["0.1"]
 
-[[fields]]
-name = "cadence"
-grammar = "cadence"
+{fields}
 
 {rules}
 
@@ -1709,6 +1781,59 @@ default_fix = "{{fix}}"
             &cadence_messages(),
         );
         assert_loader_refuses(&problems, "event_verbs must not be empty");
+    }
+
+    /// #509: an optional `snooze_field` must name one of the pack's own
+    /// declared fields with grammar `date`.
+    #[test]
+    fn loader_refuses_undeclared_snooze_field() {
+        let fields = "[[fields]]\nname = \"cadence\"\ngrammar = \"cadence\"\n\n[[fields]]\nname = \"snooze_until\"\ngrammar = \"date\"\n";
+        let problems = load_with_fields_and_rule(
+            fields,
+            &format!(
+                "{}\n{}",
+                cadence_rule(
+                    "cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\nsnooze_field = \"ghost\"\n"
+                ),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert_loader_refuses(&problems, "is not one of the pack's declared fields");
+    }
+
+    #[test]
+    fn loader_refuses_snooze_field_with_wrong_grammar() {
+        // `snooze_field` points at the cadence field: not grammar `date`.
+        let problems = load_with_rule(
+            &format!(
+                "{}\n{}",
+                cadence_rule(
+                    "cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\nsnooze_field = \"cadence\"\n"
+                ),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert_loader_refuses(&problems, "has grammar 'cadence', not \"date\"");
+    }
+
+    #[test]
+    fn loader_accepts_declared_snooze_field() {
+        // Positive control: a declared `date` field loads with no problems.
+        let fields = "[[fields]]\nname = \"cadence\"\ngrammar = \"cadence\"\n\n[[fields]]\nname = \"snooze_until\"\ngrammar = \"date\"\n";
+        let problems = load_with_fields_and_rule(
+            fields,
+            &format!(
+                "{}\n{}",
+                cadence_rule(
+                    "cadence_field = \"cadence\"\nevent_verbs = [\"touch\"]\nsnooze_field = \"snooze_until\"\n"
+                ),
+                severity_entry()
+            ),
+            &cadence_messages(),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     /// #495: a person with no cadence value is skipped, not warned.

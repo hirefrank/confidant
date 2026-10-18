@@ -5019,7 +5019,7 @@ fn personal_touch_accepts_positional_and_mirrored_forms_when_enabled() {
         "ledger/2026/10.cfd",
         &format!(
             "2026-10-01 touch {ADA} call\n\
-             2026-10-02 touch {ADA} kind:coffee\n\
+             2026-10-02 touch {ADA} kind:meal\n\
              2026-10-03 touch {ADA} text src:zoom/t-01\n\
              2026-10-04 touch {ADA}\n"
         ),
@@ -6872,5 +6872,280 @@ fn note_ref_conflicted_note_counts_as_existing() {
     assert!(
         note_ref_findings(&declarative).is_empty(),
         "a conflicted note is treated as existing: {declarative:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// personal@0.2 schema (#509): Dex-derived fields, new grammars, snooze
+// ---------------------------------------------------------------------------
+
+/// The full `personal@0.2` field set, as a fixture manifest. The real
+/// `packs/personal/manifest.toml` (and its embedded copy) stay at 0.1
+/// until #444b: this issue proves the 0.2 field set with fixtures only.
+const SCHEMA_0_2_FIELDS: &str = r#"[[fields]]
+name = "title"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "company"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "location"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "emails"
+grammar = "list"
+
+[[fields]]
+name = "phones"
+grammar = "list"
+
+[[fields]]
+name = "links"
+grammar = "labeled-list"
+
+[[fields]]
+name = "tags"
+grammar = "list"
+
+[[fields]]
+name = "birthday"
+grammar = "recurring-date"
+
+[[fields]]
+name = "dates"
+grammar = "dates-list"
+
+[[fields]]
+name = "relationship"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "cadence"
+grammar = "cadence"
+
+[[fields]]
+name = "snooze_until"
+grammar = "date"
+"#;
+
+/// Vendor a fixture pack declaring the full `personal@0.2` field set and
+/// a `cadence-overdue` rule with `snooze_field`, and return the lockfile
+/// hash for it.
+fn install_schema_pack(root: &Path) -> String {
+    let pack_dir = root.join("packs/personal-0-2@0.2");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        root,
+        "packs/personal-0-2@0.2/manifest.toml",
+        &format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
+
+[pack]
+name = "personal-0-2"
+version = "0.2"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.severity]]
+key = "personal-0-2.cadence_overdue"
+default = "warning"
+
+{SCHEMA_0_2_FIELDS}
+
+[[rules]]
+id = "cadence"
+kind = "cadence-overdue"
+code = "W_EXAMPLE_CADENCE"
+severity_key = "personal-0-2.cadence_overdue"
+cadence_field = "cadence"
+event_verbs = ["touch"]
+snooze_field = "snooze_until"
+
+[messages."W_EXAMPLE_CADENCE"]
+last = "person {{id}} is overdue (last {{d}}, cadence {{cadence_days}}d)"
+last_fix = "Reach out to {{id}}"
+none = "person {{id}} has no touchpoint logged (cadence {{cadence_days}}d)"
+none_fix = "Reach out to {{id}}"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+"#
+        ),
+    );
+    write(
+        root,
+        "packs/personal-0-2@0.2/SKILL.md",
+        "# personal 0.2 schema fixture pack (fake).\n",
+    );
+    read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash
+}
+
+/// A one-person vault checked against the fixture 0.2 pack, with the
+/// given extra front-matter lines on the person's profile. Returns the
+/// check JSON (all fake data).
+fn schema_pack_report(extra_fields: &str) -> Value {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = [\"personal-0-2@0.2\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    write(
+        root,
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n{extra_fields}---\n\nFake person.\n"
+        ),
+    );
+    let hash = install_schema_pack(root);
+    install_lockfile(root, "personal-0-2", "0.2", &hash);
+    report_json(root, None)
+}
+
+/// The full 0.2 field set with valid values validates clean (and
+/// `cadence: never` proves the extended grammar while skipping the rule).
+///
+/// `birthday`, `dates` and `cadence` are still claimed by the compiled
+/// `personal@0.1` pack (registered but not enabled here), so core flags
+/// them `W_PACK_ORPHAN`; that overlap disappears in #444b when compiled
+/// personal is replaced by the embedded 0.2 manifest. So this asserts no
+/// errors and no `E_FRONTMATTER` (grammar validation passes), not zero
+/// findings.
+#[test]
+fn personal_0_2_fields_validate_clean() {
+    let json = schema_pack_report(
+        "title: Staff Engineer\n\
+         company: Example Co\n\
+         location: Lisbon\n\
+         emails: [ada@example.com, ada2@example.com]\n\
+         phones: [+15550000000]\n\
+         links: [linkedin:https://example.test/ada, site:https://example.test/a:b]\n\
+         tags: [friend, work/finance]\n\
+         birthday: --05-14\n\
+         dates: [anniversary:2020-06-15]\n\
+         relationship: friend\n\
+         cadence: never\n\
+         snooze_until: 2026-10-20\n",
+    );
+    assert!(
+        !codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+        "every 0.2 value must validate: {json:?}"
+    );
+    assert_eq!(json["summary"]["errors"], 0, "{json:?}");
+}
+
+/// `tags: []` is a valid, empty list.
+#[test]
+fn personal_0_2_empty_list_is_valid() {
+    let json = schema_pack_report("tags: []\n");
+    assert!(codes(&json).is_empty(), "{json:?}");
+}
+
+/// Assert a 0.2 field value is rejected as `E_FRONTMATTER` naming the key.
+fn assert_schema_rejection(field: &str, value: &str) {
+    let json = schema_pack_report(&format!("{field}: {value}\n"));
+    let found = codes(&json);
+    assert!(
+        found.contains(&"E_FRONTMATTER".to_owned()),
+        "{field}: {value} must be E_FRONTMATTER: {json:?}"
+    );
+    let finding = finding_by_code(&json, "E_FRONTMATTER");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("'{field}'")),
+        "the finding must name the field: {json:?}"
+    );
+}
+
+/// Every rejection case from #509 for the new grammars is `E_FRONTMATTER`.
+#[test]
+fn personal_0_2_rejections_are_frontmatter() {
+    for (field, value) in [
+        // list: empty entry, duplicate entry.
+        ("emails", "ada@example.com,"),
+        ("tags", "[a,,b]"),
+        ("tags", "[friend, friend]"),
+        // labeled-list: no colon, empty label, no-colon tail, duplicate label.
+        ("links", "[linkedin]"),
+        ("links", "[:https://example.test]"),
+        ("links", "[linkedin:https://example.test,extra]"),
+        ("links", "[linkedin:a, linkedin:b]"),
+        // date: not a one-off date, impossible date.
+        ("snooze_until", "--10-18"),
+        ("snooze_until", "2026-13-01"),
+        // cadence: misspelling, zero, over the cap.
+        ("cadence", "neverr"),
+        ("cadence", "0d"),
+        ("cadence", "3651d"),
+        // non-empty-string unchanged.
+        ("relationship", "\"\""),
+    ] {
+        assert_schema_rejection(field, value);
+    }
+}
+
+/// `cadence: never` is a valid value that skips the person entirely: no
+/// `W_CADENCE_OVERDUE`, even with no contact at all.
+#[test]
+fn cadence_never_suppresses_overdue() {
+    let json = schema_pack_report("cadence: never\n");
+    assert!(
+        !codes(&json).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        "never must not be overdue: {json:?}"
+    );
+}
+
+/// `snooze_until` suppresses the nudge while `as_of < snooze_until`.
+#[test]
+fn snooze_until_suppresses_overdue_before_date() {
+    // as_of = 2026-10-08; snooze 2026-10-20 is in the future.
+    let json = schema_pack_report("cadence: 30d\nsnooze_until: 2026-10-20\n");
+    assert!(
+        !codes(&json).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        "an active snooze must suppress the nudge: {json:?}"
+    );
+}
+
+/// The person is eligible again on the snooze date; a past date has no
+/// effect.
+#[test]
+fn snooze_until_due_on_date_is_overdue() {
+    // snooze_until == as_of: eligible again, no contact, 30d cadence.
+    let on_date = schema_pack_report("cadence: 30d\nsnooze_until: 2026-10-08\n");
+    assert!(
+        codes(&on_date).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        "eligible on the snooze date: {on_date:?}"
+    );
+    let past = schema_pack_report("cadence: 30d\nsnooze_until: 2026-01-01\n");
+    assert!(
+        codes(&past).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        "a past snooze has no effect: {past:?}"
+    );
+}
+
+/// No 0.2 field value reaches a finding: the failures name the key only.
+#[test]
+fn personal_0_2_values_do_not_echo_in_findings() {
+    let json =
+        schema_pack_report("title: SCHEMA0TITLE\nemails: SCHEMA0EMAIL,\ncompany: SCHEMA0COMPANY\n");
+    let dumped = serde_json::to_string(&json).unwrap();
+    for leak in ["SCHEMA0TITLE", "SCHEMA0EMAIL", "SCHEMA0COMPANY"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    assert!(
+        codes(&json).contains(&"E_FRONTMATTER".to_owned()),
+        "{json:?}"
     );
 }

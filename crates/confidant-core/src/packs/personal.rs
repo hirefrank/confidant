@@ -12,7 +12,7 @@ use crate::check::{Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
 use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
 use crate::packs::grammars::{
-    parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
+    parse_field_grammar, Cadence, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
     GRAMMAR_NON_EMPTY_STRING, GRAMMAR_RECURRING_DATE,
 };
 use crate::packs::manifest::{parse_manifest, PackManifest};
@@ -21,8 +21,11 @@ use crate::record::{parse_with_list, Record, RecordKind};
 use crate::search::cleared_record_ids;
 use crate::vault::{SourcedEntry, Vault};
 
-/// Closed list of touchpoint kinds for `touch` (#182, #227 Q1).
-pub const TOUCH_KINDS: &[&str] = &["call", "text", "coffee", "gift", "meet"];
+/// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.2
+/// set, #509). `coffee` was removed, not aliased: `meal` replaces it.
+pub const TOUCH_KINDS: &[&str] = &[
+    "call", "text", "email", "meet", "meal", "event", "gift", "other",
+];
 
 /// Embedded manifest for `personal@0.1` (spec §9). Vendored from
 /// `packs/personal/manifest.toml` at the repo root: the path must stay
@@ -145,8 +148,11 @@ fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
 /// Validate a `touch` line's arguments when `personal@0.1` is enabled.
 /// Accepts either:
 /// - `DATE touch P-ID` (mirrored touchpoint with no kind)
-/// - `DATE touch P-ID kind:<call|text|coffee|gift|meet>` (mirrored touchpoint with kind)
-/// - `DATE touch P-ID <call|text|coffee|gift|meet> [note:N-ID] [src:…]` (`log touch` syntax)
+/// - `DATE touch P-ID kind:<KIND>` (mirrored touchpoint with kind)
+/// - `DATE touch P-ID <KIND> [note:N-ID] [src:…]` (`log touch` syntax)
+///
+/// `<KIND>` is one of [`TOUCH_KINDS`] (`call`, `text`, `email`, `meet`,
+/// `meal`, `event`, `gift`, `other`).
 ///
 /// Pack-internal; core reaches it through [`Pack::validate_verb_args`]
 /// (#185/#296). On non-mirrored inputs this agrees with the shape core
@@ -190,7 +196,7 @@ struct TouchEvent {
 #[derive(Clone, Debug, Default)]
 struct PersonPersonal {
     touches: Vec<TouchEvent>,
-    cadence_days: Option<u32>,
+    cadence: Option<Cadence>,
     birthday: Option<RecurringDate>,
     relationship_to_me: Option<String>,
     dates: Vec<RecurringDate>,
@@ -248,20 +254,31 @@ impl PersonalState {
             .max()
     }
 
-    pub fn cadence_days_for(&self, canonical: &RecordId, on: NaiveDate) -> Option<u32> {
-        if let Some(days) = self.people.get(canonical).and_then(|p| p.cadence_days) {
-            return Some(days);
+    /// The person's cadence value (own field first, else the first merged
+    /// member's).
+    pub fn cadence_for(&self, canonical: &RecordId, on: NaiveDate) -> Option<Cadence> {
+        if let Some(cadence) = self.people.get(canonical).and_then(|p| p.cadence) {
+            return Some(cadence);
         }
         self.ensure_members(on);
         let borrow = self.merge.groups();
         let groups = borrow.get(&on).expect("members cached");
         let members = groups.get(canonical)?;
         for m in members {
-            if let Some(days) = self.people.get(m).and_then(|p| p.cadence_days) {
-                return Some(days);
+            if let Some(cadence) = self.people.get(m).and_then(|p| p.cadence) {
+                return Some(cadence);
             }
         }
         None
+    }
+
+    /// The person's cadence in days, for `context`. `never` has no day
+    /// count, so it reads as `None` (and is never overdue).
+    pub fn cadence_days_for(&self, canonical: &RecordId, on: NaiveDate) -> Option<u32> {
+        match self.cadence_for(canonical, on) {
+            Some(Cadence::Days(days)) => Some(days),
+            Some(Cadence::Never) | None => None,
+        }
     }
 }
 
@@ -509,12 +526,12 @@ fn fold(
             }
             if let Some(raw) = rec.field("cadence") {
                 match parse_field_grammar(GRAMMAR_CADENCE, "cadence", raw) {
-                    Some(FieldValue::CadenceDays(days)) => entry.cadence_days = Some(days),
+                    Some(FieldValue::Cadence(cadence)) => entry.cadence = Some(cadence),
                     _ => push_field_error(
                         rec,
                         "cadence",
-                        "must be <N>d (1..=3650)",
-                        "Use a positive day count such as 30d or 90d",
+                        "must be <N>d (1..=3650) or never",
+                        "Use a positive day count such as 30d or 90d, or the literal never",
                         findings,
                     ),
                 }
@@ -731,6 +748,7 @@ fn cadence_and_date_rules(
         .severity("personal.cadence_overdue", Severity::Warning)
     {
         for (id, rec) in &canonical_people {
+            // No cadence at all, or `cadence: never`, is never overdue.
             let Some(cadence_days) = state.cadence_days_for(id, as_of) else {
                 continue;
             };

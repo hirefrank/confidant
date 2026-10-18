@@ -8,6 +8,20 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `personal@0.2` schema (fixtures only; the shipped `personal@0.1`
+  manifest is unchanged until #444b): three new field grammars — `list`,
+  `labeled-list`, `date` — and an extended `cadence` grammar that also
+  accepts the literal `never`. The `cadence-overdue` rule now skips a
+  `never` person and accepts an optional `snooze_field` (a declared `date`
+  field) to suppress the nudge while `as_of` is before its value (#509).
+
+### Changed
+- The `touch` kind list is now `call|text|email|meet|meal|event|gift|other`
+  (#509). `coffee` is removed, not aliased: `meal` replaces it. New `log touch`
+  writes using `coffee` are a usage error, and an existing `coffee` ledger line
+  (positional or `kind:coffee`) now fails `check` with `E_TOUCH_MALFORMED`.
+
 ## [0.5.0] - 2026-10-18
 
 **Disclosure:** the milestone 2 encryption has had no outside review

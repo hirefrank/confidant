@@ -186,9 +186,12 @@ registry; the list itself is frozen by this spec):
 | Name | Accepts | Today |
 |---|---|---|
 | `recurring-date` | `YYYY-MM-DD` or `--MM-DD` (year-less; `--02-30` rejected, `--02-29` valid) | `RecurringDate::parse` |
-| `cadence` | `<N>d`, `1 <= N <= 3650` (e.g. `30d`) | `parse_cadence_days` |
+| `cadence` | `<N>d`, `1 <= N <= 3650` (e.g. `30d`), or the literal `never` | `parse_cadence` |
 | `dates-list` | comma-separated `LABEL:DATE` entries, optionally wrapped in `[...]`; `LABEL` matches `[a-zA-Z0-9_-]+`, `DATE` is a `recurring-date` | `parse_dates_list` |
 | `non-empty-string` | any non-empty string (whitespace-trimmed) | `relationship_to_me` check |
+| `list` | comma-separated values, optionally wrapped in `[...]`; entries whitespace-trimmed, non-empty, and unique (no quoting, so a comma inside an entry is unsupported; `[]` is a valid empty list) | `parse_list` |
+| `labeled-list` | comma-separated `LABEL:VALUE` entries, optionally wrapped in `[...]`; each entry splits at the **first** `:`; `LABEL` matches `[a-zA-Z0-9_-]+`; `VALUE` is whitespace-trimmed, non-empty, may contain `:` but not a newline; duplicate labels rejected | `parse_labeled_list` |
+| `date` | one strict `YYYY-MM-DD` (a one-off date; `--MM-DD` is not accepted) | `parse_date` |
 
 A field naming an unknown grammar is a load error. Adding a grammar is
 a spec change to this list plus a Rust parser — never a manifest-only
@@ -490,8 +493,9 @@ further Frank decision or an accepted divergence (#444).
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `cadence_field` | string | One of the pack's own `[[fields]]` entries whose `grammar` is `"cadence"`. The field value is the window in days (`<N>d`, 1..=3650). |
+| `cadence_field` | string | One of the pack's own `[[fields]]` entries whose `grammar` is `"cadence"`. The field value is the window in days (`<N>d`, 1..=3650), or the literal `never` (the person is never overdue). |
 | `event_verbs` | list of strings, non-empty | Ledger verbs that count as contact. Read-only access to ledger metadata (date, verb, opaque id) — never note bodies, never `no-ai` content (PD8). |
+| `snooze_field` | string, optional | One of the pack's own `[[fields]]` entries whose `grammar` is `"date"`. While `as_of` is before its value the person is skipped; they are eligible again on the date itself, and a value in the past has no effect. Only the canonical person's own record is read (a merged member's value does not carry over). |
 
 Message variants the pack's `[messages."W_CADENCE_OVERDUE"]` table must
 declare (the loader refuses a rule whose table lacks one):
@@ -508,14 +512,18 @@ Evaluation, per canonical person in record order:
 1. The person's cadence window: their own `cadence_field` value first,
    else the first merged member's (members are in deterministic
    record order). A person with no cadence value anywhere in their
-   merge group is skipped.
-2. Last contact: the latest ledger date `<= as_of` among entries whose
+   merge group is skipped, as is a person whose cadence value is
+   `never`.
+2. When `snooze_field` is set and the canonical person's own field
+   holds a date later than `as_of`, the person is skipped. A value on
+   `as_of` or earlier has no effect.
+3. Last contact: the latest ledger date `<= as_of` among entries whose
    verb is in `event_verbs`, for the canonical person or any merged
    member.
-3. Not overdue when the last contact exists and `as_of − last` is at
+4. Not overdue when the last contact exists and `as_of − last` is at
    most the window. Otherwise emit `last` (with `start`), or `none`
    when there is no contact.
-4. Severity comes from `severity_key` (`off` skips the rule). The
+5. Severity comes from `severity_key` (`off` skips the rule). The
    finding's file is the person's record path, `id` the canonical
    person.
 
