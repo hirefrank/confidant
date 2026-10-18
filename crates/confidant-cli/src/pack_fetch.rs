@@ -60,9 +60,27 @@ fn is_safe_ref(git_ref: &str) -> bool {
 /// lines the operator is supposed to read. `--json` needs no help — serde
 /// escapes them — so this is for the human output only.
 pub(crate) fn sanitize_untrusted(text: &str) -> String {
+    escape_controls(text, true)
+}
+
+/// Like [`sanitize_untrusted`], but also escapes newlines: in a single-line
+/// field (a file name, a `version`, a claim) an embedded `\n` would inject a
+/// fake report line even though it cannot hide one.
+pub(crate) fn sanitize_line(text: &str) -> String {
+    escape_controls(text, false)
+}
+
+/// Unicode bidi/format characters visually reorder text within a line even
+/// though `char::is_control` does not flag them.
+fn is_bidi(ch: char) -> bool {
+    matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn escape_controls(text: &str, keep_newline: bool) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch.is_control() && ch != '\n' && ch != '\t' {
+        let control = ch.is_control() && (!keep_newline || (ch != '\n' && ch != '\t'));
+        if control || is_bidi(ch) {
             out.extend(ch.escape_default());
         } else {
             out.push(ch);
@@ -266,7 +284,7 @@ fn run_git(args: &[String], cwd: Option<&Path>, what: &str) -> anyhow::Result<St
                     }
                     // Untrusted: git prints the remote's own text here, so
                     // control sequences must not reach the terminal.
-                    let detail = sanitize_untrusted(stderr.trim().lines().last().unwrap_or(""));
+                    let detail = sanitize_line(stderr.trim().lines().last().unwrap_or(""));
                     return Err(anyhow::Error::new(DomainError::pack_invalid(format!(
                         "{what} failed{}",
                         if detail.is_empty() {
@@ -503,40 +521,65 @@ impl PackReport {
         )
     }
 
-    /// Human-readable report lines: hash, claims, rules, files, skill text.
-    ///
-    /// The caller prints the source/rev/subdir header, which needs
-    /// [`Fetched`] as well as the report.
+    /// Human-readable report lines: every claim (PD10), each rule, the file
+    /// list, and the skill text. The caller prints the source/rev/subdir
+    /// header, which needs [`Fetched`] as well as the report.
     pub(crate) fn human_lines(&self) -> Vec<String> {
         let m = &self.manifest;
+        let checks: Vec<String> = m
+            .checks
+            .severity
+            .iter()
+            .map(|s| s.key.clone())
+            .chain(m.checks.int.iter().map(|i| i.key.clone()))
+            .collect();
+        let claim = |items: &[String]| -> String {
+            items
+                .iter()
+                .map(|s| sanitize_line(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let mut lines = vec![
             format!("hash    {}", self.hash),
             format!(
-                "claims  {} verb(s), {} field(s), {} record type(s), {} edge kind(s), {} metric(s), {} finding code(s)",
-                m.verbs.len(),
-                m.fields.len(),
-                m.record_types.len(),
-                m.edge_kinds.len(),
-                m.balance_metrics.len(),
-                m.finding_codes.len()
+                "verbs   {}",
+                claim(&m.verbs.iter().map(|v| v.name.clone()).collect::<Vec<_>>())
             ),
+            format!(
+                "fields  {}",
+                claim(&m.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>())
+            ),
+            format!("types   {}", claim(&m.record_types)),
+            format!(
+                "edges   {}",
+                claim(
+                    &m.edge_kinds
+                        .iter()
+                        .map(|e| e.name.clone())
+                        .collect::<Vec<_>>()
+                )
+            ),
+            format!("metrics {}", claim(&m.balance_metrics)),
+            format!("codes   {}", claim(&m.finding_codes)),
+            format!("checks  {}", claim(&checks)),
         ];
         for r in &m.rules {
             lines.push(format!(
                 "rule    {} (kind {}, code {}, severity {})",
-                r.id,
-                r.kind,
-                r.code,
-                r.severity_key.as_deref().unwrap_or("(fixed)")
+                sanitize_line(&r.id),
+                sanitize_line(&r.kind),
+                sanitize_line(&r.code),
+                sanitize_line(r.severity_key.as_deref().unwrap_or("(fixed)"))
             ));
         }
         lines.push(format!("files   {} file(s)", self.files.len()));
         for (path, bytes) in &self.files {
-            lines.push(format!("  {}  {bytes} bytes", sanitize_untrusted(path)));
+            lines.push(format!("  {}  {bytes} bytes", sanitize_line(path)));
         }
         lines.push(format!(
             "skill   {} ({} bytes):",
-            sanitize_untrusted(&m.pack.skill),
+            sanitize_line(&m.pack.skill),
             self.skill_text.len()
         ));
         for line in self.skill_text.lines() {
@@ -638,6 +681,10 @@ mod tests {
         assert!(escaped.contains("hidden"), "{escaped}");
         // Newlines and tabs survive, so the report still reads.
         assert_eq!(sanitize_untrusted("a\nb\tc"), "a\nb\tc");
+        // Bidi and format characters reorder text; escape them too.
+        assert!(!sanitize_untrusted("a\u{202e}b").contains('\u{202e}'));
+        // Single-line fields escape newlines so they cannot inject a line.
+        assert_eq!(sanitize_line("a\nb"), "a\\nb");
     }
 
     #[test]

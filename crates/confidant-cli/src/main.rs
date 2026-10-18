@@ -1189,13 +1189,10 @@ fn cmd_pack_add(
         // hide the lines the operator is meant to read (PD10).
         println!(
             "pack    {}@{}",
-            pack_fetch::sanitize_untrusted(&report.name),
-            pack_fetch::sanitize_untrusted(&report.version)
+            pack_fetch::sanitize_line(&report.name),
+            pack_fetch::sanitize_line(&report.version)
         );
-        println!(
-            "source  {}",
-            pack_fetch::sanitize_untrusted(&fetched.source)
-        );
+        println!("source  {}", pack_fetch::sanitize_line(&fetched.source));
         println!(
             "rev     {}",
             if fetched.rev.is_empty() {
@@ -1209,7 +1206,7 @@ fn cmd_pack_add(
             if fetched.subdir.is_empty() {
                 "(root)".to_string()
             } else {
-                pack_fetch::sanitize_untrusted(&fetched.subdir)
+                pack_fetch::sanitize_line(&fetched.subdir)
             }
         );
         for line in report.human_lines() {
