@@ -3201,7 +3201,7 @@ fn check_messages_do_not_echo_vault_free_text() {
         dir.path(),
         "confidant.toml",
         r#"spec = "0.1"
-packs = ["coaching@0.1", "ZXQVLEAKPACK@0.1"]
+packs = ["coaching@0.1", "zxqvleakpack@0.1"]
 vault_id = "test-vault"
 
 [checks]
@@ -3233,7 +3233,8 @@ coaching.paid_session_gap = "off"
     // Record bodies, ledger lines, and file contents never echo into
     // findings. The one carve-out (#490): an external pack's own
     // `name@version` — written by the operator in confidant.toml — may
-    // join the E_PACK_UNKNOWN message, as the full pin, never bare.
+    // join the E_PACK_UNKNOWN message, as the full pin, never bare, and
+    // only when it is a real pin (#501).
     for leak in [
         "ZXQVLEAKN",
         "ZXQVLEAKVERB",
@@ -3247,7 +3248,7 @@ coaching.paid_session_gap = "off"
     let pack_unknown = finding_by_code(&json, "E_PACK_UNKNOWN");
     assert_eq!(
         pack_unknown["message"].as_str().unwrap(),
-        "external pack ZXQVLEAKPACK@0.1 listed in confidant.toml has no lockfile pin"
+        "external pack zxqvleakpack@0.1 listed in confidant.toml has no lockfile pin"
     );
     assert_eq!(pack_unknown["file"].as_str().unwrap(), "confidant.toml");
     let c = codes(&json);
@@ -5618,6 +5619,40 @@ fn external_pack_malformed_id_does_not_echo() {
         !dumped.contains("justaname"),
         "malformed id echoed: {dumped}"
     );
+
+    // #501: an entry with an `@` but no real pin shape is still free text.
+    // The loose check (`@` with both halves non-empty) echoed an email and
+    // anything with a newline; only a valid pack name plus a version-like
+    // half may echo.
+    external_vault_toml(
+        dir.path(),
+        r#""coaching@0.1", "zxqvleakmail@example.com", "zxqvleak-nl\nname@0.1", "zxqvleak-nl2@0.1\nleak""#,
+        DEFAULT_CHECKS,
+    );
+    let json = report_json(dir.path(), None);
+    let dumped = serde_json::to_string(&json).unwrap();
+    for leak in ["zxqvleakmail", "example.com", "zxqvleak-nl", "zxqvleak-nl2"] {
+        assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
+    }
+    let unknown: Vec<&Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_PACK_UNKNOWN")
+        .collect();
+    assert_eq!(
+        unknown.len(),
+        3,
+        "all malformed entries must report: {json}"
+    );
+    for finding in unknown {
+        assert_eq!(
+            finding["message"].as_str().unwrap(),
+            "a pack listed in confidant.toml is not a name@version pin",
+            "not a pin, so no name may echo: {finding}"
+        );
+        assert_eq!(finding["file"].as_str().unwrap(), "confidant.toml");
+    }
 }
 
 #[test]

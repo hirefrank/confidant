@@ -27,6 +27,7 @@ use crate::packs::{find_conflict, OrphanOwners, Pack, PackState, CORE_EDGE_KINDS
 
 /// #438: external pack problems, for the fail-closed finding conversion.
 use crate::packs::external as packs_external;
+use crate::packs::lock as packs_lock;
 use crate::record::{parse_ref_id, parse_with_list, FrontmatterRef, RecordKind};
 use crate::vault::Vault;
 
@@ -628,16 +629,24 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
 /// text anywhere.
 fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
     use packs_external::PackProblemKind as Kind;
+    // Invariant behind the echo: `load_external_packs` only emits `Unknown`
+    // for an id with no lockfile entry; every other kind comes from a
+    // matching lockfile entry, so its `problem.name` is a lockfile-validated
+    // `name@version` pin and may be echoed (#490) and turned into the
+    // vendored `file` path. If the loader ever emits a non-`Unknown` kind
+    // for a malformed id, that echo becomes a leak (see #499 for escaping
+    // untrusted pack-manifest text). A `debug_assert!` is deliberately not
+    // used: a hand-edited lockfile could trip it, and `check` must fail
+    // closed with a finding, never panic.
     let (code, message, fix) = match problem.kind {
         Kind::Unknown => {
             // The echo carve-out (#490) is for a real `name@version` pin
             // only. `load_external_packs` also emits `Unknown` for a listed
-            // id that is not of that shape (no `@`), and that raw string is
-            // operator free text and must stay name-free.
-            let is_pin = problem
-                .name
-                .split_once('@')
-                .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty());
+            // id that is not of that shape — no `@`, an `@` split that is
+            // not a valid name or a version (e.g. `ada@example.com`), or an
+            // embedded newline. That raw string is operator free text and
+            // must stay name-free (#501).
+            let is_pin = packs_lock::is_valid_pack_pin(&problem.name);
             (
                 FindingCode::PackUnknown,
                 if is_pin {
