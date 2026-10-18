@@ -457,6 +457,18 @@ impl PackManifest {
             .map(|s| s.key.as_str())
             .collect();
         for rule in &self.rules {
+            // A rule's code must be a pack-own code (#494 review): a
+            // builtin as a rule's code would let a pack emit core
+            // security findings with a re-worded meaning.
+            if FindingCode::is_builtin_code(&rule.code) {
+                return Err(manifest_err(format!(
+                    "rule '{}' emits builtin code '{}'; a rule's code must be a pack-own code",
+                    rule.id, rule.code
+                ))
+                .with_fix(
+                    "Declare a pack-own code (e.g. W_<PACK>_<RULE>) in finding_codes and use it",
+                ));
+            }
             if !known_rule_kinds().contains(&rule.kind.as_str()) {
                 return Err(manifest_err(format!(
                     "rule '{}' has unknown rule kind '{}'",

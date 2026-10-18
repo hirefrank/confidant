@@ -5725,7 +5725,11 @@ fn packs_dir_contents_are_not_records() {
 
 /// #441: a manifest declaring an unknown rule kind fails the pack at
 /// load; through `check` that is one `E_PACK_INVALID` finding and the
-/// pack is not folded (PD12), with no cascade into unknown-verb noise.
+/// pack is not folded (PD12). The vendored manifest does not parse, so
+/// per spec/pack-lock.md §5 its verbs cannot be known and the ledger
+/// verb cascades into `E_UNKNOWN_VERB` — asserted here to pin that
+/// behavior (the no-cascade case is the hash-mismatch one in
+/// `external_pack_problems_report_their_codes`).
 #[test]
 fn external_pack_unknown_rule_kind_reports_pack_invalid() {
     let dir = tempfile::tempdir().unwrap();
@@ -5790,8 +5794,10 @@ default = "stale greeting"
         found.contains(&"E_PACK_INVALID".to_string()),
         "unknown rule kind must be E_PACK_INVALID: {json:?}"
     );
-    // The cascade assertion is `external_pack_problems...`'s
-    // hash-mismatch case: an unknown kind means the manifest does not
-    // parse, so its verbs cannot be known (spec/pack-lock.md §5).
-
+    // The manifest cannot parse, so its verbs are unknown (§5): the
+    // cascade is expected and pinned here.
+    assert!(
+        found.contains(&"E_UNKNOWN_VERB".to_string()),
+        "an unparseable manifest's verbs cannot be known: {json:?}"
+    );
 }

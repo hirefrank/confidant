@@ -9,8 +9,12 @@
 //! `[[rules]]` in manifest order, resolves each rule's severity through
 //! the operator's `[checks]` config (a rule set `off` is skipped), and
 //! dispatches to the kind's `evaluate`. A rule that panics fails closed:
-//! it becomes one `E_PACK_INVALID` finding naming the pack and the rule
-//! id, never the panic payload, and `check` carries on.
+//! it becomes one `E_PACK_INVALID` finding naming the rule id — pack
+//! author text, the same trust level as the pack's message templates;
+//! never the pack name (operator free text never echoes into findings)
+//! and never the panic payload. Note the default panic hook still
+//! prints panics to stderr; the guarantee here is about findings only.
+//! `check` carries on either way.
 //!
 //! Everything here is `pub(crate)`: the trait and registry only run
 //! inside `ExternalPack`'s findings, and `MergeGroups` — the merge view
@@ -178,12 +182,14 @@ pub(crate) fn validate_rule(rule: &RuleDecl, manifest: &PackManifest) -> Result<
     kind.validate(rule, manifest)
 }
 
-/// Run one rule, panics converted to a fail-closed finding.
+/// Run one rule, panics converted to a fail-closed finding. The
+/// finding names the rule id only: the pack name is operator free text
+/// and must not echo (the #438/#494 privacy contract), the rule id is
+/// pack-author text like the pack's message templates.
 fn evaluate_catching_panic(
     kind: &'static dyn RuleKind,
     ctx: &RuleCtx,
     rule: &RuleDecl,
-    pack_name: &str,
     out: &mut Vec<Finding>,
 ) {
     // A panic payload could carry anything; it is never unwrapped.
@@ -198,7 +204,7 @@ fn evaluate_catching_panic(
             Finding::new(
                 FindingCode::PackInvalid,
                 Severity::Error,
-                format!("a rule of pack {pack_name} panicked and was not run"),
+                format!("a rule ('{}') panicked and was not run", rule.id),
             )
             .at_file("confidant.toml")
             .with_fix("Report the pack issue to its author; remove the rule from the manifest"),
@@ -215,7 +221,6 @@ pub(crate) fn run(
     merges: &MergeGroups,
     as_of: NaiveDate,
     manifest: &PackManifest,
-    pack_name: &str,
     out: &mut Vec<Finding>,
 ) {
     validate_declared_fields(vault, manifest, out);
@@ -235,7 +240,7 @@ pub(crate) fn run(
             manifest,
             severity,
         };
-        evaluate_catching_panic(kind, &ctx, rule, pack_name, out);
+        evaluate_catching_panic(kind, &ctx, rule, out);
     }
 }
 
@@ -350,7 +355,7 @@ mod tests {
         }
     }
 
-    fn as_of() -> NaiveDate {
+    pub(super) fn as_of() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()
     }
 
@@ -407,12 +412,13 @@ default = "test rule"
             ),
         )
         .unwrap();
-        // The root must outlive the vault: leak the tempdir for the
-        // test's lifetime (short-lived process; PD14's leak pattern).
+        // `dir` drops at the end of this function, removing the vault
+        // files: harmless — `load_vault` reads everything into memory
+        // before returning, and the tests only read the loaded vault.
         load_vault(dir.path()).expect("fixture vault should load")
     }
 
-    fn empty_merges() -> MergeGroups {
+    pub(super) fn empty_merges() -> MergeGroups {
         MergeGroups::new(HashMap::new())
     }
 
@@ -427,14 +433,7 @@ default = "test rule"
                 );
                 let vault = fixture_vault("", None);
                 let mut out = Vec::new();
-                run(
-                    &vault,
-                    &empty_merges(),
-                    as_of(),
-                    &manifest,
-                    "example-pack@0.1",
-                    &mut out,
-                );
+                run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
                 // The manifest lists rule_b before rule_a: findings
                 // follow manifest order, not id order.
                 assert_eq!(out.len(), 2, "both rules ran: {out:?}");
@@ -457,14 +456,7 @@ default = "test rule"
                 );
                 let vault = fixture_vault("example-pack.test_rule = \"off\"\n", None);
                 let mut out = Vec::new();
-                run(
-                    &vault,
-                    &empty_merges(),
-                    as_of(),
-                    &manifest,
-                    "example-pack@0.1",
-                    &mut out,
-                );
+                run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
                 assert!(out.is_empty(), "an off rule must not run: {out:?}");
             },
         );
@@ -481,27 +473,13 @@ default = "test rule"
                 // No operator override: the manifest default (warning).
                 let vault = fixture_vault("", None);
                 let mut out = Vec::new();
-                run(
-                    &vault,
-                    &empty_merges(),
-                    as_of(),
-                    &manifest,
-                    "example-pack@0.1",
-                    &mut out,
-                );
+                run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
                 assert_eq!(out[0].severity, Severity::Warning, "{out:?}");
 
                 // Operator override: error.
                 let vault = fixture_vault("example-pack.test_rule = \"error\"\n", None);
                 let mut out = Vec::new();
-                run(
-                    &vault,
-                    &empty_merges(),
-                    as_of(),
-                    &manifest,
-                    "example-pack@0.1",
-                    &mut out,
-                );
+                run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
                 assert_eq!(out[0].severity, Severity::Error, "{out:?}");
             },
         );
@@ -509,10 +487,12 @@ default = "test rule"
 
     #[test]
     fn unknown_kind_rejected_by_loader() {
-        // No kinds registered at all: a rule with kind "nope" fails the
-        // manifest loader.
-        let err = parse_manifest_external(&manifest_with_rules_text_kind("nope")).err();
-        assert!(err.is_some(), "unknown kind must be refused");
+        // "nope" is not a registered kind: the manifest loader refuses
+        // the pack (the fixture is otherwise valid TOML, so this really
+        // is the kind check firing).
+        let err = parse_manifest_external(&manifest_with_rules_text_kind("nope"))
+            .expect_err("unknown kind must be refused");
+        assert!(err.to_string().contains("unknown rule kind"), "{err:?}");
     }
 
     fn manifest_with_rules_text_kind(kind: &str) -> String {
@@ -540,7 +520,10 @@ default = "warning"
 
 [messages."E_FRONTMATTER"]
 default = "front matter key '{{key}}' {{problem}}"
-default_fix = "{{fix}}
+default_fix = "{{fix}}"
+
+[messages."W_TEST_KIND_CODE"]
+default = "test rule"
 "#
         )
     }
@@ -557,8 +540,12 @@ default_fix = "{{fix}}
                 assert_eq!(names, vec!["test-rule", "other-rule"]);
             },
         );
-        // Restored to empty outside the hook.
-        assert!(crate::packs::manifest::known_rule_kinds().is_empty());
+        // Outside the hook the list is empty. Run this inside an
+        // empty-kinds hook: it holds the serial lock, so no parallel
+        // test can have kinds registered while we assert.
+        crate::packs::declarative::with_rule_kinds_for_test(vec![], || {
+            assert!(crate::packs::manifest::known_rule_kinds().is_empty());
+        });
     }
 
     #[test]
@@ -589,14 +576,7 @@ default = "test rule"
         let manifest = parse_manifest_external(text).unwrap();
         let vault = fixture_vault("", Some("\ncadence: soon"));
         let mut out = Vec::new();
-        run(
-            &vault,
-            &empty_merges(),
-            as_of(),
-            &manifest,
-            "example-pack@0.1",
-            &mut out,
-        );
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].code, FindingCode::Frontmatter);
         assert!(
@@ -632,14 +612,7 @@ default = "test rule"
         let manifest = parse_manifest_external(text).unwrap();
         let vault = fixture_vault("", Some("\ncadence: 30d"));
         let mut out = Vec::new();
-        run(
-            &vault,
-            &empty_merges(),
-            as_of(),
-            &manifest,
-            "example-pack@0.1",
-            &mut out,
-        );
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
         assert!(out.is_empty(), "valid value must not report: {out:?}");
     }
 
@@ -653,14 +626,7 @@ default = "test rule"
                 );
                 let vault = fixture_vault("", None);
                 let mut out = Vec::new();
-                run(
-                    &vault,
-                    &empty_merges(),
-                    as_of(),
-                    &manifest,
-                    "example-pack@0.1",
-                    &mut out,
-                );
+                run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
                 assert_eq!(out.len(), 1, "{out:?}");
                 assert_eq!(out[0].code, FindingCode::PackInvalid);
                 assert!(
@@ -673,13 +639,19 @@ default = "test rule"
 
     #[test]
     fn pack_code_maps_to_enum_variant_when_equal() {
+        // Only E_FRONTMATTER is accepted as a builtin emission claim
+        // (the spec example's); other builtins stay refused (PD13,
+        // #494 review).
         use std::sync::OnceLock;
         static S1: OnceLock<&'static str> = OnceLock::new();
-        let s1 = S1.get_or_init(|| Box::leak("W_CADENCE_OVERDUE".to_owned().into_boxed_str()));
+        let s1 = S1.get_or_init(|| Box::leak("E_FRONTMATTER".to_owned().into_boxed_str()));
         assert_eq!(
             FindingCode::from_pack_str_or_builtin(s1).unwrap(),
-            FindingCode::CadenceOverdue
+            FindingCode::Frontmatter
         );
+        static S3: OnceLock<&'static str> = OnceLock::new();
+        let s3 = S3.get_or_init(|| Box::leak("W_CADENCE_OVERDUE".to_owned().into_boxed_str()));
+        assert!(FindingCode::from_pack_str_or_builtin(s3).is_err());
         static S2: OnceLock<&'static str> = OnceLock::new();
         let s2 = S2.get_or_init(|| Box::leak("W_EXAMPLE_THING".to_owned().into_boxed_str()));
         assert_eq!(

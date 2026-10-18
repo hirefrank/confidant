@@ -250,14 +250,7 @@ impl Pack for ExternalPack {
         let Some(external_state) = state.as_any().downcast_ref::<ExternalState>() else {
             return; // never happens in-tree; fold always makes ExternalState
         };
-        crate::packs::declarative::run(
-            vault,
-            &external_state.merge,
-            as_of,
-            self.manifest,
-            self.name(),
-            out,
-        );
+        crate::packs::declarative::run(vault, &external_state.merge, as_of, self.manifest, out);
     }
 
     /// PD16: the metric is declared and owned, no rule verifies values

@@ -255,20 +255,30 @@ impl FindingCode {
         Ok(FindingCode::Pack(code))
     }
 
-    /// Build the finding code a pack's `finding_codes` entry stands for,
-    /// allowing builtin codes as *emission claims* (#441): a v2 pack may
-    /// list a core code it emits with its own message template shell
-    /// (spec/pack-manifest.md §2 lists `E_FRONTMATTER` exactly this way).
-    /// The builtin semantics stay core's — the pack supplies wording for
-    /// its own call sites only. Pack-own codes still go through
-    /// [`FindingCode::from_pack_str`] with its collision rule.
+    /// Build the finding code a pack's `finding_codes` entry stands for.
+    /// Builtin codes are accepted as *emission claims* only where the
+    /// merged v2 spec example needs it: `E_FRONTMATTER` (a pack's field
+    /// errors render through its own template shell,
+    /// spec/pack-manifest.md §2). Every other builtin is refused —
+    /// PD13 forbids shadowing core codes, and a rule that could emit
+    /// `E_PACK_HASH` or friends would let a pack forge security
+    /// findings (#494 review). Pack-own codes still go through the
+    /// collision rule of [`FindingCode::from_pack_str`].
     pub fn from_pack_str_or_builtin(code: &'static str) -> Result<FindingCode, DomainError> {
         if !is_valid_pack_code(code) {
             return Err(DomainError::invalid(format!(
                 "invalid pack finding code '{code}' (must match ^[EW]_[A-Z0-9_]{{2,40}}$)"
             )));
         }
-        Ok(Self::builtin_from_str(code).unwrap_or(FindingCode::Pack(code)))
+        if code == "E_FRONTMATTER" {
+            return Ok(FindingCode::Frontmatter);
+        }
+        if Self::is_builtin_code(code) {
+            return Err(DomainError::invalid(format!(
+                "pack finding code '{code}' collides with an existing code"
+            )));
+        }
+        Ok(FindingCode::Pack(code))
     }
 
     /// The builtin variant whose string is `s`, if any.
