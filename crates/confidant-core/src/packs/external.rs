@@ -237,14 +237,27 @@ impl Pack for ExternalPack {
         })
     }
 
-    /// PD16: no rules yet; nothing fires.
+    /// Declarative rules + field-grammar validation (#441). Runs the
+    /// evaluator's two phases in manifest order; findings are appended
+    /// deterministically.
     fn findings(
         &self,
-        _vault: &Vault,
-        _state: &dyn PackState,
-        _as_of: NaiveDate,
-        _findings: &mut Vec<Finding>,
+        vault: &Vault,
+        state: &dyn PackState,
+        as_of: NaiveDate,
+        out: &mut Vec<Finding>,
     ) {
+        let Some(external_state) = state.as_any().downcast_ref::<ExternalState>() else {
+            return; // never happens in-tree; fold always makes ExternalState
+        };
+        crate::packs::declarative::run(
+            vault,
+            &external_state.merge,
+            as_of,
+            self.manifest,
+            self.name(),
+            out,
+        );
     }
 
     /// PD16: the metric is declared and owned, no rule verifies values
@@ -499,6 +512,26 @@ pub fn load_external_packs(
             continue;
         }
 
+        // Load: validate the rules against their kinds (PD1: params are
+        // manifest data, logic is Rust — a bad pack fails closed here,
+        // before anything folds).
+        let mut rule_validation_failed = false;
+        for rule in &manifest.rules {
+            if let Err(err) = crate::packs::declarative::validate_rule(rule, &manifest) {
+                problems.push(PackProblem {
+                    name: listed.clone(),
+                    kind: PackProblemKind::Invalid,
+                    detail: err.to_string(),
+                    known_verbs: manifest_verb_names(Some(&manifest)),
+                });
+                rule_validation_failed = true;
+                break;
+            }
+        }
+        if rule_validation_failed {
+            continue;
+        }
+
         // Load: leak the claims once, keep the skill text and manifest
         // for the declarative evaluator (#441).
         let skill_text = packed
@@ -531,7 +564,7 @@ mod tests {
 manifest_version = 2
 record_types = []
 balance_metrics = []
-finding_codes = ["W_GREET_STALE"]
+finding_codes = ["E_FRONTMATTER"]
 
 [pack]
 name = "example-pack"
@@ -539,11 +572,9 @@ version = "0.1"
 skill = "SKILL.md"
 requires_spec = ["0.1"]
 
-[messages."W_GREET_STALE"]
-default = "{who} greets oddly"
-
-[[verbs]]
-name = "greet"
+[messages."E_FRONTMATTER"]
+default = "field '{key}' {problem}"
+default_fix = "{fix}"
 
 [[fields]]
 name = "mood"

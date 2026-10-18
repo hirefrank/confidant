@@ -254,6 +254,77 @@ impl FindingCode {
         }
         Ok(FindingCode::Pack(code))
     }
+
+    /// Build the finding code a pack's `finding_codes` entry stands for,
+    /// allowing builtin codes as *emission claims* (#441): a v2 pack may
+    /// list a core code it emits with its own message template shell
+    /// (spec/pack-manifest.md §2 lists `E_FRONTMATTER` exactly this way).
+    /// The builtin semantics stay core's — the pack supplies wording for
+    /// its own call sites only. Pack-own codes still go through
+    /// [`FindingCode::from_pack_str`] with its collision rule.
+    pub fn from_pack_str_or_builtin(code: &'static str) -> Result<FindingCode, DomainError> {
+        if !is_valid_pack_code(code) {
+            return Err(DomainError::invalid(format!(
+                "invalid pack finding code '{code}' (must match ^[EW]_[A-Z0-9_]{{2,40}}$)"
+            )));
+        }
+        Ok(Self::builtin_from_str(code).unwrap_or(FindingCode::Pack(code)))
+    }
+
+    /// The builtin variant whose string is `s`, if any.
+    pub fn builtin_from_str(s: &str) -> Option<FindingCode> {
+        Some(match s {
+            "E_PARSE" => Self::Parse,
+            "E_UNREADABLE" => Self::Unreadable,
+            "E_CONFIG" => Self::Config,
+            "E_SPEC_UNSUPPORTED" => Self::SpecUnsupported,
+            "E_PACK_UNKNOWN" => Self::PackUnknown,
+            "E_PACK_CONFLICT" => Self::PackConflict,
+            "W_PACK_ORPHAN" => Self::PackOrphan,
+            "E_PACK_HASH" => Self::PackHash,
+            "E_PACK_INVALID" => Self::PackInvalid,
+            "E_PACK_VERSION" => Self::PackVersion,
+            "E_INVALID_ID" => Self::InvalidId,
+            "E_INVALID_FILENAME" => Self::InvalidFilename,
+            "E_ID_PATH_MISMATCH" => Self::IdPathMismatch,
+            "E_TYPE_PATH_MISMATCH" => Self::TypePathMismatch,
+            "E_DUPLICATE_ID" => Self::DuplicateId,
+            "E_FRONTMATTER" => Self::Frontmatter,
+            "E_UNKNOWN_VERB" => Self::UnknownVerb,
+            "E_UNKNOWN_RECORD" => Self::UnknownRecord,
+            "E_UNKNOWN_METRIC" => Self::UnknownMetric,
+            "E_LEDGER_PATH" => Self::LedgerPath,
+            "E_LEDGER_DATE" => Self::LedgerDate,
+            "E_BALANCE_MISMATCH" => Self::BalanceMismatch,
+            "E_ALIAS_PLAINTEXT" => Self::AliasPlaintext,
+            "E_ALIAS_COLLISION" => Self::AliasCollision,
+            "E_UNRESOLVED_MERGE" => Self::UnresolvedMerge,
+            "E_SELF_MERGE" => Self::SelfMerge,
+            "E_MERGE_CYCLE" => Self::MergeCycle,
+            "E_SYMLINK" => Self::Symlink,
+            "E_MERGE_CONFLICT" => Self::MergeConflict,
+            "E_MISSING_DURATION" => Self::MissingDuration,
+            "E_OPEN_MALFORMED" => Self::OpenMalformed,
+            "E_NEGATIVE_BALANCE" => Self::NegativeBalance,
+            "E_SESSION_WITHOUT_NOTES" => Self::SessionWithoutNotes,
+            "E_PAID_SESSION_GAP" => Self::PaidSessionGap,
+            "E_WRONG_ID_TYPE" => Self::WrongIdType,
+            "E_DUPLICATE_ULID" => Self::DuplicateUlid,
+            "E_MERGE_FORK" => Self::MergeFork,
+            "E_DANGLING_REF" => Self::DanglingRef,
+            "E_DUPLICATE_SRC" => Self::DuplicateSrc,
+            "W_SESSION_UNTAGGED" => Self::SessionUntagged,
+            "E_SESSION_TAGS" => Self::SessionTags,
+            "E_INBOX_KEY_MISMATCH" => Self::InboxKeyMismatch,
+            "E_SELF_EDGE" => Self::SelfEdge,
+            "E_DUPLICATE_EDGE" => Self::DuplicateEdge,
+            "E_UNKNOWN_EDGE_KIND" => Self::UnknownEdgeKind,
+            "E_TOUCH_MALFORMED" => Self::TouchMalformed,
+            "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
+            "W_DATE_UPCOMING" => Self::DateUpcoming,
+            _ => return None,
+        })
+    }
 }
 
 /// A pack-declared finding code must match `^[EW]_[A-Z0-9_]{2,40}$`.
@@ -1874,6 +1945,12 @@ mod tests {
                 | FindingCode::DateUpcoming => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
+        }
+        // The str→builtin mapping covers every builtin, both ways (#441).
+        for s in FindingCode::ALL_BUILTIN_STRS {
+            let code = FindingCode::builtin_from_str(s)
+                .unwrap_or_else(|| panic!("builtin_from_str misses {s}"));
+            assert_eq!(code.as_str(), *s, "builtin_from_str roundtrip: {s}");
         }
         assert_eq!(
             variants.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
