@@ -23,6 +23,7 @@
 //! optional `README*` and `LICENSE*` (top level only, no subdirectories).
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
@@ -87,6 +88,21 @@ pub fn tree_hash(files: &BTreeMap<String, Vec<u8>>) -> String {
 /// absolute path) and suggesting a fix.
 fn pack_dir_err(path: &str, message: impl Into<String>, fix: impl Into<String>) -> DomainError {
     DomainError::pack_invalid(format!("pack file '{path}': {}", message.into())).with_fix(fix)
+}
+
+/// Convert a directory entry name to UTF-8, rejecting names that are not
+/// valid UTF-8 (PD6).
+///
+/// Kept separate from the directory walk so the rule is testable without
+/// creating such a file: macOS APFS refuses a non-UTF-8 name at the syscall
+/// (EILSEQ), so a directory-based fixture cannot exist there.
+fn utf8_name(name: &OsStr) -> Result<&str, DomainError> {
+    name.to_str().ok_or_else(|| {
+        // The name itself is not UTF-8, so it cannot appear in the message;
+        // this is the one rejection that does not name the path.
+        DomainError::pack_invalid("pack file name is not valid UTF-8")
+            .with_fix("Rename the file to a UTF-8 name")
+    })
 }
 
 /// Check if `name` matches the PD7 allowlist.
@@ -182,12 +198,7 @@ pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
         let name_os = file_name.as_os_str();
 
         // Reject non-UTF-8 names.
-        let name = name_os.to_str().ok_or_else(|| {
-            // Use a placeholder; the name itself is not UTF-8 so we can't
-            // name it. This is the one case where we can't name the path.
-            DomainError::pack_invalid("pack file name is not valid UTF-8")
-                .with_fix("Rename the file to a UTF-8 name")
-        })?;
+        let name = utf8_name(name_os)?;
 
         // Reject .git (any component, though we're top-level only).
         if name == ".git" {
@@ -588,6 +599,21 @@ default = "example field"
     #[cfg(unix)]
     fn reject_non_utf8_name() {
         use std::os::unix::ffi::OsStrExt;
+        // The name check on its own. `to_str` rejects these bytes on every
+        // platform, including macOS, where APFS refuses to create such a file
+        // at all (EILSEQ) so a directory-based fixture cannot exist. The
+        // walk-level test below covers the same rejection on Linux.
+        let bad_name = std::ffi::OsStr::from_bytes(b"\xff\xfe-bad");
+        let err = utf8_name(bad_name).expect_err("non-UTF-8 name should be rejected");
+        let msg = err.message();
+        assert_eq!(err.code(), "E_PACK_INVALID", "wrong code: {msg}");
+        assert!(msg.contains("UTF-8"), "says UTF-8: {msg}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reject_non_utf8_name_in_directory() {
+        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(
             dir.path().join("manifest.toml"),
@@ -595,7 +621,9 @@ default = "example field"
         )
         .expect("manifest");
         fs::write(dir.path().join("SKILL.md"), "# Skill.\n").expect("skill");
-        // Non-UTF-8 file name.
+        // Non-UTF-8 file name. Linux filesystems accept these bytes, so this
+        // exercises the rejection through `read_dir`; macOS APFS returns
+        // EILSEQ on the write, hence Linux-only.
         let bad_name = std::ffi::OsStr::from_bytes(b"\xff\xfe-bad");
         fs::write(dir.path().join(bad_name), b"x").expect("bad name file");
         let err = read_pack_dir(dir.path()).expect_err("non-UTF-8 name should be rejected");
