@@ -6577,3 +6577,300 @@ fn date_rule_severity_off() {
         "{declarative_off:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declarative rule kind: note-ref (#458)
+// ---------------------------------------------------------------------------
+
+/// Vendor a declarative `touch` note-ref pack mirroring personal@0.1's
+/// templates (verbatim from packs/personal/manifest.toml) with pack-own
+/// codes: an external pack cannot claim the core codes, so it sets
+/// `invalid_code`/`wrong_type_code` explicitly (#490/PD13). Returns the
+/// lockfile hash.
+fn install_note_pack(root: &Path) -> String {
+    let pack_dir = root.join("packs/example-pack@0.1");
+    fs::create_dir_all(&pack_dir).unwrap();
+    write(
+        root,
+        "packs/example-pack@0.1/manifest.toml",
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "E_EXAMPLE_NOTE_MISSING", "E_EXAMPLE_NOTE_INVALID", "E_EXAMPLE_NOTE_WRONG_TYPE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[rules]]
+id = "touch_note"
+kind = "note-ref"
+code = "E_EXAMPLE_NOTE_MISSING"
+verb = "touch"
+pair = "note"
+invalid_code = "E_EXAMPLE_NOTE_INVALID"
+wrong_type_code = "E_EXAMPLE_NOTE_WRONG_TYPE"
+
+[messages."E_EXAMPLE_NOTE_INVALID"]
+default = "touch note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_EXAMPLE_NOTE_WRONG_TYPE"]
+default = "touch note '{id}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+
+[messages."E_EXAMPLE_NOTE_MISSING"]
+missing = "touch note '{id}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "touch note '{id}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+"#,
+    );
+    write(
+        root,
+        "packs/example-pack@0.1/SKILL.md",
+        "# example pack.\n\nNote reference rule (fake).\n",
+    );
+    read_pack_dir(&pack_dir)
+        .expect("fixture pack dir must read")
+        .hash
+}
+
+/// The note-ref findings of a report, whichever side emitted them (the
+/// compiled codes on `personal@0.1`, the pack-own codes on the
+/// declarative copy), as comparable strings.
+fn note_ref_findings(v: &Value) -> Vec<String> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            matches!(
+                f["code"].as_str().unwrap(),
+                "E_INVALID_ID"
+                    | "E_WRONG_ID_TYPE"
+                    | "E_UNKNOWN_RECORD"
+                    | "E_EXAMPLE_NOTE_INVALID"
+                    | "E_EXAMPLE_NOTE_WRONG_TYPE"
+                    | "E_EXAMPLE_NOTE_MISSING"
+            )
+        })
+        .map(|f| {
+            format!(
+                "{}/{}/{}/{}/{}/{}",
+                f["severity"].as_str().unwrap_or_default(),
+                f["message"].as_str().unwrap_or_default(),
+                f["fix"].as_str().unwrap_or_default(),
+                f["file"].as_str().unwrap_or_default(),
+                f["line"],
+                f["id"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Run `check` over one `touch` ledger and the records `setup` writes,
+/// twice: compiled `personal@0.1` and the declarative note-ref pack above.
+/// The note-ref findings — severity, message, fix, file, line, id — must
+/// match; the codes stay pack-own on the declarative side by design
+/// (#494/#490). Returns both reports.
+fn assert_note_ref_parity(ledger: &str, setup: impl Fn(&Path)) -> (Value, Value) {
+    let run_side = |root: &Path, packs: &str, declarative: bool| -> Value {
+        write(
+            root,
+            "confidant.toml",
+            &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]")),
+        );
+        setup(root);
+        write(root, "ledger/2026/10.cfd", ledger);
+        if declarative {
+            let hash = install_note_pack(root);
+            install_lockfile(root, "example-pack", "0.1", &hash);
+        }
+        report_json(root, None)
+    };
+    let personal = run_side(
+        tempfile::tempdir().unwrap().path(),
+        "\"personal@0.1\"",
+        false,
+    );
+    let declarative = run_side(
+        tempfile::tempdir().unwrap().path(),
+        "\"example-pack@0.1\"",
+        true,
+    );
+    assert_eq!(
+        note_ref_findings(&personal),
+        note_ref_findings(&declarative),
+        "declarative parity failed:\npersonal: {personal:?}\ndeclarative: {declarative:?}"
+    );
+    (personal, declarative)
+}
+
+#[test]
+fn note_ref_valid_note_no_finding() {
+    // A note that exists and belongs to the person: silent on both sides.
+    let (personal, declarative) = assert_note_ref_parity(
+        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+        },
+    );
+    assert!(note_ref_findings(&personal).is_empty(), "{personal:?}");
+    assert!(
+        note_ref_findings(&declarative).is_empty(),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn note_ref_not_a_record_id() {
+    let (personal, _) = assert_note_ref_parity(
+        &format!("2026-10-01 touch {ADA} call note:not-an-id\n"),
+        |root| person(root, ADA, "Ada Example"),
+    );
+    let findings = note_ref_findings(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0].starts_with("error/touch note is not a record ID/"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn note_ref_wrong_prefix() {
+    // A person id where a note id belongs: the wrong-type problem.
+    let (personal, _) = assert_note_ref_parity(
+        &format!("2026-10-01 touch {ADA} call note:{BEA}\n"),
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+        },
+    );
+    let findings = note_ref_findings(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0].starts_with(&format!("error/touch note '{BEA}' is not a note id/")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn note_ref_missing_note() {
+    let (personal, _) = assert_note_ref_parity(
+        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+        |root| person(root, ADA, "Ada Example"),
+    );
+    let findings = note_ref_findings(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0].starts_with(&format!("error/touch note '{NOTE}' does not exist/")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn note_ref_note_of_other_person() {
+    let (personal, _) = assert_note_ref_parity(
+        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE, BEA, "2026-10-01");
+        },
+    );
+    let findings = note_ref_findings(&personal);
+    assert_eq!(findings.len(), 1, "{personal:?}");
+    assert!(
+        findings[0].starts_with(&format!(
+            "error/touch note '{NOTE}' does not belong to {ADA}/"
+        )),
+        "{findings:?}"
+    );
+    assert!(
+        findings[0].contains("ledger/2026/10.cfd"),
+        "finding carries the ledger line: {findings:?}"
+    );
+}
+
+#[test]
+fn note_ref_merged_person_owns_note() {
+    // The note belongs to Bea, merged into Ada before the touch: no
+    // wrong-owner finding on either side.
+    let (personal, declarative) = assert_note_ref_parity(
+        &format!("2026-10-01 merge {BEA} into {ADA}\n2026-10-02 touch {ADA} call note:{NOTE}\n"),
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE, BEA, "2026-10-01");
+        },
+    );
+    assert!(note_ref_findings(&personal).is_empty(), "{personal:?}");
+    assert!(
+        note_ref_findings(&declarative).is_empty(),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn note_ref_matches_compiled_personal() {
+    // One vault that triggers all three problems; the parity helper
+    // asserts the declarative copy equals the compiled pack on every
+    // fixture, and this pins the shape of that fixture.
+    let (personal, _) = assert_note_ref_parity(
+        &format!(
+            "2026-10-01 touch {ADA} call note:{NOTE}\n2026-10-02 touch {ADA} call note:{BEA}\n2026-10-03 touch {ADA} call note:not-an-id\n"
+        ),
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE, BEA, "2026-10-01");
+        },
+    );
+    assert_eq!(note_ref_findings(&personal).len(), 3, "{personal:?}");
+}
+
+#[test]
+fn note_ref_conflicted_note_counts_as_existing() {
+    // A conflicted note file is not loaded, but it exists (two versions):
+    // the declarative kind must not report it missing. This is a
+    // documented divergence from compiled personal@0.1, which reports
+    // E_UNKNOWN_RECORD for a conflicted note (#458).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        &PERSONAL_TOML.replace(
+            "packs = [\"personal@0.1\"]",
+            "packs = [\"example-pack@0.1\"]",
+        ),
+    );
+    person(root, ADA, "Ada Example");
+    write(
+        root,
+        &format!("people/{ADA}/notes/{NOTE}.md"),
+        &format!(
+            "---\nid: {NOTE}\ntype: note\n<<<<<<< HEAD\nperson: {ADA}\n=======\nperson: {ADA}\n>>>>>>> other\ndate: 2026-10-01\n---\n\nFake note.\n"
+        ),
+    );
+    write(
+        root,
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+    );
+    let hash = install_note_pack(root);
+    install_lockfile(root, "example-pack", "0.1", &hash);
+    let declarative = report_json(root, None);
+    assert!(
+        note_ref_findings(&declarative).is_empty(),
+        "a conflicted note is treated as existing: {declarative:?}"
+    );
+}

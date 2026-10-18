@@ -35,12 +35,12 @@ use crate::check::{Finding, FindingCode, Severity};
 
 use crate::config::parse_severity_token;
 use crate::error::DomainError;
-use crate::id::RecordId;
+use crate::id::{Prefix, RecordId};
 use crate::packs::grammars::{
     parse_field_grammar, FieldValue, RecurringDate, GRAMMAR_DATES_LIST, GRAMMAR_RECURRING_DATE,
 };
 use crate::packs::groups::MergeGroups;
-use crate::packs::manifest::{PackManifest, RuleDecl};
+use crate::packs::manifest::{PackManifest, RuleDecl, MANIFEST_VERSION_V2};
 use crate::record::Record;
 use crate::vault::Vault;
 
@@ -93,8 +93,8 @@ static TEST_REGISTRY: Mutex<Option<Vec<&'static dyn RuleKind>>> = Mutex::new(Non
 pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
     // The kind implementations live in Rust (PD1); each kind's issue
     // appends its static here. #442: `cadence-overdue`; #443:
-    // `date-upcoming`.
-    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE, &DATE_UPCOMING];
+    // `date-upcoming`; #458: `note-ref`.
+    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE, &DATE_UPCOMING, &NOTE_REF];
     kinds.extend(
         TEST_REGISTRY
             .lock()
@@ -151,8 +151,13 @@ pub(crate) fn resolve_rule_severity(
     manifest: &PackManifest,
     rule: &RuleDecl,
 ) -> Option<Severity> {
+    // A kind with a fixed severity is never operator-tunable (`note-ref`
+    // is always an error, like the compiled functions it reproduces).
+    if let Some(fixed) = rule_kind(&rule.kind).and_then(|k| k.fixed_severity()) {
+        return Some(fixed);
+    }
     let Some(key) = &rule.severity_key else {
-        return rule_kind(&rule.kind).and_then(|k| k.fixed_severity());
+        return None;
     };
     // The manifest loader (#435) guarantees a declared severity_key has
     // an `[[checks.severity]]` entry; be defensive anyway.
@@ -190,6 +195,15 @@ pub(crate) fn validate_rule(rule: &RuleDecl, manifest: &PackManifest) -> Result<
         .with_fix(
             "Declare the key in [[checks.severity]] and set severity_key, or omit the rule",
         ));
+    }
+    // And the reverse: a fixed-severity kind cannot be tuned, so a
+    // severity_key would be a declaration that silently does nothing.
+    if rule.severity_key.is_some() && kind.fixed_severity().is_some() {
+        return Err(DomainError::config(format!(
+            "rule '{}' sets severity_key, but kind '{}' has a fixed severity",
+            rule.id, rule.kind
+        ))
+        .with_fix("Omit severity_key: this kind always emits its fixed severity"));
     }
     kind.validate(rule, manifest)
 }
@@ -790,6 +804,307 @@ fn resolve_int_check(ctx: &RuleCtx, key: &str) -> u64 {
 
 static DATE_UPCOMING: DateUpcomingKind = DateUpcomingKind;
 
+// ---------------------------------------------------------------------------
+// Rule kinds (#458: note-ref)
+// ---------------------------------------------------------------------------
+
+/// Default code for a note id that does not parse as a record id.
+const DEFAULT_INVALID_ID_CODE: &str = "E_INVALID_ID";
+/// Default code for a parsed id that is not a note id.
+const DEFAULT_WRONG_ID_TYPE_CODE: &str = "E_WRONG_ID_TYPE";
+
+/// Read one of the note-ref code parameters. An absent parameter takes
+/// the core default; a present-but-non-string value is refused, the same
+/// way `variants` is, never silently replaced with the default.
+fn note_ref_code_param<'a>(
+    rule: &'a RuleDecl,
+    name: &str,
+    default: &'a str,
+) -> Result<&'a str, DomainError> {
+    match rule.params.get(name) {
+        None => Ok(default),
+        Some(value) => value.as_str().ok_or_else(|| {
+            DomainError::config(format!("rule '{}': {name} must be a string", rule.id)).with_fix(
+                format!("Omit {name}, or set it to a code the pack declares"),
+            )
+        }),
+    }
+}
+
+/// `note-ref` (#458): every `<pair>:<note-id>` on a pack's ledger verb must
+/// name an existing note that belongs to the entry's canonical person.
+/// Reproduces personal@0.1's `touch_note_integrity` and coaching@0.1's
+/// `session_note_integrity`; only ids and path ownership are read, never
+/// note bodies (PD8).
+///
+/// Parameters (spec/pack-manifest.md):
+/// - `verb`: the ledger verb whose entries are checked.
+/// - `pair`: the `key:value` pair holding the note id (today `"note"`).
+/// - `variants`: `"touch"` (default) selects personal's variant names
+///   (`default`/`default_fix` for the invalid-id and wrong-type
+///   problems); `"session"` selects coaching's `session_note`/
+///   `session_note_fix`. The `missing`/`wrong_owner` variants are shared.
+/// - `invalid_code` / `wrong_type_code`: optional codes for the first two
+///   problems. Default to the core codes the compiled functions emit.
+///   A pack that cannot claim core codes (every external pack, PD13) sets
+///   its own declared codes here.
+///
+/// The generic `code` is the code for the missing / wrong-owner problems.
+/// The kind has a fixed `error` severity (both compiled functions emit
+/// `Severity::Error`), so rules omit `severity_key`.
+pub(crate) struct NoteRefKind;
+
+impl NoteRefKind {
+    /// The variant names this rule uses, from the `variants` parameter:
+    /// `(invalid/wrong-type variant, ...)`. Missing/wrong-owner variants
+    /// are the same for both compiled functions.
+    fn wrong_id_variant(rule: &RuleDecl) -> &str {
+        match rule.params.get("variants").and_then(|v| v.as_str()) {
+            Some("session") => "session_note",
+            _ => "default",
+        }
+    }
+}
+
+impl RuleKind for NoteRefKind {
+    fn name(&self) -> &'static str {
+        "note-ref"
+    }
+
+    fn fixed_severity(&self) -> Option<Severity> {
+        Some(Severity::Error)
+    }
+
+    /// Parameter validation (#458): `verb` and `pair` must be non-empty
+    /// strings; `variants`, when present, is `"touch"` or `"session"`; the
+    /// three emitted codes must have their message tables (with the
+    /// variants this kind renders) and, when pack-own, be declared in
+    /// `finding_codes`.
+    fn validate(&self, rule: &RuleDecl, manifest: &PackManifest) -> Result<(), DomainError> {
+        let err = |detail: String| DomainError::config(format!("rule '{}': {detail}", rule.id));
+        for (name, fix_hint) in [
+            ("verb", "Set verb = \"touch\""),
+            ("pair", "Set pair = \"note\""),
+        ] {
+            let Some(value) = rule.params.get(name).and_then(|v| v.as_str()) else {
+                return Err(err(format!(
+                    "the {name} parameter is missing (it names the ledger {name} to check)"
+                ))
+                .with_fix(fix_hint));
+            };
+            if value.trim().is_empty() {
+                return Err(err(format!("{name} must be a non-empty string")).with_fix(fix_hint));
+            }
+        }
+        if let Some(variants) = rule.params.get("variants") {
+            let Some(value) = variants.as_str() else {
+                return Err(err("variants must be a string".to_owned())
+                    .with_fix("Omit variants, or set variants = \"touch\" or \"session\""));
+            };
+            if value != "touch" && value != "session" {
+                return Err(err(format!(
+                    "variants '{value}' is not one of \"touch\" or \"session\""
+                ))
+                .with_fix("Omit variants, or set variants = \"touch\" or \"session\""));
+            }
+        }
+
+        let invalid_code = note_ref_code_param(rule, "invalid_code", DEFAULT_INVALID_ID_CODE)?;
+        let wrong_type_code =
+            note_ref_code_param(rule, "wrong_type_code", DEFAULT_WRONG_ID_TYPE_CODE)?;
+        let wrong_id_variant = Self::wrong_id_variant(rule);
+
+        // An external pack cannot claim a builtin code in either code
+        // parameter (#494): `E_FRONTMATTER` is the one allowed emission
+        // claim and every pack with fields already has its message table,
+        // so a builtin here would let a pack emit a core code with a
+        // re-worded meaning — the same escape the `rule.code` check in
+        // `validate_external` closes. The v1 built-in path (compiled
+        // personal) keeps the core defaults.
+        if manifest.manifest_version == MANIFEST_VERSION_V2 {
+            for (role, code) in [
+                ("invalid_code", invalid_code),
+                ("wrong_type_code", wrong_type_code),
+            ] {
+                if FindingCode::is_builtin_code(code) {
+                    return Err(DomainError::config(format!(
+                        "rule '{}' emits builtin code '{}'; a rule's {role} must be a pack-own code",
+                        rule.id, code
+                    ))
+                    .with_fix(
+                        "Declare a pack-own code (e.g. W_<PACK>_<RULE>) in finding_codes and use it",
+                    ));
+                }
+            }
+        }
+
+        // Every emitted code must be declared, or (on the v1 core-default
+        // path) one of the core codes the compiled functions emit; the
+        // builtin-code guard above already forced an external pack's two
+        // parameters to be pack-own. Message tables must exist with
+        // exactly the variants the evaluator renders; the loader's orphan
+        // rule means an external pack cannot declare a core code's table,
+        // so a missing table fails closed here.
+        for (role, code, variants) in [
+            (
+                "invalid_code",
+                invalid_code,
+                vec![
+                    wrong_id_variant.to_owned(),
+                    format!("{wrong_id_variant}_fix"),
+                ],
+            ),
+            (
+                "wrong_type_code",
+                wrong_type_code,
+                vec![
+                    wrong_id_variant.to_owned(),
+                    format!("{wrong_id_variant}_fix"),
+                ],
+            ),
+            (
+                "code",
+                rule.code.as_str(),
+                vec![
+                    "missing".to_owned(),
+                    "missing_fix".to_owned(),
+                    "wrong_owner".to_owned(),
+                    "wrong_owner_fix".to_owned(),
+                ],
+            ),
+        ] {
+            if !FindingCode::is_builtin_code(code)
+                && !manifest.finding_codes.iter().any(|c| c == code)
+            {
+                return Err(err(format!(
+                    "{role} '{code}' is not in the pack's finding_codes"
+                ))
+                .with_fix("Add the code to finding_codes or use a declared code"));
+            }
+            for variant in variants {
+                if !manifest
+                    .messages
+                    .get(code)
+                    .is_some_and(|m| m.contains_key(&variant))
+                {
+                    return Err(err(format!(
+                        "the manifest's [messages.{code}] table has no '{variant}' variant"
+                    ))
+                    .with_fix("Add the variant template (see spec/pack-manifest.md)"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate(&self, ctx: &RuleCtx, rule: &RuleDecl, out: &mut Vec<Finding>) {
+        let verb = rule
+            .params
+            .get("verb")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let pair = rule
+            .params
+            .get("pair")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let wrong_id_variant = Self::wrong_id_variant(rule);
+        let invalid_code_str = rule
+            .params
+            .get("invalid_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_INVALID_ID_CODE);
+        let wrong_type_code_str = rule
+            .params
+            .get("wrong_type_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_WRONG_ID_TYPE_CODE);
+        let (Some(invalid_code), Some(wrong_type_code), Some(unknown_code)) = (
+            resolve_finding_code(invalid_code_str),
+            resolve_finding_code(wrong_type_code_str),
+            resolve_finding_code(&rule.code),
+        ) else {
+            return; // the loader validated the codes; unreachable
+        };
+
+        for sourced in &ctx.vault.entries {
+            let entry = &sourced.entry;
+            if entry.verb != verb || entry.id.prefix() != Prefix::Person {
+                continue;
+            }
+            let Some(note_id) = entry.pair(pair) else {
+                continue;
+            };
+            // The compiled functions canonicalize as of "now" (`MAX`),
+            // not `as_of`: ownership is not a point-in-time question.
+            let person = ctx.merges.canonical_on(&entry.id, NaiveDate::MAX);
+            let finding =
+                |code: FindingCode, variant: &str, args: &[(&str, &dyn std::fmt::Display)]| {
+                    Finding::new(
+                        code,
+                        Severity::Error,
+                        ctx.manifest.render_message(code.as_str(), variant, args),
+                    )
+                    .at_file(&sourced.file)
+                    .at_line(sourced.line)
+                    .for_id(&person)
+                    .with_fix(
+                        ctx.manifest
+                            .render_fix(code.as_str(), variant, args)
+                            .unwrap_or_default(),
+                    )
+                };
+
+            match RecordId::parse(note_id) {
+                Err(_) => out.push(finding(invalid_code, wrong_id_variant, &[])),
+                Ok(nid) if nid.prefix() != Prefix::Note => out.push(finding(
+                    wrong_type_code,
+                    wrong_id_variant,
+                    // The compiled packs name this placeholder `{id}` in
+                    // personal and `{nid}` in coaching; both are supplied so
+                    // either template renders.
+                    &[("id", &nid), ("nid", &nid)],
+                )),
+                Ok(nid) => match ctx.vault.records.get(&nid) {
+                    Some(rec) => {
+                        let note_person = rec
+                            .person()
+                            .or_else(|| crate::id::person_id_from_path(&rec.path))
+                            .map(|p| ctx.merges.canonical_on(&p, NaiveDate::MAX));
+                        if note_person.as_ref() != Some(&person) {
+                            out.push(finding(
+                                unknown_code,
+                                "wrong_owner",
+                                &[("id", &nid), ("nid", &nid), ("person", &person)],
+                            ));
+                        }
+                    }
+                    // #399: a conflicted record is not loaded, but it
+                    // exists (two versions). Treat it as existing rather
+                    // than report the note missing (#458).
+                    None if ctx.vault.conflicted_ids.contains(&nid) => {}
+                    None => out.push(finding(
+                        unknown_code,
+                        "missing",
+                        &[("id", &nid), ("nid", &nid)],
+                    )),
+                },
+            }
+        }
+    }
+}
+
+/// Resolve a manifest-supplied code string: a core code keeps its builtin
+/// variant (the compiled packs' codes), anything else becomes a pack code.
+fn resolve_finding_code(code: &str) -> Option<FindingCode> {
+    if let Some(builtin) = FindingCode::builtin_from_str(code) {
+        return Some(builtin);
+    }
+    FindingCode::from_pack_str_or_builtin(intern_str(code)).ok()
+}
+
+static NOTE_REF: NoteRefKind = NoteRefKind;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,6 +1346,7 @@ default = "test rule"
                     vec![
                         "cadence-overdue",
                         "date-upcoming",
+                        "note-ref",
                         "test-rule",
                         "other-rule"
                     ]
@@ -1043,7 +1359,7 @@ default = "test rule"
         crate::packs::declarative::with_rule_kinds_for_test(vec![], || {
             assert_eq!(
                 crate::packs::manifest::known_rule_kinds(),
-                vec!["cadence-overdue", "date-upcoming"]
+                vec!["cadence-overdue", "date-upcoming", "note-ref"]
             );
         });
     }
@@ -1448,6 +1764,502 @@ default_fix = "{{fix}}"
         let mut out = Vec::new();
         run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
         assert!(out.is_empty(), "no cadence → skipped: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod note_kind_tests {
+    use super::tests::{as_of, empty_merges};
+    use super::*;
+    use crate::load_vault;
+    use crate::packs::dir::read_pack_dir;
+    use crate::packs::external::{load_external_packs, PackProblem, PackProblemKind};
+    use crate::packs::lock::Lockfile;
+    use crate::packs::manifest::{parse_manifest, parse_manifest_external};
+    use crate::packs::registry::PackRegistry;
+
+    const ADA: &str = "p-01M3TC5H00MPJG000000000000";
+    const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
+    const NOTE: &str = "n-01M3TC5H00MPJG002NAM000005";
+    const GHOST: &str = "n-01M3TC5H00MPJG000H24000000";
+
+    /// A vault with two people, one note owned by Ada, and four `touch`
+    /// lines exercising the valid/unknown/wrong-type/other-owner cases.
+    fn note_fixture_vault() -> Vault {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        )
+        .unwrap();
+        for id in [ADA, BEA] {
+            std::fs::create_dir_all(dir.path().join(format!("people/{id}/notes"))).unwrap();
+            std::fs::write(
+                dir.path().join(format!("people/{id}/profile.md")),
+                format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join(format!("people/{ADA}/notes/{NOTE}.md")),
+            format!(
+                "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nFake note.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!(
+                "2026-10-01 touch {ADA} call note:{NOTE}\n2026-10-02 touch {ADA} call note:{GHOST}\n2026-10-03 touch {ADA} call note:{BEA}\n2026-10-04 touch {ADA} call note:not-an-id\n"
+            ),
+        )
+        .unwrap();
+        load_vault(dir.path()).unwrap()
+    }
+
+    /// A v1 manifest may claim core codes (the compiled packs do), so the
+    /// builtin-code path the built-in personal pack uses is testable here.
+    fn builtin_manifest() -> PackManifest {
+        let text = r#"manifest_version = 1
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "E_INVALID_ID", "E_WRONG_ID_TYPE", "E_UNKNOWN_RECORD"]
+
+[pack]
+name = "note-pack"
+version = "0.1"
+skill = "SKILL.md"
+
+[[rules]]
+id = "touch_note"
+kind = "note-ref"
+code = "E_UNKNOWN_RECORD"
+verb = "touch"
+pair = "note"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[messages."E_INVALID_ID"]
+default = "touch note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_WRONG_ID_TYPE"]
+default = "touch note '{id}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+
+[messages."E_UNKNOWN_RECORD"]
+missing = "touch note '{id}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "touch note '{id}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
+"#;
+        parse_manifest(text).expect("v1 fixture manifest should parse")
+    }
+
+    /// A v2 external-style manifest with pack-own codes and coaching's
+    /// variant names (`variants = "session"`).
+    fn session_manifest() -> PackManifest {
+        let text = r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "E_NOTE_BAD_ID", "E_NOTE_BAD_TYPE", "E_NOTE_UNKNOWN"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[rules]]
+id = "session_note"
+kind = "note-ref"
+code = "E_NOTE_UNKNOWN"
+verb = "touch"
+pair = "note"
+variants = "session"
+invalid_code = "E_NOTE_BAD_ID"
+wrong_type_code = "E_NOTE_BAD_TYPE"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[messages."E_NOTE_BAD_ID"]
+session_note = "session note is not a record ID"
+session_note_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_NOTE_BAD_TYPE"]
+session_note = "session note '{nid}' is not a note id"
+session_note_fix = "Use note:n-<ULID>"
+
+[messages."E_NOTE_UNKNOWN"]
+missing = "session note '{nid}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "session note '{nid}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
+"#;
+        parse_manifest_external(text).expect("v2 fixture manifest should parse")
+    }
+
+    /// The codes of the `run` findings, in order.
+    fn codes_of(findings: &[Finding]) -> Vec<&'static str> {
+        findings.iter().map(|f| f.code.as_str()).collect()
+    }
+
+    #[test]
+    fn note_ref_builtin_codes_and_personal_variants() {
+        let manifest = builtin_manifest();
+        let vault = note_fixture_vault();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert_eq!(
+            codes_of(&out),
+            vec!["E_UNKNOWN_RECORD", "E_WRONG_ID_TYPE", "E_INVALID_ID"],
+            "the valid note is silent; the other three report in ledger order: {out:?}"
+        );
+        // Severity is fixed at error; the message tables name either
+        // {id} or {nid}, and both are supplied.
+        assert!(out.iter().all(|f| f.severity == Severity::Error));
+        assert_eq!(
+            out[0].message,
+            format!("touch note '{GHOST}' does not exist")
+        );
+        assert_eq!(
+            out[1].message,
+            format!("touch note '{BEA}' is not a note id")
+        );
+        assert_eq!(out[2].message, "touch note is not a record ID");
+        // file/line/id carry the ledger line and the canonical person.
+        assert_eq!(out[0].id.as_deref(), Some(ADA));
+        assert_eq!(out[0].file.as_deref(), Some("ledger/2026/10.cfd"));
+        assert_eq!(out[0].line, Some(2));
+        assert_eq!(out[2].line, Some(4));
+    }
+
+    #[test]
+    fn note_ref_session_variants_and_pack_own_codes() {
+        let manifest = session_manifest();
+        let vault = note_fixture_vault();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert_eq!(
+            codes_of(&out),
+            vec!["E_NOTE_UNKNOWN", "E_NOTE_BAD_TYPE", "E_NOTE_BAD_ID"],
+            "{out:?}"
+        );
+        // Coaching's variant names and {nid} placeholder render.
+        assert_eq!(
+            out[0].message,
+            format!("session note '{GHOST}' does not exist")
+        );
+        assert_eq!(
+            out[1].message,
+            format!("session note '{BEA}' is not a note id")
+        );
+        assert_eq!(out[2].message, "session note is not a record ID");
+    }
+
+    #[test]
+    fn note_ref_note_of_other_person_is_wrong_owner() {
+        let manifest = builtin_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        )
+        .unwrap();
+        for id in [ADA, BEA] {
+            std::fs::create_dir_all(dir.path().join(format!("people/{id}/notes"))).unwrap();
+            std::fs::write(
+                dir.path().join(format!("people/{id}/profile.md")),
+                format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join(format!("people/{BEA}/notes/{NOTE}.md")),
+            format!(
+                "---\nid: {NOTE}\ntype: note\nperson: {BEA}\ndate: 2026-10-01\n---\n\nFake note.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+        )
+        .unwrap();
+        let vault = load_vault(dir.path()).unwrap();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert_eq!(codes_of(&out), vec!["E_UNKNOWN_RECORD"], "{out:?}");
+        assert_eq!(
+            out[0].message,
+            format!("touch note '{NOTE}' does not belong to {ADA}")
+        );
+    }
+
+    #[test]
+    fn note_ref_entry_without_pair_ignored() {
+        let manifest = builtin_manifest();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("people/{ADA}"))).unwrap();
+        std::fs::write(
+            dir.path().join(format!("people/{ADA}/profile.md")),
+            format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!("2026-10-01 touch {ADA} call\n"),
+        )
+        .unwrap();
+        let vault = load_vault(dir.path()).unwrap();
+        let mut out = Vec::new();
+        run(&vault, &empty_merges(), as_of(), &manifest, &mut out);
+        assert!(out.is_empty(), "no pair: nothing to check: {out:?}");
+    }
+
+    /// Vendor a pack with the given `[[rules]]` body and return the
+    /// loader's problems. The manifest declares pack-own codes for all
+    /// three note-ref roles (an external pack cannot claim the core codes)
+    /// and a `severity_key` the tests can opt into.
+    fn load_with_note_rule(rules: &str, wrong_owner_fix: bool) -> Vec<PackProblem> {
+        let dir = tempfile::tempdir().unwrap();
+        let wrong_owner_fix_line = if wrong_owner_fix {
+            "wrong_owner_fix = \"Point note: at a note for this person\"\n"
+        } else {
+            ""
+        };
+        let text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "E_NOTE_UNKNOWN", "E_NOTE_BAD_ID", "E_NOTE_BAD_TYPE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[checks.severity]]
+key = "example-pack.note"
+default = "warning"
+
+{rules}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+
+[messages."E_NOTE_UNKNOWN"]
+missing = "note '{{nid}}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "note '{{nid}}' does not belong to {{person}}"
+{wrong_owner_fix_line}
+
+[messages."E_NOTE_BAD_ID"]
+default = "note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_NOTE_BAD_TYPE"]
+default = "note '{{nid}}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+"#
+        );
+        let pack_dir = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(pack_dir.join("manifest.toml"), text).unwrap();
+        std::fs::write(pack_dir.join("SKILL.md"), "# example pack.\n").unwrap();
+        let hash = read_pack_dir(&pack_dir)
+            .map(|p| p.hash)
+            .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
+        let mut lock = Lockfile::default();
+        lock.upsert(crate::packs::lock::LockEntry {
+            name: "example-pack".to_owned(),
+            version: "0.1".to_owned(),
+            source: "https://example.invalid/org/example-pack.git".to_owned(),
+            rev: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            subdir: String::new(),
+            hash,
+        });
+        std::fs::write(dir.path().join("confidant.lock"), lock.to_toml()).unwrap();
+        let compiled = PackRegistry::compiled();
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["example-pack@0.1".to_owned()],
+            &compiled,
+        );
+        load.problems
+    }
+
+    /// A note-ref rule with the given extra parameters. The default
+    /// `invalid_code`/`wrong_type_code` are the core codes, so callers
+    /// that want a loadable external pack pass a `params` with pack-own
+    /// codes; leaving them out is itself a loader case.
+    fn note_rule(params: &str) -> String {
+        format!(
+            "[[rules]]\nid = \"touch_note\"\nkind = \"note-ref\"\ncode = \"E_NOTE_UNKNOWN\"\n{params}"
+        )
+    }
+
+    fn pack_own_code_params() -> &'static str {
+        "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n"
+    }
+
+    fn assert_loader_refuses(problems: &[PackProblem], detail_snippet: &str) {
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            matches!(problems[0].kind, PackProblemKind::Invalid),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].detail.contains(detail_snippet),
+            "detail missing {detail_snippet:?}: {}",
+            problems[0].detail
+        );
+    }
+
+    #[test]
+    fn loader_accepts_valid_note_rule() {
+        let problems = load_with_note_rule(&note_rule(pack_own_code_params()), true);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn loader_refuses_empty_verb() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(&problems, "verb must be a non-empty string");
+    }
+
+    #[test]
+    fn loader_refuses_missing_wrong_owner_fix() {
+        let problems = load_with_note_rule(&note_rule(pack_own_code_params()), false);
+        assert_loader_refuses(&problems, "has no 'wrong_owner_fix' variant");
+    }
+
+    /// Leaving the two optional codes at their core defaults makes an
+    /// external pack (which cannot claim a core code) fail closed on the
+    /// builtin-code guard rather than emit a core code it never declared.
+    #[test]
+    fn loader_refuses_core_default_codes_for_external_pack() {
+        let problems = load_with_note_rule(&note_rule("verb = \"touch\"\npair = \"note\"\n"), true);
+        assert_loader_refuses(
+            &problems,
+            "emits builtin code 'E_INVALID_ID'; a rule's invalid_code must be a pack-own code",
+        );
+    }
+
+    /// The #494 bypass this guard closes: `E_FRONTMATTER` is the one
+    /// builtin a pack may claim, and every pack with fields already has
+    /// its message table, so without the guard an external pack could set
+    /// `invalid_code = "E_FRONTMATTER"` and emit a re-worded core code.
+    #[test]
+    fn loader_refuses_builtin_invalid_code_for_external_pack() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_FRONTMATTER\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(
+            &problems,
+            "emits builtin code 'E_FRONTMATTER'; a rule's invalid_code must be a pack-own code",
+        );
+    }
+
+    /// The same guard covers `wrong_type_code` (the invalid_code here is
+    /// pack-own, so the loop reaches the second parameter).
+    #[test]
+    fn loader_refuses_builtin_wrong_type_code_for_external_pack() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\nwrong_type_code = \"E_FRONTMATTER\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(
+            &problems,
+            "emits builtin code 'E_FRONTMATTER'; a rule's wrong_type_code must be a pack-own code",
+        );
+    }
+
+    /// A present-but-non-string code parameter is refused (like
+    /// `variants`), never silently replaced with the core default.
+    #[test]
+    fn loader_refuses_non_string_invalid_code() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = 1\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(&problems, "invalid_code must be a string");
+    }
+
+    #[test]
+    fn loader_refuses_non_string_wrong_type_code() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\nwrong_type_code = 1\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(&problems, "wrong_type_code must be a string");
+    }
+
+    #[test]
+    fn loader_refuses_undeclared_invalid_code() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_NOPE\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(
+            &problems,
+            "invalid_code 'E_NOTE_NOPE' is not in the pack's finding_codes",
+        );
+    }
+
+    #[test]
+    fn loader_refuses_severity_key_on_fixed_severity_kind() {
+        let problems = load_with_note_rule(
+            &note_rule(&format!(
+                "{}\nseverity_key = \"example-pack.note\"\n",
+                pack_own_code_params()
+            )),
+            true,
+        );
+        assert_loader_refuses(&problems, "has a fixed severity");
+    }
+
+    #[test]
+    fn loader_refuses_unknown_variants_value() {
+        let problems = load_with_note_rule(
+            &note_rule(&format!(
+                "{}\nvariants = \"weird\"\n",
+                pack_own_code_params()
+            )),
+            true,
+        );
+        assert_loader_refuses(&problems, "is not one of");
     }
 }
 
