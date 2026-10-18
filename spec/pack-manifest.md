@@ -469,9 +469,10 @@ own issue appends its section with the parameter table:
 |---|---|---|
 | `cadence-overdue` | #442 | `personal@0.1`'s keep-in-touch rule |
 | `date-upcoming` | #443 | `personal@0.1`'s upcoming-dates rule |
+| `note-ref` | #458 | `personal@0.1`'s `touch` note check and `coaching@0.1`'s `session` note check |
 
-(Planned: `note-ref` #458, `ledger-balance` #446, `session-checks` #447,
-`activity-gap` #448.)
+(Planned: `ledger-balance` #446, `session-checks` #447, `activity-gap`
+#448.)
 
 #### Kind `cadence-overdue` (#442)
 
@@ -587,6 +588,77 @@ With `as_of = 2026-10-16`, a `window_key` value of `7` and a person whose
 `birthday` is `--10-20`, the next occurrence is `2026-10-20`: one warning,
 `default` variant, `delta = 4`. A birthday of `--10-25` (delta 9) is
 outside the window and emits nothing.
+
+#### Kind `note-ref` (#458)
+
+Check the integrity of a `note:<id>` pair on a pack's ledger verb: the id
+must parse as a record id, must be a note id, must exist, and must belong
+to the entry's canonical person. Reproduces `personal@0.1`'s
+`touch_note_integrity` and `coaching@0.1`'s `session_note_integrity`.
+Only ids and path ownership are read — never note bodies, never `no-ai`
+content (PD8).
+
+This kind has a **fixed `error` severity** (both compiled functions emit
+`Severity::Error`), so its rules **omit** `severity_key`; a rule that sets
+one is refused at load.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `verb` | string, non-empty | The ledger verb whose entries are checked. |
+| `pair` | string, non-empty | The key of the pair holding the note id (today `"note"`). |
+| `variants` | string, optional | `"touch"` (default) or `"session"`: which variant names the invalid-id and wrong-type messages use (`default`/`default_fix` for personal, `session_note`/`session_note_fix` for coaching). The `missing`/`wrong_owner` variants are the same in both. |
+| `invalid_code` | string, optional | The code for an id that does not parse. Defaults to the core code `E_INVALID_ID`. |
+| `wrong_type_code` | string, optional | The code for a parsed id that is not a note id. Defaults to the core code `E_WRONG_ID_TYPE`. |
+
+The generic `code` is the code for the missing / wrong-owner problems
+(today `E_UNKNOWN_RECORD`). The three codes must have message tables in
+the manifest; a pack-own code must also be declared in `finding_codes`.
+The kind's fixed severity is `error`, so its pack-own codes use the `E_`
+prefix. An external pack cannot claim a builtin code here: omitting
+`invalid_code`/`wrong_type_code` leaves the core defaults
+(`E_INVALID_ID`/`E_WRONG_ID_TYPE`), and a builtin in either parameter is
+refused at load (the same #494 guard as the generic `code`), so an
+external pack sets both to codes it declares.
+
+Message variants the pack's tables must declare:
+
+| Code | Variants | Placeholders |
+|---|---|---|
+| `invalid_code` | `default`/`session_note`, and its `_fix` | none |
+| `wrong_type_code` | same variants as `invalid_code` | `id` or `nid` (both are supplied) |
+| `code` | `missing`, `missing_fix`, `wrong_owner`, `wrong_owner_fix` | `missing`: `id` or `nid`; `wrong_owner`: `id` or `nid`, plus `person` |
+
+Evaluation, over ledger entries in ledger order:
+
+1. Consider each entry whose verb is `verb`, whose id is a person id, and
+   which carries the `pair` pair. Entries of other verbs, non-person ids
+   and entries without the pair are ignored.
+2. Parse the note id: failure is the `invalid_code` problem, a parsed id
+   that is not a note id is the `wrong_type_code` problem.
+3. A note id that is not a loaded record is the missing problem
+   (`missing` variant under the generic `code`) — unless it is a
+   conflicted id, which is treated as existing (it has two versions, so
+   it is not missing).
+4. An existing note whose owning person (from its front matter or path)
+   canonicalizes to a different person than the entry's id is the
+   `wrong_owner` problem. Ownership and the entry's person are
+   canonicalized as of "now", like the compiled functions.
+5. Every finding carries the ledger line's file and line and the
+   canonical person as its id.
+
+Worked example (personal's variant names, pack-own codes for an external
+copy):
+
+```toml
+[[rules]]
+id = "touch_note"
+kind = "note-ref"
+code = "E_EXAMPLE_NOTE_UNKNOWN"
+verb = "touch"
+pair = "note"
+invalid_code = "E_EXAMPLE_NOTE_BAD_ID"
+wrong_type_code = "E_EXAMPLE_NOTE_BAD_TYPE"
+```
 
 ### 13.3. Names
 
