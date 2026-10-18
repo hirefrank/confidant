@@ -537,40 +537,56 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     finish_report(vault, options, findings)
 }
 
-/// #438: one failed external-pack load becomes its stable finding (PD12,
-/// fail closed). Messages stay generic and name-free: the privacy
-/// contract keeps operator-authored free text (a pack id listed in
-/// `confidant.toml`) out of findings (`check_messages_do_not_echo_
-/// vault_free_text`), and AGENTS.md rule 7 gates finding-semantics
-/// changes behind a review — the `[pack-install-review]` question asks
-/// whether the pack name may join the message once approved. The code
-/// and fix identify the failure; the config list names the packs.
+/// #438/#490: one failed external-pack load becomes its stable finding
+/// (PD12, fail closed). The message names the failing `name@version`
+/// exactly as listed in `confidant.toml` — the operator wrote that id
+/// themselves, and identifying the broken pin is the point. `E_PACK_HASH`
+/// and `E_PACK_INVALID` also point at the vendored path
+/// `packs/<name>@<version>` in `file`. Everything else stays name-free:
+/// never file contents, never absolute paths, never record/ledger free
+/// text anywhere.
 fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
     use packs_external::PackProblemKind as Kind;
     let (code, message, fix) = match problem.kind {
         Kind::Unknown => (
             FindingCode::PackUnknown,
-            "an external pack listed in confidant.toml has no lockfile pin",
+            format!(
+                "external pack {} listed in confidant.toml has no lockfile pin",
+                problem.name
+            ),
             "Run `confidant pack add <https-url>` or remove the pack",
         ),
         Kind::Hash => (
             FindingCode::PackHash,
-            "an external pack's vendored files do not match its lockfile pin",
+            format!(
+                "external pack {}'s vendored files do not match its lockfile pin",
+                problem.name
+            ),
             "Reinstall the pack (`confidant pack add`) or fix confidant.lock",
         ),
         Kind::Invalid => (
             FindingCode::PackInvalid,
-            "an external pack's manifest or contents fail validation",
+            format!(
+                "external pack {}'s manifest or contents fail validation",
+                problem.name
+            ),
             "Fix the vendored files or reinstall the pack",
         ),
         Kind::Version => (
             FindingCode::PackVersion,
-            "an external pack's spec compatibility does not include this vault",
+            format!(
+                "external pack {}'s spec compatibility does not include this vault",
+                problem.name
+            ),
             "Upgrade this CLI or pin a version the pack supports",
         ),
     };
-    Finding::new(code, Severity::Error, message.to_owned())
-        .at_file("confidant.toml")
+    let file = match problem.kind {
+        Kind::Hash | Kind::Invalid => packs_external::vendored_rel_of(&problem.name),
+        Kind::Unknown | Kind::Version => "confidant.toml".to_owned(),
+    };
+    Finding::new(code, Severity::Error, message)
+        .at_file(file)
         .with_fix(fix)
 }
 

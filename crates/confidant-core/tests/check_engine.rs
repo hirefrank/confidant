@@ -98,6 +98,15 @@ fn codes(v: &Value) -> Vec<String> {
         .collect()
 }
 
+fn finding_by_code<'a>(v: &'a Value, code: &str) -> &'a Value {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == code)
+        .unwrap_or_else(|| panic!("expected {code} finding in {v}"))
+}
+
 fn assert_golden(name: &str, actual: &Value) {
     let path = golden_path(name);
     if std::env::var("UPDATE_GOLDEN").is_ok() {
@@ -3221,8 +3230,11 @@ coaching.paid_session_gap = "off"
     );
     let json = report_json(dir.path(), None);
     let dumped = serde_json::to_string(&json).unwrap();
+    // Record bodies, ledger lines, and file contents never echo into
+    // findings. The one carve-out (#490): an external pack's own
+    // `name@version` — written by the operator in confidant.toml — may
+    // join the E_PACK_UNKNOWN message, as the full pin, never bare.
     for leak in [
-        "ZXQVLEAKPACK",
         "ZXQVLEAKN",
         "ZXQVLEAKVERB",
         "ZXQVLEAKSRC",
@@ -3232,6 +3244,12 @@ coaching.paid_session_gap = "off"
     ] {
         assert!(!dumped.contains(leak), "{leak} leaked in {dumped}");
     }
+    let pack_unknown = finding_by_code(&json, "E_PACK_UNKNOWN");
+    assert_eq!(
+        pack_unknown["message"].as_str().unwrap(),
+        "external pack ZXQVLEAKPACK@0.1 listed in confidant.toml has no lockfile pin"
+    );
+    assert_eq!(pack_unknown["file"].as_str().unwrap(), "confidant.toml");
     let c = codes(&json);
     assert!(c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
     assert!(c.contains(&"E_UNKNOWN_VERB".into()), "{c:?}");
@@ -5569,9 +5587,10 @@ name = "session"
     );
 }
 
-/// #438: each failure kind reports its own stable code, without echoing
-/// the operator's pack name (privacy contract; the name review question
-/// is filed as `[pack-install-review]`).
+/// #438/#490: each failure kind reports its own stable code, and the
+/// message names the failing `name@version` exactly as listed in
+/// `confidant.toml`; `E_PACK_HASH`/`E_PACK_INVALID` also point at the
+/// vendored path in `file`. Record/ledger free text still never echoes.
 #[test]
 fn external_pack_problems_report_their_codes() {
     let dir = tempfile::tempdir().unwrap();
@@ -5595,10 +5614,14 @@ fn external_pack_problems_report_their_codes() {
         codes(&json).contains(&"E_PACK_HASH".to_string()),
         "{json:?}"
     );
-    let dumped = serde_json::to_string(&json).unwrap();
-    assert!(
-        !dumped.contains("example-pack"),
-        "pack name must not echo: {dumped}"
+    let hash_finding = finding_by_code(&json, "E_PACK_HASH");
+    assert_eq!(
+        hash_finding["message"].as_str().unwrap(),
+        "external pack example-pack@0.1's vendored files do not match its lockfile pin"
+    );
+    assert_eq!(
+        hash_finding["file"].as_str().unwrap(),
+        "packs/example-pack@0.1"
     );
 
     // Missing vendored dir.
@@ -5608,6 +5631,12 @@ fn external_pack_problems_report_their_codes() {
         codes(&json).contains(&"E_PACK_HASH".to_string()),
         "{json:?}"
     );
+    assert_eq!(
+        finding_by_code(&json, "E_PACK_HASH")["file"]
+            .as_str()
+            .unwrap(),
+        "packs/example-pack@0.1"
+    );
 
     // No lockfile pin at all (confidant.toml lists it).
     fs::remove_file(dir.path().join("confidant.lock")).unwrap();
@@ -5616,6 +5645,12 @@ fn external_pack_problems_report_their_codes() {
         codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
         "{json:?}"
     );
+    let unknown_finding = finding_by_code(&json, "E_PACK_UNKNOWN");
+    assert_eq!(
+        unknown_finding["message"].as_str().unwrap(),
+        "external pack example-pack@0.1 listed in confidant.toml has no lockfile pin"
+    );
+    assert_eq!(unknown_finding["file"].as_str().unwrap(), "confidant.toml");
 
     // Invalid: an unlisted file inside the vendored dir (PD7).
     let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
@@ -5629,6 +5664,15 @@ fn external_pack_problems_report_their_codes() {
     assert!(
         codes(&json).contains(&"E_PACK_INVALID".to_string()),
         "{json:?}"
+    );
+    let invalid_finding = finding_by_code(&json, "E_PACK_INVALID");
+    assert_eq!(
+        invalid_finding["message"].as_str().unwrap(),
+        "external pack example-pack@0.1's manifest or contents fail validation"
+    );
+    assert_eq!(
+        invalid_finding["file"].as_str().unwrap(),
+        "packs/example-pack@0.1"
     );
     // Cleanup for the next case: remove the unlisted file.
     fs::remove_file(dir.path().join("packs/example-pack@0.1/bin/run.sh")).unwrap();
@@ -5670,6 +5714,12 @@ name = "greet"
         codes(&json).contains(&"E_PACK_VERSION".to_string()),
         "{json:?}"
     );
+    let version_finding = finding_by_code(&json, "E_PACK_VERSION");
+    assert_eq!(
+        version_finding["message"].as_str().unwrap(),
+        "external pack example-pack@0.1's spec compatibility does not include this vault"
+    );
+    assert_eq!(version_finding["file"].as_str().unwrap(), "confidant.toml");
 }
 
 /// #438: the vault scanner never treats `packs/**` as records — a
