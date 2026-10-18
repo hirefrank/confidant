@@ -179,6 +179,36 @@ pub(crate) fn parse_severity_token(s: &str) -> Result<Option<Severity>, ()> {
 }
 
 impl VaultConfig {
+    /// Replace the `packs = [...]` array in a `confidant.toml` text,
+    /// preserving comments and everything else (`toml_edit`). `pack` install
+    /// and removal go through this so an operator's comments survive (#440).
+    pub fn set_packs(text: &str, packs: &[String]) -> Result<String, DomainError> {
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| DomainError::config(format!("confidant.toml is not valid TOML: {e}")))?;
+        match doc.get_mut("packs").and_then(toml_edit::Item::as_array_mut) {
+            Some(array) => {
+                array.clear();
+                for pack in packs {
+                    array.push(pack.as_str());
+                }
+            }
+            None => {
+                let mut array = toml_edit::Array::new();
+                for pack in packs {
+                    array.push(pack.as_str());
+                }
+                // A root key-value: `toml_edit` writes the root's key-values
+                // before any `[table]`, so this cannot land inside `[checks]`.
+                doc.as_table_mut().insert(
+                    "packs",
+                    toml_edit::Item::Value(toml_edit::Value::Array(array)),
+                );
+            }
+        }
+        Ok(doc.to_string())
+    }
+
     pub fn parse(text: &str) -> Result<Self, DomainError> {
         let mut cfg: Self = toml::from_str(text).map_err(|err| {
             DomainError::config(format!("confidant.toml is not valid TOML: {err}"))
@@ -763,5 +793,44 @@ example.window_days = 10
         let findings = cfg.config_findings_with(&manifests);
         assert!(findings.is_empty());
         assert_eq!(cfg.checks.int("example.window_days"), Some(10));
+    }
+
+    #[test]
+    fn set_packs_preserves_comments_and_rewrites_in_place() {
+        let text = "spec = \"0.1\"\n# which packs this vault enables\npacks = [\"coaching@0.1\"]\nvault_id = \"x\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
+        let out = VaultConfig::set_packs(
+            text,
+            &["coaching@0.1".to_owned(), "example-pack@0.1".to_owned()],
+        )
+        .unwrap();
+        assert!(out.contains("# which packs this vault enables"), "{out}");
+        assert!(
+            out.contains("packs = [\"coaching@0.1\", \"example-pack@0.1\"]"),
+            "{out}"
+        );
+        assert!(
+            out.find("packs").unwrap() < out.find("[checks]").unwrap(),
+            "{out}"
+        );
+        assert_eq!(
+            VaultConfig::parse(&out).unwrap().packs,
+            vec!["coaching@0.1", "example-pack@0.1"]
+        );
+    }
+
+    #[test]
+    fn set_packs_inserts_a_root_key_before_tables() {
+        // A vault may omit `packs`; the inserted key must land before
+        // `[checks]`, not inside it.
+        let text = "spec = \"0.1\"\nvault_id = \"x\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
+        let out = VaultConfig::set_packs(text, &["example-pack@0.1".to_owned()]).unwrap();
+        assert!(
+            out.find("packs").unwrap() < out.find("[checks]").unwrap(),
+            "{out}"
+        );
+        assert_eq!(
+            VaultConfig::parse(&out).unwrap().packs,
+            vec!["example-pack@0.1"]
+        );
     }
 }
