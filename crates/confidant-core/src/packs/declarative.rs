@@ -25,7 +25,7 @@
 //! `check` already loaded — ledger metadata and the pack's declared
 //! plaintext front-matter fields — and emit findings only (PD8).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::catch_unwind;
 use std::sync::Mutex;
 
@@ -688,6 +688,9 @@ impl RuleKind for DateUpcomingKind {
         if fields.is_empty() {
             return Err(err("date_fields must not be empty".to_owned()).with_fix(fix_hint));
         }
+        // A repeated field would emit the same finding once per repeat;
+        // refuse it at load, like the other parameter checks (#528).
+        let mut seen = BTreeSet::new();
         for field in fields {
             let Some(name) = field.as_str() else {
                 return Err(
@@ -699,6 +702,10 @@ impl RuleKind for DateUpcomingKind {
                     "every date_fields entry must be a non-empty field name".to_owned()
                 )
                 .with_fix(fix_hint));
+            }
+            if !seen.insert(name) {
+                return Err(err(format!("date_fields lists '{name}' more than once"))
+                    .with_fix("List each date field at most once"));
             }
             let decl = manifest
                 .fields
@@ -853,17 +860,25 @@ impl RuleKind for DateUpcomingKind {
 /// defaults are not seeded into `vault.config` by `VaultConfig::parse`
 /// (only compiled manifests are), so the manifest fallback keeps a
 /// declared `window_key` meaningful for them.
+///
+/// Both fallbacks are infallible for a validated rule: the kind's
+/// `validate` refuses an undeclared `window_key`, and the manifest loader
+/// refuses a negative int default (#528). Neither is silently folded to
+/// 0 — a missing key or negative default here is a loader bug, and the
+/// rule fails closed as `E_PACK_INVALID`.
 fn resolve_int_check(ctx: &RuleCtx, key: &str) -> u64 {
     if let Some(value) = ctx.vault.config.checks.int(key) {
         return value;
     }
-    ctx.manifest
+    let default = ctx
+        .manifest
         .checks
         .int
         .iter()
         .find(|i| i.key == key)
-        .map(|i| u64::try_from(i.default).unwrap_or(0))
-        .unwrap_or(0)
+        .expect("rule kind validated window_key names a declared [[checks.int]] key")
+        .default;
+    u64::try_from(default).expect("manifest loader refused negative int defaults")
 }
 
 static DATE_UPCOMING: DateUpcomingKind = DateUpcomingKind;
@@ -2561,6 +2576,24 @@ default_fix = "Reach out to {id} or set `[checks] personal.date_upcoming = \"off
             &format!("{}\n{}", int_entry(), date_messages()),
         );
         assert_loader_refuses(&problems, "is not one of the pack's declared fields");
+    }
+
+    #[test]
+    fn loader_refuses_duplicate_date_field() {
+        // A repeated entry would emit the same finding once per repeat;
+        // it is refused at load (#528).
+        let problems = load_with_date_rule(
+            valid_fields(),
+            &format!(
+                "{}\n{}",
+                date_rule(
+                    "date_fields = [\"birthday\", \"birthday\"]\nwindow_key = \"example-pack.date_upcoming_days\"\n"
+                ),
+                severity_entry()
+            ),
+            &format!("{}\n{}", int_entry(), date_messages()),
+        );
+        assert_loader_refuses(&problems, "date_fields lists 'birthday' more than once");
     }
 
     #[test]
