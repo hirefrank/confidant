@@ -25,6 +25,7 @@ pub mod coaching;
 pub mod dir;
 pub mod grammars;
 pub mod groups;
+pub mod lock;
 pub mod manifest;
 pub mod personal;
 pub mod registry;

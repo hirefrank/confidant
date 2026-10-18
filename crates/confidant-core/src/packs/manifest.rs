@@ -41,7 +41,10 @@ const CORE_RECORD_TYPES: &[&str] = &["person", "org", "deal", "interaction", "no
 const RESERVED_PACK_NAMES: &[&str] = &["coaching", "personal"];
 
 /// Check a pack name against the v2 grammar `^[a-z][a-z0-9-]{1,31}$`.
-fn is_valid_pack_name(name: &str) -> bool {
+/// PD14: an external pack name matches `^[a-z][a-z0-9-]{1,31}$` (2..32
+/// chars, lowercase start). Used by the manifest loader and by the
+/// lockfile (#437).
+pub(crate) fn is_valid_pack_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     // 2..32 chars total: first is [a-z], rest are [a-z0-9-].
     if bytes.len() < 2 || bytes.len() > 32 {
