@@ -648,8 +648,43 @@ fn unsupported_spec_stops_after_spec_findings() {
     let json = report_json(dir.path(), None);
     let c = codes(&json);
     assert!(c.contains(&"E_SPEC_UNSUPPORTED".into()), "{c:?}");
-    assert!(c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
+    // #497: external packs are not resolved on an unsupported spec, so the
+    // compiled-only registry must not report the listed pack as unknown.
+    assert!(!c.contains(&"E_PACK_UNKNOWN".into()), "{c:?}");
     assert!(!c.contains(&"E_PARSE".into()), "{c:?}");
+}
+
+/// #497: an unsupported spec skips external-pack resolution entirely, so a
+/// listed external must not surface as `E_PACK_UNKNOWN` (or as any other
+/// pack finding) — the spec finding already fails `check`. Even a fully
+/// installed, hash-valid external pack stays unreported.
+#[test]
+fn unsupported_spec_does_not_report_listed_externals_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-05 greet {ADA} kind:wave\n"),
+    );
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"9.9\"\npacks = [\"coaching@0.1\", \"example-pack@0.1\"]\nvault_id = \"x\"\n",
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert_eq!(c, vec!["E_SPEC_UNSUPPORTED".to_string()], "{json}");
+    for code in [
+        "E_PACK_UNKNOWN",
+        "E_PACK_HASH",
+        "E_PACK_INVALID",
+        "E_UNKNOWN_VERB",
+    ] {
+        assert!(!c.contains(&code.to_string()), "{code} in {json}");
+    }
 }
 
 #[test]
