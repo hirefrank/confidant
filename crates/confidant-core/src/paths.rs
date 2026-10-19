@@ -185,6 +185,26 @@ fn open_directory(root: &Path, relative: &Path) -> Result<Directory> {
     Ok(directory)
 }
 
+/// Absolute paths beneath `root` that `relative` names but that do not exist
+/// yet, shallow to deep.
+///
+/// Callers record this *before* [`ensure_directory`] (or any write that may
+/// create parents), so a rollback only removes directories the write itself
+/// created: a directory that already existed is never a candidate (#604).
+/// `remove_dir` on a returned path is empty-only and best-effort.
+pub fn missing_ancestors(root: &Path, relative: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        current.push(component);
+        let absolute = root.join(&current);
+        if !absolute.is_dir() {
+            missing.push(absolute);
+        }
+    }
+    missing
+}
+
 /// Create `relative` beneath `root` without following symlinks.
 pub fn ensure_directory(root: &Path, relative: &Path) -> Result<()> {
     let _ = create_directory_all(root, relative)?;
@@ -779,7 +799,9 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
-    use super::{components, read_bytes, read_to_string, remove_file, write_replace};
+    use super::{
+        components, missing_ancestors, read_bytes, read_to_string, remove_file, write_replace,
+    };
     use super::{exists, read_dir, resolve, EntryKind};
     use std::fs;
     use std::path::Path;
@@ -854,6 +876,29 @@ mod tests {
             .collect();
         assert!(kinds.contains(&("ok.txt", EntryKind::File, true)));
         assert!(kinds.contains(&("s", EntryKind::Symlink, true)));
+    }
+
+    #[test]
+    fn missing_ancestors_lists_only_absent_dirs_shallow_to_deep() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("people/p-01ABC")).unwrap();
+        // `people` and `p-01ABC` exist; only the leaf is missing.
+        assert_eq!(
+            missing_ancestors(root, Path::new("people/p-01ABC/notes")),
+            vec![root.join("people/p-01ABC/notes")]
+        );
+        // A wholly absent chain is listed parent-first.
+        assert_eq!(
+            missing_ancestors(root, Path::new("packs/x@0.1/bin")),
+            vec![
+                root.join("packs"),
+                root.join("packs/x@0.1"),
+                root.join("packs/x@0.1/bin"),
+            ]
+        );
+        // A path that already exists contributes nothing.
+        assert!(missing_ancestors(root, Path::new("people/p-01ABC")).is_empty());
     }
 
     #[test]
