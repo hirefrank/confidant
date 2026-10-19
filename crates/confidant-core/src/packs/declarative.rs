@@ -104,13 +104,14 @@ pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
     // The kind implementations live in Rust (PD1); each kind's issue
     // appends its static here. #442: `cadence-overdue`; #443:
     // `date-upcoming`; #458: `note-ref`; #446: `ledger-balance`;
-    // #447: `session-checks`.
+    // #447: `session-checks`; #448: `activity-gap`.
     let mut kinds: Vec<&'static dyn RuleKind> = vec![
         &CADENCE_OVERDUE,
         &DATE_UPCOMING,
         &NOTE_REF,
         &crate::packs::rules::balance::LEDGER_BALANCE,
         &crate::packs::rules::session::SESSION_CHECKS,
+        &crate::packs::rules::gap::ACTIVITY_GAP,
     ];
     kinds.extend(
         TEST_REGISTRY
@@ -1461,6 +1462,7 @@ default = "test rule"
                         "note-ref",
                         "ledger-balance",
                         "session-checks",
+                        "activity-gap",
                         "test-rule",
                         "other-rule"
                     ]
@@ -1478,7 +1480,8 @@ default = "test rule"
                     "date-upcoming",
                     "note-ref",
                     "ledger-balance",
-                    "session-checks"
+                    "session-checks",
+                    "activity-gap"
                 ]
             );
         });
@@ -1628,6 +1631,7 @@ default = "test rule"
             ("packs/rules/ledger.rs", include_str!("rules/ledger.rs")),
             ("packs/rules/balance.rs", include_str!("rules/balance.rs")),
             ("packs/rules/session.rs", include_str!("rules/session.rs")),
+            ("packs/rules/gap.rs", include_str!("rules/gap.rs")),
         ];
         const FORBIDDEN: &[&str] = &[
             "std::net",

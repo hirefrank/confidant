@@ -1,4 +1,4 @@
-//! Declarative rule kinds that read the ledger (#446, #447).
+//! Declarative rule kinds that read the ledger (#446-#448).
 //!
 //! The kinds live here rather than in `declarative.rs` because they share
 //! one arithmetic core ([`ledger`]): the compiled `coaching@0.1` pack and
@@ -10,5 +10,6 @@
 //! process APIs (enforced by `evaluator_sources_have_no_io_apis`).
 
 pub(crate) mod balance;
+pub(crate) mod gap;
 pub(crate) mod ledger;
 pub(crate) mod session;
