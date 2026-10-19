@@ -72,8 +72,8 @@ the default; tell us if you would rather stay anonymous.
 
 ## Known limitation (standing disclosure)
 
-The milestone 2 encryption has had no outside review. This is tracked in
-[#138](https://github.com/hirefrank/confidant/issues/138) and disclosed in
-the README: until an independent audit lands, do not put other people's
-data in a vault. Reports that restate this known limitation without a new
-finding will be closed as duplicates of #138.
+Confidant's encryption hasn't been reviewed by an independent auditor. This
+is tracked in [#138](https://github.com/hirefrank/confidant/issues/138) and
+disclosed in the README: use your own judgment before storing other
+people's sensitive data. Reports that restate this known limitation without
+a new finding will be closed as duplicates of #138.
