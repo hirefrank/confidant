@@ -42,7 +42,7 @@ use confidant_core::write::{
     apply_write, apply_write_with_encryptor, require_git_repo, FileChange, PendingWrite,
     WriteOptions, WriteOutcome,
 };
-use confidant_core::{check_vault, load_vault, search, CheckOptions};
+use confidant_core::{check_vault, load_vault, search, search_for_operator, CheckOptions};
 use confidant_core::{ContentHook, ContentOutcome};
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -126,12 +126,19 @@ enum Command {
         as_of: Option<String>,
     },
     /// Scan plaintext records and ledger lines.
+    ///
+    /// Operator-only flag: `--for-operator` includes `no-ai` records the
+    /// default (agent) allowlist hides. It is never passed by MCP.
     Find {
         /// Case-insensitive substring.
         query: String,
         /// Max hits to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Include `no-ai` records, decrypted through the operator read
+        /// path (the same mechanism as `record show --for-edit`).
+        #[arg(long)]
+        for_operator: bool,
     },
     /// Print the cleared set (cleared record files and ledger lines)
     /// for index-time corpus exclusion.
@@ -227,6 +234,9 @@ enum Command {
         action: PackAction,
     },
     /// Context bundle for one person (honors no-ai).
+    ///
+    /// Operator-only flag: `--for-operator` includes `no-ai` records the
+    /// default (agent) allowlist hides. It is never passed by MCP.
     Context {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
@@ -236,6 +246,10 @@ enum Command {
         /// `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
+        /// Include `no-ai` records, decrypted through the operator read
+        /// path (the same mechanism as `record show --for-edit`).
+        #[arg(long)]
+        for_operator: bool,
     },
     /// Vault health checks (the crypto check reports encryption availability).
     Doctor {
@@ -927,9 +941,20 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::from(1))
             }
         }
-        Command::Find { query, limit } => {
+        Command::Find {
+            query,
+            limit,
+            for_operator,
+        } => {
             let root = vault_root.unwrap();
-            cmd_find(json, &root, query, *limit, cli.packs.as_deref())
+            cmd_find(
+                json,
+                &root,
+                query,
+                *limit,
+                cli.packs.as_deref(),
+                *for_operator,
+            )
         }
         Command::Resolve { query } => {
             let root = vault_root.unwrap();
@@ -1234,9 +1259,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Context {
             person,
             exclude_private,
+            for_operator,
         } => {
             let root = vault_root.unwrap();
-            cmd_context(&cli, &root, person, !exclude_private)
+            cmd_context(&cli, &root, person, !exclude_private, *for_operator)
         }
         Command::Doctor {
             clear_pending_inbox_rotation,
@@ -2262,19 +2288,29 @@ fn fail_command(json: bool, vault: Option<&str>, err: &anyhow::Error) -> anyhow:
     Ok(ExitCode::from(domain.exit_code() as u8))
 }
 
+/// Human-output banner for `--for-operator` (#572). Operator mode must be
+/// unmistakable so a screen share cannot silently show data the agent view
+/// hides. JSON carries `for_operator: true` instead.
+const OPERATOR_MODE_BANNER: &str = "OPERATOR MODE: no-ai records included (--for-operator)";
+
 fn cmd_find(
     json: bool,
     root: &Path,
     query: &str,
     limit: usize,
     packs: Option<&str>,
+    for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
     if query.trim().is_empty() {
         return Err(anyhow::Error::new(DomainError::usage(
             "find requires a non-empty query",
         )));
     }
-    let vault = match load_vault_for_reads(root, json, false) {
+    // Operator mode (#572) loads through the operator decrypt path (the
+    // same mechanism as `record show --for-edit`); the default stays the
+    // agent read path (`no-ai` records come back as keyless shells and are
+    // then excluded by the §12 allowlist).
+    let vault = match load_vault_for_reads(root, json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
@@ -2294,7 +2330,11 @@ fn cmd_find(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let result = match search(&vault, query, &scope) {
+    let result = match if for_operator {
+        search_for_operator(&vault, query, &scope)
+    } else {
+        search(&vault, query, &scope)
+    } {
         Ok(result) => result,
         Err(err) => {
             print_error(json, Some(&vault_path), &err)?;
@@ -2320,8 +2360,18 @@ fn cmd_find(
                 serde_json::Value::String(hint.to_owned()),
             );
         }
+        // Operator mode (#572): present only with the flag, so an agent's
+        // JSON is byte-for-byte unchanged.
+        if for_operator {
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("for_operator".to_owned(), serde_json::Value::Bool(true));
+            }
+        }
         print_json(&ok_envelope(Some(&vault.root), data))?;
     } else {
+        if for_operator {
+            writeln!(io::stdout(), "{OPERATOR_MODE_BANNER}")?;
+        }
         for f in &result.findings {
             writeln!(
                 io::stdout(),
@@ -4752,6 +4802,11 @@ fn cmd_record_list(
             serde_json::to_value(&roster)?,
         ))?;
     } else {
+        // #572: make operator mode unmistakable on a screen share, like
+        // `find` / `context`. Without the flag the output is unchanged.
+        if for_operator {
+            writeln!(io::stdout(), "{OPERATOR_MODE_BANNER}")?;
+        }
         for entry in &roster.records {
             let badge = match entry.no_ai {
                 "true" => "\t[no-ai]",
@@ -6105,8 +6160,12 @@ fn cmd_context(
     root: &Path,
     person_raw: &str,
     include_private: bool,
+    for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
-    let vault = match load_vault_for_reads(root, cli.json, false) {
+    // Operator mode (#572) loads through the operator decrypt path (the
+    // same mechanism as `record show --for-edit`); the default stays the
+    // agent read path.
+    let vault = match load_vault_for_reads(root, cli.json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
@@ -6129,7 +6188,7 @@ fn cmd_context(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let bundle = match build_context(&vault, &person, include_private, &scope) {
+    let bundle = match build_context(&vault, &person, include_private, &scope, for_operator) {
         Some(b) => b,
         None => {
             // ⚠2b: the person's key is absent (their record is an envelope
@@ -6154,12 +6213,22 @@ fn cmd_context(
         let value = serde_json::to_value(&bundle)?;
         print_json(&ok_envelope(Some(root), value))?;
     } else {
+        if for_operator {
+            println!("{OPERATOR_MODE_BANNER}");
+        }
         let p = &bundle.person;
+        // Operator mode carries the tri-state; the agent path still only
+        // knows the boolean.
+        let badge = match p.no_ai_mode {
+            Some("notes") => " [no-ai: notes]",
+            Some(_) => " [no-ai]",
+            None if p.no_ai => " [no-ai]",
+            None => "",
+        };
         println!(
-            "{} {}{}",
+            "{} {}{badge}",
             p.id,
             p.name.as_deref().unwrap_or("(name withheld)"),
-            if p.no_ai { " [no-ai]" } else { "" }
         );
         // #178: show the scope that applied, so a scoped bundle is never
         // mistaken for the whole record.

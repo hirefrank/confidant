@@ -513,6 +513,92 @@ fn record_list_unkeyed_surfaces_skips_never_silently_empty() {
     }
 }
 
+/// #572: `context` is operator-only for `no-ai` too. Without the flag the
+/// person is a keyless shell (PII withheld, no `for_operator`); the flag
+/// decrypts through the operator path and badges the tri-state.
+#[test]
+fn context_hides_no_ai_until_for_operator() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_no_ai(PERSON, "Ada Example", "Secret bio with zephyr."),
+    );
+    h.record_add(&input);
+
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "context failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.get("for_operator").is_none(), "{v}");
+    assert_eq!(v["person"]["no_ai"], true);
+    assert!(v["person"]["name"].is_null());
+    let dumped = serde_json::to_string(&v).unwrap();
+    assert!(!dumped.contains("zephyr"), "{dumped}");
+    assert!(!dumped.contains("Ada Example"), "{dumped}");
+
+    let out = h
+        .cmd(&["context", PERSON, "--for-operator", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "context --for-operator failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["for_operator"], true);
+    assert_eq!(v["person"]["no_ai"], "true");
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert!(v["person"]["profile"].as_str().unwrap().contains("zephyr"));
+}
+
+/// #572: `find --for-operator` decrypts and returns a `no-ai` record's
+/// hits with the tri-state badge; without the flag it stays out.
+#[test]
+fn find_hides_no_ai_until_for_operator() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_no_ai(PERSON, "Ada Example", "Secret no-ai bio with zephyr."),
+    );
+    h.record_add(&input);
+
+    let out = h
+        .cmd(&["find", "zephyr", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["matches"].as_array().unwrap().is_empty());
+    assert!(v.get("for_operator").is_none(), "{v}");
+
+    let out = h
+        .cmd(&["find", "zephyr", "--for-operator", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "find --for-operator failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["for_operator"], true);
+    let hit = v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == PERSON)
+        .expect("no-ai person must be found with the operator flag");
+    assert_eq!(hit["no_ai"], "true");
+    assert!(hit["excerpt"].as_str().unwrap().contains("zephyr"));
+}
+
 #[test]
 fn find_unkeyed_skips_and_counts_never_silent_empty() {
     let h = keyed_vault_with_records("quantum baking", "sourdough starter");

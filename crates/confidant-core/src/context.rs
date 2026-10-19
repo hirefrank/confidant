@@ -8,7 +8,11 @@
 //! duplicate-tainted records can never leak through `context`. `--exclude-private`
 //! strips PII regardless. Ledger-derived facts (sessions remaining, ICF hours,
 //! opaque alias hashes) are metadata, not content, and are kept.
-//! [`PersonView::no_ai`] always tells the caller which mode applied.
+//! [`PersonView::no_ai`] always tells the caller which mode applied. With
+//! `for_operator` (#572) the operator cleared set is used instead, so
+//! `no-ai` records are included and each view carries the tri-state
+//! [`PersonView::no_ai_mode`] / `NoteView::no_ai`; that path is
+//! operator-only (never MCP).
 //!
 //! The built-in personal pack's `packs` entry (shape, merge rule, private
 //! fields) lives in [`personal`]; `context` only strips the fields the pack
@@ -16,7 +20,9 @@
 
 pub mod personal;
 
-use serde::Serialize;
+use std::collections::HashSet;
+
+use serde::{Serialize, Serializer};
 
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
 use crate::id::RecordId;
@@ -25,16 +31,42 @@ use crate::record::RecordKind;
 use crate::scope::{
     note_linkage_owners, owners_of_ledger_entry, record_owners, OwnerKey, PackScope,
 };
-use crate::search::cleared_record_ids;
+use crate::search::{cleared_record_ids, cleared_record_ids_for_operator, operator_no_ai_badge};
 use crate::vault::Vault;
 
 /// What the caller may see of the person record.
-#[derive(Clone, Debug, Serialize)]
+///
+/// `no_ai` is a boolean on the agent path. On the operator path
+/// (`--for-operator`, #572) the same JSON key carries the tri-state string
+/// `"true"` / `"notes"` / `"false"` instead — the shape the roster already
+/// reports (#559) — so a UI can badge the mode. Agents never see the
+/// operator form, which is why serialization is hand-written rather than
+/// derived.
+#[derive(Clone, Debug)]
 pub struct PersonView {
     pub id: String,
     pub name: Option<String>,
+    /// The person's own `no-ai: true` flag (agent path).
     pub no_ai: bool,
+    /// Operator path (#572): the tri-state string, `Some` only when the
+    /// caller passed `--for-operator`.
+    pub no_ai_mode: Option<&'static str>,
     pub profile: Option<String>,
+}
+
+impl Serialize for PersonView {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("PersonView", 4)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("name", &self.name)?;
+        match self.no_ai_mode {
+            Some(mode) => st.serialize_field("no_ai", mode)?,
+            None => st.serialize_field("no_ai", &self.no_ai)?,
+        }
+        st.serialize_field("profile", &self.profile)?;
+        st.end()
+    }
 }
 
 /// One note under `people/<id>/notes/`.
@@ -43,6 +75,10 @@ pub struct NoteView {
     pub id: String,
     pub date: Option<String>,
     pub body: Option<String>,
+    /// Operator path (#572): tri-state `no_ai`, absent on the agent path so
+    /// its JSON is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_ai: Option<&'static str>,
 }
 
 /// One mirrored touchpoint for the person: a ledger `touch` line carrying
@@ -61,6 +97,9 @@ pub struct InteractionView {
     pub date: Option<String>,
     pub title: Option<String>,
     pub body: Option<String>,
+    /// Operator path (#572): tri-state `no_ai`, absent on the agent path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_ai: Option<&'static str>,
 }
 
 // CoachingView lives in crate::packs::coaching. Kept for the agent contract
@@ -93,6 +132,16 @@ pub struct PersonContext {
     /// Pack names in scope for this bundle, sorted. For an unscoped call,
     /// every enabled pack — the scope that actually applied (#178).
     pub scope: Vec<String>,
+    /// Operator path (#572): `true` only for `--for-operator`. Skipped for
+    /// agents so their `--json` output is byte-for-byte unchanged; present
+    /// so a human-facing consumer can label operator mode.
+    #[serde(skip_serializing_if = "is_false")]
+    pub for_operator: bool,
+}
+
+/// `skip_serializing_if` for the operator flag (#572).
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Build the context bundle for `person`.
@@ -104,20 +153,38 @@ pub struct PersonContext {
 /// (name, profile, aliases) stay visible, notes/interactions owned by
 /// other packs are omitted, unattributed notes/interactions are omitted,
 /// and other packs' views are dropped from `packs`.
+///
+/// `for_operator` (#572) is the operator-only path: `no-ai` is ignored when
+/// building the cleared set, so a `no-ai` person and their `no-ai` notes and
+/// interactions are included, and each view carries the tri-state `no_ai`
+/// string plus `for_operator: true`. The caller must have loaded the vault
+/// with the operator decryptor (same mechanism as `record show --for-edit`)
+/// for the content to be present; an agent path passes `false`.
 pub fn build_context(
     vault: &Vault,
     person: &RecordId,
     include_private: bool,
     scope: &PackScope,
+    for_operator: bool,
 ) -> Option<PersonContext> {
     let record = vault.records.get(person)?;
     if record.kind != RecordKind::Person {
         return None;
     }
-    // §12 allowlist, built once. `cleared` is a fixpoint: a cleared id implies
-    // all of its merge-group members are cleared, so `cleared.contains`
-    // covers the "person AND every merge-group member" rule with one lookup.
-    let cleared = cleared_record_ids(vault);
+    // §12 allowlist. `cleared` is a fixpoint: a cleared id implies all of
+    // its merge-group members are cleared, so `cleared.contains` covers the
+    // "person AND every merge-group member" rule with one lookup. The
+    // operator variant ignores `no-ai` (#572) so an operator-only read
+    // surfaces records the agent path hides. `hidden_by_no_ai` is the
+    // operator-minus-agent difference: the records that are hidden *only*
+    // because of `no-ai`, which each view badges.
+    let agent_cleared = cleared_record_ids(vault);
+    let operator_cleared = for_operator.then(|| cleared_record_ids_for_operator(vault));
+    let cleared: &HashSet<RecordId> = operator_cleared.as_ref().unwrap_or(&agent_cleared);
+    let hidden_by_no_ai: HashSet<RecordId> = match &operator_cleared {
+        Some(op) => op.difference(&agent_cleared).cloned().collect(),
+        None => HashSet::new(),
+    };
     let no_ai = record.no_ai();
     let show_pii = include_private && cleared.contains(person);
 
@@ -182,6 +249,7 @@ pub fn build_context(
             id: r.id.to_string(),
             date: r.field("date").map(str::to_owned),
             body: show_pii.then(|| r.body.clone()),
+            no_ai: for_operator.then(|| operator_no_ai_badge(r, &hidden_by_no_ai)),
         })
         .collect();
     notes.sort_by(|a, b| a.date.cmp(&b.date).then(a.id.cmp(&b.id)));
@@ -200,6 +268,7 @@ pub fn build_context(
             date: r.field("date").map(str::to_owned),
             title: show_pii.then(|| r.name.clone()).flatten(),
             body: show_pii.then(|| r.body.clone()),
+            no_ai: for_operator.then(|| operator_no_ai_badge(r, &hidden_by_no_ai)),
         })
         .collect();
     interactions.sort_by(|a, b| a.date.cmp(&b.date).then(a.id.cmp(&b.id)));
@@ -246,6 +315,7 @@ pub fn build_context(
             id: person.to_string(),
             name: show_pii.then(|| record.name.clone()).flatten(),
             no_ai,
+            no_ai_mode: for_operator.then(|| operator_no_ai_badge(record, &hidden_by_no_ai)),
             profile: show_pii.then(|| record.body.clone()),
         },
         notes,
@@ -257,6 +327,7 @@ pub fn build_context(
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
         scope: scope_names,
+        for_operator,
     })
 }
 
@@ -275,7 +346,7 @@ mod tests {
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
         let id = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
-        assert!(build_context(&vault, &id, true, &PackScope::All).is_none());
+        assert!(build_context(&vault, &id, true, &PackScope::All, false).is_none());
     }
 
     fn demo_vault() -> crate::vault::Vault {
@@ -294,12 +365,12 @@ mod tests {
         // unattributed note, one unattributed interaction.
         let vault = demo_vault();
         let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
-        let unscoped = build_context(&vault, &ada, true, &PackScope::All).unwrap();
+        let unscoped = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
         assert_eq!(unscoped.notes.len(), 2);
         assert_eq!(unscoped.interactions.len(), 1);
         assert!(unscoped.coaching.is_some());
 
-        let scoped = build_context(&vault, &ada, true, &coaching_scope()).unwrap();
+        let scoped = build_context(&vault, &ada, true, &coaching_scope(), false).unwrap();
         // Only the session-linked note survives; the unattributed note and
         // the interaction are hidden. Core identity stays visible.
         assert_eq!(scoped.notes.len(), 1);
@@ -343,7 +414,7 @@ mod tests {
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
         let bea_id = RecordId::parse(bea).unwrap();
-        let bea_ctx = build_context(&vault, &bea_id, true, &PackScope::All).unwrap();
+        let bea_ctx = build_context(&vault, &bea_id, true, &PackScope::All, false).unwrap();
         assert_eq!(bea_ctx.touchpoints.len(), 2);
         assert_eq!(bea_ctx.touchpoints[0].date, "2026-10-06");
         assert_eq!(bea_ctx.touchpoints[0].kind, None);
@@ -351,7 +422,7 @@ mod tests {
         assert_eq!(bea_ctx.touchpoints[1].kind.as_deref(), Some("call"));
         // Ada sees only her own touchpoint, not Bea's.
         let ada_id = RecordId::parse(ada).unwrap();
-        let ada_ctx = build_context(&vault, &ada_id, true, &PackScope::All).unwrap();
+        let ada_ctx = build_context(&vault, &ada_id, true, &PackScope::All, false).unwrap();
         assert_eq!(ada_ctx.touchpoints.len(), 1);
         assert_eq!(ada_ctx.touchpoints[0].date, "2026-10-06");
     }
@@ -361,13 +432,100 @@ mod tests {
         // The packs map only carries views for packs in scope.
         let vault = demo_vault();
         let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
-        let scoped = build_context(&vault, &ada, true, &coaching_scope()).unwrap();
+        let scoped = build_context(&vault, &ada, true, &coaching_scope(), false).unwrap();
         assert!(scoped.packs.contains_key("coaching@0.1"));
         let empty = PackScope::Only(std::collections::BTreeSet::new());
-        let none = build_context(&vault, &ada, true, &empty).unwrap();
+        let none = build_context(&vault, &ada, true, &empty, false).unwrap();
         assert!(none.packs.is_empty());
         assert!(none.coaching.is_none());
         // Core identity is still there even with an empty scope.
         assert_eq!(none.person.name.as_deref(), Some("Ada Example"));
+    }
+
+    /// #572: the operator bundle decrypts a `no-ai: true` person, carries
+    /// the tri-state `no_ai`, and includes the note that inherits hidden.
+    /// The agent bundle is unchanged: name withheld, note absent, boolean.
+    #[test]
+    fn operator_context_shows_no_ai_person_and_badges_inherited_note() {
+        let vault = demo_vault();
+        let cam = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+
+        let agent = build_context(&vault, &cam, true, &PackScope::All, false).unwrap();
+        assert!(agent.person.name.is_none());
+        assert!(agent.person.no_ai);
+        assert!(agent.person.no_ai_mode.is_none());
+        assert!(!agent.for_operator);
+        assert!(agent.notes.is_empty());
+
+        let op = build_context(&vault, &cam, true, &PackScope::All, true).unwrap();
+        assert_eq!(op.person.name.as_deref(), Some("Cam Sample"));
+        assert_eq!(op.person.no_ai_mode, Some("true"));
+        assert!(op.person.profile.is_some());
+        assert!(op.for_operator);
+        assert_eq!(op.notes.len(), 1);
+        assert_eq!(op.notes[0].no_ai, Some("true"));
+    }
+
+    /// #572: a `no-ai: notes` person badges `"notes"`; their inherited
+    /// note badges `"true"`, an explicit `no-ai: false` child `"false"`,
+    /// and an explicit `no-ai: true` child `"true"`.
+    #[test]
+    fn operator_context_badges_notes_mode_and_hidden_children() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let person = "p-01M3TC5H00MPJG000000000000";
+        let d = dir.path().join(format!("people/{person}"));
+        std::fs::create_dir_all(d.join("notes")).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!(
+                "---\nid: {person}\ntype: person\nname: Notes Mode\nno-ai: notes\n---\n\nBio.\n"
+            ),
+        )
+        .unwrap();
+        for (id, extra, body) in [
+            ("n-01M3TC5H00MPJG000000000001", "", "inherited hidden\n"),
+            (
+                "n-01M3TC5H00MPJG000000000002",
+                "no-ai: false\n",
+                "explicit visible\n",
+            ),
+            (
+                "n-01M3TC5H00MPJG000000000003",
+                "no-ai: true\n",
+                "explicit hidden\n",
+            ),
+        ] {
+            std::fs::write(
+                d.join("notes").join(format!("{id}.md")),
+                format!(
+                    "---\nid: {id}\ntype: note\nperson: {person}\ndate: 2026-01-01\n{extra}---\n\n{body}"
+                ),
+            )
+            .unwrap();
+        }
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let id = RecordId::parse(person).unwrap();
+
+        // Agent path: the notes-mode person is visible, but the inherited
+        // and explicit-hidden children are omitted.
+        let agent = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+        assert_eq!(agent.person.name.as_deref(), Some("Notes Mode"));
+        assert_eq!(agent.person.no_ai_mode, None);
+        let agent_notes: Vec<&str> = agent.notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(agent_notes, vec!["n-01M3TC5H00MPJG000000000002"]);
+
+        // Operator path: every child, each badged by its effective mode.
+        let op = build_context(&vault, &id, true, &PackScope::All, true).unwrap();
+        assert_eq!(op.person.no_ai_mode, Some("notes"));
+        assert!(op.for_operator);
+        let badge = |id: &str| op.notes.iter().find(|n| n.id == id).unwrap().no_ai;
+        assert_eq!(badge("n-01M3TC5H00MPJG000000000001"), Some("true"));
+        assert_eq!(badge("n-01M3TC5H00MPJG000000000002"), Some("false"));
+        assert_eq!(badge("n-01M3TC5H00MPJG000000000003"), Some("true"));
     }
 }

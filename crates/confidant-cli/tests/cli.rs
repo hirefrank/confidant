@@ -2736,3 +2736,121 @@ fn record_list_text_output_escapes_control_characters_in_names() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["records"][0]["name"], name, "--json must stay verbatim");
 }
+
+// ---------------------------------------------------------------------------
+// find / context --for-operator (#572)
+// ---------------------------------------------------------------------------
+
+/// Cam Sample is the demo vault's `no-ai: true` person.
+const CAM: &str = "p-01M3TC5H00MPJG001248000002";
+/// Cam's note, hidden from agents by inheriting the person's `no-ai: true`.
+const CAM_NOTE: &str = "n-01M3TC5H000068T0000000000C";
+const OPERATOR_BANNER: &str = "OPERATOR MODE";
+
+fn run_text(args: &[&str], vault: &Path) -> String {
+    let out = Command::new(bin())
+        .args(args)
+        .arg("--vault")
+        .arg(vault)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?} stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// #572: `find --for-operator` includes `no-ai` records the default path
+/// hides; every operator record hit carries the tri-state `no_ai`. Without
+/// the flag, matches are as before and no hit has the key.
+#[test]
+fn find_demo_for_operator_includes_no_ai_with_tri_state() {
+    // "model provider" is only in Cam's (no-ai) note body.
+    let default = run_json(&["find", "model provider"], &demo());
+    assert_eq!(default["matches"], serde_json::json!([]));
+    assert!(default.get("for_operator").is_none(), "{default}");
+    // Agent hits never carry `no_ai`.
+    let agent_ada = run_json(&["find", "Ada Example"], &demo());
+    assert!(agent_ada["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m.get("no_ai").is_none()));
+
+    let op = run_json(&["find", "model provider", "--for-operator"], &demo());
+    assert_eq!(op["for_operator"], true);
+    let hit = op["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == CAM_NOTE)
+        .expect("no-ai note must be found with the operator flag");
+    // The note has no flag of its own; it is hidden by inheritance, so the
+    // badge reports `"true"`, not `"false"`.
+    assert_eq!(hit["no_ai"], "true");
+    assert!(hit["excerpt"].as_str().unwrap().contains("model provider"));
+
+    // A cleared record is badged `"false"` in operator mode.
+    let op_ada = run_json(&["find", "Ada Example", "--for-operator"], &demo());
+    assert!(op_ada["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["no_ai"] == "false"));
+}
+
+/// #572: `context --for-operator` decrypts a `no-ai` person and their
+/// notes, with the tri-state `no_ai` and `for_operator: true`. Without the
+/// flag the output is unchanged: name withheld, notes absent, boolean flag.
+#[test]
+fn context_demo_for_operator_shows_no_ai_person_with_tri_state() {
+    let default = run_json(&["context", CAM], &demo());
+    assert!(default.get("for_operator").is_none(), "{default}");
+    assert_eq!(default["person"]["no_ai"], true);
+    assert!(default["person"]["name"].is_null());
+    assert_eq!(default["notes"], serde_json::json!([]));
+    let dumped = serde_json::to_string(&default).unwrap();
+    assert!(!dumped.contains("Cam Sample"), "{dumped}");
+
+    let op = run_json(&["context", CAM, "--for-operator"], &demo());
+    assert_eq!(op["for_operator"], true);
+    assert_eq!(op["person"]["name"], "Cam Sample");
+    assert_eq!(op["person"]["no_ai"], "true");
+    assert!(op["person"]["profile"]
+        .as_str()
+        .unwrap()
+        .contains("Fake client"));
+    let notes = op["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0]["id"], CAM_NOTE);
+    assert_eq!(notes[0]["no_ai"], "true");
+}
+
+/// #572: human output prints an unmistakable operator banner for all three
+/// commands, so a screen share cannot silently show hidden data. Without
+/// the flag no banner appears.
+#[test]
+fn operator_mode_banner_labels_find_context_and_roster() {
+    for args in [
+        vec!["find", "model provider"],
+        vec!["context", CAM],
+        vec!["record", "list"],
+    ] {
+        let mut flagged = args.clone();
+        flagged.push("--for-operator");
+        flagged.push("--no-input");
+        let text = run_text(&flagged, &demo());
+        assert!(
+            text.contains(OPERATOR_BANNER),
+            "{flagged:?} missing the operator banner: {text}"
+        );
+
+        let plain = run_text(&args, &demo());
+        assert!(
+            !plain.contains(OPERATOR_BANNER),
+            "{args:?} leaked the operator banner: {plain}"
+        );
+    }
+}
