@@ -133,17 +133,20 @@ fn golden_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The demo vault is personal-first and deliberately teaches the two
+/// warning-level personal nudges: Dana Example's overdue cadence and Eli
+/// Sample's upcoming birthday. It must stay error-free so the CI `check`
+/// step still exits 0 under the default `--fail-on error`.
 #[test]
-fn demo_vault_is_clean() {
+fn demo_vault_reports_the_personal_nudges() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
     let vault = load_vault(&root).unwrap();
     let report = check_vault(&vault, &CheckOptions::default());
-    assert!(
-        report.ok && report.findings.is_empty(),
-        "demo vault findings: {:#?}",
-        report.findings
-    );
-    assert!(report.summary.records >= 8);
+    assert!(report.ok, "demo vault findings: {:#?}", report.findings);
+    assert_eq!(report.summary.errors, 0);
+    let codes: Vec<&str> = report.findings.iter().map(|f| f.code.as_str()).collect();
+    assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
+    assert!(report.summary.records >= 12);
 }
 
 /// The `balance_mismatch` golden vault's records and ledger, shared by the
