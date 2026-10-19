@@ -5802,6 +5802,36 @@ fn external_pack_malformed_id_does_not_echo() {
     }
 }
 
+/// #612: the `E_PACK_UNKNOWN` fix for a real pin names the CLI commands that
+/// actually recover the state — `pack remove` keys off the listing (and the
+/// vendored tree) when the lock has no entry, and `pack add --yes` may
+/// re-pin — not a command that refuses. A non-pin listing stays name-free.
+#[test]
+fn pack_unknown_fix_names_the_recovery_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", DEFAULT_CHECKS);
+    let json = report_json(dir.path(), None);
+    let fix = finding_by_code(&json, "E_PACK_UNKNOWN")["fix"]
+        .as_str()
+        .unwrap();
+    assert!(fix.contains("confidant pack remove"), "{fix}");
+    assert!(fix.contains("confidant pack add"), "{fix}");
+    assert!(fix.contains("example-pack"), "{fix}");
+
+    // A malformed listing is operator free text: neither the message nor the
+    // fix may echo it, and the fix does not point at a pack command.
+    external_vault_toml(dir.path(), "\"zxqvleakmail@example.com\"", DEFAULT_CHECKS);
+    let json = report_json(dir.path(), None);
+    let fixed = &finding_by_code(&json, "E_PACK_UNKNOWN")["fix"];
+    let dumped = serde_json::to_string(&json).unwrap();
+    assert!(!dumped.contains("zxqvleakmail"), "{dumped}");
+    assert!(
+        !fixed.as_str().unwrap().contains("confidant pack remove"),
+        "{fixed}"
+    );
+}
+
 #[test]
 fn external_pack_problems_report_their_codes() {
     let dir = tempfile::tempdir().unwrap();

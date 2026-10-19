@@ -671,18 +671,29 @@ fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
             // embedded newline. That raw string is operator free text and
             // must stay name-free (#501).
             let is_pin = packs_lock::is_valid_pack_pin(&problem.name);
-            (
-                FindingCode::PackUnknown,
-                if is_pin {
-                    format!(
-                        "external pack {} listed in confidant.toml has no lockfile pin",
-                        problem.name
-                    )
-                } else {
-                    "a pack listed in confidant.toml is not a name@version pin".to_owned()
-                },
-                "Run `confidant pack add <https-url>` or remove the pack",
-            )
+            let message = if is_pin {
+                format!(
+                    "external pack {} listed in confidant.toml has no lockfile pin",
+                    problem.name
+                )
+            } else {
+                "a pack listed in confidant.toml is not a name@version pin".to_owned()
+            };
+            // #612: name commands that actually work on this state. `pack
+            // remove` keys off the `confidant.toml` listing (and the vendored
+            // tree) when the lockfile has no entry, and `pack add --yes` may
+            // re-pin the listed pack; both go through the repairing write
+            // path. The fix may name the validated bare name (a substring of
+            // the pin the #490 carve-out already echoes).
+            let fix = if is_pin {
+                let name = problem.name.split('@').next().unwrap_or(&problem.name);
+                format!(
+                    "Run `confidant pack add <https-url> --yes` to re-pin it, or `confidant pack remove {name} --yes` to drop the listing"
+                )
+            } else {
+                "Fix or remove the entry in the `packs` listing in confidant.toml".to_owned()
+            };
+            (FindingCode::PackUnknown, message, fix)
         }
         Kind::Hash => (
             FindingCode::PackHash,
@@ -690,7 +701,7 @@ fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
                 "external pack {}'s vendored files do not match its lockfile pin",
                 problem.name
             ),
-            "Reinstall the pack (`confidant pack add`) or fix confidant.lock",
+            "Reinstall the pack (`confidant pack add`) or fix confidant.lock".to_owned(),
         ),
         Kind::Invalid => (
             FindingCode::PackInvalid,
@@ -698,7 +709,7 @@ fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
                 "external pack {}'s manifest or contents fail validation",
                 problem.name
             ),
-            "Fix the vendored files or reinstall the pack",
+            "Fix the vendored files or reinstall the pack".to_owned(),
         ),
         Kind::Version => (
             FindingCode::PackVersion,
@@ -706,7 +717,7 @@ fn pack_problem_finding(problem: &packs_external::PackProblem) -> Finding {
                 "external pack {}'s spec compatibility does not include this vault",
                 problem.name
             ),
-            "Upgrade this CLI or pin a version the pack supports",
+            "Upgrade this CLI or pin a version the pack supports".to_owned(),
         ),
     };
     let file = match problem.kind {
