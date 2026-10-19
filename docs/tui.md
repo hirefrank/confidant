@@ -21,7 +21,10 @@ cargo install confidant-cli confidant-tui
 ```
 
 then launch it with `confidant tui` (extra arguments pass through to
-`confidant-tui`). From a checkout:
+`confidant-tui`). Install both from the same release and upgrade both
+together: `confidant tui` and `confidant doctor` warn when the CLI and TUI
+versions differ, because an older TUI can render stale or unknown findings.
+From a checkout:
 
 ```sh
 cargo run -p confidant-tui -- --vault examples/demo-vault

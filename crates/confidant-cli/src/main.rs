@@ -293,18 +293,24 @@ enum Command {
     /// Initialize the vault's trust anchor and keys (first device).
     ///
     /// Generates the operator key, a 24-word recovery phrase (shown once on
-    /// stderr), and this device's key; writes the trust anchor to
-    /// ~/.config/confidant/trust.toml; creates the vault lookup key and the
-    /// vault:shared client. Requires a git repo with a clean tree.
+    /// stderr, or written to `--phrase-out`), and this device's key; writes
+    /// the trust anchor to ~/.config/confidant/trust.toml; creates the vault
+    /// lookup key and the vault:shared client. Requires a git repo with a
+    /// clean tree.
     ///
     /// With `--create`, an empty or absent vault directory is scaffolded
-    /// first: the directory is created, `git init` runs when needed,
-    /// `.gitignore` gains `.confidant/`, and a minimal `confidant.toml` is
-    /// written (its `packs` list comes from the global `--packs` flag,
-    /// defaulting to `[]`) and committed. Only packs built into this binary
-    /// (today the implicit `personal@0.2`) may be listed: an external pack
-    /// is vendored into an existing vault by `confidant pack add`, so
-    /// install it after `init`. The key steps then run unchanged.
+    /// first: the directory is created, `git init` runs when needed and the
+    /// branch is set to `main`, `.gitignore` gains `.confidant/`, and a
+    /// minimal `confidant.toml` is written (its `packs` list comes from the
+    /// global `--packs` flag, defaulting to `[]`) and committed. Only packs
+    /// built into this binary (today the implicit `personal@0.2`) may be
+    /// listed: an external pack is vendored into an existing vault by
+    /// `confidant pack add`, so install it after `init`. The key steps then
+    /// run unchanged.
+    ///
+    /// `--dry-run` runs every preflight check and reports the plan without
+    /// creating a directory, writing a file, making a commit, generating
+    /// keys, or touching the keychain.
     Init {
         /// Replace an existing trust anchor after initialization succeeds.
         /// Never re-initializes an existing `keys/` tree (that is refused).
@@ -314,6 +320,12 @@ enum Command {
         /// `confidant.toml`, committed skeleton) before initializing keys.
         #[arg(long)]
         create: bool,
+        /// Write the 24-word recovery phrase to this new file (mode 0600)
+        /// instead of printing it. Refuses to overwrite. The phrase never
+        /// appears on stdout, stderr, or in JSON; move the file offline and
+        /// delete it after writing the phrase down.
+        #[arg(long, value_name = "PATH")]
+        phrase_out: Option<PathBuf>,
     },
     /// Recover the vault on a new device from the recovery phrase.
     ///
@@ -903,9 +915,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // discovery, because discovery requires `confidant.toml`. Runs first so
     // the key steps (which require a clean tree) see a committed skeleton.
     // Without `--create` this is a no-op and `init`'s behaviour is unchanged.
-    if let Command::Init { force, create } = &cli.command {
-        bootstrap_vault(&cli, *create, *force)?;
-    }
+    //
+    // #651: a scaffold is held in an armed guard until the key steps and the
+    // anchor save succeed, so any failure removes only what this command
+    // created. #649: with `--dry-run` the guard is never created because
+    // bootstrap writes nothing and returns `DryRun` instead.
+    let mut scaffold = match &cli.command {
+        Command::Init { force, create, .. } => match bootstrap_vault(&cli, *create, *force)? {
+            BootstrapPlan::DryRun => return Ok(ExitCode::SUCCESS),
+            BootstrapPlan::Continue(scaffold) => scaffold,
+        },
+        _ => None,
+    };
 
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
@@ -1358,9 +1379,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             )
         }
         Command::Reset { yes, force, .. } => cmd_reset_machine_state(&cli, *yes, *force),
-        Command::Init { force, .. } => {
+        Command::Init {
+            force, phrase_out, ..
+        } => {
             let root = vault_root.unwrap();
-            cmd_init(&cli, &root, *force)
+            cmd_init(&cli, &root, *force, scaffold.take(), phrase_out.as_deref())
         }
         Command::Recover {
             phrase_file,
@@ -8919,6 +8942,56 @@ fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> i
     Ok(())
 }
 
+/// #662: create the recovery phrase file, mode 0600, refusing to overwrite
+/// and never following a symlink (`create_new` uses `O_EXCL`). Split from
+/// the write so a refusal leaves any existing file untouched and the caller
+/// marks the file as its own only after creation succeeds.
+fn create_phrase_file(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path).map_err(|e| {
+        let fix = if e.kind() == io::ErrorKind::AlreadyExists {
+            "Choose a new path, or remove the existing file first"
+        } else {
+            "Choose a writable path in an existing directory"
+        };
+        anyhow::Error::new(DomainError::usage(format!(
+            "cannot create --phrase-out {}: {e}",
+            path.display()
+        )))
+        .with_fix(fix)
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot set mode 0600 on --phrase-out {}: {e}",
+                    path.display()
+                )))
+            })?;
+    }
+    Ok(file)
+}
+
+fn write_phrase_file(file: &mut std::fs::File, path: &Path, phrase: &str) -> anyhow::Result<()> {
+    file.write_all(phrase.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write --phrase-out {}: {e}",
+                path.display()
+            )))
+        })?;
+    Ok(())
+}
+
 /// Resolve the device key for init/recover: the `CONFIDANT_DEVICE_KEY`
 /// env var (tests) or a fresh keypair stored via the keychain module.
 /// Returns `(bech32_secret, recipient_string)`.
@@ -9083,6 +9156,258 @@ fn validate_init_packs(packs: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `init --create` scaffolded for real, kept until the key steps and
+/// the anchor save succeed so a failure can remove only what this command
+/// created (#651). Every field records a path this run wrote; rollback never
+/// touches a pre-existing user file.
+struct Scaffold {
+    root: PathBuf,
+    created_root: bool,
+    git_initialized: bool,
+    gitignore_original: Option<Vec<u8>>,
+    wrote_gitignore: bool,
+    wrote_config: bool,
+    commit_created: bool,
+    previous_head: Option<String>,
+    armed: bool,
+}
+
+impl Scaffold {
+    /// Best-effort rollback. A repo this run created is removed entirely; a
+    /// pre-existing repo is rewound to its previous HEAD (or its unborn
+    /// state) and only this run's files are removed.
+    fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if self.git_initialized {
+            let _ = std::fs::remove_dir_all(self.root.join(".git"));
+        } else if self.commit_created {
+            match &self.previous_head {
+                Some(prev) => {
+                    let _ =
+                        confidant_core::write::git(&self.root, &["reset", "--mixed", prev], true);
+                }
+                None => {
+                    let _ =
+                        confidant_core::write::git(&self.root, &["update-ref", "-d", "HEAD"], true);
+                }
+            }
+        }
+        if self.wrote_gitignore {
+            let path = self.root.join(".gitignore");
+            match &self.gitignore_original {
+                Some(bytes) => {
+                    let _ = std::fs::write(path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        if self.wrote_config {
+            let _ = std::fs::remove_file(self.root.join("confidant.toml"));
+        }
+        if self.created_root {
+            // Only removes an empty directory: any user file leaves it alone.
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
+}
+
+impl Drop for Scaffold {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
+/// Result of the `init --create` bootstrap step.
+enum BootstrapPlan {
+    /// Continue to discovery and `cmd_init`; `Some` when a skeleton was
+    /// written for real and must be rolled back if `cmd_init` fails.
+    Continue(Option<Scaffold>),
+    /// #649: `--dry-run` printed the plan and wrote nothing; stop here.
+    DryRun,
+}
+
+/// Rollback for the key steps of `init` (#651): removes a `keys/` tree this
+/// run created (never a pre-existing one), a `--phrase-out` file this run
+/// created, and the `init: trust anchor and vault keys` commit when the run
+/// fails after committing but before the anchor save. Then it lets an armed
+/// [`Scaffold`] roll the skeleton back on drop.
+struct InitRollback {
+    root: PathBuf,
+    scaffold: Option<Scaffold>,
+    keys_dir_preexisting: bool,
+    keys_started: bool,
+    /// HEAD immediately before the keys commit; `None` on an unborn branch.
+    head_before_keys: Option<String>,
+    /// True once `init: trust anchor and vault keys` succeeded.
+    keys_committed: bool,
+    phrase_out: Option<PathBuf>,
+    phrase_out_created: bool,
+    armed: bool,
+}
+
+impl InitRollback {
+    fn new(root: &Path, scaffold: Option<Scaffold>, phrase_out: Option<&Path>) -> Self {
+        InitRollback {
+            root: root.to_path_buf(),
+            scaffold,
+            keys_dir_preexisting: root.join("keys").exists(),
+            keys_started: false,
+            head_before_keys: None,
+            keys_committed: false,
+            phrase_out: phrase_out.map(Path::to_path_buf),
+            phrase_out_created: false,
+            armed: true,
+        }
+    }
+
+    /// Keep everything written so far (the run is about to succeed).
+    fn disarm(&mut self) {
+        self.armed = false;
+        if let Some(scaffold) = self.scaffold.as_mut() {
+            scaffold.armed = false;
+        }
+    }
+
+    /// Rewind the `init: trust anchor and vault keys` commit so the working
+    /// tree can be cleaned up. Returns false when git refuses.
+    fn rewind_keys_commit(&self) -> bool {
+        match &self.head_before_keys {
+            Some(prev) => {
+                confidant_core::write::git(&self.root, &["reset", "--mixed", prev], true).is_ok()
+            }
+            None => {
+                confidant_core::write::git(&self.root, &["update-ref", "-d", "HEAD"], true).is_ok()
+            }
+        }
+    }
+}
+
+impl Drop for InitRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.keys_committed && !self.rewind_keys_commit() {
+            // Keep the keys tree, the phrase file, and the scaffold: the
+            // commit still references keys/, and deleting either side would
+            // lose data silently. Say exactly what is left and why.
+            if let Some(scaffold) = self.scaffold.as_mut() {
+                scaffold.armed = false;
+            }
+            let keys_path = self.root.join("keys");
+            eprintln!(
+                "warning: init failed after committing keys/ but could not rewind the commit; \
+                 keeping {} so the phrase still matches the committed keys",
+                keys_path.display()
+            );
+            if self.phrase_out_created {
+                if let Some(path) = &self.phrase_out {
+                    eprintln!(
+                        "warning: keeping the recovery phrase file at {}; write it down before \
+                         retrying",
+                        path.display()
+                    );
+                }
+            }
+            return;
+        }
+        if self.keys_started && !self.keys_dir_preexisting {
+            let _ = std::fs::remove_dir_all(self.root.join("keys"));
+        }
+        if self.phrase_out_created {
+            if let Some(path) = &self.phrase_out {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        // `scaffold` (if still armed) rolls back when it drops next.
+    }
+}
+
+/// True when git can resolve a commit identity for the repo at `root`.
+/// Runs `git var` before `init --create` writes anything (#651), and avoids
+/// reading the *current* directory's repo config: a fresh target has no local
+/// config, so only global/system/env identity applies. `GIT_DIR` works even
+/// when that path does not exist yet.
+fn require_git_identity(root: &Path, no_input: bool) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new("git");
+    if is_git_repo_root(root, no_input) {
+        cmd.arg("-C").arg(root);
+    } else {
+        cmd.env("GIT_DIR", root.join(".git"));
+    }
+    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
+    if no_input {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    let ok = cmd
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if ok {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(DomainError::invalid(
+        "git has no author identity, so init cannot commit the vault",
+    ))
+    .with_fix(
+        "Set a git identity, e.g. `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com`",
+    ))
+}
+
+/// The current branch name (works on an unborn branch), or `None` when git
+/// cannot report one.
+fn current_branch(root: &Path, no_input: bool) -> Option<String> {
+    confidant_core::write::git(root, &["branch", "--show-current"], no_input)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Additive `next_steps` for `init` JSON (#658): point at `pack add` only
+/// when the scaffolded `packs` list is empty.
+fn init_next_steps(packs_empty: bool) -> Value {
+    if packs_empty {
+        serde_json::json!(["confidant pack add <https-url> --yes"])
+    } else {
+        serde_json::json!([])
+    }
+}
+
+/// #649: report the `init --create` plan without writing anything.
+fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyhow::Result<()> {
+    let packs_empty = packs.is_empty();
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "init",
+                "dry_run": true,
+                "branch": "main",
+                "scaffold": true,
+                "packs": packs,
+                "next_steps": init_next_steps(packs_empty),
+            }),
+        ))?;
+    } else {
+        println!("dry run — no changes:");
+        println!("  vault    {}", root.display());
+        println!("  branch   main");
+        println!("  would    create the vault directory (when absent)");
+        println!("  would    run git init and commit .gitignore + confidant.toml");
+        println!("  would    generate the operator key, recovery phrase, and device key");
+        println!("  would    commit keys/ and write the trust anchor");
+        if packs_empty {
+            println!("optional: install a pack with `confidant pack add <https-url> --yes`");
+        }
+    }
+    Ok(())
+}
+
 /// `init --create`: scaffold a vault before the key steps so one
 /// non-interactive command produces a working vault (#539).
 ///
@@ -9091,9 +9416,9 @@ fn validate_init_packs(packs: &[String]) -> anyhow::Result<()> {
 /// `confidant.toml` (`packs` from the global `--packs`, default `[]`), and
 /// commits just those files. An existing vault is left to today's path; any
 /// other non-empty directory is refused with nothing written.
-fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
+fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<BootstrapPlan> {
     if !create {
-        return Ok(());
+        return Ok(BootstrapPlan::Continue(None));
     }
     let no_input = cli.no_input;
     let root = bootstrap_target(cli);
@@ -9101,7 +9426,7 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
     // An existing vault takes today's path unchanged (anchor check, clean
     // tree, key steps).
     if root.join("confidant.toml").is_file() {
-        return Ok(());
+        return Ok(BootstrapPlan::Continue(None));
     }
 
     // B1 preflight: the very refusal `cmd_init` would produce, but before any
@@ -9147,6 +9472,40 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
         .unwrap_or_default();
     validate_init_packs(&packs)?;
 
+    // #651: require a commit identity before creating the directory or
+    // running `git init`. `git var` works outside a repo, so a refused run
+    // leaves an absent target absent instead of an empty `.git` that blocks
+    // the retry. This also covers the dry run so it reports the same refusal.
+    require_git_identity(&root, no_input)?;
+
+    // #649: dry run stops before the first write.
+    if cli.dry_run {
+        print_init_scaffold_dry_run(cli, &root, &packs)?;
+        return Ok(BootstrapPlan::DryRun);
+    }
+
+    let existing_repo = exists && is_git_repo_root(&root, no_input);
+    let previous_head = if existing_repo {
+        confidant_core::write::git(&root, &["rev-parse", "HEAD"], no_input)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    let mut scaffold = Scaffold {
+        root: root.clone(),
+        created_root: !exists,
+        git_initialized: !existing_repo,
+        gitignore_original: std::fs::read(root.join(".gitignore")).ok(),
+        wrote_gitignore: false,
+        wrote_config: false,
+        commit_created: false,
+        previous_head,
+        armed: true,
+    };
+
     std::fs::create_dir_all(&root).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot create vault directory {}: {e}",
@@ -9154,23 +9513,15 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
         )))
     })?;
 
-    if !is_git_repo_root(&root, no_input) {
+    if scaffold.git_initialized {
         confidant_core::write::git(&root, &["init"], no_input)?;
-    }
-
-    // Check the commit identity before writing any skeleton file: without
-    // one the commit below fails and would leave the files written but
-    // uncommitted, and the retry would then refuse with "tree is not clean".
-    // Nothing we own has been written yet.
-    if confidant_core::write::git(&root, &["var", "GIT_AUTHOR_IDENT"], no_input).is_err() {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(
-                "git has no author identity, so the vault skeleton cannot be committed",
-            )
-            .with_fix(
-                "Set a git identity, e.g. `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com`",
-            ),
-        ));
+        // #661: create `main` explicitly, independent of init.defaultBranch.
+        // `symbolic-ref` is portable and works before the first commit.
+        confidant_core::write::git(
+            &root,
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+            no_input,
+        )?;
     }
 
     // `.confidant/` holds the plaintext search corpus and must never be
@@ -9185,6 +9536,7 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
             text.push('\n');
         }
         text.push_str(".confidant/\n");
+        scaffold.wrote_gitignore = true;
         std::fs::write(&gitignore, text)?;
     }
 
@@ -9194,6 +9546,7 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
         let quoted: Vec<String> = packs.iter().map(|p| format!("{p:?}")).collect();
         format!("[{}]", quoted.join(", "))
     };
+    scaffold.wrote_config = true;
     std::fs::write(
         root.join("confidant.toml"),
         format!(
@@ -9235,15 +9588,23 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
             ],
             no_input,
         )?;
+        scaffold.commit_created = true;
     }
 
     if !cli.json {
-        eprintln!("scaffolded vault at {}", root.display());
+        let branch = current_branch(&root, no_input).unwrap_or_else(|| "main".to_owned());
+        eprintln!("scaffolded vault at {} (branch {branch})", root.display());
     }
-    Ok(())
+    Ok(BootstrapPlan::Continue(Some(scaffold)))
 }
 
-fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
+fn cmd_init(
+    cli: &Cli,
+    root: &Path,
+    force: bool,
+    scaffold: Option<Scaffold>,
+    phrase_out: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{
         anchor, lifecycle::KeyStore, manifest::SHARED_CLIENT_ID, recovery::Recovery,
     };
@@ -9300,6 +9661,66 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
         ));
     }
 
+    // #651: the key commit needs an identity too. Check before generating
+    // any key material (works inside an existing repo).
+    require_git_identity(root, no_input)?;
+
+    let vault = load_vault(root)?;
+    // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
+    // `init` on a vault declaring `[crypto] mode = "plaintext"` is a hard
+    // error — the opt-out is a pre-`init` declaration only. Checked here so
+    // `--dry-run` reports the same refusal without generating keys.
+    if vault.config.crypto.mode.as_deref() == Some("plaintext") {
+        return Err(anyhow::Error::new(
+            DomainError::config(
+                "confidant.toml declares [crypto] mode = \"plaintext\", but `init` \
+                 creates vault keys; keys must never coexist with a plaintext declaration",
+            )
+            .with_fix(
+                "Remove the `[crypto] mode = \"plaintext\"` line, or run `init` in a fresh vault",
+            ),
+        ));
+    }
+
+    let branch = current_branch(root, no_input);
+    let packs_empty = vault.config.packs.is_empty();
+
+    // #649: every preflight above passed; report the plan and stop before
+    // key generation, keychain writes, keys/ commits, or the anchor save.
+    if cli.dry_run {
+        if json {
+            print_json(&ok_envelope(
+                Some(root),
+                serde_json::json!({
+                    "command": "init",
+                    "dry_run": true,
+                    "branch": branch,
+                    "next_steps": init_next_steps(packs_empty),
+                }),
+            ))?;
+        } else {
+            println!("dry run — no changes:");
+            println!("  vault    {}", root.display());
+            if let Some(branch) = &branch {
+                println!("  branch   {branch}");
+            }
+            println!("  would    generate the operator key, recovery phrase, and device key");
+            println!(
+                "  would    commit keys/ and write the trust anchor at {}",
+                trust_path.display()
+            );
+            if packs_empty {
+                println!("optional: install a pack with `confidant pack add <https-url> --yes`");
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Everything from here on can write. The guard removes only what this
+    // run created: a `keys/` tree that did not exist, a `--phrase-out` file,
+    // and (with `--create`) the skeleton.
+    let mut rollback = InitRollback::new(root, scaffold, phrase_out);
+
     // B2: generate operator key, recovery phrase, and device keypair.
     // None of this material is ever written into the vault.
     // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
@@ -9309,6 +9730,17 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     #[cfg(not(feature = "test-overrides"))]
     let operator_sk = SigningKey::generate(&mut OsRng);
     let recovery = Recovery::generate();
+    let phrase = recovery.phrase();
+
+    // #662: write the phrase file before any key persistence. If the file
+    // cannot be created, abort with nothing persisted; the guard removes a
+    // partial file if the write itself fails, but never a pre-existing one.
+    if let Some(path) = phrase_out {
+        let mut file = create_phrase_file(path)?;
+        rollback.phrase_out_created = true;
+        write_phrase_file(&mut file, path, &phrase)?;
+    }
+
     let (_device_bech32, device_recipient) = provision_device_key()?;
 
     // Persist the operator signing key to the OS keychain (needed for
@@ -9341,21 +9773,7 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
 
     // B4 + B6: KeyStore via with_config_dir (mandatory seq tracker).
     // Initialize the vault lookup key and the vault:shared client (⚠6).
-    let vault = load_vault(root)?;
-    // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
-    // `init` on a vault declaring `[crypto] mode = "plaintext"` is a hard
-    // error — the opt-out is a pre-`init` declaration only.
-    if vault.config.crypto.mode.as_deref() == Some("plaintext") {
-        return Err(anyhow::Error::new(
-            DomainError::config(
-                "confidant.toml declares [crypto] mode = \"plaintext\", but `init` \
-                 creates vault keys; keys must never coexist with a plaintext declaration",
-            )
-            .with_fix(
-                "Remove the `[crypto] mode = \"plaintext\"` line, or run `init` in a fresh vault",
-            ),
-        ));
-    }
+    rollback.keys_started = true;
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
             .map_err(anyhow::Error::new)?;
@@ -9395,15 +9813,42 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
             "check failed before committing the keys/ tree; refusing to commit a broken vault",
         )));
     }
+
+    // #651: the phrase must be visible BEFORE the irreversible keys/ commit
+    // and anchor save, so a failed run can never leave keys whose phrase was
+    // never seen. With --phrase-out the file was written above; without it,
+    // display now. A display failure aborts before anything is committed.
+    if phrase_out.is_none() {
+        display_phrase_once(no_input, &phrase)?;
+    }
+
+    // #651 review: record the pre-keys HEAD so a failure after the keys
+    // commit (e.g. the anchor save) can rewind it before removing keys/.
+    rollback.head_before_keys = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &["commit", "-m", "init: trust anchor and vault keys"],
         no_input,
     )?;
+    rollback.keys_committed = true;
     let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
         .trim()
         .to_owned();
+
+    // Test-only failpoint (never in release builds): a failure after the
+    // irreversible keys/ commit and before the anchor save exercises the
+    // rewind path. Not part of the agent contract.
+    #[cfg(feature = "test-overrides")]
+    if std::env::var("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT").as_deref() == Ok("1") {
+        return Err(anyhow::Error::new(DomainError::internal(
+            "test-only failpoint: failing after the keys/ commit",
+        )));
+    }
 
     // Persist the anchor now that everything succeeded. Atomic
     // temp-and-rename: a crash never leaves a half-written trust.toml.
@@ -9428,22 +9873,38 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
         .map_err(anyhow::Error::new)?;
     }
 
-    // B5: phrase exactly once on stderr; stdout JSON carries ok, vault,
-    // and opaque paths — no phrase, no key material.
-    display_phrase_once(no_input, &recovery.phrase())?;
+    // The run succeeded: keep the skeleton, keys/, and phrase file.
+    rollback.disarm();
+
+    // B5: phrase exactly once on stderr (or only its path when
+    // --phrase-out was used); stdout JSON carries ok, vault, and opaque
+    // paths — no phrase, no key material.
+    if let Some(path) = phrase_out {
+        eprintln!("recovery phrase written to {}", path.display());
+        eprintln!("Move this file offline, then delete it.");
+    }
 
     if json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "anchor": trust_path.display().to_string(),
-                "keys_dir": keys_dir.display().to_string(),
-                "commit": commit,
-            }),
-        ))?;
+        let mut extra = serde_json::json!({
+            "anchor": trust_path.display().to_string(),
+            "keys_dir": keys_dir.display().to_string(),
+            "commit": commit,
+            "branch": branch,
+            "next_steps": init_next_steps(packs_empty),
+        });
+        if let Some(path) = phrase_out {
+            extra["phrase_out"] = Value::String(path.display().to_string());
+        }
+        print_json(&ok_envelope(Some(root), extra))?;
     } else {
         println!("initialized trust anchor at {}", trust_path.display());
+        if let Some(branch) = &branch {
+            println!("branch {branch}");
+        }
         println!("committed keys/ tree ({})", &commit[..8.min(commit.len())]);
+        if packs_empty {
+            println!("optional: install a pack with `confidant pack add <https-url> --yes`");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
