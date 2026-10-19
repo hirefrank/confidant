@@ -172,8 +172,10 @@ These are blocking. Do not open a PR for review that breaks one.
 - Code adapted from other projects keeps its license header and is recorded
   in `THIRD_PARTY_LICENSES` and `docs/borrowing.md`.
 - Tests: add or update tests for every behaviour change. The demo vault must
-  stay clean under `confidant check`. Prefer extending the existing test
-  files over adding new ones.
+  report no **errors** under `confidant check`; it intentionally carries two
+  warning-level personal nudges (`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) as
+  teaching content, so do not expect an empty findings list. Prefer extending
+  the existing test files over adding new ones.
 - Tests that write ledger lines must pin the date (`--date 2026-10-13`) or
   assert against a fixed month. A test that relies on "today" expires when
   the month rolls over and turns `main` red on its own (#585 shipped one and
