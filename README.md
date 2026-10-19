@@ -330,6 +330,28 @@ the skill falls back to plain `confidant find` and the tab shows a
 `fallback: <reason>` banner. If `python3` or the skill itself is missing, the
 tab shows an alert instead of falling back silently.
 
+The People workspace shows the cleared roster and the selected person's live
+`context`. `!` toggles **operator mode**: the roster and context are then read
+with `--for-operator`, so `no-ai` people and notes appear with a tri-state
+`[no-ai]` / `[no-ai: notes]` badge, and the footer carries the same
+`OPERATOR MODE` banner the CLI prints, so a screen share cannot silently show
+hidden data. Operator mode is off by default — the TUI passes the flag only
+after that explicit key press. Turning it off drops the operator roster and
+context before reloading, so a failed reload cannot leave hidden content on
+screen without the banner.
+
+Editing is always operator-only, independent of operator mode: from the
+context pane, `[`/`]` select the person, a note, or an interaction and `e`
+edits it. `e` uses `record show --for-edit` / `note show --for-edit`, which
+decrypt `no-ai` records even while the roster view is un-badged (operator mode
+off); the badges and banner describe the roster/context view, not the edit
+path. The text is staged in 0600 scratch under
+`<vault>/.confidant/conflicts/<id>/`, opens in `$EDITOR`/`$VISUAL` (run as a
+single program, so `EDITOR="code -w"` does not work — the same limitation as
+the CLI's own `--edit` flows), and is written back through `record edit` /
+`note edit --file` only after an explicit `y` confirm. A no-op edit commits
+nothing.
+
 ## Where we're going
 
 The roadmap is tracked as open issues on GitHub. The big themes:
@@ -346,7 +368,8 @@ The roadmap is tracked as open issues on GitHub. The big themes:
   [Issue #205](https://github.com/hirefrank/confidant/issues/205).
 - **Encrypted editing** — `record edit`, `record show --for-edit`, and the
   operator-only `note show --for-edit` / `note edit` pair
-  (#216, #557). The TUI editor on top of them is still to come.
+  (#216, #557). The TUI now puts these behind `e` in the context pane
+  (#556 phase 2).
 - **Ciphertext merge conflicts** — detection and resolution for encrypted
   records. [Issue #219](https://github.com/hirefrank/confidant/issues/219).
 - **Ledger query performance** — a rebuildable local index.

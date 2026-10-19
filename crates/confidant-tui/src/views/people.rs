@@ -287,6 +287,13 @@ fn nudge_row<'a>(nudge: &'a Nudge, roster: Option<&Roster>) -> ListItem<'a> {
 
 fn person_row(entry: &RosterEntry) -> ListItem<'_> {
     let mut spans = vec![Span::styled(entry.name.clone(), Color::White)];
+    if let Some(badge) = entry.no_ai.badge() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            badge,
+            Style::default().fg(palette::WARNING).bold(),
+        ));
+    }
     if entry.name != entry.id {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(

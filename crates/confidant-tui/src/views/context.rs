@@ -1,8 +1,10 @@
-//! Read-only Context view (`confidant context <p-id> --json --no-input`).
+//! Context view (`confidant context <p-id> --json --no-input`).
 //!
 //! Used two ways: the full-screen Context view reached from Search/Check,
 //! and the right pane of the People master–detail workspace. The renderer
-//! is shared so both show the same live bundle.
+//! is shared so both show the same live bundle. Rendering performs no I/O:
+//! the `▶` edit cursor is a pure marker over [`edit_targets`], which the app
+//! resolves to a `record`/`note` edit on `e`.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -11,6 +13,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::contract::{Context, NoteView};
+use crate::edit::{EditKind, EditTarget};
 use crate::theme;
 use crate::theme::palette;
 
@@ -20,6 +23,56 @@ pub struct ContextViewState {
     pub person_id: Option<String>,
     pub context: Option<Context>,
     pub scroll: u16,
+    /// Index into [`edit_targets`] of the item `e` would edit.
+    pub edit_index: usize,
+}
+
+/// The editable items in render order: the person, then each note, then each
+/// interaction. Shared by the app (to resolve `e` and `[`/`]`) and the
+/// renderer (to mark the current target), so the two can never disagree.
+pub fn edit_targets(ctx: &Context) -> Vec<EditTarget> {
+    let mut targets = Vec::new();
+    if !ctx.person.id.is_empty() {
+        targets.push(EditTarget {
+            id: ctx.person.id.clone(),
+            kind: EditKind::Record,
+            label: ctx
+                .person
+                .name
+                .clone()
+                .unwrap_or_else(|| ctx.person.id.clone()),
+        });
+    }
+    for note in &ctx.notes {
+        targets.push(EditTarget {
+            id: note.id.clone(),
+            kind: EditKind::Note,
+            label: format!("note {}", note.date.as_deref().unwrap_or("-")),
+        });
+    }
+    for ixn in &ctx.interactions {
+        targets.push(EditTarget {
+            id: ixn.id.clone(),
+            kind: EditKind::Record,
+            label: ixn
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("interaction {}", ixn.id)),
+        });
+    }
+    targets
+}
+
+/// The `▶` prefix marking the item `e` would edit.
+fn target_marker<'a>() -> Span<'a> {
+    Span::styled("▶ ", Style::default().fg(palette::ACCENT).bold())
+}
+
+/// The tri-state `no-ai` badge for an operator-path view, or nothing when
+/// the mode is `false`/absent (the agent path renders as it always did).
+fn no_ai_badge<'a>(mode: Option<crate::contract::NoAiMode>) -> Option<Span<'a>> {
+    mode.and_then(|mode| mode.badge())
+        .map(|text| Span::styled(text, Style::default().fg(palette::WARNING).bold()))
 }
 
 fn first_line(text: Option<&str>) -> &str {
@@ -67,13 +120,24 @@ fn body_lines(body: Option<&str>, indent: &'static str) -> Vec<Line<'static>> {
     lines
 }
 
-fn note_block(note: &NoteView) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
+fn note_block(note: &NoteView, marker: bool) -> Vec<Line<'static>> {
+    let mut lead = vec![
         Span::raw("  "),
         theme::pill(note.date.as_deref().unwrap_or("-")),
         Span::raw(" "),
-        Span::styled(note.id.clone(), Style::default().fg(palette::MUTED)),
-    ])];
+    ];
+    if marker {
+        lead.insert(0, target_marker());
+    }
+    if let Some(badge) = no_ai_badge(note.no_ai) {
+        lead.push(badge);
+        lead.push(Span::raw(" "));
+    }
+    lead.push(Span::styled(
+        note.id.clone(),
+        Style::default().fg(palette::MUTED),
+    ));
+    let mut lines = vec![Line::from(lead)];
     lines.extend(body_lines(note.body.as_deref(), "    "));
     lines
 }
@@ -119,7 +183,7 @@ fn render_with_title(state: &ContextViewState, title: &str, frame: &mut Frame<'_
         return;
     };
 
-    let paragraph = Paragraph::new(context_lines(ctx))
+    let paragraph = Paragraph::new(context_lines(ctx, state.edit_index))
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((state.scroll, 0));
@@ -128,22 +192,26 @@ fn render_with_title(state: &ContextViewState, title: &str, frame: &mut Frame<'_
 
 /// Front matter as pills, then the profile, coaching numbers, notes,
 /// interactions, touchpoints, and aliases. Bodies are plain text (the TUI
-/// does not link a Markdown renderer).
-fn context_lines(ctx: &Context) -> Vec<Line<'static>> {
+/// does not link a Markdown renderer). `edit_index` marks the item `e` would
+/// edit and badges the tri-state `no-ai` mode the operator path reports.
+fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
+    let targets = edit_targets(ctx);
+    // Fail safe: an out-of-range index marks nothing rather than panicking.
+    let selected = (edit_index < targets.len()).then_some(edit_index);
     let mut lines = Vec::new();
     let p = &ctx.person;
-    let mut identity = vec![
-        theme::label("id "),
-        theme::pill(&p.id),
-        Span::raw(" "),
-        theme::label("name "),
-        theme::pill(p.name.as_deref().unwrap_or("(name withheld)")),
-    ];
-    if p.no_ai {
-        identity.push(Span::styled(
-            " [no-ai]",
-            Style::default().fg(palette::WARNING).bold(),
-        ));
+    let mut identity = Vec::new();
+    if selected == Some(0) {
+        identity.push(target_marker());
+    }
+    identity.push(theme::label("id "));
+    identity.push(theme::pill(&p.id));
+    identity.push(Span::raw(" "));
+    identity.push(theme::label("name "));
+    identity.push(theme::pill(p.name.as_deref().unwrap_or("(name withheld)")));
+    if let Some(badge) = no_ai_badge(Some(p.no_ai)) {
+        identity.push(Span::raw(" "));
+        identity.push(badge);
     }
     lines.push(Line::from(identity));
     if !ctx.scope.is_empty() {
@@ -189,16 +257,22 @@ fn context_lines(ctx: &Context) -> Vec<Line<'static>> {
         format!("notes ({})", ctx.notes.len()),
         Style::default().fg(palette::MUTED).bold(),
     )));
-    for n in &ctx.notes {
-        lines.extend(note_block(n));
+    for (index, n) in ctx.notes.iter().enumerate() {
+        // Target 0 is the person; notes start at 1.
+        lines.extend(note_block(n, selected == Some(1 + index)));
     }
 
     lines.push(Line::from(Span::styled(
         format!("interactions ({})", ctx.interactions.len()),
         Style::default().fg(palette::MUTED).bold(),
     )));
-    for ixn in &ctx.interactions {
-        let mut title = vec![Span::raw("  ")];
+    let interactions_start = 1 + ctx.notes.len();
+    for (index, ixn) in ctx.interactions.iter().enumerate() {
+        let mut title = Vec::new();
+        if selected == Some(interactions_start + index) {
+            title.push(target_marker());
+        }
+        title.push(Span::raw("  "));
         if let Some(date) = &ixn.date {
             title.push(theme::pill(date));
             title.push(Span::raw(" "));
@@ -207,6 +281,10 @@ fn context_lines(ctx: &Context) -> Vec<Line<'static>> {
             ixn.title.clone().unwrap_or_else(|| "-".to_owned()),
             Style::default().fg(Color::White).bold(),
         ));
+        if let Some(badge) = no_ai_badge(ixn.no_ai) {
+            title.push(Span::raw(" "));
+            title.push(badge);
+        }
         title.push(Span::raw(" "));
         title.push(Span::styled(
             ixn.id.clone(),

@@ -69,6 +69,7 @@ fn run_event_loop(
     if let Some(vault) = vault {
         app.set_vault_root(vault);
     }
+    app.sweep_stale_edit_scratch();
     app.load_check();
     app.load_roster();
 

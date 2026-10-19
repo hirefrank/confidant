@@ -1,7 +1,7 @@
  1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
 vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
 ╭ Person Context ──────────────────────────────────────────────────────────────────────────────────╮
-│ id  p-01M3TC5H00MPJG000000000000  name  Ada Example                                              │
+│ ▶ id  p-01M3TC5H00MPJG000000000000  name  Ada Example                                            │
 │ scope  coaching@0.1                                                                              │
 │ profile Fake executive coaching client at Acme Corp.                                             │
 │ coaching  sessions_remaining 5   icf_hours 1.00                                                  │
