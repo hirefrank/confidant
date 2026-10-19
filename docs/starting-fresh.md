@@ -36,10 +36,11 @@ Everything a vault needs to be read and written is inside the vault directory:
 
 Deleting the vault deletes `keys/`. **The old recovery phrase on its own
 cannot restore a deleted vault.** `confidant recover` works from a vault
-checkout: it verifies `keys/operator.toml` + `keys/operator.sig` against the
-phrase-derived recovery key, then unwraps each client data key from
-`keys/<client>/wrapped/recovery.age` and re-wraps it to a fresh device key.
-With `keys/` gone there is nothing to unwrap and no certificate to verify
+checkout: it verifies the operator certificate (or the local trust anchor)
+against the phrase-derived recovery key, then unwraps each client data key
+from `keys/<client>/wrapped/recovery.age` and re-wraps it to a fresh device
+key. With `keys/` gone there is nothing to unwrap and no certificate to
+verify
 (verified: `recover` exits 1 on a checkout whose `keys/` tree was removed).
 If you want the old data back later, keep the whole vault, including
 `keys/`, and the phrase.
