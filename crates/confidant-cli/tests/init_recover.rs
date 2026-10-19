@@ -1007,6 +1007,52 @@ fn git_out(vault: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Every path under `root`, sorted, for "nothing changed" assertions.
+fn path_snapshot(root: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.display().to_string());
+            }
+            if path.is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Assert that no recovery phrase (its banner or a 24-word line) reached
+/// stdout or stderr.
+fn assert_no_recovery_phrase(out: &Output) {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !text.contains("RECOVERY PHRASE"),
+        "recovery phrase banner leaked:\n{text}"
+    );
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.len() == 24
+            && words
+                .iter()
+                .all(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+        {
+            panic!("24-word recovery phrase leaked: {line}");
+        }
+    }
+}
+
 #[test]
 fn bootstrap_one_command_from_absent_dir_creates_valid_vault() {
     let b = Boot::new();
@@ -1023,6 +1069,13 @@ fn bootstrap_one_command_from_absent_dir_creates_valid_vault() {
     // Directory + git repo.
     assert!(b.vault.is_dir(), "vault directory not created");
     git_out(&b.vault, &["rev-parse", "--git-dir"]);
+
+    // #661: the scaffold creates `main` explicitly, whatever git's default is.
+    assert_eq!(
+        git_out(&b.vault, &["branch", "--show-current"]).trim(),
+        "main",
+        "init --create must leave the vault on main"
+    );
 
     // `.confidant/` is ignored (reindex's guardrail).
     let gitignore = std::fs::read_to_string(b.vault.join(".gitignore")).unwrap();
@@ -1061,6 +1114,7 @@ fn bootstrap_one_command_from_absent_dir_creates_valid_vault() {
     // ADR-7 envelope: ok + the resolved vault path.
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
+    assert_eq!(v["branch"], "main", "init JSON must report the branch");
     let resolved = v["vault"].as_str().unwrap();
     assert_eq!(
         std::fs::canonicalize(resolved).unwrap(),
@@ -1380,6 +1434,29 @@ fn bootstrap_without_git_identity_fails_before_writing_files() {
     );
     assert!(!b.vault.join("confidant.toml").exists());
     assert!(!b.vault.join(".gitignore").exists());
+    // #651 regression: the old order left an empty `.git`, and the retry then
+    // refused because the folder was no longer empty. The target must stay
+    // absent so configuring an identity is enough to retry.
+    assert!(
+        !b.vault.exists(),
+        "a refused --create left {} behind; the retry would be blocked",
+        b.vault.display()
+    );
+
+    // Configure the identity and retry: the same command now succeeds.
+    std::fs::write(
+        b.home.join(".gitconfig"),
+        "[user]\n\tname = Test Operator\n\temail = test@example.com\n",
+    )
+    .unwrap();
+    let retry = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        retry.status.success(),
+        "retry after configuring a git identity must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(b.vault.join("confidant.toml").is_file());
 }
 
 #[test]
@@ -1449,6 +1526,356 @@ fn init_without_create_still_refuses_unclean_tree() {
         !h.trust_toml().exists(),
         "refused init must not write the anchor"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #649: `init --dry-run` writes nothing (directory, HOME, commits, keys,
+// keychain). #658: the empty-packs hint. #662: `--phrase-out`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_create_dry_run_writes_nothing() {
+    let b = Boot::new();
+    assert!(!b.vault.exists(), "precondition: vault path does not exist");
+    let home_before = path_snapshot(&b.home);
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--dry-run", "--json"]);
+    assert!(
+        out.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // #649: no directory, no repo, no skeleton, no keys, no anchor.
+    assert!(!b.vault.exists(), "dry run created the vault directory");
+    assert!(
+        !b.home.join(".config/confidant").exists(),
+        "dry run wrote HOME state"
+    );
+
+    // ADR-7 envelope: ok, dry_run, resolved vault path, branch.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["branch"], "main");
+    assert_eq!(v["vault"], b.vault.display().to_string());
+
+    assert_no_recovery_phrase(&out);
+    assert_eq!(path_snapshot(&b.home), home_before, "dry run changed HOME");
+}
+
+#[test]
+fn init_dry_run_on_prepared_vault_writes_nothing() {
+    let h = Harness::new();
+    let head_before = git_out(&h.vault, &["rev-parse", "HEAD"]);
+    let home_before = path_snapshot(&h.home);
+    let branch_before = git_out(&h.vault, &["branch", "--show-current"])
+        .trim()
+        .to_string();
+
+    let out = h.init(&["--dry-run"]);
+    assert!(
+        out.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(!h.vault.join("keys").exists(), "dry run created keys/");
+    assert!(!h.trust_toml().exists(), "dry run wrote the trust anchor");
+    assert_eq!(
+        git_out(&h.vault, &["rev-parse", "HEAD"]),
+        head_before,
+        "dry run created a commit"
+    );
+    assert!(
+        git_out(&h.vault, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "dry run dirtied the tree"
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["branch"], branch_before);
+
+    assert_no_recovery_phrase(&out);
+    assert_eq!(path_snapshot(&h.home), home_before);
+}
+
+#[test]
+fn init_dry_run_does_not_create_phrase_out_file() {
+    let h = Harness::new();
+    let phrase_path = h._tmp.path().join("phrase.txt");
+
+    let out = h.init(&["--dry-run", "--phrase-out", phrase_path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !phrase_path.exists(),
+        "dry run must not create the --phrase-out file"
+    );
+    assert!(!h.vault.join("keys").exists());
+    assert!(!h.trust_toml().exists());
+    assert_no_recovery_phrase(&out);
+}
+
+/// #658: an empty scaffolded pack list prints one optional `pack add` line.
+#[test]
+fn bootstrap_empty_packs_prints_pack_add_hint() {
+    let b = Boot::new();
+    let out = b.at_vault(&["init", "--create", "--no-input"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("confidant pack add <https-url> --yes"),
+        "missing empty-packs hint:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("confidant pack add <https-url> --yes")
+            .count(),
+        1,
+        "the optional hint must appear exactly once:\n{stdout}"
+    );
+}
+
+/// #658: JSON gets the hint additively in `next_steps`; an explicit pack
+/// list (and `--packs`) keeps it empty.
+#[test]
+fn bootstrap_json_next_steps_points_at_pack_add_only_when_empty() {
+    let b = Boot::new();
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let steps = v["next_steps"].as_array().expect("next_steps array");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("confidant pack add")),
+        "missing pack hint in next_steps: {steps:?}"
+    );
+
+    let b2 = Boot::new();
+    let out = b2.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "personal@0.1",
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["next_steps"], serde_json::json!([]));
+}
+
+/// #662: the phrase goes to a new 0600 file, never to stdout/stderr/JSON.
+#[test]
+fn init_phrase_out_writes_0600_and_hides_phrase() {
+    let h = Harness::new();
+    let phrase_path = h._tmp.path().join("phrase.txt");
+
+    let out = h.init(&["--phrase-out", phrase_path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = std::fs::read_to_string(&phrase_path).unwrap();
+    let phrase = text.trim();
+    assert_eq!(
+        phrase.split_whitespace().count(),
+        24,
+        "phrase file does not hold 24 words"
+    );
+    assert!(text.ends_with('\n'), "phrase file must end with a newline");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&phrase_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "phrase file must be 0600");
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(phrase), "phrase leaked to stdout");
+    assert!(!stderr.contains(phrase), "phrase leaked to stderr");
+    assert!(
+        !stdout.contains("RECOVERY PHRASE") && !stderr.contains("RECOVERY PHRASE"),
+        "the phrase banner must not print with --phrase-out"
+    );
+    assert!(
+        stderr.contains("Move this file offline, then delete it."),
+        "missing delete warning:\n{stderr}"
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(v["phrase_out"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("phrase.txt"));
+
+    // The run still completed: anchor, keys, clean tree.
+    assert!(h.trust_toml().is_file());
+    assert!(h.vault.join("keys/shared/recipients.toml").is_file());
+    assert!(git_out(&h.vault, &["status", "--porcelain"])
+        .trim()
+        .is_empty());
+}
+
+#[test]
+fn init_phrase_out_refuses_overwrite() {
+    let h = Harness::new();
+    let phrase_path = h._tmp.path().join("phrase.txt");
+    std::fs::write(&phrase_path, "keep me\n").unwrap();
+
+    let out = h.init(&["--phrase-out", phrase_path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "refusal is a usage error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--phrase-out"),
+        "{v}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&phrase_path).unwrap(),
+        "keep me\n",
+        "existing file must be untouched"
+    );
+    assert!(!h.vault.join("keys").exists(), "keys must not be written");
+    assert!(!h.trust_toml().exists(), "anchor must not be written");
+    assert!(
+        git_out(&h.vault, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "refused init dirtied the tree"
+    );
+}
+
+#[test]
+fn init_phrase_out_failure_aborts_before_key_persistence() {
+    let h = Harness::new();
+    // Parent directory absent: the file cannot be created.
+    let phrase_path = h._tmp.path().join("missing-dir/phrase.txt");
+
+    let out = h.init(&["--phrase-out", phrase_path.to_str().unwrap()]);
+    assert!(!out.status.success(), "missing parent must fail");
+    assert!(!phrase_path.exists());
+    assert!(!h.vault.join("keys").exists(), "keys must not be written");
+    assert!(!h.trust_toml().exists(), "anchor must not be written");
+    assert!(
+        git_out(&h.vault, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "failed init dirtied the tree"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_phrase_out_does_not_follow_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let h = Harness::new();
+    let target = h._tmp.path().join("existing.txt");
+    std::fs::write(&target, "keep me\n").unwrap();
+    let link = h._tmp.path().join("phrase-link.txt");
+    symlink(&target, &link).unwrap();
+
+    let out = h.init(&["--phrase-out", link.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "symlink must be refused");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "keep me\n",
+        "symlink target must be untouched"
+    );
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "a refused init must not remove the existing symlink"
+    );
+    assert!(!h.vault.join("keys").exists());
+    assert!(!h.trust_toml().exists());
+}
+
+#[test]
+fn init_help_mentions_phrase_out() {
+    let b = Boot::new();
+    let out = b.cmd(&["init", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("--phrase-out"),
+        "help misses --phrase-out:\n{text}"
+    );
+    assert!(
+        text.contains("0600"),
+        "help misses the 0600 promise:\n{text}"
+    );
+}
+
+/// #651: a failure after the skeleton commit (here `--phrase-out` cannot be
+/// created) must remove everything this run created, so the retry sees the
+/// same absent directory instead of a half-built vault.
+#[test]
+fn bootstrap_rolls_back_skeleton_when_a_later_step_fails() {
+    let b = Boot::new();
+    let bad_path = b._tmp.path().join("missing-dir/phrase.txt");
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--no-input",
+        "--json",
+        "--phrase-out",
+        bad_path.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "init must fail when --phrase-out fails"
+    );
+    assert!(
+        !b.vault.exists(),
+        "failed init left the skeleton behind:\n{}",
+        path_snapshot(b._tmp.path()).join("\n")
+    );
+    assert!(!b.home.join(".config/confidant/trust.toml").exists());
+    assert!(!bad_path.exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,4 +2259,119 @@ fn verify_recovery_empty_stdin_is_usage_error() {
     assert_eq!(out.status.code(), Some(2), "empty input is a usage error");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "usage_error");
+}
+
+// ---------------------------------------------------------------------------
+// #671 review: a failure after the keys commit must rewind the commit before
+// removing keys/, so a prepared vault is clean and the retry works. The
+// failpoint is test-only (`test-overrides`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failed_init_after_keys_commit_rewinds_and_retry_succeeds() {
+    let h = Harness::new();
+    let head_before = git_out(&h.vault, &["rev-parse", "HEAD"]);
+    let phrase_path = h._tmp.path().join("phrase.txt");
+
+    let out = h
+        .cmd(&[
+            "init",
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .env("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the failpoint must fail init: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The keys commit was rewound, keys/ and the phrase file are gone, and
+    // the prepared vault is exactly as clean as before the run.
+    assert_eq!(
+        git_out(&h.vault, &["rev-parse", "HEAD"]),
+        head_before,
+        "the keys commit was not rewound"
+    );
+    let porcelain = git_out(&h.vault, &["status", "--porcelain"]);
+    assert!(
+        porcelain.trim().is_empty(),
+        "rollback left a dirty tree:\n{porcelain}"
+    );
+    assert!(!h.vault.join("keys").exists(), "keys/ must be removed");
+    assert!(!phrase_path.exists(), "the phrase file must be removed");
+    assert!(!h.trust_toml().exists(), "the anchor must not be written");
+
+    // Retry without the failpoint: the same prepared vault now initializes.
+    let retry = h.init(&["--phrase-out", phrase_path.to_str().unwrap()]);
+    assert!(
+        retry.status.success(),
+        "retry failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(phrase_path.is_file(), "retry must write the phrase file");
+    assert!(h.trust_toml().is_file(), "retry must write the anchor");
+    let check = h.cmd(&["check", "--no-input", "--json"]).output().unwrap();
+    assert!(
+        check.status.success(),
+        "check failed after the retry: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
+#[test]
+fn failed_create_init_after_keys_commit_rolls_back_the_scaffold() {
+    let b = Boot::new();
+    let phrase_path = b._tmp.path().join("phrase.txt");
+
+    let out = b
+        .cmd(&[
+            "init",
+            "--create",
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the failpoint must fail init: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !b.vault.exists(),
+        "failed --create must leave the target absent"
+    );
+    assert!(!phrase_path.exists(), "the phrase file must be removed");
+
+    // Retry without the failpoint from the same absent target.
+    let retry = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        retry.status.success(),
+        "retry failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let check = b.at_vault(&["check", "--no-input", "--json"]);
+    assert!(
+        check.status.success(),
+        "check failed after the retry: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true);
 }
