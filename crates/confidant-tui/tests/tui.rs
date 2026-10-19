@@ -1076,6 +1076,23 @@ fn proposals_live_apply_against_temp_git_vault() {
         .iter()
         .any(|s| matches!(&s.status, StepStatus::Blocked { .. })));
 
+    // #611: the note landed at the manifest's own path/id, not a freshly
+    // minted one, so the reviewed dry-run named the exact file written.
+    let mut note_records = 0;
+    for r in manifest["records"].as_array().unwrap() {
+        if r.get("note_id").is_none() || r["person"].is_null() {
+            continue;
+        }
+        note_records += 1;
+        let path = dir.join(r["path"].as_str().unwrap());
+        assert!(
+            path.exists(),
+            "note not applied at its reviewed path: {}",
+            path.display()
+        );
+    }
+    assert_eq!(note_records, 1, "expected one person-linked note record");
+
     let report = flow.final_check(&runner).expect("final check runs");
     assert!(report.is_none(), "final check should be clean");
 

@@ -492,6 +492,59 @@ fn import_rejects_bad_line_before_touching_vault() {
     assert_eq!(commits(root), 1);
 }
 
+#[test]
+fn import_refuses_a_dirty_target_month_file() {
+    // #611: appending commits the whole month file (`git add`), so an
+    // unrelated uncommitted line would be swept into the proposal commit.
+    // Refuse before writing anything, then succeed once it is committed.
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let ledger = root.join("ledger/2026/10.cfd");
+    let mut dirty = std::fs::read_to_string(&ledger).unwrap();
+    dirty.push_str(&format!("2026-10-05 touch {PERSON}\n"));
+    std::fs::write(&ledger, &dirty).unwrap();
+    let before_commits = commits(root);
+
+    let file = scratch.path().join("import.cfd");
+    std::fs::write(&file, format!("2026-10-06 session {PERSON} 45m pps\n")).unwrap();
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_CONFLICT");
+    assert_eq!(commits(root), before_commits, "nothing committed");
+    assert_eq!(
+        std::fs::read_to_string(&ledger).unwrap(),
+        dirty,
+        "the dirty file must be left untouched"
+    );
+
+    // Committing the operator's unrelated line clears the refusal.
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "operator work"]);
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert!(std::fs::read_to_string(&ledger)
+        .unwrap()
+        .contains("45m pps"));
+}
+
 // ---------------------------------------------------------------------------
 // note add
 // ---------------------------------------------------------------------------
@@ -524,6 +577,110 @@ fn note_add_creates_note() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("Follow up on the launch."));
     assert_eq!(commits(root), 2);
+}
+
+#[test]
+fn note_add_honours_a_forced_id_and_is_idempotent() {
+    // #611: the TUI passes the manifest's note id so the reviewed dry-run
+    // and the commit name the same file. Reusing the request id is
+    // idempotent, never an overwrite refusal.
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "Reviewed body.\n").unwrap();
+    let nid = "n-01M3TC5H00MPJG002NAM000005";
+    let rid = "01M3TC5H00MPJG005VQC00000B";
+    let body_arg = body.display().to_string();
+    let args = [
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--id",
+        nid,
+        "--body-file",
+        body_arg.as_str(),
+        "--request-id",
+        rid,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    let (ok, v) = run_json(&args);
+    assert!(ok, "{v}");
+    assert_eq!(v["id"], nid);
+    let path = root.join(v["path"].as_str().unwrap());
+    assert!(path.exists(), "note not written at the forced id");
+    assert_eq!(path, root.join(format!("people/{PERSON}/notes/{nid}.md")));
+    assert_eq!(commits(root), 2);
+
+    let (ok, v) = run_json(&args);
+    assert!(ok, "{v}");
+    assert_eq!(v["idempotent"], true, "{v}");
+    assert_eq!(commits(root), 2, "idempotent retry must not commit again");
+}
+
+#[test]
+fn note_add_refuses_a_forced_id_that_already_exists() {
+    // A stale or hand-edited manifest must not silently overwrite a note:
+    // a forced id that already exists, with a request id that never
+    // committed it, refuses and writes nothing.
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "First body.\n").unwrap();
+    let nid = "n-01M3TC5H00MPJG002NAM000005";
+    let body_arg = body.display().to_string();
+    let (ok, v) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--id",
+        nid,
+        "--body-file",
+        body_arg.as_str(),
+        "--request-id",
+        "01M3TC5H00MPJG005VQC00000B",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(commits(root), 2);
+
+    std::fs::write(&body, "Second body.\n").unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--id",
+        nid,
+        "--body-file",
+        body_arg.as_str(),
+        "--request-id",
+        "01M3TC5H00MPJG005VQC00000C",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
+    assert_eq!(commits(root), 2, "nothing committed");
+    let text =
+        std::fs::read_to_string(root.join(format!("people/{PERSON}/notes/{nid}.md"))).unwrap();
+    assert!(
+        text.contains("First body."),
+        "the existing note must be intact"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -742,6 +742,11 @@ enum NoteAction {
         /// Mark this note no-ai.
         #[arg(long)]
         no_ai: bool,
+        /// Force the note id (`n-<ULID>`) instead of minting one. Used by
+        /// the TUI apply so the reviewed dry-run and the commit name the
+        /// same note (#611); the id comes from the proposal manifest.
+        #[arg(long)]
+        id: Option<String>,
         /// File holding the note body.
         #[arg(long)]
         body_file: PathBuf,
@@ -1177,8 +1182,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     person,
                     date,
                     no_ai,
+                    id,
                     body_file,
-                } => cmd_note_add(&cli, &root, person, date.clone(), *no_ai, body_file),
+                } => cmd_note_add(
+                    &cli,
+                    &root,
+                    person,
+                    date.clone(),
+                    *no_ai,
+                    id.as_deref(),
+                    body_file,
+                ),
                 NoteAction::Show { id, for_edit } => cmd_note_show(&cli, &root, id, *for_edit),
                 NoteAction::Edit { id, file, edit } => {
                     cmd_note_edit(&cli, &root, id, file.as_deref(), *edit)
@@ -4323,6 +4337,35 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
             .or_default()
             .push(confidant_core::format_entry(entry));
     }
+    // #611: appending commits the whole month file (`git add`), so an
+    // unrelated uncommitted line in it would be swept into this commit.
+    // Refuse before writing anything; the dry run still previews. This is
+    // the ledger-append step of the proposal flow, which the TUI cannot
+    // check itself (it never reads the vault). Other append paths are out
+    // of this fix's scope.
+    if !cli.dry_run {
+        require_git_repo(root, cli.no_input)?;
+        for path in by_file.keys() {
+            if !confidant_core::paths::exists(root, path)? {
+                continue;
+            }
+            let rel = path.to_string_lossy();
+            let status = confidant_core::write::git(
+                root,
+                &["status", "--porcelain", "--", &rel],
+                cli.no_input,
+            )?;
+            if !status.trim().is_empty() {
+                return Err(anyhow::Error::new(
+                    DomainError::conflict(format!(
+                        "{} has uncommitted changes; appending would commit them too",
+                        path.display()
+                    ))
+                    .with_fix("Commit, stash, or discard your changes to that file, then retry"),
+                ));
+            }
+        }
+    }
     let total = entries.len();
     let lines: Vec<String> = by_file.values().flatten().cloned().collect();
     let changes: Vec<FileChange> = by_file
@@ -4357,6 +4400,7 @@ fn cmd_note_add(
     person_raw: &str,
     date_raw: Option<String>,
     no_ai: bool,
+    forced_id: Option<&str>,
     body_file: &Path,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
@@ -4370,8 +4414,14 @@ fn cmd_note_add(
         )))
     })?;
 
-    let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
-        .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
+    // #611: the TUI passes the manifest's own note id so the reviewed
+    // dry-run and the commit name the same note. Without `--id` the id is
+    // minted here, exactly as before.
+    let nid = match forced_id {
+        Some(raw) => parse_note_id(raw, "note add")?,
+        None => RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
+            .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?,
+    };
     let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
     let mut fields = BTreeMap::from([
         ("person".to_owned(), person.id.to_string()),
@@ -4391,6 +4441,18 @@ fn cmd_note_add(
         body_start_line: 0,
         field_lines: BTreeMap::new(),
     };
+    let canonical_request = format!(
+        "note-add/v1\nperson={}\ndate={date}\nno_ai={no_ai}\nbody={body}",
+        person.id
+    );
+    // A forced id must not overwrite an existing note. A genuine retry
+    // (progress file lost after the commit) is recognized by its
+    // request-id trailer, and apply_write reports it idempotent; only an
+    // id we cannot account for refuses. A minted id is unique by
+    // construction, so this only runs for `--id`.
+    if forced_id.is_some() {
+        ensure_note_target_free(root, &rel, &nid, cli, &canonical_request)?;
+    }
     let (outcome, _) = apply_record_write(
         root,
         &vault,
@@ -4400,10 +4462,7 @@ fn cmd_note_add(
                 contents: confidant_core::format_record(&rec),
             }],
             summary: format!("note {} {nid}", person.id),
-            canonical_request: format!(
-                "note-add/v1\nperson={}\ndate={date}\nno_ai={no_ai}\nbody={body}",
-                person.id
-            ),
+            canonical_request,
         },
         &write_options(cli),
     )?;
@@ -4415,6 +4474,34 @@ fn cmd_note_add(
         extra["person"] = echo;
     }
     finish_write(cli, root, "note-add", outcome, extra)
+}
+
+/// Refuse a forced note id whose target already exists, unless this exact
+/// request already committed it (then the write pipeline reports it
+/// idempotent and never rewrites). `--id` exists for the TUI's #611
+/// dry-run→apply binding; a collision means a stale or hand-edited
+/// manifest, which must not silently overwrite a note.
+fn ensure_note_target_free(
+    root: &Path,
+    rel: &Path,
+    nid: &RecordId,
+    cli: &Cli,
+    canonical_request: &str,
+) -> anyhow::Result<()> {
+    if !confidant_core::paths::exists(root, rel)? {
+        return Ok(());
+    }
+    let opts = write_options(cli);
+    if let Some(rid) = opts.request_id.as_deref() {
+        let (id_hash, _) = confidant_core::write::idempotency_digests(rid, canonical_request);
+        if confidant_core::write::find_request_commit(root, &id_hash, opts.no_input)?.is_some() {
+            return Ok(());
+        }
+    }
+    Err(anyhow::Error::new(
+        DomainError::already_exists(format!("note {nid} already exists at {}", rel.display()))
+            .with_fix("Pick a fresh note id, or edit the existing note with `confidant note edit`"),
+    ))
 }
 
 // ---------------------------------------------------------------------------

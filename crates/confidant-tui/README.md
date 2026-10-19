@@ -23,6 +23,13 @@ It consumes only the ADR-7 CLI JSON contract
 directly and deliberately never links `confidant-core` or
 `confidant-crypt`, so it stays the second consumer of that contract.
 
+Review is bound to what it shows: a proposal step's dry-run pins the bytes
+of the manifest file it reviewed (the ledger `lines_file` or a note's
+`body_file`), and the confirm refuses if that file changed, if the target
+ledger file has unrelated uncommitted changes, or if the note id the
+preview named is no longer free. A refusal writes nothing and leaves the
+proposal as it was.
+
 ## Keys
 
 `j`/`k` move, `g`/`G` jump to the first/last row, `Tab` cycles the views
