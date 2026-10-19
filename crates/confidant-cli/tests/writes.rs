@@ -15,6 +15,8 @@ fn demo() -> PathBuf {
 }
 
 const PERSON: &str = "p-01J9Z3K4QF0000000000000000";
+const PERSON2: &str = "p-01J9Z3K4QF0000000000000002";
+const IXN: &str = "i-01J9Z3K4QF0000000000000003";
 const PKG: &str = "pkg-01J9Z3K4QF0000000000000000";
 
 /// A minimal git-backed vault with one person holding a 4-session package.
@@ -555,6 +557,169 @@ fn record_add_deal_and_dry_run() {
         .join("deals/d-01J9Z3K4QF0000000000000002/deal.md")
         .exists());
     assert_eq!(commits(root), 1);
+}
+
+/// `record add` a plaintext person profile, so a `with:` reference exists
+/// (`check` verifies `with:` entries at write time).
+fn add_person_record(vroot: &str, id: &str, name: &str) {
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("person.md");
+    std::fs::write(
+        &file,
+        format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\nBio.\n"),
+    )
+    .unwrap();
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        vroot,
+    ]);
+    assert!(ok, "{v}");
+}
+
+/// `record add` an interaction record from markdown text.
+fn add_interaction(vroot: &str, text: &str) -> (bool, Value) {
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("interaction.md");
+    std::fs::write(&file, text).unwrap();
+    run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        vroot,
+    ])
+}
+
+/// The vault's `touch` ledger lines, whole lines (`ledger/2026/10.cfd`), so a
+/// test can pin exactly what the mirrored touchpoints are.
+fn touch_ledger_lines(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("ledger/2026/10.cfd"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(" touch "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #505: a primary-only interaction mirrors one `touch` for its `person:`,
+/// in the same commit as the record.
+#[test]
+fn record_add_primary_only_mirrors_one_touch() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let before = commits(root);
+    let (ok, v) = add_interaction(
+        &vroot,
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Lunch\ndate: 2026-10-06\nperson: {PERSON}\n---\n\nFake lunch.\n"
+        ),
+    );
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["touchpoints"],
+        serde_json::json!([format!("2026-10-06 touch {PERSON}")]),
+        "{v}"
+    );
+    assert_eq!(
+        commits(root),
+        before + 1,
+        "record and touch line: one commit"
+    );
+    // Whole lines: exactly one touchpoint, and no other id or argument on it.
+    assert_eq!(
+        touch_ledger_lines(root),
+        vec![format!("2026-10-06 touch {PERSON}")]
+    );
+}
+
+/// #505: a multi-person interaction mirrors the primary plus every `with:`
+/// participant, exactly once each.
+#[test]
+fn record_add_primary_and_participants_mirror_each_once() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    add_person_record(&vroot, PERSON2, "Bea Demo");
+    let (ok, v) = add_interaction(
+        &vroot,
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Dinner\ndate: 2026-10-06\nperson: {PERSON}\nwith: [{PERSON2}]\n---\n\nFake dinner.\n"
+        ),
+    );
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["touchpoints"],
+        serde_json::json!([
+            format!("2026-10-06 touch {PERSON}"),
+            format!("2026-10-06 touch {PERSON2}")
+        ]),
+        "{v}"
+    );
+    // Whole lines: the primary and the participant, exactly once each, with
+    // no other id or argument on either line.
+    assert_eq!(
+        touch_ledger_lines(root),
+        vec![
+            format!("2026-10-06 touch {PERSON}"),
+            format!("2026-10-06 touch {PERSON2}"),
+        ]
+    );
+}
+
+/// #505: logging an interaction clears a `cadence-overdue` warning — the
+/// mirrored primary touch line is what the ledger-only rule sees.
+#[test]
+fn cadence_overdue_clears_after_interaction_logged() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // Pin `as_of` and enable the personal pack, then give the person a
+    // cadence with no contact on record.
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\", \"personal@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(format!("people/{PERSON}/profile.md")),
+        format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\ncadence: 30d\n---\n\nTest bio.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "personal cadence"]);
+
+    let (_, before) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(
+        finding_codes(&before).contains(&"W_CADENCE_OVERDUE".to_owned()),
+        "the warning must fire before contact: {before}"
+    );
+
+    let (ok, added) = add_interaction(
+        &vroot,
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Coffee\ndate: 2026-10-06\nperson: {PERSON}\n---\n\nFake coffee.\n"
+        ),
+    );
+    assert!(ok, "{added}");
+
+    let (ok, after) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{after}");
+    assert!(
+        !finding_codes(&after).contains(&"W_CADENCE_OVERDUE".to_owned()),
+        "the mirrored primary touch must clear the warning: {after}"
+    );
 }
 
 #[test]
