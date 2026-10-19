@@ -17,7 +17,7 @@ mod record_decrypt;
 mod record_resolve;
 mod setup;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(not(feature = "test-overrides"))]
 use std::io::IsTerminal;
 use std::io::{self, Write};
@@ -1545,6 +1545,18 @@ fn cmd_pack_add_inner(
             ))
             .with_fix("Re-run `confidant pack add` and review the report again"));
         }
+        // #612: the pack may already be listed in `confidant.toml` with no
+        // lockfile pin (a lost lock, a bad merge, a partial restore). That is
+        // the exact `E_PACK_UNKNOWN` the pre-check reports and this write
+        // repairs by writing the pin, so route it through the repairing path;
+        // the post-check still gates the commit. With no such listing the
+        // pre-check runs as usual.
+        let cfg_text = read_config_text(root)?;
+        let unpinned_listing = confidant_core::config::VaultConfig::parse(&cfg_text)
+            .map_err(anyhow::Error::new)?
+            .packs
+            .iter()
+            .any(|listed| listed == &format!("{}@{}", report.name, report.version));
         let changes = install_changes(root, &report, &files, &fetched, None)?;
         let summary = format!(
             "pack: add {}@{} ({})",
@@ -1557,7 +1569,11 @@ fn cmd_pack_add_inner(
             canonical_request: summary.clone(),
             summary,
         };
-        let outcome = apply_write(root, pending, &write_options(cli))?;
+        let outcome = if unpinned_listing {
+            apply_write_repairing(root, pending, &write_options(cli))?
+        } else {
+            apply_write(root, pending, &write_options(cli))?
+        };
         return finish_write(
             cli,
             root,
@@ -2015,8 +2031,68 @@ fn cmd_pack_verify(
     Ok(ExitCode::from(if ok { 0 } else { 1 }))
 }
 
+/// Whether `version` is safe to join into `<root>/packs/<name>@<version>`:
+/// one path segment, not `.`/`..`, portable across Windows (no `/`, `\`, `:`,
+/// or control characters). Mirrors the lockfile's own `subdir` rule so a
+/// hand-edited `confidant.toml` listing can never steer a delete out of the
+/// vendored tree.
+fn is_safe_version_part(version: &str) -> bool {
+    !version.is_empty()
+        && version != "."
+        && version != ".."
+        && !version.contains('/')
+        && !version.contains('\\')
+        && !version.contains(':')
+        && !version.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
+/// The `name@version` ids of vendored pack directories under
+/// `<root>/packs` for `name`, listed without following a symbolic link
+/// (#440). A missing `packs/` is an empty list; an unlistable one fails
+/// closed. Ids whose version is not a single safe path segment are skipped.
+fn vendored_ids_for(root: &Path, name: &str) -> anyhow::Result<Vec<String>> {
+    let listing = match confidant_core::paths::read_dir(root, Path::new("packs")) {
+        Ok(listing) => listing,
+        Err(error) => {
+            // A missing `packs/` is not an error (there is simply nothing
+            // vendored); anything else — including a planted `packs` symlink,
+            // which the no-follow reader refuses — fails closed.
+            if !confidant_core::paths::exists(root, Path::new("packs")).unwrap_or(true) {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        }
+    };
+    if let Some((entry, cause)) = listing.errors.first() {
+        return Err(anyhow::anyhow!(
+            "cannot list packs/: {}: {cause}",
+            pack_fetch::escape_line(entry)
+        ));
+    }
+    let prefix = format!("{name}@");
+    let mut ids = Vec::new();
+    for entry in listing.entries {
+        if !entry.kind.is_directory() {
+            continue;
+        }
+        let Some(version) = entry.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if is_safe_version_part(version) {
+            ids.push(format!("{name}@{version}"));
+        }
+    }
+    Ok(ids)
+}
+
 /// `pack remove <name>`: delete the vendored files, the lockfile entries and
 /// the `packs` listing. Needs `--yes`.
+///
+/// #612: the pack's install state is keyed off every source — the lockfile,
+/// the `confidant.toml` listing, and the vendored tree — not the lockfile
+/// alone. When `confidant.lock` is missing (a lost lock, a bad merge, a
+/// partial restore) the listing and the vendored directory still identify the
+/// pack, so removal is the escape `check`'s `E_PACK_UNKNOWN` fix can point at.
 fn cmd_pack_remove(
     cli: &Cli,
     vault_root: Option<&Path>,
@@ -2025,21 +2101,56 @@ fn cmd_pack_remove(
 ) -> anyhow::Result<ExitCode> {
     let root = vault_root_required(vault_root, "pack remove")?;
     let mut lock = read_lockfile_or_empty(root)?;
-    let entries: Vec<confidant_core::packs::lock::LockEntry> = lock
+    let lock_entries: Vec<confidant_core::packs::lock::LockEntry> = lock
         .packs
         .iter()
         .filter(|e| e.name == name)
         .cloned()
         .collect();
-    if entries.is_empty() {
+
+    let cfg_text = read_config_text(root)?;
+    let cfg_packs = confidant_core::config::VaultConfig::parse(&cfg_text)
+        .map_err(anyhow::Error::new)?
+        .packs;
+
+    // Well-formed `name@version` ids to delete (the vendored tree) and
+    // un-pin (the lockfile): the lock entries plus any safe listing.
+    // `drop_listings` is every `confidant.toml` entry for this name, including
+    // one that is not a well-formed id (a bare `example-pack`), so a malformed
+    // listing is repaired too.
+    let mut ids: BTreeSet<String> = lock_entries.iter().map(|e| e.id()).collect();
+    let mut drop_listings: BTreeSet<String> = BTreeSet::new();
+    for listed in &cfg_packs {
+        let matches_name = listed == &name
+            || listed
+                .split_once('@')
+                .is_some_and(|(listed_name, _)| listed_name == name);
+        if !matches_name {
+            continue;
+        }
+        drop_listings.insert(listed.clone());
+        if let Some((_, version)) = listed.split_once('@') {
+            if is_safe_version_part(version) {
+                ids.insert(listed.clone());
+            }
+        }
+    }
+    // The vendored tree is the last resort: only when neither the lockfile nor
+    // the listing names the pack (a listing hand-edited away, a partial
+    // restore) is it consulted. A healthy removal keeps its prior behaviour.
+    if lock_entries.is_empty() && drop_listings.is_empty() {
+        ids.extend(vendored_ids_for(root, &name)?);
+    }
+    if ids.is_empty() && drop_listings.is_empty() {
         return Err(anyhow::Error::new(DomainError::not_found(format!(
             "pack '{name}' is not installed"
         )))
         .with_fix("Run `confidant pack list` to see installed packs"));
     }
-    let listed: Vec<String> = entries
+    let listed: Vec<String> = ids
         .iter()
-        .map(|e| format!("{}@{}", e.name, e.version))
+        .chain(drop_listings.iter().filter(|l| !ids.contains(*l)))
+        .cloned()
         .collect();
 
     if !yes {
@@ -2055,7 +2166,7 @@ fn cmd_pack_remove(
         } else {
             println!("would remove (pass --yes to apply):");
             for id in &listed {
-                // A hand-edited lockfile id must not be able to hide itself.
+                // A hand-edited lockfile or listing id must not hide itself.
                 println!("  {}", pack_fetch::escape_line(id));
             }
         }
@@ -2063,20 +2174,26 @@ fn cmd_pack_remove(
     }
 
     let mut changes = Vec::new();
-    for entry in &entries {
-        changes.extend(delete_vendored_changes(root, &entry.name, &entry.version)?);
-        lock.remove(&entry.name, &entry.version);
+    for id in &ids {
+        // Ids are always `name@version` (the lockfile's id, or a validated
+        // listing / vendored name); the name half carries no `@`.
+        let (id_name, id_version) = id.split_once('@').expect("ids are name@version");
+        changes.extend(delete_vendored_changes(root, id_name, id_version)?);
+        lock.remove(id_name, id_version);
     }
-    changes.push(FileChange::WriteFile {
-        path: PathBuf::from("confidant.lock"),
-        contents: lock.to_toml(),
-    });
-    let cfg_text = read_config_text(root)?;
-    let mut packs = confidant_core::config::VaultConfig::parse(&cfg_text)
-        .map_err(anyhow::Error::new)?
-        .packs;
-    let removed: std::collections::HashSet<&String> = listed.iter().collect();
-    packs.retain(|p| !removed.contains(p));
+    // A lockfile that is absent stays absent: removing the last pin must not
+    // conjure an empty `confidant.lock` (a vault with no external packs has
+    // no lockfile).
+    let lock_exists =
+        confidant_core::paths::exists(root, Path::new("confidant.lock")).unwrap_or(true);
+    if lock_exists {
+        changes.push(FileChange::WriteFile {
+            path: PathBuf::from("confidant.lock"),
+            contents: lock.to_toml(),
+        });
+    }
+    let mut packs = cfg_packs;
+    packs.retain(|p| !drop_listings.contains(p));
     changes.push(FileChange::WriteFile {
         path: PathBuf::from("confidant.toml"),
         contents: confidant_core::config::VaultConfig::set_packs(&cfg_text, &packs)
@@ -2089,10 +2206,21 @@ fn cmd_pack_remove(
         canonical_request: summary.clone(),
         summary,
     };
-    let outcome = apply_write(root, pending, &write_options(cli))?;
+    // #612: with no lockfile entry for this pack the pre-check reports exactly
+    // the `E_PACK_UNKNOWN` this removal repairs, so the write goes through the
+    // repairing path. Its post-check still gates the commit, so a removal can
+    // never commit a vault that is still broken. With a lock entry the
+    // pre-check runs as usual.
+    let outcome = if lock_entries.is_empty() {
+        apply_write_repairing(root, pending, &write_options(cli))?
+    } else {
+        apply_write(root, pending, &write_options(cli))?
+    };
     if matches!(outcome, WriteOutcome::Applied { .. }) {
-        for entry in &entries {
-            let _ = std::fs::remove_dir(root.join(vendored_rel(&entry.name, &entry.version)));
+        for id in &ids {
+            if let Some((id_name, id_version)) = id.split_once('@') {
+                let _ = std::fs::remove_dir(root.join(vendored_rel(id_name, id_version)));
+            }
         }
     }
     finish_write(

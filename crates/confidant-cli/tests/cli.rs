@@ -2663,6 +2663,194 @@ fn pack_remove_yes_deletes_files_lock_and_entry() {
     assert_eq!(v["ok"], true, "{v}");
 }
 
+/// Drop `confidant.lock` and commit the deletion, producing the #612 state:
+/// the pack is still listed in `confidant.toml` and vendored, but unpinned.
+#[cfg(unix)]
+fn drop_lock(vault: &Path) {
+    git(vault, &["rm", "-q", "confidant.lock"]);
+    git(
+        vault,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "drop lock",
+        ],
+    );
+}
+
+/// #612: a missing `confidant.lock` with the pack still listed used to have
+/// no working CLI repair — every command `check` named refused. `pack remove`
+/// now keys off the `confidant.toml` listing (and the vendored tree), so the
+/// recovery the fix names works and leaves a clean vault.
+#[cfg(unix)]
+#[test]
+fn pack_remove_recovers_a_missing_lock() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    drop_lock(vault.path());
+
+    // The state is real: `check` fails `E_PACK_UNKNOWN`, and its fix names the
+    // recovery commands.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let finding = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "E_PACK_UNKNOWN")
+        .expect("E_PACK_UNKNOWN");
+    let fix = finding["fix"].as_str().unwrap();
+    assert!(fix.contains("confidant pack remove"), "{fix}");
+    assert!(fix.contains("confidant pack add"), "{fix}");
+
+    // The removal command the fix names works: the vendored tree and the
+    // listing go, and the absent lock stays absent.
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    assert!(!vault.path().join("confidant.lock").exists());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
+    assert!(cfg.contains("# keep this comment above packs"), "{cfg}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #612: the other recovery `check` names — `pack add --yes` re-pins the
+/// listed pack. The unpinned listing is an `E_PACK_UNKNOWN` to the pre-check,
+/// so the add goes through the repairing write path; the post-check still
+/// gates the commit.
+#[cfg(unix)]
+#[test]
+fn pack_add_repins_a_missing_lock() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    let original_lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    drop_lock(vault.path());
+
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert!(out.status.success(), "{out:?}");
+    // The pin is restored, and the read-only check is clean again.
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap(),
+        original_lock
+    );
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #612: removal is keyed off the listing even when the vendored tree is
+/// gone too (a partial restore), so a listed-but-unpinned-and-unvendored pack
+/// is still removable.
+#[cfg(unix)]
+#[test]
+fn pack_remove_recovers_when_only_the_listing_remains() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    git(vault.path(), &["rm", "-r", "-q", "confidant.lock", "packs"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "lose lock and vendored tree",
+        ],
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #612: when neither the lockfile nor the listing names the pack, the
+/// vendored tree is the last resort — removal still cleans it up.
+#[cfg(unix)]
+#[test]
+fn pack_remove_falls_back_to_the_vendored_tree() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    unlist_pack(vault.path(), "example-pack@0.1");
+    git(vault.path(), &["rm", "-q", "confidant.lock"]);
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "lose lock and listing",
+        ],
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_list_and_verify_report_tampering() {

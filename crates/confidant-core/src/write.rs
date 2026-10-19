@@ -284,9 +284,9 @@ pub fn apply_write(
 /// change, every touched file is rolled back and the outcome is
 /// [`WriteOutcome::CheckBlocked`], so this can never commit into a vault
 /// that is still broken. Use it only when the write repairs the exact
-/// problem the pre-check reports. `pack update` is the one caller: a stale
-/// `confidant.lock` hash makes the pre-check report `E_PACK_HASH` for the
-/// pin the pending write rewrites (#606).
+/// problem the pre-check reports. Callers: `pack update` for a stale
+/// `confidant.lock` hash (#606), and `pack add`/`pack remove` for a listed
+/// pack with no pin (#612).
 pub fn apply_write_repairing(
     root: &Path,
     pending: PendingWrite,
