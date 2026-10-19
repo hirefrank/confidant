@@ -364,7 +364,7 @@ git -C "$NEW_VAULT" remote -v
 git -C "$NEW_VAULT" log --oneline -3
 # only commits made in the new vault; no old-vault history
 
-grep -R "$OLD_VAULT" "$HOME/.config/confidant" \
+grep -R "$OLD_VAULT" "$HOME/.config/confidant" 2>/dev/null \
   || echo "no old vault path in config"
 
 printf '%s\n' "${CONFIDANT_VAULT:-}"   # the new path, not the old one
@@ -387,6 +387,9 @@ secret-tool lookup service confidant-inbox username inbox-key >/dev/null \
   && echo "inbox key still present" \
   || echo "no inbox key in the keychain"
 ```
+
+On macOS the equivalent check is
+`security find-generic-password -s confidant-inbox -a inbox-key >/dev/null`.
 
 Finally, if you added coaching, confirm the pack is installed and pinned:
 
