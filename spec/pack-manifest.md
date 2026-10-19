@@ -447,6 +447,7 @@ requires_spec = ["0.1"]
 - `[pack].requires_spec`: required in v2, absent in v1. Non-empty list
   of exact spec version strings.
 - `[[rules]]`: the declarative checks (§13.2). Absent in v1.
+- `[context]`: the opt-in `context` view (§13.9). Absent in v1.
 - Everything else (§4) is unchanged: `record_types`, `balance_metrics`,
   `finding_codes`, `[pack]` name/version/skill, `[[verbs]]`,
   `[[fields]]`, `[[edge_kinds]]`, `[checks]`, `[messages]`.
@@ -1080,8 +1081,9 @@ compiled path stays (R1 in #504):
 
 - `context_view`: compiled coaching serves the per-person
   `sessions_remaining` / `icf_hours` / `recent_sessions` view
-  (`packs/coaching.rs`). External packs are check-only (PD16); core owns
-  no declarative replacement. This is the **only** genuinely
+  (`packs/coaching.rs`). External packs are check-only by default
+  (PD16); §13.9 adds the opt-in `[context]` view for exactly this shape,
+  and core owns the builder. This is the **only** genuinely
   compiled-only behaviour.
 
 An earlier version of this section listed three hooks. Two of them are
@@ -1109,9 +1111,10 @@ add no blocker; the reasoning is in the #594 proposal comment
 
 Criteria for removing the compiled path, all in one change:
 
-1. Core owns `context_view`, or it has a declared, reviewed home. The
-   PII-field and verb-argument hooks are already core-owned or shared
-   (above), so they add no blocker.
+1. Core owns `context_view`, or it has a declared, reviewed home
+   (§13.9 is that home for `ledger-sessions`). The PII-field and
+   verb-argument hooks are already core-owned or shared (above), so they
+   add no blocker.
 2. The parity and CLI tests are green against the *final* `coaching` pack
    (the fixture is renamed to `coaching` only then).
 3. `coaching` is dropped from `RESERVED_PACK_NAMES`, the hard-coded
@@ -1122,3 +1125,82 @@ Until all three hold, the reservation and the compiled path stay (PD14:
 compiled wins on equal `name@version`). **Removing the compiled coaching
 path needs Frank's explicit OK**; #504 records the sequencing and the
 core-ownership scope, and #449 tracks the switch.
+
+### 13.9. Context views (`[context]`, v2, opt-in)
+
+*A PD16 amendment (AGENTS.md rule 7) that needs Frank's explicit OK. It
+narrows PD16 for a pack that declares `[context]`; it is additive, so a
+pack without `[context]` is unchanged.*
+
+An external pack may declare one `[context]` table to serve a `context`
+view. The manifest **names** a core-implemented view; core owns the
+builder, exactly as `[[rules]]` names a core rule kind (PD1). Declaring
+`[context]` is optional: **a pack without it serves no view, exactly as
+today**, and stays check-only (PD16).
+
+```toml
+[context]
+view = "ledger-sessions"   # the only view today (fixed list)
+recent_limit = 10          # optional; default 10
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `view` | string | One of the fixed view list below. An unknown value is `E_PACK_INVALID`. |
+| `recent_limit` | integer, optional | How many recent sessions `recent_sessions` keeps. Default 10; zero or a negative value is `E_PACK_INVALID`. Omitting the key keeps the default, so the view has no way to ask for an empty list. |
+
+**The fixed view list.** This spec starts with one:
+
+| View | Spec issue | Reproduces |
+|---|---|---|
+| `ledger-sessions` | #594 | `coaching@0.1`'s per-person `sessions_remaining` / `icf_hours` / `recent_sessions` view (`packs/coaching.rs`) |
+
+`ledger-sessions` resolves its parameters from the pack's
+`ledger-balance` rule (§13.2): `open_verb` and `consume_verb` select the
+ledger lines, `units_metric` is the units count and `minutes_metric` the
+hours. The loader refuses the pack (`E_PACK_INVALID`) when:
+
+- `[context].view` is not in the fixed list;
+- a `ledger-sessions` pack does not have exactly one `ledger-balance`
+  rule (the view needs one to resolve its verbs and metrics).
+
+The view is built from **derived ledger metadata only**: verbs, dates,
+opaque ids, the pack's own balance metrics, and session duration and
+billing-tag tokens. It reads no record field, note body, profile, private
+field, or decrypted content. The pack thus gains no way to inject PII or
+widen the §12 allowlist: the view is core's JSON in core's fixed shape —
+core fixes which slots appear, their key names and their types, and the
+compiled path and any `[context]` pack emit the same ones — with the
+same validation the compiled path has today. Its keys are
+`sessions_remaining` (integer), `icf_hours` (decimal hours, in
+hundredths) and `recent_sessions` — the pack's `consume_verb` entries
+for the canonical person, newest first, truncated to `recent_limit`, each
+`{date, duration_minutes, tag}` with `tag` the first of `paid`, `pps`,
+`comp`. The pack's `units_metric` and `minutes_metric` parameters choose
+which of its declared balance metrics fill the units and hours slots;
+they do not name the keys, so the compiled shape
+(`sessions_remaining`, `icf_hours`, `recent_sessions`) is reproduced
+exactly.
+`private_context_fields` and the `--exclude-private` list stay
+core-owned (#510), so `--exclude-private` is a no-op on this view, and
+`context`'s contract is unchanged for a pack without `[context]`. A
+future view that wanted record fields would need its own reviewed
+`private_fields` key and a `no-ai` deny-by-default allowlist; that is not
+this section.
+
+**The PD16 amendment.** `spec/0.1.md` §8 states that external packs
+affect `check` only. Under this section a pack that declares `[context]`
+also affects `context`, **strictly scoped to the derived ledger metadata
+above** — no content, no private fields, no decrypted content, and no
+widening of the §12 allowlist. The rationale is ADR-7: the compiled
+coaching view is live agent contract that `context`, MCP, the CLI and the
+TUI read today, and it is ledger metadata, not content. Naming a
+core-owned builder keeps PD16's purpose — an external pack cannot reach
+record content — while letting an external `coaching` pack serve the same
+narrow read surface. A pack without `[context]` is check-only, as before.
+
+**Parity.** While both paths exist, a core test builds this view from the
+compiled `CoachingPack` and from the core builder over
+`examples/demo-vault` and the three golden vaults and asserts structural
+equality (keys, ordering, values), mirroring #592's parity harness. The
+golden `check` JSON files record findings and are **not** edited.
