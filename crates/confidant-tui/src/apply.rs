@@ -584,8 +584,10 @@ pub enum StepApplyOutcome {
     CheckBlocked { report: CheckReport },
 }
 
-/// Lowercase hex SHA-256 of `bytes`, for the #611 source pin.
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`, for the #611 source pin. Also used by
+/// the new-person capture to bind its confirm to the reviewed staged bytes
+/// (#621).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hasher

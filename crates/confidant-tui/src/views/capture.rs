@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::capture::{Capture, FieldKind};
+use crate::capture::{Capture, CaptureKind, FieldKind};
 use crate::theme;
 use crate::theme::palette;
 
@@ -31,13 +31,22 @@ pub fn render_form(capture: &Capture, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(ratatui::widgets::Clear, modal);
 
     let mut lines = Vec::new();
-    let name = capture.person_name.clone().unwrap_or_default();
-    lines.push(Line::from(vec![
-        theme::label("person "),
-        theme::pill(&capture.person_id),
-        Span::raw(" "),
-        Span::styled(name, theme::muted()),
-    ]));
+    if capture.kind == CaptureKind::NewPerson {
+        // A new person has no selected row and no name yet; the minted id is
+        // shown so the operator can recognise it in the preview and later.
+        lines.push(Line::from(vec![
+            theme::label("new person "),
+            theme::pill(&capture.person_id),
+        ]));
+    } else {
+        let name = capture.person_name.clone().unwrap_or_default();
+        lines.push(Line::from(vec![
+            theme::label("person "),
+            theme::pill(&capture.person_id),
+            Span::raw(" "),
+            Span::styled(name, theme::muted()),
+        ]));
+    }
     lines.push(Line::from(""));
 
     for (index, field) in capture.fields.iter().enumerate() {

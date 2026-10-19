@@ -17,6 +17,7 @@ use crate::contract::{
     FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
 };
 use crate::edit::{self, EditFlow, EditPhase};
+use crate::ids;
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
 use crate::search::{filter_search_result, find_result_to_search, SearchViewState};
@@ -1392,6 +1393,37 @@ impl<R: Runner> App<R> {
         self.capture = Some(Capture::new(kind, id, name));
     }
 
+    /// `a` (#621): open the new-person form, minting the `p-<ULID>` the CLI
+    /// requires in the record's front matter. Nothing is written and no
+    /// person is selected: this is the one capture that starts from an empty
+    /// form. A pending write (another capture, an edit confirm, or a proposal
+    /// modal) keeps the keyboard, so this is only reachable at browse level;
+    /// the guard below also makes a programmatic call a safe no-op.
+    pub fn begin_new_person(&mut self) {
+        if self.capture.is_some() {
+            return;
+        }
+        let id = match ids::new_person_id() {
+            Ok(id) => id,
+            Err(e) => {
+                self.alert = Some(AlertState {
+                    title: "Cannot Mint a Person ID".to_owned(),
+                    code: Some("id_mint_failed".to_owned()),
+                    message: format!("could not mint a ULID for the new person: {e:#}"),
+                    fix: Some(
+                        "Retry; if it persists, check the system clock and available entropy"
+                            .to_owned(),
+                    ),
+                    blocking: false,
+                    raw: None,
+                });
+                return;
+            }
+        };
+        self.alert = None;
+        self.capture = Some(Capture::new(CaptureKind::NewPerson, id, None));
+    }
+
     /// Run each capture source that is cheap to know up front so the Review
     /// Queue badge is populated from launch: the proposal manifests from disk,
     /// and the inbox dry run. Conflicts are derived from the check report
@@ -1494,21 +1526,43 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Stage the note body (for `note add --body-file`), then run the CLI's
-    /// `--dry-run` preview. Nothing is written to the vault.
+    /// Stage the input a file-backed write needs (a note body for
+    /// `note add --body-file`, or a composed record for `record add --file`),
+    /// then run the CLI's `--dry-run` preview. Nothing is written to the
+    /// vault.
     fn capture_begin_preview(&mut self) {
-        let Some(capture) = self.capture.as_ref() else {
+        let Some(kind) = self.capture.as_ref().map(|capture| capture.kind) else {
             return;
         };
-        if let Some(label) = capture.first_missing() {
+        let missing = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.first_missing());
+        if let Some(label) = missing {
             self.set_capture_error(format!("{label} is required"));
             return;
         }
+        // A new preview invalidates any earlier pin: if staging or the CLI
+        // fails from here, a confirm must not be able to reuse a stale hash.
+        if let Some(capture) = self.capture.as_mut() {
+            capture.reviewed_hash = None;
+        }
 
-        // Only `note add` needs a file; the inline surfaces (session/touch)
-        // pass their note as an argument.
+        // Only the file-backed surfaces need a scratch; the inline surfaces
+        // (session/touch) pass their note as an argument.
         let mut scratch_arg: Option<String> = None;
-        if capture.kind == CaptureKind::Note {
+        if kind.stages_scratch() {
+            let (person_id, staged) = {
+                let Some(capture) = self.capture.as_ref() else {
+                    return;
+                };
+                let staged = match kind {
+                    CaptureKind::Note => capture.value(FieldId::Body).to_owned(),
+                    CaptureKind::NewPerson => capture.compose_record(),
+                    _ => unreachable!("stages_scratch covers only the file surfaces"),
+                };
+                (capture.person_id.clone(), staged)
+            };
             let Some(root) = resolve_vault_root(self.vault_root_override.as_deref()) else {
                 self.set_capture_error(
                     "no vault found: pass --vault or set CONFIDANT_VAULT".to_owned(),
@@ -1517,21 +1571,24 @@ impl<R: Runner> App<R> {
             };
             if !self.scratch_is_gitignored(&root) {
                 self.set_capture_error(
-                    "`.confidant/` is not git-ignored in this vault, so the note scratch could be committed"
+                    "`.confidant/` is not git-ignored in this vault, so the scratch could be committed"
                         .to_owned(),
                 );
                 return;
             }
-            let Some(path) = capture::scratch_path(&root, &capture.person_id) else {
-                self.set_capture_error(format!("{} is not a usable person id", capture.person_id));
+            let Some(path) = capture::scratch_path(&root, &person_id) else {
+                self.set_capture_error(format!("{person_id} is not a usable person id"));
                 return;
             };
-            if let Err(e) = edit::write_scratch(&path, capture.value(FieldId::Body)) {
-                self.set_capture_error(format!("cannot stage the note scratch: {e:#}"));
+            if let Err(e) = edit::write_scratch(&path, &staged) {
+                self.set_capture_error(format!("cannot stage the scratch: {e:#}"));
                 return;
             }
             if let Some(capture) = self.capture.as_mut() {
                 capture.scratch = Some(path.clone());
+                // Pin the bytes this preview reviews (#611/#618): a confirm
+                // re-reads the scratch and refuses if it changed.
+                capture.reviewed_hash = Some(crate::apply::sha256_hex(staged.as_bytes()));
             }
             scratch_arg = path.to_str().map(str::to_owned);
         }
@@ -1549,19 +1606,34 @@ impl<R: Runner> App<R> {
                 }
             }
             Ok(WriteOutcome::CliError { code, message, fix }) => {
+                self.clear_preview_scratch();
                 self.set_capture_error(cli_error_message(&code, &message, fix.as_deref()));
             }
             Ok(WriteOutcome::CheckBlocked { .. }) => {
+                self.clear_preview_scratch();
                 self.set_capture_error(
                     "check blocked the preview; fix the findings, then retry".to_owned(),
                 );
             }
             Ok(other) => {
+                self.clear_preview_scratch();
                 self.set_capture_error(format!("unexpected preview outcome: {other:?}"));
             }
             Err(e) => {
+                self.clear_preview_scratch();
                 self.set_capture_error(format!("could not run confidant: {e:#}"));
             }
+        }
+    }
+
+    /// A failed preview wrote nothing: sweep any staged plaintext and clear
+    /// the review pin so the form stays open with nothing left on disk.
+    fn clear_preview_scratch(&mut self) {
+        if let Some(capture) = self.capture.as_mut() {
+            if let Some(path) = capture.scratch.take() {
+                edit::remove_scratch(&path);
+            }
+            capture.reviewed_hash = None;
         }
     }
 
@@ -1571,14 +1643,37 @@ impl<R: Runner> App<R> {
         let Some(capture) = self.capture.take() else {
             return;
         };
+        let kind = capture.kind;
+        // #611/#618: the review is bound to what it showed. A file-backed
+        // write (a note body, a composed person) staged plaintext for the
+        // preview and the CLI re-reads that file now; if anything changed it
+        // since the dry-run, refuse instead of committing bytes the operator
+        // never saw. (The inline surfaces have no scratch and no pin.)
+        if let (Some(expected), Some(path)) = (&capture.reviewed_hash, &capture.scratch) {
+            let unchanged = std::fs::read(path)
+                .map(|bytes| crate::apply::sha256_hex(&bytes) == *expected)
+                .unwrap_or(false);
+            if !unchanged {
+                edit::remove_scratch(path);
+                self.alert = Some(AlertState {
+                    title: "Record Changed After Preview".to_owned(),
+                    code: Some("source_changed".to_owned()),
+                    message: "the staged record changed after the dry-run you reviewed; nothing was written"
+                        .to_owned(),
+                    fix: Some("Open the form again and review the new preview, then confirm".to_owned()),
+                    blocking: false,
+                    raw: None,
+                });
+                return;
+            }
+        }
         let scratch_arg = capture
             .scratch
             .as_ref()
             .and_then(|path| path.to_str())
             .map(str::to_owned);
         let argv = capture.argv(scratch_arg.as_deref());
-        let kind = capture.kind;
-        // Run first: for a note the CLI reads `--body-file` during the write.
+        // Run first: the CLI reads `--body-file` / `--file` during the write.
         let outcome = crate::apply::run_write_step(&self.runner, &argv, false);
         if let Some(path) = &capture.scratch {
             edit::remove_scratch(path);
@@ -1647,7 +1742,8 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Cancel the pending capture: remove the note scratch, write nothing.
+    /// Cancel the pending capture: remove the staged scratch (a note body or
+    /// a composed new person), write nothing.
     fn cancel_capture(&mut self) {
         if let Some(capture) = self.capture.take() {
             if let Some(path) = &capture.scratch {
@@ -2209,6 +2305,24 @@ impl<R: Runner> App<R> {
             }
             "search.query" => self.enter_search(),
             "search.open" => self.switch_to(ActiveView::Search),
+            // #621: the same guard as the `a` key — composing a person is a
+            // People/Context action, so the palette cannot start it from a
+            // view where the operator cannot see the roster/context.
+            "person.new" => {
+                if matches!(self.active_view, ActiveView::People | ActiveView::Context) {
+                    self.begin_new_person();
+                } else {
+                    self.alert = Some(AlertState {
+                        title: "New Person Needs People".to_owned(),
+                        code: Some("new_person_needs_people".to_owned()),
+                        message: "composing a new person works from People or the Context view"
+                            .to_owned(),
+                        fix: Some("switch to People (1), then retry".to_owned()),
+                        blocking: false,
+                        raw: None,
+                    });
+                }
+            }
             "capture.session" => self.begin_capture(CaptureKind::Session),
             "capture.touch" => self.begin_capture(CaptureKind::Touch),
             "capture.note" => self.begin_capture(CaptureKind::Note),
@@ -2284,6 +2398,14 @@ impl<R: Runner> App<R> {
             }
             KeyCode::Char('n') => {
                 self.begin_capture(CaptureKind::Note);
+                true
+            }
+            // #621: compose a new person from People or the full-screen
+            // Context view. Unlike `s`/`t`/`n` it needs no selected row.
+            KeyCode::Char('a')
+                if matches!(self.active_view, ActiveView::People | ActiveView::Context) =>
+            {
+                self.begin_new_person();
                 true
             }
             KeyCode::Char('d') => {

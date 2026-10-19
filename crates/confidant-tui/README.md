@@ -35,11 +35,11 @@ proposal as it was.
 `j`/`k` move, `g`/`G` jump to the first/last row, `Tab` cycles the views
 inside a workspace, `/` filters People (or starts a query), `Enter` opens,
 `r` refreshes, and `q` quits. `s`/`t`/`n` open the session, touch, and
-note capture forms; `[`/`]` pick the context item `e` edits; and `!`
-toggles operator mode (`--for-operator`). Every write needs an explicit `y`
-after a preview (the CLI's `--dry-run`, or both sides for a conflict);
-`Esc` clears a filter or goes back, and at the People home it does not
-quit.
+note capture forms, and `a` composes a new person; `[`/`]` pick the
+context item `e` edits; and `!` toggles operator mode (`--for-operator`).
+Every write needs an explicit `y` after a preview (the CLI's `--dry-run`,
+or both sides for a conflict); `Esc` clears a filter or goes back, and at
+the People home it does not quit.
 
 ## Install
 

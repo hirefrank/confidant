@@ -13,6 +13,7 @@ pub mod apply;
 pub mod capture;
 pub mod contract;
 pub mod edit;
+pub mod ids;
 pub mod proposals;
 pub mod runner;
 pub mod search;
