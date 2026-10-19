@@ -582,6 +582,18 @@ vault-wide keypair:
   this, re-adding a retired recovery key as a device would re-wrap the
   vault's remaining keys to a key that still opens a shredded client's
   history.
+- `confidant keys verify-recovery` is the read-only check for a saved
+  copy (#663). It compares both pinned recovery halves in `trust.toml`
+  (never falling back to `keys/` when an anchor exists), verifies
+  `keys/operator.toml` against the phrase, and trial-unwraps the
+  current-epoch `wrapped/recovery.age` of every initialized client
+  except the device-only `vault:lookup` key. It writes nothing and never
+  prints words, word positions, derived keys, or fingerprints; a
+  malformed phrase's position hint goes to stderr only. It reports a
+  retired phrase distinctly (the derived recipient is in
+  `recovery-recipients.toml` but is not the anchor's current one) with
+  the same shred guidance: destroy that copy, because it still opens
+  history. CLI-only: no MCP tool, no skill-driven phrase piping.
 
 ## 10. Alias HMAC
 
