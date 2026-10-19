@@ -24,6 +24,11 @@ use, in files you can read. Underneath, a ledger of dated facts
 New here? Start with [Agent setup](#agent-setup) for the one-prompt
 install, or [Quickstart](#quickstart) to try the fake-data demo vault.
 
+Starting over, or adopting Confidant in stages? See
+[Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
+relationships first (`personal@0.2` is built in), coaching clients later,
+in the same vault.
+
 ## Install
 
 **The easiest path:** paste the one-prompt install from
