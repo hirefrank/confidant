@@ -7,9 +7,10 @@ of skill proposals, QMD-backed search, and inbox review.
 ## Operator layout
 
 The screen is a three-workspace bar: **1 People & Search** (the default
-master–detail view), **2 Review Queue** (Proposals, Inbox, and Conflicts;
-they move under one queue in a later phase), and **3 Check**. `d` opens
-Doctor, `p` shows the resolved scope, and `?` shows the keymap.
+master–detail view), **2 Review Queue** (Proposals, Inbox, and Conflicts,
+with a pending-count badge), and **3 Check**. `d` opens Doctor, `p` shows
+the resolved scope, `?` shows the grouped keymap, and `:` (or `Ctrl-P`)
+opens the command palette.
 
 People's left pane filters the cleared roster from
 `confidant record list --json` and lists `Needs Attention` nudges derived
@@ -21,6 +22,17 @@ It consumes only the ADR-7 CLI JSON contract
 (`confidant <subcommand> --json --no-input`): it never opens vault files
 directly and deliberately never links `confidant-core` or
 `confidant-crypt`, so it stays the second consumer of that contract.
+
+## Keys
+
+`j`/`k` move, `g`/`G` jump to the first/last row, `Tab` cycles the views
+inside a workspace, `/` filters People (or starts a query), `Enter` opens,
+`r` refreshes, and `q` quits. `s`/`t`/`n` open the session, touch, and
+note capture forms; `[`/`]` pick the context item `e` edits; and `!`
+toggles operator mode (`--for-operator`). Every write needs an explicit `y`
+after a preview (the CLI's `--dry-run`, or both sides for a conflict);
+`Esc` clears a filter or goes back, and at the People home it does not
+quit.
 
 ## Install
 

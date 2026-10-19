@@ -3924,3 +3924,389 @@ fn prime_review_queue_keeps_the_first_startup_alert() {
         "the inbox failure must not replace the earlier startup alert"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keymap, help modal, and command palette (TUI-v2 phase 5, #556)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_modal_is_a_grouped_keymap_with_operator_and_selection_calls() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    let before = app.runner.recorded_calls().len();
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.info_modal.is_some(), "help modal open");
+    let help = render_to_string(&app);
+    for needle in [
+        "Help",
+        "Workspaces",
+        "People & Search",
+        "Review Queue",
+        "Check",
+        "Anywhere",
+        "g/G first/last",
+        "Tab/Shift-Tab",
+        "context: j/k scroll",
+        "[ / ] select the context item",
+        "e edit it",
+        "! operator mode",
+        ": or Ctrl-P palette",
+        "Enter never writes; y confirms after a preview",
+        "at the People home it does not quit",
+    ] {
+        assert!(help.contains(needle), "missing {needle:?} in:\n{help}");
+    }
+    assert_eq!(app.runner.recorded_calls().len(), before, "no CLI call");
+}
+
+#[test]
+fn help_keymap_snapshot() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('?')));
+    assert_snapshot("help_keymap.snap", &render_to_string(&app));
+}
+
+#[test]
+fn command_palette_filters_and_runs_a_read_only_action() {
+    let fake = people_runner().with_response("doctor", 0, doctor_ok_json());
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char(':')));
+    assert!(app.palette.is_some(), ": opens the palette");
+    type_text(&mut app, "doctor");
+    let state = app.palette.as_ref().expect("palette open");
+    assert!(
+        state
+            .matches()
+            .iter()
+            .any(|entry| entry.id == "view.doctor"),
+        "doctor is in the filtered list"
+    );
+    assert_eq!(
+        state.selected_entry().map(|entry| entry.id),
+        Some("view.doctor"),
+        "single best match selected"
+    );
+
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.palette.is_none(), "palette closes after running");
+    assert_eq!(app.active_view, ActiveView::Doctor);
+    assert!(app.doctor.report.is_some(), "the normal Doctor loader ran");
+}
+
+#[test]
+fn command_palette_opens_with_ctrl_p_and_esc_closes_it() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    assert!(app.palette.is_some(), "Ctrl-P opens the palette");
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.palette.is_none(), "Esc closes the palette");
+    assert!(!app.should_quit, "closing the palette does not quit");
+}
+
+#[test]
+fn command_palette_capture_still_dry_runs_and_waits_for_y() {
+    let runner = capture_base_runner()
+        .with_argv_response(
+            &["log", "session", ADA, "60m", "--dry-run"],
+            0,
+            capture_dry_json(
+                "log-session",
+                "ledger/2026/10.cfd",
+                "append",
+                "2026-10-13 session ADA 60m\n",
+            ),
+        )
+        .with_argv_response(
+            &["log", "session", ADA, "60m"],
+            0,
+            capture_applied_json("log-session"),
+        );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "log a session");
+    assert_eq!(
+        app.palette
+            .as_ref()
+            .and_then(|state| state.selected_entry())
+            .map(|entry| entry.id),
+        Some("capture.session")
+    );
+    app.handle_key(key(KeyCode::Enter));
+
+    // The palette only starts the normal capture flow: form first, then the
+    // CLI's dry run, then an explicit `y`. Nothing is written yet.
+    assert!(app.capture.is_some(), "capture form opened");
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Editing)
+    );
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("log")),
+        "no CLI write from the palette alone"
+    );
+
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+        "dry run issued: {calls:?}"
+    );
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview)
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+        "preview does not write: {calls:?}"
+    );
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.capture.is_none(), "capture closed after the write");
+    assert!(
+        app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+        "y performed the real write"
+    );
+}
+
+#[test]
+fn palette_cannot_open_over_a_pending_capture_confirm() {
+    let mut app = App::new(capture_base_runner());
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('s')));
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+    // No dry-run response is queued; the capture stays open with an inline
+    // error. The palette key must stay owned by the capture modal.
+    app.handle_key(key(KeyCode::Char(':')));
+    assert!(app.palette.is_none(), "palette did not bypass the modal");
+}
+
+#[test]
+fn command_palette_snapshot() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char(':')));
+    assert_snapshot("command_palette.snap", &render_to_string(&app));
+}
+
+#[test]
+fn g_and_shift_g_jump_to_the_first_and_last_row() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    assert_eq!(app.people.selected, 1, "nudge, then Ada");
+
+    app.runner.push_response(
+        0,
+        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
+    );
+    app.handle_key(key(KeyCode::Char('G')));
+    assert_eq!(app.people.selected, 2, "G lands on the last person");
+    assert_eq!(app.people.selected_person.as_deref(), Some(BEA));
+    assert_eq!(
+        app.context
+            .context
+            .as_ref()
+            .map(|ctx| ctx.person.id.as_str()),
+        Some(BEA),
+        "the last person's context loaded"
+    );
+
+    app.handle_key(key(KeyCode::Char('g')));
+    assert_eq!(app.people.selected, 0, "g lands on the first row");
+    assert_eq!(
+        app.people.selected_person.as_deref(),
+        Some(BEA),
+        "landing on a nudge keeps the last person's context"
+    );
+}
+
+#[test]
+fn home_esc_does_not_quit_and_still_clears_the_filter() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.should_quit, "Esc at People home is inert");
+    assert!(app.alert.is_none());
+
+    app.handle_key(key(KeyCode::Char('/')));
+    type_text(&mut app, "Bea");
+    assert_eq!(app.people.filter, "Bea");
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.people.filter, "", "Esc clears the filter first");
+    assert!(!app.should_quit);
+
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit, "q is the explicit quit");
+}
+
+#[test]
+fn command_palette_inbox_apply_dry_runs_then_asks_for_y() {
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+
+    app.handle_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "apply inbox");
+    assert_eq!(
+        app.palette
+            .as_ref()
+            .and_then(|state| state.selected_entry())
+            .map(|entry| entry.id),
+        Some("inbox.apply")
+    );
+    let before = app.runner.recorded_calls().len();
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    assert!(app.inbox.confirming, "the normal apply confirm is open");
+    let calls = app.runner.recorded_calls();
+    let issued = &calls[before..];
+    assert_eq!(
+        issued,
+        &[vec!["inbox".to_owned(), "--dry-run".to_owned()]],
+        "exactly one dry run, no write: {issued:?}"
+    );
+
+    // Esc cancels the confirm; the real (non-dry-run) inbox is never issued.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.inbox.confirming);
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call == &vec!["inbox".to_owned()]),
+        "cancelling writes nothing"
+    );
+}
+
+#[test]
+fn command_palette_inbox_apply_failure_keeps_the_confirm_closed() {
+    // Prime the view with a successful dry run, then make the palette's own
+    // fresh dry run fail. The loaded report is now stale, so the confirm must
+    // stay closed: otherwise `y` would run the real inbox behind a preview the
+    // TUI just failed to refresh (the entry's fail-closed contract).
+    let fake = FakeRunner::new();
+    fake.push_response(0, inbox_dry_run_json());
+    fake.push_response(
+        1,
+        r#"{
+            "ok": false,
+            "schema_version": "1",
+            "vault": "/tmp/fake-vault",
+            "error": {
+                "code": "E_INBOX_CRYPTO",
+                "message": "inbox dry run failed",
+                "fix": "queue the item again"
+            }
+        }"#,
+    );
+    let mut app = App::new(fake);
+
+    app.load_inbox();
+    assert!(
+        app.inbox
+            .report
+            .as_ref()
+            .is_some_and(|r| !r.empty && !r.items.is_empty()),
+        "the first dry run primed an applicable preview"
+    );
+
+    app.handle_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "apply inbox");
+    assert_eq!(
+        app.palette
+            .as_ref()
+            .and_then(|state| state.selected_entry())
+            .map(|entry| entry.id),
+        Some("inbox.apply")
+    );
+    let before = app.runner.recorded_calls().len();
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    assert!(
+        !app.inbox.confirming,
+        "a failed fresh dry run must not open the apply confirm"
+    );
+    assert!(
+        app.alert.is_some(),
+        "the dry-run failure is surfaced to the operator"
+    );
+    let issued = &app.runner.recorded_calls()[before..];
+    assert_eq!(
+        issued,
+        &[vec!["inbox".to_owned(), "--dry-run".to_owned()]],
+        "the palette still issues exactly one fresh dry run: {issued:?}"
+    );
+
+    // With no confirm open, `y` is an ordinary key: the real inbox never runs.
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call == &vec!["inbox".to_owned()]),
+        "the real inbox must not run behind the stale preview"
+    );
+}
+
+#[test]
+fn palette_record_edit_is_refused_outside_people_and_context() {
+    // `e` edits the loaded context pane, which only People and the Context
+    // view show. Launched from another view, the palette entry must refuse
+    // rather than silently edit a context the operator cannot see.
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('3')));
+    assert_eq!(app.active_view, ActiveView::Check);
+    let before = app.runner.recorded_calls().len();
+
+    app.handle_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "edit the selected");
+    assert_eq!(
+        app.palette
+            .as_ref()
+            .and_then(|state| state.selected_entry())
+            .map(|entry| entry.id),
+        Some("record.edit")
+    );
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(app.active_view, ActiveView::Check, "the view is unchanged");
+    let alert = app.alert.as_ref().expect("a refusal alert");
+    assert_eq!(alert.code.as_deref(), Some("edit_needs_context"));
+    assert_eq!(
+        app.runner.recorded_calls().len(),
+        before,
+        "the refusal issues no CLI call"
+    );
+}

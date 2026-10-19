@@ -1,0 +1,24 @@
+ 1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
+vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
+╭ Filter ─╭─ Help ───────────────────────────────────────────────────────────────────────╮─────────╮
+│ press / │ Workspaces                                                                   │ple      │
+╰─────────│   1 People & Search   2 Review Queue   3 Check   Tab/Shift-Tab cycles        │         │
+╭ Roster ─│ People & Search                                                              │         │
+│   Needs │   list: j/k move   g/G first/last   / filter   Enter open                    │         │
+│   W_DATE│   f search   s/t/n session/touch/note (pre-filled with the person)           │         │
+│     birt│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
+│   People│ Review Queue                                                                 │         │
+│ › Ada Ex│   o Proposals   i Inbox   c Conflicts   r refresh   Enter open/detail        │         │
+│   Bea De│   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │         │
+│         │ Check                                                                        │0008     │
+│         │   3 Check   d Doctor   r refresh   x raw CLI output (from an alert)          │         │
+│         │ Anywhere                                                                     │         │
+│         │   : or Ctrl-P palette   p scope   ? help   q quit                            │         │
+│         │   palette: type to filter, Up/Down select, Enter runs, Esc closes            │         │
+│         │   ! operator mode: off; press ! to include no-ai records                     │         │
+│         │   Enter never writes; y confirms after a preview (--dry-run/both sides)      │         │
+│         │   Esc clears a filter or goes back; at the People home it does not quit      │         │
+│         ╰ Press any key to close. ─────────────────────────────────────────────────────╯         │
+│                                    ││                                                            │
+╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
+ 1-3  ws  Tab  view  j/k  move  /  filter  [ ]  item  !  op  :  palette  ?  help  q  quit
