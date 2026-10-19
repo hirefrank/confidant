@@ -172,9 +172,9 @@ CLI — or `confidant mcp`, a thin stdio wrapper over the same commands — and
 follow one workflow: propose, confirm, apply. Every command takes `--json`
 and `--no-input`; usage errors exit 2; branch on `code`, never message text.
 
-`confidant mcp` exposes eight fixed tools (`check`, `find`, `context`,
-`log_session`, `import_ledger`, `note_add`, `schema`, `doctor`); no tool can
-widen that list. A write runs `check` and commits once. `--packs` scopes
+`confidant mcp` exposes ten fixed tools (`check`, `doctor`, `find`,
+`context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
+`pack_skill`); no tool can widen that list. A write runs `check` and commits once. `--packs` scopes
 reads (on `mcp` it is the instance ceiling) as a read-time policy filter,
 not cryptography ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
 [`docs/threat-model-agents.md`](docs/threat-model-agents.md)).
@@ -273,7 +273,8 @@ design — a `touch` line carries a date, an opaque ID, and a kind, never
 prose.
 
 A `[crypto] mode = "plaintext"` vault opts out; that is only for vaults with
-no real data and can never downgrade a keyed vault. `find`, `context`, and
+no real data and can never downgrade a keyed vault. Existing plaintext
+records are never encrypted in place. `find`, `context`, and
 MCP decrypt cleared records (never `no-ai`, except the operator-only
 `--for-operator` flag). Content an agent reads is sent to a hosted model
 provider; this is explicit and accepted, and Confidant makes no claim about
@@ -285,6 +286,13 @@ still serves derived ledger metadata and the flag itself is visible in the
 envelope header. A stolen unlocked device defeats every guarantee. See
 [`docs/privacy.md`](docs/privacy.md) and
 [`docs/threat-model-agents.md`](docs/threat-model-agents.md).
+
+`confidant doctor` checks GitHub for the latest release and reports skills
+link health. The release check is one unauthenticated `GET` to
+`api.github.com/repos/hirefrank/confidant/releases/latest`; no vault data is
+included, and only the `tag_name` is read — the response body is discarded.
+Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
+`staleness check disabled`.
 
 ## Where to go deeper
 
