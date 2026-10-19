@@ -76,8 +76,16 @@ qmd embed
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the
 collection. Re-run it after pulls, merges, or anything that changes vault
 content — hits are verified against the live cleared set at query time
-(record paths, ledger lines), so a stale index can only miss or mislabel:
-it cannot surface a record the CLI does not clear.
+(record paths, ledger lines), so a stale index cannot surface a record the
+CLI does not clear. It can, however, miss a hit, mislabel a line number, or
+return a **stale snippet of a still-cleared record**: the excerpt comes from
+the corpus copy, so a note edited in the vault keeps returning its old text
+until `qmd-index` reruns. That is not a §12 leak (the record is still
+cleared and the corpus already holds that text), but the text can be out of
+date. For a ledger file, one edited or removed vault line makes the
+corpus-to-vault line alignment run off the end and drop every later corpus
+line in that file until the next reindex; it fails closed (a dropped line is
+never returned), and a rerun clears it.
 
 ## Querying
 

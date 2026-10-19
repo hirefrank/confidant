@@ -32,10 +32,15 @@ Guardrails:
   `confidant reindex` (it writes the corpus); this script no longer checks
   them itself.
 
-Re-run after pulls/merges/writes. A stale index can only miss (or
-mislabel) results: query-time allowlist filtering runs against the live
-cleared set, so staleness can never return a record or ledger line the
-CLI does not clear (#538).
+Re-run after pulls/merges/writes. A stale index cannot return a record or
+ledger line the CLI does not clear — query-time allowlist filtering runs
+against the live cleared set (#538). It can still miss or mislabel results,
+or return a stale snippet of a still-cleared record: excerpts come from the
+corpus copy, so a note edited in the vault keeps returning its old text
+until this script reruns. In a ledger file, one edited or removed vault line
+makes the corpus-to-vault line alignment run off the end and drop every
+later corpus line in that file until the next rerun; it fails closed, and a
+rerun clears it.
 """
 import argparse
 import json

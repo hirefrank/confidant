@@ -153,14 +153,22 @@ merged hit file is then:
   (qmd only knows corpus lines). A line that does not align — edited,
   dropped, or cleared-never — resolves to nothing and is dropped. The
   first record ID on the resolved line supplies `id` (display only, the
-  CLI's `find` did the same from its parsed line).
+  CLI's `find` did the same from its parsed line). A single edited or
+  removed vault line makes this forward scan run off the end of the vault
+  file, so every later corpus line in that ledger file is dropped until the
+  next reindex. It fails closed — a dropped line is never returned — and
+  rerunning `qmd-index` clears it.
 
 Anything else is dropped and counted in `dropped_uncleared`, never
 returned. Snippets come from the QMD hit (records) or the aligned corpus
 line (ledger). Verification is therefore path/line-based, not text-based:
 rerun `qmd-index` (and `qmd embed`) after vault writes so a stale *index*
 does not mislabel line numbers — an unaligned hit drops rather than
-returning something unverified.
+returning something unverified. A stale index can also return a **stale
+snippet of a still-cleared record**: the excerpt comes from the corpus copy,
+so a note edited in the vault keeps returning its old text until `qmd-index`
+reruns. That is not a §12 leak — the record is still cleared and the corpus
+already holds that text — but the text can be out of date.
 
 Two real-qmd contract details the scripts handle:
 
