@@ -33,6 +33,7 @@ pub mod lock;
 pub mod manifest;
 pub mod manifest_pack;
 pub mod registry;
+mod rules;
 pub mod untrusted;
 
 pub use registry::PackRegistry;

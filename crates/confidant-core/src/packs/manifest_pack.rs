@@ -212,15 +212,26 @@ impl Pack for ManifestPack {
         crate::packs::declarative::run(vault, &state.merge, as_of, self.manifest, out);
     }
 
-    /// A metric declared and owned, but no rule verifies values yet (the
-    /// `ledger-balance` rule kind arrives in #446).
+    /// Verify a `balance` line whose metric one of the pack's
+    /// `ledger-balance` rules owns (#446): the rule kind does the math,
+    /// exactly as the compiled coaching pack does.
     fn check_balance(
         &self,
-        _vault: &Vault,
-        _state: &dyn PackState,
-        _sourced: &SourcedEntry,
-        _findings: &mut Vec<Finding>,
+        vault: &Vault,
+        state: &dyn PackState,
+        sourced: &SourcedEntry,
+        findings: &mut Vec<Finding>,
     ) {
+        let Some(state) = state.as_any().downcast_ref::<ManifestState>() else {
+            return; // never happens in-tree; fold always makes ManifestState
+        };
+        crate::packs::rules::balance::check_balance(
+            self.manifest,
+            vault,
+            &state.merge,
+            sourced,
+            findings,
+        );
     }
 
     /// The built-in personal pack serves core's merge-aware personal view
