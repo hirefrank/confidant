@@ -599,6 +599,60 @@ fn find_hides_no_ai_until_for_operator() {
     assert!(hit["excerpt"].as_str().unwrap().contains("zephyr"));
 }
 
+/// #593: a plaintext ledger line hidden from agents only because it names a
+/// `no-ai` person is an operator hit with `operator_only: true`. The agent
+/// JSON has no such key.
+#[test]
+fn find_marks_operator_only_ledger_line() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_no_ai(PERSON, "Ada Example", "Secret no-ai bio."),
+    );
+    h.record_add(&input);
+    // Ledger lines stay plaintext; only records are encrypted.
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-07 session {PERSON} 45m paid\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "ledger"]);
+
+    let out = h
+        .cmd(&["find", "45m", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v.get("for_operator").is_none(), "{v}");
+
+    let out = h
+        .cmd(&["find", "45m", "--for-operator", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "find --for-operator failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["for_operator"], true);
+    let hit = v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["path"].as_str().unwrap().starts_with("ledger/"))
+        .expect("the ledger line must be an operator hit");
+    assert_eq!(hit["operator_only"], true);
+    assert!(hit.get("no_ai").is_none(), "{hit}");
+}
+
 #[test]
 fn find_unkeyed_skips_and_counts_never_silent_empty() {
     let h = keyed_vault_with_records("quantum baking", "sourdough starter");

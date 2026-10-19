@@ -28,10 +28,19 @@ pub struct SearchHit {
     /// Operator-only tri-state `no-ai` mode (`"true"`, `"notes"`, `"false"`)
     /// of the hit's record, present only on [`search_for_operator`] (#572).
     /// `None` for every agent-path hit and for ledger-line hits, so the
-    /// field never changes an agent's byte-for-byte output. A ledger line
-    /// has no record of its own to badge.
+    /// field never changes an agent's byte-for-byte output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_ai: Option<&'static str>,
+    /// Operator-only marker for a ledger-line hit the section 12 agent
+    /// allowlist hides but [`search_for_operator`] includes (#593). Absent
+    /// on record hits (they carry `no_ai`), on ledger hits an agent can see
+    /// too, and on every agent-path hit, so agent JSON is unchanged.
+    /// Always `Some(true)` when present: whether a line is operator-only is
+    /// a yes/no question, and one line may reference several `no-ai`
+    /// records whose modes disagree, so there is no single `no-ai` value
+    /// to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -70,6 +79,10 @@ struct Allowlist<'a> {
     ledger_tokens: Vec<Vec<IdToken>>,
     named_ledger_lines: BTreeMap<RecordId, Vec<usize>>,
     ledger_ok: Vec<bool>,
+    /// Operator mode only (#593): per ledger line, `true` when the operator
+    /// allowlist shows it and the agent allowlist does not. Empty on the
+    /// agent path.
+    ledger_operator_only: Vec<bool>,
     /// Pack scope this search applies (#178). [`PackScope::All`] for the
     /// unscoped §12 allowlist.
     scope: PackScope,
@@ -101,8 +114,10 @@ pub fn search(vault: &Vault, query: &str, scope: &PackScope) -> Result<SearchRes
 /// Operator-only variant of [`search`] (#572): the same scan, but the
 /// cleared set is computed as if `no-ai` did not exist, so `no-ai` records
 /// (and ledger lines that only reference them) come back as hits. Each
-/// record hit carries the tri-state `no_ai` string. Reached only through
-/// `confidant find --for-operator`, never through MCP (spec §12).
+/// record hit carries the tri-state `no_ai` string; a ledger hit visible
+/// only because of the operator allowlist carries `operator_only: true`
+/// (#593). Reached only through `confidant find --for-operator`, never
+/// through MCP (spec §12).
 pub fn search_for_operator(
     vault: &Vault,
     query: &str,
@@ -158,6 +173,14 @@ fn search_with(
                 // A ledger line is not a record; it has no `no-ai` of its
                 // own to badge, even in operator mode.
                 no_ai: None,
+                // #593: mark it only when the operator flag is why it is
+                // on screen. A line an agent can also see carries nothing.
+                operator_only: allow
+                    .ledger_operator_only
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(true),
             });
         }
     }
@@ -378,6 +401,7 @@ impl<'a> Allowlist<'a> {
             ledger_tokens,
             named_ledger_lines,
             ledger_ok: Vec::new(),
+            ledger_operator_only: Vec::new(),
             scope: scope.clone(),
             operator,
             no_ai_hidden: HashSet::new(),
@@ -385,6 +409,11 @@ impl<'a> Allowlist<'a> {
             linkage,
         };
         allow.cleared = compute_cleared(&allow);
+        // Operator mode only (#593): the agent's ledger allowlist, from the
+        // same token rules with just the cleared set swapped. Collected
+        // here so the ledger badge reuses the operator-minus-agent
+        // difference, never a second notion of "hidden by no-ai".
+        let mut agent_ledger_ok: Option<Vec<bool>> = None;
         if operator {
             // The badge set: everything the operator allowlist adds over
             // the agent allowlist is hidden solely by `no-ai`. The operator
@@ -394,6 +423,17 @@ impl<'a> Allowlist<'a> {
             let hidden: HashSet<RecordId> =
                 allow.cleared.difference(&agent.cleared).cloned().collect();
             allow.no_ai_hidden = hidden;
+            agent_ledger_ok = Some(
+                allow
+                    .vault
+                    .ledger_lines
+                    .iter()
+                    .zip(allow.ledger_tokens.iter())
+                    .map(|(line, toks)| {
+                        line.searchable && tokens_allowed_with(toks, &agent.cleared, &allow)
+                    })
+                    .collect(),
+            );
         }
         allow.ledger_ok = allow
             .vault
@@ -402,6 +442,14 @@ impl<'a> Allowlist<'a> {
             .zip(allow.ledger_tokens.iter())
             .map(|(line, toks)| line.searchable && tokens_allowed(toks, &allow))
             .collect();
+        if let Some(agent_ok) = agent_ledger_ok {
+            allow.ledger_operator_only = allow
+                .ledger_ok
+                .iter()
+                .zip(agent_ok)
+                .map(|(operator, agent)| *operator && !agent)
+                .collect();
+        }
         allow
     }
 }
@@ -1107,6 +1155,9 @@ fn scan_record(
                 no_ai: allow
                     .operator
                     .then(|| operator_no_ai_badge(rec, &allow.no_ai_hidden)),
+                // `operator_only` is the ledger-line marker; record hits
+                // already carry `no_ai`.
+                operator_only: None,
             });
         }
     }
@@ -1376,5 +1427,57 @@ mod tests {
             .hits
             .iter()
             .any(|h| h.path.starts_with("ledger/") && h.no_ai.is_none()));
+    }
+
+    /// #593: the operator-only marker is for ledger hits the agent allowlist
+    /// hides. A ledger hit an agent can see too stays unmarked, and record
+    /// hits keep the tri-state `no_ai` (never the ledger marker).
+    #[test]
+    fn operator_ledger_hits_mark_only_operator_only_lines() {
+        let vault = demo_vault();
+        // `2026-10-07 session <Cam> ... note:<Cam's note>` is hidden from
+        // agents: the person is `no-ai: true` and the note inherits it.
+        let agent = search(&vault, "2026-10-07", &PackScope::All).unwrap();
+        assert!(agent.hits.is_empty(), "{:?}", agent.hits);
+
+        let operator = search_for_operator(&vault, "2026-10-07", &PackScope::All).unwrap();
+        let ledger = operator
+            .hits
+            .iter()
+            .find(|h| h.path.starts_with("ledger/"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cam's session line must be an operator hit: {:?}",
+                    operator.hits
+                )
+            });
+        assert_eq!(ledger.operator_only, Some(true));
+        assert!(ledger.no_ai.is_none());
+        // The note's front-matter date is a record hit: tri-state `no_ai`,
+        // no ledger marker.
+        let record = operator
+            .hits
+            .iter()
+            .find(|h| h.id.as_deref() == Some("n-01M3TC5H000068T0000000000C"))
+            .expect("the no-ai note must be an operator hit");
+        assert_eq!(record.no_ai, Some("true"));
+        assert_eq!(record.operator_only, None);
+
+        // An alias line naming cleared people is visible to agents too, so
+        // the operator path does not mark it.
+        let agent_alias = search(&vault, "alias", &PackScope::All).unwrap();
+        assert!(agent_alias
+            .hits
+            .iter()
+            .any(|h| h.path.starts_with("ledger/")));
+        assert!(agent_alias.hits.iter().all(|h| h.operator_only.is_none()));
+        let operator_alias = search_for_operator(&vault, "alias", &PackScope::All).unwrap();
+        let visible: Vec<_> = operator_alias
+            .hits
+            .iter()
+            .filter(|h| h.path.starts_with("ledger/"))
+            .collect();
+        assert!(!visible.is_empty());
+        assert!(visible.iter().all(|h| h.operator_only.is_none()));
     }
 }
