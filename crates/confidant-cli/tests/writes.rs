@@ -1976,8 +1976,8 @@ fn help_json_lists_every_subcommand() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     for expected in [
-        "check", "find", "resolve", "log", "import", "note", "context", "doctor", "schema", "help",
-        "mcp",
+        "check", "find", "resolve", "alias", "log", "import", "note", "context", "doctor",
+        "schema", "help", "mcp",
     ] {
         assert!(names.contains(&expected), "missing subcommand {expected}");
     }
@@ -1993,6 +1993,20 @@ fn help_json_lists_every_subcommand() {
         .unwrap()
         .iter()
         .any(|s| s == "session"));
+    let alias = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "alias")
+        .unwrap();
+    let alias_subs: Vec<&str> = alias["subcommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert!(alias_subs.contains(&"add"), "{alias_subs:?}");
+    assert!(alias_subs.contains(&"resolve"), "{alias_subs:?}");
 }
 
 // ---------------------------------------------------------------------------

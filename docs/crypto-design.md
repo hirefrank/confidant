@@ -612,6 +612,43 @@ values live encrypted in the profile. `HEX` is at least 32 hex chars
 (spec §6). Importers match on aliases by recomputing the HMAC of the
 normalized value.
 
+### Accepted dictionary-attack oracle (#547, 2026-10-19)
+
+A keyed HMAC over a low-entropy value is an **equality oracle**: anyone who
+holds the lookup key — every enrolled device and agent, and the operator —
+can test a candidate (`HMAC(key, candidate) == hmac:HEX?`) and confirm whether
+a given email, phone number, or handle belongs to a person. Alias values are
+enumerable in practice (address books, domain guesses), so this oracle
+reveals the *values*, not just their hashes.
+
+This is **accepted and deliberate**, not an oversight:
+
+- It is inherent to the design (ADR-2/ADR-9): the ledger must record a
+  matchable alias without storing plaintext PII, and HMAC is what makes the
+  line matchable at all. Replacing it with a plain hash would let *anyone*
+  with the ledger mount the same attack; the key at least limits it to key
+  holders.
+- The lookup key is device-only and never recovery-wrapped (§10), so the
+  oracle is available only alongside the ability to decrypt the rest of the
+  vault. It grants no capability beyond what a trusted-device holder already
+  has.
+- The clear-text alias values remain encrypted under each client's
+  recovery-wrapped data key; the oracle leaks *membership* of a guessed
+  value, never the stored plaintext.
+
+The `confidant alias resolve` CLI path (#537 phase 3b) exposes this oracle as
+a short command. That adds **no new capability** — `alias_hmac` and
+`KeyStore::read_lookup_key` were already public and a five-line script could
+compute the same — but it is recorded here so a future reader does not mistake
+the CLI for the source of the property. The CLI takes the value from stdin or
+`--value-file` only (never `argv`), so the untrusted command line does not
+leak it, and it never echoes the value in output or errors.
+
+Plaintext lifetime in the process is best-effort, not guaranteed: the value
+is held in a `Zeroizing<String>` and dropped there, but `read_to_string` can
+leave an un-wiped copy when the `String` reallocates, and `alias::normalize`
+inside `alias_hmac` allocates its own short-lived plain `String`.
+
 ## 11. Threat model
 
 After architecture §4:
@@ -643,6 +680,11 @@ writes.
   which opaque IDs change together, and plaintext ledger fields (dates,
   amounts, stage tokens) tied to opaque IDs. An observer learns *when* and
   *how much*, never *who* or *what*.
+- **Guessing an alias value.** The alias index is a keyed HMAC over an
+  enumerable value, so a key holder (any enrolled device) can confirm a
+  guessed email, phone, or handle by recomputing the HMAC. Accepted and
+  documented in §10 ("Accepted dictionary-attack oracle") — it is inherent to
+  a matchable, non-plaintext alias.
 - Rubber-hose / compelled disclosure of the recovery phrase (it reads the
   whole vault — ADR-15).
 - **A history-derived shred check failing open.** `shredded_clients`,

@@ -107,8 +107,8 @@ The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 
 | Area | Commands | Notes |
 |---|---|---|
-| Write | `record add`, `record edit`, `note add`, `note edit`, `log session`, `log touch`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
-| Read | `find`, `context`, `resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster and `--for-operator` adds `no-ai` records; `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
+| Write | `record add`, `record edit`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
+| Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster and `--for-operator` adds `no-ai` records; `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
 | Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
 | Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |
@@ -125,6 +125,17 @@ echo the resolved `p-<ULID>` (and name) so a wrong pick is visible.
 `confidant resolve <query>` is the read-only lookup. A `no-ai: true` person
 is addressed by `p-<ULID>` only — never by name — and an ambiguous name fails
 closed with `E_AMBIGUOUS_PERSON` rather than guessing.
+
+**Aliases** turn a `kind:value` (`email`, `phone`, or `handle`) into a
+person. `confidant alias add <person> <kind>` appends the
+`DATE alias <p-ULID> KIND hmac:HEX` ledger line, and
+`confidant alias resolve <kind>` maps a value back to the canonical person.
+The raw value is PII: both read it from stdin or `--value-file`, **never** an
+argument, and never echo it — only the `hmac:` appears. `alias resolve`
+honors `no-ai` like other reads (an alias on a `no-ai: true` person is not
+surfaced), and two cleared people sharing one alias fails closed with
+`E_AMBIGUOUS_PERSON`. Alias HMACs are computed with the vault lookup key, so
+these commands need an enrolled device (see [`docs/crypto-design.md`](docs/crypto-design.md) §10).
 
 ## Packs
 
