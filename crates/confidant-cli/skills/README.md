@@ -71,7 +71,7 @@ Every skill follows the same shape:
 | `portal-sync/` | Coaching portal events (JSONL) | `open` (renewals), `stage` (checkouts sent, lost deals), all with `src:portal/<event-id>` |
 | `transcript-import/` | Transcript metadata (JSON) | Interaction record + `session` line with duration and `src:transcript/<id>` |
 | `lightfield-import/` | Lightfield export (JSON) | Person/deal/note/interaction records + ledger lines, `src:lightfield/<id>` |
-| `capture-gap-summary/` | `confidant check --json` | Nothing — operator-facing summary of `E_SESSION_WITHOUT_NOTES` / `E_PAID_SESSION_GAP` |
+| `capture-gap-summary/` | `confidant check --json` | Nothing — operator-facing summary of `E_COACHING_SESSION_WITHOUT_NOTES` / `E_COACHING_PAID_SESSION_GAP` |
 
 ## Shared helper
 

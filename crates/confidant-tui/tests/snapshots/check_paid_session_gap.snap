@@ -4,7 +4,7 @@ vault  unknown   scope  not resolved yet   doctor  not run
 │  FAILED   spec 0.1  •  records 2  •  ledger 2  •  errors 0  •  warnings 1  •  findings 1         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
-│ › [warning] E_PAID_SESSION_GAP p-01M3TC5H00MPJG0000 ││ code      E_PAID_SESSION_GAP              │
+│ › [warning] E_COACHING_PAID_SESSION_GAP p-01M3TC5H0 ││ code      E_COACHING_PAID_SESSION_GAP     │
 │                                                     ││ severity  [warning]                       │
 │                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
 │                                                     ││ location  -                               │

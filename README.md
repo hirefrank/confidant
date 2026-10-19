@@ -144,11 +144,12 @@ balance metrics, and check rules. Packs are the extension mechanism: the
 core stays generic, and a pack turns Confidant into a tool for a specific
 domain.
 
-- **`coaching@0.1`** ships today, compiled into the binary. It adds sessions,
-  packages, ICF hours, balance assertions, and gap rules (a session with no
-  notes; a paid client with no session inside a configurable window). If you
-  run a coaching practice, this pack covers what you'd otherwise need a
-  coaching CRM for — without the sales-pipeline baggage.
+- **`coaching@0.1`** ships as an external pack (vendored into the vault
+  with `confidant pack add`). It adds sessions, packages, ICF hours, balance
+  assertions, and gap rules (a session with no notes; a paid client with no
+  session inside a configurable window). If you run a coaching practice, this
+  pack covers what you'd otherwise need a coaching CRM for — without the
+  sales-pipeline baggage.
 - **`personal@0.2`** is the built-in personal pack. It is **implicit**:
   every vault has it, whether or not `packs` lists it (`packs = []` still
   enables it), and a `personal@…` entry is a no-op. It adds birthdays,
@@ -165,9 +166,9 @@ domain.
   client and a friend, and a coaching agent never sees personal notes —
   is still to come.
 - **External packs** ([issue #193](https://github.com/hirefrank/confidant/issues/193)):
-  the long-term direction is installable, versioned packs loaded at runtime,
-  so third parties can publish packs without opening a PR here. Not yet
-  built.
+  installable, versioned packs are vendored into the vault under `packs/`
+  and pinned in `confidant.lock`, so third parties can publish packs without
+  opening a PR here. `coaching@0.1` ships this way.
 
 Pack specs live in [`packs/`](packs/). The coaching pack's human-readable
 contract is [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
@@ -272,8 +273,8 @@ paid client (`sessions_remaining > 0` or a `pps` session in the lookback)
 with no session inside a configurable window. The gap clock runs from
 `max(last session, latest open)`. Session billing tags are `paid`
 (consumes a slot), `pps`, and `comp` (complimentary; never consume). A
-session with none of these still consumes and is `W_SESSION_UNTAGGED`; more
-than one is `E_SESSION_TAGS`. A merge between different record types is
+session with none of these still consumes and is `W_COACHING_SESSION_UNTAGGED`; more
+than one is `E_COACHING_SESSION_TAGS`. A merge between different record types is
 `E_WRONG_ID_TYPE`. `find` follows the section 12 allowlist.
 
 ```sh

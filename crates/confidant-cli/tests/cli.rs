@@ -26,6 +26,28 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
+/// Vendor the shipped external `coaching@0.1` pack into `root` and pin
+/// its hash, as `pack add --from-dir` does (#449).
+#[cfg(unix)]
+fn install_shipped_coaching(root: &Path) -> String {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
+    let dst = root.join("packs/coaching@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let hash = read_pack_dir(&dst).unwrap().hash;
+    std::fs::write(
+        root.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+    hash
+}
+
 #[test]
 fn check_demo_json_ok() {
     let out = Command::new(bin())
@@ -86,7 +108,7 @@ fn find_surfaces_load_findings() {
     std::fs::write(
         dir.path().join("confidant.toml"),
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = []
 vault_id = "x"
 [checks]
 as_of = "2026-10-08"
@@ -117,7 +139,7 @@ fn find_unreadable_ledger_is_command_error() {
     std::fs::write(
         dir.path().join("confidant.toml"),
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = []
 vault_id = "x"
 [checks]
 as_of = "2026-10-08"
@@ -199,7 +221,7 @@ fn find_json_findings_omit_raw_profile_text() {
     std::fs::write(
         dir.path().join("confidant.toml"),
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = []
 vault_id = "x"
 [checks]
 as_of = "2026-10-08"
@@ -437,6 +459,7 @@ const EDGE_FRIEND: &str = "e-01M3TC5H00MPJG00E100000000";
 /// built-in is visible to a scoped read only when the scope names it (#551).
 fn personal_data_vault() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
+    install_shipped_coaching(dir.path());
     std::fs::write(
         dir.path().join("confidant.toml"),
         r#"spec = "0.1"
@@ -689,7 +712,7 @@ fn find_edge_scoping_follows_kind() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"x\"\n",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"x\"\n",
     )
     .unwrap();
     let ada = "p-01M3TC5H00MPJG000000000000";
@@ -729,15 +752,15 @@ fn find_edge_scoping_follows_kind() {
         );
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
     };
-    // Core kind: visible unscoped and under a coaching scope.
+    // Core kind: visible unscoped and under a scoped read.
     let v = find("married", None);
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
-    let v = find("married", Some(COACHING));
+    let v = find("married", Some("personal@0.2"));
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
     // Unknown kind: visible unscoped, hidden when scoped (fail closed).
     let v = find("nemesis", None);
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
-    let v = find("nemesis", Some(COACHING));
+    let v = find("nemesis", Some("personal@0.2"));
     assert_eq!(v["matches"], serde_json::json!([]));
 }
 #[test]
@@ -754,8 +777,9 @@ fn help_pack_coaching_serves_skill_text() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("# Coaching pack (coaching@0.1)"), "{text}");
-    assert!(text.contains("E_OPEN_MALFORMED"), "{text}");
-    assert!(text.contains("W_SESSION_UNTAGGED"), "{text}");
+    assert!(text.contains("E_COACHING_OPEN_MALFORMED"), "{text}");
+    assert!(text.contains("W_COACHING_SESSION_UNTAGGED"), "{text}");
+    assert!(text.starts_with("[external pack:"), "{text}");
 }
 
 #[test]
@@ -773,7 +797,10 @@ fn help_pack_coaching_json_envelope() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["packs"], serde_json::json!(["coaching@0.1"]));
-    assert!(v["skill"].as_str().unwrap().contains("E_PAID_SESSION_GAP"));
+    assert!(v["skill"]
+        .as_str()
+        .unwrap()
+        .contains("E_COACHING_PAID_SESSION_GAP"));
 }
 
 /// A minimal valid v2 manifest for the external help fixture.
@@ -958,7 +985,7 @@ fn help_pack_bare_includes_external_pack() {
 #[test]
 fn help_pack_compiled_is_unlabelled() {
     let out = Command::new(bin())
-        .args(["help", "pack:coaching@0.1", "--vault"])
+        .args(["help", "pack:personal@0.2", "--vault"])
         .arg(demo())
         .output()
         .unwrap();
@@ -968,7 +995,7 @@ fn help_pack_compiled_is_unlabelled() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let shipped = include_str!("../pack-skills/coaching/SKILL.md");
+    let shipped = include_str!("../pack-skills/personal/SKILL.md");
     assert!(!stdout.starts_with("[external pack:"), "{stdout:?}");
     assert_eq!(
         stdout,
@@ -1883,8 +1910,8 @@ fn pack_add_same_version_different_hash_refused() {
 #[test]
 fn pack_add_refuses_reserved_names() {
     let vault = git_vault();
-    // `coaching` is reserved for the compiled pack (PD14).
-    let pack = versioned_pack("coaching", "0.9", "# nope\n", None);
+    // `personal` is reserved for the built-in (PD14).
+    let pack = versioned_pack("personal", "0.9", "# nope\n", None);
     let out = pack_add(pack.path(), vault.path(), true);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1892,25 +1919,34 @@ fn pack_add_refuses_reserved_names() {
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
 }
 
-/// #449: the on-disk parity fixture installs as a real external pack on a
-/// copy of the demo vault, and the vault then checks clean. The copy swaps
-/// compiled coaching for the fixture: both claim `open`/`session`, so a
-/// vault enabling both is `E_PACK_CONFLICT`. The compiled `coaching.*`
-/// check keys are dropped; the fixture's manifest defaults are the same
-/// values, and the core parity tests cover the `coaching-ext.*` keys.
+/// #449: `coaching` is an ordinary external pack after the reservation
+/// drop, so `pack add --from-dir` accepts it.
+#[cfg(unix)]
+#[test]
+fn pack_add_accepts_external_coaching_name() {
+    let vault = git_vault();
+    let pack = versioned_pack("coaching", "0.9", "# ok\n", None);
+    let out = pack_add(pack.path(), vault.path(), true);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #449: the shipped `packs/coaching/` installs as a real external pack on
+/// a copy of the demo vault, and the vault then checks clean.
 #[cfg(unix)]
 #[test]
 fn declarative_coaching_cli_install_then_check_clean() {
     let vault = tempfile::tempdir().unwrap();
     copy_tree(&demo(), vault.path());
-    let config = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
-    let config: String = config
-        .replace("packs = [\"coaching@0.1\"]", "packs = []")
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("coaching."))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    std::fs::write(vault.path().join("confidant.toml"), config).unwrap();
+    // The demo already vendors the pack; this test installs it through the
+    // CLI. The listing stays, so `pack add` repairs the missing pin
+    // (#612) rather than failing the pre-check on an unclean vault.
+    std::fs::remove_dir_all(vault.path().join("packs")).unwrap();
+    std::fs::remove_file(vault.path().join("confidant.lock")).unwrap();
     git(vault.path(), &["init", "-q"]);
     git(vault.path(), &["config", "user.name", "Test"]);
     git(
@@ -1931,8 +1967,7 @@ fn declarative_coaching_cli_install_then_check_clean() {
         ],
     );
 
-    let pack_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/coaching-ext");
+    let pack_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
     let out = pack_add(&pack_dir, vault.path(), true);
     assert!(
         out.status.success(),
@@ -1941,7 +1976,7 @@ fn declarative_coaching_cli_install_then_check_clean() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // `pack verify` accepts the vendored fixture...
+    // `pack verify` accepts the vendored pack...
     let verify = Command::new(bin())
         .args(["pack", "verify", "--vault"])
         .arg(vault.path())
@@ -1974,6 +2009,7 @@ fn declarative_coaching_cli_install_then_check_clean() {
 fn pack_add_check_failure_rolls_back() {
     let vault = git_vault();
     // coaching@0.1 owns the `session` verb; a pack claiming it conflicts.
+    install_shipped_coaching(vault.path());
     std::fs::write(
         vault.path().join("confidant.toml"),
         "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
@@ -1993,6 +2029,7 @@ fn pack_add_check_failure_rolls_back() {
         ],
     );
     let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let before_lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
     // A directory that already exists (even empty, so git never tracks it) must
     // survive the rollback: the write did not create it (#604).
     std::fs::create_dir_all(vault.path().join("packs/pre-existing-empty")).unwrap();
@@ -2005,7 +2042,10 @@ fn pack_add_check_failure_rolls_back() {
         .path()
         .join("packs/example-pack@0.1/manifest.toml")
         .exists());
-    assert!(!vault.path().join("confidant.lock").exists());
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap(),
+        before_lock
+    );
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 

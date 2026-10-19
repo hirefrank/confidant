@@ -46,6 +46,27 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Vendor the shipped external `coaching@0.1` pack and pin its hash.
+fn install_shipped_coaching(root: &Path) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
+    let dst = root.join("packs/coaching@0.1");
+    std::fs::create_dir_all(&dst).unwrap();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
+        .unwrap()
+        .hash;
+    std::fs::write(
+        root.join("confidant.lock"),
+        format!(
+            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
 struct Repo {
     dir: TempDir,
 }
@@ -58,6 +79,7 @@ impl Repo {
         git(root, &["init", "-b", "main", "-q"]);
         git(root, &["config", "user.name", "Test"]);
         git(root, &["config", "user.email", "test@example.com"]);
+        install_shipped_coaching(root);
         std::fs::write(
             root.join("confidant.toml"),
             "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"inbox-e2e-vault\"\n",

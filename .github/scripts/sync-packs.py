@@ -5,16 +5,14 @@ Pack skills and manifests are duplicated by hand because the binary embeds
 the in-crate copies (`include_dir!` / `include_str!`), and crates.io
 tarballs do not include the repo-root `../../packs`:
 
-  packs/coaching/SKILL.md        -> crates/confidant-cli/pack-skills/coaching/SKILL.md
   packs/personal/SKILL.md        -> crates/confidant-cli/pack-skills/personal/SKILL.md
-  packs/coaching/manifest.toml   -> crates/confidant-core/pack-manifests/coaching/manifest.toml
   packs/personal/manifest.toml   -> crates/confidant-core/pack-manifests/personal-0.2/manifest.toml
   packs/personal/SKILL.md        -> crates/confidant-core/pack-manifests/personal-0.2/SKILL.md
   packs/personal/0.2.md          -> crates/confidant-core/pack-manifests/personal-0.2/0.2.md
 
 Edit the repo-root source, then run this once. The drift tests
 (`crates/confidant-cli/src/embedded.rs`,
-`crates/confidant-core/src/packs/{coaching,embedded}.rs`) stay in CI and
+`crates/confidant-core/src/packs/embedded.rs`) stay in CI and
 still fail on any drift; this script only removes the manual copying.
 
 Usage:
@@ -36,12 +34,8 @@ REPO = Path(__file__).resolve().parent.parent.parent
 
 # (repo-root source, in-crate vendored copy) relative to the repo root.
 COPIES = [
-    ("packs/coaching/SKILL.md",
-     "crates/confidant-cli/pack-skills/coaching/SKILL.md"),
     ("packs/personal/SKILL.md",
      "crates/confidant-cli/pack-skills/personal/SKILL.md"),
-    ("packs/coaching/manifest.toml",
-     "crates/confidant-core/pack-manifests/coaching/manifest.toml"),
     ("packs/personal/manifest.toml",
      "crates/confidant-core/pack-manifests/personal-0.2/manifest.toml"),
     ("packs/personal/SKILL.md",

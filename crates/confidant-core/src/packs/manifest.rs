@@ -65,11 +65,12 @@ const CORE_VERBS_V2: &[&str] = &["alias", "merge", "stage", "balance", "touch"];
 /// Core record types no external pack may claim (PD8 rule 2).
 const CORE_RECORD_TYPES: &[&str] = &["person", "org", "deal", "interaction", "note", "edge"];
 
-/// Pack names reserved for compiled packs (PD14).
-const RESERVED_PACK_NAMES: &[&str] = &["coaching", "personal"];
+/// Pack names reserved for compiled-in packs (PD14). `personal` is the
+/// only built-in; `coaching` became an external pack in #449.
+const RESERVED_PACK_NAMES: &[&str] = &["personal"];
 
-/// Whether `name` is reserved for a compiled pack (PD14). An external pack
-/// cannot be installed under a reserved name (#440).
+/// Whether `name` is reserved for a compiled-in pack (PD14). An external
+/// pack cannot be installed under a reserved name (#440).
 pub fn is_reserved_pack_name(name: &str) -> bool {
     RESERVED_PACK_NAMES.contains(&name)
 }
@@ -1272,9 +1273,20 @@ default_fix = "{fix}"
 
     #[test]
     fn external_rejects_reserved_name() {
-        let text = valid_v2_toml().replace("name = \"example-pack\"", "name = \"coaching\"");
+        let text = valid_v2_toml().replace("name = \"example-pack\"", "name = \"personal\"");
         let err = parse_manifest_external(&text).unwrap_err();
         assert!(err.to_string().contains("reserved"), "{err:?}");
+    }
+
+    /// #449: `coaching` is no longer reserved; the shipped external pack
+    /// must load under its real name.
+    #[test]
+    fn external_accepts_coaching_name() {
+        let text = valid_v2_toml()
+            .replace("name = \"example-pack\"", "name = \"coaching\"")
+            .replace("example-pack.example_rule", "coaching.example_rule");
+        let m = parse_manifest_external(&text).expect("coaching is an external pack now");
+        assert_eq!(m.pack.name, "coaching");
     }
 
     #[test]

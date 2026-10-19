@@ -18,7 +18,7 @@ use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, PackOrigin};
-use crate::packs::rules::ledger;
+use crate::packs::rules::ledger::{self, LedgerFacts};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::vault::{SourcedEntry, Vault};
 use chrono::NaiveDate;
@@ -28,8 +28,8 @@ fn leak_str(s: String) -> &'static str {
 }
 
 /// A pack registered at runtime from a validated declarative manifest: its
-/// claims are leaked once — the same pattern the compiled packs use in
-/// `coaching.rs` — plus the skill text and the manifest for the declarative
+/// claims are leaked once — the same pattern the embedded built-in uses —
+/// plus the skill text and the manifest for the declarative
 /// evaluator (#441). The claim slices are leaked too (the `Pack` trait
 /// returns `&'static`), so all of them are `'static` field references copied
 /// out per call.
@@ -204,14 +204,27 @@ impl Pack for ManifestPack {
     /// a compiled pack's rules use.
     fn fold(
         &self,
-        _vault: &Vault,
+        vault: &Vault,
         merges: &MergeMap,
         _as_of: NaiveDate,
         _findings: &mut Vec<Finding>,
     ) -> Box<dyn PackState> {
-        Box::new(ManifestState {
-            merge: MergeGroups::new(merges.clone()),
-        })
+        let merge = MergeGroups::new(merges.clone());
+        // Fold each `ledger-balance` rule once here, so `check_balance`
+        // can verify every `balance` line against the same facts instead
+        // of refolding the whole ledger per line (#449 performance).
+        let mut ledger = std::collections::BTreeMap::new();
+        for rule in &self.manifest.rules {
+            if rule.kind != crate::packs::rules::balance::KIND {
+                continue;
+            }
+            let Some(params) = crate::packs::rules::balance::BalanceParams::parse(rule) else {
+                continue;
+            };
+            let folded = ledger::fold(vault, &merge, params.fold_params());
+            ledger.insert(rule.id.clone(), folded.facts);
+        }
+        Box::new(ManifestState { merge, ledger })
     }
 
     /// Declarative rules + field-grammar validation (#441). Runs the
@@ -231,11 +244,10 @@ impl Pack for ManifestPack {
     }
 
     /// Verify a `balance` line whose metric one of the pack's
-    /// `ledger-balance` rules owns (#446): the rule kind does the math,
-    /// exactly as the compiled coaching pack does.
+    /// `ledger-balance` rules owns (#446): the rule kind does the math.
     fn check_balance(
         &self,
-        vault: &Vault,
+        _vault: &Vault,
         state: &dyn PackState,
         sourced: &SourcedEntry,
         findings: &mut Vec<Finding>,
@@ -245,8 +257,7 @@ impl Pack for ManifestPack {
         };
         crate::packs::rules::balance::check_balance(
             self.manifest,
-            vault,
-            &state.merge,
+            &state.ledger,
             sourced,
             findings,
         );
@@ -277,8 +288,8 @@ impl Pack for ManifestPack {
         let params = self.context_params.as_ref()?;
         let state = state.as_any().downcast_ref::<ManifestState>()?;
         // #594: the ledger-balance rule already owns these verbs (PD1); fold
-        // with the same shared arithmetic the check path uses, then build the
-        // view the compiled coaching pack also builds.
+        // with the same shared arithmetic the check path uses, then build
+        // the core ledger-sessions view.
         let folded = ledger::fold(vault, &state.merge, params.fold_params());
         crate::context::ledger_sessions::build_ledger_sessions_view(
             vault,
@@ -320,6 +331,9 @@ impl Pack for ManifestPack {
 /// rules (#441) read it; a compiled pack folds much more.
 pub struct ManifestState {
     merge: MergeGroups,
+    /// Cached fold per `ledger-balance` rule id, so `check_balance` does
+    /// not refold the ledger for every `balance` line (#449).
+    ledger: std::collections::BTreeMap<String, LedgerFacts>,
 }
 
 impl PackState for ManifestState {

@@ -33,6 +33,7 @@ pub fn generate_realistic_vault(
 ) -> Result<(String, String)> {
     refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
+    install_coaching(root)?;
     let unique = "zxqvUniqueTokenAda0";
     let common = "coaching-practice";
     let vault_id = ulid_from_parts(TIME_MS, 1);
@@ -166,6 +167,33 @@ coaching.pps_lookback_days = 180
         )?;
     }
     Ok((unique.to_owned(), common.to_owned()))
+}
+
+/// Vendor the shipped external `coaching@0.1` pack into a generated bench
+/// vault and pin its hash (#449). `bench-gen` is a hidden developer tool
+/// and runs from the repo; a packaged binary without `../../packs` gets a
+/// clear error rather than a silently different vault.
+fn install_coaching(root: &Path) -> Result<()> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
+    if !src.is_dir() {
+        return Err(anyhow::Error::new(DomainError::config(
+            "bench-gen needs the repo's packs/coaching/ directory to build its fixture vault",
+        )));
+    }
+    let dst = root.join("packs/coaching@0.1");
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(&src)? {
+        let entry = entry?;
+        std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+    }
+    let hash = crate::packs::dir::read_pack_dir(&dst)
+        .map_err(anyhow::Error::new)?
+        .hash;
+    let lock = format!(
+        "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+    );
+    paths::write_replace(root, Path::new("confidant.lock"), lock.as_bytes())?;
+    Ok(())
 }
 
 fn push_ledger(

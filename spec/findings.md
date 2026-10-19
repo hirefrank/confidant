@@ -6,6 +6,11 @@ text. Codes are stable once published. A new meaning needs a new code.
 Severity listed here is the default. Vault `[checks]` keys can promote,
 demote, or turn a rule `off` where the table says "configurable".
 
+Codes prefixed `E_COACHING_` / `W_COACHING_` are **pack-owned**: the
+external `coaching@0.1` pack declares and emits them, and no other pack may
+claim them (PD13). The core codes remain stable and are emitted by core or
+the built-in personal pack.
+
 Warning findings never block writes, commits, or inbox merges; only
 errors do. `doctor` reports warnings as warning status, never error.
 `check --fail-on warning` exits non-zero when any warning (or error) is
@@ -23,20 +28,19 @@ present, for CI users who want the stricter gate.
 | `E_PACK_INVALID` | error | | An external pack's manifest or contents fail validation: bad `manifest_version`, unknown keys, name or finding-code regex violations, reserved names, capability-limit (PD8) violations, or disallowed files (PD7). A vendored-pack failure names the `name@version` exactly as listed in `confidant.toml` and sets `file` to the vendored path `packs/<name>@<version>`; a broken `confidant.lock` is a separate name-free finding. |
 | `E_PACK_CONFLICT` | error | | Two enabled packs claim the same verb, record type, field, balance metric, or edge kind. The pack set is incoherent: `check` reports the conflict and skips all pack folding (core checks still run). |
 | `W_PACK_ORPHAN` | warning | | A ledger verb, record field, record type, balance metric, or edge kind belongs to a registered pack that is not enabled. Warnings never block writes; the operator enables the pack or removes the data. |
-| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, `note:`, merge `TO`, `open` PKG-ID, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value (including ASCII case variants: `Person:`, `ORG:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
+| `E_INVALID_ID` | error | | An ID is not `prefix-ULID` (ledger subject, merge `TO`, a front-matter reference, or a malformed ID-shaped token in front matter: record prefix, ASCII or Unicode dash, and an alphanumeric run 20–32 characters that fails ULID validation or a longer run whose first 26 characters canonicalize to a ULID). A `person` / `org` / `deal` value (including ASCII case variants: `Person:`, `ORG:`, …) accepts `[[id|Alias]]` only inside `[[…]]` (bare `p-A|Name` is this code), a trailing comment after a space or tab then `#`, and treats empty / `~` / YAML `null` as no reference. Check reports the line number and, when the key is a known spec key (including a case-variant ref key, named as written), the key name; it never echoes the token. |
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
-| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, `note:` is not a note, or a `merge` folds one record type into another. |
+| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, or a `merge` folds one record type into another. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
 | `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a person record — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core, not in an enabled pack, and not owned by a disabled pack (those are `W_PACK_ORPHAN`). The message does not echo the verb. |
-| `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file, or `note:` does not name a note that belongs to the session's person. |
+| `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file. A coaching `note:` miss is the pack's `E_COACHING_UNKNOWN_RECORD`. |
 | `E_UNKNOWN_METRIC` | error | | A `balance` line names a metric no enabled pack defines and no disabled pack owns (those are `W_PACK_ORPHAN`). |
 | `E_LEDGER_PATH` | error | | A file under `ledger/` is not `YYYY/MM.cfd`. |
 | `E_LEDGER_DATE` | error | | An entry's date is not in its file's year/month. |
-| `E_BALANCE_MISMATCH` | error | | A `balance` assertion disagrees with the value computed as of the end of the assertion date. |
 | `E_ALIAS_PLAINTEXT` | error | | An `alias` line is not exactly `KIND hmac:HEX` with ≥32 hex characters. |
 | `E_ALIAS_COLLISION` | warning | | Two canonical IDs share the same alias kind and HMAC. |
 | `E_UNRESOLVED_MERGE` | error | | A `merge` names an ID that does not exist. |
@@ -45,13 +49,20 @@ present, for CI users who want the stricter gate.
 | `E_MERGE_FORK` | error | | The same `FROM` is merged into two different `TO`s. |
 | `E_SYMLINK` | error | | A symbolic link exists in the vault. |
 | `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. When both conflict sides parse as encrypted envelopes, the message says the encrypted record has two versions and points at `record resolve`. |
-| `E_MISSING_DURATION` | error | `coaching.require_duration` | A `session` has no parseable duration. |
-| `E_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, `N` is over 100000, or the running open total overflows. |
-| `E_NEGATIVE_BALANCE` | error | `coaching.balance_nonnegative` | Computed `sessions_remaining` is negative. |
-| `E_SESSION_WITHOUT_NOTES` | warning | `coaching.session_notes` | A session has no linked or same-day note (coverage only; `note:` integrity is always on). |
-| `E_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. The gap clock runs from `max(last session, latest open)`. |
-| `W_SESSION_UNTAGGED` | warning | | A session has none of `paid`, `pps`, or `comp`. The session still consumes a package slot. |
-| `E_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
+| `E_COACHING_INVALID_ID` | error | | A package id on an `open` line is not a valid `pkg-<ULID>` record id. |
+| `E_COACHING_WRONG_ID_TYPE` | error | | A package id lacks the `pkg-` prefix. |
+| `E_COACHING_NOTE_INVALID_ID` | error | | A `note:` id on a session line is not a valid record id. |
+| `E_COACHING_NOTE_WRONG_TYPE` | error | | A `note:` id parses but is not a note id. |
+| `E_COACHING_UNKNOWN_RECORD` | error | | A `note:` names a note that does not exist, or one that belongs to another person. |
+| `E_COACHING_PARSE` | error | | A coaching `balance` line is malformed (missing or non-numeric value), or a duration total overflows. |
+| `E_COACHING_BALANCE_MISMATCH` | error | | A `balance` assertion disagrees with the value computed as of the end of the assertion date. |
+| `E_COACHING_NEGATIVE_BALANCE` | error | `coaching.balance_nonnegative` | Computed `sessions_remaining` is negative. |
+| `E_COACHING_OPEN_MALFORMED` | error | | An `open` line is not `package PKG-ID N sessions`, `N` is over 100000, or the running open total overflows. |
+| `E_COACHING_MISSING_DURATION` | error | `coaching.require_duration` | A `session` has no parseable duration. |
+| `E_COACHING_SESSION_TAGS` | error | | A session has more than one of `paid`, `pps`, or `comp`. |
+| `W_COACHING_SESSION_UNTAGGED` | warning | | A session has none of `paid`, `pps`, or `comp`. The session still consumes a package slot. |
+| `E_COACHING_SESSION_WITHOUT_NOTES` | warning | `coaching.session_notes` | A session has no linked or same-day note (coverage only; `note:` integrity is always on). |
+| `E_COACHING_PAID_SESSION_GAP` | warning | `coaching.paid_session_gap` | A paid client (`sessions_remaining > 0` or a `pps` session within `coaching.pps_lookback_days`) has no session in the gap window. The gap clock runs from `max(last session, latest open)`. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. Also: an edge end (`a` / `b`) or a `with:` entry with no record. |
 | `E_SELF_EDGE` | error | | An edge links a person to themself (`a` and `b` are the same id). |
 | `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. |

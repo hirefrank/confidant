@@ -263,7 +263,7 @@ pub fn contract_schema() -> Value {
                     },
                     "packs": {
                         "type": "object",
-                        "description": "Pack state grouped by pack name (\"coaching@0.1\" today). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
+                        "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Opaque hmac:<hex> values."}

@@ -2,8 +2,9 @@
 //!
 //! Replaces the compile-time [`crate::packs::ALL_PACKS`] lookups with a
 //! runtime `PackRegistry` value passed to call sites. The registry holds
-//! the compiled packs plus the implicit built-ins (#551); a later issue adds
-//! loaded packs from `confidant.lock` (#438).
+//! any compiled packs, the implicit built-ins (#551) and the external packs
+//! loaded from `confidant.lock` (#438). There are no compiled optional
+//! packs today (#449).
 //!
 //! A compiled pack always wins on the same `name@version` (PD14); per-pack
 //! failures fail closed (PD12). The [`crate::packs::Pack`] trait is not

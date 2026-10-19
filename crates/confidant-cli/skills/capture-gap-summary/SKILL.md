@@ -1,6 +1,6 @@
 ---
 name: "capture-gap-summary"
-description: "Weekly operator-facing summary of capture gaps: sessions with no notes and paid clients with no recent session (E_SESSION_WITHOUT_NOTES, E_PAID_SESSION_GAP). Read-only; writes nothing."
+description: "Weekly operator-facing summary of capture gaps: sessions with no notes and paid clients with no recent session (E_COACHING_SESSION_WITHOUT_NOTES, E_COACHING_PAID_SESSION_GAP). Read-only; writes nothing."
 ---
 
 # Capture-gap summary

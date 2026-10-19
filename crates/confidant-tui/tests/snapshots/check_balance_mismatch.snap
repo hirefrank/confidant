@@ -4,7 +4,7 @@ vault  unknown   scope  not resolved yet   doctor  not run
 │  FAILED   spec 0.1  •  records 2  •  ledger 3  •  errors 1  •  warnings 0  •  findings 1         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
-│ › [error] E_BALANCE_MISMATCH p-01M3TC5H00MPJG000000 ││ code      E_BALANCE_MISMATCH              │
+│ › [error] E_COACHING_BALANCE_MISMATCH p-01M3TC5H00M ││ code      E_COACHING_BALANCE_MISMATCH     │
 │                                                     ││ severity  [error]                         │
 │                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
 │                                                     ││ location  ledger/2026/10.cfd:3            │

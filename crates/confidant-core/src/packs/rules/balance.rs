@@ -1,8 +1,8 @@
 //! `ledger-balance` (#446): a per-person running count of opened units,
 //! consumed by a ledger verb, verified against `balance` lines.
 //!
-//! Reproduces the compiled `coaching@0.1` behaviour for
-//! `sessions_remaining` and `icf_hours`: the fold's merge-aware
+//! Implements the coaching pack's `sessions_remaining` and `icf_hours`
+//! behaviour: the fold's merge-aware
 //! accumulation, per-date ordering (opens before sessions), the
 //! comp/pps consumption rules, the per-open cap and overflow checks, the
 //! `pkg-` package rule, the negative-balance finding and the `balance`
@@ -17,10 +17,9 @@ use crate::ledger::{parse_decimal_hundredths, Arg};
 use crate::packs::declarative::{
     resolve_declared_severity, resolve_finding_code, RuleCtx, RuleKind,
 };
-use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, RuleDecl};
-use crate::packs::rules::ledger::{self, FoldParams, LedgerIssue};
-use crate::vault::{SourcedEntry, Vault};
+use crate::packs::rules::ledger::{self, FoldParams, LedgerFacts, LedgerIssue};
+use crate::vault::SourcedEntry;
 
 /// Core defaults for the codes the kind emits. A compiled-in pack keeps
 /// them; an external pack sets pack-own codes (PD13: a rule's code must
@@ -490,8 +489,7 @@ fn render_issue(
 /// `check_balances`; reproduces the compiled messages exactly.
 pub(crate) fn check_balance(
     manifest: &PackManifest,
-    vault: &Vault,
-    merges: &MergeGroups,
+    ledger: &std::collections::BTreeMap<String, LedgerFacts>,
     sourced: &SourcedEntry,
     findings: &mut Vec<Finding>,
 ) {
@@ -513,8 +511,10 @@ pub(crate) fn check_balance(
         );
         return;
     };
-    let folded = ledger::fold(vault, merges, params.fold_params());
-    let person = folded.facts.canonical_on(&entry.id, entry.date);
+    let Some(facts) = ledger.get(&rule.id) else {
+        return; // the pack state always caches one per ledger-balance rule
+    };
+    let person = facts.canonical_on(&entry.id, entry.date);
 
     let (asserted, computed, mismatch) = if metric == params.units_metric {
         let asserted: i64 = match number.parse() {
@@ -535,7 +535,7 @@ pub(crate) fn check_balance(
                 return;
             }
         };
-        let computed = folded.facts.sessions_remaining_on(&person, entry.date);
+        let computed = facts.sessions_remaining_on(&person, entry.date);
         (
             asserted.to_string(),
             computed.to_string(),
@@ -557,7 +557,7 @@ pub(crate) fn check_balance(
             findings.push(finding);
             return;
         };
-        let computed = folded.facts.icf_hours_hundredths_on(&person, entry.date);
+        let computed = facts.icf_hours_hundredths_on(&person, entry.date);
         (
             ledger::format_hundredths(asserted),
             ledger::format_hundredths(computed),

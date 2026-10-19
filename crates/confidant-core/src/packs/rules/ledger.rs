@@ -1,12 +1,12 @@
 //! Shared ledger arithmetic for the coaching rule kinds (#446-#448).
 //!
-//! The compiled `coaching@0.1` fold and the declarative kinds must agree
-//! exactly, so this module owns the accumulation and the merge-aware
-//! queries, and `coaching.rs` delegates to it. The rules and messages stay
-//! in their own modules; only the arithmetic and the fold ordering live
-//! here.
+//! The shipped `coaching@0.1` pack's `ledger-balance` rule and the
+//! `session-checks` and `activity-gap` kinds must agree exactly, so this
+//! module owns the accumulation and the merge-aware queries. The rules and
+//! messages stay in their own modules; only the arithmetic and the fold
+//! ordering live here.
 //!
-//! Semantics (ported verbatim from the compiled fold):
+//! Semantics:
 //! - events are ordered by date, then opens before the consuming verb,
 //!   then line, then file;
 //! - only person-prefixed ids take part;
@@ -27,21 +27,14 @@ use crate::packs::groups::MergeGroups;
 use crate::packs::PackState;
 use crate::vault::{SourcedEntry, Vault};
 
-/// The billing tags the compiled coaching fold knows (#447 names the same
-/// list in `billing_tags`). `pps` and `comp` never consume a unit.
-pub(crate) const BILLING_TAGS: [&str; 3] = ["paid", "pps", "comp"];
-
-/// The compiled fold's per-open cap (today `MAX_OPEN_N`).
-pub(crate) const DEFAULT_MAX_OPEN_N: i64 = 100_000;
-
 /// How many of `tags` the entry carries.
 pub(crate) fn billing_tag_count(entry: &LedgerEntry, tags: &[&str]) -> usize {
     tags.iter().filter(|tag| entry.has_token(tag)).count()
 }
 
 /// Format hundredths of an hour as a decimal with two places (`150` ->
-/// `"1.50"`). Moved from `coaching.rs` so the compiled pack and the
-/// declarative kind render an `icf_hours` mismatch identically.
+/// `"1.50"`). Three decimal places, no floating point: the balance rule
+/// renders an `icf_hours` mismatch from it.
 pub(crate) fn format_hundredths(n: i64) -> String {
     let sign = if n < 0 { "-" } else { "" };
     let Some(n) = n.checked_abs() else {
@@ -120,8 +113,7 @@ impl PersonLedger {
     }
 }
 
-/// Merge-aware per-person ledger state. This is the compiled coaching
-/// pack's state too: `coaching.rs` uses it as `CoachingState`.
+/// Merge-aware per-person ledger state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LedgerFacts {
     merge: MergeGroups,

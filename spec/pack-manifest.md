@@ -943,12 +943,12 @@ only event is an open on `2026-01-01` emits `none`.
 ### 13.3. Names
 
 - Pack names match `^[a-z][a-z0-9-]{1,31}$` (PD14).
-- `coaching` and `personal` are reserved: no external pack may use
-  them. A vault listing `coaching@0.1` resolves to the compiled coaching
-  pack, which always wins and whose lockfile entry is ignored (`doctor`
-  notes it). `personal@…` names the implicit built-in personal pack: the
-  listing is a no-op at any version, and any vendored directory or
-  lockfile pin for it is `E_PACK_INVALID` (§13.7).
+- `personal` is reserved: no external pack may use it. `personal@…` names
+  the implicit built-in personal pack: the listing is a no-op at any
+  version, and any vendored directory or lockfile pin for it is
+  `E_PACK_INVALID` (§13.7). `coaching` is an ordinary external pack since
+  #449: a vault listing `coaching@0.1` resolves through `confidant.lock`
+  and its vendored `packs/coaching@0.1/` bytes.
 - Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
 - Finding codes declared by an external pack must match
   `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
@@ -1062,69 +1062,31 @@ message tables — applies in full.
 
 ### 13.8. Removing the compiled coaching path (#449)
 
-*Switch criteria, not a behaviour change. This note needs Frank's
-explicit OK (AGENTS.md rule 7); it describes a future removal, and
-nothing here removes the compiled path.*
+*Landed in #449. This note is the switch record; it changes no format.*
 
-`coaching@0.1` stays compiled into the binary and `coaching` stays a
-reserved name (§13.3) until an external pack can match it. The #449 parity
-fixture (`testdata/packs/coaching-ext/`) is a v2 pack using `note-ref`
-(#458), `ledger-balance` (#446), `session-checks` (#447) and
-`activity-gap` (#448). The core tests run it and the compiled pack over
-the same vaults — the three golden vaults and `examples/demo-vault` — and
-compare findings after the documented code and `[checks]`-key
-normalisation; the CLI test installs it as a real external pack and checks
-the vault clean. That proves the **check** behaviour is reproducible.
+The compiled `coaching@0.1` path is gone. The shipped pack is
+`packs/coaching/`, a v2 external pack using `note-ref` (#458),
+`ledger-balance` (#446), `session-checks` (#447) and `activity-gap`
+(#448), and it opts into the core `ledger-sessions` context view with
+`[context] view = "ledger-sessions"` (#594).
 
-What the declarative path does **not** reproduce yet, which is why the
-compiled path stays (R1 in #504):
-
-- `context_view`: compiled coaching serves the per-person
-  `sessions_remaining` / `icf_hours` / `recent_sessions` view
-  (`packs/coaching.rs`). External packs are check-only by default
-  (PD16); §13.9 adds the opt-in `[context]` view for exactly this shape,
-  and core owns the builder. This is the **only** genuinely
-  compiled-only behaviour.
-
-An earlier version of this section listed three hooks. Two of them are
-already core-owned or never implemented by compiled coaching, so they
-add no blocker; the reasoning is in the #594 proposal comment
-(<https://github.com/hirefrank/confidant/issues/594#issuecomment-6260159832>):
-
-- `private_context_fields`: a trait default (`packs/mod.rs`) that
-  `ManifestPack` already implements for declarative packs
-  (`packs/manifest_pack.rs`); compiled coaching does not override it.
-  The hook is generic, but the only non-empty list today is core-owned:
-  the built-in personal pack returns `context/personal.rs`'s
-  `PRIVATE_CONTEXT_FIELDS`, selected by `ManifestPack` solely for the
-  compiled-in `personal` manifest. A pack loaded as external gets the
-  empty list, so no external pack can yet declare its own PII fields.
-  Coaching's view carries no PII, so it has nothing to declare.
-- `validate_verb_args` / `verb_kind`: trait defaults that compiled
-  coaching does not override, so neither hook answers for `open` or
-  `session`. The `open` and `session` grammars already live in shared
-  core (`packs/rules/ledger.rs`, `packs/rules/session.rs`), the compiled
-  fold delegates to the same code (`packs/coaching.rs`), and the
-  declarative kinds reproduce it under the #449 parity tests. The one
-  grammar served through the trait is `touch` (core-owned, #510), which
-  is neither verb.
-
-Criteria for removing the compiled path, all in one change:
-
-1. Core owns `context_view`, or it has a declared, reviewed home
-   (§13.9 is that home for `ledger-sessions`). The PII-field and
-   verb-argument hooks are already core-owned or shared (above), so they
-   add no blocker.
-2. The parity and CLI tests are green against the *final* `coaching` pack
-   (the fixture is renamed to `coaching` only then).
-3. `coaching` is dropped from `RESERVED_PACK_NAMES`, the hard-coded
-   `COACHING_PACK` in `config.rs` / `check.rs` is removed, and compiled
-   `coaching.rs` is deleted in the same change.
-
-Until all three hold, the reservation and the compiled path stay (PD14:
-compiled wins on equal `name@version`). **Removing the compiled coaching
-path needs Frank's explicit OK**; #504 records the sequencing and the
-core-ownership scope, and #449 tracks the switch.
+- `coaching` is no longer in `RESERVED_PACK_NAMES`; `personal` is the only
+  reserved name. A vault vendors `packs/coaching@0.1/` and pins it in
+  `confidant.lock` like any other external pack.
+- `packs/coaching.rs`, the `ALL_PACKS` entry, `pack_manifests()` and the
+  in-crate vendored copies are deleted. `ALL_PACKS` is empty; the only
+  built-in is the embedded `personal@0.2`.
+- The parity and CLI tests now run the shipped external pack against the
+  three golden vaults and `examples/demo-vault`, which vendors the pack and
+  its lockfile.
+- The finding codes are the pack-own `E_COACHING_*` / `W_COACHING_*`
+  family (PD13 forbids an external pack from naming a builtin code, and
+  omission of a `*_code` parameter does not inherit a core default for an
+  external pack). `spec/findings.md` lists the mapping.
+- The legacy top-level `coaching` field in `context` survives (ADR-7): it
+  is the entry of the pack named `coaching` that serves the
+  `ledger-sessions` view, and the `packs["coaching@0.1"]` key is
+  unchanged.
 
 ### 13.9. Context views (`[context]`, v2, opt-in)
 
@@ -1153,7 +1115,7 @@ recent_limit = 10          # optional; default 10
 
 | View | Spec issue | Reproduces |
 |---|---|---|
-| `ledger-sessions` | #594 | `coaching@0.1`'s per-person `sessions_remaining` / `icf_hours` / `recent_sessions` view (`packs/coaching.rs`) |
+| `ledger-sessions` | #594 | the shipped external `coaching@0.1` pack's per-person `sessions_remaining` / `icf_hours` / `recent_sessions` view |
 
 `ledger-sessions` resolves its parameters from the pack's
 `ledger-balance` rule (§13.2): `open_verb` and `consume_verb` select the
@@ -1169,18 +1131,16 @@ opaque ids, the pack's own balance metrics, and session duration and
 billing-tag tokens. It reads no record field, note body, profile, private
 field, or decrypted content. The pack thus gains no way to inject PII or
 widen the §12 allowlist: the view is core's JSON in core's fixed shape —
-core fixes which slots appear, their key names and their types, and the
-compiled path and any `[context]` pack emit the same ones — with the
-same validation the compiled path has today. Its keys are
+core fixes which slots appear, their key names and their types, and any
+`[context]` pack emits exactly those. Its keys are
 `sessions_remaining` (integer), `icf_hours` (decimal hours, in
 hundredths) and `recent_sessions` — the pack's `consume_verb` entries
 for the canonical person, newest first, truncated to `recent_limit`, each
 `{date, duration_minutes, tag}` with `tag` the first of `paid`, `pps`,
 `comp`. The pack's `units_metric` and `minutes_metric` parameters choose
 which of its declared balance metrics fill the units and hours slots;
-they do not name the keys, so the compiled shape
-(`sessions_remaining`, `icf_hours`, `recent_sessions`) is reproduced
-exactly.
+they do not name the keys, so the fixed keys
+(`sessions_remaining`, `icf_hours`, `recent_sessions`) are used.
 `private_context_fields` and the `--exclude-private` list stay
 core-owned (#510), so `--exclude-private` is a no-op on this view, and
 `context`'s contract is unchanged for a pack without `[context]`. A
@@ -1196,11 +1156,11 @@ widening of the §12 allowlist. The rationale is ADR-7: the compiled
 coaching view is live agent contract that `context`, MCP, the CLI and the
 TUI read today, and it is ledger metadata, not content. Naming a
 core-owned builder keeps PD16's purpose — an external pack cannot reach
-record content — while letting an external `coaching` pack serve the same
-narrow read surface. A pack without `[context]` is check-only, as before.
+record content — while letting the shipped external `coaching@0.1` pack
+serve that same narrow read surface. A pack without `[context]` is
+check-only, as before.
 
-**Parity.** While both paths exist, a core test builds this view from the
-compiled `CoachingPack` and from the core builder over
-`examples/demo-vault` and the three golden vaults and asserts structural
-equality (keys, ordering, values), mirroring #592's parity harness. The
+**Parity.** A core test builds this view from the shipped external pack
+over `examples/demo-vault` and the three golden vaults and asserts the
+literal values and ordering, so arithmetic or shape drift fails. The
 golden `check` JSON files record findings and are **not** edited.
