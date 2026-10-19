@@ -49,7 +49,10 @@ fn run_doctor(vault: &Path, path: &std::ffi::OsStr, extra_env: &[(&str, &str)]) 
         .env("PATH", path)
         .env("CONFIDANT_OFFLINE", "1")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_SKILLS_DIR");
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        // #541: keep the device-key probe off the real OS keychain.
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_KEYCHAIN", "off");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

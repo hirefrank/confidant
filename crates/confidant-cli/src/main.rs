@@ -6097,6 +6097,9 @@ struct DoctorCheck {
     id: &'static str,
     status: &'static str,
     message: String,
+    /// Actionable next step for a non-ok check, serialized as `fix` (the
+    /// ADR-7 error-envelope field name). `None` when nothing needs doing.
+    fix: Option<String>,
 }
 
 /// Latest GitHub Release endpoint (#165). Release builds always use the
@@ -6210,6 +6213,7 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
         id: "cli-staleness",
         status,
         message,
+        fix: None,
     }
 }
 
@@ -6267,6 +6271,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
                 "git {}.{}.{} (>= {floor}; SSH-signed inbox commits supported)",
                 v.0, v.1, v.2
             ),
+            fix: None,
         },
         Some(v) => DoctorCheck {
             id: "git-version",
@@ -6275,6 +6280,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
                 "git {}.{}.{} is below the minimum {floor}; upgrade git to >= {floor} for SSH-signed inbox commits",
                 v.0, v.1, v.2
             ),
+            fix: None,
         },
         None => DoctorCheck {
             id: "git-version",
@@ -6282,6 +6288,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
             message: format!(
                 "could not determine git version; SSH-signed inbox commits need git >= {floor}"
             ),
+            fix: None,
         },
     }
 }
@@ -6322,6 +6329,7 @@ fn keys_staging_check(root: &Path) -> DoctorCheck {
             id: "keys-staging",
             status: "ok",
             message: "no leftover keys/ staging state".to_owned(),
+            fix: None,
         };
     }
     let detail = leftovers.join(", ");
@@ -6332,6 +6340,7 @@ fn keys_staging_check(root: &Path) -> DoctorCheck {
             message: format!(
                 "leftover keys/ staging state ({detail}) from an interrupted operation; the next keys device-add or revoke repairs it"
             ),
+            fix: None,
         }
     } else {
         DoctorCheck {
@@ -6340,7 +6349,66 @@ fn keys_staging_check(root: &Path) -> DoctorCheck {
             message: format!(
                 "keys/ is missing with leftover staging state ({detail}); re-run the interrupted keys command — it repairs staging leftovers before starting"
             ),
+            fix: None,
         }
+    }
+}
+
+/// #541: device key / keychain state for headless hosts and agents.
+///
+/// Probes the same resolution order a real load uses (env, then the OS
+/// keychain) and reports the source plus the exact fix. Never returns or
+/// logs key material. Warning-only for a missing key: an unenrolled device
+/// is normal for a plaintext vault, and `doctor` must not fail on a host
+/// that simply has no keychain yet — the hint is the point.
+fn device_key_check() -> DoctorCheck {
+    use confidant_crypt::keychain::{self, DeviceKeyState, DEVICE_KEY_ENV, INBOX_KEY_ENV};
+
+    const ID: &str = "device-key";
+    let headless_fix = format!(
+        "On headless hosts (no D-Bus Secret Service) set {DEVICE_KEY_ENV} to the device key \
+         and {INBOX_KEY_ENV} to the inbox key before running confidant, e.g. \
+         `export {DEVICE_KEY_ENV}=AGE-SECRET-KEY-1…`. On a new device run `confidant recover` \
+         instead. Keys never live in files."
+    );
+    let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
+        id: ID,
+        status,
+        message,
+        fix,
+    };
+    match keychain::device_key_state() {
+        Ok(DeviceKeyState::Env) => check(
+            "ok",
+            format!("device key comes from {DEVICE_KEY_ENV} (headless/agent host)"),
+            None,
+        ),
+        Ok(DeviceKeyState::Keychain) => check(
+            "ok",
+            "device key is in the OS keychain (keychain reachable)".to_owned(),
+            None,
+        ),
+        Ok(DeviceKeyState::NotEnrolled) => check(
+            "warning",
+            "device key: not enrolled (the OS keychain holds no device key)".to_owned(),
+            Some(headless_fix),
+        ),
+        Ok(DeviceKeyState::KeychainUnreachable(detail)) => check(
+            "warning",
+            format!(
+                "device key: the OS keychain is unreachable ({detail}); this device cannot \
+                 unwrap client keys"
+            ),
+            Some(headless_fix),
+        ),
+        Err(e) => check(
+            "error",
+            format!("device key: {e}"),
+            Some(format!(
+                "Fix the device key source (the OS keychain, or {DEVICE_KEY_ENV} on a headless host), \
+                 then re-run `confidant doctor`"
+            )),
+        ),
     }
 }
 
@@ -6361,6 +6429,7 @@ fn skills_links_check() -> DoctorCheck {
                 id: "skills-links",
                 status: "warning",
                 message: format!("cannot determine home directory: {e:#}"),
+                fix: None,
             };
         }
     };
@@ -6385,6 +6454,7 @@ fn skills_links_check() -> DoctorCheck {
             status: "ok",
             message: "no agents set up; run `confidant setup --agent auto` to install skills"
                 .to_owned(),
+            fix: None,
         };
     }
     let total_expected: usize = targeted.iter().map(|h| h.total).sum();
@@ -6398,6 +6468,7 @@ fn skills_links_check() -> DoctorCheck {
                 "skills linked ({total_linked}/{total_expected}) for {}",
                 names.join(", ")
             ),
+            fix: None,
         }
     } else {
         let mut parts = Vec::new();
@@ -6411,6 +6482,7 @@ fn skills_links_check() -> DoctorCheck {
                 "skills missing (linked {total_linked}/{total_expected}: {}); run `confidant setup --agent auto`",
                 parts.join(", ")
             ),
+            fix: None,
         }
     }
 }
@@ -6430,6 +6502,7 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
         id: ID,
         status: "ok",
         message,
+        fix: None,
     };
 
     let Some(qmd) = find_on_path("qmd") else {
@@ -6577,6 +6650,7 @@ fn cmd_doctor(
         id: "vault-discovery",
         status: "ok",
         message: format!("vault resolved to {}", root.display()),
+        fix: None,
     });
 
     match require_git_repo(root, cli.no_input) {
@@ -6584,11 +6658,13 @@ fn cmd_doctor(
             id: "git-repo",
             status: "ok",
             message: "vault is a git repository".to_owned(),
+            fix: None,
         }),
         Err(_) => checks.push(DoctorCheck {
             id: "git-repo",
             status: "error",
             message: "vault is not a git repository; writes need git".to_owned(),
+            fix: None,
         }),
     }
 
@@ -6605,12 +6681,14 @@ fn cmd_doctor(
             id: "git-identity",
             status: "ok",
             message: format!("git identity is {} <{}>", identity[0], identity[1]),
+            fix: None,
         });
     } else {
         checks.push(DoctorCheck {
             id: "git-identity",
             status: "error",
             message: "git user.name / user.email are not configured; commits will fail".to_owned(),
+            fix: None,
         });
     }
 
@@ -6635,12 +6713,14 @@ fn cmd_doctor(
                     id: "spec",
                     status: "ok",
                     message: "vault spec 0.1 supported".to_owned(),
+                    fix: None,
                 });
             } else {
                 checks.push(DoctorCheck {
                     id: "spec",
                     status: "error",
                     message: format!("unsupported vault spec: {}", vault.config.spec),
+                    fix: None,
                 });
             }
             let report = check_vault(&vault, &CheckOptions::default());
@@ -6652,18 +6732,21 @@ fn cmd_doctor(
                         "check reports {} error(s); writes are blocked until fixed",
                         report.summary.errors
                     ),
+                    fix: None,
                 });
             } else if report.summary.warnings > 0 {
                 checks.push(DoctorCheck {
                     id: "check",
                     status: "warning",
                     message: format!("check reports {} warning(s)", report.summary.warnings),
+                    fix: None,
                 });
             } else {
                 checks.push(DoctorCheck {
                     id: "check",
                     status: "ok",
                     message: "check is clean".to_owned(),
+                    fix: None,
                 });
             }
             // #73: key-manifest health. A corrupt recipients.toml used to
@@ -6684,6 +6767,7 @@ fn cmd_doctor(
                         message: "cannot locate the config dir (HOME unset); \
                                   the manifest seq tracker cannot be checked"
                             .to_owned(),
+                        fix: None,
                     }),
                     Some(config_dir) => {
                         match confidant_crypt::lifecycle::KeyStore::with_config_dir(
@@ -6695,6 +6779,7 @@ fn cmd_doctor(
                                 id: "crypto-manifests",
                                 status: "error",
                                 message: format!("manifest seq tracker unreadable: {e}"),
+                                fix: None,
                             }),
                             Ok(store) => {
                                 let mut corrupt: Vec<String> = Vec::new();
@@ -6721,6 +6806,7 @@ fn cmd_doctor(
                                         } else {
                                             format!("{valid} key manifest(s) parse")
                                         },
+                                        fix: None,
                                     });
                                 } else {
                                     checks.push(DoctorCheck {
@@ -6730,6 +6816,7 @@ fn cmd_doctor(
                                             "corrupt key manifest(s); fix or re-init before crypto operations: {}",
                                             corrupt.join("; ")
                                         ),
+                                        fix: None,
                                     });
                                 }
                                 // #154 must-fix 4: surface degraded git history,
@@ -6740,6 +6827,7 @@ fn cmd_doctor(
                                         id: "shred-history",
                                         status: "warning",
                                         message: reason,
+                                        fix: None,
                                     });
                                 }
                             }
@@ -6752,6 +6840,7 @@ fn cmd_doctor(
             id: "vault-load",
             status: "error",
             message: format!("cannot load vault: {e}"),
+            fix: None,
         }),
     }
 
@@ -6782,6 +6871,7 @@ fn cmd_doctor(
             id: "crypto",
             status: "ok",
             message: mode_desc.to_owned(),
+            fix: None,
         });
     } else if confidant_crypt::is_available() {
         checks.push(DoctorCheck {
@@ -6790,6 +6880,7 @@ fn cmd_doctor(
             message:
                 "crypto library present, CLI not wired yet, vault content is stored as plaintext"
                     .to_owned(),
+            fix: None,
         });
     } else {
         checks.push(DoctorCheck {
@@ -6797,8 +6888,14 @@ fn cmd_doctor(
             status: "warning",
             message: "encryption not available in this build; vault content is stored as plaintext"
                 .to_owned(),
+            fix: None,
         });
     }
+
+    // #541: keychain reachability and device enrollment. Headless hosts
+    // have no Secret Service, so the failure an agent hits is otherwise an
+    // opaque NoKey; this names the source and the env-var fix.
+    checks.push(device_key_check());
 
     // #105: report pending inbox rotation as a warning until explicitly cleared.
     if let Ok(pending_path) = pending_inbox_rotation_path() {
@@ -6819,6 +6916,7 @@ fn cmd_doctor(
                          run `confidant inbox rotate --finish` on the inbox device, then \
                          `confidant doctor --clear-pending-inbox-rotation`"
                     ),
+                    fix: None,
                 });
             }
         }
@@ -6834,6 +6932,7 @@ fn cmd_doctor(
             id: "record-encryption-mix",
             status: "ok",
             message: format!("{encrypted} encrypted, {plaintext} plaintext record files"),
+            fix: None,
         });
     }
 
@@ -6862,11 +6961,17 @@ fn cmd_doctor(
         let items: Vec<serde_json::Value> = checks
             .iter()
             .map(|c| {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "id": c.id,
                     "status": c.status,
                     "message": c.message,
-                })
+                });
+                // `fix` only when there is one: the field stays absent on
+                // healthy checks, matching the ADR-7 error envelope.
+                if let Some(fix) = &c.fix {
+                    item["fix"] = serde_json::Value::String(fix.clone());
+                }
+                item
             })
             .collect();
         let mut extra = serde_json::Map::new();
@@ -6877,6 +6982,9 @@ fn cmd_doctor(
     } else {
         for c in &checks {
             println!("{:7} {}: {}", c.status, c.id, c.message);
+            if let Some(fix) = &c.fix {
+                println!("        fix: {fix}");
+            }
         }
     }
     if ok {
