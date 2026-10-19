@@ -82,7 +82,7 @@ Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2
 |---|---|
 | `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [-v]` | Materialize embedded skills, link into agent skill dirs |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
-| `confidant doctor` | Vault health + CLI staleness + skills link health |
+| `confidant doctor` | Vault health + CLI staleness + keychain/device-enrollment state + skills link health |
 | `confidant agents` | List supported agents and detection status |
 | `confidant which [--skills-dir]` | Print installed skills location |
 | `confidant routing` | Print the optional routing snippet |
@@ -103,6 +103,45 @@ Every command takes `--json` and `--no-input` per the agent contract.
 | `CONFIDANT_OFFLINE=1` | Skip the release check entirely |
 | `CONFIDANT_HOME` | Root for materialized skills (default `~/.local/share/confidant`) |
 | `CONFIDANT_SKILLS_DIR` | Single skills parent, overrides `--agent` |
+
+## Headless hosts and agents
+
+Linux containers, cloud VMs, and agent sandboxes usually have no D-Bus
+session bus, so the OS keychain (Secret Service) is unreachable. Confidant
+fails closed there: loading the device or inbox key errors out instead of
+falling back to anything on disk. Keys never live in files — there is no
+file-backed keystore, and no `CONFIDANT_KEYCHAIN`-style switch can point at
+one (see [`docs/crypto-design.md`](crypto-design.md) §2).
+
+The supported headless path is the env-var overrides, injected per process
+by the host's secret store or agent runtime:
+
+| Variable | What |
+|---|---|
+| `CONFIDANT_DEVICE_KEY` | This device's age identity (`AGE-SECRET-KEY-1…`) |
+| `CONFIDANT_INBOX_KEY` | The vault inbox keypair's private half (`AGE-SECRET-KEY-1…`) |
+| `CONFIDANT_INBOX_KEY_PREVIOUS` | The rotation-window slot (only during `inbox rotate`) |
+| `CONFIDANT_OPERATOR_KEY` | Operator Ed25519 seed (64 hex chars), operator-only commands |
+
+An env var wins over the keychain and holds the same value the keychain
+would (`AGE-SECRET-KEY-1…`), so injecting one cannot silently change which
+key a command uses. Set it in the process environment only, never in the
+vault, a git file, or a shell history line.
+
+`confidant doctor` reports the result as one `device-key` check, with the
+same data in human and `--json` output:
+
+| Check message | Meaning |
+|---|---|
+| `device key comes from CONFIDANT_DEVICE_KEY` | Env-provided; the normal headless state (ok) |
+| `device key is in the OS keychain` | Keychain reachable and enrolled (ok) |
+| `not enrolled (the OS keychain holds no device key)` | Reachable but empty: run `confidant init` / `confidant recover`, or inject `CONFIDANT_DEVICE_KEY` (warning) |
+| `the OS keychain is unreachable (...)` | Headless host or locked keychain; the `fix` field names `CONFIDANT_DEVICE_KEY` and `CONFIDANT_INBOX_KEY` (warning) |
+
+In `--json`, each check is `{id, status, message}` plus `fix` when there is
+something to do. A missing key is a warning, not an error: a plaintext demo
+vault needs no keys, and a report that still lists every other check is
+more useful than a hard failure.
 
 ## Staying current (updates)
 

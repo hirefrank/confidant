@@ -81,10 +81,14 @@ fn run_json(args: &[&str]) -> (bool, Value) {
     // Hermetic HOME: Windows CI runners don't set HOME, and doctor's
     // crypto-manifests check errors without a config dir. A fresh tempdir
     // per call is fine — no test here persists anchor state across calls.
+    // The keychain is disabled too (#541): `doctor` probes it for device
+    // enrollment, and these plaintext fixtures never need real keys.
     let tmp_home = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
         .args(args)
         .env("HOME", tmp_home.path())
+        .env("CONFIDANT_KEYCHAIN", "off")
+        .env_remove("CONFIDANT_DEVICE_KEY")
         .output()
         .unwrap();
     let v: Value = match serde_json::from_slice(&out.stdout) {
@@ -109,6 +113,9 @@ fn run_raw(args: &[&str]) -> (bool, String, String) {
     let out = Command::new(bin())
         .args(args)
         .env("HOME", tmp_home.path())
+        // #541: doctor probes the keychain; keep the suite off the real one.
+        .env("CONFIDANT_KEYCHAIN", "off")
+        .env_remove("CONFIDANT_DEVICE_KEY")
         .output()
         .unwrap();
     (

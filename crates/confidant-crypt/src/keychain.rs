@@ -41,6 +41,11 @@
 //! hosts the keychain is unreachable (keyring reports no storage access)
 //! — use the env-var overrides there. macOS always has a keychain.
 //!
+//! Diagnostics: [`device_key_state`] reports where the device key resolves
+//! from (env / keychain / not enrolled / unreachable) without returning
+//! key material, so `confidant doctor` can name the fix. It is
+//! observational — never a decrypt path.
+//!
 //! Device and inbox keys are stored as the age identity's Bech32 encoding
 //! (`AGE-SECRET-KEY-1…`), the same format the env vars take, so keychain
 //! and env var are interchangeable. The operator signing key is the odd
@@ -318,6 +323,82 @@ pub fn device_key() -> Result<Zeroizing<Vec<u8>>, Error> {
         "device key",
         KeyFormat::AgeBech32,
     )
+}
+
+/// Where the device key resolves from, for diagnostics only. Never carries
+/// key material.
+///
+/// The resolution order matches [`device_key`] exactly — legacy plaintext
+/// file refused, then `CONFIDANT_DEVICE_KEY`, then the OS keychain — so a
+/// caller reports the state a real load would see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceKeyState {
+    /// `CONFIDANT_DEVICE_KEY` supplies a valid key (tests, CI, agent hosts).
+    Env,
+    /// The OS keychain holds the device key.
+    Keychain,
+    /// The keychain is reachable but holds no device key: not enrolled.
+    NotEnrolled,
+    /// The keychain could not be read (for example no D-Bus Secret Service
+    /// on a headless Linux host). The message is the backend's, never key
+    /// material.
+    KeychainUnreachable(String),
+}
+
+/// Report where the device key comes from, without returning it.
+///
+/// Observational wrapper over the same resolution order as
+/// [`device_key`]; it is not a decrypt path. A refusal (legacy plaintext
+/// key file, malformed env override, bad `CONFIDANT_KEYCHAIN` value) is
+/// returned unchanged so the caller can show it instead of naming a
+/// source that would not actually load.
+pub fn device_key_state() -> Result<DeviceKeyState, Error> {
+    device_key_state_with(&OsKeychain, config_dir().as_deref())
+}
+
+/// Backend-parameterized [`device_key_state`], for diagnostics tests: the
+/// real OS keychain is never touched in unit tests.
+pub fn device_key_state_with(
+    backend: &dyn KeychainBackend,
+    config_dir: Option<&Path>,
+) -> Result<DeviceKeyState, Error> {
+    // A typo in the test-only switch is an error, not "unreachable".
+    keychain_switch()?;
+    // Same first refusal as `load_key_opt`: a stray plaintext key file is
+    // never silently ignored, diagnostics included.
+    if let Some(dir) = config_dir {
+        refuse_if_legacy_file(
+            dir,
+            LEGACY_DEVICE_FILE,
+            DEVICE_SERVICE,
+            DEVICE_ACCOUNT,
+            "device key",
+        )?;
+    }
+    // Env wins over the keychain, exactly as in `load_key_opt`. Validate
+    // first so a typo reads as a bad key, not as "env-provided".
+    if let Ok(raw) = std::env::var(DEVICE_KEY_ENV) {
+        let raw = Zeroizing::new(raw);
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            validate_key_format(trimmed, "device key", DEVICE_KEY_ENV, KeyFormat::AgeBech32)?;
+            return Ok(DeviceKeyState::Env);
+        }
+    }
+    match backend_password(backend, DEVICE_SERVICE, DEVICE_ACCOUNT) {
+        Ok(Some(raw)) => {
+            validate_key_format(
+                raw.trim(),
+                "device key",
+                &format!("keychain {DEVICE_SERVICE}/{DEVICE_ACCOUNT}"),
+                KeyFormat::AgeBech32,
+            )?;
+            Ok(DeviceKeyState::Keychain)
+        }
+        Ok(None) => Ok(DeviceKeyState::NotEnrolled),
+        Err(Error::Keychain(detail)) => Ok(DeviceKeyState::KeychainUnreachable(detail)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Load the inbox key's Bech32 age identity (`AGE-SECRET-KEY-1…`),
@@ -1119,6 +1200,110 @@ mod tests {
         assert!(matches!(err, Error::NoKey(_)), "unexpected: {err:?}");
         let err = h.load_inbox().unwrap_err();
         assert!(matches!(err, Error::NoKey(_)), "unexpected: {err:?}");
+    }
+
+    /// A backend that fails every read, like a headless host with no D-Bus
+    /// session bus. Diagnostics must name the failure, never fall back.
+    struct UnreachableKeychain;
+
+    impl KeychainBackend for UnreachableKeychain {
+        fn get_password(
+            &self,
+            _service: &str,
+            _account: &str,
+        ) -> Result<Option<Zeroizing<String>>, Error> {
+            Err(Error::Keychain("no Secret Service on this host".to_owned()))
+        }
+
+        fn set_password(
+            &self,
+            _service: &str,
+            _account: &str,
+            _password: &str,
+        ) -> Result<(), Error> {
+            Err(Error::Keychain("no Secret Service on this host".to_owned()))
+        }
+
+        fn delete_credential(&self, _service: &str, _account: &str) -> Result<(), Error> {
+            Err(Error::Keychain("no Secret Service on this host".to_owned()))
+        }
+    }
+
+    #[test]
+    fn device_key_state_reports_env() {
+        let bech32 = fresh_identity_bech32();
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.set(DEVICE_KEY_ENV, &bech32);
+        let state = device_key_state_with(&h.backend, h.dir()).unwrap();
+        assert_eq!(state, DeviceKeyState::Env);
+    }
+
+    #[test]
+    fn device_key_state_reports_keychain() {
+        let bech32 = fresh_identity_bech32();
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
+        store_key(
+            &h.backend,
+            DEVICE_SERVICE,
+            DEVICE_ACCOUNT,
+            &bech32,
+            "device key",
+        )
+        .unwrap();
+        let state = device_key_state_with(&h.backend, h.dir()).unwrap();
+        assert_eq!(state, DeviceKeyState::Keychain);
+    }
+
+    #[test]
+    fn device_key_state_reports_not_enrolled() {
+        // Reachable backend, no entry: the device is simply not enrolled.
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
+        let state = device_key_state_with(&h.backend, h.dir()).unwrap();
+        assert_eq!(state, DeviceKeyState::NotEnrolled);
+    }
+
+    #[test]
+    fn device_key_state_reports_unreachable_keychain() {
+        // Env unset and the keychain failing: report the backend message
+        // so `doctor` can point at the env-var override.
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
+        let state = device_key_state_with(&UnreachableKeychain, h.dir()).unwrap();
+        assert_eq!(
+            state,
+            DeviceKeyState::KeychainUnreachable("no Secret Service on this host".to_owned())
+        );
+    }
+
+    #[test]
+    fn device_key_state_rejects_bad_env() {
+        let h = Harness::new();
+        let mut _g = EnvGuard::lock();
+        _g.set(DEVICE_KEY_ENV, "not-a-key");
+        let err = device_key_state_with(&h.backend, h.dir()).unwrap_err();
+        assert!(matches!(err, Error::Age(_)), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn device_key_state_refuses_legacy_file() {
+        // Diagnostics never launder a stray plaintext key file into a
+        // cheerful "not enrolled".
+        let bech32 = fresh_identity_bech32();
+        let h = Harness::new();
+        std::fs::write(h.dir.path().join(LEGACY_DEVICE_FILE), &bech32).unwrap();
+        let mut _g = EnvGuard::lock();
+        _g.unset(DEVICE_KEY_ENV);
+        let err = device_key_state_with(&h.backend, h.dir()).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy plaintext key file"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
