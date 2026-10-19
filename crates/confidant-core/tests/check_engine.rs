@@ -9857,18 +9857,25 @@ fn shipped_coaching_note_ref_codes_are_pack_own() {
 fn shipped_coaching_pack_hash_is_stable() {
     let pack = read_pack_dir(&shipped_coaching_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:d5dbb563979e7b16f2a35f0a59412720149a43ef207fa6a6d799da669d3ab604",
+        pack.hash, "sha256:b4234c3b952e9905b02c9a03b4aacaf78c44bcf37f366548d29c4bb6691f8813",
         "the shipped coaching pack changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);
 }
 
 /// #449: the demo vault's vendored coaching pack is a byte-for-byte copy of
-/// the shipped `packs/coaching/`, so the example cannot drift.
+/// the shipped `packs/coaching/`, so the example cannot drift — and its
+/// `confidant.lock` pins that same tree.
+///
+/// #633 edited the pack's hash-pinned `SKILL.md` (root and demo copy) but
+/// left the demo lock's pin stale, so `check` reported `E_PACK_HASH` and the
+/// coaching pack became unloadable. The byte comparison below cannot catch
+/// that: both copies drift together. The lock assertion can, and it fails
+/// here rather than only in the CLI suite that `check`s the demo vault.
 #[test]
 fn demo_vault_vendored_coaching_matches_shipped_pack() {
-    let demo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/demo-vault/packs/coaching@0.1");
+    let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+    let demo = demo_root.join("packs/coaching@0.1");
     let shipped = shipped_coaching_dir();
     for name in ["manifest.toml", "SKILL.md", "0.1.md"] {
         assert_eq!(
@@ -9877,9 +9884,21 @@ fn demo_vault_vendored_coaching_matches_shipped_pack() {
             "examples/demo-vault/packs/coaching@0.1/{name} drifted from packs/coaching/{name}"
         );
     }
+    let demo_hash = read_pack_dir(&demo).unwrap().hash;
+    assert_eq!(demo_hash, read_pack_dir(&shipped).unwrap().hash);
+
+    let lock = confidant_core::packs::lock::read_lockfile(&demo_root)
+        .expect("the demo vault lock reads")
+        .expect("the demo vault pins its coaching pack");
+    let pin = lock
+        .packs
+        .iter()
+        .find(|entry| entry.id() == "coaching@0.1")
+        .expect("the demo vault lock pins coaching@0.1");
     assert_eq!(
-        read_pack_dir(&demo).unwrap().hash,
-        read_pack_dir(&shipped).unwrap().hash
+        pin.hash, demo_hash,
+        "examples/demo-vault/confidant.lock pins a stale coaching@0.1 tree; \
+         reinstall the pack (`confidant pack update coaching --from-dir packs/coaching --yes`)"
     );
 }
 
