@@ -241,7 +241,17 @@ fn dry_run_lists_every_item_and_mutates_nothing() {
     assert_eq!(v["dry_run"], true);
     assert_eq!(v["changed"], true);
     assert!(v["vault"].is_null(), "{v}");
-    assert!(v["vault_guard"].is_null(), "{v}");
+    // The fixture's default and [vaults] entries both point at missing
+    // paths; the guard reports them but nothing is initialized.
+    let guard = &v["vault_guard"];
+    assert_eq!(guard["forced"], false, "{guard}");
+    assert_eq!(guard["initialized"], serde_json::json!([]), "{guard}");
+    let candidates = guard["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{guard}");
+    for candidate in candidates {
+        assert_eq!(candidate["initialized"], false, "{candidate}");
+        assert!(!candidate["sources"].as_array().unwrap().is_empty());
+    }
 
     let items = v["items"].as_array().unwrap();
     assert_eq!(items.len(), 11, "{items:?}");
@@ -399,13 +409,32 @@ fn guard_refuses_live_vault_and_force_allows_without_touching_it() {
     let (out, v) = h.reset_json(&["--yes", "--no-input", "--force", "--vault", &vault_arg]);
     assert!(out.status.success(), "{v}");
     assert_eq!(v["changed"], true, "{v}");
+    let guard = &v["vault_guard"];
     assert_eq!(
-        v["vault_guard"]["vault"],
-        vault_canonical.display().to_string(),
-        "{v}"
+        guard["initialized"],
+        serde_json::json!([vault_canonical.display().to_string()]),
+        "{guard}"
     );
-    assert_eq!(v["vault_guard"]["initialized"], true, "{v}");
-    assert_eq!(v["vault_guard"]["forced"], true, "{v}");
+    assert_eq!(guard["forced"], true, "{guard}");
+    let live = guard["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["initialized"] == true)
+        .expect("the live vault is reported");
+    assert_eq!(
+        live["path"],
+        vault_canonical.display().to_string(),
+        "{live}"
+    );
+    assert!(
+        live["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source == "--vault"),
+        "{live}"
+    );
     assert!(h.keychain_entries().is_empty());
     assert_eq!(
         h.snapshot(&h.vault),
@@ -430,8 +459,116 @@ fn deleted_vault_path_does_not_block_reset() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(v["changed"], true, "{v}");
-    assert!(v["vault_guard"].is_null(), "{v}");
+    assert_eq!(
+        v["vault_guard"]["initialized"],
+        serde_json::json!([]),
+        "{v}"
+    );
     assert!(h.keychain_entries().is_empty());
+}
+
+#[test]
+fn guard_checks_vaults_when_default_vault_is_deleted() {
+    // A deleted default_vault must not hide a live [vaults] entry whose
+    // device/operator keys this reset would delete.
+    let h = Harness::new();
+    h.write_fixture();
+    let deleted_default = h._tmp.path().join("deleted-default");
+    let config = std::fs::read_to_string(h.config()).unwrap();
+    let config = config
+        .replace(
+            &h._tmp.path().join("retired-vault").display().to_string(),
+            &deleted_default.display().to_string(),
+        )
+        .replace(
+            &h._tmp.path().join("other-vault").display().to_string(),
+            &h.vault.display().to_string(),
+        );
+    std::fs::write(h.config(), config).unwrap();
+    let vault_before = h.snapshot(&h.vault);
+    let live = std::fs::canonicalize(&h.vault).unwrap();
+
+    let (out, v) = h.reset_json(&["--yes", "--no-input"]);
+    assert_eq!(out.status.code(), Some(1), "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&live.display().to_string()), "{message}");
+    h.assert_everything_present();
+    assert_eq!(
+        h.snapshot(&h.vault),
+        vault_before,
+        "refusal touched the vault"
+    );
+}
+
+#[test]
+fn guard_fails_closed_on_bad_vault_flag_with_live_default() {
+    // A `--vault` that does not exist used to make discovery fail, which
+    // left the guard with no vault to inspect. It must still see the live
+    // default_vault.
+    let h = Harness::new();
+    h.write_fixture();
+    let config = std::fs::read_to_string(h.config()).unwrap();
+    let config = config.replace(
+        &h._tmp.path().join("retired-vault").display().to_string(),
+        &h.vault.display().to_string(),
+    );
+    std::fs::write(h.config(), config).unwrap();
+    let vault_before = h.snapshot(&h.vault);
+    let live = std::fs::canonicalize(&h.vault).unwrap();
+    let missing = h._tmp.path().join("missing-flag-vault");
+    let missing_arg = missing.display().to_string();
+
+    let (out, v) = h.reset_json(&["--yes", "--no-input", "--vault", &missing_arg]);
+    assert_eq!(out.status.code(), Some(1), "{v}");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&live.display().to_string()), "{message}");
+    h.assert_everything_present();
+    assert_eq!(
+        h.snapshot(&h.vault),
+        vault_before,
+        "refusal touched the vault"
+    );
+}
+
+#[test]
+fn keychain_failure_points_at_the_manual_fallback_and_keeps_files() {
+    // No test keychain dir + the kill switch: keychain writes refuse, the
+    // command fails closed before touching files, and the error tells the
+    // user where the platform fallback lives.
+    let h = Harness::new();
+    h.write_fixture();
+    let out = h
+        .cmd(&["reset", "--machine-state", "--yes", "--no-input", "--json"])
+        .env_remove("CONFIDANT_TEST_KEYCHAIN_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(message.contains("confidant/device-key"), "{message}");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    assert!(fix.contains("docs/starting-fresh.md"), "{fix}");
+    assert!(fix.contains("secret-tool"), "{fix}");
+    h.assert_everything_present();
+}
+
+#[test]
+fn nothing_to_remove_skips_confirmation() {
+    // Nothing present: go straight to the no-op instead of asking.
+    let h = Harness::new();
+    let out = h
+        .cmd(&["reset", "--machine-state"])
+        .env("CONFIDANT_TEST_FORCE_INTERACTIVE", "1")
+        .env("CONFIDANT_TEST_PROMPT_ANSWERS", "n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("nothing to remove: machine state is already clear"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("nothing removed"), "{stdout}");
 }
 
 #[test]

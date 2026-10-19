@@ -267,13 +267,15 @@ enum Command {
     /// entries from `config.toml`, and this machine's device, operator and
     /// inbox keys from the OS keychain.
     ///
-    /// It refuses when a vault is resolvable (`--vault`, `CONFIDANT_VAULT`,
-    /// or a walk-up) and has a `keys/` tree, because removing the anchor and
-    /// keys would break it; `--force` overrides that only for a vault you
-    /// have retired. Use the global `--dry-run` to see the plan; `--yes`
-    /// (or an interactive `y`) is required to remove anything. JSON always
-    /// reports `"vault": null`: this command is machine state, not
-    /// vault-scoped.
+    /// It refuses when any resolvable vault has a `keys/` tree, because
+    /// removing the anchor and keys would break it. It checks `--vault`,
+    /// `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up from the
+    /// current directory, `default_vault`, and every `[vaults]` entry — even
+    /// when discovery itself would fail — and names every initialized vault
+    /// in the error. `--force` overrides the guard only for vaults you have
+    /// retired. Use the global `--dry-run` to see the plan; `--yes` (or an
+    /// interactive `y`) is required to remove anything. JSON always reports
+    /// `"vault": null`: this command is machine state, not vault-scoped.
     Reset {
         /// Machine state only. Required: there is no vault-scoped reset.
         #[arg(long, required = true)]
@@ -1317,9 +1319,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 *clear_pending_inbox_rotation,
             )
         }
-        Command::Reset { yes, force, .. } => {
-            cmd_reset_machine_state(&cli, vault_root.as_deref(), *yes, *force)
-        }
+        Command::Reset { yes, force, .. } => cmd_reset_machine_state(&cli, *yes, *force),
         Command::Init { force, .. } => {
             let root = vault_root.unwrap();
             cmd_init(&cli, &root, *force)
@@ -8034,16 +8034,219 @@ fn delete_machine_key(slot: MachineKeySlot) -> anyhow::Result<()> {
     result.map_err(anyhow::Error::new)
 }
 
+/// A keychain failure is a dead end without a pointer to the manual path;
+/// the docs page keeps the platform commands as the fallback.
+fn keychain_delete_error(slot: MachineKeySlot, err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(
+        DomainError::invalid(format!(
+            "could not remove keychain entry {}/{}: {err:#}",
+            slot.service(),
+            slot.account()
+        ))
+        .with_fix(
+            "If this host has no reachable keychain, remove the entry with `secret-tool` (Linux) or `security` (macOS); see docs/starting-fresh.md, \"Clearing keychain entries\", then re-run",
+        ),
+    )
+}
+
+/// One vault path the reset guard checked. `sources` records every input
+/// that named it (`--vault`, `CONFIDANT_VAULT`, a walk-up, `default_vault`,
+/// or a `[vaults]` entry); `initialized` means the directory exists and has
+/// a `keys/` tree.
+struct VaultCandidate {
+    path: PathBuf,
+    sources: Vec<String>,
+    initialized: bool,
+}
+
+/// Expand the `~/` form used by `config.toml` values, matching
+/// `confidant_core::discover`'s `default_vault`/`[vaults]` handling.
+fn expand_config_path(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut path = PathBuf::from(home);
+            path.push(rest);
+            return path;
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// A display/dedupe path for a candidate: a `confidant.toml` argument
+/// becomes its parent (as discovery does), and an existing path is
+/// canonicalized (macOS `/var` → `/private/var`).
+fn normalize_vault_candidate(path: &Path) -> PathBuf {
+    let path = if path.is_file()
+        && path
+            .file_name()
+            .is_some_and(|name| name == "confidant.toml")
+    {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn push_vault_candidate(
+    candidates: &mut Vec<VaultCandidate>,
+    source: impl Into<String>,
+    path: PathBuf,
+) {
+    let path = normalize_vault_candidate(&path);
+    let source = source.into();
+    if let Some(existing) = candidates.iter_mut().find(|c| c.path == path) {
+        if !existing.sources.contains(&source) {
+            existing.sources.push(source);
+        }
+        return;
+    }
+    let initialized = path.join("keys").is_dir();
+    candidates.push(VaultCandidate {
+        path,
+        sources: vec![source],
+        initialized,
+    });
+}
+
+/// The nearest ancestor of `start` holding `confidant.toml`, matching
+/// discovery's walk-up. Never fails the guard when the directory cannot be
+/// canonicalized.
+fn walk_up_vault(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    loop {
+        if dir.join("confidant.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn config_string_value(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    match doc.get(key) {
+        None => Ok(None),
+        Some(item) => match item.as_str() {
+            Some(value) => Ok(Some(value.to_owned())),
+            None => Err(anyhow::Error::new(DomainError::config(format!(
+                "{}: {key} is not a string — refusing to rewrite it",
+                path.display()
+            )))),
+        },
+    }
+}
+
+fn config_vault_entries(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(item) = doc.get("vaults") else {
+        return Ok(Vec::new());
+    };
+    let Some(table) = item.as_table_like() else {
+        return Err(not_a_table(path, "vaults"));
+    };
+    let mut entries = Vec::new();
+    for (name, item) in table.iter() {
+        let Some(value) = item.as_str() else {
+            return Err(anyhow::Error::new(DomainError::config(format!(
+                "{}: [vaults].{name} is not a string — refusing to rewrite it",
+                path.display()
+            ))));
+        };
+        entries.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(entries)
+}
+
+/// Build the guard's candidate set from every way a vault can resolve. It
+/// deliberately does not use `discover()`: discovery stops at the first
+/// answer, and a bad `--vault` makes it fail, which would leave a live
+/// `default_vault` or `[vaults]` entry unchecked. Read-only.
+fn vault_guard_candidates(
+    cli: &Cli,
+    doc: &toml_edit::DocumentMut,
+    config_path: &Path,
+) -> anyhow::Result<Vec<VaultCandidate>> {
+    let mut candidates = Vec::new();
+
+    if let Some(flag) = &cli.vault {
+        push_vault_candidate(&mut candidates, "--vault", flag.clone());
+    }
+
+    let vault_entries = config_vault_entries(doc, config_path)?;
+    if let Some(env) = std::env::var("CONFIDANT_VAULT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        // `CONFIDANT_VAULT` is a path unless it names a `[vaults]` entry,
+        // exactly as discovery treats it.
+        let path = vault_entries
+            .iter()
+            .find(|(name, _)| name == &env)
+            .map(|(_, raw)| expand_config_path(raw))
+            .unwrap_or_else(|| expand_config_path(&env));
+        push_vault_candidate(&mut candidates, "CONFIDANT_VAULT", path);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(found) = walk_up_vault(&cwd) {
+        push_vault_candidate(&mut candidates, "walk-up", found);
+    }
+
+    if let Some(default) = config_string_value(doc, config_path, "default_vault")? {
+        push_vault_candidate(
+            &mut candidates,
+            "default_vault",
+            expand_config_path(&default),
+        );
+    }
+
+    for (name, raw) in vault_entries {
+        push_vault_candidate(
+            &mut candidates,
+            format!("[vaults] {name}"),
+            expand_config_path(&raw),
+        );
+    }
+
+    Ok(candidates)
+}
+
+fn vault_candidates_json(candidates: &[VaultCandidate], force: bool) -> Value {
+    let items: Vec<Value> = candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "path": candidate.path.display().to_string(),
+                "sources": candidate.sources,
+                "initialized": candidate.initialized,
+            })
+        })
+        .collect();
+    let initialized: Vec<Value> = candidates
+        .iter()
+        .filter(|candidate| candidate.initialized)
+        .map(|candidate| Value::String(candidate.path.display().to_string()))
+        .collect();
+    serde_json::json!({
+        "candidates": items,
+        "initialized": initialized,
+        "forced": force,
+    })
+}
+
 /// `confidant reset --machine-state` (#638): clear the state the machine
 /// keeps *outside* the vault so `init --create` starts clean. The vault is
 /// never opened for writing; a resolvable initialized vault only triggers
 /// the guard.
-fn cmd_reset_machine_state(
-    cli: &Cli,
-    vault: Option<&Path>,
-    yes: bool,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
+fn cmd_reset_machine_state(cli: &Cli, yes: bool, force: bool) -> anyhow::Result<ExitCode> {
     let dry_run = cli.dry_run;
 
     if dry_run && yes {
@@ -8057,29 +8260,6 @@ fn cmd_reset_machine_state(
         )));
     }
 
-    // Guard: only an initialized vault (keys/ exists) can be broken by
-    // removing the anchor and keys. Read-only.
-    let initialized_vault = vault.filter(|root| root.join("keys").is_dir());
-    if let Some(root) = initialized_vault {
-        if !force {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "refusing to clear machine state: vault {} looks initialized (keys/ exists), and removing the trust anchor and keys would break it",
-                    root.display()
-                ))
-                .with_fix(
-                    "Pass --force only if you have retired this vault; otherwise run from outside it or unset CONFIDANT_VAULT",
-                ),
-            ));
-        }
-        if !cli.json {
-            eprintln!(
-                "warning: --force set; vault {} looks initialized and will be left without its anchor or keys",
-                root.display()
-            );
-        }
-    }
-
     let config_dir = confidant_config_dir().ok_or_else(|| {
         anyhow::Error::new(DomainError::usage(
             "`reset --machine-state` needs $HOME to locate ~/.config/confidant",
@@ -8087,8 +8267,45 @@ fn cmd_reset_machine_state(
     })?;
     let config_path = config_dir.join("config.toml");
 
-    // Read the config once so presence and removal agree on one document.
+    // Read the config once so presence, guard, and removal agree on one
+    // document.
     let mut doc = read_user_config_document(&config_path)?;
+
+    // Guard: only an initialized vault (keys/ exists) can be broken by
+    // removing the anchor and keys. Check every way a vault can resolve,
+    // not just the one discovery would pick. Read-only.
+    let candidates = vault_guard_candidates(cli, &doc, &config_path)?;
+    let initialized: Vec<&VaultCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.initialized)
+        .collect();
+    if !initialized.is_empty() {
+        let listed = initialized
+            .iter()
+            .map(|candidate| candidate.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (subject, verb, object, possessive) = if initialized.len() == 1 {
+            ("vault", "looks", "it", "its")
+        } else {
+            ("vaults", "look", "them", "their")
+        };
+        if !force {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "refusing to clear machine state: {subject} {listed} {verb} initialized (keys/ exists), and removing the trust anchor and keys would break {object}"
+                ))
+                .with_fix(
+                    "Pass --force only after retiring every listed vault; otherwise run from outside them or unset CONFIDANT_VAULT",
+                ),
+            ));
+        }
+        if !cli.json {
+            eprintln!(
+                "warning: --force set; initialized {subject} {listed} will be left without {possessive} anchor or keys"
+            );
+        }
+    }
 
     let mut items: Vec<ResetItem> = Vec::new();
     for name in [
@@ -8110,7 +8327,10 @@ fn cmd_reset_machine_state(
 
     let changed = items.iter().any(|item| item.present != Some(false));
 
+    // Nothing present: report the no-op without asking (there is nothing
+    // to confirm).
     if !dry_run
+        && changed
         && !yes
         && !confirm_yn(
             "Remove this machine's Confidant state? This never touches a vault.",
@@ -8132,7 +8352,7 @@ fn cmd_reset_machine_state(
                 .find(|item| item.slot == Some(slot))
                 .and_then(|item| item.present);
             if present != Some(false) {
-                delete_machine_key(slot)?;
+                delete_machine_key(slot).map_err(|err| keychain_delete_error(slot, err))?;
             }
         }
         if remove_config_entries(&mut doc) {
@@ -8175,14 +8395,7 @@ fn cmd_reset_machine_state(
         );
         extra.insert(
             "vault_guard".to_owned(),
-            match vault {
-                Some(root) => serde_json::json!({
-                    "vault": root.display().to_string(),
-                    "initialized": root.join("keys").is_dir(),
-                    "forced": force,
-                }),
-                None => Value::Null,
-            },
+            vault_candidates_json(&candidates, force),
         );
         print_json(&ok_envelope(None, Value::Object(extra)))?;
     } else if !changed {

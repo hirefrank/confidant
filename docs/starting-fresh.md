@@ -83,11 +83,19 @@ confidant reset --machine-state --yes
 `--dry-run` prints exactly what would go (files, config keys and keychain
 service/account pairs) and changes nothing. `--yes` is required with
 `--no-input` or `--json`; without it the command asks before removing
-anything. It refuses while a resolvable vault has a `keys/` tree, because
-removing the anchor and keys would break that vault; `--force` overrides the
-guard for a vault you have retired. It never writes inside a vault, and a
-second run reports `nothing to remove` and exits 0. With `--json`, `vault` is
-`null` and `scope` is `machine-state`: this command is not vault-scoped.
+anything. If nothing is present it skips the prompt and reports
+`nothing to remove`. It refuses while **any** resolvable vault has a `keys/`
+tree, because removing the anchor and keys would break that vault. The guard
+checks `--vault`, `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up
+from the current directory, `default_vault`, and every `[vaults]` entry —
+even when normal discovery would fail — and names every initialized vault in
+the error. `--force` overrides the guard for vaults you have retired. It
+never writes inside a vault, and a second run reports `nothing to remove` and
+exits 0. With `--json`, `vault` is `null` and `scope` is `machine-state`:
+this command is not vault-scoped.
+
+If the OS keychain is unreachable, the command fails before removing any
+files (so a retry can finish) and points at the platform fallback below.
 
 The platform commands below are the fallback, for example when the command
 cannot reach a keychain or you want to remove one entry by hand.
@@ -192,12 +200,16 @@ confidant reset --machine-state --yes       # remove it (skips the prompt)
 It preserves unrelated keys, comments and formatting in `config.toml`, never
 writes inside a vault, and running it twice is safe (the second run, or a
 dry-run after the first, reports `nothing to remove: machine state is already
-clear`). It **refuses** if discovery resolves a vault that has a
-`keys/` tree, because removing the anchor and keys would break that vault.
+clear`). It **refuses** if **any** resolvable vault has a `keys/` tree,
+because removing the anchor and keys would break that vault. The guard checks
+`--vault`, `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up from the
+current directory, `default_vault`, and every `[vaults]` entry — even when
+normal discovery would fail — and names every initialized vault in the error.
 That is the intended protection for "I forgot the old vault still exists".
 Move or delete the old vault first (§2.1), or pass `--force` only after you
-have retired it. `--json` reports `"vault": null` and `"scope":
-"machine-state"`.
+have retired them. `--json` reports `"vault": null`, `"scope":
+"machine-state"`, and the full candidate list (including candidates with no
+`keys/`) under `vault_guard`.
 
 If you keep the old vault recoverable, do not run the full reset: it archives
 nothing. Use the manual fallback below instead, which keeps old files.
@@ -346,10 +358,10 @@ coaching verbs such as `log session` become valid. Existing personal records
 stay where they are; there is no migration.
 
 Do not try to seed coaching at `init` time with `--packs coaching@0.1`.
-That is currently rejected as an unknown pack because the external pack is
-not vendored yet (tracked in
-[#639](https://github.com/hirefrank/confidant/issues/639)). Init with no
-packs, then `pack add`.
+`init` only seeds packs built into the binary (today the implicit
+`personal@0.2`); naming an external pack is a usage error (exit 2) with a fix
+telling you to install it after init ([#639](https://github.com/hirefrank/confidant/issues/639)).
+Init with no packs, then `pack add`.
 
 To undo the change, `confidant pack remove coaching --yes` removes the
 vendored files, the lock entry, and the `packs` listing. Data written under
