@@ -8,22 +8,105 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-19
+
+**Disclosure:** the milestone 2 encryption has had no independent review and
+none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138));
+use your own judgment before storing other people's sensitive data.
+
+**Breaking (shipped as a patch by maintainer decision):** the shipped
+`packs/coaching/` asset and the four operator-specific embedded skills are
+gone. A vault that lists `coaching@0.1` must install an out-of-tree copy
+(`confidant pack add --from-dir <dir> --yes`, or an https URL) or remove the
+listing; otherwise `check` reports `E_PACK_UNKNOWN`. The coaching codes are
+not reserved in core, so an out-of-tree copy still loads. Upgraded installs
+may retain stale agent links until `confidant setup`/`update` prunes them.
+Normally a break of this size would bump the minor; 0.6.1 keeps the patch
+number by explicit maintainer decision so the agent-authored coaching reboot
+can ship as 0.7.0.
+
+### Added
+- `confidant pack init <dir> [--name] [--version]`: scaffolds a valid
+  external pack (`manifest.toml`, `SKILL.md`, `<version>.md`, `README.md`)
+  outside the vault. `--dry-run` writes nothing. The new `pack-author` skill
+  walks an agent through pack-vs-skill-vs-core, review, confirmation,
+  install, `check` and iteration with `pack update --from-dir` (#674, #676).
+- `confidant keys verify-recovery [--phrase-file <path>]`: a read-only,
+  human-only check that a saved phrase matches the trust anchor, the operator
+  certificate, and every current client's recovery wrapping. It writes
+  nothing and never puts the phrase or derived keys in JSON (#663).
+- `confidant init --phrase-out <path>`: writes the one-time phrase to a new
+  `0600` file, refuses to overwrite, and prints only the path. The phrase is
+  still shown once on stderr without the flag (#662).
+- Headless encrypted init: `init` accepts `CONFIDANT_OPERATOR_KEY` (a
+  64-character hex Ed25519 seed) alongside the existing
+  `CONFIDANT_DEVICE_KEY`, and skips the OS-keychain operator write when it is
+  set. `doctor` now names both variables in its pre-init hint (#650).
+- `confidant init --create` starts the repo on `main`, reports the branch in
+  human and JSON output, and prints an optional `pack add` hint when
+  `packs = []` (#658, #661).
+- New `doctor` checks: `git-remote` (local-only vs encrypted+remote vs
+  plaintext+remote), `tui-version` (optional TUI installed/matching/mismatched),
+  and a Linux-only best-effort `disk-encryption` check (#653, #659, #660).
+- `setup`/`update` prune confidant-owned links/copies for skills this binary
+  no longer embeds, reporting `removed_stale`; unowned files are left alone
+  (#200).
+- `confidant agents` always prints the nine-agent table with detected and
+  linked counts; `setup` and `doctor` now agree on distinct skill dirs
+  (muse/agents share one), and `--agent auto` announces its claude-code
+  fallback (#652, #655, #653).
+
+### Changed
+- `--dry-run` is now honored by `setup`, `update`, and `init --create`:
+  no directories, links, commits, key generation, keychain writes, or
+  anchor writes. JSON carries `dry_run` and the planned actions (#649, #668).
+- `doctor`'s qmd check warns when the corpus is missing, and its
+  no-embeddings message now points at the vault-local
+  `qmd-index.py --embed` wrapper instead of a bare `qmd embed` (#657, #666).
+- `confidant tui` compares its version with `confidant-tui` and warns on a
+  mismatch; `confidant tui --json` is a probe-only envelope and does not
+  launch the child (#659).
+- Unresolved external-pack `[checks]` keys now point at `confidant pack add`
+  rather than the spec page that cannot define them (#656).
+- The demo vault is personal-only: the coaching client, notes, pack listing,
+  lockfile entry and coaching checks are gone. Tests, qa-smoke and bench-gen
+  use the neutral `testdata/packs/example-pack/` fixture (#200, #201, #675).
+
+### Fixed
+- Failed `init --create` runs are atomic: preflight checks happen before any
+  write, a partial skeleton is rolled back, and a failure after the keys
+  commit rewinds that commit instead of leaving a dirty tree that blocks the
+  retry. The recovery phrase is shown/written before the irreversible commit
+  (#651).
+- `init --create` no longer leaves a `master` branch behind, and an unborn
+  pre-existing repo is moved to `main` (#661).
+- `setup --dry-run` no longer creates agent directories or symlinks;
+  `update --dry-run` no longer relinks skills or offers to run the upgrade
+  command (#649, #668).
+- `confidant agents` no longer exits 0 with blank output before setup (#652).
+- A failed `init` no longer leaves an empty `.git` that blocks the retry
+  (#651).
+
 ### Removed
 - The four operator-specific embedded skills (`capture-gap-summary`,
   `lightfield-import`, `portal-sync`, `transcript-import`). `qmd-search` and
   `pack-author` remain.
-- The shipped `packs/coaching/` asset. A local coaching-shaped pack can be
-  authored with the `pack-author` skill and installed with `pack add`.
-- The demo vault's coaching client, notes, pack listing, lockfile and
-  coaching ledger data; the demo is personal-only.
+- The shipped `packs/coaching/` asset, its demo-vault copy, and the demo's
+  coaching data. A local coaching-shaped pack can be authored with
+  `pack-author` and installed with `pack add --from-dir`.
 - The TUI's Lightfield-specific proposal cleanup prompt.
+- Operator-specific live docs and spec examples (Lightfield Appendix A,
+  portal shapes, coaching-first framing, gap/`icf_hours`/billing examples).
+  Historical `docs/research/` and the CHANGELOG are kept.
 
-### Changed
-- `setup`/`update` now prune confidant-owned links/copies for skills this
-  binary no longer embeds, and report them as `removed_stale`. Unowned files
-  are left alone.
-- The test, QA-smoke and benchmark fixtures now use the neutral
-  `testdata/packs/example-pack/` fixture instead of the shipped pack.
+### Documentation
+- Installation and setup docs now cover non-interactive `CONFIDANT_VAULT`
+  (never `source ~/.bashrc`), the rustup no-default-toolchain hint, headless
+  key injection, `--phrase-out`, `verify-recovery`, local packs, optional
+  remotes with the plaintext warning, and installing the CLI and TUI
+  together (#654, #653, #660, #662, #663).
+- README status records that the independent audit has not happened yet
+  (#138, #679).
 
 ## [0.6.0] - 2026-10-19
 
@@ -495,7 +578,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/hirefrank/confidant/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hirefrank/confidant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hirefrank/confidant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hirefrank/confidant/compare/v0.3.1...v0.4.0
