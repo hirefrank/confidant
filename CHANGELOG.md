@@ -10,9 +10,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [0.6.1] - 2026-10-19
 
-**Disclosure:** the milestone 2 encryption still has no outside review
-([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
-other people's client data in a vault until the audit lands.
+**Disclosure:** the milestone 2 encryption has had no independent review and
+none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138));
+use your own judgment before storing other people's sensitive data.
 
 **Breaking (shipped as a patch by maintainer decision):** the shipped
 `packs/coaching/` asset and the four operator-specific embedded skills are
