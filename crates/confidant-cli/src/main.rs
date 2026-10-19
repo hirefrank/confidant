@@ -4539,13 +4539,17 @@ pub(crate) fn main_path_for(id: &RecordId) -> Option<PathBuf> {
 /// Ids `record show` / `record edit` / `record resolve` do not handle,
 /// refused as usage errors (exit 2, ADR-7) rather than looked up and
 /// reported as missing.
+///
+/// Any `confidant <command>` hint in these messages must name a real
+/// subcommand; `prefix_hint_names_an_existing_subcommand` enforces it so a
+/// deleted command cannot leave a dead-end hint behind (#542).
 pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
     match id.prefix() {
         Prefix::Note => Err(anyhow::Error::new(DomainError::usage(
             "notes are not read or edited by `record`; their files live under people/<person>/notes/",
         ))),
         Prefix::Package => Err(anyhow::Error::new(DomainError::usage(
-            "a package is a ledger id, not a record; use `confidant balance <person>`",
+            "a package is a ledger id, not a record; use `confidant context <person>` to see a person's package balance",
         ))),
         _ => Ok(()),
     }
@@ -10891,9 +10895,50 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
-        parse_git_version, InstallMethod, MIN_GIT_VERSION,
+        parse_git_version, reject_unsupported_prefix, InstallMethod, MIN_GIT_VERSION,
     };
     use std::path::Path;
+
+    /// #542: a `confidant <command>` hint in `reject_unsupported_prefix`
+    /// must name a subcommand clap actually has. The old package hint said
+    /// `confidant balance`, which does not exist, so following it produced
+    /// a clap error instead of a fix.
+    #[test]
+    fn prefix_hint_names_an_existing_subcommand() {
+        use clap::CommandFactory as _;
+
+        let pkg = confidant_core::id::RecordId::parse("pkg-01J9Z3K4QF0000000000000000")
+            .expect("fake package id");
+        let err = reject_unsupported_prefix(&pkg).expect_err("packages are refused");
+
+        let domain = confidant_core::error::DomainError::of(&err).expect("usage error");
+        assert_eq!(domain.kind(), confidant_core::error::ErrorKind::Usage);
+        assert_eq!(domain.exit_code(), 2, "ADR-7: usage errors exit 2");
+
+        // Extract the backticked hint and its first two words:
+        // `confidant <subcommand> …`.
+        let hint = domain
+            .message()
+            .split('`')
+            .nth(1)
+            .expect("the message carries a backticked command hint");
+        let mut words = hint.split_whitespace();
+        assert_eq!(words.next(), Some("confidant"), "hint: {hint}");
+        let subcommand = words.next().expect("the hint names a subcommand");
+
+        let known: Vec<String> = crate::Cli::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_owned())
+            .collect();
+        assert!(
+            known.iter().any(|name| name == subcommand),
+            "hint `{hint}` names `{subcommand}`, which is not a subcommand; known: {known:?}"
+        );
+        assert!(
+            hint.contains("<person>"),
+            "the hint should say what to pass: {hint}"
+        );
+    }
 
     #[test]
     fn install_method_detection_from_exe_path() {
