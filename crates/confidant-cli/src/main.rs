@@ -102,11 +102,11 @@ struct Cli {
     #[arg(long, global = true)]
     request_id: Option<String>,
 
-    /// Pack scope for agent-facing reads (`find`, `context`, `allowlist`,
-    /// `mcp`). Comma-separated pack names, e.g. `coaching@0.1`. Unset =
-    /// all enabled packs. Naming an unknown or disabled pack is a hard
-    /// error. Ignored by `check` / `doctor` (always unscoped) and
-    /// by writes.
+    /// Pack scope for reads (`find`, `context`, `allowlist`,
+    /// `record list`) and `mcp`. Comma-separated pack names, e.g.
+    /// `coaching@0.1`. Unset = all enabled packs. Naming an unknown or
+    /// disabled pack is a hard error. Ignored by `check` / `doctor` (always
+    /// unscoped) and by writes.
     #[arg(long, global = true)]
     packs: Option<String>,
 
@@ -564,6 +564,23 @@ enum RecordAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// List the vault's records of one kind, one entry each.
+    ///
+    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
+    /// a fixed tool whitelist), and without `--for-operator` it lists only
+    /// the §12 cleared set, so `no-ai: true` records are absent. With
+    /// `--for-operator` an operator may see them, with a tri-state
+    /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
+    /// stays in the JSON envelope (ADR-7).
+    List {
+        /// Include `no-ai` records, decrypted through the operator read
+        /// path (the same mechanism as `record show --for-edit`).
+        #[arg(long)]
+        for_operator: bool,
+        /// Record kind to list.
+        #[arg(long, value_enum, default_value_t = RosterKind::Person)]
+        kind: RosterKind,
+    },
     /// Print one record's decrypted text, to prepare an edit.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
@@ -631,6 +648,25 @@ impl Side {
         match self {
             Side::Ours => "ours",
             Side::Theirs => "theirs",
+        }
+    }
+}
+
+/// Record kinds `record list --kind` accepts (#558).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum RosterKind {
+    Person,
+    Org,
+    Deal,
+}
+
+impl RosterKind {
+    /// The core record kind this filter names.
+    pub(crate) fn record_kind(self) -> RecordKind {
+        match self {
+            RosterKind::Person => RecordKind::Person,
+            RosterKind::Org => RecordKind::Org,
+            RosterKind::Deal => RecordKind::Deal,
         }
     }
 }
@@ -1105,6 +1141,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match action {
                 RecordAction::Add { file } => cmd_record_add(&cli, &root, file),
                 RecordAction::Edit { id, file } => cmd_record_edit(&cli, &root, id, file),
+                RecordAction::List { for_operator, kind } => {
+                    cmd_record_list(&cli, &root, kind.record_kind(), *for_operator)
+                }
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
                 RecordAction::Resolve {
                     id,
@@ -4521,6 +4560,105 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// record list (operator-only roster, #558)
+// ---------------------------------------------------------------------------
+
+/// #558: list the vault's records of one kind, one entry each.
+///
+/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
+/// argv and this command is not in it, so no agent connection can reach it.
+/// Without `--for-operator` the vault loads through the agent read path and
+/// the roster is the §12 cleared set, so `no-ai: true` records are absent
+/// (never present with a nulled name). With `--for-operator` the operator
+/// decrypt path is used (`RecordDecryptor::for_edit`, the same mechanism as
+/// `record show --for-edit`) and entries carry the tri-state `no_ai`
+/// (`"true"` | `"notes"` | `"false"`) the #559 ruling specifies.
+fn cmd_record_list(
+    cli: &Cli,
+    root: &Path,
+    kind: RecordKind,
+    for_operator: bool,
+) -> anyhow::Result<ExitCode> {
+    let vault = match load_vault_for_reads(root, cli.json, for_operator) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let vault_path = vault.root.display().to_string();
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        print_error(
+            cli.json,
+            Some(&vault_path),
+            &DomainError::spec_unsupported(&vault.config.spec),
+        )?;
+        return Ok(ExitCode::from(1));
+    }
+    let (scope, scope_names) = match resolve_cli_scope(&vault, cli.packs.as_deref()) {
+        Ok(pair) => pair,
+        Err(err) => {
+            print_error(cli.json, Some(&vault_path), &err)?;
+            return Ok(ExitCode::from(err.exit_code() as u8));
+        }
+    };
+    let roster = confidant_core::build_roster(&vault, kind, &scope, for_operator);
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(&vault.root),
+            serde_json::to_value(&roster)?,
+        ))?;
+    } else {
+        for entry in &roster.records {
+            let badge = match entry.no_ai {
+                "true" => "\t[no-ai]",
+                "notes" => "\t[no-ai: notes]",
+                _ => "",
+            };
+            // Escape the name so a tab, newline, or terminal escape in a
+            // display name cannot break the one-entry-per-line layout
+            // (`escape_line` also neutralizes bidi/format characters).
+            // `--json` is untouched: there the name is a JSON string.
+            writeln!(
+                io::stdout(),
+                "{}\t{}{badge}",
+                entry.id,
+                confidant_core::packs::untrusted::escape_line(&entry.name)
+            )?;
+        }
+        let noun = if kind == RecordKind::Person {
+            "people"
+        } else {
+            "records"
+        };
+        writeln!(
+            io::stdout(),
+            "{} {noun} ({})",
+            roster.records.len(),
+            kind.as_str()
+        )?;
+        // ⚠2: never silently empty — the skip/refuse counts are always
+        // visible when nonzero, and a scoped call names the scope that
+        // applied (like `context`).
+        if matches!(scope, PackScope::Only(_)) && !scope_names.is_empty() {
+            writeln!(io::stdout(), "scope: {}", scope_names.join(", "))?;
+        }
+        if roster.skipped_encrypted > 0 {
+            writeln!(
+                io::stdout(),
+                "skipped_encrypted: {}",
+                roster.skipped_encrypted
+            )?;
+        }
+        if roster.refused_envelopes > 0 {
+            writeln!(
+                io::stdout(),
+                "refused_envelopes: {}",
+                roster.refused_envelopes
+            )?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------

@@ -108,7 +108,7 @@ The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 | Area | Commands | Notes |
 |---|---|---|
 | Write | `record add`, `record edit`, `note add`, `note edit`, `log session`, `log touch`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
-| Read | `find`, `context`, `resolve`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
+| Read | `find`, `context`, `resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster and `--for-operator` adds `no-ai` records; `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
 | Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
 | Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |

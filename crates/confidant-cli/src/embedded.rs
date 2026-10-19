@@ -168,6 +168,40 @@ mod tests {
         }
     }
 
+    /// Recursively collect every UTF-8 file in an embedded tree as
+    /// `(relative path, text)`.
+    fn embedded_texts(dir: &Dir<'static>, out: &mut Vec<(String, String)>) {
+        for file in dir.files() {
+            if let Some(text) = file.contents_utf8() {
+                out.push((file.path().display().to_string(), text.to_owned()));
+            }
+        }
+        for sub in dir.dirs() {
+            embedded_texts(sub, out);
+        }
+    }
+
+    /// #559: `--for-operator` is operator-only, and a skill is an agent
+    /// path. No shipped skill text — the whole embedded `skills/` tree or
+    /// any pack `SKILL.md` — may name the roster command or the flag. A
+    /// skill that needs people uses `find`, which keeps the §12 allowlist.
+    #[test]
+    fn shipped_skills_never_name_the_operator_roster_or_flag() {
+        let mut texts = Vec::new();
+        embedded_texts(&SKILLS, &mut texts);
+        embedded_texts(&PACK_SKILLS, &mut texts);
+        assert!(!texts.is_empty(), "no embedded skill text found");
+        for (name, text) in &texts {
+            for needle in ["record list", "--for-operator", "for_operator"] {
+                assert!(
+                    !text.contains(needle),
+                    "{name} mentions {needle:?}; skills are agent-facing and \
+                     must not reach the operator-only roster (#559)"
+                );
+            }
+        }
+    }
+
     /// Drift test (#189, generalized #345): every finding code a pack declares
     /// it can emit must be documented in its skill text ("what it means, what
     /// to do"), so the docs stay honest as rules change. Codes are read from

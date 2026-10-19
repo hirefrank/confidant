@@ -472,6 +472,7 @@ mod tests {
             "record_show",
             "record_edit",
             "record_resolve",
+            "record_list",
             "note_show",
             "note_edit",
             "pack",
@@ -481,8 +482,10 @@ mod tests {
             "pack_remove",
             "pack_update",
             "for_edit",
+            "for_operator",
             "show",
             "edit",
+            "list",
             "resolve",
         ] {
             assert!(
@@ -580,6 +583,57 @@ mod tests {
         // `pack_skill` is the one pack-shaped tool and it only reads skill
         // text; it is not an install path.
         assert!(names.contains(&"pack_skill"));
+    }
+
+    /// #558 / #559: `record list` is the operator-only roster. The
+    /// `--for-operator` flag gates `no-ai` visibility, so no agent path may
+    /// reach the command or the flag. The whitelist is the only way MCP can
+    /// invoke the CLI (`call_tool` maps known names to argv and rejects
+    /// everything else), so asserting no such tool is listed — and that a
+    /// call by name is refused — pins the property. The schemas are also
+    /// checked so a future tool cannot smuggle the flag in as an argument.
+    #[test]
+    fn mcp_whitelist_has_no_roster_tool_or_operator_flag() {
+        let whitelist = tools();
+        let names: Vec<&str> = whitelist
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for forbidden in ["record_list", "record_list_for_operator", "list", "roster"] {
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden:?} is exposed over MCP: {names:?}"
+            );
+            let resp = handle(
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"{forbidden}","arguments":{{}}}}}}"#
+                ),
+                Path::new("/tmp"),
+                &None,
+            )
+            .unwrap();
+            assert_eq!(
+                resp["result"]["isError"], true,
+                "{forbidden} must be refused: {resp}"
+            );
+            assert!(
+                resp["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unknown tool"),
+                "{forbidden}: {resp}"
+            );
+        }
+        // No tool schema advertises the operator flag, so even a tool built
+        // on `record list` later cannot pass it through `tools/call`.
+        for t in &whitelist {
+            let schema = t["inputSchema"].to_string();
+            assert!(
+                !schema.contains("for_operator"),
+                "tool {} exposes for_operator: {schema}",
+                t["name"]
+            );
+        }
     }
 
     #[test]

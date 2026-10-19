@@ -22,6 +22,7 @@ pub mod ledger;
 pub mod paths;
 pub mod record;
 pub mod resolve;
+pub mod roster;
 pub mod schema;
 pub mod search;
 pub mod touch;
@@ -49,6 +50,7 @@ pub use inbox::{
 };
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
+pub use roster::{build_roster, Roster, RosterEntry};
 pub use scope::{
     intersect_scope, note_linkage_owners, owner_labels, owners_of_ledger_text, parse_pack_list,
     record_owners, resolve_scope, OwnerKey, PackScope,
