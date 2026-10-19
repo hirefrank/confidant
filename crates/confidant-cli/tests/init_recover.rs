@@ -883,3 +883,362 @@ fn no_secret_material_in_any_pr1_output() {
         "stderr leaks device key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #539: `confidant init --create` bootstraps an absent/empty directory in one
+// non-interactive command. Everything here is fake data and throwaway keys.
+// ---------------------------------------------------------------------------
+
+/// A bootstrap context: temp HOME with a git identity (so the skeleton commit
+/// has an author), a vault path that does not exist yet, and a throwaway
+/// device key. The OS keychain is never consulted.
+struct Boot {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    vault: PathBuf,
+    device_bech32: String,
+}
+
+impl Boot {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = Test Operator\n\temail = test@example.com\n",
+        )
+        .unwrap();
+        Boot {
+            _tmp: tmp,
+            home,
+            vault,
+            device_bech32: age_generate_bech32(),
+        }
+    }
+
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(bin());
+        c.args(args);
+        c.env("HOME", &self.home);
+        c.env("CONFIDANT_DEVICE_KEY", &self.device_bech32);
+        c.env("CONFIDANT_KEYCHAIN", "off");
+        c
+    }
+
+    /// `confidant <args> --vault <this vault>`.
+    fn at_vault(&self, args: &[&str]) -> Output {
+        self.cmd(args)
+            .arg("--vault")
+            .arg(&self.vault)
+            .output()
+            .unwrap()
+    }
+}
+
+/// Run git and return stdout, asserting success.
+fn git_out(vault: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(vault)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn bootstrap_one_command_from_absent_dir_creates_valid_vault() {
+    let b = Boot::new();
+    assert!(!b.vault.exists(), "precondition: vault path does not exist");
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "init --create failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Directory + git repo.
+    assert!(b.vault.is_dir(), "vault directory not created");
+    git_out(&b.vault, &["rev-parse", "--git-dir"]);
+
+    // `.confidant/` is ignored (reindex's guardrail).
+    let gitignore = std::fs::read_to_string(b.vault.join(".gitignore")).unwrap();
+    assert!(
+        gitignore.lines().any(|l| l.trim() == ".confidant/"),
+        ".gitignore missing .confidant/: {gitignore}"
+    );
+
+    // A minimal confidant.toml: encrypted default, empty pack list (the
+    // built-in `personal` default, #504), and no plaintext opt-out.
+    let cfg = std::fs::read_to_string(b.vault.join("confidant.toml")).unwrap();
+    assert!(cfg.contains("spec = \"0.1\""), "{cfg}");
+    assert!(cfg.contains("packs = []"), "{cfg}");
+    assert!(cfg.contains("vault_id = "), "{cfg}");
+    assert!(!cfg.contains("plaintext"), "{cfg}");
+
+    // Skeleton and keys are committed; the tree is clean.
+    let tracked = git_out(&b.vault, &["ls-files"]);
+    for f in [
+        "confidant.toml",
+        ".gitignore",
+        "keys/shared/recipients.toml",
+    ] {
+        assert!(tracked.contains(f), "{f} not committed:\n{tracked}");
+    }
+    assert!(
+        git_out(&b.vault, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "tree not clean after init --create"
+    );
+
+    // Trust anchor from the key steps.
+    assert!(b.home.join(".config/confidant/trust.toml").is_file());
+
+    // ADR-7 envelope: ok + the resolved vault path.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    let resolved = v["vault"].as_str().unwrap();
+    assert_eq!(
+        std::fs::canonicalize(resolved).unwrap(),
+        std::fs::canonicalize(&b.vault).unwrap()
+    );
+}
+
+#[test]
+fn bootstrap_from_empty_existing_dir_works() {
+    // `mkdir vault && confidant init --create` — the directory exists and is
+    // empty (the README's old hand-written `git init` step, folded in).
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(b.vault.join("confidant.toml").is_file());
+    git_out(&b.vault, &["rev-parse", "--git-dir"]);
+}
+
+#[test]
+fn bootstrap_reindex_does_not_refuse_on_gitignore() {
+    let b = Boot::new();
+    assert!(b
+        .at_vault(&["init", "--create", "--no-input", "--json"])
+        .status
+        .success());
+
+    let out = b.at_vault(&["reindex", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "reindex refused after --create: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
+#[test]
+fn bootstrap_with_packs_writes_the_list() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "coaching@0.1",
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = std::fs::read_to_string(b.vault.join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"coaching@0.1\"]"), "{cfg}");
+}
+
+#[test]
+fn bootstrap_unknown_pack_is_usage_error_and_writes_nothing() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "nope@9.9",
+        "--no-input",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    assert!(!b.vault.exists(), "nothing should be created on refusal");
+}
+
+#[test]
+fn bootstrap_refuses_nonempty_non_repo_dir() {
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    std::fs::write(b.vault.join("hello.txt"), "not ours\n").unwrap();
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!b.vault.join("confidant.toml").exists());
+    assert!(!b.vault.join(".git").exists());
+    assert_eq!(
+        std::fs::read_to_string(b.vault.join("hello.txt")).unwrap(),
+        "not ours\n",
+        "an existing file must be untouched"
+    );
+}
+
+#[test]
+fn bootstrap_refuses_nonempty_clean_repo() {
+    // A non-empty target is refused even when it is a clean git repo: #539
+    // scopes --create to an absent or empty directory, so running it from the
+    // wrong cwd cannot turn a project checkout into a vault.
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    std::fs::write(b.vault.join("README.md"), "a project\n").unwrap();
+    git_out(&b.vault, &["init", "-q"]);
+    git_out(&b.vault, &["add", "README.md"]);
+    git_out(
+        &b.vault,
+        &[
+            "-c",
+            "user.name=Test Operator",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "project",
+        ],
+    );
+    assert!(git_out(&b.vault, &["status", "--porcelain"])
+        .trim()
+        .is_empty());
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "non-empty repo must be refused");
+    assert!(!b.vault.join("confidant.toml").exists());
+    assert!(!b.vault.join(".gitignore").exists());
+    // The project repo is untouched: same clean tree, same single commit.
+    assert!(git_out(&b.vault, &["status", "--porcelain"])
+        .trim()
+        .is_empty());
+    assert_eq!(git_out(&b.vault, &["log", "--oneline"]).lines().count(), 1);
+}
+
+#[test]
+fn bootstrap_without_git_identity_fails_before_writing_files() {
+    // No git identity: the skeleton commit would fail, so `--create` refuses
+    // before writing files (a half-written skeleton would make the retry
+    // fail with "tree is not clean").
+    let b = Boot::new();
+    std::fs::remove_file(b.home.join(".gitconfig")).unwrap();
+
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(
+        fix.contains("user.name") && fix.contains("user.email"),
+        "fix must name git identity config: {fix}"
+    );
+    assert!(!b.vault.join("confidant.toml").exists());
+    assert!(!b.vault.join(".gitignore").exists());
+}
+
+#[test]
+fn bootstrap_refuses_existing_anchor_before_writing_skeleton() {
+    // A second device / re-run must keep B1's refusal, and must not leave a
+    // half-built skeleton behind.
+    let h = Harness::new();
+    assert!(h.init(&[]).status.success());
+
+    let target = h.home.join("fresh-vault");
+    let out = h
+        .cmd_at(&["init", "--create", "--no-input", "--json"], &target)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("already exists"), "{msg}");
+    assert!(
+        !target.join("confidant.toml").exists(),
+        "skeleton must not be written when the anchor refusal fires"
+    );
+}
+
+#[test]
+fn init_create_on_prepared_vault_keeps_anchor_refusal() {
+    // `--create` on an existing vault is not a bootstrap: it takes today's
+    // path, so the anchor refusal still applies.
+    let h = Harness::new();
+    assert!(h.init(&[]).status.success());
+    let out = h.init(&["--create"]);
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("already exists"));
+}
+
+#[test]
+fn init_without_create_in_nonempty_dir_is_unchanged() {
+    // No `--create`: never scaffold. A non-empty non-vault directory fails
+    // discovery as before and nothing is written.
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    std::fs::write(b.vault.join("hello.txt"), "hi\n").unwrap();
+
+    let out = b.at_vault(&["init", "--no-input", "--json"]);
+    assert!(!out.status.success());
+    assert!(!b.vault.join("confidant.toml").exists());
+    assert!(!b.vault.join(".git").exists());
+}
+
+#[test]
+fn init_without_create_still_refuses_unclean_tree() {
+    // Prepared vault (repo + confidant.toml) with an uncommitted change:
+    // `init` keeps refusing "not clean" when not bootstrapping.
+    let h = Harness::new();
+    std::fs::write(h.vault.join("dirty.txt"), "uncommitted\n").unwrap();
+
+    let out = h.init(&[]);
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("not clean"), "{msg}");
+    assert!(
+        !h.trust_toml().exists(),
+        "refused init must not write the anchor"
+    );
+}

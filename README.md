@@ -65,26 +65,27 @@ When creating or connecting a vault, choose **encrypted** (real data) or
 **plaintext** (demo/fixtures only) up front — see
 [`docs/agent-setup.md`](docs/agent-setup.md#encrypted-vault-vs-plaintext-demo):
 
-- **Real relationship data (encrypted, default):** ensure `confidant.toml`
-  does **not** set `[crypto] mode = "plaintext"` (never copy the demo vault's
-  opt-out into a real vault) and the git working tree is clean (`git status`),
-  then run `confidant init`. Record bodies are encrypted in git; ledger lines
-  stay structural plaintext.
+- **Real relationship data (encrypted, default):** scaffold a fresh vault
+  with `confidant init --create` (or prepare one by hand: a git repo with a
+  committed `confidant.toml` and a clean tree, then `confidant init`). Never
+  copy the demo vault's `[crypto] mode = "plaintext"` opt-out into a real
+  vault. Record bodies are encrypted in git; ledger lines stay structural
+  plaintext.
 - **Demo / learning / fixtures only (plaintext opt-out):** set
   `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the
   vault is structurally plaintext) and do **not** run `confidant init`. Never
   use for real PII — `git clone` exposes all record content.
 
-Create an encrypted vault (or point `CONFIDANT_VAULT` at an existing one)
-and check it:
+Create an encrypted vault in one command (or point `CONFIDANT_VAULT` at an
+existing one) and check it:
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"
-mkdir -p "$CONFIDANT_VAULT" && cd "$CONFIDANT_VAULT" && git init
-# confidant.toml is optional — encrypted is the default and `confidant init`
-# does not write it. Create it by hand only if you need [crypto] settings or
-# packs, then commit it so `git status` stays clean:
-confidant init   # generates your operator key; shows a 24-word recovery phrase once — store it offline
+# --create scaffolds an absent or empty directory: mkdir, `git init`,
+# `.gitignore` with `.confidant/`, a committed `confidant.toml`, then the
+# vault keys. Add `--packs coaching@0.1` to record packs in confidant.toml
+# (default: none).
+confidant init --create --no-input   # shows a 24-word recovery phrase once on stderr — store it offline
 confidant check
 confidant check --json --no-input
 ```

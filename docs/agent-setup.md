@@ -33,7 +33,10 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
 3. Ask me where my vault is and set `CONFIDANT_VAULT` to it (export it for
    this session and tell me what to add to my shell rc to keep it). If I
    have no vault yet, ask whether to create one at a path I choose or
-   stop — do not invent a path.
+   stop — do not invent a path. To create one, run
+   `confidant init --create --no-input` against an absent or empty
+   directory: it scaffolds the directory, git repo, `.gitignore`, and
+   `confidant.toml`, then the keys.
 4. Ask me whether this vault is for **real relationship data** (encrypted
    mode, the production default) or **demo / learning / fixtures only**
    (plaintext opt-out), and explain the consequences before editing
@@ -70,7 +73,7 @@ Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2
 
 | Mode | Use for | Consequences | Agent behavior |
 |---|---|---|---|
-| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and prints a 24-word recovery phrase once (store offline). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | Ensure `mode` is not `"plaintext"` in `confidant.toml` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then guide `confidant init` and offline phrase storage. |
+| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and prints a 24-word recovery phrase once (store offline). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | For a fresh vault, run `confidant init --create`; for an existing one, ensure `mode` is not `"plaintext"` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then run `confidant init`. Store the recovery phrase offline. |
 | **Plaintext opt-out** | Demo, learning, fixtures only (`examples/demo-vault`) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Never use for real PII: `git clone` exposes all record content. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, and warn that `git clone` exposes all record content. |
 
 ## Commands
