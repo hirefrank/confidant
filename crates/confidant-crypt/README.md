@@ -13,10 +13,11 @@ by anyone outside the project**. It is published so that the Confidant CLI
 and its dependencies can be installed from crates.io — not as a
 general-purpose crypto library. It is not a stable API surface yet.
 
-**Do not use it to protect data you cannot afford to lose or expose** until
-the outside audit lands. The audit is tracked in the main repository as
-issue [#138](https://github.com/hirefrank/confidant/issues/138); the design
-it implements is documented in `docs/crypto-design.md` there.
+**`confidant-crypt` has not had an independent audit.** Use your own
+judgment before storing other people's sensitive data. This is tracked in
+the main repository as issue
+[#138](https://github.com/hirefrank/confidant/issues/138); the design it
+implements is documented in `docs/crypto-design.md` there.
 
 Two related caveats from the main repository README (which is the
 authoritative project status):
@@ -24,8 +25,8 @@ authoritative project status):
 - the Confidant CLI now encrypts record content on write for keyed vaults
   (`record add`, `note add`, `log session --note`); a vault that opts out
   with `[crypto] mode = "plaintext"` stays plaintext in git;
-- see [the README status
-  section](https://github.com/hirefrank/confidant#status-one-thing-is-not-ready-for-other-peoples-data)
+- see the [Security status
+  section](https://github.com/hirefrank/confidant#security-status-no-independent-audit-yet)
   for the current disclosure.
 
 ## License
