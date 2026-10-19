@@ -65,7 +65,11 @@ VAULT_ID = "01J9Z3K4QF0000000000000000"
 SESSION_DATE = "2026-10-13"
 ALIAS_DATE = "2026-10-13"
 TOUCH_DATE = "2026-10-15"
-PACK_DIR = REPO / "testdata" / "packs" / "coaching-ext"
+# The shipped external coaching pack (#449, #624). Installed the way a user
+# installs it from a local checkout: `confidant pack add --from-dir <dir>`.
+PACK_DIR = REPO / "packs" / "coaching"
+COACHING_PACK = "coaching"
+COACHING_DIR = "coaching@0.1"
 
 # Marker the script drops in a work directory it created. A `--workdir` is
 # wiped before a run, so an existing non-empty directory without this marker
@@ -336,6 +340,39 @@ class Smoke:
         self.git(vault, ["add", "-A"])
         self.git(vault, ["commit", "-qm", "seed ledger"])
 
+    def install_coaching(self, vault: Path) -> None:
+        """Vendor the shipped coaching pack, as a user would.
+
+        `coaching@0.1` is no longer compiled in (#449, #624): a vault that
+        uses `open`/`session` must install it first, so the write vaults do
+        exactly that before seeding ledger lines.
+        """
+        step = "pack add --from-dir (coaching)"
+        report = self.cli_ok(
+            step,
+            [
+                "pack",
+                "add",
+                "--from-dir",
+                str(PACK_DIR),
+                "--yes",
+                "--json",
+                "--no-input",
+                "--vault",
+                str(vault),
+            ],
+        )
+        self.ok(
+            step,
+            report.get("pack", {}).get("name") == COACHING_PACK,
+            f"coaching pack was not installed: {report}",
+        )
+        self.ok(
+            step,
+            (vault / "packs" / COACHING_DIR / "manifest.toml").is_file(),
+            "the coaching pack was not vendored",
+        )
+
     def check_clean(self, step: str, vault: Path) -> None:
         report = self.cli_ok(
             step, ["check", "--json", "--no-input", "--vault", str(vault)]
@@ -367,7 +404,8 @@ class Smoke:
 
 def plaintext_vault_steps(smoke: Smoke) -> None:
     """Write pipeline, read-path privacy, and the refused-write invariant."""
-    vault = smoke.make_plaintext_vault("plaintext", ["coaching@0.1"])
+    vault = smoke.make_plaintext_vault("plaintext", [])
+    smoke.install_coaching(vault)
 
     smoke.write_person(PERSON, "Ada Example")
     smoke.write_person(NO_AI_PERSON, "Cam Sample", no_ai=True)
@@ -601,8 +639,6 @@ def encrypted_vault_steps(smoke: Smoke) -> None:
         [
             "init",
             "--create",
-            "--packs",
-            "coaching@0.1",
             "--no-input",
             "--json",
             "--vault",
@@ -617,6 +653,11 @@ def encrypted_vault_steps(smoke: Smoke) -> None:
         "init did not write the trust anchor",
     )
     smoke.mark(step)
+
+    # `coaching@0.1` is external now (#449, #624); install it before any
+    # ledger write. `init` could not take `--packs coaching@0.1` because its
+    # commit-time check refuses an unvendored listing.
+    smoke.install_coaching(vault)
 
     step = "keys init-client (encrypted)"
     smoke.cli_ok(
@@ -774,10 +815,10 @@ def pack_lifecycle_steps(smoke: Smoke) -> None:
             str(vault),
         ],
     )
-    smoke.ok(step, report["pack"]["name"] == "coaching-ext", f"bad pack add: {report}")
+    smoke.ok(step, report["pack"]["name"] == COACHING_PACK, f"bad pack add: {report}")
     smoke.ok(
         step,
-        (vault / "packs" / "coaching-ext@0.1" / "manifest.toml").is_file(),
+        (vault / "packs" / COACHING_DIR / "manifest.toml").is_file(),
         "pack was not vendored",
     )
     smoke.check_clean("check --json (pack added)", vault)
@@ -799,7 +840,7 @@ def pack_lifecycle_steps(smoke: Smoke) -> None:
         [
             "pack",
             "update",
-            "coaching-ext",
+            COACHING_PACK,
             "--from-dir",
             pack_dir,
             "--yes",
@@ -836,7 +877,7 @@ def pack_lifecycle_steps(smoke: Smoke) -> None:
         [
             "pack",
             "update",
-            "coaching-ext",
+            COACHING_PACK,
             "--from-dir",
             pack_dir,
             "--yes",
@@ -867,7 +908,7 @@ def pack_lifecycle_steps(smoke: Smoke) -> None:
         [
             "pack",
             "remove",
-            "coaching-ext",
+            COACHING_PACK,
             "--yes",
             "--json",
             "--no-input",
@@ -877,12 +918,12 @@ def pack_lifecycle_steps(smoke: Smoke) -> None:
     )
     smoke.ok(
         step,
-        report.get("removed") == ["coaching-ext@0.1"],
+        report.get("removed") == [COACHING_DIR],
         f"pack remove did not remove the pack: {report}",
     )
     smoke.ok(
         step,
-        not (vault / "packs" / "coaching-ext@0.1").exists(),
+        not (vault / "packs" / COACHING_DIR).exists(),
         "pack remove left the vendored tree behind",
     )
     smoke.check_clean("check --json (pack removed)", vault)
@@ -1035,7 +1076,10 @@ def main() -> int:
         return 1
 
     if not PACK_DIR.is_dir():
-        print(f"qa smoke FAILED: fixture pack missing at {PACK_DIR}", file=sys.stderr)
+        print(
+            f"qa smoke FAILED: shipped coaching pack missing at {PACK_DIR}",
+            file=sys.stderr,
+        )
         return 1
 
     try:
