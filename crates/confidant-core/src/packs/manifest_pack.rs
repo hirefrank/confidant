@@ -13,10 +13,10 @@
 
 use crate::check::Finding;
 use crate::check::MergeMap;
-use crate::id::Prefix;
+use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
-use crate::packs::manifest::PackManifest;
+use crate::packs::manifest::{PackManifest, PackOrigin};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::vault::{SourcedEntry, Vault};
 use chrono::NaiveDate;
@@ -50,6 +50,18 @@ impl ManifestPack {
     /// The pack's manifest (leaked once with the pack).
     pub fn pack_manifest(&self) -> &'static PackManifest {
         self.manifest
+    }
+
+    /// Whether this is the built-in personal pack (#551).
+    ///
+    /// The `context` view, its private-field list and the `touch` grammar
+    /// cannot be expressed in a manifest (PD16 scopes external packs to
+    /// `check`), so core owns them (#510). Only the compiled-in built-in
+    /// named `personal` serves that core view; an external pack can never
+    /// use the reserved name (`E_PACK_INVALID`), so the origin + name check
+    /// is unambiguous.
+    fn serves_core_personal_view(&self) -> bool {
+        self.manifest.origin == PackOrigin::CompiledIn && self.manifest.pack.name == "personal"
     }
 }
 
@@ -209,6 +221,39 @@ impl Pack for ManifestPack {
         _sourced: &SourcedEntry,
         _findings: &mut Vec<Finding>,
     ) {
+    }
+
+    /// The built-in personal pack serves core's merge-aware personal view
+    /// (#510/#551), built from this manifest's declared fields so the view
+    /// follows the pack data.
+    fn context_view(
+        &self,
+        vault: &Vault,
+        _state: &dyn PackState,
+        person: &RecordId,
+        canonical: &RecordId,
+        as_of: NaiveDate,
+    ) -> Option<serde_json::Value> {
+        if !self.serves_core_personal_view() {
+            return None;
+        }
+        crate::context::personal::build_personal_view(
+            vault,
+            person,
+            canonical,
+            as_of,
+            &self.manifest.fields,
+        )
+    }
+
+    /// The `--exclude-private` list is core-owned (#510); only the built-in
+    /// personal pack carries it.
+    fn private_context_fields(&self) -> &'static [&'static str] {
+        if self.serves_core_personal_view() {
+            crate::context::personal::PRIVATE_CONTEXT_FIELDS
+        } else {
+            &[]
+        }
     }
 }
 

@@ -1071,6 +1071,51 @@ fn bootstrap_with_packs_writes_the_list() {
     assert!(cfg.contains("packs = [\"coaching@0.1\"]"), "{cfg}");
 }
 
+/// #551: a `personal@…` listing is a known, no-op pack, so `init --packs`
+/// accepts it (any version) instead of refusing it as unknown.
+#[test]
+fn bootstrap_accepts_a_noop_personal_listing() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "personal@0.1",
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The vault checks clean even though the listing names no real version.
+    let check = b.at_vault(&["check", "--no-input", "--json"]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+}
+
+/// #551 nit: `personal@` (empty version) is malformed, not a built-in no-op,
+/// so `init --packs` refuses it like any unknown pack.
+#[test]
+fn bootstrap_refuses_empty_version_personal_listing() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "personal@",
+        "--no-input",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    assert!(!b.vault.exists(), "nothing should be created on refusal");
+}
+
 #[test]
 fn bootstrap_unknown_pack_is_usage_error_and_writes_nothing() {
     let b = Boot::new();

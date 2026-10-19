@@ -4993,7 +4993,8 @@ fn edge_with_three_people_is_independent() {
 }
 
 // ---------------------------------------------------------------------------
-// #184 + #182: personal@0.1 pack and the `touch` verb.
+// #184 + #182: the built-in personal pack and the `touch` verb. The
+// `packs = ["personal@0.1"]` listing is a no-op (#551): the pack is implicit.
 // ---------------------------------------------------------------------------
 
 const PERSONAL_TOML: &str = r#"spec = "0.1"
@@ -5042,7 +5043,9 @@ fn personal_touch_unknown_kind_is_malformed_when_enabled() {
 }
 
 #[test]
-fn personal_touch_positional_form_orphan_when_disabled() {
+fn personal_touch_positional_form_valid_with_empty_packs() {
+    // #551: the built-in personal pack is implicit, so `packs = []` still
+    // enables the richer `touch` grammar and there is no W_PACK_ORPHAN.
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "confidant.toml", "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n");
     person(dir.path(), ADA, "Ada Example");
@@ -5053,8 +5056,75 @@ fn personal_touch_positional_form_orphan_when_disabled() {
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
-    assert!(c.contains(&"W_PACK_ORPHAN".to_string()), "{c:?}");
-    assert!(!c.iter().any(|code| code.starts_with("E_")), "{c:?}");
+    assert!(c.is_empty(), "{c:?}");
+}
+
+/// #551: the built-in personal pack is implicit — `packs = []` enables it —
+/// and a `personal@…` listing at any version is a no-op, never
+/// `E_PACK_UNKNOWN` and never a `W_PACK_ORPHAN` for personal fields.
+#[test]
+fn personal_is_implicit_and_listings_are_noops() {
+    let build = |packs: &str| -> Value {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "confidant.toml",
+            &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]")),
+        );
+        write(
+            dir.path(),
+            &format!("people/{ADA}/profile.md"),
+            &format!(
+                "---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: --10-10\ncadence: 30d\n---\n\nFake person.\n"
+            ),
+        );
+        report_json(dir.path(), None)
+    };
+    let empty = build("");
+    // The fixture really fires personal's own rules, so the comparison is
+    // meaningful.
+    assert!(
+        codes(&empty)
+            .iter()
+            .any(|c| c == "W_DATE_UPCOMING" || c == "W_CADENCE_OVERDUE"),
+        "{empty:?}"
+    );
+    for listed in ["\"personal@0.1\"", "\"personal@0.2\"", "\"personal@9.9\""] {
+        let json = build(listed);
+        assert_eq!(codes(&json), codes(&empty), "{listed}: {json:?}");
+        assert!(
+            !codes(&json).contains(&"E_PACK_UNKNOWN".to_owned()),
+            "{listed}: {json:?}"
+        );
+        assert!(
+            !codes(&json).contains(&"W_PACK_ORPHAN".to_owned()),
+            "{listed}: {json:?}"
+        );
+    }
+}
+
+/// #551: the `personal.*` `[checks]` keys are accepted without the vault
+/// listing the pack, because the implicit pack's manifest is always in the
+/// config manifest set.
+#[test]
+fn personal_check_keys_accepted_without_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\npersonal.cadence_overdue = \"off\"\npersonal.date_upcoming = \"off\"\npersonal.date_upcoming_days = 14\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: --10-10\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(!codes(&json).contains(&"E_CONFIG".to_owned()), "{json:?}");
+    // Both personal rules are off, so the fixture is clean.
+    assert!(codes(&json).is_empty(), "{json:?}");
 }
 
 #[test]
@@ -5129,7 +5199,7 @@ fn personal_field_validation_rejects_malformed_values() {
     write(
         dir.path(),
         &format!("people/{ADA}/profile.md"),
-        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: 05-14\ncadence: 30\nrelationship_to_me: \"\"\ndates: [bad]\n---\n\nFake person.\n"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\nbirthday: 05-14\ncadence: 30\nrelationship: \"\"\ndates: [bad]\n---\n\nFake person.\n"),
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
@@ -5335,8 +5405,9 @@ fn pack_emitted_codes_are_all_declared() {
             "pack emitted {code} but finding_codes() does not declare it: {emitted:?}"
         );
     }
-    // Sanity: the registry holds exactly the packs this fixture covers.
-    assert_eq!(ALL_PACKS.len(), 2);
+    // Sanity: the compiled registry holds exactly the pack this fixture
+    // covers; the built-in personal pack is implicit and separate (#551).
+    assert_eq!(ALL_PACKS.len(), 1);
     assert_eq!(ALL_PACKS[0].name(), "coaching@0.1");
 }
 
@@ -6141,9 +6212,10 @@ fn install_external_pack_raw(root: &Path, name: &str, version: &str, manifest: &
 // Declarative rule kind: cadence-overdue (#442)
 // ---------------------------------------------------------------------------
 
-/// Vendor a declarative pack whose cadence rule mirrors personal@0.1's
-/// (templates verbatim from packs/personal/manifest.toml), and return
-/// the lockfile hash for it.
+/// Vendor a declarative pack whose cadence rule mirrors the built-in
+/// personal pack's, and return the lockfile hash for it. It claims its own
+/// `example_cadence` field so it can coexist with the implicit personal
+/// pack (#551).
 fn install_cadence_pack(root: &Path) -> String {
     let pack_dir = root.join("packs/example-pack@0.1");
     fs::create_dir_all(&pack_dir).unwrap();
@@ -6166,7 +6238,7 @@ key = "example-pack.cadence_overdue"
 default = "warning"
 
 [[fields]]
-name = "cadence"
+name = "example_cadence"
 grammar = "cadence"
 
 [[rules]]
@@ -6174,7 +6246,7 @@ id = "cadence"
 kind = "cadence-overdue"
 code = "W_EXAMPLE_CADENCE"
 severity_key = "example-pack.cadence_overdue"
-cadence_field = "cadence"
+cadence_field = "example_cadence"
 event_verbs = ["touch", "session"]
 
 [messages."W_EXAMPLE_CADENCE"]
@@ -6198,15 +6270,15 @@ default_fix = "{fix}"
         .hash
 }
 
-/// Run `check` over a person with a `cadence` field and the given
-/// ledger (per monthly file), twice: once enabled through compiled
-/// `personal@0.1`, once through the declarative pack above. The
+/// Run `check` over a person with a cadence field and the given ledger
+/// (per monthly file), twice: once through the built-in personal pack, once
+/// through the declarative pack above. The
 /// `W_CADENCE_OVERDUE` findings — code, severity, message, fix, file,
 /// id — must match exactly; that is the parity the declarative kind
 /// promises (#442). Everything else in each report legitimately
-/// differs (the compiled run enables personal@0.1; the declarative run
-/// enables the example pack, whose `touch` verb claims stay with the
-/// disabled compiled pack as `W_PACK_ORPHAN`s).
+/// differs (the built-in run sees personal's `cadence`; the declarative run
+/// sees the example pack's `example_cadence`, so neither pack's rule
+/// double-fires).
 fn assert_cadence_parity(
     ledger_files: &[(&str, String)],
     operator_personal: &str,
@@ -6241,6 +6313,13 @@ fn assert_cadence_parity(
             install_lockfile(root, "example-pack", "0.1", &hash);
         }
         extra_setup(root);
+        if declarative {
+            // The fixture pack claims its own cadence field so it does not
+            // collide with the implicit built-in personal pack (#551),
+            // which always claims `cadence`.
+            rewrite_profile_field(root, ADA, "cadence:", "example_cadence:");
+            rewrite_profile_field(root, BEA, "cadence:", "example_cadence:");
+        }
         report_json(root, None)
     };
     let personal = setup(
@@ -6303,6 +6382,17 @@ fn person_without_cadence(root: &Path, id: &str) {
         &format!("people/{id}/profile.md"),
         &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
     );
+}
+
+/// Rename one front-matter key in a person's profile, when the file exists.
+/// Used to give a parity fixture pack its own non-colliding field name
+/// (#551) without duplicating every fixture writer.
+fn rewrite_profile_field(root: &Path, id: &str, from: &str, to: &str) {
+    let path = root.join(format!("people/{id}/profile.md"));
+    if let Ok(text) = fs::read_to_string(&path) {
+        let out = text.replace(&format!("\n{from}"), &format!("\n{to}"));
+        fs::write(&path, out).unwrap();
+    }
 }
 
 #[test]
@@ -6484,8 +6574,9 @@ fn cadence_rule_severity_off_and_error_from_config() {
 // Declarative rule kind: date-upcoming (#443)
 // ---------------------------------------------------------------------------
 
-/// Vendor a declarative pack whose date rule mirrors personal@0.1's
-/// (templates verbatim from packs/personal/manifest.toml), with the
+/// Vendor a declarative pack whose date rule mirrors the built-in personal
+/// pack's, with its own `example_birthday` / `example_dates` fields so it
+/// can coexist with the implicit personal pack (#551), with the
 /// `example-pack.date_upcoming_days` window default given. Returns the
 /// lockfile hash.
 fn install_date_pack(root: &Path, window_default: i64) -> String {
@@ -6507,11 +6598,11 @@ skill = "SKILL.md"
 requires_spec = ["0.1"]
 
 [[fields]]
-name = "birthday"
+name = "example_birthday"
 grammar = "recurring-date"
 
 [[fields]]
-name = "dates"
+name = "example_dates"
 grammar = "dates-list"
 
 [[checks.severity]]
@@ -6527,7 +6618,7 @@ id = "dates"
 kind = "date-upcoming"
 code = "W_EXAMPLE_DATE"
 severity_key = "example-pack.date_upcoming"
-date_fields = ["birthday", "dates"]
+date_fields = ["example_birthday", "example_dates"]
 window_key = "example-pack.date_upcoming_days"
 
 [messages."W_EXAMPLE_DATE"]
@@ -6551,7 +6642,7 @@ default_fix = "{{fix}}"
 }
 
 /// Run `check` over a person with the given front-matter fields, on two
-/// vaults: compiled `personal@0.1` and the declarative pack above, both at
+/// vaults: the built-in personal pack and the declarative pack above, both at
 /// `as_of`. The `W_DATE_UPCOMING` findings — code-agnostic content
 /// (severity, message, fix, file, id) — must match exactly; the code itself
 /// stays pack-own on the declarative side by design (#494/#490), exactly as
@@ -6582,6 +6673,10 @@ fn assert_date_parity(
             ),
         );
         if declarative {
+            // The fixture pack claims its own date fields so it does not
+            // collide with the implicit built-in personal pack (#551).
+            rewrite_profile_field(root, ADA, "birthday:", "example_birthday:");
+            rewrite_profile_field(root, ADA, "dates:", "example_dates:");
             let hash = install_date_pack(root, window_default);
             install_lockfile(root, "example-pack", "0.1", &hash);
         }
@@ -6768,8 +6863,8 @@ fn date_rule_severity_off() {
 // Declarative rule kind: note-ref (#458)
 // ---------------------------------------------------------------------------
 
-/// Vendor a declarative `touch` note-ref pack mirroring personal@0.1's
-/// templates (verbatim from packs/personal/manifest.toml) with pack-own
+/// Vendor a declarative note-ref pack mirroring the built-in personal
+/// pack's templates with pack-own
 /// codes: an external pack cannot claim the core codes, so it sets
 /// `invalid_code`/`wrong_type_code` explicitly (#490/PD13). Returns the
 /// lockfile hash.
@@ -6790,11 +6885,15 @@ version = "0.1"
 skill = "SKILL.md"
 requires_spec = ["0.1"]
 
+[[verbs]]
+name = "example_touch"
+id_type = "person"
+
 [[rules]]
 id = "touch_note"
 kind = "note-ref"
 code = "E_EXAMPLE_NOTE_MISSING"
-verb = "touch"
+verb = "example_touch"
 pair = "note"
 invalid_code = "E_EXAMPLE_NOTE_INVALID"
 wrong_type_code = "E_EXAMPLE_NOTE_WRONG_TYPE"
@@ -6828,8 +6927,8 @@ default_fix = "{fix}"
         .hash
 }
 
-/// The note-ref findings of a report, whichever side emitted them (the
-/// compiled codes on `personal@0.1`, the pack-own codes on the
+/// The note-ref findings of a report, whichever side emitted them (the core
+/// codes on the built-in personal pack, the pack-own codes on the
 /// declarative copy), as comparable strings.
 fn note_ref_findings(v: &Value) -> Vec<String> {
     v["findings"]
@@ -6861,8 +6960,9 @@ fn note_ref_findings(v: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Run `check` over one `touch` ledger and the records `setup` writes,
-/// twice: compiled `personal@0.1` and the declarative note-ref pack above.
+/// Run `check` over one ledger and the records `setup` writes, twice: the
+/// built-in personal pack (on `touch`) and the declarative note-ref pack
+/// above (on its own `example_touch` verb, #551).
 /// The note-ref findings — severity, message, fix, file, line, id — must
 /// match; the codes stay pack-own on the declarative side by design
 /// (#494/#490). Returns both reports.
@@ -6874,7 +6974,14 @@ fn assert_note_ref_parity(ledger: &str, setup: impl Fn(&Path)) -> (Value, Value)
             &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]")),
         );
         setup(root);
-        write(root, "ledger/2026/10.cfd", ledger);
+        // The fixture pack owns its own verb so it does not collide with
+        // the implicit built-in personal pack's `touch` (#551).
+        let ledger = if declarative {
+            ledger.replace(" touch ", " example_touch ")
+        } else {
+            ledger.to_owned()
+        };
+        write(root, "ledger/2026/10.cfd", &ledger);
         if declarative {
             let hash = install_note_pack(root);
             install_lockfile(root, "example-pack", "0.1", &hash);
@@ -7027,7 +7134,7 @@ fn note_ref_matches_compiled_personal() {
 fn note_ref_conflicted_note_counts_as_existing() {
     // A conflicted note file is not loaded, but it exists (two versions):
     // the declarative kind must not report it missing. This is a
-    // documented divergence from compiled personal@0.1, which reports
+    // documented divergence from an earlier compiled pack, which reported
     // E_UNKNOWN_RECORD for a conflicted note (#458).
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -7050,7 +7157,7 @@ fn note_ref_conflicted_note_counts_as_existing() {
     write(
         root,
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 touch {ADA} call note:{NOTE}\n"),
+        &format!("2026-10-01 example_touch {ADA} call note:{NOTE}\n"),
     );
     let hash = install_note_pack(root);
     install_lockfile(root, "example-pack", "0.1", &hash);
@@ -7117,74 +7224,17 @@ name = "snooze_until"
 grammar = "date"
 "#;
 
-/// Vendor a fixture pack declaring the full `personal@0.2` field set and
-/// a `cadence-overdue` rule with `snooze_field`, and return the lockfile
-/// hash for it.
-fn install_schema_pack(root: &Path) -> String {
-    let pack_dir = root.join("packs/personal-0-2@0.2");
-    fs::create_dir_all(&pack_dir).unwrap();
-    write(
-        root,
-        "packs/personal-0-2@0.2/manifest.toml",
-        &format!(
-            r#"manifest_version = 2
-record_types = []
-balance_metrics = []
-finding_codes = ["E_FRONTMATTER", "W_EXAMPLE_CADENCE"]
-
-[pack]
-name = "personal-0-2"
-version = "0.2"
-skill = "SKILL.md"
-requires_spec = ["0.1"]
-
-[[checks.severity]]
-key = "personal-0-2.cadence_overdue"
-default = "warning"
-
-{SCHEMA_0_2_FIELDS}
-
-[[rules]]
-id = "cadence"
-kind = "cadence-overdue"
-code = "W_EXAMPLE_CADENCE"
-severity_key = "personal-0-2.cadence_overdue"
-cadence_field = "cadence"
-event_verbs = ["touch"]
-snooze_field = "snooze_until"
-
-[messages."W_EXAMPLE_CADENCE"]
-last = "person {{id}} is overdue (last {{d}}, cadence {{cadence_days}}d)"
-last_fix = "Reach out to {{id}}"
-none = "person {{id}} has no touchpoint logged (cadence {{cadence_days}}d)"
-none_fix = "Reach out to {{id}}"
-
-[messages."E_FRONTMATTER"]
-default = "front matter key '{{key}}' {{problem}}"
-default_fix = "{{fix}}"
-"#
-        ),
-    );
-    write(
-        root,
-        "packs/personal-0-2@0.2/SKILL.md",
-        "# personal 0.2 schema fixture pack (fake).\n",
-    );
-    read_pack_dir(&pack_dir)
-        .expect("fixture pack dir must read")
-        .hash
-}
-
-/// A one-person vault checked against the fixture 0.2 pack, with the
-/// given extra front-matter lines on the person's profile. Returns the
-/// check JSON (all fake data).
+/// A one-person vault checked against the built-in `personal@0.2` pack,
+/// with the given extra front-matter lines on the person's profile. The
+/// built-in is implicit (#551), so `packs = []` still enables it. Returns
+/// the check JSON (all fake data).
 fn schema_pack_report(extra_fields: &str) -> Value {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
         root,
         "confidant.toml",
-        "spec = \"0.1\"\npacks = [\"personal-0-2@0.2\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
     );
     write(
         root,
@@ -7193,20 +7243,11 @@ fn schema_pack_report(extra_fields: &str) -> Value {
             "---\nid: {ADA}\ntype: person\nname: Ada Example\n{extra_fields}---\n\nFake person.\n"
         ),
     );
-    let hash = install_schema_pack(root);
-    install_lockfile(root, "personal-0-2", "0.2", &hash);
     report_json(root, None)
 }
 
 /// The full 0.2 field set with valid values validates clean (and
 /// `cadence: never` proves the extended grammar while skipping the rule).
-///
-/// `birthday`, `dates` and `cadence` are still claimed by the compiled
-/// `personal@0.1` pack (registered but not enabled here), so core flags
-/// them `W_PACK_ORPHAN`; that overlap disappears in #444b when compiled
-/// personal is replaced by the embedded 0.2 manifest. So this asserts no
-/// errors and no `E_FRONTMATTER` (grammar validation passes), not zero
-/// findings.
 #[test]
 fn personal_0_2_fields_validate_clean() {
     let json = schema_pack_report(
@@ -7228,6 +7269,7 @@ fn personal_0_2_fields_validate_clean() {
         "every 0.2 value must validate: {json:?}"
     );
     assert_eq!(json["summary"]["errors"], 0, "{json:?}");
+    assert_eq!(json["summary"]["warnings"], 0, "{json:?}");
 }
 
 /// `tags: []` is a valid, empty list.
@@ -7288,7 +7330,7 @@ fn personal_0_2_rejections_are_frontmatter() {
 fn cadence_never_suppresses_overdue() {
     let json = schema_pack_report("cadence: never\n");
     assert!(
-        !codes(&json).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        !codes(&json).iter().any(|c| c == "W_CADENCE_OVERDUE"),
         "never must not be overdue: {json:?}"
     );
 }
@@ -7299,7 +7341,7 @@ fn snooze_until_suppresses_overdue_before_date() {
     // as_of = 2026-10-08; snooze 2026-10-20 is in the future.
     let json = schema_pack_report("cadence: 30d\nsnooze_until: 2026-10-20\n");
     assert!(
-        !codes(&json).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        !codes(&json).iter().any(|c| c == "W_CADENCE_OVERDUE"),
         "an active snooze must suppress the nudge: {json:?}"
     );
 }
@@ -7311,12 +7353,12 @@ fn snooze_until_due_on_date_is_overdue() {
     // snooze_until == as_of: eligible again, no contact, 30d cadence.
     let on_date = schema_pack_report("cadence: 30d\nsnooze_until: 2026-10-08\n");
     assert!(
-        codes(&on_date).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        codes(&on_date).iter().any(|c| c == "W_CADENCE_OVERDUE"),
         "eligible on the snooze date: {on_date:?}"
     );
     let past = schema_pack_report("cadence: 30d\nsnooze_until: 2026-01-01\n");
     assert!(
-        codes(&past).iter().any(|c| c == "W_EXAMPLE_CADENCE"),
+        codes(&past).iter().any(|c| c == "W_CADENCE_OVERDUE"),
         "a past snooze has no effect: {past:?}"
     );
 }
@@ -7337,34 +7379,34 @@ fn personal_0_2_values_do_not_echo_in_findings() {
 }
 
 // ---------------------------------------------------------------------------
-// personal@0.2 embedded declarative pack (#550)
+// personal@0.2 embedded declarative pack (#550, cutover #551)
 //
-// The built-in `personal@0.2` pack is compiled into the binary and loaded
-// through the manifest-v2 / declarative path. This is the parity gate from
-// #444: compiled `personal@0.1` and the embedded 0.2 pack must agree on the
-// 0.1 field set (`birthday`, `cadence`, `dates`, the `touch` note pair).
+// The built-in `personal@0.2` pack is compiled into the binary, implicit in
+// every vault, and loaded through the manifest-v2 / declarative path. This
+// block pins the behaviour on the 0.1/0.2 field set as a recorded golden:
+// the fixture triggers every in-scope code, and its findings are asserted
+// verbatim.
 // ---------------------------------------------------------------------------
 
 use confidant_core::packs::embedded as packs_embedded;
 
-/// A note id with two versions: a conflicted note. Compiled personal@0.1
-/// reports it missing; the declarative 0.2 pack treats a conflicted id as
-/// existing (#458) — a documented divergence the parity normaliser drops.
+/// A note id with two versions: a conflicted note. The declarative kinds
+/// treat a conflicted id as existing (#458).
 const CONFLICTED_NOTE: &str = "n-01M3TC5H00MPJG00900000000G";
 
 /// A well-formed note id with no record file: the `missing` variant.
 const MISSING_NOTE: &str = "n-01M3TC5H00MPJG00A000000000H";
 
-/// Build a vault fixture that triggers every in-scope code at least once on
-/// the 0.1 field set, with `packs` selecting which personal pack is enabled.
-/// Fake data only.
-fn parity_fixture(packs: &str) -> Value {
+/// Build a vault fixture that triggers every in-scope code at least once.
+/// The built-in personal pack is implicit (#551), so `packs = []`. Fake data
+/// only.
+fn personal_golden_fixture() -> Value {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
         root,
         "confidant.toml",
-        &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]")),
+        &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", "packs = []"),
     );
     // Ada: overdue cadence and an upcoming birthday.
     write(
@@ -7403,7 +7445,7 @@ fn parity_fixture(packs: &str) -> Value {
     // Ada's last contact is 40 days before as_of (2026-10-08): overdue. Bea's
     // touch lines carry the note problems (invalid id, wrong type, missing);
     // Cam points at Bea's note (wrong owner). The conflicted note is a sixth
-    // touch, dropped by the normaliser (#458).
+    // touch and is treated as existing (#458), so it adds no finding.
     write(
         root,
         "ledger/2026/10.cfd",
@@ -7419,7 +7461,7 @@ fn parity_fixture(packs: &str) -> Value {
     report_json(root, None)
 }
 
-/// The in-scope codes the #550 parity gate compares (the #444 list).
+/// The in-scope codes the #550/#551 golden covers (the #444 list).
 const PARITY_CODES: &[&str] = &[
     "W_CADENCE_OVERDUE",
     "W_DATE_UPCOMING",
@@ -7429,40 +7471,19 @@ const PARITY_CODES: &[&str] = &[
     "E_UNKNOWN_RECORD",
 ];
 
-/// Normalise a report for the parity comparison. Kept to what the test
-/// documents:
-///
-/// - only the in-scope codes are compared. Compiled `personal@0.1` stays
-///   registered (PD14) and disabled on the embedded run, so fields both
-///   packs claim trip `W_PACK_ORPHAN`; that transitional artifact (#551
-///   removes the compiled pack) and any other non-in-scope code drop out.
-/// - the conflicted note's compiled-only `E_UNKNOWN_RECORD` is dropped
-///   (#458).
-/// - `E_FRONTMATTER` message/fix wording is blanked (compiled names the
-///   per-field problem, the declarative template is generic).
-///
-/// Everything else — code, severity, file, line, id — is compared verbatim.
-fn normalise_parity(v: &Value) -> Vec<Value> {
+/// The in-scope findings of a report, as comparable values. Only the codes
+/// in [`PARITY_CODES`] are kept; `E_FRONTMATTER` wording is normalised
+/// because the declarative evaluator renders the manifest's generic
+/// template. Everything else — code, severity, file, line, id — is verbatim.
+fn parity_findings(v: &Value) -> Vec<Value> {
     v["findings"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|f| PARITY_CODES.contains(&f["code"].as_str().unwrap()))
-        .filter(|f| {
-            // #458: compiled personal@0.1 reports a conflicted note missing;
-            // the declarative kind treats a conflicted id as existing. Both
-            // are in-scope codes, so drop the compiled-only finding.
-            !f["message"]
-                .as_str()
-                .is_some_and(|m| m.contains(CONFLICTED_NOTE))
-        })
         .map(|f| {
             let mut f = f.clone();
             if f["code"] == "E_FRONTMATTER" {
-                // Documented divergence: compiled names the per-field problem
-                // ("must be YYYY-MM-DD or --MM-DD"); the declarative evaluator
-                // renders the manifest's generic template ("does not match its
-                // declared grammar"). Only the wording differs.
                 f["message"] = json!("<frontmatter>");
                 f["fix"] = json!("<frontmatter>");
             }
@@ -7471,57 +7492,157 @@ fn normalise_parity(v: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The cutover parity gate (#444/#550): compiled `personal@0.1` and the
-/// embedded declarative `personal@0.2` produce equal findings on the 0.1
-/// field set, and the fixture triggers every in-scope code.
+/// The cutover golden (#444/#550/#551): the implicit built-in `personal@0.2`
+/// produces the recorded findings on a fixture that triggers every in-scope
+/// code. Compiled `personal@0.1` (the old oracle) is gone; this pins the
+/// behaviour instead of comparing two live implementations.
 #[test]
-fn declarative_personal_matches_compiled_personal() {
-    let personal = parity_fixture("\"personal@0.1\"");
-    let declarative = parity_fixture("\"personal@0.2\"");
-    let personal_norm = normalise_parity(&personal);
-    let declarative_norm = normalise_parity(&declarative);
-    assert_eq!(
-        personal_norm, declarative_norm,
-        "embedded personal@0.2 must match compiled personal@0.1:\n\
-         personal: {personal:?}\ndeclarative: {declarative:?}"
-    );
+fn declarative_personal_golden_findings() {
+    let json = personal_golden_fixture();
+    let findings = parity_findings(&json);
+    // Every in-scope code is exercised, so the golden cannot silently shrink.
     for code in PARITY_CODES {
         assert!(
-            personal_norm.iter().any(|f| f["code"] == **code),
-            "the parity fixture must trigger {code}: {personal_norm:?}"
+            findings.iter().any(|f| f["code"] == **code),
+            "the fixture must trigger {code}: {findings:?}"
         );
     }
+    let expected: Vec<Value> = json!([
+        {
+            "code": "E_FRONTMATTER",
+            "severity": "error",
+            "message": "<frontmatter>",
+            "fix": "<frontmatter>",
+            "file": "people/p-01M3TC5H00MPJG000H24000001/profile.md",
+            "line": 5,
+            "id": "p-01M3TC5H00MPJG000H24000001"
+        },
+        {
+            "code": "E_FRONTMATTER",
+            "severity": "error",
+            "message": "<frontmatter>",
+            "fix": "<frontmatter>",
+            "file": "people/p-01M3TC5H00MPJG000H24000001/profile.md",
+            "line": 6,
+            "id": "p-01M3TC5H00MPJG000H24000001"
+        },
+        {
+            "code": "E_FRONTMATTER",
+            "severity": "error",
+            "message": "<frontmatter>",
+            "fix": "<frontmatter>",
+            "file": "people/p-01M3TC5H00MPJG001248000002/profile.md",
+            "line": 5,
+            "id": "p-01M3TC5H00MPJG001248000002"
+        },
+        {
+            "code": "E_INVALID_ID",
+            "severity": "error",
+            "message": "touch note is not a record ID",
+            "fix": "Point note: at an existing n-<ULID> note",
+            "file": "ledger/2026/10.cfd",
+            "line": 2,
+            "id": "p-01M3TC5H00MPJG000H24000001"
+        },
+        {
+            "code": "E_INVALID_ID",
+            "severity": "error",
+            "message": "touch note is not a record ID",
+            "fix": "Point note: at an existing n-<ULID> note",
+            "file": "ledger/2026/10.cfd",
+            "line": 4,
+            "id": "p-01M3TC5H00MPJG000H24000001"
+        },
+        {
+            "code": "E_UNKNOWN_RECORD",
+            "severity": "error",
+            "message": "touch note 'n-01M3TC5H00MPJG002NAM000005' does not belong to p-01M3TC5H00MPJG001248000002",
+            "fix": "Point note: at a note for this person",
+            "file": "ledger/2026/10.cfd",
+            "line": 5,
+            "id": "p-01M3TC5H00MPJG001248000002"
+        },
+        {
+            "code": "E_WRONG_ID_TYPE",
+            "severity": "error",
+            "message": "touch note 'p-01M3TC5H00MPJG001248000002' is not a note id",
+            "fix": "Use note:n-<ULID>",
+            "file": "ledger/2026/10.cfd",
+            "line": 3,
+            "id": "p-01M3TC5H00MPJG000H24000001"
+        },
+        {
+            "code": "W_CADENCE_OVERDUE",
+            "severity": "warning",
+            "message": "person p-01M3TC5H00MPJG000000000000 has no touchpoint on or after 2026-09-08 (last was 2026-08-29, cadence 30d)",
+            "fix": "Log a touchpoint with `confidant log touch p-01M3TC5H00MPJG000000000000 <kind>` or widen cadence",
+            "file": "people/p-01M3TC5H00MPJG000000000000/profile.md",
+            "id": "p-01M3TC5H00MPJG000000000000"
+        },
+        {
+            "code": "W_DATE_UPCOMING",
+            "severity": "warning",
+            "message": "upcoming date for p-01M3TC5H00MPJG000000000000 on 2026-10-12 (in 4d)",
+            "fix": "Reach out to p-01M3TC5H00MPJG000000000000 or set `[checks] personal.date_upcoming = \"off\"`",
+            "file": "people/p-01M3TC5H00MPJG000000000000/profile.md",
+            "id": "p-01M3TC5H00MPJG000000000000"
+        }
+    ])
+    .as_array()
+    .unwrap()
+    .clone();
+    assert_eq!(findings, expected, "golden drift:\n{json:?}");
 }
 
-/// The demo vault, with `personal@0.1` swapped for the embedded `personal@0.2`
-/// pack, stays clean (#550 acceptance).
-#[test]
-fn declarative_personal_demo_vault_clean() {
-    let dir = tempfile::tempdir().unwrap();
-    copy_dir(&demo_vault(), dir.path());
-    let cfg = fs::read_to_string(dir.path().join("confidant.toml")).unwrap();
-    fs::write(
-        dir.path().join("confidant.toml"),
-        cfg.replace("\"personal@0.1\"", "\"personal@0.2\""),
-    )
-    .unwrap();
-    let json = report_json(dir.path(), None);
-    assert_eq!(json["findings"], json!([]), "{json:?}");
-    assert_eq!(json["summary"]["errors"], 0, "{json:?}");
-    assert_eq!(json["summary"]["warnings"], 0, "{json:?}");
-}
-
-/// A vault that vendors its own `packs/personal@0.2/` is still
-/// `E_PACK_INVALID`: the stable-code allowance is keyed on compiled-in
-/// origin, never the pack name (#504 R8).
+/// A vault that vendors its own `packs/personal@…/` is `E_PACK_INVALID`
+/// whether or not it lists the pack: the built-in is implicit, and the
+/// stable-code allowance is keyed on compiled-in origin, never the pack
+/// name (#504 R8, #551).
 #[test]
 fn vault_supplied_personal_pack_is_e_pack_invalid() {
+    for (listing, vendored) in [
+        ("personal@0.2", "personal@0.2"),
+        ("personal@0.1", "personal@0.1"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "confidant.toml",
+            &PERSONAL_TOML.replace(
+                "packs = [\"personal@0.1\"]",
+                &format!("packs = [\"{listing}\"]"),
+            ),
+        );
+        person(root, ADA, "Ada Example");
+        let declared =
+            packs_embedded::find("personal@0.2").expect("personal@0.2 is a compiled-in pack");
+        for (rel, bytes) in declared.files() {
+            write(
+                root,
+                &format!("packs/{vendored}/{rel}"),
+                std::str::from_utf8(bytes).unwrap(),
+            );
+        }
+        let (name, version) = vendored.split_once('@').unwrap();
+        install_lockfile(root, name, version, declared.hash());
+        let json = report_json(root, None);
+        let finding = finding_by_code(&json, "E_PACK_INVALID");
+        assert_eq!(
+            finding["file"],
+            format!("packs/{vendored}"),
+            "the finding points at the vendored path: {json:?}"
+        );
+    }
+
+    // A vendored directory with no listing at all is still invalid: the
+    // built-in is on even when `packs = []`.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
         root,
         "confidant.toml",
-        &PERSONAL_TOML.replace("personal@0.1", "personal@0.2"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
     );
     person(root, ADA, "Ada Example");
     let declared =
@@ -7533,13 +7654,9 @@ fn vault_supplied_personal_pack_is_e_pack_invalid() {
             std::str::from_utf8(bytes).unwrap(),
         );
     }
-    install_lockfile(root, "personal", "0.2", declared.hash());
     let json = report_json(root, None);
     let finding = finding_by_code(&json, "E_PACK_INVALID");
-    assert_eq!(
-        finding["file"], "packs/personal@0.2",
-        "the finding points at the vendored path: {json:?}"
-    );
+    assert_eq!(finding["file"], "packs/personal@0.2", "{json:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -7579,15 +7696,15 @@ default_fix = "{{fix}}"
         .fields
 }
 
-/// The compiled personal pack's view for a person, via `context`.
+/// The built-in personal pack's view for a person, via `context`.
 fn personal_view(root: &Path, person: &str) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(person).unwrap();
     let bundle = build_context(&vault, &id, true, &PackScope::All).unwrap();
     bundle
         .packs
-        .get("personal@0.1")
-        .expect("personal@0.1 view")
+        .get("personal@0.2")
+        .expect("personal@0.2 view")
         .clone()
 }
 
@@ -7625,10 +7742,10 @@ fn write_full_0_2_person(root: &Path, no_ai: bool) {
     );
 }
 
-/// Structural golden for a demo-vault person: the `personal@0.1` entry keeps
-/// today's shape (the pack key moves to `personal@0.2` at the #444 cutover,
-/// not here). Demo Ada has no declared personal field, so only derived keys
-/// appear; the 2026-10-08 session is her last contact.
+/// Structural golden for a demo-vault person: the `personal@0.2` entry keeps
+/// the same shape at the #551 cutover. Demo Ada has no declared personal
+/// field, so only derived keys appear; the 2026-10-08 session is her last
+/// contact.
 #[test]
 fn context_view_shape_is_stable() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
@@ -7942,11 +8059,11 @@ fn context_recent_touches_last_10_and_order() {
     assert!(!recent.iter().any(|t| t["date"] == "2026-10-03"), "{view}");
 }
 
-/// Every rejected `touch` argument form routes through the core grammar: a
-/// malformed line is `E_TOUCH_MALFORMED` while an enabled pack is on, and a
-/// disabled pack's valid shape is `W_PACK_ORPHAN`.
+/// Every rejected `touch` argument form routes through the core grammar and
+/// is `E_TOUCH_MALFORMED`. The built-in personal pack is implicit (#551), so
+/// there is no longer a valid-shape `W_PACK_ORPHAN` half.
 #[test]
-fn touch_args_table_malformed_and_orphan() {
+fn touch_args_table_malformed() {
     for args in [
         "smoke",
         "coffee",
@@ -7968,39 +8085,4 @@ fn touch_args_table_malformed_and_orphan() {
             "{args} must be malformed: {json}"
         );
     }
-
-    // Disabled pack: the positional `log touch` shape is a valid pack shape
-    // (`W_PACK_ORPHAN`), a bad kind is still malformed.
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "confidant.toml",
-        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
-    );
-    person(dir.path(), ADA, "Ada Example");
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!("2026-10-01 touch {ADA} call\n"),
-    );
-    let orphan = report_json(dir.path(), None);
-    assert!(
-        codes(&orphan).contains(&"W_PACK_ORPHAN".to_owned()),
-        "{orphan}"
-    );
-
-    let dir2 = tempfile::tempdir().unwrap();
-    write(
-        dir2.path(),
-        "confidant.toml",
-        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
-    );
-    person(dir2.path(), ADA, "Ada Example");
-    write(
-        dir2.path(),
-        "ledger/2026/10.cfd",
-        &format!("2026-10-01 touch {ADA} coffee\n"),
-    );
-    let malformed = report_json(dir2.path(), None);
-    assert_eq!(codes(&malformed), vec!["E_TOUCH_MALFORMED"], "{malformed}");
 }

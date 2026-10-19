@@ -998,11 +998,11 @@ fn cadence_overdue_clears_after_interaction_logged() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    // Pin `as_of` and enable the personal pack, then give the person a
-    // cadence with no contact on record.
+    // Pin `as_of`; the built-in personal pack is implicit (#551), then give
+    // the person a cadence with no contact on record.
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\", \"personal@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\n\n[crypto]\nmode = \"plaintext\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -1151,7 +1151,7 @@ fn context_exclude_private_strips_personal_pii_fields() {
         root.join(format!("people/{PERSON}/profile.md")),
         format!(
             "---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n\
-             birthday: --05-14\nrelationship_to_me: friend\n\
+             birthday: --05-14\nrelationship: friend\n\
              dates: [anniversary:2020-06-15]\ncadence: 30d\n---\n\nTest bio.\n"
         ),
     )
@@ -1161,9 +1161,9 @@ fn context_exclude_private_strips_personal_pii_fields() {
 
     let (ok, full) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
     assert!(ok, "{full}");
-    let view = &full["packs"]["personal@0.1"];
+    let view = &full["packs"]["personal@0.2"];
     assert_eq!(view["birthday"], "--05-14", "{full}");
-    assert_eq!(view["relationship_to_me"], "friend", "{full}");
+    assert_eq!(view["relationship"], "friend", "{full}");
     assert_eq!(view["dates"][0]["label"], "anniversary", "{full}");
     assert_eq!(view["cadence_days"], 30, "{full}");
 
@@ -1177,8 +1177,8 @@ fn context_exclude_private_strips_personal_pii_fields() {
         &vroot,
     ]);
     assert!(ok, "{stripped}");
-    let view = &stripped["packs"]["personal@0.1"];
-    for field in ["birthday", "relationship_to_me", "dates"] {
+    let view = &stripped["packs"]["personal@0.2"];
+    for field in ["birthday", "relationship", "dates"] {
         assert!(view.get(field).is_none(), "{field} leaked: {stripped}");
     }
     assert_eq!(view["cadence_days"], 30, "{stripped}");
@@ -2482,8 +2482,9 @@ fn plaintext_vault_note_inherits_notes_mode_via_id_list_field() {
     assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
 }
 
-/// Enable `personal@0.1` next to `coaching@0.1` (the `log touch` enable
-/// switch) and commit the config change. Shared by the `log touch` tests.
+/// Append a no-op `personal@0.2` listing next to `coaching@0.1` and commit
+/// the config change. #551: the built-in personal pack is implicit, so the
+/// listing changes nothing; the commit keeps the fixture's commit counts.
 fn enable_personal(root: &Path) {
     let toml_path = root.join("confidant.toml");
     let toml = std::fs::read_to_string(&toml_path).unwrap();
@@ -2491,7 +2492,7 @@ fn enable_personal(root: &Path) {
         &toml_path,
         toml.replace(
             "packs = [\"coaching@0.1\"]",
-            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
+            "packs = [\"coaching@0.1\", \"personal@0.2\"]",
         ),
     )
     .unwrap();
@@ -2500,11 +2501,11 @@ fn enable_personal(root: &Path) {
 }
 
 #[test]
-fn log_touch_requires_personal_pack() {
+fn log_touch_works_without_listing_personal() {
+    // #551: the built-in personal pack is implicit, so `log touch` works in
+    // a vault that only lists coaching.
     let dir = make_vault();
-    let root = dir.path();
-    let vroot = vault_arg(root);
-    // make_vault only enables coaching@0.1; `log touch` must refuse.
+    let vroot = vault_arg(dir.path());
     let (ok, v) = run_json(&[
         "log",
         "touch",
@@ -2515,12 +2516,7 @@ fn log_touch_requires_personal_pack() {
         "--vault",
         &vroot,
     ]);
-    assert!(!ok, "{v}");
-    assert_eq!(v["error"]["code"], "E_INVALID");
-    assert!(v["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("personal@0.1"));
+    assert!(ok, "{v}");
 }
 
 #[test]
@@ -2528,7 +2524,7 @@ fn log_touch_writes_one_commit_and_appears_in_context() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    // Enable personal@0.1.
+    // enable_personal commits a no-op personal@0.2 listing (#551).
     enable_personal(root);
 
     let (ok, added) = run_json(&[

@@ -138,19 +138,21 @@ domain.
   notes; a paid client with no session inside a configurable window). If you
   run a coaching practice, this pack covers what you'd otherwise need a
   coaching CRM for — without the sales-pipeline baggage.
-- **`personal@0.1`** ships today, compiled into the binary. It adds
-  birthdays, relationship edges (`friend`, `family`, `sibling`, `partner`,
-  `parent`, `mentor`), keep-in-touch cadence (`W_CADENCE_OVERDUE`), upcoming
+- **`personal@0.2`** is the built-in personal pack. It is **implicit**:
+  every vault has it, whether or not `packs` lists it (`packs = []` still
+  enables it), and a `personal@…` entry is a no-op. It adds birthdays,
+  relationship edges (`friend`, `family`, `sibling`, `partner`, `parent`,
+  `mentor`), keep-in-touch cadence (`W_CADENCE_OVERDUE`), upcoming
   important dates (`W_DATE_UPCOMING`), and the `touch` ledger verb
   (`confidant log touch <person> call|text|email|meet|meal|event|gift|other`) for lightweight
   touchpoints. Both cadence and date nudges are warning-level and never block
   a write.
 - **Multi-pack vaults** ([issue #173](https://github.com/hirefrank/confidant/issues/173)):
-  a vault can list several packs at once (`packs = [...]` in
-  `confidant.toml`), e.g. `packs = ["coaching@0.1", "personal@0.1"]`. Per-pack
+  a vault can list additional packs at once (`packs = [...]` in
+  `confidant.toml`), e.g. `packs = ["coaching@0.1"]`. Per-pack
   access scoping — so one person can be a coaching
-  client and a friend, and a coaching agent never sees personal notes — is
-  still to come.
+  client and a friend, and a coaching agent never sees personal notes —
+  is still to come.
 - **External packs** ([issue #193](https://github.com/hirefrank/confidant/issues/193)):
   the long-term direction is installable, versioned packs loaded at runtime,
   so third parties can publish packs without opening a PR here. Not yet
@@ -323,7 +325,7 @@ The roadmap is tracked as open issues on GitHub. The big themes:
 
 - **Multi-pack vaults** — one vault, several packs, per-pack scoping.
   [Issue #173](https://github.com/hirefrank/confidant/issues/173) is the
-  umbrella; `personal@0.1` is the proving pack
+  umbrella; the implicit built-in `personal@0.2` is the proving pack
   ([#184](https://github.com/hirefrank/confidant/issues/184)).
 - **External packs** — installable, versioned, loaded at runtime so third
   parties can publish packs without a PR here.

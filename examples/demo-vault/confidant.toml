@@ -1,5 +1,5 @@
 spec = "0.1"
-packs = ["coaching@0.1", "personal@0.1"]
+packs = ["coaching@0.1"]
 vault_id = "01M3TC5H00MPJG005VQC00000B"
 
 [checks]

@@ -1,11 +1,12 @@
-//! Schema packs compiled into the binary (ADR-8).
+//! Schema packs: the compiled packs and the implicit embedded built-ins
+//! (ADR-8).
 //!
 //! A pack owns ledger verbs, record types, front-matter fields, balance
 //! metrics, and edge kinds. `check` resolves the vault's `packs = [...]`
-//! list against the static registry, refuses conflicting claims
-//! (`E_PACK_CONFLICT`), folds each enabled pack independently, and warns
-//! — never errors — on data owned by a pack that is not enabled
-//! (`W_PACK_ORPHAN`, #177 Q2).
+//! list against the static registry plus the implicit built-ins, refuses
+//! conflicting claims (`E_PACK_CONFLICT`), folds each enabled pack
+//! independently, and warns — never errors — on data owned by a pack that
+//! is not enabled (`W_PACK_ORPHAN`, #177 Q2).
 //!
 //! Calculations stay compiled in Rust (the #173 decision). There is no
 //! plugin ABI in this slice; external pack discovery (#193) is a later cut
@@ -31,7 +32,6 @@ pub mod groups;
 pub mod lock;
 pub mod manifest;
 pub mod manifest_pack;
-pub mod personal;
 pub mod registry;
 pub mod untrusted;
 
@@ -191,42 +191,57 @@ pub trait Pack: Send + Sync {
     }
 }
 
-/// Every pack compiled into this binary, in registry order.
-pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack, &personal::PersonalPack];
+/// Every pack compiled into this binary, in registry order. The built-in
+/// declarative packs are not here: they are implicit and live in
+/// [`embedded`] (#551), enabled in every vault.
+pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack];
 
 /// The parsed manifests of every compiled pack, in registry order.
 /// `config` reads the `[checks]` key declarations from these so the
 /// allowlists and defaults live in the manifests, not in hardcoded
 /// slices (#345).
-pub(crate) fn pack_manifests() -> [&'static manifest::PackManifest; 2] {
-    [
-        &coaching::manifest_claims().manifest,
-        &personal::manifest_claims().manifest,
-    ]
+pub(crate) fn pack_manifests() -> Vec<&'static manifest::PackManifest> {
+    vec![&coaching::manifest_claims().manifest]
 }
 
 /// The pack manifests consulted for `[checks]` key handling (#433).
-/// Compiled packs today; #438 extends this with loaded external packs.
-/// Returns a `Vec` (not a fixed array) so later issues can append.
+/// The compiled packs plus the implicit embedded built-ins (#551): the
+/// built-in personal pack's `[checks]` keys must be accepted without the
+/// vault listing it.
 pub(crate) fn pack_manifests_for_config() -> Vec<&'static manifest::PackManifest> {
-    pack_manifests().into_iter().collect()
+    let mut manifests = pack_manifests();
+    manifests.extend(embedded::embedded_packs().iter().map(|p| p.manifest()));
+    manifests
 }
 
-/// The parsed manifest for a compiled pack, by `name@version`
+/// The parsed manifest for a compiled or built-in pack, by `name@version`
 /// (e.g. `"coaching@0.1"`). Used by the CLI's drift tests to check
 /// manifest text against the embedded SKILL.md (#345).
 pub fn pack_manifest(name: &str) -> Option<&'static manifest::PackManifest> {
-    pack_manifests()
+    pack_manifests_for_config()
         .into_iter()
         .find(|m| format!("{}@{}", m.pack.name, m.pack.version) == name)
 }
 
-/// The enabled packs for a vault's `packs = [...]` list, each at most once
-/// (a duplicated listing folds once), plus the listed names no compiled pack
-/// implements. Order follows the config list.
+/// Whether `listed` names a pack this binary implements: a compiled pack or
+/// an implicit built-in (at any version). `init --packs` validates against
+/// this so a no-op `personal@…` listing is accepted (#551).
+pub fn is_known_pack_id(listed: &str) -> bool {
+    pack_manifest(listed).is_some() || embedded::is_builtin_listing(listed)
+}
+
+/// The enabled packs for a vault's `packs = [...]` list, plus the implicit
+/// built-ins (`implicit`), each at most once (a duplicated listing folds
+/// once), and the listed names no registry pack implements. Order follows
+/// the config list; implicit packs the list did not name are appended.
+///
+/// A `name@version` in `names` that matches a pack exactly enables it. A
+/// built-in listing at another version (`personal@0.1`) is a no-op: the
+/// built-in is already enabled under its own `name@version`.
 pub fn resolve_enabled<'a>(
     names: &[String],
     registry: &[&'a dyn Pack],
+    implicit: &[&'a dyn Pack],
 ) -> (Vec<&'a dyn Pack>, Vec<String>) {
     let mut found = Vec::new();
     let mut seen: HashSet<&'static str> = HashSet::new();
@@ -238,7 +253,13 @@ pub fn resolve_enabled<'a>(
                     found.push(*pack);
                 }
             }
+            None if embedded::is_builtin_listing(name) => {}
             None => unknown.push(name.clone()),
+        }
+    }
+    for pack in implicit {
+        if seen.insert(pack.name()) {
+            found.push(*pack);
         }
     }
     (found, unknown)
@@ -300,7 +321,7 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
         // #434: finding codes claimed by two enabled *external* packs
         // conflict. Codes that are already builtin enum codes are skipped:
         // compiled packs legitimately share them (coaching@0.1 and
-        // personal@0.1 both list E_INVALID_ID, E_WRONG_ID_TYPE,
+        // the built-in personal pack both list E_INVALID_ID, E_WRONG_ID_TYPE,
         // E_UNKNOWN_RECORD).
         for code in pack.finding_codes() {
             if crate::check::FindingCode::is_builtin_code(code) {
@@ -444,15 +465,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_compiled_matches_all_packs() {
+    fn registry_compiled_holds_compiled_and_builtin_packs() {
         let names: Vec<&str> = PackRegistry::compiled()
             .all()
             .iter()
             .map(|p| p.name())
             .collect();
-        assert_eq!(names, vec!["coaching@0.1", "personal@0.1"]);
+        assert_eq!(names, vec!["coaching@0.1", "personal@0.2"]);
         let all_names: Vec<&str> = ALL_PACKS.iter().map(|p| p.name()).collect();
-        assert_eq!(names, all_names);
+        assert_eq!(all_names, vec!["coaching@0.1"]);
     }
 
     #[test]
@@ -464,9 +485,32 @@ mod tests {
             "nope@9.9".to_string(),
         ];
         let (found, unknown) = registry.resolve_enabled(&names);
-        assert_eq!(found.len(), 1);
+        // The implicit built-in is appended after the listed packs.
+        assert_eq!(found.len(), 2);
         assert_eq!(found[0].name(), "coaching@0.1");
+        assert_eq!(found[1].name(), "personal@0.2");
         assert_eq!(unknown, vec!["nope@9.9".to_string()]);
+    }
+
+    #[test]
+    fn implicit_personal_is_enabled_with_empty_packs() {
+        let registry = PackRegistry::compiled();
+        let (found, unknown) = registry.resolve_enabled(&[]);
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "personal@0.2");
+    }
+
+    #[test]
+    fn personal_listings_are_noops_at_any_version() {
+        for listed in ["personal@0.1", "personal@0.2", "personal@9.9"] {
+            let registry = PackRegistry::compiled();
+            let names = vec![listed.to_string()];
+            let (found, unknown) = registry.resolve_enabled(&names);
+            assert!(unknown.is_empty(), "{listed}: {unknown:?}");
+            assert_eq!(found.len(), 1, "{listed}");
+            assert_eq!(found[0].name(), "personal@0.2", "{listed}");
+        }
     }
 
     #[test]
@@ -475,11 +519,11 @@ mod tests {
         let personal = registry
             .all()
             .iter()
-            .find(|p| p.name() == "personal@0.1")
+            .find(|p| p.name() == "personal@0.2")
             .unwrap();
         let enabled: Vec<&dyn Pack> = vec![*personal];
         let via_method = registry.orphan_owners(&enabled);
-        let via_free = orphan_owners(ALL_PACKS, &enabled);
+        let via_free = orphan_owners(registry.all(), &enabled);
         // Coaching verbs are orphans when only personal is enabled.
         assert_eq!(via_method.verbs.get("open"), Some(&"coaching@0.1"));
         assert_eq!(via_method.verbs.get("session"), Some(&"coaching@0.1"));
@@ -503,7 +547,7 @@ mod tests {
             "coaching@0.1".to_string(),
             "nope@1".to_string(),
         ];
-        let (found, unknown) = resolve_enabled(&names, &registry());
+        let (found, unknown) = resolve_enabled(&names, &registry(), &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "coaching@0.1");
         assert_eq!(unknown, vec!["nope@1".to_string()]);
@@ -684,11 +728,13 @@ mod tests {
 
     #[test]
     fn find_conflict_ignores_shared_core_codes() {
-        // coaching@0.1 and personal@0.1 both list E_INVALID_ID,
+        // coaching@0.1 and the built-in personal pack both list E_INVALID_ID,
         // E_WRONG_ID_TYPE, E_UNKNOWN_RECORD — shared builtin codes must not
         // conflict (#434).
-        static PERSONAL: personal::PersonalPack = personal::PersonalPack;
-        let packs: Vec<&dyn Pack> = vec![&COACHING, &PERSONAL];
+        let personal = crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_2)
+            .expect("personal@0.2 is embedded")
+            .pack();
+        let packs: Vec<&dyn Pack> = vec![&COACHING, personal];
         assert!(find_conflict(&packs).is_none());
     }
 
@@ -737,7 +783,7 @@ mod tests {
     /// the code supplies the right values at each call site.
     #[test]
     fn all_manifest_message_templates_render() {
-        for m in super::pack_manifests() {
+        for m in super::pack_manifests_for_config() {
             for code in &m.finding_codes {
                 let variants = &m.messages[code.as_str()];
                 for (variant, template) in variants {

@@ -15,22 +15,26 @@ two warning-level rules (keep-in-touch cadence, upcoming dates). It works
 alongside `coaching@0.1` in one vault — a coaching client can also be a
 friend, and each pack's data scopes independently (#178).
 
-The pack is declared in `confidant.toml`:
+The pack is **implicit**: every vault has it, whether or not
+`confidant.toml` lists it. A vault that lists `coaching@0.1` explicitly
+looks like:
 
 ```toml
-packs = ["coaching@0.1", "personal@0.2"]
+packs = ["coaching@0.1"]
 ```
 
-Without this pack, personal fields are unattributed, the personal edge kinds
-are unknown, and the cadence/date rules do not run. A `touch` line stays a
-valid core mirror touchpoint either way; the pack owns its richer form.
+`packs = []` still enables the personal pack. A `personal@…` entry in
+`packs` is accepted as a no-op.
 
-**0.1 compatibility.** This is the 0.2 contract. Until the cutover (#551) the
-compiled `personal@0.1` pack still serves vaults that list it, and it keeps
-the 0.1 field set: it names the relationship field `relationship_to_me` and
-claims only `birthday`, `cadence`, `relationship_to_me`, and `dates` (no
-`title`, `company`, `location`, `emails`, `phones`, `links`, `tags`, or
-`snooze_until`). The `cadence`/`never` value and the `touch` kinds are shared.
+Personal fields are owned by the pack, the personal edge kinds are known, and
+the cadence/date rules always run. A `touch` line is both a core mirror
+touchpoint and the pack's richer form; the pack owns it.
+
+**0.1 history.** This is the 0.2 contract. The compiled `personal@0.1` pack
+(in place until the #551 cutover) kept the 0.1 field set: it named the
+relationship field `relationship_to_me` and claimed only `birthday`,
+`cadence`, `relationship_to_me`, and `dates`. It is gone; `personal@…`
+listings are no-ops and `personal@0.2` is the only personal pack.
 
 ## Fields
 

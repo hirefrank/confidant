@@ -533,13 +533,17 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     // external as `E_PACK_UNKNOWN` — noise on top of the spec finding,
     // which already fails `check` and returns below.
     if spec_ok {
+        let mut reported: HashSet<&str> = HashSet::new();
         for listed in &unknown_packs {
             // #438: a listed pack that exists but failed to load becomes its
             // specific finding (fail closed, PD12; problem packs are not
             // folded). One that is neither compiled nor resolvable at all
             // stays E_PACK_UNKNOWN.
             match vault.pack_problems.iter().find(|p| p.name == *listed) {
-                Some(problem) => findings.push(pack_problem_finding(problem)),
+                Some(problem) => {
+                    findings.push(pack_problem_finding(problem));
+                    reported.insert(problem.name.as_str());
+                }
                 None => findings.push(
                     Finding::new(
                         FindingCode::PackUnknown,
@@ -549,6 +553,19 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
                     .at_file("confidant.toml")
                     .with_fix("Remove the pack or use a CLI that implements it"),
                 ),
+            }
+        }
+        // #551: a broken install for an implicit built-in is reported even
+        // though the listing is a no-op and the name is known, so a vault
+        // can never silently shadow or vendor a built-in (#504 R8). Only
+        // built-in names reach here: the first loop reports every listed
+        // problem, and the loader never produces an unlisted non-built-in
+        // problem, so a broader filter could double-report one later.
+        for problem in &vault.pack_problems {
+            if !reported.contains(problem.name.as_str())
+                && crate::packs::embedded::is_builtin_listing(&problem.name)
+            {
+                findings.push(pack_problem_finding(problem));
             }
         }
     }
@@ -905,7 +922,7 @@ fn check_verbs_and_refs(
                             .at_file(&sourced.file)
                             .at_line(sourced.line)
                             .for_id(&e.id)
-                            .with_fix("Enable personal@0.1 or remove the line"),
+                            .with_fix("Enable the pack that owns the verb or remove the line"),
                         );
                     } else {
                         findings.push(

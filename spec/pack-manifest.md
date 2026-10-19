@@ -97,7 +97,7 @@ finding_codes = ["E_FRONTMATTER", "W_CADENCE_OVERDUE"]
 [pack]
 name = "personal"
 version = "0.1"
-# Full pack name is "personal@0.1", matching today's `Pack::name()`.
+# Full pack name is "personal@<version>".
 
 # Skill text is referenced, not duplicated: packs/<name>/SKILL.md is
 # the single source of truth (see §8).
@@ -176,7 +176,7 @@ Two independent versions, mirroring the spec/CLI split (ADR-1):
 - `manifest_version`: the schema version of this file. A reader that
   does not implement it fails with a config error rather than guessing.
   Bump only when the schema changes.
-- `[pack].version`: the pack's own version (`personal@0.1`). Pack
+- `[pack].version`: the pack's own version (`personal@0.2`). Pack
   version bumps follow the pack's contract file (`packs/<name>/0.1.md`).
 
 ## 6. Field grammars: a fixed named list
@@ -265,12 +265,14 @@ This keeps the manifest honest the same way the current test keeps the
 slices honest: the manifest cannot claim a code it cannot render, and
 cannot render a code it does not claim.
 
-## 11. Worked example: `personal@0.1` (frozen)
+## 11. Worked example: a v1 manifest (historical `personal@0.1`)
 
-`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`: the
-compiled `personal@0.1` pack's frozen claims. The repo-root
-`packs/personal/manifest.toml` is now the current `personal@0.2` built-in
-contract; see §13.7 for how a compiled-in built-in loads.
+The TOML below is the frozen `personal@0.1` claims that the compiled pack
+shipped with until the #551 cutover. That pack and its in-crate manifest
+(`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`) are
+deleted; the current built-in is `personal@0.2` at
+`packs/personal/manifest.toml` (§13.7). The example is kept because it is the
+clearest statement of the v1 manifest shape.
 
 ```toml
 manifest_version = 1
@@ -475,9 +477,9 @@ own issue appends its section with the parameter table:
 
 | Kind | Spec issue | Reproduces |
 |---|---|---|
-| `cadence-overdue` | #442 | `personal@0.1`'s keep-in-touch rule |
-| `date-upcoming` | #443 | `personal@0.1`'s upcoming-dates rule |
-| `note-ref` | #458 | `personal@0.1`'s `touch` note check and `coaching@0.1`'s `session` note check |
+| `cadence-overdue` | #442 | the built-in personal pack's keep-in-touch rule |
+| `date-upcoming` | #443 | the built-in personal pack's upcoming-dates rule |
+| `note-ref` | #458 | the built-in personal pack's `touch` note check and `coaching@0.1`'s `session` note check |
 
 (Planned: `ledger-balance` #446, `session-checks` #447, `activity-gap`
 #448.)
@@ -485,14 +487,14 @@ own issue appends its section with the parameter table:
 #### Kind `cadence-overdue` (#442)
 
 Warn when a person's last contact is older than their cadence window.
-Reproduces `personal@0.1`'s keep-in-touch rule (including the merge
+Reproduces the built-in personal pack's keep-in-touch rule (including the merge
 semantics: the canonical person's own cadence value first, else the
 first merged member's; contacts from any merged member count).
 
 One narrowed divergence remains (accepted, per §13.4 rule 7 / PD8):
 rules read ledger entries only, so an interaction with no mirrored
 `touch` line — hand-written, or written before the primary mirror
-landed — counts for compiled `personal@0.1` but not for a declarative
+landed — counts for the built-in personal pack but not for a declarative
 pack. `record add` mirrors a line for the primary person as well as for
 `with:` participants, so a newly logged interaction counts for both
 (#505).
@@ -552,7 +554,7 @@ one warning, `last` variant, `start = 2026-09-08`. A touch on
 #### Kind `date-upcoming` (#443)
 
 Warn when one of a person's recurring dates falls within the next
-`window` days. Reproduces `personal@0.1`'s upcoming-dates rule; the date
+`window` days. Reproduces the built-in personal pack's upcoming-dates rule; the date
 parsing and next-occurrence math are core's (`recurring-date` /
 `dates-list` grammars), never reimplemented per pack.
 
@@ -606,7 +608,7 @@ outside the window and emits nothing.
 
 Check the integrity of a `note:<id>` pair on a pack's ledger verb: the id
 must parse as a record id, must be a note id, must exist, and must belong
-to the entry's canonical person. Reproduces `personal@0.1`'s
+to the entry's canonical person. Reproduces the built-in personal pack's
 `touch_note_integrity` and `coaching@0.1`'s `session_note_integrity`.
 Only ids and path ownership are read — never note bodies, never `no-ai`
 content (PD8).
@@ -677,9 +679,11 @@ wrong_type_code = "E_EXAMPLE_NOTE_BAD_TYPE"
 
 - Pack names match `^[a-z][a-z0-9-]{1,31}$` (PD14).
 - `coaching` and `personal` are reserved: no external pack may use
-  them. If a vault lists `coaching@0.1` or `personal@0.1`, the compiled
-  pack always wins and any lockfile entry for it is ignored (`doctor`
-  notes it).
+  them. A vault listing `coaching@0.1` resolves to the compiled coaching
+  pack, which always wins and whose lockfile entry is ignored (`doctor`
+  notes it). `personal@…` names the implicit built-in personal pack: the
+  listing is a no-op at any version, and any vendored directory or
+  lockfile pin for it is `E_PACK_INVALID` (§13.7).
 - Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
 - Finding codes declared by an external pack must match
   `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
@@ -711,8 +715,8 @@ violation is `E_PACK_INVALID`:
 
 Ledger verbs named in rule parameters (e.g. `event_verbs`) are
 read-only access to plaintext ledger metadata (date, verb, opaque id)
-and may be any verb: `personal@0.1` counts coaching's `session` as a
-touchpoint.
+and may be any verb: the built-in personal pack counts coaching's
+`session` as a touchpoint.
 
 ### 13.5. Allowed pack contents (PD7)
 
@@ -768,8 +772,10 @@ issue turns the v2 example into a test.
 
 A **built-in** pack (today `personal@0.2`) is a v2 manifest whose bytes
 are compiled into the binary and loaded through the same loader and rule
-kinds as an external pack. The manifest's **origin** is what differs,
-and only the loader sets it (a manifest file cannot claim it):
+kinds as an external pack. A built-in is **implicit**: it is enabled in
+every vault, a `packs = []` vault included, and a `personal@…` listing is a
+no-op. The manifest's **origin** is what differs, and only the loader sets
+it (a manifest file cannot claim it):
 
 - origin `external` (the default): the bytes came from the vault's
   `packs/<name>@<version>/`; the PD8 capability limits and the

@@ -133,9 +133,10 @@ pass unchanged.
 The recommendation asked for the benchmark re-run with encryption on and
 with touch volume before building any cache. `bench-gen` grew two flags:
 
-- `--touch`: enables `personal@0.1` and writes 100 small `touch` ledger
+- `--touch`: writes 100 small `touch` ledger
   lines per person across 2024–2026 (40,000 lines; ledger entries
-  10,320 → 50,320).
+  10,320 → 50,320). The built-in personal pack is implicit (#551), so no
+  config change is needed.
 - `--encrypted`: keys the fresh vault (`init` + `keys init-client` per
   person under throwaway keys, no OS keychain) and encrypts all 2,400
   records through the production `encrypt_file` path. Needs the

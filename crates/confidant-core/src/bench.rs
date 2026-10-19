@@ -19,8 +19,9 @@ const TOUCHES_PER_PERSON: usize = 100;
 /// person 0's profile (for a one-hit search) and a common token planted in
 /// every profile. When `cjk` is true, note bodies use a no-space CJK
 /// paragraph (with an embedded dash) instead of English filler. When
-/// `touch` is true, the vault also enables `personal@0.1` and writes
-/// `TOUCHES_PER_PERSON` small `touch` ledger lines per person.
+/// `touch` is true, the vault also writes `TOUCHES_PER_PERSON` small
+/// `touch` ledger lines per person (the built-in personal pack is implicit,
+/// so no listing is needed).
 ///
 /// Refuses to run on a non-empty directory or an existing vault.
 pub fn generate_realistic_vault(
@@ -35,11 +36,7 @@ pub fn generate_realistic_vault(
     let unique = "zxqvUniqueTokenAda0";
     let common = "coaching-practice";
     let vault_id = ulid_from_parts(TIME_MS, 1);
-    let packs = if touch {
-        r#"packs = ["coaching@0.1", "personal@0.1"]"#
-    } else {
-        r#"packs = ["coaching@0.1"]"#
-    };
+    let packs = r#"packs = ["coaching@0.1"]"#;
     let cfg = format!(
         r#"spec = "0.1"
 {packs}

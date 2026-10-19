@@ -123,7 +123,7 @@ default = "warning"
 key = "personal.date_upcoming_days"
 default = 7
 
-# Keep-in-touch cadence. Reproduces personal@0.1's rule (ledger contacts
+# Keep-in-touch cadence. Reproduces the compiled personal pack's rule (ledger contacts
 # only, per the accepted §13.4 rule 7 divergence) and adds `snooze_until`.
 [[rules]]
 id = "cadence_overdue"

@@ -2,9 +2,9 @@
 //! (#510).
 //!
 //! `context`'s `packs` map carries one entry per enabled pack, keyed by the
-//! pack's `name@version` (`"personal@0.1"` today, `"personal@0.2"` at the
-//! #444 cutover). This module builds that entry for the built-in personal
-//! pack; #444 moves the compiled wrapper away, not this code.
+//! pack's `name@version` (`"personal@0.2"`). This module builds that entry
+//! for the built-in personal pack, served by the embedded declarative pack
+//! (#551).
 //!
 //! # The contract
 //!
@@ -100,18 +100,16 @@ use crate::vault::Vault;
 /// denylist for one operator-controlled flag and says nothing about `no-ai`,
 /// which is deny-by-default over the declared fields (see
 /// [`UNCLEARED_VISIBLE_FIELDS`] and the module docs). This is the single
-/// list: `PersonalPack::private_context_fields` serves it and #444 keeps
-/// serving it from core.
+/// list: the built-in personal pack serves it through
+/// `ManifestPack::private_context_fields` (#551).
 ///
 /// `title`, `company`, `cadence`, and `snooze_until` are deliberately
 /// absent: they stay so an agent can still see the cadence state that drove a
 /// nudge.
 ///
-/// `relationship` is the 0.2 name (#509). `relationship_to_me` is still
-/// emitted by the compiled `personal@0.1` manifest until the #444 cutover,
-/// so it stays in the list too — dropping it here would leak the label under
-/// `--exclude-private`, which is a behaviour change this issue must not
-/// make. The extra entry is harmless after #444 (no view carries that key).
+/// `relationship` is the 0.2 name (#509). `relationship_to_me` is kept in the
+/// list too: it is harmless (no view carries it after the #551 cutover) and
+/// keeps a stale listing from leaking if any older build's text is replayed.
 pub const PRIVATE_CONTEXT_FIELDS: &[&str] = &[
     "location",
     "emails",
@@ -173,7 +171,7 @@ pub struct RecentTouch {
     pub kind: Option<String>,
 }
 
-/// The personal pack's `context` view (`packs["personal@0.1"]`).
+/// The personal pack's `context` view (`packs["personal@0.2"]`).
 ///
 /// The declared fields live in the flattened `fields` map, keyed by the
 /// pack's declared field name, so the view follows the manifest (#510).

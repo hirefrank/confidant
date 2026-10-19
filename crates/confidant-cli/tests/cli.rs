@@ -335,6 +335,9 @@ fn find_scoped_to_coaching_hides_unattributed() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["matches"], serde_json::json!([]));
+    // #551: the built-in personal pack is implicit (always enabled), but a
+    // scoped read sees it only when the scope names it, so a coaching-only
+    // ceiling sees coaching alone.
     assert_eq!(v["scope"], serde_json::json!([COACHING]));
 
     let out = Command::new(bin())
@@ -346,7 +349,8 @@ fn find_scoped_to_coaching_hides_unattributed() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
 
-    // Unscoped still sees the unattributed note.
+    // Unscoped still sees the unattributed note and covers every enabled
+    // pack, the implicit built-in personal pack included (#551).
     let out = Command::new(bin())
         .args(["find", "Follow-up", "--json", "--vault"])
         .arg(demo())
@@ -354,7 +358,7 @@ fn find_scoped_to_coaching_hides_unattributed() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(v["scope"], serde_json::json!([COACHING, "personal@0.1"]));
+    assert_eq!(v["scope"], serde_json::json!([COACHING, "personal@0.2"]));
 }
 
 #[test]
@@ -394,8 +398,10 @@ fn context_scoped_to_coaching_filters_notes_and_interactions() {
     assert_eq!(v["notes"][0]["id"], "n-01M3TC5H00MPJG002NAM000005");
     assert_eq!(v["interactions"], serde_json::json!([]));
     assert_eq!(v["person"]["name"], "Ada Example");
+    // #551: a coaching-only ceiling excludes the implicit personal pack.
     assert_eq!(v["scope"], serde_json::json!([COACHING]));
     assert!(v["coaching"].is_object());
+    assert!(v["packs"].get("personal@0.2").is_none());
 
     let out = Command::new(bin())
         .args(["context", ADA, "--json", "--vault"])
@@ -405,6 +411,131 @@ fn context_scoped_to_coaching_filters_notes_and_interactions() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["notes"].as_array().unwrap().len(), 2);
     assert_eq!(v["interactions"].as_array().unwrap().len(), 1);
+}
+
+const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
+const EDGE_FRIEND: &str = "e-01M3TC5H00MPJG00E100000000";
+
+/// A vault with personal-owned data — a personal field (`relationship`), a
+/// personal edge kind (`friend`), and a `touch` ledger line — next to a
+/// coaching pack listing. Used to prove that the implicit `personal@0.2`
+/// built-in is visible to a scoped read only when the scope names it (#551).
+fn personal_data_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        r#"spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "01M3TC5H00MPJG005VQC00000B"
+[checks]
+as_of = "2026-10-08"
+"#,
+    )
+    .unwrap();
+    for (id, name, extra) in [
+        (ADA, "Ada Example", "relationship: climbing buddy\n"),
+        (BEA, "Bea Demo", ""),
+    ] {
+        let d = dir.path().join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n{extra}---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    let e = dir.path().join(format!("edges/{EDGE_FRIEND}"));
+    std::fs::create_dir_all(&e).unwrap();
+    std::fs::write(
+        e.join("edge.md"),
+        format!("---\nid: {EDGE_FRIEND}\ntype: edge\na: {ADA}\nb: {BEA}\nkind: friend\n---\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    std::fs::write(
+        dir.path().join("ledger/2026/10.cfd"),
+        format!("2026-10-06 touch {ADA} kind:call\n"),
+    )
+    .unwrap();
+    dir
+}
+
+fn run_json(args: &[&str], vault: &Path) -> serde_json::Value {
+    let out = Command::new(bin())
+        .args(args)
+        .arg("--json")
+        .arg("--vault")
+        .arg(vault)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?} stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn find_scope_excludes_personal_unless_named() {
+    // #551: personal fields, personal edge kinds, and `touch` lines are
+    // personal-owned, so a coaching-only ceiling hides them even though the
+    // built-in pack is enabled in every vault.
+    let dir = personal_data_vault();
+    for (needle, label) in [
+        ("climbing buddy", "personal field"),
+        ("friend", "personal edge kind"),
+        ("touch", "touch line"),
+    ] {
+        let coaching = run_json(&["find", needle, "--packs", COACHING], dir.path());
+        assert_eq!(
+            coaching["matches"].as_array().unwrap().len(),
+            0,
+            "coaching-only scope leaked a {label}: {coaching}"
+        );
+        assert_eq!(coaching["scope"], serde_json::json!([COACHING]));
+        // Naming personal through the any-version alias puts it in scope.
+        let personal = run_json(
+            &["find", needle, "--packs", "coaching@0.1,personal@0.1"],
+            dir.path(),
+        );
+        assert_eq!(
+            personal["matches"].as_array().unwrap().len(),
+            1,
+            "personal-naming scope hid a {label}: {personal}"
+        );
+        assert_eq!(
+            personal["scope"],
+            serde_json::json!([COACHING, "personal@0.2"])
+        );
+    }
+}
+
+#[test]
+fn context_scope_excludes_personal_unless_named() {
+    // #551: the personal `context` view and the person's touchpoints are
+    // personal-owned. A coaching-only ceiling drops both; naming personal
+    // (at any version) brings the view and the touch line back.
+    let dir = personal_data_vault();
+    let coaching = run_json(&["context", ADA, "--packs", COACHING], dir.path());
+    assert!(
+        coaching["packs"].get("personal@0.2").is_none(),
+        "{coaching}"
+    );
+    assert_eq!(coaching["touchpoints"], serde_json::json!([]));
+    assert!(coaching["coaching"].is_object());
+    assert_eq!(coaching["scope"], serde_json::json!([COACHING]));
+
+    let personal = run_json(&["context", ADA, "--packs", "personal@0.1"], dir.path());
+    assert_eq!(
+        personal["packs"]["personal@0.2"]["relationship"],
+        "climbing buddy"
+    );
+    assert_eq!(
+        personal["touchpoints"],
+        serde_json::json!([{"date": "2026-10-06", "kind": "call"}])
+    );
+    assert_eq!(personal["scope"], serde_json::json!(["personal@0.2"]));
 }
 
 #[test]
@@ -719,7 +850,7 @@ fn help_pack_bare_includes_external_pack() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("Packs in scope: example-pack@0.1"),
+        stdout.contains("Packs in scope: example-pack@0.1, personal@0.2"),
         "{stdout}"
     );
     assert!(stdout.contains("## example-pack@0.1"), "{stdout}");
@@ -737,7 +868,10 @@ fn help_pack_bare_includes_external_pack() {
     assert!(out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
-    assert_eq!(v["packs"], serde_json::json!(["example-pack@0.1"]));
+    assert_eq!(
+        v["packs"],
+        serde_json::json!(["example-pack@0.1", "personal@0.2"])
+    );
     let combined = v["skill"].as_str().unwrap();
     assert!(combined.contains(label), "{v}");
     assert!(combined.contains(&skill), "{v}");
@@ -780,7 +914,10 @@ fn help_pack_bare_serves_combined_skill() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("Packs in scope: coaching@0.1"), "{text}");
+    assert!(
+        text.contains("Packs in scope: coaching@0.1, personal@0.2"),
+        "{text}"
+    );
     assert!(text.contains("## coaching@0.1"), "{text}");
 }
 

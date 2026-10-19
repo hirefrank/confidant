@@ -229,7 +229,41 @@ pub fn load_external_packs(
 
     let mut packs: Vec<&'static dyn Pack> = Vec::new();
     let mut manifests: Vec<&'static PackManifest> = Vec::new();
+    // Built-ins are implicit (#551): enabled in every vault, listed or not.
+    // Install state for one is therefore always a broken install: a vault
+    // may not vendor or pin a pack that ships inside the binary (#504 R8).
+    // Reported once per offending `name@version`, whichever listing or pin
+    // named it.
+    let mut reported_builtins: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut problems = Vec::new();
+    for builtin in builtins {
+        let name = builtin.reserved_name();
+        let mut offending: Vec<String> = lock
+            .packs
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.id())
+            .collect();
+        offending.extend(crate::packs::dir::vendored_versions(root, name));
+        for listed in offending {
+            if !reported_builtins.insert(listed.clone()) {
+                continue;
+            }
+            problems.push(PackProblem {
+                name: listed.clone(),
+                kind: PackProblemKind::Invalid,
+                detail: format!(
+                    "{listed} ships inside the binary; a built-in pack is not installed from the vault"
+                ),
+                known_verbs: builtin
+                    .pack()
+                    .verbs()
+                    .iter()
+                    .map(|v| (*v).to_owned())
+                    .collect(),
+            });
+        }
+    }
     let mut loaded_ids = std::collections::HashSet::new();
     for listed in names {
         if is_compiled(listed) {
@@ -240,29 +274,10 @@ pub fn load_external_packs(
             // skip loading the second time.
             continue;
         }
-        // A compiled-in built-in (#550) supplies its name@version without a
-        // lockfile. The vault may not install it: any lockfile pin or
-        // vendored directory for the name is a broken install, so it fails
-        // closed rather than silently shadowing the built-in (#504 R8).
-        if let Some(builtin) = builtins.iter().find(|b| b.listed() == listed) {
-            let (name, version) = listed
-                .split_once('@')
-                .expect("a built-in's listed name is always name@version");
-            let dir_rel = vendored_rel(name, version);
-            let dir = root.join(dir_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if lock.find(name, version).is_some() || dir.exists() {
-                problems.push(PackProblem {
-                    name: listed.clone(),
-                    kind: PackProblemKind::Invalid,
-                    detail: format!(
-                        "{listed} ships inside the binary; a built-in pack is not installed from the vault"
-                    ),
-                    known_verbs: builtin.pack().verbs().iter().map(|v| (*v).to_owned()).collect(),
-                });
-                continue;
-            }
-            packs.push(builtin.pack());
-            manifests.push(builtin.manifest());
+        // A built-in (#551) is already in the registry (implicitly enabled);
+        // a listing is a no-op. Its install state, if any, was reported in
+        // the pre-scan above.
+        if builtins.iter().any(|b| b.matches_listing(listed)) {
             continue;
         }
         let Some((name, version)) = listed.split_once('@') else {

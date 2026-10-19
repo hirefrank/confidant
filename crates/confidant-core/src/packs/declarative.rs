@@ -273,7 +273,7 @@ pub(crate) fn run(
 
 /// Field grammar validation for an external pack (#441): every declared
 /// `[[fields]]` entry is validated on every `person` record, exactly
-/// like the compiled `personal@0.1` does. Messages come from the pack's
+/// like the built-in personal pack does. Messages come from the pack's
 /// own `[messages."E_FRONTMATTER"]` template (loader guarantees the
 /// pack declares it when it declares fields).
 fn validate_declared_fields(vault: &Vault, manifest: &PackManifest, out: &mut Vec<Finding>) {
@@ -652,7 +652,7 @@ static CADENCE_OVERDUE: CadenceOverdueKind = CadenceOverdueKind;
 
 /// `date-upcoming` (#443): for each merge-canonical person, warn when one
 /// of the pack's recurring-date fields has its next occurrence within the
-/// configured lookahead window. Reproduces `personal@0.1`'s upcoming-dates
+/// configured lookahead window. Reproduces the built-in personal pack's upcoming-dates
 /// rule (including its date math: the parsers and
 /// [`RecurringDate::next_occurrence_on_or_after`] are reused, never
 /// reimplemented).
@@ -912,7 +912,7 @@ fn note_ref_code_param<'a>(
 
 /// `note-ref` (#458): every `<pair>:<note-id>` on a pack's ledger verb must
 /// name an existing note that belongs to the entry's canonical person.
-/// Reproduces personal@0.1's `touch_note_integrity` and coaching@0.1's
+/// Reproduces the built-in personal pack's `touch_note_integrity` and coaching@0.1's
 /// `session_note_integrity`; only ids and path ownership are read, never
 /// note bodies (PD8).
 ///

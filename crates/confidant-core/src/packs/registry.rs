@@ -1,20 +1,27 @@
 //! Runtime pack registry (#432).
 //!
 //! Replaces the compile-time [`crate::packs::ALL_PACKS`] lookups with a
-//! runtime `PackRegistry` value passed to call sites. For now the registry
-//! holds exactly the two compiled packs (no behaviour change); a later
-//! issue adds loaded packs from `confidant.lock` (#438).
+//! runtime `PackRegistry` value passed to call sites. The registry holds
+//! the compiled packs plus the implicit built-ins (#551); a later issue adds
+//! loaded packs from `confidant.lock` (#438).
 //!
 //! A compiled pack always wins on the same `name@version` (PD14); per-pack
 //! failures fail closed (PD12). The [`crate::packs::Pack`] trait is not
 //! changed by this module.
 
+use crate::packs::embedded;
 use crate::packs::{orphan_owners, resolve_enabled, OrphanOwners, Pack};
 
 /// The packs available to a vault, resolved at runtime.
+///
+/// `packs` holds every available pack: the compiled packs, the implicit
+/// built-ins (#551) and any loaded external packs. `implicit` marks the
+/// built-ins that are enabled in every vault, independent of the vault's
+/// `packs = [...]` list.
 #[derive(Clone)]
 pub struct PackRegistry {
     packs: Vec<&'static dyn Pack>,
+    implicit: Vec<&'static dyn Pack>,
 }
 
 impl std::fmt::Debug for PackRegistry {
@@ -23,6 +30,10 @@ impl std::fmt::Debug for PackRegistry {
             .field(
                 "packs",
                 &self.packs.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            )
+            .field(
+                "implicit",
+                &self.implicit.iter().map(|p| p.name()).collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -37,16 +48,27 @@ impl PackRegistry {
         self.packs.push(pack);
     }
 
-    /// The compiled packs, in `ALL_PACKS` order.
+    /// The packs always available to a vault: the compiled packs plus the
+    /// implicit built-ins (#551). The built-ins are enabled in every vault
+    /// even when `packs = []`.
     pub fn compiled() -> Self {
-        Self {
-            packs: crate::packs::ALL_PACKS.to_vec(),
-        }
+        let implicit: Vec<&'static dyn Pack> = embedded::embedded_packs()
+            .iter()
+            .map(|p| p.pack())
+            .collect();
+        let mut packs = crate::packs::ALL_PACKS.to_vec();
+        packs.extend(implicit.iter().copied());
+        Self { packs, implicit }
     }
 
     /// All packs in the registry, in registry order.
     pub fn all(&self) -> &[&'static dyn Pack] {
         &self.packs
+    }
+
+    /// The implicit built-ins, enabled in every vault (#551).
+    pub fn implicit(&self) -> &[&'static dyn Pack] {
+        &self.implicit
     }
 
     /// The agent-facing skill text the registry's pack `name` carries, if
@@ -61,9 +83,10 @@ impl PackRegistry {
 
     /// The enabled packs for a vault's `packs = [...]` list, each at most
     /// once (a duplicated listing folds once), plus the listed names no
-    /// pack in this registry implements. Order follows the config list.
+    /// pack in this registry implements. Order follows the config list;
+    /// the implicit built-ins are appended.
     pub fn resolve_enabled(&self, names: &[String]) -> (Vec<&'static dyn Pack>, Vec<String>) {
-        resolve_enabled(names, &self.packs)
+        resolve_enabled(names, &self.packs, &self.implicit)
     }
 
     /// Claims owned by packs in this registry that are *not* in `enabled`,

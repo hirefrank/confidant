@@ -34,6 +34,31 @@ use crate::packs::manifest::{
     parse_manifest_external, parse_manifest_with_origin, PackManifest, PackOrigin,
 };
 
+/// The `name@version` ids of any vendored directories for `name` under a
+/// vault root's `packs/` (#551). A built-in pack is never installed from the
+/// vault, so a caller uses this to fail closed on `packs/personal@…`.
+/// Best-effort: an absent or unreadable `packs/` yields no ids.
+pub(crate) fn vendored_versions(root: &Path, name: &str) -> Vec<String> {
+    let dir = root.join("packs");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}@");
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if let Some(version) = fname.strip_prefix(&prefix) {
+            if !version.is_empty() {
+                out.push(format!("{name}@{version}"));
+            }
+        }
+    }
+    out
+}
+
 /// Maximum number of files in a pack directory.
 const MAX_FILES: usize = 200;
 /// Maximum size of a single file (1 MiB).
