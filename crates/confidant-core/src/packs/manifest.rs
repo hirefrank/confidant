@@ -618,6 +618,41 @@ impl PackManifest {
         self.validate_common()
     }
 
+    /// #629: a retired code (`spec/findings.md`) is never a valid code
+    /// value. Refuse it in a rule's generic `code` and in every `*_code`
+    /// parameter, whatever the manifest's origin: the cutover retired those
+    /// names, so no pack may revive one for a new meaning. The per-kind
+    /// validators require the parameters; this guard checks their values.
+    fn validate_rule_codes_not_retired(&self) -> Result<(), DomainError> {
+        for rule in &self.rules {
+            if FindingCode::is_retired_code(&rule.code) {
+                return Err(manifest_err(format!(
+                    "rule '{}': code '{}' is retired; nothing emits it in 0.1 and it must never be reused",
+                    rule.id, rule.code
+                ))
+                .with_fix("Set code to a code the pack declares in finding_codes"));
+            }
+            for (name, value) in &rule.params {
+                if !name.ends_with("_code") {
+                    continue;
+                }
+                let Some(code) = value.as_str() else {
+                    continue; // the kind's validator reports the bad type
+                };
+                if FindingCode::is_retired_code(code) {
+                    return Err(manifest_err(format!(
+                        "rule '{}': {name} '{code}' is retired; nothing emits it in 0.1 and it must never be reused",
+                        rule.id
+                    ))
+                    .with_fix(format!(
+                        "Set {name} to a code the pack declares in finding_codes"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_common(&self) -> Result<(), DomainError> {
         if self.pack.name.trim().is_empty() {
             return Err(manifest_err("[pack].name must be non-empty")
@@ -646,6 +681,8 @@ impl PackManifest {
         check_unique(&self.record_types, "record type")?;
         check_unique(&self.balance_metrics, "balance metric")?;
         check_unique(&self.finding_codes, "finding code")?;
+
+        self.validate_rule_codes_not_retired()?;
 
         let verb_names: Vec<String> = self.verbs.iter().map(|v| v.name.clone()).collect();
         check_unique(&verb_names, "verb")?;
@@ -707,7 +744,9 @@ impl PackManifest {
 
         // Every finding code needs a [messages.<CODE>] table with at least
         // one variant, and every [messages] key must be a finding code —
-        // no orphan text, no undocumented codes.
+        // no orphan text, no undocumented codes. The #629 retired-code
+        // guard runs above this loop, so a retired name reports as retired
+        // rather than as a missing/undeclared code.
         for code in &self.finding_codes {
             match self.messages.get(code) {
                 None => {
@@ -1193,6 +1232,42 @@ default = "wrong {id}"
         );
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("non-empty"), "{err:?}");
+    }
+
+    /// #629: a retired code (`spec/findings.md`) is never a valid rule
+    /// parameter value, even though the name is still reserved as a
+    /// builtin. The error names the parameter.
+    #[test]
+    fn rejects_retired_code_parameter() {
+        let text = format!(
+            "{}\n[[rules]]\nid = \"note\"\nkind = \"note-ref\"\ncode = \"E_EXAMPLE_FIELD\"\nverb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_SESSION_WITHOUT_NOTES\"\nwrong_type_code = \"E_EXAMPLE_FIELD\"\n",
+            valid_v2_toml()
+        );
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid_code 'E_SESSION_WITHOUT_NOTES' is retired"),
+            "{err:?}"
+        );
+    }
+
+    /// #629: the generic `code` is refused too, and on a compiled-in pack
+    /// (where PD13's builtin guard does not run) this is the only check
+    /// that catches a retired name.
+    #[test]
+    fn rejects_retired_generic_code_for_compiled_in_pack() {
+        let text = valid_v2_toml()
+            .replace(
+                "finding_codes = [\"E_FRONTMATTER\", \"E_EXAMPLE_FIELD\"]",
+                "finding_codes = [\"E_FRONTMATTER\", \"E_EXAMPLE_FIELD\", \"E_PAID_SESSION_GAP\"]",
+            )
+            + "\n[messages.\"E_PAID_SESSION_GAP\"]\ndefault = \"retired\"\n[[rules]]\nid = \"gap\"\nkind = \"activity-gap\"\ncode = \"E_PAID_SESSION_GAP\"\n";
+        let err = parse_manifest_compiled_in(&text).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("code 'E_PAID_SESSION_GAP' is retired"),
+            "{err:?}"
+        );
     }
 
     /// A minimal valid v2 manifest from spec §13.6.

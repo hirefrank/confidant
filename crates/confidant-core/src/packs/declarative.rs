@@ -209,6 +209,34 @@ pub(crate) fn resolve_declared_severity(
         .severity(key, manifest_default.expect("checked Some above"))
 }
 
+/// Read a required `*_code` parameter (#629). A rule kind's code
+/// parameters have no fallback: the compiled coaching path is gone
+/// (`ALL_PACKS` is empty), so a default can only point at a core code that
+/// an external pack may not name. The kind still checks that the returned
+/// code is declared and has its message variants.
+pub(crate) fn required_code_param<'a>(
+    rule: &'a RuleDecl,
+    name: &str,
+) -> Result<&'a str, DomainError> {
+    let err = |detail: String| DomainError::config(format!("rule '{}': {detail}", rule.id));
+    let Some(value) = rule.params.get(name) else {
+        return Err(err(format!(
+            "the {name} parameter is missing; every rule code parameter must be set to a code the pack declares in finding_codes"
+        ))
+        .with_fix(format!(
+            "Set {name} to a code the pack declares in finding_codes"
+        )));
+    };
+    value.as_str().ok_or_else(|| {
+        err(format!(
+            "{name} must be a string naming a code the pack declares in finding_codes"
+        ))
+        .with_fix(format!(
+            "Set {name} to a code the pack declares in finding_codes"
+        ))
+    })
+}
+
 /// Validate one rule's params against its registered kind (PD1: the
 /// logic lives in Rust; the loader refuses what a kind does not accept).
 ///
@@ -928,29 +956,6 @@ static DATE_UPCOMING: DateUpcomingKind = DateUpcomingKind;
 // Rule kinds (#458: note-ref)
 // ---------------------------------------------------------------------------
 
-/// Default code for a note id that does not parse as a record id.
-const DEFAULT_INVALID_ID_CODE: &str = "E_INVALID_ID";
-/// Default code for a parsed id that is not a note id.
-const DEFAULT_WRONG_ID_TYPE_CODE: &str = "E_WRONG_ID_TYPE";
-
-/// Read one of the note-ref code parameters. An absent parameter takes
-/// the core default; a present-but-non-string value is refused, the same
-/// way `variants` is, never silently replaced with the default.
-fn note_ref_code_param<'a>(
-    rule: &'a RuleDecl,
-    name: &str,
-    default: &'a str,
-) -> Result<&'a str, DomainError> {
-    match rule.params.get(name) {
-        None => Ok(default),
-        Some(value) => value.as_str().ok_or_else(|| {
-            DomainError::config(format!("rule '{}': {name} must be a string", rule.id)).with_fix(
-                format!("Omit {name}, or set it to a code the pack declares"),
-            )
-        }),
-    }
-}
-
 /// `note-ref` (#458): every `<pair>:<note-id>` on a pack's ledger verb must
 /// name an existing note that belongs to the entry's canonical person.
 /// Reproduces the built-in personal pack's `touch_note_integrity` and coaching@0.1's
@@ -964,10 +969,9 @@ fn note_ref_code_param<'a>(
 ///   (`default`/`default_fix` for the invalid-id and wrong-type
 ///   problems); `"session"` selects coaching's `session_note`/
 ///   `session_note_fix`. The `missing`/`wrong_owner` variants are shared.
-/// - `invalid_code` / `wrong_type_code`: optional codes for the first two
-///   problems. Default to the core codes the compiled functions emit.
-///   A pack that cannot claim core codes (every external pack, PD13) sets
-///   its own declared codes here.
+/// - `invalid_code` / `wrong_type_code`: required codes for the first two
+///   problems (#629). There are no defaults: an external pack cannot name
+///   a core code (PD13), and a retired name is refused outright.
 ///
 /// The generic `code` is the code for the missing / wrong-owner problems.
 /// The kind has a fixed `error` severity (both compiled functions emit
@@ -1029,9 +1033,10 @@ impl RuleKind for NoteRefKind {
             }
         }
 
-        let invalid_code = note_ref_code_param(rule, "invalid_code", DEFAULT_INVALID_ID_CODE)?;
-        let wrong_type_code =
-            note_ref_code_param(rule, "wrong_type_code", DEFAULT_WRONG_ID_TYPE_CODE)?;
+        // #629: both code parameters are required; the fixed-severity kind
+        // has no compiled pack left to inherit a core default from.
+        let invalid_code = required_code_param(rule, "invalid_code")?;
+        let wrong_type_code = required_code_param(rule, "wrong_type_code")?;
         let wrong_id_variant = Self::wrong_id_variant(rule);
 
         // An external pack cannot claim a builtin code in either code
@@ -1039,9 +1044,9 @@ impl RuleKind for NoteRefKind {
         // claim and every pack with fields already has its message table,
         // so a builtin here would let a pack emit a core code with a
         // re-worded meaning — the same escape the `rule.code` check in
-        // `validate_external` closes. The v1 compiled path and a
-        // compiled-in built-in (#550) keep the core defaults and may name
-        // the stable codes.
+        // `validate_external` closes. A compiled-in built-in (#550) may
+        // name a live core code, but it must set both parameters explicitly
+        // (#629) and a retired name is refused for every origin.
         if !manifest.may_emit_builtin_codes() {
             for (role, code) in [
                 ("invalid_code", invalid_code),
@@ -1059,7 +1064,7 @@ impl RuleKind for NoteRefKind {
             }
         }
 
-        // Every emitted code must be declared, or (on the v1 core-default
+        // Every emitted code must be declared, or (on the v1/compiled-in
         // path) one of the core codes the compiled functions emit; the
         // builtin-code guard above already forced an external pack's two
         // parameters to be pack-own. Message tables must exist with
@@ -1130,16 +1135,14 @@ impl RuleKind for NoteRefKind {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let wrong_id_variant = Self::wrong_id_variant(rule);
-        let invalid_code_str = rule
-            .params
-            .get("invalid_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_INVALID_ID_CODE);
-        let wrong_type_code_str = rule
-            .params
-            .get("wrong_type_code")
-            .and_then(|v| v.as_str())
-            .unwrap_or(DEFAULT_WRONG_ID_TYPE_CODE);
+        let Some(invalid_code_str) = rule.params.get("invalid_code").and_then(|v| v.as_str())
+        else {
+            return; // the loader requires it; unreachable
+        };
+        let Some(wrong_type_code_str) = rule.params.get("wrong_type_code").and_then(|v| v.as_str())
+        else {
+            return; // the loader requires it; unreachable
+        };
         let (Some(invalid_code), Some(wrong_type_code), Some(unknown_code)) = (
             resolve_finding_code(invalid_code_str),
             resolve_finding_code(wrong_type_code_str),
@@ -2078,6 +2081,8 @@ kind = "note-ref"
 code = "E_UNKNOWN_RECORD"
 verb = "touch"
 pair = "note"
+invalid_code = "E_INVALID_ID"
+wrong_type_code = "E_WRONG_ID_TYPE"
 
 [messages."E_FRONTMATTER"]
 default = "front matter key '{key}' {problem}"
@@ -2396,15 +2401,42 @@ default_fix = "Use note:n-<ULID>"
         assert_loader_refuses(&problems, "has no 'wrong_owner_fix' variant");
     }
 
-    /// Leaving the two optional codes at their core defaults makes an
-    /// external pack (which cannot claim a core code) fail closed on the
-    /// builtin-code guard rather than emit a core code it never declared.
+    /// #629: the code parameters have no fallback. Omitting either one is
+    /// `E_PACK_INVALID`, and the error names the missing parameter.
     #[test]
-    fn loader_refuses_core_default_codes_for_external_pack() {
-        let problems = load_with_note_rule(&note_rule("verb = \"touch\"\npair = \"note\"\n"), true);
+    fn loader_refuses_missing_invalid_code_for_external_pack() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            ),
+            true,
+        );
+        assert_loader_refuses(&problems, "the invalid_code parameter is missing");
+    }
+
+    #[test]
+    fn loader_refuses_missing_wrong_type_code_for_external_pack() {
+        let problems = load_with_note_rule(
+            &note_rule("verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\n"),
+            true,
+        );
+        assert_loader_refuses(&problems, "the wrong_type_code parameter is missing");
+    }
+
+    /// #629: a retired name (`spec/findings.md`) is refused as a parameter
+    /// value at parse time, for every origin — never silently accepted
+    /// because it is still a builtin name.
+    #[test]
+    fn loader_refuses_retired_code_parameter() {
+        let problems = load_with_note_rule(
+            &note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_NOTE_BAD_ID\"\nwrong_type_code = \"E_SESSION_WITHOUT_NOTES\"\n",
+            ),
+            true,
+        );
         assert_loader_refuses(
             &problems,
-            "emits builtin code 'E_INVALID_ID'; a rule's invalid_code must be a pack-own code",
+            "wrong_type_code 'E_SESSION_WITHOUT_NOTES' is retired",
         );
     }
 

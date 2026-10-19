@@ -233,9 +233,32 @@ impl FindingCode {
         "W_DATE_UPCOMING",
     ];
 
+    /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
+    /// builtin names that nothing emits in 0.1 and that no pack may reuse
+    /// for a new meaning. They stay in [`Self::ALL_BUILTIN_STRS`] so a
+    /// pack-declared code cannot shadow them.
+    pub const RETIRED_CODES: &[&str] = &[
+        "E_BALANCE_MISMATCH",
+        "E_NEGATIVE_BALANCE",
+        "E_OPEN_MALFORMED",
+        "E_MISSING_DURATION",
+        "E_SESSION_TAGS",
+        "W_SESSION_UNTAGGED",
+        "E_SESSION_WITHOUT_NOTES",
+        "E_PAID_SESSION_GAP",
+    ];
+
     /// Whether `s` is the string of a builtin enum variant (not a `Pack` code).
     pub fn is_builtin_code(s: &str) -> bool {
         Self::ALL_BUILTIN_STRS.contains(&s)
+    }
+
+    /// Whether `s` is one of the retired codes (`spec/findings.md`). A
+    /// retired name is never a valid rule code or `*_code` parameter value,
+    /// whatever the manifest's origin: nothing emits it, and reusing it
+    /// would give an old name a new meaning.
+    pub fn is_retired_code(s: &str) -> bool {
+        Self::RETIRED_CODES.contains(&s)
     }
 
     /// Build a `Pack` code from a pack-declared string (#434). The string
@@ -1849,6 +1872,22 @@ mod tests {
         assert_eq!(FindingCode::PackOrphan.as_str(), "W_PACK_ORPHAN");
         assert_eq!(FindingCode::PackHash.as_str(), "E_PACK_HASH");
         assert_eq!(FindingCode::PackInvalid.as_str(), "E_PACK_INVALID");
+    }
+
+    /// #629: a retired name stays reserved, so a pack-declared code cannot
+    /// shadow it, and `is_retired_code` is the guard the manifest loader
+    /// uses to refuse it as a rule or `*_code` value.
+    #[test]
+    fn retired_codes_are_reserved_builtins() {
+        for code in FindingCode::RETIRED_CODES {
+            assert!(
+                FindingCode::is_builtin_code(code),
+                "{code} must stay in ALL_BUILTIN_STRS"
+            );
+            assert!(FindingCode::is_retired_code(code));
+        }
+        assert!(!FindingCode::is_retired_code("E_PARSE"));
+        assert!(!FindingCode::is_retired_code("E_COACHING_PARSE"));
     }
 
     #[test]
