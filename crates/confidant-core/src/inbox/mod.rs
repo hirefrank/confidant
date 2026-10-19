@@ -508,6 +508,52 @@ mod tests {
         check_inbox_pubkey, check_local_inbox_pubkey, verify_inbox_signatures,
     };
 
+    /// #559: inbox intake is the third agent path (with MCP and skills). An
+    /// inbox item is data for the in-process write pipeline — ledger lines
+    /// or a record file — never a CLI invocation, so it cannot carry the
+    /// operator-only `--for-operator` flag. Pin both directions from the
+    /// drain path's own sources: nothing names the roster or the flag, and
+    /// every process the path starts is `git`, never the `confidant` CLI.
+    #[test]
+    fn inbox_sources_never_route_to_the_operator_roster() {
+        const INBOX_SOURCES: &[(&str, &str)] = &[
+            ("inbox/mod.rs", include_str!("mod.rs")),
+            ("inbox/item.rs", include_str!("item.rs")),
+            ("inbox/plan.rs", include_str!("plan.rs")),
+            ("inbox/merge.rs", include_str!("merge.rs")),
+            ("inbox/queue.rs", include_str!("queue.rs")),
+            ("inbox/rotate.rs", include_str!("rotate.rs")),
+            ("inbox/trust.rs", include_str!("trust.rs")),
+            ("inbox/git.rs", include_str!("git.rs")),
+            ("inbox/preflight.rs", include_str!("preflight.rs")),
+            ("inbox/keys.rs", include_str!("keys.rs")),
+        ];
+        for (name, source) in INBOX_SOURCES {
+            // Test modules build fixtures with git; scan production only.
+            let production = source.split("#[cfg(test)]\nmod ").next().unwrap_or(source);
+            for needle in [
+                "record list",
+                "--for-operator",
+                "for_operator",
+                "build_roster",
+            ] {
+                assert!(
+                    !production.contains(needle),
+                    "{name} mentions {needle:?}; inbox intake must not reach \
+                     the operator-only roster (#559)"
+                );
+            }
+            for (idx, _) in production.match_indices("Command::new(") {
+                let after = &production[idx + "Command::new(".len()..];
+                assert!(
+                    after.starts_with("\"git\""),
+                    "{name} starts a non-git process: {}",
+                    after.lines().next().unwrap_or("")
+                );
+            }
+        }
+    }
+
     /// Fixed test-only inbox identities. Every crypto test uses the same
     /// values so parallel tests never race on the env var's *value*; tests
     /// that mutate the var take [`EnvGuard::lock`].

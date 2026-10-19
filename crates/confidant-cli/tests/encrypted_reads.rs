@@ -386,6 +386,133 @@ fn notes_mode_context_shows_person_hides_notes() {
     );
 }
 
+/// #558: `record list` is the operator-only roster. Without
+/// `--for-operator` it lists the §12 cleared set, so a `no-ai: true` person
+/// is absent — never present with a nulled name or id. The flag, the same
+/// mechanism as `record show --for-edit`, restores them with the tri-state
+/// `no_ai` the #559 ruling specifies.
+#[test]
+fn record_list_hides_no_ai_until_for_operator() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+    let second = "p-01J9Z3K4QH0000000000000000";
+    h.init_client(second);
+    let input2 = write_file(
+        h._tmp.path(),
+        "person2.md",
+        &person_md_no_ai(second, "Cam Example", "Secret bio."),
+    );
+    h.record_add(&input2);
+
+    // Cleared set only: the no-ai person is absent, and neither their name
+    // nor their id appears anywhere in the output.
+    let out = h
+        .cmd(&["record", "list", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record list failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["for_operator"], false);
+    let names: Vec<&str> = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Ada Example"], "{v}");
+    let dumped = serde_json::to_string(&v).unwrap();
+    assert!(!dumped.contains("Cam Example"), "{dumped}");
+    assert!(!dumped.contains(second), "{dumped}");
+
+    // Operator flag: decrypted, listed, and badged.
+    let out = h
+        .cmd(&["record", "list", "--for-operator", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record list --for-operator failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["for_operator"], true);
+    let records = v["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{v}");
+    let names: Vec<&str> = records
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Ada Example", "Cam Example"]);
+    let cam = records.iter().find(|r| r["id"] == second).unwrap();
+    assert_eq!(cam["no_ai"], "true");
+    assert_eq!(cam["kind"], "person");
+}
+
+/// #558/#559: a `no-ai: notes` person is in the cleared set, so the roster
+/// lists them without the flag and reports the middle tri-state value.
+#[test]
+fn record_list_reports_notes_mode_without_the_flag() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md_notes_mode(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    let out = h
+        .cmd(&["record", "list", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record list failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let records = v["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{v}");
+    assert_eq!(records[0]["name"], "Ada Example");
+    assert_eq!(records[0]["no_ai"], "notes");
+}
+
+/// #558: without a device key nothing decrypts. The roster is empty, but
+/// the skip count is visible — never a silent empty list (spec 4, ⚠2).
+#[test]
+fn record_list_unkeyed_surfaces_skips_never_silently_empty() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    for flag in [false, true] {
+        let mut args = vec!["record", "list", "--json", "--no-input"];
+        if flag {
+            args.push("--for-operator");
+        }
+        let out = h.cmd_no_device_key(&args).output().unwrap();
+        assert!(out.status.success(), "record list failed: {}", stderr(&out));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            v["records"].as_array().unwrap().is_empty(),
+            "unkeyed roster must not list undecryptable people: {v}"
+        );
+        assert!(
+            v["skipped_encrypted"].as_u64().unwrap() >= 1,
+            "unkeyed roster must surface the skip count: {v}"
+        );
+        assert_eq!(v["refused_envelopes"], 0);
+    }
+}
+
 #[test]
 fn find_unkeyed_skips_and_counts_never_silent_empty() {
     let h = keyed_vault_with_records("quantum baking", "sourdough starter");

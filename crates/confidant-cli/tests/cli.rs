@@ -2210,3 +2210,225 @@ fn pack_add_non_utf8_skill_exits_1() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E_PACK_INVALID"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// record list (#558): the operator-only roster
+// ---------------------------------------------------------------------------
+
+fn demo_roster(args: &[&str]) -> serde_json::Value {
+    let out = Command::new(bin())
+        .args(["record", "list", "--json", "--no-input", "--vault"])
+        .arg(demo())
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn roster_names(v: &serde_json::Value) -> Vec<&str> {
+    v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn record_list_demo_is_the_cleared_set_in_name_order() {
+    let v = demo_roster(&[]);
+    // ADR-7 envelope: resolved vault path, ok, schema version.
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["schema_version"], "1");
+    assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
+    assert_eq!(v["kind"], "person");
+    assert_eq!(v["for_operator"], false);
+    assert_eq!(v["skipped_encrypted"], 0);
+    assert_eq!(v["refused_envelopes"], 0);
+    // Deterministic: display name, case-insensitive.
+    assert_eq!(roster_names(&v), vec!["Ada Example", "Bea Demo"]);
+    for entry in v["records"].as_array().unwrap() {
+        assert_eq!(entry["no_ai"], "false");
+        assert_eq!(entry["kind"], "person");
+        assert!(entry["id"].as_str().unwrap().starts_with("p-"));
+    }
+}
+
+#[test]
+fn record_list_demo_for_operator_adds_no_ai_with_tri_state() {
+    let v = demo_roster(&["--for-operator"]);
+    assert_eq!(v["for_operator"], true);
+    assert_eq!(
+        roster_names(&v),
+        vec!["Ada Example", "Bea Demo", "Cam Sample"]
+    );
+    let cam = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Cam Sample")
+        .expect("no-ai person must be listed with the operator flag");
+    assert_eq!(cam["no_ai"], "true");
+    assert_eq!(cam["kind"], "person");
+}
+
+#[test]
+fn record_list_kind_filters() {
+    let orgs = demo_roster(&["--kind", "org"]);
+    assert_eq!(orgs["kind"], "org");
+    assert_eq!(roster_names(&orgs), vec!["Northwind Training Co"]);
+    assert_eq!(orgs["records"][0]["kind"], "org");
+
+    let deals = demo_roster(&["--kind", "deal"]);
+    assert_eq!(roster_names(&deals), vec!["Discovery workshop"]);
+    assert_eq!(deals["records"][0]["kind"], "deal");
+}
+
+#[test]
+fn record_list_packs_scope_is_reported_and_fails_closed() {
+    // The scope is echoed and validated, like `find` / `context`. Roster
+    // entries are core-owned identity records, so a narrower scope does not
+    // remove them today.
+    let v = demo_roster(&["--packs", "coaching@0.1"]);
+    assert_eq!(v["scope"], serde_json::json!(["coaching@0.1"]));
+    assert_eq!(roster_names(&v), vec!["Ada Example", "Bea Demo"]);
+
+    // Unknown or disabled pack: usage error, exit 2 (ADR-7).
+    let out = Command::new(bin())
+        .args(["record", "list", "--json", "--no-input", "--vault"])
+        .arg(demo())
+        .args(["--packs", "nope@9.9"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+}
+
+#[test]
+fn record_list_orders_by_name_then_id_and_falls_back_to_id() {
+    // Same display name twice plus an unnamed record: the id breaks the
+    // name tie, and an unnamed record renders its opaque id.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    for (id, name_line) in [
+        ("p-01J9Z3K4QF0000000000000001", "name: Ada Example\n"),
+        ("p-01J9Z3K4QF0000000000000002", "name: ada example\n"),
+        ("p-01J9Z3K4QF0000000000000003", ""),
+    ] {
+        let d = dir.path().join("people").join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\n{name_line}---\n\n"),
+        )
+        .unwrap();
+    }
+    let out = Command::new(bin())
+        .args(["record", "list", "--json", "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ids: Vec<&str> = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "p-01J9Z3K4QF0000000000000001",
+            "p-01J9Z3K4QF0000000000000002",
+            "p-01J9Z3K4QF0000000000000003",
+        ],
+        "{v}"
+    );
+    // The unnamed record's name is its id, never null.
+    assert_eq!(v["records"][2]["name"], "p-01J9Z3K4QF0000000000000003");
+}
+
+#[test]
+fn record_list_text_output_lists_one_entry_per_line() {
+    let out = Command::new(bin())
+        .args(["record", "list", "--no-input", "--vault"])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Ada Example"), "{text}");
+    assert!(text.contains("Bea Demo"), "{text}");
+    assert!(text.contains("2 people (person)"), "{text}");
+    // The no-ai person is absent without the flag.
+    assert!(!text.contains("Cam Sample"), "{text}");
+}
+
+#[test]
+fn record_list_text_output_escapes_control_characters_in_names() {
+    // A tab or ESC in a display name must not break the one-entry-per-line
+    // layout or reach the terminal raw. `--json` keeps the name verbatim.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    let id = "p-01J9Z3K4QF0000000000000001";
+    let name = "Ada\tEx\u{1b}[8mample";
+    let d = dir.path().join("people").join(id);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("profile.md"),
+        format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n---\n\n"),
+    )
+    .unwrap();
+
+    let out = Command::new(bin())
+        .args(["record", "list", "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains('\u{1b}'),
+        "raw escape reached stdout: {text:?}"
+    );
+    assert!(
+        !text.contains("Ada\tEx"),
+        "raw tab in a name broke the layout: {text:?}"
+    );
+    assert!(text.contains("Ada\\tEx\\u{1b}[8mample"), "{text:?}");
+    // One entry line plus the summary line: the name's tab did not split it.
+    assert!(text.lines().count() <= 3, "{text:?}");
+
+    let out = Command::new(bin())
+        .args(["record", "list", "--json", "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["records"][0]["name"], name, "--json must stay verbatim");
+}
