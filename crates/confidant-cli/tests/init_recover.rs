@@ -2375,3 +2375,265 @@ fn failed_create_init_after_keys_commit_rolls_back_the_scaffold() {
     let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(v["ok"], true);
 }
+
+// ---------------------------------------------------------------------------
+// #650: headless encrypted init with CONFIDANT_OPERATOR_KEY plus the existing
+// CONFIDANT_DEVICE_KEY. Fake seeds and throwaway device keys only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn headless_init_uses_env_operator_and_device_keys() {
+    let b = Boot::new();
+    let seed_hex = "11".repeat(32);
+    let seed: [u8; 32] = hex::decode(&seed_hex).unwrap().try_into().unwrap();
+    let expected = hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .as_bytes(),
+    );
+
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_OPERATOR_KEY", &seed_hex)
+        // Any keychain write would fail closed on this invalid switch value,
+        // so a successful init proves the env operator key never went to the
+        // keychain (and no fallback was attempted).
+        .env("CONFIDANT_KEYCHAIN", "bogus")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "headless init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The env seed is the operator key: both the trust anchor and the
+    // operator certificate carry its public half.
+    let trust = std::fs::read_to_string(b.home.join(".config/confidant/trust.toml")).unwrap();
+    assert!(
+        trust.contains(&format!("operator_pubkey = \"{expected}\"")),
+        "trust.toml does not pin the env operator key:\n{trust}"
+    );
+    let cert = std::fs::read_to_string(b.vault.join("keys/operator.toml")).unwrap();
+    assert!(
+        cert.contains(&expected),
+        "operator certificate does not carry the env operator key"
+    );
+
+    // Encrypted vault: keys/ exists, no plaintext opt-out, and check passes.
+    assert!(b.vault.join("keys/shared/epoch").is_file());
+    let cfg = std::fs::read_to_string(b.vault.join("confidant.toml")).unwrap();
+    assert!(!cfg.contains("plaintext"), "{cfg}");
+    let check = b.at_vault(&["check", "--no-input", "--json"]);
+    assert!(
+        check.status.success(),
+        "check failed after headless init: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert!(b.home.join(".config/confidant/trust.toml").is_file());
+}
+
+#[test]
+fn init_rejects_invalid_operator_env_key_before_writing() {
+    let cases = [
+        ("empty", String::new()),
+        ("short", "abcd".to_string()),
+        ("non-hex", format!("g{}", "0".repeat(63))),
+    ];
+    for (label, bad) in cases {
+        let b = Boot::new();
+        let out = b
+            .cmd(&["init", "--create", "--no-input", "--json"])
+            .arg("--vault")
+            .arg(&b.vault)
+            .env("CONFIDANT_OPERATOR_KEY", &bad)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{label}: must fail");
+        assert_eq!(out.status.code(), Some(2), "{label}: usage error");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("CONFIDANT_OPERATOR_KEY") && msg.contains("64 hex"),
+            "{label}: error must name the variable and format: {msg}"
+        );
+        assert!(
+            !b.vault.exists(),
+            "{label}: invalid operator key must write nothing (no skeleton)"
+        );
+    }
+}
+
+#[test]
+fn init_dry_run_rejects_invalid_operator_env_key() {
+    let b = Boot::new();
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--dry-run", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_OPERATOR_KEY", "not-hex")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "dry run must validate the env key");
+    assert_eq!(out.status.code(), Some(2), "usage error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("CONFIDANT_OPERATOR_KEY"), "{msg}");
+    assert!(!b.vault.exists(), "dry run wrote the target");
+}
+
+#[test]
+fn init_dry_run_with_env_keys_reports_plan() {
+    let b = Boot::new();
+    let seed_hex = "22".repeat(32);
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--dry-run", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_OPERATOR_KEY", &seed_hex)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert!(!b.vault.exists());
+    assert!(!b.home.join(".config/confidant").exists());
+    assert_no_recovery_phrase(&out);
+}
+
+#[test]
+fn init_phrase_out_works_with_env_operator_key() {
+    let b = Boot::new();
+    let seed_hex = "33".repeat(32);
+    let phrase_path = b._tmp.path().join("phrase.txt");
+    let out = b
+        .cmd(&[
+            "init",
+            "--create",
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_OPERATOR_KEY", &seed_hex)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = std::fs::read_to_string(&phrase_path).unwrap();
+    assert_eq!(text.split_whitespace().count(), 24);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&phrase_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "phrase file must be 0600");
+    }
+    let phrase = text.trim();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains(phrase)
+            && !String::from_utf8_lossy(&out.stderr).contains(phrase),
+        "phrase leaked to stdout/stderr"
+    );
+    assert!(b.home.join(".config/confidant/trust.toml").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// #661 edge: a pre-existing repo with an unborn HEAD is set to main, but a
+// repo that already has commits is never renamed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bootstrap_sets_main_on_a_preexisting_unborn_repo() {
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    git_out(&b.vault, &["init", "-q", "-b", "master"]);
+    assert_eq!(
+        git_out(&b.vault, &["symbolic-ref", "--short", "HEAD"]).trim(),
+        "master",
+        "precondition: unborn HEAD on master"
+    );
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        git_out(&b.vault, &["branch", "--show-current"]).trim(),
+        "main",
+        "unborn pre-existing repo must be created on main"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["branch"], "main");
+}
+
+#[test]
+fn bootstrap_does_not_rename_a_repo_with_commits() {
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    git_out(&b.vault, &["init", "-q", "-b", "trunk"]);
+    std::fs::write(b.vault.join(".gitignore"), "*.log\n").unwrap();
+    git_out(
+        &b.vault,
+        &[
+            "-c",
+            "user.name=Test Operator",
+            "-c",
+            "user.email=test@example.com",
+            "add",
+            "--",
+            ".gitignore",
+        ],
+    );
+    git_out(
+        &b.vault,
+        &[
+            "-c",
+            "user.name=Test Operator",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        git_out(&b.vault, &["branch", "--show-current"]).trim(),
+        "trunk",
+        "a repo with commits must keep its branch"
+    );
+}
