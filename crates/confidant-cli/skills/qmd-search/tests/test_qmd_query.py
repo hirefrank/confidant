@@ -17,6 +17,9 @@ notes added here are the demo vault's style of obviously fake content.
 """
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -32,6 +35,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 SKILL_DIR = TESTS_DIR.parent
 REPO_ROOT = TESTS_DIR.parents[4]
 QUERY = SKILL_DIR / "bin" / "qmd-query.py"
+INDEX = SKILL_DIR / "bin" / "qmd-index.py"
 DEMO = REPO_ROOT / "examples" / "demo-vault"
 
 PERSON = "p-01M3TC5H00MPJG000000000000"
@@ -248,6 +252,93 @@ class QmdQueryTest(unittest.TestCase):
         self.assertEqual(data["matches"][0]["path"], COACHING_NOTE)
         self.assertEqual(len(spawns), 1, spawns)
         self.assertIn("find Kickoff", spawns[0])
+
+
+def load_index_module():
+    """Import bin/qmd-index.py (a hyphenated filename) as a module."""
+    spec = importlib.util.spec_from_file_location("qmd_index", INDEX)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class QmdIndexEncryptedDiskTest(unittest.TestCase):
+    """#540: the encrypted-disk gate honours a persisted confirmation.
+
+    The gate is device policy, so the tests drive
+    `encrypted_disk_confirmation` with detection patched instead of building
+    a corpus: the env var and the user-config key both satisfy it, neither
+    (with no detection) refuses, and detection is reported ahead of any
+    operator assertion.
+    """
+
+    home_keys = ("CONFIDANT_ASSUME_ENCRYPTED_DISK", "HOME")
+
+    def setUp(self):
+        self.index = load_index_module()
+        self._saved = {k: os.environ.get(k) for k in self.home_keys}
+        self._detected = self.index.encrypted_disk_detected
+        os.environ.pop("CONFIDANT_ASSUME_ENCRYPTED_DISK", None)
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-540-")
+        self.home = Path(self.tmp.name)
+        os.environ["HOME"] = str(self.home)
+
+    def tearDown(self):
+        self.index.encrypted_disk_detected = self._detected
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def detect(self, value):
+        self.index.encrypted_disk_detected = lambda vault: value
+
+    def write_user_config(self, text):
+        cfg = self.home / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(text, encoding="utf-8")
+
+    def test_env_confirmation_satisfies_gate(self):
+        self.detect(None)  # no detection possible (cloud VM / container)
+        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "1"
+        self.assertEqual(
+            self.index.encrypted_disk_confirmation("/vault", False),
+            "asserted via CONFIDANT_ASSUME_ENCRYPTED_DISK")
+
+    def test_user_config_confirmation_satisfies_gate(self):
+        self.detect(None)
+        self.write_user_config("[qmd]\nassume_encrypted_disk = true\n")
+        mechanism = self.index.encrypted_disk_confirmation("/vault", False)
+        self.assertIn("config.toml", mechanism)
+        self.assertIn("assume_encrypted_disk", mechanism)
+
+    def test_without_confirmation_it_refuses(self):
+        self.detect(False)  # definitively not detected, no assertion
+        with self.assertRaises(SystemExit):
+            self.index.ensure_encrypted_disk("/vault", False)
+
+    def test_detection_preferred_over_assertions(self):
+        self.detect(True)
+        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "1"
+        self.write_user_config("[qmd]\nassume_encrypted_disk = true\n")
+        self.assertEqual(
+            self.index.encrypted_disk_confirmation("/vault", True),
+            "detected (FileVault/dm-crypt)")
+
+    def test_mechanism_is_printed_to_stderr(self):
+        self.detect(None)
+        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "true"
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIn("CONFIDANT_ASSUME_ENCRYPTED_DISK", err.getvalue())
+
+    def test_flag_alone_still_satisfies_gate(self):
+        self.detect(None)
+        self.assertEqual(
+            self.index.encrypted_disk_confirmation("/vault", True),
+            "asserted via --i-confirm-encrypted-disk")
 
 
 if __name__ == "__main__":

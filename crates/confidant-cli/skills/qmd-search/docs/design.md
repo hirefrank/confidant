@@ -63,8 +63,15 @@ skill (device policy):
    item 4; device policy, not a per-command check). Auto-detected:
    `fdesetup isactive` on macOS, or a `crypt`-type ancestor of the vault's
    backing device in `lsblk` on Linux. If detection is impossible, the
-   build refuses unless the operator passes `--i-confirm-encrypted-disk`
-   (having verified it themselves). The script prints which path it took.
+   build refuses unless the operator asserts the disk is encrypted, having
+   verified it themselves: per run with `--i-confirm-encrypted-disk`, or
+   persisted for automated runs on hosts where detection is impossible (a
+   cloud VM or container has no local `dm-crypt` ancestor; #540) with
+   `CONFIDANT_ASSUME_ENCRYPTED_DISK=1` or `[qmd] assume_encrypted_disk =
+   true` in `~/.config/confidant/config.toml`. Detection is preferred over
+   every assertion, and the script prints which path it took on stderr, so
+   an assumption is never reported as a check. The persisted forms are a
+   device-policy statement by the operator, not a verification.
    Note: calling `confidant reindex` directly bypasses this device-policy
    gate — see #37's review flag; #37 chose to leave the assertion in the
    skill.
