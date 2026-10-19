@@ -18,7 +18,7 @@ use crate::error::DomainError;
 use crate::id::{person_id_from_path, Prefix, RecordId};
 use crate::ledger::parse_strict_date;
 use crate::packs::declarative::{
-    resolve_declared_severity, resolve_finding_code, RuleCtx, RuleKind,
+    required_code_param, resolve_declared_severity, resolve_finding_code, RuleCtx, RuleKind,
 };
 use crate::packs::manifest::{PackManifest, RuleDecl};
 use crate::packs::rules::ledger::billing_tag_count;
@@ -26,21 +26,6 @@ use crate::record::RecordKind;
 use crate::vault::Vault;
 
 const KIND: &str = "session-checks";
-
-const DEFAULT_TAGS_CODE: &str = "E_SESSION_TAGS";
-const DEFAULT_UNTAGGED_CODE: &str = "W_SESSION_UNTAGGED";
-const DEFAULT_NOTES_CODE: &str = "E_SESSION_WITHOUT_NOTES";
-
-fn str_param<'a>(rule: &'a RuleDecl, name: &str, default: &'a str) -> Result<&'a str, DomainError> {
-    match rule.params.get(name) {
-        None => Ok(default),
-        Some(value) => value.as_str().ok_or_else(|| {
-            DomainError::config(format!("rule '{}': {name} must be a string", rule.id)).with_fix(
-                format!("Omit {name}, or set it to a code the pack declares"),
-            )
-        }),
-    }
-}
 
 /// The validated parameters of one `session-checks` rule.
 #[derive(Clone, Debug)]
@@ -67,21 +52,9 @@ impl<'a> SessionParams<'a> {
                 .collect::<Option<Vec<_>>>()?,
             duration_key: rule.params.get("severity_duration_key")?.as_str()?,
             notes_key: rule.params.get("severity_notes_key")?.as_str()?,
-            tags_code: rule
-                .params
-                .get("tags_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_TAGS_CODE),
-            untagged_code: rule
-                .params
-                .get("untagged_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_UNTAGGED_CODE),
-            notes_code: rule
-                .params
-                .get("notes_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_NOTES_CODE),
+            tags_code: rule.params.get("tags_code")?.as_str()?,
+            untagged_code: rule.params.get("untagged_code")?.as_str()?,
+            notes_code: rule.params.get("notes_code")?.as_str()?,
         })
     }
 }
@@ -174,9 +147,12 @@ impl RuleKind for SessionChecksKind {
             }
         }
 
-        let tags_code = str_param(rule, "tags_code", DEFAULT_TAGS_CODE)?;
-        let untagged_code = str_param(rule, "untagged_code", DEFAULT_UNTAGGED_CODE)?;
-        let notes_code = str_param(rule, "notes_code", DEFAULT_NOTES_CODE)?;
+        // #629: every code is required. There is no compiled pack left to
+        // inherit a default from, and a default could only name a core code
+        // an external pack may not emit.
+        let tags_code = required_code_param(rule, "tags_code")?;
+        let untagged_code = required_code_param(rule, "untagged_code")?;
+        let notes_code = required_code_param(rule, "notes_code")?;
 
         // PD13/#494: an external pack cannot name a builtin code.
         if !manifest.may_emit_builtin_codes() {
@@ -399,4 +375,90 @@ fn note_coverage(
         map.entry(person).or_default().extend(dates);
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::declarative::validate_rule;
+    use crate::packs::manifest::parse_manifest_external;
+
+    const MANIFEST: &str = r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_EX_DURATION", "E_EX_TAGS", "W_EX_UNTAGGED", "E_EX_NOTES"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[checks.severity]]
+key = "example-pack.require_duration"
+default = "error"
+
+[[checks.severity]]
+key = "example-pack.session_notes"
+default = "warning"
+
+[[rules]]
+id = "sessions"
+kind = "session-checks"
+code = "E_EX_DURATION"
+severity_duration_key = "example-pack.require_duration"
+severity_notes_key = "example-pack.session_notes"
+verb = "session"
+billing_tags = ["paid", "pps", "comp"]
+tags_code = "E_EX_TAGS"
+untagged_code = "W_EX_UNTAGGED"
+notes_code = "E_EX_NOTES"
+
+[messages."E_EX_DURATION"]
+default = "session for {id} has no duration"
+default_fix = "Add a duration"
+
+[messages."E_EX_TAGS"]
+default = "session for {id} has more than one tag"
+default_fix = "Keep one tag"
+
+[messages."W_EX_UNTAGGED"]
+default = "session for {id} has no tag"
+default_fix = "Tag it"
+
+[messages."E_EX_NOTES"]
+default = "session on {date} for {person} has no notes"
+default_fix = "Add a note"
+"#;
+
+    fn manifest() -> PackManifest {
+        parse_manifest_external(MANIFEST).expect("fixture parses")
+    }
+
+    /// #629: every code parameter is required, and the error names it.
+    #[test]
+    fn requires_each_code_parameter() {
+        for name in ["tags_code", "untagged_code", "notes_code"] {
+            let mut manifest = manifest();
+            manifest.rules[0].params.remove(name);
+            let err = validate_rule(&manifest.rules[0], &manifest).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("the {name} parameter is missing")),
+                "expected the missing {name} to be named: {err}"
+            );
+        }
+    }
+
+    /// The fixture itself is valid, so the missing-parameter tests above
+    /// fail for the reason they name.
+    #[test]
+    fn fixture_manifest_validates() {
+        let manifest = manifest();
+        validate_rule(&manifest.rules[0], &manifest).expect("fixture is a valid rule");
+    }
 }

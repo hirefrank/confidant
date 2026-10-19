@@ -15,35 +15,13 @@ use crate::check::{Finding, FindingCode, Severity};
 use crate::error::DomainError;
 use crate::ledger::{parse_decimal_hundredths, Arg};
 use crate::packs::declarative::{
-    resolve_declared_severity, resolve_finding_code, RuleCtx, RuleKind,
+    required_code_param, resolve_declared_severity, resolve_finding_code, RuleCtx, RuleKind,
 };
 use crate::packs::manifest::{PackManifest, RuleDecl};
 use crate::packs::rules::ledger::{self, FoldParams, LedgerFacts, LedgerIssue};
 use crate::vault::SourcedEntry;
 
-/// Core defaults for the codes the kind emits. A compiled-in pack keeps
-/// them; an external pack sets pack-own codes (PD13: a rule's code must
-/// be a pack-own code).
-const DEFAULT_PARSE_CODE: &str = "E_PARSE";
-const DEFAULT_NEGATIVE_CODE: &str = "E_NEGATIVE_BALANCE";
-const DEFAULT_OPEN_MALFORMED_CODE: &str = "E_OPEN_MALFORMED";
-const DEFAULT_INVALID_ID_CODE: &str = "E_INVALID_ID";
-const DEFAULT_WRONG_ID_TYPE_CODE: &str = "E_WRONG_ID_TYPE";
-
 pub(crate) const KIND: &str = "ledger-balance";
-
-/// Read one string parameter, or the default when absent. A present but
-/// non-string value is refused rather than silently defaulted.
-fn str_param<'a>(rule: &'a RuleDecl, name: &str, default: &'a str) -> Result<&'a str, DomainError> {
-    match rule.params.get(name) {
-        None => Ok(default),
-        Some(value) => value.as_str().ok_or_else(|| {
-            DomainError::config(format!("rule '{}': {name} must be a string", rule.id)).with_fix(
-                format!("Omit {name}, or set it to a code the pack declares"),
-            )
-        }),
-    }
-}
 
 /// The validated parameters of one `ledger-balance` rule.
 #[derive(Clone, Copy, Debug)]
@@ -71,31 +49,11 @@ impl<'a> BalanceParams<'a> {
             units_metric: rule.params.get("units_metric")?.as_str()?,
             minutes_metric: rule.params.get("minutes_metric")?.as_str()?,
             max_open_n: rule.params.get("max_open_n")?.as_integer()?,
-            parse_code: rule
-                .params
-                .get("parse_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_PARSE_CODE),
-            negative_code: rule
-                .params
-                .get("negative_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_NEGATIVE_CODE),
-            open_malformed_code: rule
-                .params
-                .get("open_malformed_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_OPEN_MALFORMED_CODE),
-            invalid_code: rule
-                .params
-                .get("invalid_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_INVALID_ID_CODE),
-            wrong_type_code: rule
-                .params
-                .get("wrong_type_code")
-                .and_then(|v| v.as_str())
-                .unwrap_or(DEFAULT_WRONG_ID_TYPE_CODE),
+            parse_code: rule.params.get("parse_code")?.as_str()?,
+            negative_code: rule.params.get("negative_code")?.as_str()?,
+            open_malformed_code: rule.params.get("open_malformed_code")?.as_str()?,
+            invalid_code: rule.params.get("invalid_code")?.as_str()?,
+            wrong_type_code: rule.params.get("wrong_type_code")?.as_str()?,
         })
     }
 
@@ -253,15 +211,16 @@ impl RuleKind for LedgerBalanceKind {
             .with_fix("Declare the key in [[checks.severity]] or use its declared key"));
         }
 
-        let parse_code = str_param(rule, "parse_code", DEFAULT_PARSE_CODE)?;
-        let negative_code = str_param(rule, "negative_code", DEFAULT_NEGATIVE_CODE)?;
-        let open_malformed_code =
-            str_param(rule, "open_malformed_code", DEFAULT_OPEN_MALFORMED_CODE)?;
-        let invalid_code = str_param(rule, "invalid_code", DEFAULT_INVALID_ID_CODE)?;
-        let wrong_type_code = str_param(rule, "wrong_type_code", DEFAULT_WRONG_ID_TYPE_CODE)?;
+        // #629: every code is required. There is no compiled pack left to
+        // inherit a default from, and a default could only name a core code
+        // an external pack may not emit.
+        let parse_code = required_code_param(rule, "parse_code")?;
+        let negative_code = required_code_param(rule, "negative_code")?;
+        let open_malformed_code = required_code_param(rule, "open_malformed_code")?;
+        let invalid_code = required_code_param(rule, "invalid_code")?;
+        let wrong_type_code = required_code_param(rule, "wrong_type_code")?;
 
-        // PD13/#494: an external pack cannot name a builtin code; a
-        // compiled-in pack (or the v1 compiled path) keeps the defaults.
+        // PD13/#494: an external pack cannot name a builtin code.
         if !manifest.may_emit_builtin_codes() {
             for (role, code) in [
                 ("code", rule.code.as_str()),
@@ -584,4 +543,123 @@ pub(crate) fn check_balance(
         finding = finding.with_fix(fix);
     }
     findings.push(finding);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::declarative::validate_rule;
+    use crate::packs::manifest::parse_manifest_external;
+
+    const MANIFEST: &str = r#"manifest_version = 2
+record_types = []
+balance_metrics = ["sessions_remaining", "icf_hours"]
+finding_codes = [
+  "E_EX_BALANCE",
+  "E_EX_PARSE",
+  "E_EX_NEGATIVE",
+  "E_EX_OPEN",
+  "E_EX_ID",
+  "E_EX_TYPE",
+]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[verbs]]
+name = "open"
+id_type = "person"
+
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[checks.severity]]
+key = "example-pack.balance_nonnegative"
+default = "error"
+
+[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_EX_BALANCE"
+severity_key = "example-pack.balance_nonnegative"
+open_verb = "open"
+consume_verb = "session"
+units_metric = "sessions_remaining"
+minutes_metric = "icf_hours"
+max_open_n = 100000
+parse_code = "E_EX_PARSE"
+negative_code = "E_EX_NEGATIVE"
+open_malformed_code = "E_EX_OPEN"
+invalid_code = "E_EX_ID"
+wrong_type_code = "E_EX_TYPE"
+
+[messages."E_EX_BALANCE"]
+sessions_remaining = "asserted {asserted}, computed {computed}"
+sessions_remaining_fix = "Fix it for {person}"
+icf_hours = "asserted {asserted}, computed {computed}"
+icf_hours_fix = "Fix it for {person}"
+
+[messages."E_EX_PARSE"]
+missing_number = "balance line is missing a number"
+expected_integer = "expected integer"
+expected_integer_fix = "Use an integer"
+expected_decimal = "expected decimal"
+expected_decimal_fix = "Use a decimal"
+minutes_overflow = "session minutes for {id} overflow"
+
+[messages."E_EX_NEGATIVE"]
+default = "balance for {id} is {remaining}"
+default_fix = "Add an open or remove sessions"
+
+[messages."E_EX_OPEN"]
+shape = "open line is malformed"
+shape_fix = "Use the open shape"
+not_integer = "expected integer"
+not_integer_fix = "Use an integer"
+exceeds_cap = "open N {n} exceeds {cap}"
+exceeds_cap_fix = "Use a size within {cap}"
+total_overflow = "open total for {id} overflows"
+
+[messages."E_EX_ID"]
+package = "package id is not a record ID"
+package_fix = "Use a pkg-<ULID> id"
+
+[messages."E_EX_TYPE"]
+package = "package id '{pkg}' must use the pkg- prefix"
+"#;
+
+    fn manifest() -> PackManifest {
+        parse_manifest_external(MANIFEST).expect("fixture parses")
+    }
+
+    /// #629: every code parameter is required, and the error names it.
+    #[test]
+    fn requires_each_code_parameter() {
+        for name in [
+            "parse_code",
+            "negative_code",
+            "open_malformed_code",
+            "invalid_code",
+            "wrong_type_code",
+        ] {
+            let mut manifest = manifest();
+            manifest.rules[0].params.remove(name);
+            let err = validate_rule(&manifest.rules[0], &manifest).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("the {name} parameter is missing")),
+                "expected the missing {name} to be named: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_manifest_validates() {
+        let manifest = manifest();
+        validate_rule(&manifest.rules[0], &manifest).expect("fixture is a valid rule");
+    }
 }

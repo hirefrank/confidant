@@ -58,7 +58,7 @@ use crate::error::DomainError;
 use crate::id::RecordId;
 use crate::ledger::LedgerEntry;
 use crate::packs::manifest::PackManifest;
-use crate::packs::rules::balance::{BalanceParams, KIND as LEDGER_BALANCE_KIND};
+use crate::packs::rules::balance::KIND as LEDGER_BALANCE_KIND;
 use crate::packs::rules::ledger::{FoldParams, LedgerFacts};
 use crate::vault::Vault;
 
@@ -179,18 +179,29 @@ pub(crate) fn resolve_params(
         )
         .with_fix("Let one ledger-balance rule own the session balance"));
     }
-    let params = BalanceParams::parse(rule).ok_or_else(|| {
-        view_err(format!(
+    // Read the structural parameters the view needs directly: the code
+    // parameters (#629) belong to the rule kind's findings, not to the
+    // view, so a missing code must not surface as a confusing "the view
+    // needs this" error here — the kind's own validator names it.
+    let text = |name: &str| rule.params.get(name).and_then(|v| v.as_str());
+    let (Some(open_verb), Some(consume_verb), Some(_units), Some(_minutes), Some(max_open_n)) = (
+        text("open_verb"),
+        text("consume_verb"),
+        text("units_metric"),
+        text("minutes_metric"),
+        rule.params.get("max_open_n").and_then(|v| v.as_integer()),
+    ) else {
+        return Err(view_err(format!(
             "the ledger-balance rule '{}' does not supply the parameters the context view needs",
             rule.id
         ))
-        .with_fix("Declare open_verb, consume_verb, units_metric, minutes_metric and max_open_n")
-    })?;
+        .with_fix("Declare open_verb, consume_verb, units_metric, minutes_metric and max_open_n"));
+    };
 
     Ok(Some(LedgerSessionsParams {
-        open_verb: params.open_verb.to_owned(),
-        consume_verb: params.consume_verb.to_owned(),
-        max_open_n: params.max_open_n,
+        open_verb: open_verb.to_owned(),
+        consume_verb: consume_verb.to_owned(),
+        max_open_n,
         recent_limit,
     }))
 }

@@ -473,6 +473,12 @@ After the generic keys come the kind-specific keys, defined by each
 kind's own spec section. Unknown keys — generic or kind-specific — are
 an error.
 
+Every kind-specific `*_code` parameter is **required** and names a code
+the pack declares in `finding_codes` (a compiled-in pack may also name a
+live core code, §13.7). There are no fallback defaults: a missing
+parameter, or a value on the retired list in `spec/findings.md`, is
+`E_PACK_INVALID` at load.
+
 **The fixed kind list.** This spec starts the list empty. Each kind's
 own issue appends its section with the parameter table:
 
@@ -623,18 +629,18 @@ one is refused at load.
 | `verb` | string, non-empty | The ledger verb whose entries are checked. |
 | `pair` | string, non-empty | The key of the pair holding the note id (today `"note"`). |
 | `variants` | string, optional | `"touch"` (default) or `"session"`: which variant names the invalid-id and wrong-type messages use (`default`/`default_fix` for personal, `session_note`/`session_note_fix` for coaching). The `missing`/`wrong_owner` variants are the same in both. |
-| `invalid_code` | string, optional | The code for an id that does not parse. Defaults to the core code `E_INVALID_ID`. |
-| `wrong_type_code` | string, optional | The code for a parsed id that is not a note id. Defaults to the core code `E_WRONG_ID_TYPE`. |
+| `invalid_code` | string | The code for an id that does not parse. Required; must be a code the pack declares. |
+| `wrong_type_code` | string | The code for a parsed id that is not a note id. Required; must be a code the pack declares. |
 
 The generic `code` is the code for the missing / wrong-owner problems
-(today `E_UNKNOWN_RECORD`). The three codes must have message tables in
-the manifest; a pack-own code must also be declared in `finding_codes`.
-The kind's fixed severity is `error`, so its pack-own codes use the `E_`
-prefix. An external pack cannot claim a builtin code here: omitting
-`invalid_code`/`wrong_type_code` leaves the core defaults
-(`E_INVALID_ID`/`E_WRONG_ID_TYPE`), and a builtin in either parameter is
-refused at load (the same #494 guard as the generic `code`), so an
-external pack sets both to codes it declares.
+(today `E_UNKNOWN_RECORD`). All three codes are required and must have
+message tables in the manifest; a pack-own code must also be declared in
+`finding_codes`. The kind's fixed severity is `error`, so its pack-own
+codes use the `E_` prefix. An external pack cannot claim a builtin code
+(PD13), so it sets `invalid_code` and `wrong_type_code` to codes it
+declares. A compiled-in pack may name a live core code, but it must still
+set both explicitly. A retired name (`spec/findings.md`) is refused for
+every origin.
 
 Message variants the pack's tables must declare:
 
@@ -697,17 +703,19 @@ checking. Every other finding is a fixed `error`.
 | `units_metric` | string | The declared `balance_metrics` entry holding the integer unit count (today `sessions_remaining`). |
 | `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (today `icf_hours`). |
 | `max_open_n` | integer > 0 | Cap for one `open` line (today `100000`). A larger `N` is refused and not counted. |
-| `parse_code` | string, optional | Code for `balance`-line parse problems and the minutes-overflow problem. Defaults to the core code `E_PARSE`. |
-| `negative_code` | string, optional | Code for a negative unit balance. Defaults to `E_NEGATIVE_BALANCE`. |
-| `open_malformed_code` | string, optional | Code for malformed `open` lines. Defaults to `E_OPEN_MALFORMED`. |
-| `invalid_code` | string, optional | Code for a package id that does not parse. Defaults to `E_INVALID_ID`. |
-| `wrong_type_code` | string, optional | Code for a parsed package id that is not a `pkg-` id. Defaults to `E_WRONG_ID_TYPE`. |
+| `parse_code` | string | Code for `balance`-line parse problems and the minutes-overflow problem. Required; must be a code the pack declares. |
+| `negative_code` | string | Code for a negative unit balance. Required; must be a code the pack declares. |
+| `open_malformed_code` | string | Code for malformed `open` lines. Required; must be a code the pack declares. |
+| `invalid_code` | string | Code for a package id that does not parse. Required; must be a code the pack declares. |
+| `wrong_type_code` | string | Code for a parsed package id that is not a `pkg-` id. Required; must be a code the pack declares. |
 
-The generic `code` is the `balance`-mismatch code (today
-`E_BALANCE_MISMATCH`). Every emitted code must have a message table; a
-pack-own code must also be declared in `finding_codes`. An external pack
-cannot name a builtin code (PD13): it sets every code parameter to a code
-it declares. A compiled-in pack may keep the defaults.
+The generic `code` is the `balance`-mismatch code. All six codes are
+required and must have a message table; a pack-own code must also be
+declared in `finding_codes`. An external pack cannot name a builtin code
+(PD13): it sets every code parameter to a code it declares. A compiled-in
+pack may name a live core code, but it must still set every parameter
+explicitly. A retired name (`spec/findings.md`) is refused for every
+origin.
 
 Message variants the pack's tables must declare (`<units>` and `<minutes>`
 are the two metric names, so a coaching copy declares
@@ -762,13 +770,18 @@ Worked example:
 [[rules]]
 id = "balance"
 kind = "ledger-balance"
-code = "E_BALANCE_MISMATCH"
+code = "E_COACHING_BALANCE_MISMATCH"
 severity_key = "coaching.balance_nonnegative"
 open_verb = "open"
 consume_verb = "session"
 units_metric = "sessions_remaining"
 minutes_metric = "icf_hours"
 max_open_n = 100000
+parse_code = "E_COACHING_PARSE"
+negative_code = "E_COACHING_NEGATIVE_BALANCE"
+open_malformed_code = "E_COACHING_OPEN_MALFORMED"
+invalid_code = "E_COACHING_INVALID_ID"
+wrong_type_code = "E_COACHING_WRONG_ID_TYPE"
 ```
 
 With `2026-10-01 open p-… package pkg-… 6 sessions`, a paid session on
@@ -804,15 +817,16 @@ checks.
 | `billing_tags` | list of strings, non-empty, unique | The tags that count as billing. Exactly one is expected per entry; none is `untagged_code`, more than one is `tags_code`. |
 | `severity_duration_key` | string | A declared `[[checks.severity]]` key for the missing-duration finding. `off` suppresses it. |
 | `severity_notes_key` | string | A declared `[[checks.severity]]` key for the session-without-notes finding. `off` suppresses it. |
-| `tags_code` | string, optional | Code for more than one billing tag. Defaults to the core code `E_SESSION_TAGS`. |
-| `untagged_code` | string, optional | Code for no billing tag. Defaults to `W_SESSION_UNTAGGED`. |
-| `notes_code` | string, optional | Code for a session with no notes. Defaults to `E_SESSION_WITHOUT_NOTES`. |
+| `tags_code` | string | Code for more than one billing tag. Required; must be a code the pack declares. |
+| `untagged_code` | string | Code for no billing tag. Required; must be a code the pack declares. |
+| `notes_code` | string | Code for a session with no notes. Required; must be a code the pack declares. |
 
-The generic `code` is the missing-duration code (today
-`E_MISSING_DURATION`). Every emitted code must have a message table; a
-pack-own code must also be declared in `finding_codes`. An external pack
-cannot name a builtin code (PD13): it sets every code to a code it
-declares.
+The generic `code` is the missing-duration code. All four codes are
+required and must have a message table; a pack-own code must also be
+declared in `finding_codes`. An external pack cannot name a builtin code
+(PD13): it sets every code to a code it declares. A compiled-in pack may
+name a live core code, but it must still set every parameter explicitly.
+A retired name (`spec/findings.md`) is refused for every origin.
 
 Message variants the pack's tables must declare:
 
@@ -855,18 +869,22 @@ Worked example:
 [[rules]]
 id = "sessions"
 kind = "session-checks"
-code = "E_MISSING_DURATION"
+code = "E_COACHING_MISSING_DURATION"
 severity_duration_key = "coaching.require_duration"
 severity_notes_key = "coaching.session_notes"
 verb = "session"
 billing_tags = ["paid", "pps", "comp"]
+tags_code = "E_COACHING_SESSION_TAGS"
+untagged_code = "W_COACHING_SESSION_UNTAGGED"
+notes_code = "E_COACHING_SESSION_WITHOUT_NOTES"
 ```
 
 A `2026-10-01 session p-… 60m paid` line with no `note:` and no note
-record for that day emits `E_SESSION_WITHOUT_NOTES` at the
+record for that day emits `E_COACHING_SESSION_WITHOUT_NOTES` at the
 `coaching.session_notes` severity. Adding `note:n-…` to the line, or a
 note for the person dated `2026-10-01`, silences it. A second session
-that day tagged both `paid` and `pps` emits `E_SESSION_TAGS` as well.
+that day tagged both `paid` and `pps` emits `E_COACHING_SESSION_TAGS` as
+well.
 
 #### Kind `activity-gap` (#448)
 
@@ -883,9 +901,11 @@ cases.
 | `lookback_days_key` | string | A declared `[[checks.int]]` key holding the pay-per-session lookback in days. |
 | `balance_metric` | string | A declared `balance_metrics` entry that a `ledger-balance` rule owns as its `units_metric` (today `sessions_remaining`); the kind uses that rule's fold for the remaining count and the `pps` history. |
 
-The generic `code` is the gap code (today `E_PAID_SESSION_GAP`) and must
-be a code the pack declares (PD13: an external pack cannot name the
-builtin). Severity comes from `severity_key`; `off` skips the rule.
+The generic `code` is the gap code and is required. It must be a code the
+pack declares (PD13: an external pack cannot name a builtin); a retired
+name (`spec/findings.md`) is refused for every origin. The kind has no
+other code parameter. Severity comes from `severity_key`; `off` skips the
+rule.
 
 Message variants the pack's `[messages."<CODE>"]` table must declare (the
 loader refuses a rule whose table lacks one):
@@ -925,7 +945,7 @@ Worked example:
 [[rules]]
 id = "gap"
 kind = "activity-gap"
-code = "E_PAID_SESSION_GAP"
+code = "E_COACHING_PAID_SESSION_GAP"
 severity_key = "coaching.paid_session_gap"
 activity_verb = "session"
 start_verb = "open"
@@ -1051,7 +1071,9 @@ it (a manifest file cannot claim it):
 - origin `compiled-in`: the bytes shipped inside the binary and are
   trusted as core. The reserved-name rule and PD8 rules 1–3 do not
   apply (a built-in may claim `touch`), and a rule's `code`,
-  `invalid_code` or `wrong_type_code` may name any core code.
+  `invalid_code` or `wrong_type_code` may name any **live** core code.
+  Every `*_code` parameter is still required, and the retired names in
+  `spec/findings.md` are refused for every origin (#629).
 
 The allowance is keyed on the origin, **never on the pack name**. A
 vault directory `packs/personal@<version>/` still resolves through the
@@ -1080,9 +1102,10 @@ The compiled `coaching@0.1` path is gone. The shipped pack is
   three golden vaults and `examples/demo-vault`, which vendors the pack and
   its lockfile.
 - The finding codes are the pack-own `E_COACHING_*` / `W_COACHING_*`
-  family (PD13 forbids an external pack from naming a builtin code, and
-  omission of a `*_code` parameter does not inherit a core default for an
-  external pack). `spec/findings.md` lists the mapping.
+  family (PD13 forbids an external pack from naming a builtin code; every
+  `*_code` parameter is required, so a pack cannot inherit a core default
+  — a missing one is `E_PACK_INVALID`, #629). `spec/findings.md` lists the
+  mapping and the retired names.
 - The legacy top-level `coaching` field in `context` survives (ADR-7): it
   is the entry of the pack named `coaching` that serves the
   `ledger-sessions` view, and the `packs["coaching@0.1"]` key is

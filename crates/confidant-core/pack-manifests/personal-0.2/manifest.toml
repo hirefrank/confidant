@@ -144,13 +144,16 @@ date_fields = ["birthday", "dates"]
 window_key = "personal.date_upcoming_days"
 
 # `note:` integrity on `touch` lines, with the core codes the compiled
-# pack emits (allowed because these bytes are compiled in).
+# pack emits (allowed because these bytes are compiled in). Every code
+# parameter is set explicitly (#629): the kinds have no fallbacks.
 [[rules]]
 id = "touch_note"
 kind = "note-ref"
 code = "E_UNKNOWN_RECORD"
 verb = "touch"
 pair = "note"
+invalid_code = "E_INVALID_ID"
+wrong_type_code = "E_WRONG_ID_TYPE"
 
 [messages."E_FRONTMATTER"]
 default = "front matter key '{key}' {problem}"

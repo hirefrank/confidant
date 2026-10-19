@@ -9299,6 +9299,43 @@ fn session_checks_loader_refuses_missing_message_variant() {
     assert_pack_invalid(dir.path());
 }
 
+#[test]
+fn session_checks_loader_refuses_missing_notes_code() {
+    // #629: the code parameters have no fallback; omitting one is
+    // `E_PACK_INVALID`. The kind's own unit test asserts the parameter
+    // name in the message.
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_SESSION_RULE.replace("notes_code = \"E_COACHING_EXT_NOTES\"\n", ""),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn balance_rule_loader_refuses_retired_code_param() {
+    // #629: a retired name is refused as a parameter value, not accepted
+    // because it is still a builtin. The refusal is at manifest parse, so
+    // the fixture cannot compute a real hash (`install_external_pack_raw`
+    // + an unusable pin, like the other parse-time negatives).
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let manifest = coaching_ext_manifest(&COACHING_EXT_BALANCE_RULE.replace(
+        "negative_code = \"E_COACHING_EXT_NEGATIVE\"",
+        "negative_code = \"E_NEGATIVE_BALANCE\"",
+    ));
+    install_external_pack_raw(dir.path(), "coaching-ext", "0.1", &manifest);
+    install_lockfile(
+        dir.path(),
+        "coaching-ext",
+        "0.1",
+        &unusable_external_pack_hash(),
+    );
+    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    assert_pack_invalid(dir.path());
+}
+
 // ---------------------------------------------------------------------------
 // Declarative coaching kinds (#448 activity-gap)
 // ---------------------------------------------------------------------------
@@ -9785,6 +9822,32 @@ fn gap_rule_loader_refuses_undeclared_balance_metric() {
             )
         ),
     );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn gap_rule_loader_refuses_retired_generic_code() {
+    // #629: `activity-gap` has no `*_code` parameter; its generic `code`
+    // is the one code, and a retired name is never valid. The refusal is at
+    // manifest parse, so the fixture uses an unusable pin.
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let manifest = coaching_ext_manifest(&format!(
+        "{}\n{}",
+        COACHING_EXT_BALANCE_RULE,
+        COACHING_EXT_GAP_RULE.replace(
+            "code = \"E_COACHING_EXT_GAP\"",
+            "code = \"E_PAID_SESSION_GAP\""
+        )
+    ));
+    install_external_pack_raw(dir.path(), "coaching-ext", "0.1", &manifest);
+    install_lockfile(
+        dir.path(),
+        "coaching-ext",
+        "0.1",
+        &unusable_external_pack_hash(),
+    );
+    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
     assert_pack_invalid(dir.path());
 }
 
