@@ -1877,3 +1877,386 @@ fn bootstrap_rolls_back_skeleton_when_a_later_step_fails() {
     assert!(!b.home.join(".config/confidant/trust.toml").exists());
     assert!(!bad_path.exists());
 }
+
+// ---------------------------------------------------------------------------
+// #663: `keys verify-recovery` (read-only phrase verification)
+// ---------------------------------------------------------------------------
+
+/// Every file under `dir`, keyed by relative path, byte for byte.
+fn snapshot_dir(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.insert(rel, bytes);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn git_status(vault: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(vault)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// What `verify-recovery` must leave untouched.
+struct ReadOnlySnapshot {
+    keys: std::collections::BTreeMap<String, Vec<u8>>,
+    trust: Option<Vec<u8>>,
+    status: String,
+}
+
+fn snapshot_state(h: &Harness) -> ReadOnlySnapshot {
+    ReadOnlySnapshot {
+        keys: snapshot_dir(&h.vault.join("keys")),
+        trust: std::fs::read(h.trust_toml()).ok(),
+        status: git_status(&h.vault),
+    }
+}
+
+fn assert_unchanged(h: &Harness, before: &ReadOnlySnapshot) {
+    assert_eq!(
+        snapshot_dir(&h.vault.join("keys")),
+        before.keys,
+        "verify-recovery modified keys/"
+    );
+    assert_eq!(
+        std::fs::read(h.trust_toml()).ok(),
+        before.trust,
+        "verify-recovery modified trust.toml"
+    );
+    assert_eq!(
+        git_status(&h.vault),
+        before.status,
+        "verify-recovery changed git status"
+    );
+}
+
+fn verify_recovery(h: &Harness, phrase_file: &Path) -> Output {
+    h.cmd(&["keys", "verify-recovery", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(phrase_file)
+        .output()
+        .unwrap()
+}
+
+fn write_phrase(h: &Harness, phrase: &str) -> PathBuf {
+    let path = h.home.join("saved-recovery.txt");
+    std::fs::write(&path, phrase).unwrap();
+    path
+}
+
+#[test]
+fn verify_recovery_matches_on_enrolled_device_and_writes_nothing() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file = write_phrase(&h, &phrase);
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert!(
+        out.status.success(),
+        "verify-recovery failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["outcome"], "match");
+    assert_eq!(v["checks"]["anchor"], "pass");
+    assert_eq!(v["checks"]["recipient"], "pass");
+    assert_eq!(v["checks"]["cert"], "pass");
+    assert_eq!(v["checks"]["unwrap"]["vault:shared"], "pass");
+    assert_eq!(v["clients_checked"], 1);
+    assert!(!stdout.contains(&phrase), "JSON leaked the phrase");
+    assert!(!stderr.contains(&phrase), "stderr leaked the phrase");
+    assert!(!stdout.contains("AGE-SECRET-KEY"), "JSON leaked a key");
+
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_reads_stdin_and_writes_nothing() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+
+    let before = snapshot_state(&h);
+    let mut child = h
+        .cmd(&["keys", "verify-recovery", "--no-input", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("  {phrase}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdin verify failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&phrase));
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_mismatch_reports_code_and_writes_nothing() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    // A second, independent vault gives a valid BIP39 phrase that is not
+    // this vault's.
+    let other = Harness::new();
+    let out = other.init(&[]);
+    assert!(out.status.success());
+    let other_phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file = write_phrase(&h, &other_phrase);
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert_eq!(out.status.code(), Some(1), "mismatch must exit 1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["outcome"], "mismatch");
+    assert_eq!(v["error"]["code"], "E_RECOVERY_MISMATCH");
+    assert_eq!(v["checks"]["anchor"], "fail");
+    assert_eq!(v["checks"]["recipient"], "fail");
+    assert!(!stdout.contains(&other_phrase), "JSON leaked the phrase");
+
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_checks_both_anchor_halves() {
+    // Tamper only the X25519 recipient in trust.toml: the Ed25519 half
+    // still matches, the certificate and unwrappings still work. The
+    // command must still fail as a mismatch (and never fall back to
+    // keys/), proving it checks both halves.
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file = write_phrase(&h, &phrase);
+
+    let trust = std::fs::read_to_string(h.trust_toml()).unwrap();
+    let mut replaced = false;
+    let mut lines: Vec<String> = Vec::new();
+    for line in trust.lines() {
+        if line.trim_start().starts_with("recovery_age_recipient") {
+            let recipient = age::x25519::Identity::generate().to_public().to_string();
+            lines.push(format!("recovery_age_recipient = \"{recipient}\""));
+            replaced = true;
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    assert!(
+        replaced,
+        "trust.toml has no recovery_age_recipient:\n{trust}"
+    );
+    std::fs::write(h.trust_toml(), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outcome"], "mismatch");
+    assert_eq!(v["error"]["code"], "E_RECOVERY_MISMATCH");
+    assert_eq!(v["checks"]["anchor"], "pass");
+    assert_eq!(v["checks"]["recipient"], "fail");
+    assert_eq!(v["checks"]["cert"], "pass");
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_retired_phrase_reports_shred_guidance() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase1 = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file1 = write_phrase(&h, &phrase1);
+
+    // Simulate a lost device: fresh recover rotates the recovery identity.
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    let out = h
+        .cmd(&["recover", "--no-input", "--json"])
+        .arg("--phrase-file")
+        .arg(&phrase_file1)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_TEST_DEVICE_KEY", age_generate_bech32())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recover failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let phrase2 = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    assert_ne!(phrase2, phrase1);
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file1);
+    assert_eq!(out.status.code(), Some(1), "retired phrase must exit 1");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["outcome"], "retired");
+    assert_eq!(v["error"]["code"], "E_RECOVERY_RETIRED");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("retired"), "{msg}");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(fix.contains("Destroy"), "{fix}");
+    assert!(fix.contains("still opens the vault's history"), "{fix}");
+    assert!(!stdout.contains(&phrase1), "JSON leaked the retired phrase");
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_malformed_phrase_hints_on_stderr_only() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let mut words: Vec<&str> = phrase.split_whitespace().collect();
+    words[0] = "zzzznotabip39word";
+    let bad = words.join(" ");
+    let phrase_file = write_phrase(&h, &bad);
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "malformed phrase is a failure, not usage"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outcome"], "malformed");
+    assert_eq!(v["error"]["code"], "E_RECOVERY_MALFORMED");
+    assert!(
+        stderr.contains("word 1"),
+        "position hint missing from stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("word 1"),
+        "word position leaked into JSON: {stdout}"
+    );
+    assert!(!stdout.contains(&bad), "JSON leaked the phrase");
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_works_on_fresh_device_without_writing_config() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file = write_phrase(&h, &phrase);
+
+    // Lost device: no config dir at all. The operator certificate in
+    // keys/ must be enough to verify, and nothing may be recreated.
+    std::fs::remove_dir_all(h.home.join(".config")).unwrap();
+    let config_dir = h.home.join(".config/confidant");
+    assert!(!config_dir.exists());
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert!(
+        out.status.success(),
+        "fresh-device verify failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outcome"], "match");
+    assert_eq!(v["checks"]["anchor"], "absent");
+    assert_eq!(v["checks"]["recipient"], "absent");
+    assert_eq!(v["checks"]["cert"], "pass");
+    assert_eq!(v["checks"]["unwrap"]["vault:shared"], "pass");
+    assert!(
+        !config_dir.exists(),
+        "verify-recovery recreated the config dir"
+    );
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_failed_unwrap_has_its_own_code() {
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+    let phrase = extract_phrase(&String::from_utf8_lossy(&out.stderr));
+    let phrase_file = write_phrase(&h, &phrase);
+
+    // Tamper the shared client's recovery wrapping. The manifest (signed)
+    // still verifies and the phrase still matches the pin, so this is
+    // specifically an unwrap failure.
+    let wrapping = h.vault.join("keys/shared/wrapped/recovery.age");
+    assert!(wrapping.is_file(), "missing {wrapping:?}");
+    std::fs::write(&wrapping, b"not an age envelope").unwrap();
+
+    let before = snapshot_state(&h);
+    let out = verify_recovery(&h, &phrase_file);
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["outcome"], "unwrap_failed");
+    assert_eq!(v["error"]["code"], "E_RECOVERY_UNWRAP");
+    assert_eq!(v["checks"]["anchor"], "pass");
+    assert_eq!(v["checks"]["recipient"], "pass");
+    assert_eq!(v["checks"]["cert"], "pass");
+    assert_eq!(v["checks"]["unwrap"]["vault:shared"], "fail");
+    assert_unchanged(&h, &before);
+}
+
+#[test]
+fn verify_recovery_empty_stdin_is_usage_error() {
+    use std::process::Stdio;
+
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(out.status.success());
+
+    let out = h
+        .cmd(&["keys", "verify-recovery", "--no-input", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "empty input is a usage error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "usage_error");
+}

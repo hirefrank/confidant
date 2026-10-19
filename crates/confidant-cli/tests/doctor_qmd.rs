@@ -1,10 +1,11 @@
-//! `doctor` qmd-search check (#386).
+//! `doctor` qmd-search check (#386, #657).
 //!
-//! The check is informational and never warns or fails: qmd is optional.
-//! Tests cover the three states from the issue — `qmd` absent from PATH,
-//! present without a corpus, and present with a corpus — plus the
-//! embeddings probe. No test touches the network (`CONFIDANT_OFFLINE=1`)
-//! and all data is fake.
+//! A missing qmd is `ok`: qmd is optional. An installed qmd without a
+//! corpus is a `warning` (#657) because `confidant reindex` is needed to
+//! enable semantic search. Tests cover `qmd` absent from PATH, present
+//! without a corpus, and present with a corpus, plus the embeddings
+//! probe. No test touches the network (`CONFIDANT_OFFLINE=1`) and all
+//! data is fake.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -129,16 +130,19 @@ fn doctor_qmd_present_without_corpus_points_at_reindex() {
 
     let v = run_doctor(&vault, &path_with_fake_qmd(dir.path()), &[]);
     let c = check(&v, "qmd-search").expect("qmd-search check missing");
-    assert_eq!(c["status"], "ok", "{v}");
+    // #657: an installed qmd with no corpus is actionable, not "ok".
+    assert_eq!(c["status"], "warning", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("corpus is missing"), "{msg}");
     assert!(msg.contains("confidant reindex"), "{msg}");
     assert!(msg.contains("confidant find"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("confidant reindex"), "{fix}");
 }
 
 #[cfg(unix)]
 #[test]
-fn doctor_qmd_corpus_without_vectors_points_at_embed() {
+fn doctor_qmd_corpus_without_vectors_points_at_skill_wrapper() {
     let dir = tempfile::tempdir().unwrap();
     write_fake_qmd(dir.path());
     let vault_dir = tempfile::tempdir().unwrap();
@@ -155,10 +159,20 @@ fn doctor_qmd_corpus_without_vectors_points_at_embed() {
         &[("QMD_FAKE_VECTORS", "0")],
     );
     let c = check(&v, "qmd-search").expect("qmd-search check missing");
+    // #666: keyword/BM25 search is healthy; semantic ranking is optional.
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("no embedded vectors"), "{msg}");
-    assert!(msg.contains("qmd embed"), "{msg}");
+    assert!(msg.contains("keyword (BM25) search ready"), "{msg}");
+    assert!(msg.contains("semantic/hybrid"), "{msg}");
+    assert!(
+        !msg.contains("qmd embed"),
+        "must not recommend a bare `qmd embed` (default store): {msg}"
+    );
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("qmd-index.py"), "{fix}");
+    assert!(fix.contains("--embed"), "{fix}");
+    assert!(fix.contains("--vault"), "{fix}");
+    assert!(fix.contains(&vault.display().to_string()), "{fix}");
     assert!(
         !vault.join(".confidant/qmd/index.sqlite").exists(),
         "probe must not create the index file"

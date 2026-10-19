@@ -63,23 +63,45 @@ pub fn detect_agents(home: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Resolve an `--agent` spec to ordered agent ids.
-/// Returns (resolved, unknown_names). `auto` falls back to `claude-code`
-/// when nothing is detected; unknown names are skipped, never fatal.
-pub fn resolve_agents(spec: &str, home: &Path) -> (Vec<String>, Vec<String>) {
+/// Outcome of resolving an `--agent` spec.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedAgents {
+    pub agents: Vec<String>,
+    pub unknown: Vec<String>,
+    /// Set when `auto` detected nothing and fell back to `claude-code`.
+    /// `setup` prints this on stderr so the implicit fallback is not silent
+    /// (#653c).
+    pub fallback_note: Option<String>,
+}
+
+/// Resolve an `--agent` spec to ordered agent ids. `auto` falls back to
+/// `claude-code` when nothing is detected (and says so); unknown names are
+/// skipped, never fatal.
+pub fn resolve_agents(spec: &str, home: &Path) -> ResolvedAgents {
     let spec = spec.trim();
     if spec.is_empty() || spec == "auto" {
         let found = detect_agents(home);
         if found.is_empty() {
-            return (vec!["claude-code".to_owned()], vec![]);
+            return ResolvedAgents {
+                agents: vec!["claude-code".to_owned()],
+                unknown: vec![],
+                fallback_note: Some(
+                    "claude-code was not detected; --agent auto falls back to it".to_owned(),
+                ),
+            };
         }
-        return (found, vec![]);
+        return ResolvedAgents {
+            agents: found,
+            unknown: vec![],
+            fallback_note: None,
+        };
     }
     if spec == "all" {
-        return (
-            AGENTS.iter().map(|(id, _)| (*id).to_owned()).collect(),
-            vec![],
-        );
+        return ResolvedAgents {
+            agents: AGENTS.iter().map(|(id, _)| (*id).to_owned()).collect(),
+            unknown: vec![],
+            fallback_note: None,
+        };
     }
     let mut resolved = Vec::new();
     let mut unknown = Vec::new();
@@ -96,7 +118,11 @@ pub fn resolve_agents(spec: &str, home: &Path) -> (Vec<String>, Vec<String>) {
             unknown.push(name.to_owned());
         }
     }
-    (resolved, unknown)
+    ResolvedAgents {
+        agents: resolved,
+        unknown,
+        fallback_note: None,
+    }
 }
 
 pub fn confidant_home() -> anyhow::Result<PathBuf> {
@@ -219,6 +245,10 @@ pub struct SetupResult {
     pub agents: Vec<AgentSetup>,
     pub unknown_agents: Vec<String>,
     pub verbose_lines: Vec<String>,
+    /// True when the run only reported planned actions (#649).
+    pub dry_run: bool,
+    /// Set when `--agent auto` fell back to `claude-code` (#653c).
+    pub fallback_note: Option<String>,
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -524,6 +554,82 @@ fn prune_old_versions(
     pruned
 }
 
+/// Plan one skill link without touching the filesystem (#649). Mirrors
+/// [`link_one_skill`]'s ownership rules and outcome vocabulary so a dry run
+/// reports exactly what a real run would do.
+fn plan_link(
+    src: &Path,
+    dest: &Path,
+    force: bool,
+    copy_mode: bool,
+    skills_root: &Path,
+) -> (LinkOutcome, Vec<String>) {
+    let owned = is_owned(dest, skills_root);
+    let verb = if copy_mode {
+        "would copy"
+    } else {
+        "would link"
+    };
+    if dest.is_symlink() || dest.exists() {
+        if !owned && !force {
+            let kind = if dest.is_symlink() {
+                "symlink"
+            } else if dest.is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            return (
+                LinkOutcome::SkippedExists,
+                vec![format!(
+                    "skip    {} (existing {kind} not managed by confidant; use --force to replace)",
+                    dest.display()
+                )],
+            );
+        }
+        let old_target = std::fs::read_link(dest).ok();
+        let outcome = if copy_mode {
+            LinkOutcome::Copied
+        } else {
+            match old_target {
+                Some(t) if t == src => LinkOutcome::AlreadyLinked,
+                Some(_) => LinkOutcome::Repointed,
+                None => LinkOutcome::Linked,
+            }
+        };
+        return (outcome, vec![format!("{verb}  {}", dest.display())]);
+    }
+    let outcome = if copy_mode {
+        LinkOutcome::Copied
+    } else {
+        LinkOutcome::Linked
+    };
+    let line = if copy_mode {
+        format!("{verb}  {}", dest.display())
+    } else {
+        format!("{verb}  {} -> {}", dest.display(), src.display())
+    };
+    (outcome, vec![line])
+}
+
+/// Identity of a target skills dir: canonical when it exists, else the
+/// literal path. Two agent ids can map to one dir (`muse` and `agents` both
+/// use `~/.agents/skills`), which must be linked and counted once (#655).
+fn target_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Append a target, joining labels when the dir is already present.
+fn push_target(targets: &mut Vec<(String, PathBuf)>, label: &str, dir: PathBuf) {
+    let key = target_key(&dir);
+    if let Some((existing, _)) = targets.iter_mut().find(|(_, d)| target_key(d) == key) {
+        existing.push_str(", ");
+        existing.push_str(label);
+        return;
+    }
+    targets.push((label.to_owned(), dir));
+}
+
 /// Run `setup`: materialize the embedded tree, then link/copy each skill
 /// into every target parent. Returns per-agent detail for human/`--json`
 /// output. Unknown `--agent` names are reported, never fatal.
@@ -532,33 +638,48 @@ fn prune_old_versions(
 /// root, or copies carrying the managed marker) are replaced or re-pointed
 /// without `--force`. `--force` is the only path that touches unowned
 /// entries; `update` must not imply it.
-pub fn run_setup(agent_spec: &str, force: bool, copy_mode: bool) -> anyhow::Result<SetupResult> {
+///
+/// `dry_run` (#649) writes nothing at all: no version dir, no
+/// `create_dir_all`, no links/copies/markers, no pruning. It reports the
+/// planned outcomes instead.
+pub fn run_setup(
+    agent_spec: &str,
+    force: bool,
+    copy_mode: bool,
+    dry_run: bool,
+) -> anyhow::Result<SetupResult> {
     let home = home_dir()?;
     let confidant_home = confidant_home()?;
     let skills_root = confidant_home.join("skills");
-    let skills_dir = materialize_current()?;
+    let skills_dir = if dry_run {
+        skills_version_dir()?
+    } else {
+        materialize_current()?
+    };
     let skill_ids = embedded::skill_ids();
     let mut verbose_lines = Vec::new();
 
-    // Resolve target parents.
+    // Resolve target parents, deduped by dir (muse/agents share one).
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
     let mut unknown_agents = Vec::new();
+    let mut fallback_note = None;
     if let Some(single) = skills_dir_override() {
         reject_home_overlap(&single, &confidant_home)?;
         targets.push(("custom".to_owned(), single));
     } else {
-        let (resolved, unknown) = resolve_agents(agent_spec, &home);
-        unknown_agents = unknown;
-        if resolved.is_empty() {
+        let resolved = resolve_agents(agent_spec, &home);
+        unknown_agents = resolved.unknown;
+        fallback_note = resolved.fallback_note;
+        if resolved.agents.is_empty() {
             return Err(anyhow::Error::new(
                 confidant_core::error::DomainError::usage(
                     "no agent skill directories selected: pass --agent with a known agent name, 'all', or 'auto'",
                 ),
             ));
         }
-        for name in resolved {
+        for name in resolved.agents {
             if let Some(dir) = agent_dir(&name, &home) {
-                targets.push((name, dir));
+                push_target(&mut targets, &name, dir);
             }
         }
     }
@@ -566,15 +687,20 @@ pub fn run_setup(agent_spec: &str, force: bool, copy_mode: bool) -> anyhow::Resu
     let mut agents = Vec::new();
     let mut any_installed = false;
     for (label, parent) in targets {
-        std::fs::create_dir_all(&parent)
-            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
+        if !dry_run {
+            std::fs::create_dir_all(&parent)
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
+        }
         verbose_lines.push(format!("-- {label} ({})", parent.display()));
         let mut links = Vec::new();
         for skill in &skill_ids {
             let src = skills_dir.join(skill);
             let dest = parent.join(skill);
-            let (outcome, mut lines) =
-                link_one_skill(skill, &src, &dest, force, copy_mode, &skills_root)?;
+            let (outcome, mut lines) = if dry_run {
+                plan_link(&src, &dest, force, copy_mode, &skills_root)
+            } else {
+                link_one_skill(skill, &src, &dest, force, copy_mode, &skills_root)?
+            };
             if !matches!(outcome, LinkOutcome::SkippedExists) {
                 any_installed = true;
             }
@@ -595,8 +721,8 @@ pub fn run_setup(agent_spec: &str, force: bool, copy_mode: bool) -> anyhow::Resu
     // Prune stale version dirs, but only after every link succeeded and at
     // least one skill was actually installed (a fully-skipped run leaves the
     // old version's links in place, so its dir must stay). Versions other
-    // agents still link into are never pruned (#195).
-    if any_installed {
+    // agents still link into are never pruned (#195). A dry run never prunes.
+    if any_installed && !dry_run {
         let referenced = referenced_skill_versions(&skills_root, &home);
         for pruned in prune_old_versions(&skills_root, env!("CARGO_PKG_VERSION"), &referenced) {
             verbose_lines.push(format!("pruned old skills version {pruned}"));
@@ -610,6 +736,8 @@ pub fn run_setup(agent_spec: &str, force: bool, copy_mode: bool) -> anyhow::Resu
         agents,
         unknown_agents,
         verbose_lines,
+        dry_run,
+        fallback_note,
     })
 }
 
@@ -739,23 +867,26 @@ mod tests {
     #[test]
     fn resolve_auto_falls_back_to_claude_code() {
         let home = PathBuf::from("/nonexistent-conf exhibit");
-        let (resolved, unknown) = resolve_agents("auto", &home);
-        assert_eq!(resolved, vec!["claude-code".to_owned()]);
-        assert!(unknown.is_empty());
+        let resolved = resolve_agents("auto", &home);
+        assert_eq!(resolved.agents, vec!["claude-code".to_owned()]);
+        assert!(resolved.unknown.is_empty());
+        assert!(resolved.fallback_note.is_some());
     }
 
     #[test]
     fn resolve_all_returns_every_agent() {
         let home = PathBuf::from("/nonexistent");
-        let (resolved, _) = resolve_agents("all", &home);
-        assert_eq!(resolved.len(), 9);
+        let resolved = resolve_agents("all", &home);
+        assert_eq!(resolved.agents.len(), 9);
+        assert!(resolved.fallback_note.is_none());
     }
 
     #[test]
     fn resolve_unknown_names_are_reported() {
         let home = PathBuf::from("/nonexistent");
-        let (resolved, unknown) = resolve_agents("claude-code,bogus", &home);
-        assert_eq!(resolved, vec!["claude-code".to_owned()]);
-        assert_eq!(unknown, vec!["bogus".to_owned()]);
+        let resolved = resolve_agents("claude-code,bogus", &home);
+        assert_eq!(resolved.agents, vec!["claude-code".to_owned()]);
+        assert_eq!(resolved.unknown, vec!["bogus".to_owned()]);
+        assert!(resolved.fallback_note.is_none());
     }
 }

@@ -392,6 +392,26 @@ impl KeyStore {
         client_id: &str,
         anchor: &Anchor,
     ) -> Result<(u64, u64, RecipientMap, Vec<CommitmentEntry>), Error> {
+        let parsed = self.verify_manifest_bytes(client_id, anchor)?;
+        // Advance the high-water mark past what we just verified, and
+        // return the commitments from the verified buffer — never re-read
+        // the file.
+        self.advance_seq(client_id, parsed.0)?;
+        Ok(parsed)
+    }
+
+    /// Read and verify a client's manifest against the trust anchor without
+    /// advancing (and therefore without persisting) the off-vault seq
+    /// tracker.
+    ///
+    /// The replay check still compares against the current high-water mark;
+    /// it just cannot move it. Used by `keys verify-recovery`, which must
+    /// write nothing (including `~/.config/confidant/manifest-seq.toml`).
+    fn verify_manifest_bytes(
+        &self,
+        client_id: &str,
+        anchor: &Anchor,
+    ) -> Result<(u64, u64, RecipientMap, Vec<CommitmentEntry>), Error> {
         manifest::validate_client_id(client_id)?;
         let epoch = self.current_epoch(client_id)?;
         let (toml_path, sig_path) = self.manifest_paths(client_id);
@@ -421,11 +441,9 @@ impl KeyStore {
                 min_seq,
             )
         })?;
-        // Advance the high-water mark past what we just verified, and
-        // return the commitments from the verified buffer — never re-read
+        // Return the commitments from the verified buffer — never re-read
         // the file.
         let (seq, _, commitments) = manifest::from_toml(&toml)?;
-        self.advance_seq(client_id, seq)?;
         Ok((seq, epoch, map, commitments))
     }
 
@@ -572,9 +590,62 @@ impl KeyStore {
         identity: &dyn age::Identity,
         anchor: &Anchor,
     ) -> Result<DataKey, Error> {
-        manifest::validate_client_id(client_id)?;
         let (current_epoch, recipients, commitments) =
             self.verified_recipients(client_id, anchor)?;
+        self.unwrap_verified(
+            client_id,
+            key_id,
+            epoch,
+            identity,
+            current_epoch,
+            &recipients,
+            commitments,
+        )
+    }
+
+    /// Trial-unwrap a data key without touching the off-vault seq tracker.
+    ///
+    /// Same verification and commitment check as [`unwrap_data_key`], but
+    /// read-only: the manifest is verified against the current high-water
+    /// mark without advancing it, so `keys verify-recovery` writes nothing.
+    /// The returned key is [`DataKey`], which zeroizes on drop; callers
+    /// must drop it immediately and never log, return, or cache it.
+    pub fn trial_unwrap_data_key(
+        &self,
+        client_id: &str,
+        key_id: &str,
+        epoch: u64,
+        identity: &dyn age::Identity,
+        anchor: &Anchor,
+    ) -> Result<DataKey, Error> {
+        let (_seq, current_epoch, recipients, commitments) =
+            self.verify_manifest_bytes(client_id, anchor)?;
+        self.unwrap_verified(
+            client_id,
+            key_id,
+            epoch,
+            identity,
+            current_epoch,
+            &recipients,
+            commitments,
+        )
+    }
+
+    // Private helper for the two public unwrap paths; the manifest facts
+    // are threaded through rather than re-read, so the argument list is
+    // deliberately explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn unwrap_verified(
+        &self,
+        client_id: &str,
+        key_id: &str,
+        epoch: u64,
+        identity: &dyn age::Identity,
+        current_epoch: u64,
+        recipients: &RecipientMap,
+        commitments: Vec<CommitmentEntry>,
+    ) -> Result<DataKey, Error> {
+        manifest::validate_client_id(client_id)?;
         if !recipients.contains_key(key_id) && key_id != RECOVERY_KEY_ID {
             return Err(Error::NoKey(format!(
                 "key id {key_id} not in manifest for {client_id}"
@@ -1160,6 +1231,18 @@ impl KeyStore {
             }
         }
         out
+    }
+
+    /// Read-only view of every recovery age recipient this vault has ever
+    /// wrapped to: the working-tree `keys/recovery-recipients.toml` plus
+    /// every historical version from git.
+    ///
+    /// Used by `keys verify-recovery` to tell a retired phrase (recorded
+    /// here by a later `recover` or `keys shred`) apart from a plain
+    /// mismatch. The result is a denylist-style union: it only ever errs
+    /// large. Writes nothing and does not touch the seq tracker.
+    pub fn recovery_history(&self) -> std::collections::BTreeSet<String> {
+        self.recovery_history_pubkeys()
     }
 
     /// Why the history-derived shred checks cannot be trusted on this vault,
