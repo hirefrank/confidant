@@ -9,6 +9,12 @@
 //! strips PII regardless. Ledger-derived facts (sessions remaining, ICF hours,
 //! opaque alias hashes) are metadata, not content, and are kept.
 //! [`PersonView::no_ai`] always tells the caller which mode applied.
+//!
+//! The built-in personal pack's `packs` entry (shape, merge rule, private
+//! fields) lives in [`personal`]; `context` only strips the fields the pack
+//! declares as private.
+
+pub mod personal;
 
 use serde::Serialize;
 

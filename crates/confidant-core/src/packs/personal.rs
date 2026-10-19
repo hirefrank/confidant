@@ -6,11 +6,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
 
 use crate::check::{Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
-use crate::ledger::{parse_strict_date, Arg, LedgerEntry};
+use crate::ledger::{parse_strict_date, LedgerEntry};
 use crate::packs::grammars::{
     parse_field_grammar, Cadence, FieldValue, RecurringDate, GRAMMAR_CADENCE, GRAMMAR_DATES_LIST,
     GRAMMAR_NON_EMPTY_STRING, GRAMMAR_RECURRING_DATE,
@@ -18,14 +17,12 @@ use crate::packs::grammars::{
 use crate::packs::manifest::{parse_manifest, PackManifest};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::{parse_with_list, Record, RecordKind};
-use crate::search::cleared_record_ids;
 use crate::vault::{SourcedEntry, Vault};
 
-/// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.2
-/// set, #509). `coffee` was removed, not aliased: `meal` replaces it.
-pub const TOUCH_KINDS: &[&str] = &[
-    "call", "text", "email", "meet", "meal", "event", "gift", "other",
-];
+/// Closed list of touchpoint kinds for `touch` (#182, #227 Q1). The list
+/// and its parser moved to core in #510; kept re-exported here so the
+/// historic path keeps working until #444 deletes this module.
+pub use crate::touch::TOUCH_KINDS;
 
 /// Embedded manifest for `personal@0.1` (spec §9). Vendored from
 /// `packs/personal/manifest.toml` at the repo root: the path must stay
@@ -126,68 +123,6 @@ fn render_fix(
     manifest_claims().manifest.render_fix(code, variant, args)
 }
 
-fn is_valid_touch_kind(kind: &str) -> bool {
-    TOUCH_KINDS.contains(&kind)
-}
-
-/// Extract the touchpoint kind from either a positional `KIND` token
-/// (`2026-10-12 touch p-… call`) or a `kind:KIND` pair (`2026-10-12 touch p-… kind:call`).
-/// Pack-internal; core reaches it through [`Pack::verb_kind`] (#185/#296).
-fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
-    if let Some(k) = entry.pair("kind") {
-        return Some(k.to_owned());
-    }
-    if let Some(tok) = entry.args.first().and_then(Arg::as_token) {
-        if is_valid_touch_kind(tok) {
-            return Some(tok.to_owned());
-        }
-    }
-    None
-}
-
-/// Validate a `touch` line's arguments when `personal@0.1` is enabled.
-/// Accepts either:
-/// - `DATE touch P-ID` (mirrored touchpoint with no kind)
-/// - `DATE touch P-ID kind:<KIND>` (mirrored touchpoint with kind)
-/// - `DATE touch P-ID <KIND> [note:N-ID] [src:…]` (`log touch` syntax)
-///
-/// `<KIND>` is one of [`TOUCH_KINDS`] (`call`, `text`, `email`, `meet`,
-/// `meal`, `event`, `gift`, `other`).
-///
-/// Pack-internal; core reaches it through [`Pack::validate_verb_args`]
-/// (#185/#296). On non-mirrored inputs this agrees with the shape core
-/// used to ask `is_personal_touch_shape` about, so the disabled-pack
-/// branch of `check` can use it as the pack-shape check behind
-/// `W_PACK_ORPHAN`.
-fn validate_touch_args_enabled(args: &[Arg]) -> bool {
-    match args {
-        [] => true,
-        [arg] => match arg.pair() {
-            Some(("kind", k)) => is_valid_touch_kind(k),
-            None => arg.as_token().is_some_and(is_valid_touch_kind),
-            _ => false,
-        },
-        _ => parse_personal_touch_args(args).is_some(),
-    }
-}
-
-fn parse_personal_touch_args(args: &[Arg]) -> Option<&str> {
-    let first = args.first()?.as_token()?;
-    if !is_valid_touch_kind(first) {
-        return None;
-    }
-    let mut seen_note = false;
-    let mut seen_src = false;
-    for arg in &args[1..] {
-        match arg.pair() {
-            Some(("note", _)) if !seen_note => seen_note = true,
-            Some(("src", _)) if !seen_src => seen_src = true,
-            _ => return None,
-        }
-    }
-    Some(first)
-}
-
 #[derive(Clone, Debug)]
 struct TouchEvent {
     date: NaiveDate,
@@ -282,40 +217,6 @@ impl PersonalState {
     }
 }
 
-/// One important date entry in `context` (`packs["personal@0.1"].dates`).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ImportantDateView {
-    pub label: String,
-    pub date: String,
-}
-
-/// One recent touchpoint in `context` (`packs["personal@0.1"].recent_touches`).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RecentTouch {
-    pub date: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-}
-
-/// Personal pack context view (`packs["personal@0.1"]`).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PersonalView {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub birthday: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship_to_me: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub dates: Vec<ImportantDateView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cadence_days: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_touch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub days_since_touch: Option<i64>,
-    pub overdue: bool,
-    pub recent_touches: Vec<RecentTouch>,
-}
-
 /// The compiled personal pack (#184). Registered in [`crate::packs::ALL_PACKS`].
 pub struct PersonalPack;
 
@@ -361,16 +262,18 @@ impl Pack for PersonalPack {
             .map(|(_, p)| *p)
     }
 
+    /// #510: the grammar lives in core `touch`; this pack only claims the
+    /// verb, so the same parser serves `check` and `log touch` after #444.
     fn validate_verb_args(&self, verb: &str, entry: &LedgerEntry) -> Option<bool> {
         match verb {
-            "touch" => Some(validate_touch_args_enabled(&entry.args)),
+            "touch" => Some(crate::touch::validate_touch_args(&entry.args)),
             _ => None,
         }
     }
 
     fn verb_kind(&self, verb: &str, entry: &LedgerEntry) -> Option<String> {
         match verb {
-            "touch" => extract_touch_kind(entry),
+            "touch" => crate::touch::extract_touch_kind(entry),
             _ => None,
         }
     }
@@ -409,84 +312,31 @@ impl Pack for PersonalPack {
     ) {
     }
 
+    /// #510: the merge-aware view and its private-field list live in core
+    /// `context::personal`, built from the pack's **declared fields**, so
+    /// the same code serves the embedded 0.2 pack after #444. The pack state
+    /// is not an input here any more; `check`'s folds are unchanged.
     fn context_view(
         &self,
         vault: &Vault,
-        state: &dyn PackState,
+        _state: &dyn PackState,
         person: &RecordId,
         canonical: &RecordId,
         as_of: NaiveDate,
     ) -> Option<serde_json::Value> {
-        let state = state
-            .as_any()
-            .downcast_ref::<PersonalState>()
-            .expect("PersonalPack state");
-        let cleared = cleared_record_ids(vault);
-        let person_cleared = cleared.contains(person);
-
-        let cadence_days = state.cadence_days_for(canonical, as_of);
-        let last_touch_date = state.last_touch_on(canonical, as_of);
-        let days_since_touch = last_touch_date.map(|d| as_of.signed_duration_since(d).num_days());
-        let overdue = match (cadence_days, days_since_touch) {
-            (Some(cad), Some(days)) => days > i64::from(cad),
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-
-        let (birthday, relationship_to_me, dates) = if person_cleared {
-            let p = state.people.get(canonical);
-            (
-                p.and_then(|pp| pp.birthday.as_ref().map(|b| b.raw.clone())),
-                p.and_then(|pp| pp.relationship_to_me.clone()),
-                p.map(|pp| {
-                    pp.dates
-                        .iter()
-                        .map(|d| ImportantDateView {
-                            label: d.label.clone(),
-                            date: d.raw.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            )
-        } else {
-            (None, None, Vec::new())
-        };
-
-        let mut recent_touches: Vec<RecentTouch> = vault
-            .entries
-            .iter()
-            .filter(|s| {
-                s.entry.verb == "touch"
-                    && s.entry.date <= as_of
-                    && state.canonical_on(&s.entry.id, as_of) == *canonical
-            })
-            .map(|s| RecentTouch {
-                date: s.entry.date.to_string(),
-                kind: extract_touch_kind(&s.entry),
-            })
-            .collect();
-        recent_touches.sort_by(|a, b| b.date.cmp(&a.date).then(a.kind.cmp(&b.kind)));
-        recent_touches.truncate(10);
-
-        let view = PersonalView {
-            birthday,
-            relationship_to_me,
-            dates,
-            cadence_days,
-            last_touch: last_touch_date.map(|d| d.to_string()),
-            days_since_touch,
-            overdue,
-            recent_touches,
-        };
-        serde_json::to_value(view).ok()
+        crate::context::personal::build_personal_view(
+            vault,
+            person,
+            canonical,
+            as_of,
+            &manifest_claims().manifest.fields,
+        )
     }
 
     fn private_context_fields(&self) -> &'static [&'static str] {
-        // `birthday`, `relationship_to_me`, and `dates` are the person's own
-        // PII; `context` strips them when private data is excluded. The
+        // Core owns the list (#510): the person's own PII fields. The
         // cadence/touch fields are derived metadata and stay.
-        &["birthday", "relationship_to_me", "dates"]
+        crate::context::personal::PRIVATE_CONTEXT_FIELDS
     }
 }
 

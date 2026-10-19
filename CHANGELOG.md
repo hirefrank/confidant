@@ -21,6 +21,10 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   (#509). `coffee` is removed, not aliased: `meal` replaces it. New `log touch`
   writes using `coffee` are a usage error, and an existing `coffee` ledger line
   (positional or `kind:coffee`) now fails `check` with `E_TOUCH_MALFORMED`.
+- Core owns the personal pack's `context` view, its `--exclude-private`
+  field list and the `touch` kind grammar; `personal@0.1` delegates to them
+  (#510). `context --json` output is unchanged, and the declarative
+  `personal@0.2` pack can serve the same view after the #444 cutover.
 
 ## [0.5.0] - 2026-10-18
 

@@ -659,6 +659,51 @@ fn context_exclude_private_strips_pii() {
     assert_eq!(v["person"]["profile"], Value::Null);
 }
 
+/// #510: end-to-end `--exclude-private` over the personal pack's view: every
+/// PII field the core list names is stripped, the cadence state stays.
+#[test]
+fn context_exclude_private_strips_personal_pii_fields() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+    std::fs::write(
+        root.join(format!("people/{PERSON}/profile.md")),
+        format!(
+            "---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n\
+             birthday: --05-14\nrelationship_to_me: friend\n\
+             dates: [anniversary:2020-06-15]\ncadence: 30d\n---\n\nTest bio.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "personal fields"]);
+
+    let (ok, full) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{full}");
+    let view = &full["packs"]["personal@0.1"];
+    assert_eq!(view["birthday"], "--05-14", "{full}");
+    assert_eq!(view["relationship_to_me"], "friend", "{full}");
+    assert_eq!(view["dates"][0]["label"], "anniversary", "{full}");
+    assert_eq!(view["cadence_days"], 30, "{full}");
+
+    let (ok, stripped) = run_json(&[
+        "context",
+        PERSON,
+        "--exclude-private",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{stripped}");
+    let view = &stripped["packs"]["personal@0.1"];
+    for field in ["birthday", "relationship_to_me", "dates"] {
+        assert!(view.get(field).is_none(), "{field} leaked: {stripped}");
+    }
+    assert_eq!(view["cadence_days"], 30, "{stripped}");
+}
+
 #[test]
 fn context_unknown_person_is_not_found() {
     let dir = make_vault();
@@ -1551,6 +1596,23 @@ fn plaintext_vault_note_inherits_notes_mode_via_id_list_field() {
     assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
 }
 
+/// Enable `personal@0.1` next to `coaching@0.1` (the `log touch` enable
+/// switch) and commit the config change. Shared by the `log touch` tests.
+fn enable_personal(root: &Path) {
+    let toml_path = root.join("confidant.toml");
+    let toml = std::fs::read_to_string(&toml_path).unwrap();
+    std::fs::write(
+        &toml_path,
+        toml.replace(
+            "packs = [\"coaching@0.1\"]",
+            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "enable personal"]);
+}
+
 #[test]
 fn log_touch_requires_personal_pack() {
     let dir = make_vault();
@@ -1581,18 +1643,7 @@ fn log_touch_writes_one_commit_and_appears_in_context() {
     let root = dir.path();
     let vroot = vault_arg(root);
     // Enable personal@0.1.
-    let toml_path = root.join("confidant.toml");
-    let toml = std::fs::read_to_string(&toml_path).unwrap();
-    std::fs::write(
-        &toml_path,
-        toml.replace(
-            "packs = [\"coaching@0.1\"]",
-            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
-        ),
-    )
-    .unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "enable personal"]);
+    enable_personal(root);
 
     let (ok, added) = run_json(&[
         "log",
@@ -1621,18 +1672,7 @@ fn log_touch_bad_kind_is_usage_error() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    let toml_path = root.join("confidant.toml");
-    let toml = std::fs::read_to_string(&toml_path).unwrap();
-    std::fs::write(
-        &toml_path,
-        toml.replace(
-            "packs = [\"coaching@0.1\"]",
-            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
-        ),
-    )
-    .unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "enable personal"]);
+    enable_personal(root);
 
     let (ok, v) = run_json(&[
         "log",
@@ -1648,6 +1688,81 @@ fn log_touch_bad_kind_is_usage_error() {
     assert_eq!(v["error"]["code"], "usage_error");
 }
 
+/// #510: the kind list lives in core `touch`; an unknown kind is a usage
+/// error (exit 2) listing the core kinds.
+#[test]
+fn log_touch_rejects_unknown_kind_exit_2() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let tmp_home = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args([
+            "log",
+            "touch",
+            PERSON,
+            "smoke",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ])
+        .env("HOME", tmp_home.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "usage_error");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("call, text, email, meet, meal, event, gift, other"),
+        "the error must list the core kinds: {message}"
+    );
+}
+
+/// #510: every kind in the core constant is accepted and written verbatim.
+#[test]
+fn log_touch_accepts_every_core_kind() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    for (i, kind) in [
+        "call", "text", "email", "meet", "meal", "event", "gift", "other",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let date = format!("2026-10-{:02}", i + 1);
+        let (ok, v) = run_json(&[
+            "log",
+            "touch",
+            PERSON,
+            kind,
+            "--date",
+            &date,
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ]);
+        assert!(ok, "{kind}: {v}");
+        let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+        assert!(
+            ledger.contains(&format!("{date} touch {PERSON} {kind}\n")),
+            "{kind}: {ledger}"
+        );
+    }
+}
+
 /// #509: `coffee` was removed from the v1 kind list (replaced by `meal`,
 /// no alias); a removed kind is a usage error that lists the new kinds.
 #[test]
@@ -1655,18 +1770,7 @@ fn log_touch_rejects_coffee_and_lists_v1_kinds() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
-    let toml_path = root.join("confidant.toml");
-    let toml = std::fs::read_to_string(&toml_path).unwrap();
-    std::fs::write(
-        &toml_path,
-        toml.replace(
-            "packs = [\"coaching@0.1\"]",
-            "packs = [\"coaching@0.1\", \"personal@0.1\"]",
-        ),
-    )
-    .unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "enable personal"]);
+    enable_personal(root);
 
     let (ok, v) = run_json(&[
         "log",
