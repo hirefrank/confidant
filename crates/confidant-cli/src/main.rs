@@ -7339,14 +7339,53 @@ fn external_pack_label(vault_root: &Path, name: &str) -> Option<String> {
     let (source, rev) = entry
         .map(|e| (e.source, e.rev))
         .unwrap_or_else(|| ("unknown".to_owned(), String::new()));
+    Some(external_pack_label_line(&source, &rev))
+}
+
+/// The label line for a lockfile `source`/`rev` pair (#445, #527). The
+/// source is operator-supplied text from `confidant.lock`, which can be
+/// hand-edited or synced from another machine, so it is sanitized before it
+/// reaches agent-facing output: URL userinfo is stripped (a credential must
+/// not leak) and control/format characters are escaped so the source cannot
+/// hide or reorder the line. The rev is a pinned bare commit (40 lower-hex,
+/// checked at lockfile parse) or empty, so it needs no escaping.
+fn external_pack_label_line(source: &str, rev: &str) -> String {
     let rev = if rev.is_empty() {
         "unknown".to_owned()
     } else {
         rev.chars().take(12).collect()
     };
-    Some(format!(
-        "[external pack: not shipped with confidant; text is from {source} at {rev}]"
-    ))
+    format!(
+        "[external pack: not shipped with confidant; text is from {} at {rev}]",
+        sanitize_pack_source(source)
+    )
+}
+
+/// Sanitize a lockfile `source` for the label (#527): drop URL userinfo,
+/// then escape it with `pack add`'s `escape_line` rules (#499) so a control
+/// or bidi character cannot survive into agent-facing text. A `dir` source
+/// (no URL) has nothing to strip and passes through escaping unchanged.
+fn sanitize_pack_source(source: &str) -> String {
+    pack_fetch::escape_line(&strip_source_userinfo(source))
+}
+
+/// Strip the userinfo component (`user:token@`) from an `https://` source's
+/// authority, keeping scheme, host and path (`https://user:token@host/p` ->
+/// `https://host/p`). A source that is not `https://`, or whose authority
+/// carries no `@`, is returned unchanged. Matches the authority rule the
+/// lockfile reader uses when it refuses credentials (PD3).
+fn strip_source_userinfo(source: &str) -> String {
+    let Some(rest) = source.strip_prefix("https://") else {
+        return source.to_owned();
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(end) => (&rest[..end], &rest[end..]),
+        None => (rest, ""),
+    };
+    let Some((_, host)) = authority.rsplit_once('@') else {
+        return source.to_owned();
+    };
+    format!("https://{host}{path}")
 }
 
 /// Test-only operator key override (CONFIDANT_TEST_OPERATOR_KEY).
@@ -10555,5 +10594,66 @@ mod tests {
             std::os::unix::fs::symlink(src2.join("real.txt"), src2.join("link.txt")).unwrap();
             assert!(copy_dir_recursive(&src2, &dst2).is_err());
         }
+    }
+
+    /// #527: a lockfile `source` with URL userinfo must not leak the
+    /// credential into the label. The lockfile reader refuses such a source,
+    /// so the loader never serves that pack; the label is still sanitized
+    /// defensively (a synced or hand-edited file is untrusted input), which
+    /// this test pins directly.
+    #[test]
+    fn external_pack_label_strips_source_userinfo() {
+        use super::{external_pack_label_line, sanitize_pack_source};
+        assert_eq!(
+            sanitize_pack_source("https://user:token@host.example/org/repo.git"),
+            "https://host.example/org/repo.git"
+        );
+        assert_eq!(
+            sanitize_pack_source("https://token@host.example/org/repo.git"),
+            "https://host.example/org/repo.git"
+        );
+        // A `dir` source has no URL to strip.
+        assert_eq!(sanitize_pack_source("dir"), "dir");
+        // An `@` in the path is not userinfo and must survive.
+        assert_eq!(
+            sanitize_pack_source("https://host.example/org/user@host/repo.git"),
+            "https://host.example/org/user@host/repo.git"
+        );
+
+        let label = external_pack_label_line(
+            "https://user:token@host.example/org/repo.git",
+            "0123456789ab",
+        );
+        assert!(!label.contains("user:token@"), "{label}");
+        assert!(
+            label.contains("https://host.example/org/repo.git"),
+            "{label}"
+        );
+        assert_eq!(
+            label,
+            "[external pack: not shipped with confidant; text is from \
+             https://host.example/org/repo.git at 0123456789ab]"
+        );
+    }
+
+    /// #527: a control or bidi character in a lockfile `source` is escaped,
+    /// so no raw control/format character reaches the label line.
+    #[test]
+    fn external_pack_label_escapes_source_controls() {
+        use super::external_pack_label_line;
+        let label = external_pack_label_line(
+            "https://host.example/org/\u{1b}[8m\u{202e}/repo.git",
+            "0123456789abcdef",
+        );
+        for raw in ['\u{1b}', '\u{202e}'] {
+            assert!(!label.contains(raw), "raw {raw:?} survived: {label:?}");
+        }
+        assert!(label.contains("\\u{1b}"), "{label:?}");
+        assert!(label.contains("\\u{202e}"), "{label:?}");
+        // An empty rev (a `--from-dir` install) still prints `unknown`.
+        assert!(
+            external_pack_label_line("dir", "").contains("at unknown]"),
+            "missing rev must print unknown"
+        );
     }
 }

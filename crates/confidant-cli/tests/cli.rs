@@ -587,6 +587,14 @@ const EXTERNAL_HELP_MANIFEST: &str = "manifest_version = 2\n\
 /// A non-git vault with `example-pack@0.1` vendored, pinned and enabled,
 /// plus the vendored skill text. Fake data only.
 fn external_help_vault() -> (tempfile::TempDir, String) {
+    external_help_vault_with_source("https://example.invalid/org/example-pack.git")
+}
+
+/// Like [`external_help_vault`] but with an explicit lockfile `source`.
+/// `source_toml` is the value *as it appears in the `confidant.lock` basic
+/// string* (already TOML-escaped), so a test can pin a hostile source such
+/// as one carrying a control or format character.
+fn external_help_vault_with_source(source_toml: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("confidant.toml"),
@@ -605,7 +613,7 @@ fn external_help_vault() -> (tempfile::TempDir, String) {
     std::fs::write(
         dir.path().join("confidant.lock"),
         format!(
-            "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"https://example.invalid/org/example-pack.git\"\nrev = \"0123456789abcdef0123456789abcdef01234567\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+            "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"{source_toml}\"\nrev = \"0123456789abcdef0123456789abcdef01234567\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
         ),
     )
     .unwrap();
@@ -645,6 +653,49 @@ fn help_pack_external_is_labelled() {
         v["skill"].as_str().unwrap().starts_with(label),
         "the agent-facing JSON must carry the label: {v}"
     );
+}
+
+/// #527: a lockfile `source` carrying a control or Unicode format character
+/// is escaped into a visible `\u{…}` form, so no raw control/format
+/// character reaches agent-facing output (the label line, or the `--json`
+/// copy an agent reads).
+#[test]
+fn help_pack_external_label_escapes_lockfile_source() {
+    // TOML-escaped `\u001b` (ESC) and `\u202e` (right-to-left override) in
+    // the authority-free path, so the source still parses as an https URL.
+    let (vault, _skill) =
+        external_help_vault_with_source("https://example.invalid/org/\\u001b[8m\\u202e/repo.git");
+    let out = Command::new(bin())
+        .args(["help", "pack:example-pack@0.1", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for raw in ['\u{1b}', '\u{202e}'] {
+        assert!(
+            !stdout.contains(raw),
+            "raw {raw:?} reached the label: {stdout:?}"
+        );
+    }
+    assert!(stdout.contains("\\u{1b}"), "{stdout:?}");
+    assert!(stdout.contains("\\u{202e}"), "{stdout:?}");
+
+    let out = Command::new(bin())
+        .args(["help", "pack:example-pack@0.1", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let skill = v["skill"].as_str().unwrap();
+    for raw in ['\u{1b}', '\u{202e}'] {
+        assert!(!skill.contains(raw), "raw {raw:?} in JSON skill: {skill:?}");
+    }
 }
 
 /// #523: `help pack` (no pack name) builds its combined text from the
