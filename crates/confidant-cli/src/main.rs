@@ -8358,7 +8358,7 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
             // PD10 (#445): external pack text shown to agents is labelled
             // with where it came from. Compiled packs are shipped with the
             // binary and print exactly as before.
-            if let Some(label) = external_pack_label(root, name) {
+            if let Some(label) = external_pack_label(v.pack_registry(), root, name) {
                 text = format!("{label}\n{text}");
             }
             (vec![name.to_owned()], text)
@@ -8372,7 +8372,7 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
             // and gets no label, so its output is byte for byte unchanged.
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             let text = embedded::combined_pack_skill(v.pack_registry(), &refs, |name| {
-                external_pack_label(root, name)
+                external_pack_label(v.pack_registry(), root, name)
             })
             .ok_or_else(|| {
                 anyhow::Error::new(DomainError::internal("an enabled pack ships no SKILL.md"))
@@ -8397,12 +8397,21 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
 /// <rev first 12>]`. `None` for a compiled pack (embedded, shipped with
 /// the binary).
 ///
+/// The decision is the pack's `origin` in the vault's registry (#535),
+/// never whether embedded text with the same base name exists: an external
+/// pack whose base name matches a compiled pack (`coaching@0.9` next to the
+/// compiled `coaching@0.1`) is still external and must be labelled.
+///
 /// The lockfile is the authority for source and rev; a loaded external
 /// pack always has a pin (the loader fails closed without one). A `dir`
 /// source has no commit (PD3), so its empty rev prints `unknown`; a
 /// missing pin prints `unknown` too rather than inventing a source.
-fn external_pack_label(vault_root: &Path, name: &str) -> Option<String> {
-    if embedded::pack_skill_text(name).is_some() {
+fn external_pack_label(
+    registry: &confidant_core::packs::PackRegistry,
+    vault_root: &Path,
+    name: &str,
+) -> Option<String> {
+    if !registry.is_external(name) {
         return None; // compiled: ships with confidant
     }
     let entry = read_lockfile(vault_root).ok().flatten().and_then(|lock| {
