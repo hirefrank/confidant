@@ -203,6 +203,11 @@ jobs:
     # the unit suite, so it stays off the critical path for everything else
     # (see `.agents/skills/qa-sweep/SKILL.md`).
     if: github.event_name != 'pull_request' || needs.changes.outputs.qa_relevant == 'true'
+    # Filing the failure alert needs issues:write; every other job keeps the
+    # workflow-level `contents: read`.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
@@ -220,8 +225,30 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         # Drives the built binary through the deterministic subset of the
         # sweep protocol: writes, refusal invariants, read-path privacy,
-        # pack lifecycle.
-        run: python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
+        # pack lifecycle. `tee` keeps the output for the failure alert below;
+        # pipefail keeps this step's exit status that of the smoke, not tee.
+        run: |
+          set -o pipefail
+          python3 .github/scripts/qa-smoke.py --cli target/debug/confidant 2>&1 | tee qa-smoke.log
+      # A red night must land on the queue a human already watches, without
+      # filing a new issue every time. The alert updates one `qa-found` issue
+      # in place, and only for `main`: a manual dispatch on a branch cannot
+      # open or clear the alert for main. `!cancelled()` keeps a concurrency
+      # cancellation from filing an issue (#625).
+      - name: report failure
+        if: failure() && !cancelled() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/qa-alert.sh report --log qa-smoke.log
+      - name: clear failure alert
+        # A green run closes the alert. The docs-only skip also applies here:
+        # a docs-only push did not run the smoke and must not clear a real red.
+        if: success() && !cancelled() && github.ref == 'refs/heads/main' && needs.changes.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .github/scripts/qa-alert.sh clear
 
   deny:
     name: cargo deny

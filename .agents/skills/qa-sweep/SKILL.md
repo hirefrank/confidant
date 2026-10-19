@@ -149,9 +149,10 @@ refused-write invariant. Run
 
 CI runs it nightly and on push to `main` (`qa-smoke` job in
 `.github/workflows/ci.yml`), never on pull requests, to keep PR latency
-down. Until a failed run alerts someone (#625), the maintainer watches the
-nightly `qa smoke` run each morning — a red night otherwise only notifies
-whoever last edited the cron.
+down. A failed run on `main` opens or updates the `qa-found` alert issue
+with the run link, commit and failing step, and a later green run closes
+it again (#625), so a red night lands on the same queue as a sweep instead
+of waiting for someone to notice.
 
 A sweep starts by running it, then spends its time on the columns in the
 rotation table the script does not cover.
