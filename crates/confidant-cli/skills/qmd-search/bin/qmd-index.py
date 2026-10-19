@@ -22,8 +22,13 @@ Guardrails:
 - The encrypted-disk assertion STAYS HERE (architecture §9b item 4): the
   corpus and QMD's index hold plaintext chunks, so the script refuses
   unless the disk is encrypted (auto-detected: FileVault on macOS,
-  dm-crypt ancestor in lsblk on Linux) or the operator passes
-  --i-confirm-encrypted-disk. It is device policy, not a per-command check.
+  dm-crypt ancestor in lsblk on Linux) or the operator asserts it — per
+  run with --i-confirm-encrypted-disk, or persisted for automated runs on
+  hosts where detection is impossible (cloud VMs, containers) with
+  CONFIDANT_ASSUME_ENCRYPTED_DISK=1 or `[qmd] assume_encrypted_disk =
+  true` in ~/.config/confidant/config.toml (issue #540). It is device
+  policy, not a per-command check, and it prints which mechanism satisfied
+  it (stderr) so the trust assumption stays visible.
 - QMD's own store is moved under <vault>/.confidant/qmd/ (INDEX_PATH +
   QMD_CONFIG_DIR env), created 0700; on macOS it is added to the Time
   Machine exclusion list. A previous default-store `confidant` collection
@@ -53,6 +58,14 @@ import sys
 COLLECTION = "confidant"
 CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 STORE_REL = os.path.join(".confidant", "qmd")
+
+# Persisted encrypted-disk confirmation (issue #540). A cloud VM or
+# container has no local dm-crypt ancestor for lsblk to find, so automated
+# reindex runs would otherwise pass --i-confirm-encrypted-disk every time.
+# These are device-policy assertions by the operator, not checks.
+ASSUME_ENV = "CONFIDANT_ASSUME_ENCRYPTED_DISK"
+USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
+TRUTHY = ("1", "true", "yes", "on")
 
 
 def resolve_vault(explicit):
@@ -169,21 +182,85 @@ def encrypted_disk_detected(vault):
     return False
 
 
-def ensure_encrypted_disk(vault, confirmed_flag):
-    """Refuse unless the disk is encrypted (detected) or the operator asserts it."""
-    detected = encrypted_disk_detected(vault)
-    if detected is True:
-        print("encrypted disk: detected — ok")
-        return
+def _truthy(value):
+    """A config/env value that opts in: 1/true/yes/on, case-insensitive."""
+    return str(value).strip().lower() in TRUTHY
+
+
+def assume_from_env():
+    """True when CONFIDANT_ASSUME_ENCRYPTED_DISK is set to a truthy value."""
+    return _truthy(os.environ.get(ASSUME_ENV, ""))
+
+
+def assume_from_user_config(home=None):
+    """True when ~/.config/confidant/config.toml opts in via [qmd].
+
+    Reads `[qmd] assume_encrypted_disk = true` from the *user* config
+    (never the vault), so the trust assumption is declared once on the
+    device rather than passed per run (issue #540). Fail closed: a missing
+    file, invalid TOML, or an unreadable value is not a confirmation. On a
+    Python without `tomllib` (< 3.11) the config key is unavailable and the
+    env var / flag / detection still work.
+    """
+    home = home or os.environ.get("HOME")
+    if not home:
+        return False
+    try:
+        import tomllib
+    except ImportError:
+        return False
+    try:
+        with open(os.path.join(home, USER_CONFIG_REL), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    qmd = data.get("qmd")
+    return isinstance(qmd, dict) and _truthy(qmd.get("assume_encrypted_disk", ""))
+
+
+def encrypted_disk_confirmation(vault, confirmed_flag):
+    """The mechanism that satisfies the encrypted-disk gate, or None.
+
+    Detection is preferred over every assertion, so a real FileVault /
+    dm-crypt answer is reported as `detected` rather than as an operator
+    assumption. `--i-confirm-encrypted-disk` is strongest among the
+    assertions (per run); the persisted confirmations (#540) come next.
+    A definite `False` from detection does not short-circuit: like the
+    original per-run flag, any explicit operator assertion still allows
+    the build, and the printed mechanism makes clear it was asserted.
+    """
+    if encrypted_disk_detected(vault) is True:
+        return "detected (FileVault/dm-crypt)"
     if confirmed_flag:
-        print("encrypted disk: asserted via --i-confirm-encrypted-disk — ok")
+        return "asserted via --i-confirm-encrypted-disk"
+    if assume_from_env():
+        return f"asserted via {ASSUME_ENV}"
+    if assume_from_user_config():
+        return ("asserted via ~/.config/confidant/config.toml "
+                "[qmd].assume_encrypted_disk")
+    return None
+
+
+def ensure_encrypted_disk(vault, confirmed_flag):
+    """Refuse unless the disk is encrypted (detected) or the operator asserts it.
+
+    Prints which mechanism satisfied the gate to stderr (issue #540), so
+    the trust assumption is visible in logs and never looks like a check.
+    """
+    mechanism = encrypted_disk_confirmation(vault, confirmed_flag)
+    if mechanism is not None:
+        print(f"encrypted disk: {mechanism} — ok", file=sys.stderr)
         return
     sys.exit(
         "error: refusing to build: could not confirm the disk is encrypted.\n"
         "The QMD index holds plaintext vault content (including no-ai records)\n"
         "and architecture §9b item 4 requires an encrypted disk.\n"
-        "Fix: run on a FileVault/dm-crypt volume, or re-run with\n"
-        "  --i-confirm-encrypted-disk   (only if you have verified it yourself)")
+        "Fix: run on a FileVault/dm-crypt volume, re-run with\n"
+        "  --i-confirm-encrypted-disk   (only if you have verified it yourself),\n"
+        "or persist the assertion once for this device:\n"
+        f"  export {ASSUME_ENV}=1\n"
+        "  (or [qmd] assume_encrypted_disk = true in\n"
+        "   ~/.config/confidant/config.toml)")
 
 
 def qmd_store_paths(vault):
@@ -282,7 +359,9 @@ def main():
                          "(default: confidant on PATH)")
     ap.add_argument("--i-confirm-encrypted-disk", action="store_true",
                     help="assert the disk is encrypted (only if you have "
-                         "verified it yourself; detection is attempted first)")
+                         "verified it yourself; detection is attempted first; "
+                         f"or set {ASSUME_ENV}=1 / [qmd] "
+                         "assume_encrypted_disk in the user config)")
     args = ap.parse_args()
 
     vault = resolve_vault(args.vault)

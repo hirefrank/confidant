@@ -33,10 +33,19 @@ truth for the search allowlist.
 - **`qmd-index` keeps the encrypted-disk assertion** (architecture §9b
   item 4, device policy, not a per-command check): it refuses unless the
   disk is encrypted — auto-detected (FileVault on macOS, dm-crypt ancestor
-  in `lsblk` on Linux) or asserted with `--i-confirm-encrypted-disk`. QMD's
-  index DB and collection registry are moved under the vault via
-  `INDEX_PATH`/`QMD_CONFIG_DIR` (never `~/.cache`), and any `confidant`
-  collection left in qmd's default store is removed on first run.
+  in `lsblk` on Linux) or asserted by the operator. Detection is preferred
+  and reported when it succeeds; otherwise the assertion can be per run
+  (`--i-confirm-encrypted-disk`) or persisted for automated runs on hosts
+  where detection is impossible — a cloud VM or container with no local
+  `dm-crypt` ancestor (#540) — with `CONFIDANT_ASSUME_ENCRYPTED_DISK=1`
+  or `[qmd] assume_encrypted_disk = true` in
+  `~/.config/confidant/config.toml`. The persisted forms are a
+  device-policy statement by the operator, **not a check**: the script
+  prints which mechanism satisfied the gate on stderr, so an assumption
+  never masquerades as detection. QMD's index DB and collection registry
+  are moved under the vault via `INDEX_PATH`/`QMD_CONFIG_DIR` (never
+  `~/.cache`), and any `confidant` collection left in qmd's default store
+  is removed on first run.
 - **The §12 allowlist is enforced at query time, and uncleared records are
   also excluded at index time.** `confidant reindex` copies only the exact
   cleared set computed by the CLI (cleared record files and cleared ledger
@@ -137,7 +146,10 @@ it on stderr.
   rebuild: the CLI wipes the old corpus), then registers it as the `confidant`
   QMD collection (removing any previous one first). It never walks the vault
   itself. It keeps one guardrail: it refuses unless the disk is encrypted
-  (auto-detected or `--i-confirm-encrypted-disk`); the gitignore refusal and
+  (auto-detected, or asserted with `--i-confirm-encrypted-disk` /
+  `CONFIDANT_ASSUME_ENCRYPTED_DISK=1` / `[qmd]
+  assume_encrypted_disk = true`; detection is preferred and the mechanism
+  used is printed on stderr); the gitignore refusal and
   the `0700`/`0600` permissions live in `confidant reindex`. Puts QMD's own
   store under `<vault>/.confidant/qmd/`. `--cli` points at the confidant
   binary (default `confidant` on PATH). Each kept `ledger/*.cfd` is written by
