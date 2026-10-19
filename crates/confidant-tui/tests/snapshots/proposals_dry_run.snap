@@ -21,4 +21,4 @@ vault  /tmp/tui-test-proposals-dryrun   scope  not resolved yet   doctor  not ru
 │                                                                                                  │
 │                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- 1-3  ws  Tab  view  /  filter  f  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit
+ 1-3  ws  Tab  view  j/k  move  Enter  open  a  apply  r  reload  :  palette  ?  help  q  quit

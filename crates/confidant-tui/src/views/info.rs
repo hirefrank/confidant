@@ -31,8 +31,11 @@ impl InfoState {
 /// Pure renderer: a centered modal over the current view.
 pub fn render(state: &InfoState, frame: &mut Frame<'_>, area: Rect) {
     let width = area.width.saturating_sub(10).clamp(30, 80);
-    let height = (state.lines.len() as u16 + 6)
-        .min(area.height.saturating_sub(4))
+    // Content + borders + one row of margin, so the full keymap fits on a
+    // standard 24-row terminal; the close hint lives in the block's bottom
+    // title instead of consuming a content line.
+    let height = (state.lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(1))
         .max(7);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -40,17 +43,17 @@ pub fn render(state: &InfoState, frame: &mut Frame<'_>, area: Rect) {
 
     frame.render_widget(ratatui::widgets::Clear, modal);
 
-    let mut lines: Vec<Line> = state.lines.iter().map(|l| Line::from(l.clone())).collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(ratatui::text::Span::styled(
-        "Press any key to close.",
-        theme::muted(),
-    )));
+    let lines: Vec<Line> = state.lines.iter().map(|l| Line::from(l.clone())).collect();
 
-    let block = theme::block("").title(ratatui::text::Span::styled(
-        format!(" {} ", state.title),
-        Style::default().fg(palette::TEXT).bold(),
-    ));
+    let block = theme::block("")
+        .title(ratatui::text::Span::styled(
+            format!(" {} ", state.title),
+            Style::default().fg(palette::TEXT).bold(),
+        ))
+        .title_bottom(ratatui::text::Line::from(ratatui::text::Span::styled(
+            " Press any key to close. ",
+            theme::muted(),
+        )));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)

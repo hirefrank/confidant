@@ -28,8 +28,10 @@ use crate::views::conflict::{self, ConflictAction, ConflictViewState};
 use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
+use crate::views::help;
 use crate::views::inbox::{self, InboxViewState};
 use crate::views::info::{self, InfoState};
+use crate::views::palette::{render as render_palette, PaletteState};
 use crate::views::people::{self, PeopleViewState};
 use crate::views::proposals::{
     self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
@@ -174,6 +176,11 @@ pub struct App<R: Runner> {
     pub scope: Option<Vec<String>>,
     /// `p` Scope / `?` Help modal; any key dismisses it.
     pub info_modal: Option<InfoState>,
+    /// The `:` / `Ctrl-P` command palette (#556 phase 5). While `Some`, the
+    /// palette owns the keyboard; `Enter` runs the highlighted entry through
+    /// the same function its key binding calls, so a write still previews
+    /// with `--dry-run` and waits for `y`.
+    pub palette: Option<PaletteState>,
     pub should_quit: bool,
     pub proposals: ProposalsTab,
     pub inbox: InboxViewState,
@@ -214,6 +221,7 @@ impl<R: Runner> App<R> {
             blocking_alert: None,
             scope: None,
             info_modal: None,
+            palette: None,
             should_quit: false,
             proposals: ProposalsTab::default(),
             inbox: InboxViewState::default(),
@@ -643,6 +651,24 @@ impl<R: Runner> App<R> {
             return;
         }
         let next = (self.people.selected as i32 + delta).clamp(0, total as i32 - 1) as usize;
+        self.select_people_row(next);
+    }
+
+    /// Select a row in the combined nudge + roster list and load the
+    /// person's context when the row is a person.
+    fn select_people_row(&mut self, next: usize) {
+        let nudge_count =
+            people::attention(self.check.report.as_ref(), self.people.roster.as_ref()).len();
+        let ids: Vec<String> =
+            people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+        let total = nudge_count + ids.len();
+        if total == 0 {
+            return;
+        }
+        let next = next.min(total - 1);
         self.people.selected = next;
         if next >= nudge_count {
             let id = ids[next - nudge_count].clone();
@@ -731,18 +757,26 @@ impl<R: Runner> App<R> {
 
     /// Run `confidant inbox --dry-run --json --no-input` and update the
     /// Inbox view state. Read-only: decrypts and plans, commits nothing.
-    pub fn load_inbox(&mut self) {
+    ///
+    /// Returns `false` when the dry run failed (runner error, CLI error,
+    /// invalid JSON, or a version mismatch); in that case any report already
+    /// on the state is left untouched, and the caller must not treat it as a
+    /// fresh preview. The palette's apply entry gates its confirm on this.
+    pub fn load_inbox(&mut self) -> bool {
         let raw = match self.runner.run(&["inbox", "--dry-run"]) {
             Ok(r) => r,
             Err(e) => {
                 self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
-                return;
+                return false;
             }
         };
         if let Some((_, report)) = self.apply_outcome::<InboxReport>(&raw) {
             self.inbox.report = Some(report);
             self.inbox.confirming = false;
             self.inbox.last_apply = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -1677,7 +1711,9 @@ impl<R: Runner> App<R> {
                     self.run_search(&q);
                 }
             }
-            ActiveView::Inbox => self.load_inbox(),
+            ActiveView::Inbox => {
+                self.load_inbox();
+            }
             ActiveView::Conflicts => self.load_conflicts(),
         }
     }
@@ -1890,11 +1926,7 @@ impl<R: Runner> App<R> {
     }
 
     fn switch_to(&mut self, view: ActiveView) {
-        self.active_view = view;
-        self.input_mode = InputMode::Normal;
-        self.search.editing = false;
-        self.people.editing_filter = false;
-        self.alert = None;
+        self.reset_for_navigation(view);
         match view {
             ActiveView::People => {
                 if !self.people.loaded {
@@ -1908,10 +1940,23 @@ impl<R: Runner> App<R> {
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
             ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
-            ActiveView::Inbox if self.inbox.report.is_none() => self.load_inbox(),
+            ActiveView::Inbox if self.inbox.report.is_none() => {
+                self.load_inbox();
+            }
             ActiveView::Conflicts if !self.conflict.loaded => self.load_conflicts(),
             _ => {}
         }
+    }
+
+    /// Move to `view` and leave any local text mode, without loading
+    /// anything. The caller owns the refresh (the palette's inbox apply
+    /// wants exactly one fresh dry run, not the lazy load plus another).
+    fn reset_for_navigation(&mut self, view: ActiveView) {
+        self.active_view = view;
+        self.input_mode = InputMode::Normal;
+        self.search.editing = false;
+        self.people.editing_filter = false;
+        self.alert = None;
     }
 
     /// Switch to a workspace, landing on its first view.
@@ -2068,30 +2113,140 @@ impl<R: Runner> App<R> {
     }
 
     fn open_help_modal(&mut self) {
-        let operator_line = if self.operator_mode {
-            format!("! operator mode is ON — {OPERATOR_MODE_BANNER}")
-        } else {
-            "! operator mode: show no-ai records (--for-operator)".to_owned()
+        self.info_modal = Some(InfoState::new("Help", help::lines(self.operator_mode)));
+    }
+
+    /// `:` or `Ctrl-P`: the command palette's opening keys. `:` is vim's
+    /// command line; `Ctrl-P` is the familiar launcher binding.
+    fn palette_open_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char(':'))
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')))
+    }
+
+    /// The palette is a browser-level launcher: it refuses to open while a
+    /// text field owns the keyboard or a write flow is waiting for an answer,
+    /// so it can never be used to jump out of a confirm modal.
+    fn palette_can_open(&self) -> bool {
+        self.input_mode == InputMode::Normal
+            && self.edit_flow.is_none()
+            && self.capture.is_none()
+            && !self.inbox.confirming
+            && self.conflict.confirming.is_none()
+            && self
+                .proposals
+                .opened
+                .as_ref()
+                .is_none_or(|flow| matches!(flow.phase, FlowPhase::Browsing))
+    }
+
+    fn open_palette(&mut self) {
+        self.palette = Some(PaletteState::new());
+    }
+
+    /// Handle a key while the palette is open. Returns true: the palette
+    /// owns the keyboard until it runs an entry or closes.
+    ///
+    /// `j`/`k` are *not* navigation here — they are ordinary query
+    /// characters, so a query like `j` still filters. Use the arrows or
+    /// `Ctrl-P`/`Ctrl-N`.
+    fn handle_palette_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.palette.as_mut() else {
+            return;
         };
-        self.info_modal = Some(InfoState::new(
-            "Help",
-            vec![
-                "1 People & Search    2 Review Queue    3 Check".to_owned(),
-                "/ filter people   f unified search   j/k move   Enter open".to_owned(),
-                "s session   t touch   n note (pre-fills the selected person)".to_owned(),
-                "Tab / Shift-Tab cycle the views inside a workspace".to_owned(),
-                "o Proposals   i Inbox   c Conflicts".to_owned(),
-                "d Doctor   p Scope   ? Help   r refresh   q quit".to_owned(),
-                operator_line,
-                "[ ] select the context item   e edit it (person, note, interaction)".to_owned(),
-                String::new(),
-                "People shows the roster and a live context pane; nudges come from".to_owned(),
-                "the cached check report. With operator mode on, the roster and".to_owned(),
-                "context include no-ai people and notes, each badged. The Review".to_owned(),
-                "Queue tab is badged with its pending count. Quick capture (s/t/n)".to_owned(),
-                "previews with --dry-run and writes only on an explicit y.".to_owned(),
-            ],
-        ));
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Enter => {
+                let chosen = state.selected_entry().map(|entry| entry.id);
+                self.palette = None;
+                if let Some(id) = chosen {
+                    self.run_palette_action(id);
+                }
+            }
+            KeyCode::Up => state.move_by(-1),
+            KeyCode::Down => state.move_by(1),
+            KeyCode::Backspace => state.backspace(),
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.move_by(-1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.move_by(1);
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                state.insert(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Run a palette entry through the same path as its key binding.
+    ///
+    /// Read-only entries switch views or open a modal. Write entries
+    /// (`capture.*`, `record.edit`, `inbox.apply`) only *start* the usual
+    /// flow: a `--dry-run` preview followed by an explicit `y`. Nothing here
+    /// writes on `Enter` alone. `record.edit` is refused outside People and
+    /// the Context view (where the operator can see the loaded context), and
+    /// `inbox.apply` opens its confirm only when the fresh dry run it just
+    /// issued succeeded, so `y` can never apply behind a stale preview.
+    fn run_palette_action(&mut self, id: &str) {
+        match id {
+            "workspace.people" => self.switch_workspace(Workspace::People),
+            "workspace.review" => self.switch_workspace(Workspace::Review),
+            "workspace.check" => self.switch_workspace(Workspace::Check),
+            "view.proposals" => self.switch_to(ActiveView::Proposals),
+            "view.inbox" => self.switch_to(ActiveView::Inbox),
+            "view.conflicts" => self.switch_to(ActiveView::Conflicts),
+            "view.doctor" => self.switch_to(ActiveView::Doctor),
+            "people.filter" => {
+                self.switch_workspace(Workspace::People);
+                self.enter_filter();
+            }
+            "search.query" => self.enter_search(),
+            "search.open" => self.switch_to(ActiveView::Search),
+            "capture.session" => self.begin_capture(CaptureKind::Session),
+            "capture.touch" => self.begin_capture(CaptureKind::Touch),
+            "capture.note" => self.begin_capture(CaptureKind::Note),
+            // `e` edits the loaded context pane, which only People and the
+            // full-screen Context view show. Refuse elsewhere rather than
+            // silently editing a context the operator cannot see.
+            "record.edit" => {
+                if matches!(self.active_view, ActiveView::People | ActiveView::Context) {
+                    self.begin_edit();
+                } else {
+                    self.alert = Some(AlertState {
+                        title: "Editing Needs the Context".to_owned(),
+                        code: Some("edit_needs_context".to_owned()),
+                        message: "editing the selected record or note works from People or the Context view"
+                            .to_owned(),
+                        fix: Some(
+                            "open the person (People, or Enter a p-… hit), then press e".to_owned(),
+                        ),
+                        blocking: false,
+                        raw: None,
+                    });
+                }
+            }
+            // Re-run the dry run first, then open the normal apply confirm —
+            // but only when that fresh dry run succeeded. If it failed, the
+            // loaded report is stale (e.g. the one primed at launch); opening
+            // the confirm on it would let `y` apply behind a preview the TUI
+            // just failed to refresh.
+            "inbox.apply" => {
+                self.reset_for_navigation(ActiveView::Inbox);
+                if self.load_inbox() {
+                    self.inbox_begin_apply();
+                }
+            }
+            "operator.toggle" => self.toggle_operator_mode(),
+            "scope" => self.open_scope_modal(),
+            "help" => self.open_help_modal(),
+            "refresh" => self.refresh_current(),
+            "quit" => self.should_quit = true,
+            _ => {}
+        }
     }
 
     /// Workspace bar, pills, and per-workspace shortcuts. Returns true when
@@ -2251,6 +2406,12 @@ impl<R: Runner> App<R> {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.proposals.selected = self.proposals.selected.saturating_sub(1);
             }
+            KeyCode::Char('g') => self.proposals.selected = 0,
+            KeyCode::Char('G') => {
+                if !self.proposals.entries.is_empty() {
+                    self.proposals.selected = self.proposals.entries.len() - 1;
+                }
+            }
             KeyCode::Enter => self.open_selected_proposal(),
             KeyCode::Char('a') => {
                 self.open_selected_proposal();
@@ -2357,6 +2518,16 @@ impl<R: Runner> App<R> {
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.conflict.selected = self.conflict.selected.saturating_sub(1);
+                    true
+                }
+                KeyCode::Char('g') => {
+                    self.conflict.selected = 0;
+                    true
+                }
+                KeyCode::Char('G') => {
+                    if !self.conflict.entries.is_empty() {
+                        self.conflict.selected = self.conflict.entries.len() - 1;
+                    }
                     true
                 }
                 KeyCode::Enter => {
@@ -2572,6 +2743,17 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        // The command palette owns the keyboard while open, and only opens at
+        // browse level: never out of a text field or a pending write confirm.
+        if self.palette.is_some() {
+            self.handle_palette_key(key);
+            return;
+        }
+        if Self::palette_open_key(key) && self.palette_can_open() {
+            self.open_palette();
+            return;
+        }
+
         // A version-skew alert keeps the raw clap output behind `x` (#591):
         // the alert itself shows the one-line fix, and the full text opens in
         // the dismissable info modal only when asked for.
@@ -2657,10 +2839,12 @@ impl<R: Runner> App<R> {
                     self.people.clamp(self.check.report.as_ref());
                 }
                 ActiveView::People => {
+                    // Esc is "back", and the People home is the top of the
+                    // stack: it does not quit (#556 phase 5, Silas's phase-1
+                    // nit). `q` is the explicit quit; an alert is dismissed
+                    // first so Esc keeps its dismiss meaning.
                     if self.alert.is_some() {
                         self.alert = None;
-                    } else {
-                        self.should_quit = true;
                     }
                 }
                 ActiveView::Search | ActiveView::Context => self.switch_to(ActiveView::People),
@@ -2710,6 +2894,13 @@ impl<R: Runner> App<R> {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_prev();
+            }
+            // Vim/lazygit ends: first/last row of the active list.
+            KeyCode::Char('g') => {
+                self.select_first();
+            }
+            KeyCode::Char('G') => {
+                self.select_last();
             }
             KeyCode::Enter => {
                 self.activate_selected();
@@ -2802,6 +2993,64 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// `g`: jump to the first row of the active list (the top of the context
+    /// pane when the full-screen Context view is open).
+    fn select_first(&mut self) {
+        self.select_edge(false);
+    }
+
+    /// `G`: jump to the last row of the active list.
+    fn select_last(&mut self) {
+        self.select_edge(true);
+    }
+
+    fn select_edge(&mut self, last: bool) {
+        match self.active_view {
+            ActiveView::People => {
+                let nudge_count =
+                    people::attention(self.check.report.as_ref(), self.people.roster.as_ref())
+                        .len();
+                let people =
+                    people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                        .len();
+                let total = nudge_count + people;
+                if total > 0 {
+                    self.select_people_row(if last { total - 1 } else { 0 });
+                }
+            }
+            ActiveView::Check => {
+                if let Some(report) = &self.check.report {
+                    if !report.findings.is_empty() {
+                        self.check.selected = if last { report.findings.len() - 1 } else { 0 };
+                    }
+                }
+            }
+            ActiveView::Context => {
+                if !last {
+                    self.context.scroll = 0;
+                }
+            }
+            ActiveView::Doctor => {
+                if let Some(report) = &self.doctor.report {
+                    if !report.checks.is_empty() {
+                        self.doctor.selected = if last { report.checks.len() - 1 } else { 0 };
+                    }
+                }
+            }
+            ActiveView::Search => {
+                if let Some(result) = &self.search.result {
+                    if !result.kept.is_empty() {
+                        self.search.selected = if last { result.kept.len() - 1 } else { 0 };
+                    }
+                }
+            }
+            // The proposals and conflicts tabs handle `g`/`G` in their own
+            // list handlers (they own Enter/selection); Inbox has no row
+            // selection.
+            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
+        }
+    }
+
     fn activate_selected(&mut self) {
         if self.active_view == ActiveView::People {
             self.activate_people_selection();
@@ -2878,9 +3127,12 @@ impl<R: Runner> App<R> {
             }
         }
 
-        Self::render_footer(self.operator_mode, frame, chunks[2]);
+        self.render_footer(frame, chunks[2]);
         if let Some(modal) = &self.info_modal {
             info::render(modal, frame, area);
+        }
+        if let Some(palette_state) = &self.palette {
+            render_palette(palette_state, frame, area);
         }
         if let Some(flow) = &self.edit_flow {
             if flow.phase == EditPhase::Confirm {
@@ -2985,31 +3237,120 @@ impl<R: Runner> App<R> {
 
     /// Borderless one-line footer with key badges and action labels. In
     /// operator mode the mode banner leads the line (persistent, not a
-    /// toast), so hidden data on screen is unmistakable on a screen share.
-    fn render_footer(operator_mode: bool, frame: &mut Frame<'_>, area: Rect) {
+    /// toast), so hidden data on screen is unmistakable on a screen share;
+    /// the banner is long, so only the keys that turn it off or get help
+    /// follow it. Otherwise the hints are context-aware for the active view,
+    /// and always advertise the operator toggle, context-item selection, and
+    /// the command palette (#556 phase 5).
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
-        if operator_mode {
+        let keys: Vec<(&'static str, &'static str)> = if self.operator_mode {
             spans.push(Span::styled(
                 OPERATOR_MODE_BANNER,
                 Style::default().fg(palette::ERROR).bold(),
             ));
             spans.push(Span::raw("  "));
-        }
-        for (key, label) in [
-            ("1-3", "ws"),
-            ("Tab", "view"),
-            ("/", "filter"),
-            ("f", "search"),
-            ("j/k", "move"),
-            ("Enter", "open"),
-            ("r", "refresh"),
-            ("?", "help"),
-            ("q", "quit"),
-        ] {
+            vec![("!", "op off"), ("?", "help"), ("q", "quit")]
+        } else {
+            self.footer_keys()
+        };
+        for (key, label) in keys {
             spans.push(theme::key_badge(key));
             spans.push(theme::key_hint(label));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// The footer hint set for the current view. Kept short enough for a
+    /// 100-column terminal; the full reference lives behind `?`.
+    fn footer_keys(&self) -> Vec<(&'static str, &'static str)> {
+        match self.active_view {
+            ActiveView::People => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "move"),
+                ("/", "filter"),
+                ("[ ]", "item"),
+                ("!", "op"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Context => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "scroll"),
+                ("[ ]", "item"),
+                ("e", "edit"),
+                ("!", "op"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Search => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("/", "query"),
+                ("e", "exact"),
+                ("j/k", "move"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Proposals => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "move"),
+                ("Enter", "open"),
+                ("a", "apply"),
+                ("r", "reload"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Inbox => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("a", "apply"),
+                ("r", "reload"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Conflicts => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "move"),
+                ("Enter", "open"),
+                ("o/t", "take"),
+                ("m", "merge"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Check => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "move"),
+                ("g/G", "ends"),
+                ("d", "doctor"),
+                ("r", "refresh"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            ActiveView::Doctor => vec![
+                ("1-3", "ws"),
+                ("Tab", "view"),
+                ("j/k", "move"),
+                ("g/G", "ends"),
+                ("d", "check"),
+                ("r", "refresh"),
+                (":", "palette"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+        }
     }
 
     /// Render the inbox tab: dry-run report, or the apply confirm modal.

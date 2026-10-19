@@ -21,4 +21,4 @@ vault  /tmp/v   scope  not resolved yet   doctor  not run
 │ location  people/p-01M3TC5H00MPJG000000000000.cfd:3  via qmd  score 0.9123                       │
 │ excerpt   Ada Example                                                                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- 1-3  ws  Tab  view  /  filter  f  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit
+ 1-3  ws  Tab  view  /  query  e  exact  j/k  move  :  palette  ?  help  q  quit
