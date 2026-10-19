@@ -1752,7 +1752,7 @@ impl<R: Runner> App<R> {
                 .map(|f| f.manifest_path.clone());
             match path.map(|p| ApplyFlow::open(&p, &root)) {
                 Some(Ok(flow)) => self.proposals.opened = Some(flow),
-                _ => self.proposals.opened = None,
+                _ => self.close_opened_proposal(),
             }
         }
     }
@@ -1831,6 +1831,9 @@ impl<R: Runner> App<R> {
             return;
         }
         let path = root.join(".confidant").join("proposals").join(&entry.name);
+        // Defensive: if a flow was already open, sweep its staged reviewed
+        // bytes before it is replaced (#618).
+        self.close_opened_proposal();
         match ApplyFlow::open(&path, &root) {
             Ok(flow) => self.proposals.opened = Some(flow),
             Err(e) => {
@@ -2549,7 +2552,7 @@ impl<R: Runner> App<R> {
         let Some(phase) = phase else { return };
         match phase {
             FlowPhase::Browsing => match key.code {
-                KeyCode::Esc => self.proposals.opened = None,
+                KeyCode::Esc => self.close_opened_proposal(),
                 KeyCode::Char('a') => self.proposals_start_apply(),
                 KeyCode::Char('q') => self.should_quit = true,
                 _ => {}
@@ -2561,8 +2564,9 @@ impl<R: Runner> App<R> {
                     }
                 }
                 KeyCode::Esc => {
+                    // Cancel the review: drop the staged reviewed bytes (#618).
                     if let Some(flow) = self.proposals.opened.as_mut() {
-                        flow.phase = FlowPhase::Browsing;
+                        flow.cancel_step(step);
                     }
                 }
                 KeyCode::Char('q') => self.should_quit = true,
@@ -2580,10 +2584,11 @@ impl<R: Runner> App<R> {
                     }
                 }
             },
-            FlowPhase::StepFailed { .. } => match key.code {
+            FlowPhase::StepFailed { step, .. } => match key.code {
                 KeyCode::Esc => {
+                    // The step must be re-reviewed; drop its staged bytes (#618).
                     if let Some(flow) = self.proposals.opened.as_mut() {
-                        flow.phase = FlowPhase::Browsing;
+                        flow.cancel_step(step);
                     }
                 }
                 KeyCode::Char('r') => self.proposals_start_apply(),
@@ -2632,13 +2637,13 @@ impl<R: Runner> App<R> {
                     }
                 }
                 _ => {
-                    self.proposals.opened = None;
+                    self.close_opened_proposal();
                 }
             },
             // Terminal phases are exited immediately by the action that
             // produced them; any stray key just closes the detail.
             FlowPhase::Finished | FlowPhase::CheckFailed | FlowPhase::CleanupExportInput { .. } => {
-                self.proposals.opened = None;
+                self.close_opened_proposal();
             }
         }
     }
@@ -2688,6 +2693,14 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Close the opened proposal, dropping any staged reviewed bytes first
+    /// (#618: `Esc`/terminal phases must not leave plaintext scratch behind).
+    fn close_opened_proposal(&mut self) {
+        if let Some(mut flow) = self.proposals.opened.take() {
+            flow.sweep_all_staged_sources();
+        }
+    }
+
     /// Run cleanup (delete the proposal set) for the open proposal.
     fn proposals_run_cleanup(&mut self, export: Option<&str>) {
         let result = {
@@ -2704,7 +2717,7 @@ impl<R: Runner> App<R> {
                     .as_ref()
                     .is_some_and(|f| f.phase == FlowPhase::Finished);
                 if finished {
-                    self.proposals.opened = None;
+                    self.close_opened_proposal();
                     self.load_proposals();
                 }
             }

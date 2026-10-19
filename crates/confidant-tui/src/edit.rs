@@ -204,7 +204,7 @@ pub fn read_scratch(path: &Path) -> Result<String> {
 /// `Zeroizing`). It only keeps the plaintext from lingering in the directory,
 /// and cleanup never masks the result it is cleaning up after.
 pub fn remove_scratch(path: &Path) {
-    best_effort_zero_and_remove(path);
+    zero_and_remove(path);
     if let Some(dir) = path.parent() {
         let _ = std::fs::remove_dir(dir);
         if let Some(parent) = dir.parent() {
@@ -244,7 +244,11 @@ pub fn sweep_stale_edit_scratch(vault_root: &Path) {
 
 /// Overwrite the file's current bytes with zeros, then unlink it. Best-effort:
 /// a failure to overwrite still falls through to the unlink.
-fn best_effort_zero_and_remove(path: &Path) {
+///
+/// Shared with the proposal apply engine's staged reviewed-source sweep
+/// (`apply::remove_staged_source`, #618); both are hygiene, not secure
+/// deletion.
+pub(crate) fn zero_and_remove(path: &Path) {
     use std::io::Write;
     if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {

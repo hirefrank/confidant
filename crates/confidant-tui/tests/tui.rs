@@ -758,6 +758,75 @@ fn proposals_cancel_confirm_writes_nothing() {
 }
 
 #[test]
+fn proposals_cancel_sweeps_the_staged_source() {
+    // #618: the reviewed lines are staged under the manifest stem and the
+    // CLI is handed the scratch, never the shared `.cfd`. Esc cancels the
+    // review and sweeps the scratch, so no plaintext lingers.
+    let dir = proposals_temp_dir("tui-test-proposals-staged-cancel");
+    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+
+    let fake = FakeRunner::new().with_response("import", 0, dry_run_import_json());
+    let mut app = open_proposals_app(&dir, fake);
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('a')));
+
+    let proposals = dir.join(".confidant").join("proposals");
+    let lines = proposals.join("portal-20261015T000000Z.cfd");
+    let staged = proposals
+        .join("portal-20261015T000000Z")
+        .join("staged")
+        .join("ledger.cfd");
+    assert!(staged.exists(), "the reviewed lines are staged for the CLI");
+    let dry = app
+        .runner
+        .recorded_calls()
+        .into_iter()
+        .find(|c| c.iter().any(|a| a == "--dry-run"))
+        .expect("dry-run call");
+    let file_arg = dry
+        .iter()
+        .position(|a| a == "--file")
+        .map(|i| dry[i + 1].clone())
+        .expect("--file");
+    assert_eq!(file_arg, staged.display().to_string());
+    assert!(
+        !dry.iter().any(|a| a == &lines.display().to_string()),
+        "the shared lines_file is never handed to the CLI: {dry:?}"
+    );
+
+    // Esc cancels the review: back to browsing, scratch gone, nothing written.
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(
+        app.proposals.opened.as_ref().map(|f| f.phase.clone()),
+        Some(FlowPhase::Browsing)
+    );
+    assert!(!staged.exists(), "cancel sweeps the staged reviewed bytes");
+    assert!(
+        !staged.parent().unwrap().exists(),
+        "the staged dir is pruned once empty"
+    );
+    assert!(app
+        .runner
+        .recorded_calls()
+        .iter()
+        .all(|c| c.iter().any(|a| a == "--dry-run")));
+
+    // Reviewing again re-stages; Esc from browsing closes the proposal and
+    // leaves nothing behind either.
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(staged.exists(), "the second review re-stages the lines");
+    app.handle_key(key(KeyCode::Esc)); // cancel back to browsing
+    assert!(!staged.exists());
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(staged.exists());
+    app.handle_key(key(KeyCode::Esc)); // cancel
+    app.handle_key(key(KeyCode::Esc)); // close the proposal
+    assert!(app.proposals.opened.is_none(), "the proposal is closed");
+    assert!(!staged.exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn proposals_apply_uses_manifest_ids_and_resumes_after_crash() {
     let dir = proposals_temp_dir("tui-test-proposals-resume");
     let note_rid = "01M3TC5H00MPJG0066D000000C".to_owned();
@@ -867,6 +936,19 @@ fn proposals_check_blocked_renders_report_and_marks_nothing_done() {
     // The step is not marked done.
     let progress = read_progress(&manifest_path);
     assert!(!progress.is_done("ledger"));
+    // #618: a check-blocked write keeps the staged reviewed bytes so the
+    // operator can retry after fixing the findings; they are not committed
+    // content, just the reviewed copy.
+    let staged = dir
+        .join(".confidant")
+        .join("proposals")
+        .join("portal-20261015T000000Z")
+        .join("staged")
+        .join("ledger.cfd");
+    assert!(
+        staged.exists(),
+        "a check-blocked step keeps its staged copy for the retry"
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 
