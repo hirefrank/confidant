@@ -86,16 +86,22 @@ fn python3() -> String {
 }
 
 fn render_to_string<R: Runner>(app: &App<R>) -> String {
-    let backend = TestBackend::new(WIDTH, HEIGHT);
+    render_to_string_at(app, WIDTH, HEIGHT)
+}
+
+/// Render at an explicit size: a wider buffer keeps a long context identity
+/// line (id + name + no-ai badge) on one line for a substring assertion.
+fn render_to_string_at<R: Runner>(app: &App<R>, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
     terminal
         .draw(|frame| app.render(frame))
         .expect("draw frame");
     let buffer = terminal.backend().buffer();
-    let mut lines = Vec::with_capacity(HEIGHT as usize);
-    for y in 0..HEIGHT {
+    let mut lines = Vec::with_capacity(height as usize);
+    for y in 0..height {
         let mut row = String::new();
-        for x in 0..WIDTH {
+        for x in 0..width {
             row.push_str(buffer[(x, y)].symbol());
         }
         lines.push(row.trim_end().to_owned());
@@ -2319,4 +2325,833 @@ fn pending_apply_confirm_is_not_escaped_by_workspace_shortcuts() {
     app.handle_key(key(KeyCode::Char('1')));
     assert_eq!(app.active_view, ActiveView::People);
     fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Operator mode and record/note editing (TUI-v2 phase 2, #556)
+// ---------------------------------------------------------------------------
+
+use confidant_tui::app::OPERATOR_MODE_BANNER;
+use confidant_tui::edit::{scratch_path, EditPhase};
+
+const CAM: &str = "p-01M3TC5H00MPJG001248000002";
+const NIA: &str = "p-01M3TC5H00MPJG000H24000002";
+const NOTE: &str = "n-01M3TC5H00MPJG002NAM000005";
+const IXN: &str = "i-01M3TC5H00MPJG0048H0000008";
+
+const RECORD_TEXT: &str =
+    "---\nid: ADA\ntype: person\nname: Ada Example\n---\n\nfake profile body\n";
+const EDITED_TEXT: &str =
+    "---\nid: ADA\ntype: person\nname: Ada Example\n---\n\nedited fake profile body\n";
+const NOTE_TEXT: &str =
+    "---\nid: NOTE\ntype: note\nperson: ADA\ndate: 2026-10-01\n---\n\nfake note body\n";
+
+/// Serializes `$VISUAL`/`$EDITOR` manipulation: the env is process-wide, so
+/// two edit tests changing it at once would race.
+static EDIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Set (or clear) the operator editor for the lifetime of the guard, holding
+/// the env lock so only one edit test is env-sensitive at a time.
+struct EditorEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    visual: Option<std::ffi::OsString>,
+    editor: Option<std::ffi::OsString>,
+}
+
+impl EditorEnv {
+    fn set(editor: Option<&str>) -> Self {
+        let lock = EDIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let visual = std::env::var_os("VISUAL");
+        let editor_old = std::env::var_os("EDITOR");
+        match editor {
+            Some(value) => {
+                std::env::set_var("VISUAL", value);
+                std::env::set_var("EDITOR", value);
+            }
+            None => {
+                std::env::remove_var("VISUAL");
+                std::env::remove_var("EDITOR");
+            }
+        }
+        Self {
+            _lock: lock,
+            visual,
+            editor: editor_old,
+        }
+    }
+}
+
+impl Drop for EditorEnv {
+    fn drop(&mut self) {
+        match &self.visual {
+            Some(value) => std::env::set_var("VISUAL", value),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match &self.editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+    }
+}
+
+/// Roster the operator path returns: a `no-ai: true` person and a
+/// `no-ai: notes` person alongside the cleared one.
+fn operator_roster_json() -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "kind": "person",
+        "for_operator": true,
+        "records": [
+            {"id": ADA, "name": "Ada Example", "no_ai": "false", "kind": "person"},
+            {"id": CAM, "name": "Cam Sample", "no_ai": "true", "kind": "person"},
+            {"id": NIA, "name": "Nia Notes", "no_ai": "notes", "kind": "person"}
+        ],
+        "scope": ["coaching@0.1"],
+        "skipped_encrypted": 0,
+        "refused_envelopes": 0
+    })
+    .to_string()
+}
+
+/// Operator context bundle with the tri-state `no_ai` on the person and the
+/// note.
+fn operator_context_json(person_mode: &str, note_mode: &str) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "for_operator": true,
+        "person": {"id": ADA, "name": "Ada Example", "no_ai": person_mode,
+                   "profile": "Fake operator-only client."},
+        "notes": [
+            {"id": NOTE, "date": "2026-10-01", "body": "Fake operator-only note.",
+             "no_ai": note_mode}
+        ],
+        "interactions": [],
+        "touchpoints": [],
+        "packs": {},
+        "aliases": [],
+        "skipped_encrypted": 0,
+        "refused_envelopes": 0,
+        "scope": ["coaching@0.1"]
+    })
+    .to_string()
+}
+
+/// The first rendered line containing `needle`, or an empty string.
+fn line_with<'a>(rendered: &'a str, needle: &str) -> &'a str {
+    rendered
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or("")
+}
+
+#[test]
+fn operator_mode_off_sends_no_flag_and_hides_no_ai() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+
+    assert!(!app.operator_mode, "operator mode is off by default");
+    let rendered = render_to_string(&app);
+    assert!(!rendered.contains(OPERATOR_MODE_BANNER), "{rendered}");
+    assert!(!rendered.contains("[no-ai]"), "{rendered}");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.iter().any(|arg| arg == "--for-operator")),
+        "the default path never passes --for-operator: {calls:?}"
+    );
+}
+
+#[test]
+fn operator_mode_toggle_reloads_with_flag_and_badges_no_ai() {
+    let fake = FakeRunner::new();
+    // Boot (flag off).
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, people_roster_json());
+    fake.push_response(
+        0,
+        people_context_json(ADA, "Ada Example", "Fake coaching client."),
+    );
+    // Toggle: check, roster, context all reload through the operator path.
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, operator_roster_json());
+    fake.push_response(0, operator_context_json("notes", "true"));
+
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    let before = render_to_string(&app);
+    assert!(!before.contains("Cam Sample"), "{before}");
+    assert!(!before.contains("Nia Notes"), "{before}");
+
+    app.handle_key(key(KeyCode::Char('!')));
+    assert!(app.operator_mode);
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls.iter().any(|call| call
+            == &vec![
+                "record".to_owned(),
+                "list".to_owned(),
+                "--kind".to_owned(),
+                "person".to_owned(),
+                "--for-operator".to_owned(),
+            ]),
+        "roster reloaded with --for-operator: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| call
+            == &vec![
+                "context".to_owned(),
+                "--for-operator".to_owned(),
+                "--".to_owned(),
+                ADA.to_owned(),
+            ]),
+        "context reloaded with --for-operator: {calls:?}"
+    );
+
+    let after = render_to_string(&app);
+    // The CLI's banner is on screen, persistently (it is drawn every frame).
+    assert!(after.contains(OPERATOR_MODE_BANNER), "{after}");
+    // The no-ai people and the notes-mode person are listed, badged.
+    assert!(after.contains("Cam Sample"), "{after}");
+    assert!(after.contains("[no-ai]"), "{after}");
+    assert!(after.contains("Nia Notes"), "{after}");
+    assert!(after.contains("[no-ai: notes]"), "{after}");
+    // The context pane badges the person and the inherited note. Full-screen
+    // Context (and a wider buffer) keeps the identity line on one row.
+    app.active_view = ActiveView::Context;
+    let context_screen = render_to_string_at(&app, 160, HEIGHT);
+    assert!(
+        line_with(&context_screen, ADA).contains("[no-ai: notes]"),
+        "{context_screen}"
+    );
+    assert!(
+        line_with(&context_screen, NOTE).contains("[no-ai]"),
+        "{context_screen}"
+    );
+}
+
+#[test]
+fn operator_mode_off_fails_closed_when_context_reload_fails() {
+    let fake = FakeRunner::new();
+    // Boot in operator mode: a hidden note is on screen.
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, operator_roster_json());
+    fake.push_response(0, operator_context_json("true", "true"));
+    // Toggle off: the agent check and roster succeed, the context read fails.
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, people_roster_json());
+    fake.push_response(1, check_cli_error_json());
+
+    let mut app = App::new(fake);
+    app.operator_mode = true;
+    app.load_check();
+    app.load_roster();
+    let before = render_to_string(&app);
+    assert!(before.contains(OPERATOR_MODE_BANNER), "{before}");
+    assert!(before.contains("Fake operator-only note."), "{before}");
+
+    app.handle_key(key(KeyCode::Char('!')));
+    assert!(!app.operator_mode);
+
+    // Fail closed: the operator bundle was dropped *before* the failed reload,
+    // so a stale `no-ai` note cannot render without the banner.
+    assert!(
+        app.context.context.is_none(),
+        "stale operator context survived the failed reload"
+    );
+    let after = render_to_string(&app);
+    assert!(!after.contains(OPERATOR_MODE_BANNER), "{after}");
+    assert!(!after.contains("Fake operator-only note."), "{after}");
+
+    // Even once the failure alert is dismissed, the pane stays empty.
+    app.handle_key(key(KeyCode::Esc));
+    let dismissed = render_to_string(&app);
+    assert!(
+        !dismissed.contains("Fake operator-only note."),
+        "{dismissed}"
+    );
+    assert!(!dismissed.contains(OPERATOR_MODE_BANNER), "{dismissed}");
+    assert!(dismissed.contains("No context loaded"), "{dismissed}");
+}
+
+#[test]
+fn operator_mode_off_fails_closed_when_roster_reload_fails() {
+    let fake = FakeRunner::new();
+    // Boot in operator mode: the `no-ai` people are listed.
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, operator_roster_json());
+    fake.push_response(0, operator_context_json("true", "true"));
+    // Toggle off: the roster read fails; the context read succeeds, which
+    // clears the alert so the panes actually render.
+    fake.push_response(0, people_check_json());
+    fake.push_response(1, check_cli_error_json());
+    fake.push_response(
+        0,
+        people_context_json(ADA, "Ada Example", "Fake coaching client."),
+    );
+
+    let mut app = App::new(fake);
+    app.operator_mode = true;
+    app.load_check();
+    app.load_roster();
+    assert!(render_to_string(&app).contains("Cam Sample"));
+
+    app.handle_key(key(KeyCode::Char('!')));
+    assert!(!app.operator_mode);
+
+    // The operator roster was dropped before the reload failed, so the No-ai
+    // people cannot reappear (e.g. after the alert is dismissed).
+    assert!(
+        app.people.roster.is_none(),
+        "operator roster survived the failed reload"
+    );
+    let after = render_to_string(&app);
+    assert!(!after.contains(OPERATOR_MODE_BANNER), "{after}");
+    assert!(!after.contains("Cam Sample"), "{after}");
+    assert!(!after.contains("[no-ai]"), "{after}");
+    assert!(after.contains("People (0)"), "{after}");
+
+    app.handle_key(key(KeyCode::Esc));
+    let dismissed = render_to_string(&app);
+    assert!(!dismissed.contains("Cam Sample"), "{dismissed}");
+    assert!(!dismissed.contains("[no-ai]"), "{dismissed}");
+}
+
+#[test]
+fn context_edit_target_moves_person_notes_interactions() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+
+    let ctx = app.context.context.as_ref().expect("context loaded");
+    let targets = confidant_tui::views::context::edit_targets(ctx);
+    assert_eq!(targets.len(), 3, "person + one note + one interaction");
+    assert_eq!(targets[0].id, ADA);
+    assert_eq!(targets[1].id, NOTE);
+    assert_eq!(targets[2].id, IXN);
+
+    // The person is the default target, marked with the ▶ cursor.
+    assert_eq!(app.context.edit_index, 0);
+    let person = render_to_string(&app);
+    assert!(line_with(&person, ADA).contains('▶'), "{person}");
+    assert!(!line_with(&person, NOTE).contains('▶'), "{person}");
+
+    // `]` moves to the note, then the interaction, then wraps to the person.
+    app.handle_key(key(KeyCode::Char(']')));
+    assert_eq!(app.context.edit_index, 1);
+    let note = render_to_string(&app);
+    assert!(line_with(&note, NOTE).contains('▶'), "{note}");
+    assert!(!line_with(&note, ADA).contains('▶'), "{note}");
+
+    app.handle_key(key(KeyCode::Char(']')));
+    assert_eq!(app.context.edit_index, 2);
+    assert!(line_with(&render_to_string(&app), IXN).contains('▶'));
+
+    app.handle_key(key(KeyCode::Char(']')));
+    assert_eq!(app.context.edit_index, 0, "wraps past the last target");
+    app.handle_key(key(KeyCode::Char('[')));
+    assert_eq!(app.context.edit_index, 2, "wraps back past the first");
+}
+
+/// App with the operator-edit responses registered by exact argv, a real temp
+/// vault root for the scratch, and `git check-ignore` answering "ignored".
+fn edit_app(root: &Path) -> App<FakeRunner> {
+    let runner = FakeRunner::new()
+        .with_argv_response(&["check"], 0, people_check_json())
+        .with_argv_response(
+            &["record", "list", "--kind", "person"],
+            0,
+            people_roster_json(),
+        )
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        )
+        .with_argv_response(
+            &["record", "show", ADA, "--for-edit"],
+            0,
+            edit_source_json(ADA, "person", RECORD_TEXT),
+        )
+        .with_argv_response(
+            &["record", "edit", ADA, "--file"],
+            0,
+            edit_applied_json("record-edit", ADA),
+        )
+        .with_argv_response(
+            &["note", "show", NOTE, "--for-edit"],
+            0,
+            edit_source_json(NOTE, "note", NOTE_TEXT),
+        )
+        .with_argv_response(
+            &["note", "edit", NOTE, "--file"],
+            0,
+            edit_applied_json("note-edit", NOTE),
+        );
+    // rev-parse: a git repo; check-ignore: `.confidant/` is ignored.
+    runner.push_program_response("git", 0, "");
+    runner.push_program_response("git", 0, "");
+    let mut app = App::new(runner);
+    app.set_vault_root(root.to_path_buf());
+    app.load_check();
+    app.load_roster();
+    app
+}
+
+fn edit_source_json(id: &str, kind: &str, text: &str) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "id": id,
+        "type": kind,
+        "path": format!("people/{id}/profile.md"),
+        "no_ai": false,
+        "for_edit": true,
+        "text": text
+    })
+    .to_string()
+}
+
+fn edit_applied_json(command: &str, id: &str) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "command": command,
+        "commit": "abcdef1234567890",
+        "files": ["people/x"],
+        "id": id,
+        "path": "people/x"
+    })
+    .to_string()
+}
+
+/// Begin an edit and drive the fake editor through one round trip.
+fn run_editor_round_trip(app: &mut App<FakeRunner>, edited: Option<&str>) -> PathBuf {
+    let scratch = app
+        .edit_flow
+        .as_ref()
+        .expect("flow started")
+        .scratch
+        .clone();
+    let cmd = app.take_suspended_command().expect("editor queued");
+    assert_eq!(cmd.program.as_deref(), Some("fake-editor"));
+    assert_eq!(cmd.args, vec![scratch.display().to_string()]);
+    assert_eq!(app.run_suspended_command(&cmd).unwrap(), 0);
+    if let Some(text) = edited {
+        fs::write(&scratch, text).expect("simulate the editor's write");
+    }
+    app.after_suspended_command(Ok(0));
+    scratch
+}
+
+#[test]
+fn edit_record_stages_scratch_then_cancel_writes_nothing() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    app.handle_key(key(KeyCode::Char('e')));
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &vec!["record", "show", ADA, "--for-edit"]),
+        "the operator read prepares the edit: {calls:?}"
+    );
+    let scratch = scratch_path(dir.path(), ADA).expect("scratch path");
+    assert_eq!(
+        fs::read_to_string(&scratch).unwrap(),
+        RECORD_TEXT,
+        "scratch holds the fetched text"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&scratch).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "scratch is 0600");
+    }
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--file")),
+        "nothing is written before the editor: {calls:?}"
+    );
+
+    let scratch = run_editor_round_trip(&mut app, Some(EDITED_TEXT));
+    let flow = app.edit_flow.as_ref().expect("awaiting confirm");
+    assert_eq!(flow.phase, EditPhase::Confirm);
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("Confirm: Apply record edit"),
+        "{rendered}"
+    );
+    // Plaintext is never rendered in the modal.
+    assert!(!rendered.contains("fake profile body"), "{rendered}");
+
+    // Any key other than `y` cancels: no write, scratch removed.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.edit_flow.is_none(), "modal closed");
+    assert!(!scratch.exists(), "scratch removed on cancel");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--file")),
+        "cancel writes nothing: {calls:?}"
+    );
+}
+
+#[test]
+fn edit_record_confirm_writes_once_and_reloads() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    app.handle_key(key(KeyCode::Char('e')));
+    let scratch = run_editor_round_trip(&mut app, Some(EDITED_TEXT));
+    app.handle_key(key(KeyCode::Char('y')));
+
+    assert!(app.edit_flow.is_none(), "flow finished");
+    assert!(!scratch.exists(), "scratch removed after the write");
+    let calls = app.runner.recorded_calls();
+    let edit_call = calls
+        .iter()
+        .find(|call| {
+            call.first().map(String::as_str) == Some("record")
+                && call.get(1).map(String::as_str) == Some("edit")
+        })
+        .expect("record edit issued");
+    assert_eq!(
+        edit_call,
+        &vec![
+            "record".to_owned(),
+            "edit".to_owned(),
+            ADA.to_owned(),
+            "--file".to_owned(),
+            scratch.display().to_string(),
+        ]
+    );
+    // The views reloaded after the write.
+    assert!(
+        calls
+            .iter()
+            .filter(|call| **call == vec!["context".to_owned(), "--".to_owned(), ADA.to_owned()])
+            .count()
+            >= 2,
+        "context reloaded after the edit: {calls:?}"
+    );
+    let alert = app.alert.as_ref().expect("result alert");
+    assert_eq!(alert.title, "Edit Committed");
+    assert!(alert.message.contains("abcdef12"), "{}", alert.message);
+}
+
+#[test]
+fn edit_no_op_does_not_call_the_cli_and_removes_scratch() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    app.handle_key(key(KeyCode::Char('e')));
+    // The editor changes nothing.
+    let scratch = run_editor_round_trip(&mut app, None);
+
+    assert!(app.edit_flow.is_none(), "no confirm for a no-op");
+    assert!(!scratch.exists(), "scratch removed");
+    let alert = app.alert.as_ref().expect("no-op alert");
+    assert_eq!(alert.title, "No Changes");
+    assert_eq!(alert.code.as_deref(), Some("unchanged"));
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.get(1).map(String::as_str) == Some("edit")),
+        "a no-op never reaches `record edit`: {calls:?}"
+    );
+}
+
+#[test]
+fn edit_note_uses_note_show_and_note_edit() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    // Target 0 is the person; `]` selects the note.
+    app.handle_key(key(KeyCode::Char(']')));
+    assert_eq!(app.context.edit_index, 1);
+
+    app.handle_key(key(KeyCode::Char('e')));
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &vec!["note", "show", NOTE, "--for-edit"]),
+        "the note read is used for notes: {calls:?}"
+    );
+    let scratch = run_editor_round_trip(&mut app, Some(EDITED_TEXT));
+    assert_eq!(scratch, scratch_path(dir.path(), NOTE).unwrap());
+
+    app.handle_key(key(KeyCode::Char('y')));
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls.iter().any(|call| {
+            call.first().map(String::as_str) == Some("note")
+                && call.get(1).map(String::as_str) == Some("edit")
+                && call.contains(&"--file".to_owned())
+        }),
+        "the note write uses `note edit --file`: {calls:?}"
+    );
+    assert!(!scratch.exists(), "scratch removed");
+}
+
+#[test]
+fn edit_refused_when_scratch_is_not_gitignored() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let runner = FakeRunner::new()
+        .with_argv_response(&["check"], 0, people_check_json())
+        .with_argv_response(
+            &["record", "list", "--kind", "person"],
+            0,
+            people_roster_json(),
+        )
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        );
+    runner.push_program_response("git", 0, ""); // rev-parse: a git repo
+    runner.push_program_response("git", 1, ""); // check-ignore: NOT ignored
+    let mut app = App::new(runner);
+    app.set_vault_root(dir.path().to_path_buf());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('e')));
+
+    let alert = app.alert.as_ref().expect("refused");
+    assert_eq!(alert.code.as_deref(), Some("scratch_not_ignored"));
+    assert!(app.edit_flow.is_none(), "no flow started");
+    assert!(app.suspended.is_none(), "no editor queued");
+    assert!(
+        !scratch_path(dir.path(), ADA).unwrap().exists(),
+        "no plaintext scratch when the gitignore gate fails"
+    );
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--for-edit")),
+        "the operator read is not even run when refused: {calls:?}"
+    );
+}
+
+#[test]
+fn edit_without_editor_fails_fast_before_scratch() {
+    let _env = EditorEnv::set(None);
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    app.handle_key(key(KeyCode::Char('e')));
+
+    let alert = app.alert.as_ref().expect("alert");
+    assert_eq!(alert.code.as_deref(), Some("no_editor"));
+    assert!(app.edit_flow.is_none());
+    assert!(
+        !scratch_path(dir.path(), ADA).unwrap().exists(),
+        "no scratch exists without an editor"
+    );
+}
+
+#[test]
+fn pending_edit_confirm_is_not_escaped_by_workspace_shortcuts() {
+    let _env = EditorEnv::set(Some("fake-editor"));
+    let dir = tempfile::tempdir().expect("temp vault");
+    let mut app = edit_app(dir.path());
+
+    app.handle_key(key(KeyCode::Char('e')));
+    run_editor_round_trip(&mut app, Some(EDITED_TEXT));
+    assert!(app.edit_flow.is_some(), "confirm is armed");
+
+    // `2` must not escape to the Review workspace while a write is pending;
+    // the modal treats it as a cancel, so nothing is written.
+    app.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(app.active_view, ActiveView::People, "no workspace escape");
+    assert!(
+        app.edit_flow.is_none(),
+        "confirm disarmed, not left pending"
+    );
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--file")),
+        "cancelled edit writes nothing: {calls:?}"
+    );
+}
+
+#[test]
+fn live_operator_roster_and_context_include_no_ai_person() {
+    // The real CLI with `--for-operator` against the demo vault: Cam Sample
+    // is `no-ai: true` and must appear (and be editable) only on the
+    // operator path.
+    let runner =
+        ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    let agent_names: Vec<String> = app
+        .people
+        .roster
+        .as_ref()
+        .unwrap()
+        .records
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    assert!(!agent_names.iter().any(|n| n == "Cam Sample"));
+
+    app.handle_key(key(KeyCode::Char('!')));
+    assert!(app.operator_mode);
+    let roster = app.people.roster.as_ref().expect("roster loaded");
+    let cam = roster
+        .records
+        .iter()
+        .find(|entry| entry.name == "Cam Sample")
+        .expect("no-ai person visible in operator mode");
+    assert_eq!(cam.no_ai, confidant_tui::contract::NoAiMode::Hidden);
+
+    // The operator context decrypts the hidden person and badges it.
+    app.load_context(CAM);
+    let ctx = app
+        .context
+        .context
+        .as_ref()
+        .expect("operator context loaded");
+    assert!(ctx.for_operator);
+    assert_eq!(ctx.person.name.as_deref(), Some("Cam Sample"));
+    assert_eq!(ctx.person.no_ai, confidant_tui::contract::NoAiMode::Hidden);
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains(OPERATOR_MODE_BANNER), "{rendered}");
+    // Full-screen Context at a wider buffer keeps the identity line together.
+    app.active_view = ActiveView::Context;
+    let context_screen = render_to_string_at(&app, 160, HEIGHT);
+    assert!(
+        line_with(&context_screen, CAM).contains("[no-ai]"),
+        "{context_screen}"
+    );
+}
+
+/// End-to-end: the real CLI and a real `$EDITOR` edit a person record in a
+/// throwaway git vault, committing exactly once and leaving the tree clean.
+#[test]
+#[cfg(unix)]
+fn live_edit_commits_once_through_the_real_cli_and_editor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A fresh git copy of the demo vault.
+    let dir = tempfile::tempdir().expect("temp vault");
+    let root = dir.path();
+    for entry in fs::read_dir(demo_vault()).expect("read demo vault") {
+        let entry = entry.unwrap();
+        let dest = root.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&dest).unwrap();
+            for f in walk_files(&entry.path()) {
+                let rel = f.strip_prefix(entry.path()).unwrap();
+                let d = dest.join(rel);
+                fs::create_dir_all(d.parent().unwrap()).unwrap();
+                fs::copy(&f, &d).unwrap();
+            }
+        } else {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    };
+    git(&["init", "-b", "main", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(root.join(".gitignore"), ".confidant/\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    // A real editor that appends a marker line to the scratch file. It lives
+    // outside the vault: any stray file at the vault root is an
+    // `E_INVALID_FILENAME` finding, which would block the write.
+    let editor_dir = tempfile::tempdir().expect("temp editor dir");
+    let editor = editor_dir.path().join("editor.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\nprintf '\\nlive-edit-marker\\n' >> \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let _env = EditorEnv::set(Some(&editor.display().to_string()));
+
+    let runner = ProcessRunner::new(confidant_bin(), Some(root.to_path_buf()))
+        .with_env("CONFIDANT_OFFLINE", "1");
+    let mut app = App::new(runner);
+    app.set_vault_root(root.to_path_buf());
+    app.load_check();
+    app.load_roster();
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.handle_key(key(KeyCode::Char('e')));
+    assert!(app.edit_flow.is_some(), "edit flow started");
+    let scratch = scratch_path(root, ADA).unwrap();
+    assert!(scratch.exists(), "scratch staged");
+
+    let cmd = app.take_suspended_command().expect("editor queued");
+    let status = app.run_suspended_command(&cmd).expect("editor runs");
+    assert_eq!(status, 0, "editor exits cleanly");
+    app.after_suspended_command(Ok(status));
+    assert!(app.edit_flow.is_some(), "awaiting confirm");
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.edit_flow.is_none(), "flow finished");
+    assert!(!scratch.exists(), "scratch removed after the write");
+    assert_eq!(
+        app.alert.as_ref().map(|a| a.title.as_str()),
+        Some("Edit Committed")
+    );
+
+    // Exactly one new commit (init + the edit).
+    let log = std::process::Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(root)
+        .output()
+        .expect("git log");
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert_eq!(log.lines().count(), 2, "one edit commit:\n{log}");
+    let profile = fs::read_to_string(root.join("people").join(ADA).join("profile.md")).unwrap();
+    assert!(profile.contains("live-edit-marker"), "{profile}");
+    // The edit scratch is git-ignored: the tree is clean after the commit.
+    let status_out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .expect("git status");
+    assert!(
+        String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty(),
+        "working tree must be clean: {}",
+        String::from_utf8_lossy(&status_out.stdout)
+    );
 }

@@ -2,17 +2,20 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::theme;
+use crate::theme::palette;
 
-use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
+use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus, WriteOutcome};
 use crate::contract::{
-    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, InboxReport,
-    ResolveApplied, ResolveShow, Roster, SearchResult,
+    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, FindResult,
+    InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
 };
+use crate::edit::{self, EditFlow, EditPhase};
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
 use crate::search::{filter_search_result, find_result_to_search, SearchViewState};
@@ -118,10 +121,38 @@ pub enum InputMode {
 /// An interactive `confidant` invocation the TUI must run outside its
 /// alternate screen (#456 hand-merge): the host suspends the terminal,
 /// runs the argv, then resumes and refreshes.
+///
+/// `program: None` runs the resolved `confidant` binary; `Some(program)`
+/// runs an external program (the operator's `$EDITOR` on a scratch file,
+/// #556 phase 2). Both inherit the terminal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SuspendedCommand {
+    pub program: Option<String>,
     pub args: Vec<String>,
 }
+
+impl SuspendedCommand {
+    /// Run the `confidant` binary with `args`.
+    pub fn confidant(args: Vec<String>) -> Self {
+        Self {
+            program: None,
+            args,
+        }
+    }
+
+    /// Run `program` with `args` (the operator's editor).
+    pub fn program(program: String, args: Vec<String>) -> Self {
+        Self {
+            program: Some(program),
+            args,
+        }
+    }
+}
+
+/// The operator-mode banner. Byte-identical to the CLI's
+/// (`crates/confidant-cli/src/main.rs` `OPERATOR_MODE_BANNER`) so a screen
+/// share shows the same warning whichever front end is on screen.
+pub const OPERATOR_MODE_BANNER: &str = "OPERATOR MODE: no-ai records included (--for-operator)";
 
 /// Top-level TUI state machine generic over a [`Runner`].
 pub struct App<R: Runner> {
@@ -147,6 +178,15 @@ pub struct App<R: Runner> {
     /// Pending interactive command (set by hand-merge confirm); the host
     /// takes it, suspends the terminal, runs it, and resumes.
     pub suspended: Option<SuspendedCommand>,
+    /// Operator mode (#556 phase 2): when on, the roster and context are
+    /// loaded with `--for-operator`, so `no-ai` people and notes appear with
+    /// a tri-state badge and the footer carries the operator banner.
+    /// Off by default: the flags are only ever passed after the human presses
+    /// `!`, never on the TUI's own initiative.
+    pub operator_mode: bool,
+    /// The in-flight record/note edit (`e`). While `Some`, the confirm modal
+    /// owns the keyboard and the scratch file is live on disk.
+    pub edit_flow: Option<EditFlow>,
     vault_root_override: Option<std::path::PathBuf>,
 }
 
@@ -172,7 +212,18 @@ impl<R: Runner> App<R> {
             inbox: InboxViewState::default(),
             conflict: ConflictViewState::default(),
             suspended: None,
+            operator_mode: false,
+            edit_flow: None,
             vault_root_override: None,
+        }
+    }
+
+    /// Best-effort overwrite-with-zeros and removal of any stale edit scratch
+    /// left by a crashed run (#455/#557 convention). This is hygiene, not
+    /// secure deletion; called once at startup.
+    pub fn sweep_stale_edit_scratch(&self) {
+        if let Some(root) = resolve_vault_root(self.vault_root_override.as_deref()) {
+            edit::sweep_stale_edit_scratch(&root);
         }
     }
 
@@ -208,12 +259,18 @@ impl<R: Runner> App<R> {
     }
 
     /// Run `confidant record list --json --no-input --kind person` and
-    /// update the People roster (#558). This is the cleared set: `no-ai:
-    /// true` people are absent. On first load it selects the first person
-    /// and loads their live context; refreshing preserves the current
-    /// selection when that person is still in the roster.
+    /// update the People roster (#558). Without operator mode this is the
+    /// cleared set: `no-ai: true` people are absent. With operator mode the
+    /// call carries `--for-operator`, so `no-ai` people appear badged. On
+    /// first load it selects the first person and loads their live context;
+    /// refreshing preserves the current selection when that person is still
+    /// in the roster.
     pub fn load_roster(&mut self) {
-        let raw = match self.runner.run(&["record", "list", "--kind", "person"]) {
+        let mut args: Vec<&str> = vec!["record", "list", "--kind", "person"];
+        if self.operator_mode {
+            args.push("--for-operator");
+        }
+        let raw = match self.runner.run(&args) {
             Ok(r) => r,
             Err(e) => {
                 self.people.loaded = true;
@@ -279,15 +336,7 @@ impl<R: Runner> App<R> {
         let vault_root = match resolve_vault_root(self.vault_root_override.as_deref()) {
             Some(root) => root,
             None => {
-                self.alert = Some(AlertState {
-                    title: "No Vault".to_owned(),
-                    code: Some("no_vault".to_owned()),
-                    message:
-                        "no vault found: pass --vault, set CONFIDANT_VAULT, or run inside a vault"
-                            .to_owned(),
-                    fix: None,
-                    blocking: false,
-                });
+                self.alert = Some(no_vault_alert());
                 return;
             }
         };
@@ -421,17 +470,26 @@ impl<R: Runner> App<R> {
     }
 
     /// Run `confidant context --json --no-input -- <person_id>` and update
-    /// the Context view state. The People workspace's right pane and the
-    /// full-screen Context view share this state.
+    /// the Context view state. With operator mode the call carries
+    /// `--for-operator`, so `no-ai` people, notes, and interactions come
+    /// back with the tri-state `no_ai`. The People workspace's right pane and
+    /// the full-screen Context view share this state.
     pub fn load_context(&mut self, person_id: &str) {
         let pid = person_id.to_owned();
         let changed = self.context.person_id.as_deref() != Some(pid.as_str());
         if changed {
             self.context.context = None;
             self.context.scroll = 0;
+            self.context.edit_index = 0;
         }
         self.context.person_id = Some(pid.clone());
-        let raw = match self.runner.run(&["context", "--", &pid]) {
+        let mut args: Vec<&str> = vec!["context"];
+        if self.operator_mode {
+            args.push("--for-operator");
+        }
+        args.push("--");
+        args.push(&pid);
+        let raw = match self.runner.run(&args) {
             Ok(r) => r,
             Err(e) => {
                 self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
@@ -444,7 +502,68 @@ impl<R: Runner> App<R> {
             }
             self.context.context = Some(ctx);
             self.context.scroll = 0;
+            // The bundle changed under the cursor: keep the edit target in
+            // range rather than pointing at a record that no longer renders.
+            let count = self
+                .context
+                .context
+                .as_ref()
+                .map(|ctx| context::edit_targets(ctx).len())
+                .unwrap_or(0);
+            if count == 0 {
+                self.context.edit_index = 0;
+            } else if self.context.edit_index >= count {
+                self.context.edit_index = count - 1;
+            }
         }
+    }
+
+    /// Toggle operator mode (#556 phase 2): the explicit human action that
+    /// lets the TUI pass `--for-operator`. Reloads the check report, the
+    /// roster, and the selected person's context through the new path.
+    ///
+    /// Turning **off** fails closed: everything the operator path may have
+    /// surfaced is dropped *before* the agent-path reload. If that reload
+    /// fails, the panes show "not loaded" rather than leaving hidden people
+    /// or notes on screen without the operator banner.
+    pub fn toggle_operator_mode(&mut self) {
+        self.operator_mode = !self.operator_mode;
+        if !self.operator_mode {
+            // Clear the operator-derived views first. `load_roster` and
+            // `load_context` keep their previous value on failure, so without
+            // this a failed reload would leave `no-ai` content visible while
+            // the banner is gone.
+            self.people.roster = None;
+            self.people.selected = 0;
+            self.context.context = None;
+            self.context.scroll = 0;
+            self.context.edit_index = 0;
+            // An edit started in operator mode cannot be pending here (the
+            // confirm modal swallows every key, including `!`), but cancelling
+            // is harmless and keeps the removal of hidden state exhaustive.
+            self.cancel_edit();
+        }
+        self.load_check();
+        self.load_roster();
+        if let Some(pid) = self.context.person_id.clone() {
+            self.load_context(&pid);
+        }
+    }
+
+    /// Move the context pane's edit target by `delta`, wrapping. No CLI call.
+    fn move_edit_target(&mut self, delta: i32) {
+        let count = self
+            .context
+            .context
+            .as_ref()
+            .map(|ctx| context::edit_targets(ctx).len())
+            .unwrap_or(0);
+        if count == 0 {
+            self.context.edit_index = 0;
+            return;
+        }
+        let current = self.context.edit_index.min(count - 1);
+        self.context.edit_index = (current as i32 + delta).rem_euclid(count as i32) as usize;
     }
 
     /// Reconcile the left-pane selection with the current roster, filter,
@@ -811,14 +930,12 @@ impl<R: Runner> App<R> {
         let Some(id) = self.conflict.detail_id.clone() else {
             return;
         };
-        self.suspended = Some(SuspendedCommand {
-            args: vec![
-                "record".to_owned(),
-                "resolve".to_owned(),
-                id,
-                "--edit".to_owned(),
-            ],
-        });
+        self.suspended = Some(SuspendedCommand::confidant(vec![
+            "record".to_owned(),
+            "resolve".to_owned(),
+            id,
+            "--edit".to_owned(),
+        ]));
     }
 
     /// Take the pending interactive command for the host to run while the
@@ -830,16 +947,26 @@ impl<R: Runner> App<R> {
     /// Run a suspended command through the runner with an inherited
     /// terminal. Called by the host while the TUI is suspended.
     pub fn run_suspended_command(&self, cmd: &SuspendedCommand) -> anyhow::Result<i32> {
-        self.runner
-            .run_confidant_interactive(&cmd.args.iter().map(String::as_str).collect::<Vec<_>>())
+        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        match &cmd.program {
+            None => self.runner.run_confidant_interactive(&args),
+            Some(program) => self.runner.run_program_interactive(program, &args),
+        }
     }
 
-    /// Refresh after an interactive command completes: the hand-merge may
-    /// have resolved the record, so reload the list and close the detail.
-    /// A failed or nonzero `--edit` run raises the alert view instead of
-    /// silently refreshing.
+    /// Refresh after an interactive command completes.
+    ///
+    /// For the conflict hand-merge (#456) the merge may have resolved the
+    /// record, so reload the list and close the detail. For an edit
+    /// (#556 phase 2) the editor has changed the scratch file: read it back
+    /// and either confirm the write or report a no-op. A failed or nonzero
+    /// run raises the alert view instead of silently refreshing.
     pub fn after_suspended_command(&mut self, result: anyhow::Result<i32>) {
         self.suspended = None;
+        if self.edit_flow.is_some() {
+            self.after_edit_editor(result);
+            return;
+        }
         // Reload first: the loaders clear the alert on success, so the
         // failure alert below must be raised after.
         self.load_conflicts();
@@ -859,6 +986,316 @@ impl<R: Runner> App<R> {
                     "hand-merge command failed: {e:#}"
                 )));
             }
+        }
+    }
+
+    /// `e`: edit the context pane's selected item (person, note, or
+    /// interaction) through the operator scratch/editor flow. Operator-only
+    /// by construction: `record show --for-edit` / `note show --for-edit`
+    /// are the same reads the CLI reserves for the human.
+    pub fn begin_edit(&mut self) {
+        if self.edit_flow.is_some() {
+            return;
+        }
+        let Some(root) = resolve_vault_root(self.vault_root_override.as_deref()) else {
+            self.alert = Some(no_vault_alert());
+            return;
+        };
+        let Some(ctx) = self.context.context.clone() else {
+            self.alert = Some(AlertState {
+                title: "Nothing to Edit".to_owned(),
+                code: Some("no_context".to_owned()),
+                message: "no context is loaded for the selected person".to_owned(),
+                fix: Some("select a person in People, then press e".to_owned()),
+                blocking: false,
+            });
+            return;
+        };
+        let targets = context::edit_targets(&ctx);
+        if targets.is_empty() {
+            return;
+        }
+        let target = targets[self.context.edit_index.min(targets.len() - 1)].clone();
+
+        // Pre-flight: the plaintext scratch must not be committable. Mirrors
+        // the CLI's `git check-ignore` gate before it writes plaintext.
+        if !self.scratch_is_gitignored(&root) {
+            self.alert = Some(AlertState {
+                title: "Edit Refused".to_owned(),
+                code: Some("scratch_not_ignored".to_owned()),
+                message: "`.confidant/` is not git-ignored in this vault, so the edit scratch could be committed".to_owned(),
+                fix: Some("Add `.confidant/` to .gitignore, then retry".to_owned()),
+                blocking: false,
+            });
+            return;
+        }
+
+        // Fail fast: no editor means no plaintext scratch is written.
+        let Some(editor) = edit::resolve_editor() else {
+            self.alert = Some(AlertState {
+                title: "No Editor Configured".to_owned(),
+                code: Some("no_editor".to_owned()),
+                message: "neither $VISUAL nor $EDITOR is set".to_owned(),
+                fix: Some("Set $EDITOR (or $VISUAL), then press e again".to_owned()),
+                blocking: false,
+            });
+            return;
+        };
+
+        // The operator-only read that prints the current text as JSON.
+        let argv = target.kind.show_argv(&target.id);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let raw = match self.runner.run(&refs) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                return;
+            }
+        };
+        let source = match parse_raw_output::<EditSource>(&raw) {
+            ContractOutcome::Ok { vault, data, .. } => {
+                if vault.is_some() {
+                    self.vault = vault;
+                }
+                self.alert = None;
+                data
+            }
+            ContractOutcome::VersionMismatch { reported_version } => {
+                self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
+                return;
+            }
+            ContractOutcome::CliError {
+                status,
+                usage_error,
+                error,
+            } => {
+                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                return;
+            }
+            ContractOutcome::InvalidJson { status } => {
+                self.alert = Some(AlertState::invalid_json(status));
+                return;
+            }
+        };
+
+        let Some(scratch) = edit::scratch_path(&root, &target.id) else {
+            self.alert = Some(AlertState {
+                title: "Edit Refused".to_owned(),
+                code: Some("unsafe_id".to_owned()),
+                message: format!("{} is not a usable record id", target.id),
+                fix: None,
+                blocking: false,
+            });
+            return;
+        };
+        // Clear any stale scratch from a crashed run before writing ours.
+        edit::sweep_stale_edit_scratch(&root);
+        if let Err(e) = edit::write_scratch(&scratch, &source.text) {
+            self.alert = Some(AlertState {
+                title: "Cannot Stage Scratch".to_owned(),
+                code: Some("scratch_write_failed".to_owned()),
+                message: format!("{e:#}"),
+                fix: Some(format!("Check permissions on {}", root.display())),
+                blocking: false,
+            });
+            return;
+        }
+        self.edit_flow = Some(EditFlow {
+            target,
+            scratch: scratch.clone(),
+            original: source.text,
+            edited: None,
+            phase: EditPhase::Editing,
+        });
+        self.suspended = Some(SuspendedCommand::program(
+            editor,
+            vec![scratch.display().to_string()],
+        ));
+    }
+
+    /// After the editor exits: a failed run or an unchanged file writes
+    /// nothing; otherwise arm the confirm modal.
+    fn after_edit_editor(&mut self, result: anyhow::Result<i32>) {
+        let Some(flow) = self.edit_flow.take() else {
+            return;
+        };
+        match result {
+            Ok(0) => {}
+            Ok(status) => {
+                edit::remove_scratch(&flow.scratch);
+                self.alert = Some(AlertState {
+                    title: "Editor Exited with an Error".to_owned(),
+                    code: Some("editor_failed".to_owned()),
+                    message: format!("the editor exited with status {status}; nothing was written"),
+                    fix: Some("Retry the edit with e".to_owned()),
+                    blocking: false,
+                });
+                return;
+            }
+            Err(e) => {
+                edit::remove_scratch(&flow.scratch);
+                self.alert = Some(AlertState::runner_error(&format!(
+                    "could not run the editor: {e:#}"
+                )));
+                return;
+            }
+        }
+        match edit::read_scratch(&flow.scratch) {
+            // A no-op edit never reaches the CLI, so nothing can be committed.
+            Ok(text) if text == flow.original => {
+                edit::remove_scratch(&flow.scratch);
+                self.alert = Some(AlertState {
+                    title: "No Changes".to_owned(),
+                    code: Some("unchanged".to_owned()),
+                    message: format!("{} was not changed; nothing was written", flow.target.id),
+                    fix: None,
+                    blocking: false,
+                });
+            }
+            Ok(text) => {
+                self.edit_flow = Some(EditFlow {
+                    edited: Some(text),
+                    phase: EditPhase::Confirm,
+                    ..flow
+                });
+            }
+            Err(e) => {
+                edit::remove_scratch(&flow.scratch);
+                self.alert = Some(AlertState {
+                    title: "Cannot Read the Edited File".to_owned(),
+                    code: Some("scratch_read_failed".to_owned()),
+                    message: format!("{e:#}"),
+                    fix: Some("Retry the edit with e".to_owned()),
+                    blocking: false,
+                });
+            }
+        }
+    }
+
+    /// The confirm modal owns every key once the editor returns: `y` writes
+    /// through the CLI, anything else cancels and removes the scratch.
+    /// Returns true when the key was consumed.
+    fn handle_edit_confirm_key(&mut self, key: KeyEvent) -> bool {
+        let Some(flow) = self.edit_flow.as_ref() else {
+            return false;
+        };
+        if flow.phase != EditPhase::Confirm {
+            return false;
+        }
+        if matches!(key.code, KeyCode::Char('y')) {
+            self.apply_edit();
+        } else {
+            self.cancel_edit();
+        }
+        true
+    }
+
+    /// Cancel the pending edit: remove the scratch, write nothing.
+    fn cancel_edit(&mut self) {
+        if let Some(flow) = self.edit_flow.take() {
+            edit::remove_scratch(&flow.scratch);
+        }
+    }
+
+    /// Run the confirmed write (`record edit --file` / `note edit --file`),
+    /// then remove the scratch and surface the outcome. Always cleans up:
+    /// the CLI has already read the file by the time it returns.
+    fn apply_edit(&mut self) {
+        let Some(flow) = self.edit_flow.take() else {
+            return;
+        };
+        let Some(file) = flow.scratch.to_str().map(str::to_owned) else {
+            edit::remove_scratch(&flow.scratch);
+            return;
+        };
+        let argv = flow.target.kind.edit_argv(&flow.target.id, &file);
+        let outcome = crate::apply::run_write_step(&self.runner, &argv, false);
+        edit::remove_scratch(&flow.scratch);
+        let id = flow.target.id.clone();
+        let noun = flow.target.kind.noun();
+        match outcome {
+            Ok(WriteOutcome::Applied { commit, .. }) => {
+                self.reload_after_edit();
+                self.alert = Some(AlertState {
+                    title: "Edit Committed".to_owned(),
+                    code: Some("committed".to_owned()),
+                    message: format!("{noun} {id} edited (commit {})", short_commit(&commit)),
+                    fix: None,
+                    blocking: false,
+                });
+            }
+            Ok(WriteOutcome::Idempotent { .. }) => {
+                self.reload_after_edit();
+                self.alert = Some(AlertState {
+                    title: "No Changes".to_owned(),
+                    code: Some("unchanged".to_owned()),
+                    message: format!("{noun} {id} was unchanged; nothing was committed"),
+                    fix: None,
+                    blocking: false,
+                });
+            }
+            Ok(WriteOutcome::CheckBlocked { report }) => {
+                // The report renders in the Check view itself.
+                self.check.report = Some(report);
+                self.check.selected = 0;
+                self.active_view = ActiveView::Check;
+            }
+            Ok(WriteOutcome::CliError { code, message, fix }) => {
+                self.alert = Some(AlertState {
+                    title: format!("Edit Failed ({code})"),
+                    code: Some(code),
+                    message,
+                    fix,
+                    blocking: false,
+                });
+            }
+            Ok(WriteOutcome::DryRun { .. }) => {
+                self.alert = Some(AlertState {
+                    title: "Edit Failed".to_owned(),
+                    code: Some("unexpected_outcome".to_owned()),
+                    message: "the edit command returned a dry-run preview; nothing was applied"
+                        .to_owned(),
+                    fix: None,
+                    blocking: false,
+                });
+            }
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+            }
+        }
+    }
+
+    /// Reload the views an edit can change: the check report (a write can add
+    /// findings), the roster (a name or `no-ai` mode may differ), and the
+    /// selected person's context (the body/notes changed).
+    fn reload_after_edit(&mut self) {
+        self.load_check();
+        self.load_roster();
+        if let Some(pid) = self.context.person_id.clone() {
+            self.load_context(&pid);
+        }
+    }
+
+    /// True when `.confidant/` is git-ignored in `root`, mirroring the CLI's
+    /// pre-flight gate: git missing or the vault not a repo is allowed (there
+    /// is nothing to commit into); a repo that does not ignore `.confidant/`
+    /// is refused.
+    fn scratch_is_gitignored(&self, root: &std::path::Path) -> bool {
+        let root_str = root.display().to_string();
+        match self
+            .runner
+            .run_program("git", &["-C", &root_str, "rev-parse", "--git-dir"])
+        {
+            Err(_) => return true,                     // git not found
+            Ok(out) if out.status != 0 => return true, // not a git repo
+            Ok(_) => {}
+        }
+        match self.runner.run_program(
+            "git",
+            &["-C", &root_str, "check-ignore", "-q", ".confidant/.probe"],
+        ) {
+            Ok(out) => out.status == 0,
+            Err(_) => true,
         }
     }
 
@@ -1228,6 +1665,11 @@ impl<R: Runner> App<R> {
     }
 
     fn open_help_modal(&mut self) {
+        let operator_line = if self.operator_mode {
+            format!("! operator mode is ON — {OPERATOR_MODE_BANNER}")
+        } else {
+            "! operator mode: show no-ai records (--for-operator)".to_owned()
+        };
         self.info_modal = Some(InfoState::new(
             "Help",
             vec![
@@ -1236,10 +1678,13 @@ impl<R: Runner> App<R> {
                 "Tab / Shift-Tab cycle the views inside a workspace".to_owned(),
                 "o Proposals   i Inbox   c Conflicts".to_owned(),
                 "d Doctor   p Scope   ? Help   r refresh   q quit".to_owned(),
+                operator_line,
+                "[ ] select the context item   e edit it (person, note, interaction)".to_owned(),
                 String::new(),
-                "People shows the cleared roster and a live context pane; nudges".to_owned(),
-                "come from the cached check report. Note editing and quick capture".to_owned(),
-                "arrive in later phases.".to_owned(),
+                "People shows the roster and a live context pane; nudges come from".to_owned(),
+                "the cached check report. With operator mode on, the roster and".to_owned(),
+                "context include no-ai people and notes, each badged. Quick capture".to_owned(),
+                "and the merged review queue arrive in phase 3.".to_owned(),
             ],
         ));
     }
@@ -1709,6 +2154,14 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        // The edit confirm modal owns every key once the editor has returned:
+        // `y` writes, anything else cancels. It sits above the workspace
+        // shortcuts so a pending write cannot be escaped (same rule as a
+        // proposal confirm).
+        if self.handle_edit_confirm_key(key) {
+            return;
+        }
+
         // Proposals owns its open-flow keys and calls the workspace
         // shortcuts itself (so its phase modals keep swallowing input).
         if self.active_view == ActiveView::Proposals {
@@ -1793,6 +2246,25 @@ impl<R: Runner> App<R> {
             // #387: exact literal scan toggle for the unified Search tab.
             KeyCode::Char('e') if self.active_view == ActiveView::Search => {
                 self.toggle_search_exact();
+            }
+            // #556 phase 2: edit the selected record/note through the operator
+            // scratch + editor flow.
+            KeyCode::Char('e')
+                if matches!(self.active_view, ActiveView::People | ActiveView::Context) =>
+            {
+                self.begin_edit();
+            }
+            // #556 phase 2: the explicit human action that lets the roster and
+            // context be read through `--for-operator`.
+            KeyCode::Char('!') => {
+                self.toggle_operator_mode();
+            }
+            // #556 phase 2: move the context pane's edit target.
+            KeyCode::Char('[') => {
+                self.move_edit_target(-1);
+            }
+            KeyCode::Char(']') => {
+                self.move_edit_target(1);
             }
             KeyCode::Char('r') => {
                 self.refresh_current();
@@ -1970,9 +2442,27 @@ impl<R: Runner> App<R> {
             }
         }
 
-        Self::render_footer(frame, chunks[2]);
+        Self::render_footer(self.operator_mode, frame, chunks[2]);
         if let Some(modal) = &self.info_modal {
             info::render(modal, frame, area);
+        }
+        if let Some(flow) = &self.edit_flow {
+            if flow.phase == EditPhase::Confirm {
+                let noun = flow.target.kind.noun();
+                confirm::render(
+                    &ConfirmState::new(
+                        format!("Apply {noun} edit: {}", flow.target.id),
+                        vec![
+                            format!("{noun} {} ({})", flow.target.id, flow.target.label),
+                            String::new(),
+                            "This re-encrypts and creates one commit (if anything changed)."
+                                .to_owned(),
+                        ],
+                    ),
+                    frame,
+                    area,
+                );
+            }
         }
     }
 
@@ -2023,9 +2513,18 @@ impl<R: Runner> App<R> {
         frame.render_widget(Paragraph::new(status), rows[1]);
     }
 
-    /// Borderless one-line footer with key badges and action labels.
-    fn render_footer(frame: &mut Frame<'_>, area: Rect) {
+    /// Borderless one-line footer with key badges and action labels. In
+    /// operator mode the mode banner leads the line (persistent, not a
+    /// toast), so hidden data on screen is unmistakable on a screen share.
+    fn render_footer(operator_mode: bool, frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
+        if operator_mode {
+            spans.push(Span::styled(
+                OPERATOR_MODE_BANNER,
+                Style::default().fg(palette::ERROR).bold(),
+            ));
+            spans.push(Span::raw("  "));
+        }
         for (key, label) in [
             ("1-3", "ws"),
             ("Tab", "view"),
@@ -2256,6 +2755,23 @@ fn compact_path(path: &str, max_chars: usize) -> String {
     }
     let tail: String = chars[chars.len() - (max_chars - 1)..].iter().collect();
     format!("…{tail}")
+}
+
+/// The alert for "no vault found", shared by the search and edit paths.
+fn no_vault_alert() -> AlertState {
+    AlertState {
+        title: "No Vault".to_owned(),
+        code: Some("no_vault".to_owned()),
+        message: "no vault found: pass --vault, set CONFIDANT_VAULT, or run inside a vault"
+            .to_owned(),
+        fix: None,
+        blocking: false,
+    }
+}
+
+/// The first 8 characters of a commit SHA, or the whole (short) value.
+fn short_commit(commit: &str) -> &str {
+    &commit[..8.min(commit.len())]
 }
 
 /// Pure check behind [`App::qmd_available`], taking its inputs explicitly

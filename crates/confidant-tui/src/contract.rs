@@ -7,10 +7,84 @@
 
 use std::collections::BTreeMap;
 
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::de::{DeserializeOwned, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::runner::RawOutput;
+
+/// Tri-state `no-ai` mode as the CLI reports it (#559/#572).
+///
+/// The roster and the operator `context` path carry the string form
+/// (`"true"` | `"notes"` | `"false"`); the agent `context` path carries the
+/// boolean `no_ai` and notes/interactions simply omit the field. Both shapes
+/// deserialize here so one badge helper serves every view, and an absent or
+/// `false` value renders as it did before operator mode existed. An unknown
+/// string fails toward [`NoAiMode::Hidden`] so a mode this build does not know
+/// never renders as cleared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoAiMode {
+    /// `no-ai: false`, or an absent value: nothing hidden.
+    #[default]
+    False,
+    /// `no-ai: true` (JSON `true` or `"true"`): the record is hidden from
+    /// agent reads.
+    Hidden,
+    /// `no-ai: notes` (JSON `"notes"`): the person is listable but their
+    /// notes are hidden from agent reads.
+    Notes,
+}
+
+impl NoAiMode {
+    /// True when the record itself is hidden from agent reads (`no-ai: true`).
+    pub fn is_hidden(self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+
+    /// The badge text for this mode, or `None` when nothing is hidden.
+    /// Matches the CLI's human-output badges.
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            Self::Hidden => Some("[no-ai]"),
+            Self::Notes => Some("[no-ai: notes]"),
+            Self::False => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NoAiMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ModeVisitor;
+
+        impl Visitor<'_> for ModeVisitor {
+            type Value = NoAiMode;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a boolean or one of \"true\", \"notes\", \"false\"")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    NoAiMode::Hidden
+                } else {
+                    NoAiMode::False
+                })
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(match value {
+                    "notes" => NoAiMode::Notes,
+                    "false" => NoAiMode::False,
+                    // Fail toward showing a badge: an unknown mode must never
+                    // render as cleared. `"true"` and anything the CLI adds
+                    // later get the hidden badge.
+                    _ => NoAiMode::Hidden,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ModeVisitor)
+    }
+}
 
 /// Supported ADR-7 JSON schema version.
 pub const SUPPORTED_SCHEMA_VERSION: &str = "1";
@@ -195,9 +269,18 @@ pub struct Context {
     pub refused_envelopes: u32,
     #[serde(default)]
     pub scope: Vec<String>,
+    /// Present (`true`) only when the operator path answered
+    /// (`--for-operator`). Absent on the agent path, so its JSON is
+    /// unchanged.
+    #[serde(default)]
+    pub for_operator: bool,
 }
 
 /// Person identity and profile inside [`Context`].
+///
+/// `no_ai` is a boolean on the agent path and the tri-state string on the
+/// operator path (#572); [`NoAiMode`] accepts both, and a viewer that only
+/// needs "is this hidden" uses [`NoAiMode::is_hidden`].
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct PersonView {
     #[serde(default)]
@@ -205,12 +288,15 @@ pub struct PersonView {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
-    pub no_ai: bool,
+    pub no_ai: NoAiMode,
     #[serde(default)]
     pub profile: Option<String>,
 }
 
 /// One note inside [`Context`].
+///
+/// `no_ai` is the operator-path tri-state (#572) and absent on the agent
+/// path.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct NoteView {
     #[serde(default)]
@@ -219,9 +305,14 @@ pub struct NoteView {
     pub date: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub no_ai: Option<NoAiMode>,
 }
 
 /// One interaction inside [`Context`].
+///
+/// `no_ai` is the operator-path tri-state (#572) and absent on the agent
+/// path.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct InteractionView {
     #[serde(default)]
@@ -232,6 +323,8 @@ pub struct InteractionView {
     pub title: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub no_ai: Option<NoAiMode>,
 }
 
 /// One mirrored touchpoint inside [`Context`].
@@ -267,10 +360,11 @@ pub struct RecentSession {
 
 /// Output of `confidant record list --json --no-input` (#558).
 ///
-/// The TUI calls the roster without `--for-operator`, so this is the
-/// section 12 cleared set: a `no-ai: true` person is absent, never present
-/// with a nulled name. `no_ai` is the tri-state string (`"true"`,
-/// `"notes"`, `"false"`) the CLI reports; phase 1 does not render it.
+/// The TUI calls the roster without `--for-operator` unless operator mode is
+/// on; without it this is the section 12 cleared set, so a `no-ai: true`
+/// person is absent (never present with a nulled name). With the operator
+/// flag the decrypt path is the operator one and entries carry the tri-state
+/// `no_ai` the #559 ruling specifies.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Roster {
     #[serde(default)]
@@ -295,9 +389,43 @@ pub struct RosterEntry {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub no_ai: String,
+    pub no_ai: NoAiMode,
     #[serde(default)]
     pub kind: String,
+}
+
+/// Output of `confidant record show <id> --for-edit --json --no-input`
+/// (#216) and `confidant note show <n-id> --for-edit --json --no-input`
+/// (#557), the two operator-only reads that prepare an edit.
+///
+/// `text` is decrypted plaintext (a `no-ai` record is decrypted in full
+/// here), so the manual [`std::fmt::Debug`] impl redacts it: plaintext must
+/// never reach logs or panic messages.
+#[derive(Clone, Default, Deserialize, PartialEq)]
+pub struct EditSource {
+    #[serde(default)]
+    pub id: String,
+    /// `"person"`, `"note"`, `"interaction"`, … (the JSON key is `type`).
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub no_ai: bool,
+    #[serde(default)]
+    pub text: String,
+}
+
+impl std::fmt::Debug for EditSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditSource")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("path", &self.path)
+            .field("no_ai", &self.no_ai)
+            .field("text", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Output of `confidant doctor --json --no-input`.
@@ -541,5 +669,66 @@ pub fn parse_raw_output<T: DeserializeOwned + Default>(raw: &RawOutput) -> Contr
         ok: header.ok,
         vault: header.vault,
         data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_ai_mode_accepts_boolean_and_tri_state_strings() {
+        // Agent `context` sends a boolean; the roster and operator `context`
+        // send the tri-state string. Both must land in the same type, and an
+        // unknown string must fail toward a badge (never look cleared).
+        let from = |json: &str| serde_json::from_str::<NoAiMode>(json).unwrap();
+        assert_eq!(from("true"), NoAiMode::Hidden);
+        assert_eq!(from("false"), NoAiMode::False);
+        assert_eq!(from("\"true\""), NoAiMode::Hidden);
+        assert_eq!(from("\"false\""), NoAiMode::False);
+        assert_eq!(from("\"notes\""), NoAiMode::Notes);
+        assert_eq!(from("\"weird\""), NoAiMode::Hidden);
+        assert_eq!(from("\"\""), NoAiMode::Hidden);
+    }
+
+    #[test]
+    fn person_and_note_views_accept_both_no_ai_shapes() {
+        // Agent path: boolean `no_ai`, no per-note field.
+        let agent: PersonView = serde_json::from_str(r#"{"id": "p-1", "no_ai": false}"#).unwrap();
+        assert_eq!(agent.no_ai, NoAiMode::False);
+        // Operator path: tri-state strings.
+        let op: PersonView = serde_json::from_str(r#"{"id": "p-1", "no_ai": "notes"}"#).unwrap();
+        assert_eq!(op.no_ai, NoAiMode::Notes);
+        let note: NoteView = serde_json::from_str(r#"{"id": "n-1", "no_ai": "true"}"#).unwrap();
+        assert_eq!(note.no_ai, Some(NoAiMode::Hidden));
+        // Absent note field stays `None` (the agent path).
+        let plain: NoteView = serde_json::from_str(r#"{"id": "n-1"}"#).unwrap();
+        assert_eq!(plain.no_ai, None);
+    }
+
+    #[test]
+    fn badge_matches_cli_human_output() {
+        assert_eq!(NoAiMode::False.badge(), None);
+        assert_eq!(NoAiMode::Hidden.badge(), Some("[no-ai]"));
+        assert_eq!(NoAiMode::Notes.badge(), Some("[no-ai: notes]"));
+        assert!(NoAiMode::Hidden.is_hidden());
+        assert!(!NoAiMode::Notes.is_hidden());
+        assert!(!NoAiMode::False.is_hidden());
+    }
+
+    #[test]
+    fn edit_source_debug_redacts_plaintext() {
+        let source = EditSource {
+            id: "p-1".to_owned(),
+            kind: "person".to_owned(),
+            path: "people/p-1/profile.md".to_owned(),
+            no_ai: true,
+            text: "SENTINEL-SECRET-BODY".to_owned(),
+        };
+        let debug = format!("{source:?}");
+        assert!(!debug.contains("SENTINEL"), "plaintext leaked: {debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        // The non-secret fields survive for debugging.
+        assert!(debug.contains("people/p-1/profile.md"), "{debug}");
     }
 }

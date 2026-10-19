@@ -11,6 +11,7 @@ use std::io::{self, Write};
 pub mod app;
 pub mod apply;
 pub mod contract;
+pub mod edit;
 pub mod proposals;
 pub mod runner;
 pub mod search;
