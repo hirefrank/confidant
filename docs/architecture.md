@@ -4,7 +4,7 @@
 
 ## 1. What this is
 
-`confidant` is open-source, local-first relationship memory for **one operator** (a solo entrepreneur or coach) and their AI agents. Records are plain text in a git repo (the **vault**). A Rust CLI reads, writes and validates the vault. It runs on the operator's own computer and has no server.
+`confidant` is open-source, local-first relationship memory for **one operator** (a solo professional) and their AI agents. Records are plain text in a git repo (the **vault**). A Rust CLI reads, writes and validates the vault. It runs on the operator's own computer and has no server.
 
 It is modeled on beancount and beancount-io: plain text in git, a CLI with a `--file` / `--json` / `--no-input` automation contract, a `check` command, agent skills that confirm before writing, and an MCP server as a thin layer on top.
 
@@ -14,11 +14,11 @@ It is modeled on beancount and beancount-io: plain text in git, a CLI with a `--
 
 **Later, out of scope here.** A hosted or paid version, probably an agent for non-technical users. Cloudflare Artifacts (git-compatible storage in open beta; one repo per user at scale; short-lived per-repo read/write tokens; events on push; US/EU data location) is the likely base. The hosted side must only ever hold ciphertext. v0 works with any git remote.
 
-**What it is and what it isn't.** `confidant` is the operator's private record of relationships: people, organizations, deals, interactions and notes, plus the judgment about them. It is **not** a system that faces customers. Booking, payments, invoicing, client logins, scheduling and anything a customer touches stay in the tools built for that (a booking portal, Stripe, a calendar). `confidant` reads from those systems: an agent or script *pulls* their events into the vault, so nothing ever pushes into `confidant`, and nothing private flows back out to them. For example, Frank's hirefrank coaching portal keeps booking, Stripe payments, session balances shown to clients and logins, and `confidant` pulls its events.
+**What it is and what it isn't.** `confidant` is the operator's private record of relationships: people, organizations, deals, interactions and notes, plus the judgment about them. It is **not** a system that faces customers. Booking, payments, invoicing, client logins, scheduling and anything a customer touches stay in the tools built for that (a booking portal, a payment processor, a calendar). `confidant` reads from those systems: an agent or script *pulls* their events into the vault, so nothing ever pushes into `confidant`, and nothing private flows back out to them.
 
 ## 2. Why not a typical client/server web app
 
-A server-side CRM must hold plaintext to search, display and summarize notes. That is how every hosted CRM works (Lightfield, HubSpot, Attio and the rest), and it is what the privacy rule below forbids.
+A server-side CRM must hold plaintext to search, display and summarize notes. That is how every hosted CRM works (HubSpot, Attio and the rest), and it is what the privacy rule below forbids.
 
 What a web app does better, and why it doesn't matter here:
 
@@ -38,7 +38,7 @@ What a web app does better, and why it doesn't matter here:
 
 1. Plaintext only on trusted devices (laptop, agent computer).
 2. Only ciphertext in any git remote or backup.
-3. Nothing private in the portal, ever.
+3. Nothing private leaves the trusted devices for an outside tool, ever.
 
 **Accepted exception:** when an agent reads notes, that content is sent to a hosted model provider for processing. This is explicit and accepted. The design does not claim the provider stores nothing; that depends on the provider's terms.
 
@@ -82,7 +82,7 @@ confidant/
 ├── crates/confidant-crypt/     # age key wrapping, record-bound XChaCha20-Poly1305 content encryption
 ├── crates/confidant-cli/       # CLI + agent contract + thin MCP server
 │   └── skills/           # agent skills, embedded in the binary by `setup`
-├── packs/                # schema packs and check packs (coaching first)
+├── packs/                # built-in and vendored schema packs
 ├── examples/demo-vault/  # fake data for tests, docs and agents
 ├── docs/
 └── THIRD_PARTY_LICENSES  # MIT notice for code adapted from cr (ADR-13)
@@ -94,11 +94,10 @@ Structured facts are one-line ledger entries. Prose is Markdown.
 
 ```
 ; ledger/2026/10.cfd
-2026-10-01 open     p-01J9Z3K4QF  package pkg-01J9Z4 6 sessions  ; coaching pack
-2026-10-01 session  p-01J9Z3K4QF  60m paid
+2026-10-01 touch    p-01J9Z3K4QF  call
 2026-10-03 alias    p-01J9Z3K4QF  email hmac:3f9c…  ; keyed HMAC; real value in encrypted profile
-2026-10-08 session  p-01J9Z3K4QF  45m paid  src:transcript/t-01JA02
-2026-10-08 balance  p-01J9Z3K4QF  sessions_remaining 4
+2026-10-08 touch    p-01J9Z3K4QF  meet note:n-01JA02
+2026-10-08 balance  p-01J9Z3K4QF  unknown_metric 4
 2026-10-09 stage    d-01J9ZB7W1M  proposal
 2026-10-12 merge    p-01J9ZQ00XY  into p-01J9Z3K4QF  reason "duplicate account"
 ```
@@ -108,7 +107,7 @@ Structured facts are one-line ledger entries. Prose is Markdown.
 ---
 id: p-01J9Z3K4QF
 type: person
-name: Example Client
+name: Example Person
 ---
 Context, goals, preferences. Prose only; no structured facts here.
 ```
@@ -117,25 +116,25 @@ Context, goals, preferences. Prose only; no structured facts here.
 
 Each ADR is flagged **One-way door** (hard to change once vaults exist) or **Reversible**.
 
-### ADR-1. The file format is a versioned spec, separate from the CLI. Generic core, coaching as a pack.
+### ADR-1. The file format is a versioned spec, separate from the CLI. Generic core, domain schemas as packs.
 
 **Door:** One-way.
 
-**Context.** Agents, scripts and future tools (including a hosted agent) must read and write vaults without depending on one binary. Frank's use is coaching, but open-source users are not all coaches.
+**Context.** Agents, scripts and future tools (including a hosted agent) must read and write vaults without depending on one binary. One operator's domain is not every user's.
 
-**Decision.** Publish the format in `spec/` with a version number declared in each vault's `confidant.toml`. Core record types: person, org, deal, interaction, note. Coaching (sessions, ICF hours, packages, renewals) is a **schema pack** (ADR-8), not core.
+**Decision.** Publish the format in `spec/` with a version number declared in each vault's `confidant.toml`. Core record types: person, org, deal, interaction, note. Domain schemas (a clinic's appointments and packages, a team's projects, and so on) are **schema packs** (ADR-8), not core.
 
-**Alternatives considered.** (a) Format defined by whatever the CLI does: faster at first, but every change silently breaks other readers. (b) Coaching types in core: simpler for Frank, but bakes one profession into every vault.
+**Alternatives considered.** (a) Format defined by whatever the CLI does: faster at first, but every change silently breaks other readers. (b) One domain's types in core: simpler for that operator, but bakes one profession into every vault.
 
-**Consequences.** Format changes need a spec version bump and a migration (`confidant migrate`). The core stays small. The coaching pack is the first real test that packs work.
+**Consequences.** Format changes need a spec version bump and a migration (`confidant migrate`). The core stays small. External packs are the test that packs work.
 
 ### ADR-2. Structured facts are dated ledger entries in a strict grammar; prose is Markdown.
 
 **Door:** One-way.
 
-**Context.** An agent writes most data. Structured facts (sessions, stage changes, payments) must be checkable, diffable and mergeable. Derived values (sessions remaining, ICF hours) must not drift.
+**Context.** An agent writes most data. Structured facts (touchpoints, stage changes, payments) must be checkable, diffable and mergeable. Derived values (pack balances and totals) must not drift.
 
-**Decision.** Facts are one-line entries, `DATE VERB ID ARGS…`, beancount style, e.g. `2026-10-01 session p-01J9… 60m paid`. Prose lives in Markdown. Derived values are computed, never stored as truth. `balance` entries are assertions that `confidant check` verifies against the computed value. YAML frontmatter holds only identity and display fields (id, type, name), not facts.
+**Decision.** Facts are one-line entries, `DATE VERB ID ARGS…`, beancount style, e.g. `2026-10-01 touch p-01J9… call`. Prose lives in Markdown. Derived values are computed, never stored as truth. `balance` entries are assertions that `confidant check` verifies against the computed value. YAML frontmatter holds only identity and display fields (id, type, name), not facts.
 
 Ledger arguments never carry plaintext PII. Alias values (emails, phones, handles) are stored either as `HMAC(vault lookup key, normalized value)` for matching, with the real value in the encrypted profile, or as an encrypted payload (Open question 2). A plain hash isn't enough because it can be dictionary-attacked. The lookup key is wrapped to devices like a data key. The ledger is the only source of truth for facts; there is no separate audit journal (ADR-6).
 
@@ -228,10 +227,10 @@ There is no separate audit journal. The audit trail is the ledger plus git histo
 - Search results return ID, path and excerpt.
 - A demo vault with fake data.
 - The MCP server is a thin wrapper over the CLI, never a second way in.
-- Shipped skills (prep session, log session, open renewal, weekly pipeline review) confirm with the human before writing.
+- Shipped skills confirm with the human before writing.
 
 ```sh
-confidant log session p-01J9Z3K4QF 60m paid --request-id 01J9Z3K4QF7F3A000000000000 --json --no-input --dry-run
+confidant log touch p-01J9Z3K4QF call --request-id 01J9Z3K4QF7F3A000000000000 --json --no-input --dry-run
 confidant context p-01J9Z3K4QF --exclude-private --json
 confidant check --json
 ```
@@ -239,13 +238,13 @@ confidant check --json
 ```json
 {
   "ok": false,
-  "vault": "/home/frank/vault",
+  "vault": "/home/operator/vault",
   "error": {
-    "code": "E_COACHING_BALANCE_MISMATCH",
+    "code": "E_UNKNOWN_METRIC",
     "file": "ledger/2026/10.cfd",
     "line": 5,
-    "message": "sessions_remaining asserted 4, computed 3",
-    "fix": "Check for a missing 'open' entry or a duplicated 'session' entry for p-01J9Z3K4QF"
+    "message": "unknown metric",
+    "fix": "Use a metric an enabled pack defines, or remove the balance line"
   }
 }
 ```
@@ -258,34 +257,34 @@ confidant check --json
 
 **Door:** Reversible.
 
-**Context.** Integrations (portal, email, transcripts, QMD indexing) are what agents are good at, and they change often. What must *not* be skipped, whoever writes, is validation. Beancount gets this right: its plugins transform and validate entries on every load.
+**Context.** Integrations (a booking portal, email, meeting notes, search indexing) are what agents are good at, and they change often. What must *not* be skipped, whoever writes, is validation. Beancount gets this right: its plugins transform and validate entries on every load.
 
 **Decision.** v0 has **no general plugin system for integrations.** Agents handle every integration by calling the agent contract (ADR-7), shipped as agent skills or small scripts embedded in the CLI binary (`crates/confidant-cli/skills/`, installed by `confidant setup`). Extensible in v0:
 
-1. **Check rules / validators.** Run on every write and in `confidant check`, regardless of who writes (human, agent, script). Example: an `ICF hours` rule that rejects a session without a duration.
-2. **Schema packs.** Define record types, ledger verbs and derived values, declared in `confidant.toml`. Coaching is the first pack: sessions, packages, balances, renewals, ICF hours.
+1. **Check rules / validators.** Run on every write and in `confidant check`, regardless of who writes (human, agent, script). Example: a rule that rejects a package `open` line with no unit count.
+2. **Schema packs.** Define record types, ledger verbs and derived values, declared in `confidant.toml`. The built-in personal pack is the reference; external packs add domain schemas (a clinic's appointments, a team's projects).
 3. **Local decrypted operations (possible).** Operations that need plaintext, such as building a search index, run inside or under the CLI so plaintext doesn't have to leave it through a general export. Scope to be decided (Open question 4).
 
 ```toml
 # confidant.toml
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 
 [checks]
-coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
+example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
 ```
 
-Integrations are idempotent and record provenance on each entry (`src:portal/evt-…`, `src:transcript/t-…`) so re-running an import adds nothing.
+Integrations are idempotent and record provenance on each entry (`src:<source>/<id>`) so re-running an import adds nothing.
 
 ```sh
-# installed portal-sync skill script, run by the agent on a schedule
-confidant import --file portal-events.jsonl --request-id portal-2026-10-07 --json --no-input
+# installed import skill script, run by the agent on a schedule
+confidant import --file events.jsonl --request-id import-2026-10-07 --json --no-input
 ```
 
 **Alternatives considered.** Git-style subprocess plugins: `confidant-<name>` on PATH, a JSON stdin/stdout protocol, and a capability manifest declaring whether the plugin needs the private (decrypted) tier. Clean, and a likely later addition, but in v0 it is a framework to design, version and secure before there is a second user who needs it. Agents plus the CLI contract cover the same integrations today.
 
-**Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; the coaching pack ships as an external declarative pack, while the built-in personal pack stays compiled behind the same pack interface.
+**Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; external packs are declarative, while the built-in personal pack stays compiled behind the same pack interface.
 
 *External packs (#193, approved 2026-10-16).* Schema packs can now also
 ship outside the binary: a v2 manifest (`spec/pack-manifest.md` §13)
@@ -298,7 +297,7 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Door:** Reversible.
 
-**Context.** People have several emails and handles. Lightfield currently has a client duplicated across two accounts.
+**Context.** People have several emails and handles, and an outside system can hold the same person under two accounts.
 
 **Decision.** `alias` entries attach emails, phones and handles to an ID, stored as a keyed HMAC or encrypted, never as plaintext (ADR-2). A `merge` entry folds one ID into another; the old ID stays resolvable and its history is kept. `confidant check` warns on two IDs sharing an alias.
 
@@ -390,63 +389,72 @@ registry, no signing in v1. External packs affect `check` only.
 
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, parser, generic records, derived values, balance assertions, check engine, coaching pack, demo vault.
+1. **Spec + core + check.** Format spec 0.1, parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Crypt.** age key wrapping, record-bound content encryption, signed recipient changes, recovery key (ADR-15), `confidant keys`, scoped keys, shredding, git-crypt compatibility notes. Done when a recovery drill passes: clone the demo vault onto a clean machine, recover with only the phrase, rotate to a new phrase, and confirm the old one no longer works. Store the phrase in 1Password plus a printed copy kept somewhere physical; `confidant doctor` gives a yearly reminder to check the paper copy.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
-4. **Portal sync + transcript import skills.** Agent skills that pull portal events and transcripts (with duration) into the vault, with dry runs and safe retries.
+4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.
 5. **QMD search (right after v0).** On trusted devices with encrypted disks only, and the index never goes in git (section 9b).
 6. **Terminal UI (`crates/confidant-tui`, after v0).** Reference second consumer of the ADR-7 CLI contract: invokes `confidant <subcommand> --json --no-input` as a child process without linking `confidant-core`, keeping plaintext on the alternate screen only (#205, #210).
 
 Out of v0: hosted version, integration plugin system, GUI.
 
-## 8a. Worked example: session forms
+## 8a. Worked example: encrypted intake (the inbox pattern)
 
-Frank sends each client a form before and after every session. The answers should end up in the vault, and the questions should be shaped by past sessions. Delivery can be an email link to a web form or a form embedded in a Slack message. This flow exercises the whole architecture without a Confidant server or a plugin system.
+An outside tool can hand material to the vault without a server and without
+being able to read the vault. This flow exercises the architecture without a
+Confidant server or a plugin system.
 
-**Who sees what.** The forms are customer-facing, so they live in the portal (which already has `form_submissions` for presession, reflection and discovery forms) or in Slack. Private notes stay in the vault. The only thing that crosses from the vault to a server is question text, and the client sees that anyway.
+**Who sees what.** The outside tool already holds whatever the customer
+typed there; private notes stay in the vault. The only thing that crosses
+from the vault to a server is text the customer sees anyway.
 
 **Flow.**
 
-1. **Draft questions locally.** Before a session, the agent runs `confidant context <person>` on a trusted device and drafts tailored questions from recent sessions, open commitments and themes.
-2. **Approve, then send.** By default Frank approves the questions before they go out, because they come from private notes and one slip (a detail that belongs to another client, say) would be costly. Sending without approval can be a per-template setting later.
-3. **Deliver.** The agent pushes only the question text to the delivery channel: the portal's emailed web form, or a form embedded in a Slack message. The channel doesn't matter to Confidant.
-4. **Capture answers encrypted.** Strongest option: the web form encrypts answers in the client's browser using the vault's public key, so the portal stores only ciphertext. Baseline: the portal stores answers as it does today, and the agent deletes them from the portal after a verified import.
-5. **Import through the inbox.** The agent pulls new answers (or picks up encrypted items dropped into an `inbox/` branch or folder), runs `confidant inbox` to validate and merge them, and writes encrypted interaction entries linked to the session with provenance (`src:form/<submission-id>`). Importing twice adds nothing.
+1. **Prepare locally.** On a trusted device, the agent runs
+   `confidant context <person>` and drafts the payload from recent
+   interactions, open commitments and themes.
+2. **Approve, then send.** By default the operator approves anything derived
+   from private notes before it leaves the trusted device.
+3. **Deliver.** The agent pushes only the intended text to the delivery
+   channel. The channel does not matter to Confidant.
+4. **Capture answers encrypted.** The outside tool encrypts each item to the
+   vault's public inbox key and stores only ciphertext.
+5. **Import through the inbox.** The agent picks up encrypted items dropped
+   into an `inbox/` branch or folder, runs `confidant inbox` to validate and
+   merge them, and writes encrypted interaction entries with provenance
+   (`src:<source>/<id>`). Importing twice adds nothing.
 
-**Inbox pattern (general).** Any outside tool can drop content for the vault without a server and without being able to read the vault: it encrypts each item to the vault's public key and pushes it to `inbox/`. `confidant inbox` (new command) decrypts, runs `check`, merges into the vault and clears the inbox. GitHub webhooks are not used for intake. They only notify a server you would have to run, and a GitHub Action must never hold decryption keys.
+**Inbox pattern (general).** Any outside tool can drop content for the vault
+without a server and without being able to read the vault: it encrypts each
+item to the vault's public key and pushes it to `inbox/`. `confidant inbox`
+decrypts, runs `check`, merges into the vault and clears the inbox. GitHub
+webhooks are not used for intake. They only notify a server you would have to
+run, and a GitHub Action must never hold decryption keys.
 
-**Decided (see section 9).** In v0, answers are deleted from the portal after a verified import, and browser-side encryption comes in v0.1. The inbox is a separate `inbox` branch, with main protected so only trusted signers can write to it.
+**Intended pattern.** The operator deletes answers from the outside tool
+after a verified import; browser-side encryption is the stronger option.
+The inbox is a separate `inbox` branch, with main protected so only trusted
+signers can write to it. This is the intended pattern, not a v0 enforcement
+claim (see section 9).
 
-## 9. Open questions for Frank
+## 9. Open questions (resolved)
 
 1. **Name.** Resolved: Confidant (CLI `confidant`), chosen 2026-10-07 after an availability check.
 2. **Ledger privacy.** Resolved 2026-10-07: amounts and dates stay plain metadata, tied only to opaque IDs, so `check`, balances and merges work without a key. Names, notes and alias values stay encrypted. Alias lookup uses a keyed HMAC, with the real values encrypted (ADR-2).
-3. **Transcripts.** Resolved: source-agnostic. Confidant doesn't care which tool records or stores transcripts. An import skill reads them from wherever they live (Frank's are already saving in parallel to Google Drive) and writes encrypted interaction entries with provenance (`src:transcript/<source-id>`) and duration, which ICF hours use. Copies left in a hosted store like Drive are outside Confidant's privacy guarantee; deleting them after import is the operator's call.
+3. **Transcripts.** Resolved: source-agnostic. Confidant doesn't care which tool records or stores transcripts. An import skill reads them from wherever they live and writes encrypted interaction entries with provenance (`src:<source>/<id>`) and duration, which pack metrics can use. Copies left in a hosted store are outside Confidant's privacy guarantee; deleting them after import is the operator's call.
 4. **Local decrypted operations.** Resolved: not in v0. Agents use `confidant context` and `--json` output for now.
-5. **First integration skill.** Resolved: portal sync (renewals, sent checkouts, lost deals), because it feeds renewals and deals into the vault.
-6. **Session forms (8a).** Resolved: in v0 the agent deletes answers from the portal after a verified import. Browser-side encryption comes in v0.1.
-7. **Inbox location.** Resolved: a separate `inbox` branch, with main protected so only trusted signers can write to it.
+5. **First integration skill.** Resolved: an import from the outside tool that feeds records and ledger entries into the vault.
+6. **Inbox location.** Resolved: a separate `inbox` branch, with main protected so only trusted signers can write to it.
 
 ## 9b. Risks and how we handle them (decided 2026-10-07)
 
 1. **Conflicting edits to an encrypted file.** Git can't merge ciphertext. When two devices change the same record, the CLI keeps both versions side by side, `confidant check` flags the conflict, and the agent or the operator picks which one to keep. Nothing is silently dropped. Conflicts should be rare, because records are one file each and writes are mostly append-only.
-2. **The model provider sees plaintext.** Agents send what they read to a hosted model provider. The README and privacy model say so plainly and don't claim the provider stores nothing. A per-client `no-ai` flag keeps that client's notes and PII out of `confidant context` and `--json` output used by agents, so the operator can keep sensitive clients away from models entirely.
-3. **Capture going stale.** Confidant only knows what agents write into it. A `confidant check` rule flags gaps, such as a session with no notes, or a paid client with no session within a set window. The agent sends the operator a weekly summary of these gaps.
-4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred clients (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks (FileVault on the laptop, and the agent's computer), and its index stays out of git and is never synced anywhere.
+2. **The model provider sees plaintext.** Agents send what they read to a hosted model provider. The README and privacy model say so plainly and don't claim the provider stores nothing. A per-client `no-ai` flag keeps that client's notes and PII out of `confidant context` and `--json` output used by agents, so the operator can keep sensitive people away from models entirely.
+3. **Capture going stale.** Confidant only knows what agents write into it. A `confidant check` rule flags gaps, such as a record with no follow-up note, or a contact with no touchpoint within a set window. The agent sends the operator a weekly summary of these gaps.
+4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred people (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks, and its index stays out of git and is never synced anywhere.
 5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with client data.
 
    Changed 2026-10-12 by Frank: the crates.io release is **not** treated as the invitation. Publishing (needed for `cargo install confidant-cli` to resolve its dependencies) goes ahead with an explicit disclosure that the crypto is unaudited and the CLI write path still produces plaintext; a disclosure that withholds the invitation satisfies this item as written. The outside review and code audit are still required before any surface invites trust with client data, and remain tracked in issue #138. If the audit finds a defect, the fix ships as a new version; published versions are yanked, not deleted.
-
-## Appendix A. Moving off Lightfield (Frank's context)
-
-- **No deadline.** Frank has already cancelled the renewal and hasn't opened Lightfield in a long time. Agents replaced how he used it. Its only valuable feature was meeting transcription, which isn't unique to it.
-- **What matters.** Transcripts (already saving in parallel to Google Drive) and the notes written from them. The transcript import skill (Open question 3) is the real migration.
-- **Export and import.** Export Lightfield before access ends, and import whatever is useful from it (contacts, deals, meeting notes, transcripts). It's best-effort: transcripts and notes are the must-have, and everything else is a bonus. The export is plaintext PII: keep it on a trusted device, never commit it, and delete it after a verified import.
-- **Loose ends.** Paige's coaching skills that read Lightfield directly (session prep, renewal offers, ICF hours) move to `confidant`. ICF hours read duration from transcripts. The portal's Lightfield sync gets turned off. Paige reviews these changes, since she owns the coaching practice.
-
-## Appendix B. Simplifying the coaching CLI (after v0)
-
-Once Confidant v0 ships, list every `bun run` coaching command and mark each one move, keep or drop. Commands that touch client records, the ledger or sessions move to `confidant`. Portal, forms and outreach stay in the coaching CLI as thin skills that call `confidant`. Paige reviews the list, since it's her workflow. Not started; deferred by Frank on 2026-10-07.
 
 ## Appendix: Prior art (sweep 2026-10-07)
 

@@ -32,9 +32,9 @@ only). There are no field-level flags — the record is the unit.
   metadata**: the personal pack's cadence and touch state (`cadence_days`,
   `cadence_never`, `last_touch`, `days_since_touch`, `overdue`,
   `recent_touches`, and the declared `snooze_until`), the top-level
-  `touchpoints` list (dates and kinds of the `touch` lines), the coaching
-  pack's `sessions_remaining`, `icf_hours`, and `recent_sessions` (dates,
-  durations, billing tags), and opaque `hmac:` alias hashes. These are
+  `touchpoints` list (dates and kinds of the `touch` lines), any enabled
+  pack's derived balance metrics and recent entries (dates, durations,
+  tags), and opaque `hmac:` alias hashes. These are
   structural, not content: a schedule and the dates it ran against, so an
   agent can still tell that the person is overdue or deliberately set to
   `never`. `find`, the allowlist, and the search corpus return none of that.
@@ -152,7 +152,7 @@ from the pack registry, and out-of-scope items are filtered out. It is NOT
 cryptography — every client still holds the same recipient set, so a
 scoped agent that can read the vault files directly can see everything.
 What scoping stops is an agent over-reaching through the tool surface:
-a coaching-scoped agent never sees personal notes about the same person
+a pack-scoped agent never sees another pack's notes about the same person
 through `context`, `find`, or MCP.
 
 Rules:

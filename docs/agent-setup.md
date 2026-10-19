@@ -76,9 +76,8 @@ To add an external pack after init:
 
 ```sh
 confidant pack add <https-url> --yes
-# for coaching:
-confidant pack add https://github.com/hirefrank/confidant.git \
-  --subdir packs/coaching --yes
+# or a local directory you authored:
+confidant pack add --from-dir ~/confidant-packs/my-pack --yes
 ```
 
 The pack is vendored under `packs/`, pinned in `confidant.lock`, and listed

@@ -50,7 +50,7 @@ Read before changing behaviour:
 | `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary and on crates.io; launched via `confidant tui` |
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser and §14 envelope decoder (own workspace, excluded from the main one; not run in CI) |
 | `spec/` | Format spec and finding codes |
-| `packs/` | Schema packs (the built-in personal pack) |
+| `packs/` | Schema packs (built-in personal; external packs live in the vault) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |
@@ -123,7 +123,7 @@ These are blocking. Do not open a PR for review that breaks one.
    phone numbers, notes, transcripts, keys, recovery phrases, tokens, or
    secrets anywhere in the repo: code, tests, fixtures, docs, examples,
    commit messages, issues, or CI logs. Use the demo vault's style of
-   obviously fake people (`Ada Example`) and fake ULIDs.
+   obviously fake people (`Robin Example`) and fake ULIDs.
 2. **CI never holds vault keys.** Crypto tests generate throwaway keys
    during the run (ADR-14). Do not add secrets to workflows, and never give
    a GitHub Action decryption keys.

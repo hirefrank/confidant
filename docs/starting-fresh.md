@@ -5,7 +5,7 @@ Two operator jobs that are easy to get wrong:
 - **Starting fresh:** replacing or wiping a vault without leaving the old
   vault's trust anchor, keys, or config entries behind.
 - **Adopting in stages:** using one vault for personal relationships first,
-  then adding coaching clients later.
+  then adding external packs later.
 
 Confidant's data lives in a vault you can copy or delete. The *machine* also
 remembers things outside the vault, and those are what usually break a reset.
@@ -338,7 +338,7 @@ Tracked defect from verification:
 - Re-enrollment is not `init`: running `init` again creates a new vault's
   keys rather than recovering the old ones.
 
-## 3. Adopting in stages: personal first, coaching later
+## 3. Adopting in stages: personal first, packs later
 
 ### 3.1 Start with the personal pack (nothing to install)
 
@@ -350,45 +350,52 @@ That gives you birthdays, relationship edges, keep-in-touch cadence, upcoming
 dates, and the `touch` ledger verb:
 
 ```sh
-confidant record add --file ada.md --no-input
-confidant log touch "Ada Example" call --date 2026-10-19
-confidant context "Ada Example"
+confidant record add --file robin.md --no-input
+confidant log touch "Robin Example" call --date 2026-10-19
+confidant context "Robin Example"
 ```
 
 Quote display names with spaces. A `no-ai: true` person is addressed by
 `p-<ULID>` only.
 
-### 3.2 Add coaching later
+### 3.2 Add a pack later
 
-When you are ready, install the external coaching pack into the same vault:
+When you are ready, author or install an external pack into the same vault.
+A local pack needs no git host:
 
 ```sh
-confidant pack add https://github.com/hirefrank/confidant.git \
-  --subdir packs/coaching --yes
+confidant pack init ~/confidant-packs/weekly-checkin
+confidant pack add --from-dir ~/confidant-packs/weekly-checkin          # review
+confidant pack add --from-dir ~/confidant-packs/weekly-checkin --yes    # install
 ```
 
-Verified effects:
+`pack init` writes `manifest.toml`, `SKILL.md`, `<version>.md`, and
+`README.md` for the new pack. Fill in its verbs, fields, finding codes,
+`[checks]` keys, and rules, then install it. An external pack fetched over
+HTTPS uses `confidant pack add <https-url> --yes` instead.
 
-- vendors `packs/coaching@0.1/` (manifest, `SKILL.md`, `0.1.md`) into the
-  vault;
+Installing a pack:
+
+- vendors `packs/<name>@<version>/` (manifest, `SKILL.md`, contract file)
+  into the vault;
 - writes `confidant.lock` with the pack hash;
-- sets `packs = ["coaching@0.1"]` in `confidant.toml`;
+- sets `packs = ["<name>@<version>"]` in `confidant.toml`;
 - commits those files in one commit.
 
 It does **not** touch records, client keys, or the trust anchor. `check`
-starts applying coaching rules (sessions, packages, balances, gap rules), and
-coaching verbs such as `log session` become valid. Existing personal records
-stay where they are; there is no migration.
+starts applying the pack's rules and its verbs become valid. Existing
+personal records stay where they are; there is no migration.
 
-Do not try to seed coaching at `init` time with `--packs coaching@0.1`.
-`init` only seeds packs built into the binary (today the implicit
-`personal@0.2`); naming an external pack is a usage error (exit 2) with a fix
-telling you to install it after init ([#639](https://github.com/hirefrank/confidant/issues/639)).
-Init with no packs, then `pack add`.
+Do not try to seed an external pack at `init` time with
+`--packs <name>@<version>`. `init` only seeds packs built into the binary
+(today the implicit `personal@0.2`); naming an external pack is a usage
+error (exit 2) with a fix telling you to install it after init
+([#639](https://github.com/hirefrank/confidant/issues/639)). Init with no
+packs, then `pack add`.
 
-To undo the change, `confidant pack remove coaching --yes` removes the
+To undo the change, `confidant pack remove <name> --yes` removes the
 vendored files, the lock entry, and the `packs` listing. Data written under
-coaching verbs then becomes `W_PACK_ORPHAN` warnings, not errors; the
+the pack's verbs then becomes `W_PACK_ORPHAN` warnings, not errors; the
 personal pack is never orphaned. `confidant pack list` and
 `confidant pack verify` show what is installed and whether the hash still
 matches.
@@ -404,16 +411,16 @@ queries.) That is useful against an agent over-reaching through the tool
 surface.
 
 It is **not** an encryption or access boundary yet. Every client still holds
-the same recipient set, so a coaching-scoped agent that can read the vault
-files directly, or run the CLI unscoped, can see the personal records too.
-The crypto layer (per-client recipient sets) is future work:
+the same recipient set, so a pack-scoped agent that can read the vault files
+directly, or run the CLI unscoped, can see the other pack's records too. The
+crypto layer (per-client recipient sets) is future work:
 [#160](https://github.com/hirefrank/confidant/issues/160). The policy layer
 landed under [#178](https://github.com/hirefrank/confidant/issues/178).
 
-If coaching/personal isolation must be a real boundary today, use **separate
-vaults** (separate keys, separate git histories) rather than one vault with
-two packs. `no-ai` hides content from agent-facing reads, but it is also not
-a boundary against a process that can read the files.
+If pack isolation must be a real boundary today, use **separate vaults**
+(separate keys, separate git histories) rather than one vault with two packs.
+`no-ai` hides content from agent-facing reads, but it is also not a boundary
+against a process that can read the files.
 
 ## 4. Verification checklist
 
@@ -481,7 +488,7 @@ secret-tool lookup service confidant-inbox username inbox-key >/dev/null \
 On macOS the equivalent check is
 `security find-generic-password -s confidant-inbox -a inbox-key >/dev/null`.
 
-Finally, if you added coaching, confirm the pack is installed and pinned:
+Finally, if you added a pack, confirm it is installed and pinned:
 
 ```sh
 confidant pack list
@@ -489,5 +496,5 @@ confidant pack verify
 confidant check --json --no-input
 ```
 
-`pack list` should show `coaching 0.1` with `status: ok`; `pack verify`
-should exit 0; `check` should still be `"ok": true`.
+`pack list` should show the pack with `status: ok`; `pack verify` should exit
+0; `check` should still be `"ok": true`.

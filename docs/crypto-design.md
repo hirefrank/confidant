@@ -92,7 +92,8 @@ conflict handling):
 
 - `confidant.toml` (including `vault_id`), ledger files (`ledger/YYYY/MM.cfd`):
   dates, verbs, opaque IDs (`p-…`, `pkg-…`), amounts/session counts, stage
-  tokens, billing tags (`paid`/`pps`/`comp`), `src:` provenance IDs.
+  tokens, pack tag tokens (for example a session pack's payment tags),
+  `src:` provenance IDs.
   Amounts and dates stay plain metadata tied only to opaque IDs (§9 Q2).
 - Alias lines: `hmac:HEX` values only (never plaintext aliases) — §10.
 - Record paths (opaque IDs; filenames never reveal who is a client) and the

@@ -11,7 +11,7 @@ with #160.
 ## What the policy layer does and does not do
 
 The policy layer stops an agent from over-reaching *through the tool
-surface*: a coaching-scoped MCP call never returns personal notes, even
+surface*: a pack-scoped MCP call never returns another pack's notes, even
 though the same vault holds them. It does **not** stop anyone who can
 read the vault files directly. Encryption today is per-person, not
 per-pack (`client_id_for_record` maps person/note/interaction → person
@@ -30,8 +30,8 @@ operator's — that is, when *someone other than the operator* holds a
 device key:
 
 1. **A second device or service with narrower access.** E.g. a hosted
-   coaching agent that should be able to decrypt coaching sessions but
-   not personal notes, even if its host is compromised or curious.
+   agent for one pack that should be able to decrypt that pack's entries
+   but not personal notes, even if its host is compromised or curious.
    Today there is no such reader: every client is the operator's own.
 2. **Multi-user vaults.** If two people share a vault (a household, a
    team) and each should decrypt only their packs' data, policy
@@ -39,8 +39,8 @@ device key:
    *unable* to decrypt out-of-scope records, not merely asked not to.
 3. **Audit or compliance requiring cryptographic separation.** If a
    future requirement says "personal data must be undecryptable by the
-   coaching service" rather than "the coaching service must not
-   request it", only per-pack keys satisfy it.
+   other pack's service" rather than "that service must not request it",
+   only per-pack keys satisfy it.
 
 Until one of those arrives, the policy layer is the right scope: it
 solves the real, present problem (agent over-reach through tools) with
@@ -50,15 +50,15 @@ no key-format change, no migration, and no new failure modes.
 
 - **Client ids become per-(person, pack).** Today a record's client id
   is derived from its person (or `vault:shared`). Under per-pack keys it
-  would be derived from (person, owning pack) — e.g. a coaching note
+  would be derived from (person, owning pack) — e.g. a pack-owned note
   about Ada encrypts under a key whose recipients are exactly the
-  devices authorized for (Ada, coaching). Core-owned identity (name,
+  devices authorized for (Ada, pack-a). Core-owned identity (name,
   aliases) stays under the per-person key, readable by every pack.
 - **Unattributed records stay per-person.** Anything the registry
   cannot attribute to a pack keeps the current per-person keying; the
   policy layer still hides it from scoped agents.
 - **Recipient sets narrow, never widen.** A device authorized for
-  (Ada, coaching) must not gain (Ada, personal) by asking. Key
+  (Ada, pack-a) must not gain (Ada, pack-b) by asking. Key
   provisioning becomes a per-(person, pack) grant, and #160's scoped
   recipients work is the prerequisite.
 - **Migration is a re-encrypt.** Existing records would need
