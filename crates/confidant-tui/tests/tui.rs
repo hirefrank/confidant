@@ -400,6 +400,104 @@ fn error_alert_and_usage_error_alert_snapshots() {
     assert_snapshot("alert_usage.snap", &rendered_usage);
 }
 
+/// #591: an exit-2 usage error that names an unknown subcommand is a
+/// `confidant` older than this TUI. The TUI says so in one actionable line
+/// (naming the resolved binary and the subcommand) instead of dumping the
+/// raw clap help, which stays reachable with `x`.
+#[test]
+fn unknown_subcommand_usage_error_names_cli_skew_not_raw_help() {
+    let usage_json = r#"{
+        "ok": false,
+        "schema_version": "1",
+        "vault": null,
+        "error": {
+            "code": "usage_error",
+            "message": "error: unrecognized subcommand 'list'\n\nUsage: confidant record [OPTIONS] <COMMAND>\n\nFor more information, try '--help'."
+        }
+    }"#;
+    let fake = FakeRunner::from_json(2, usage_json).with_bin("/tmp/fake-confidant");
+    let mut app = App::new(fake);
+    app.load_roster();
+
+    let alert = app.alert.as_ref().expect("skew alert shown");
+    assert_eq!(alert.code.as_deref(), Some("old_cli"));
+    assert!(
+        alert.message.contains("/tmp/fake-confidant"),
+        "resolved path named in: {}",
+        alert.message
+    );
+    assert!(
+        alert.message.contains("list"),
+        "subcommand named in: {}",
+        alert.message
+    );
+
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("CLI Version Skew"), "{rendered}");
+    assert!(rendered.contains("/tmp/fake-confidant"), "{rendered}");
+    assert!(
+        !rendered.contains("For more information"),
+        "raw clap help must not be shown first:\n{rendered}"
+    );
+
+    // `x` opens the raw CLI text in the dismissable info modal.
+    app.handle_key(key(KeyCode::Char('x')));
+    assert!(app.info_modal.is_some(), "raw text reachable with x");
+    let raw = render_to_string(&app);
+    assert!(raw.contains("unrecognized subcommand 'list'"), "{raw}");
+    assert!(raw.contains("For more information"), "{raw}");
+    // Any key closes it, and the alert is still up afterwards.
+    app.handle_key(key(KeyCode::Char('z')));
+    assert!(app.info_modal.is_none());
+    assert!(app.alert.is_some());
+}
+
+/// #591: only the unknown-subcommand shape is a skew; an ordinary CLI error
+/// and a usage error that names no subcommand keep their current rendering,
+/// and neither carries a hidden raw payload.
+#[test]
+fn ordinary_errors_keep_current_rendering_and_no_raw() {
+    let err_json = r#"{
+        "ok": false, "schema_version": "1", "vault": "/fake/demo-vault",
+        "error": {"code": "E_LEDGER_UNREADABLE", "message": "1 items",
+                  "fix": "Fix permissions"}
+    }"#;
+    let fake = FakeRunner::from_json(1, err_json).with_bin("/tmp/fake-confidant");
+    let mut app = App::new(fake);
+    app.load_check();
+    let alert = app.alert.as_ref().expect("alert shown");
+    assert_eq!(alert.title, "CLI Error (exit 1)");
+    assert_eq!(alert.code.as_deref(), Some("E_LEDGER_UNREADABLE"));
+    assert!(alert.raw.is_none(), "no raw payload on an ordinary error");
+
+    // A usage error without an unknown subcommand keeps the usage rendering.
+    let usage_json = r#"{
+        "ok": false, "schema_version": "1", "vault": null,
+        "error": {"code": "usage_error", "message": "find requires a non-empty query"}
+    }"#;
+    let fake = FakeRunner::from_json(2, usage_json);
+    let mut app = App::new(fake);
+    app.load_check();
+    let alert = app.alert.as_ref().expect("usage alert shown");
+    assert_eq!(alert.title, "Usage Error (exit 2)");
+    assert!(alert.raw.is_none());
+    // `x` is inert when the alert has no raw payload.
+    app.handle_key(key(KeyCode::Char('x')));
+    assert!(app.info_modal.is_none());
+}
+
+/// #591: the resolved CLI path is a durable fact in the Scope modal.
+#[test]
+fn scope_modal_shows_resolved_cli_path() {
+    let fake = people_runner().with_bin("/tmp/fake-confidant");
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('p')));
+    let scope = render_to_string(&app);
+    assert!(scope.contains("cli: /tmp/fake-confidant"), "{scope}");
+}
+
 #[test]
 fn non_json_stdout_shows_alert_and_does_not_panic() {
     let fake = FakeRunner::single(1, b"not valid json {{{".to_vec());

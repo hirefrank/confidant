@@ -12,8 +12,8 @@ use crate::theme::palette;
 
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus, WriteOutcome};
 use crate::contract::{
-    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, FindResult,
-    InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
+    parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, ErrorBody,
+    FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
 };
 use crate::edit::{self, EditFlow, EditPhase};
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
@@ -304,7 +304,8 @@ impl<R: Runner> App<R> {
             } => {
                 self.people.loaded = true;
                 self.people.load_error = Some(error.message.clone());
-                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
             }
             ContractOutcome::InvalidJson { status } => {
                 self.people.loaded = true;
@@ -359,6 +360,7 @@ impl<R: Runner> App<R> {
                         .to_owned(),
                 ),
                 blocking: false,
+                raw: None,
             });
             return;
         }
@@ -377,6 +379,7 @@ impl<R: Runner> App<R> {
                     message: format!("could not run python3: {e:#}"),
                     fix: Some("Install python3, or press e for exact search".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
                 return;
             }
@@ -463,6 +466,7 @@ impl<R: Runner> App<R> {
                         .to_owned(),
                     fix: Some("Run `confidant setup` to install skills".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
                 None
             }
@@ -807,6 +811,7 @@ impl<R: Runner> App<R> {
             message: "this confidant binary does not support `record resolve`".to_owned(),
             fix: Some("upgrade confidant to resolve merge conflicts".to_owned()),
             blocking: false,
+            raw: None,
         }
     }
 
@@ -844,7 +849,8 @@ impl<R: Runner> App<R> {
                 usage_error,
                 error,
             } => {
-                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
             }
             ContractOutcome::VersionMismatch { reported_version } => {
                 self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
@@ -912,7 +918,8 @@ impl<R: Runner> App<R> {
                 usage_error,
                 error,
             } => {
-                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
             }
             ContractOutcome::VersionMismatch { reported_version } => {
                 self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
@@ -979,6 +986,7 @@ impl<R: Runner> App<R> {
                     message: format!("`record resolve --edit` exited with status {status}"),
                     fix: Some("re-run the hand-merge from the conflict detail view".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
             }
             Err(e) => {
@@ -1008,6 +1016,7 @@ impl<R: Runner> App<R> {
                 message: "no context is loaded for the selected person".to_owned(),
                 fix: Some("select a person in People, then press e".to_owned()),
                 blocking: false,
+                raw: None,
             });
             return;
         };
@@ -1026,6 +1035,7 @@ impl<R: Runner> App<R> {
                 message: "`.confidant/` is not git-ignored in this vault, so the edit scratch could be committed".to_owned(),
                 fix: Some("Add `.confidant/` to .gitignore, then retry".to_owned()),
                 blocking: false,
+                raw: None,
             });
             return;
         }
@@ -1038,6 +1048,7 @@ impl<R: Runner> App<R> {
                 message: "neither $VISUAL nor $EDITOR is set".to_owned(),
                 fix: Some("Set $EDITOR (or $VISUAL), then press e again".to_owned()),
                 blocking: false,
+                raw: None,
             });
             return;
         };
@@ -1069,7 +1080,8 @@ impl<R: Runner> App<R> {
                 usage_error,
                 error,
             } => {
-                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
                 return;
             }
             ContractOutcome::InvalidJson { status } => {
@@ -1085,6 +1097,7 @@ impl<R: Runner> App<R> {
                 message: format!("{} is not a usable record id", target.id),
                 fix: None,
                 blocking: false,
+                raw: None,
             });
             return;
         };
@@ -1097,6 +1110,7 @@ impl<R: Runner> App<R> {
                 message: format!("{e:#}"),
                 fix: Some(format!("Check permissions on {}", root.display())),
                 blocking: false,
+                raw: None,
             });
             return;
         }
@@ -1129,6 +1143,7 @@ impl<R: Runner> App<R> {
                     message: format!("the editor exited with status {status}; nothing was written"),
                     fix: Some("Retry the edit with e".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
                 return;
             }
@@ -1150,6 +1165,7 @@ impl<R: Runner> App<R> {
                     message: format!("{} was not changed; nothing was written", flow.target.id),
                     fix: None,
                     blocking: false,
+                    raw: None,
                 });
             }
             Ok(text) => {
@@ -1167,6 +1183,7 @@ impl<R: Runner> App<R> {
                     message: format!("{e:#}"),
                     fix: Some("Retry the edit with e".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
             }
         }
@@ -1222,6 +1239,7 @@ impl<R: Runner> App<R> {
                     message: format!("{noun} {id} edited (commit {})", short_commit(&commit)),
                     fix: None,
                     blocking: false,
+                    raw: None,
                 });
             }
             Ok(WriteOutcome::Idempotent { .. }) => {
@@ -1232,6 +1250,7 @@ impl<R: Runner> App<R> {
                     message: format!("{noun} {id} was unchanged; nothing was committed"),
                     fix: None,
                     blocking: false,
+                    raw: None,
                 });
             }
             Ok(WriteOutcome::CheckBlocked { report }) => {
@@ -1247,6 +1266,7 @@ impl<R: Runner> App<R> {
                     message,
                     fix,
                     blocking: false,
+                    raw: None,
                 });
             }
             Ok(WriteOutcome::DryRun { .. }) => {
@@ -1257,6 +1277,7 @@ impl<R: Runner> App<R> {
                         .to_owned(),
                     fix: None,
                     blocking: false,
+                    raw: None,
                 });
             }
             Err(e) => {
@@ -1436,6 +1457,7 @@ impl<R: Runner> App<R> {
                 message: format!("{}: {err}", entry.name),
                 fix: Some("Re-run the proposer to regenerate the manifest".to_owned()),
                 blocking: false,
+                raw: None,
             });
             return;
         }
@@ -1449,6 +1471,7 @@ impl<R: Runner> App<R> {
                     message: e,
                     fix: Some("Re-run the proposer to regenerate the manifest".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
             }
         }
@@ -1492,6 +1515,7 @@ impl<R: Runner> App<R> {
                     message: "every step applied, but the final check has findings; fix them before cleaning up".to_owned(),
                     fix: Some("Resolve the findings above, then re-run the apply to reach cleanup".to_owned()),
                     blocking: false,
+                    raw: None,
                 });
             }
             Err(e) => {
@@ -1521,7 +1545,8 @@ impl<R: Runner> App<R> {
                 usage_error,
                 error,
             } => {
-                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
                 None
             }
             ContractOutcome::InvalidJson { status } => {
@@ -1626,6 +1651,35 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// The alert for a CLI error envelope: a usage error that names an
+    /// unknown subcommand becomes an actionable version-skew message (#591)
+    /// rather than a wall of clap help. Everything else keeps its current
+    /// rendering. The raw CLI text rides on the alert and is reachable with
+    /// `x`.
+    fn cli_error_alert(&self, status: i32, usage_error: bool, error: &ErrorBody) -> AlertState {
+        if usage_error {
+            if let Some(subcommand) = alert::unknown_subcommand(&error.message) {
+                return AlertState::cli_version_skew(
+                    &self.cli_display(),
+                    &subcommand,
+                    &error.message,
+                );
+            }
+        }
+        AlertState::from_cli_error(status, usage_error, error)
+    }
+
+    /// The resolved `confidant` path, for display in the Scope modal and the
+    /// version-skew alert: an explicit path is shown as configured; a bare
+    /// command name (`confidant` from `PATH`) is resolved against `PATH` so
+    /// the user sees which binary actually ran. Best-effort.
+    fn cli_display(&self) -> String {
+        match self.runner.bin() {
+            Some(bin) => resolved_bin_display(bin),
+            None => "confidant".to_owned(),
+        }
+    }
+
     /// Doctor state from the cached report; never runs doctor itself.
     fn doctor_label(&self) -> String {
         let Some(report) = &self.doctor.report else {
@@ -1655,6 +1709,7 @@ impl<R: Runner> App<R> {
             "Scope",
             vec![
                 format!("vault: {}", self.vault_label()),
+                format!("cli: {}", self.cli_display()),
                 format!("scope: {}", self.scope_label()),
                 "source: `confidant record list --json` (cleared set)".to_owned(),
                 String::new(),
@@ -2152,6 +2207,17 @@ impl<R: Runner> App<R> {
         if self.info_modal.is_some() {
             self.info_modal = None;
             return;
+        }
+
+        // A version-skew alert keeps the raw clap output behind `x` (#591):
+        // the alert itself shows the one-line fix, and the full text opens in
+        // the dismissable info modal only when asked for.
+        if matches!(key.code, KeyCode::Char('x')) {
+            if let Some(raw) = self.alert.as_ref().and_then(|a| a.raw.as_deref()) {
+                let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+                self.info_modal = Some(InfoState::new("Raw CLI Output", lines));
+                return;
+            }
         }
 
         // The edit confirm modal owns every key once the editor has returned:
@@ -2746,6 +2812,25 @@ impl<R: Runner> App<R> {
     }
 }
 
+/// Resolve `bin` for display. An explicit path is shown as configured; a
+/// bare command name is resolved against `PATH` so the message names the
+/// binary that actually ran. Falls back to the bare name when it is not on
+/// `PATH`.
+fn resolved_bin_display(bin: &std::path::Path) -> String {
+    if bin.is_absolute() || bin.components().count() > 1 {
+        return bin.display().to_string();
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(bin);
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    bin.display().to_string()
+}
+
 /// Shorten a status-pill path from the left, keeping the most specific
 /// trailing components. The full path stays in the Scope modal.
 fn compact_path(path: &str, max_chars: usize) -> String {
@@ -2766,6 +2851,7 @@ fn no_vault_alert() -> AlertState {
             .to_owned(),
         fix: None,
         blocking: false,
+        raw: None,
     }
 }
 
