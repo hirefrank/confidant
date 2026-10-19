@@ -1186,6 +1186,47 @@ fn bootstrap_refuses_nonempty_clean_repo() {
     assert_eq!(git_out(&b.vault, &["log", "--oneline"]).lines().count(), 1);
 }
 
+/// Strip every git identity source from `cmd`, pointing it at a `home` that
+/// has no `.gitconfig`: global and system config are `/dev/null`, `HOME` is
+/// the temp dir, and the `GIT_AUTHOR_*`/`GIT_COMMITTER_*` vars are unset.
+///
+/// `user.useConfigOnly=true` is the platform-dependent part (#560): without
+/// it git falls back to guessing `$USER@$HOSTNAME`, which macOS runners
+/// resolve to `runner@<host>.local`, so `git var` succeeds there and the
+/// "no identity" precondition does not hold. With it, git refuses to guess
+/// on every platform and the test is deterministic.
+fn without_git_identity(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+        .env("GIT_CONFIG_VALUE_0", "true")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL");
+}
+
+/// `git var GIT_COMMITTER_IDENT` under the same identity-less environment as
+/// [`without_git_identity`], rendered for an assertion message: it shows
+/// whether git could resolve an identity at all and, if not, why.
+fn git_committer_ident(home: &Path) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(["var", "GIT_COMMITTER_IDENT"]);
+    without_git_identity(&mut cmd, home);
+    match cmd.output() {
+        Ok(out) => format!(
+            "status={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+        Err(e) => format!("could not run git: {e}"),
+    }
+}
+
 #[test]
 fn bootstrap_without_git_identity_fails_before_writing_files() {
     // No git identity: the skeleton commit would fail, so `--create` refuses
@@ -1194,26 +1235,28 @@ fn bootstrap_without_git_identity_fails_before_writing_files() {
     let b = Boot::new();
     std::fs::remove_file(b.home.join(".gitconfig")).unwrap();
 
-    let out = b
-        .cmd(&["init", "--create", "--no-input", "--json"])
-        .arg("--vault")
-        .arg(&b.vault)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_AUTHOR_NAME")
-        .env_remove("GIT_AUTHOR_EMAIL")
-        .env_remove("GIT_COMMITTER_NAME")
-        .env_remove("GIT_COMMITTER_EMAIL")
-        .output()
-        .unwrap();
+    let mut cmd = b.cmd(&["init", "--create", "--no-input", "--json"]);
+    cmd.arg("--vault").arg(&b.vault);
+    without_git_identity(&mut cmd, &b.home);
+    let out = cmd.output().unwrap();
 
-    assert!(!out.status.success());
+    let diag = format!(
+        "git var GIT_COMMITTER_IDENT: {}\n\
+         init stdout: {:?}\n\
+         init stderr: {:?}",
+        git_committer_ident(&b.home),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !out.status.success(),
+        "init --create must refuse with no git identity\n{diag}"
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let fix = v["error"]["fix"].as_str().unwrap_or("");
     assert!(
         fix.contains("user.name") && fix.contains("user.email"),
-        "fix must name git identity config: {fix}"
+        "fix must name git identity config: {fix}\n{diag}"
     );
     assert!(!b.vault.join("confidant.toml").exists());
     assert!(!b.vault.join(".gitignore").exists());

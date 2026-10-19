@@ -3213,6 +3213,10 @@ fn note_edit_edit_uses_0600_scratch_and_cleans_up() {
     std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
 
     let modes_out = h._tmp.path().join("modes.txt");
+    // The fake editor is portable shell only (#564): BSD sed on macOS reads
+    // the argument after `-i` as a backup suffix, so GNU `sed -i` fails
+    // there with "invalid command code". Read the scratch into a variable
+    // and write the edited text back over it instead.
     let script = write_file(
         h._tmp.path(),
         "editor.sh",
@@ -3221,7 +3225,13 @@ fn note_edit_edit_uses_0600_scratch_and_cleans_up() {
              d=$(dirname \"$1\")\n\
              ls -ld \"$d\" | cut -c1-10 > \"{}\"\n\
              ls -l \"$1\" | cut -c1-10 >> \"{}\"\n\
-             sed -i 's/Editor note body./Editor changed body./' \"$1\"\n",
+             text=$(cat \"$1\")\n\
+             case $text in\n\
+             *\"Editor note body.\"*) ;;\n\
+             *) echo \"editor: marker not found\" >&2; exit 1 ;;\n\
+             esac\n\
+             printf '%s' \"${{text%%Editor note body.*}}\" > \"$1\"\n\
+             printf '%s\\n' \"Editor changed body.\" >> \"$1\"\n",
             modes_out.display(),
             modes_out.display(),
         ),
