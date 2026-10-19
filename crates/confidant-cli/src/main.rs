@@ -230,10 +230,20 @@ enum Command {
     /// stderr), and this device's key; writes the trust anchor to
     /// ~/.config/confidant/trust.toml; creates the vault lookup key and the
     /// vault:shared client. Requires a git repo with a clean tree.
+    ///
+    /// With `--create`, an empty or absent vault directory is scaffolded
+    /// first: the directory is created, `git init` runs when needed,
+    /// `.gitignore` gains `.confidant/`, and a minimal `confidant.toml` is
+    /// written (its `packs` list comes from the global `--packs` flag,
+    /// defaulting to `[]`) and committed. The key steps then run unchanged.
     Init {
         /// Proceed even if a trust anchor already exists (re-initialization).
         #[arg(long)]
         force: bool,
+        /// Scaffold the vault directory (create, `git init`, `.gitignore`,
+        /// `confidant.toml`, committed skeleton) before initializing keys.
+        #[arg(long)]
+        create: bool,
     },
     /// Recover the vault on a new device from the recovery phrase.
     ///
@@ -677,6 +687,14 @@ macro_rules! vault_or {
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let json = cli.json;
 
+    // Bootstrap (#539): `confidant init --create` scaffolds the vault before
+    // discovery, because discovery requires `confidant.toml`. Runs first so
+    // the key steps (which require a clean tree) see a committed skeleton.
+    // Without `--create` this is a no-op and `init`'s behaviour is unchanged.
+    if let Command::Init { force, create } = &cli.command {
+        bootstrap_vault(&cli, *create, *force)?;
+    }
+
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
     // `device-add --initiate` runs on a brand-new device that has no vault
@@ -1070,7 +1088,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 *clear_pending_inbox_rotation,
             )
         }
-        Command::Init { force } => {
+        Command::Init { force, .. } => {
             let root = vault_root.unwrap();
             cmd_init(&cli, &root, *force)
         }
@@ -6261,6 +6279,235 @@ fn provision_device_key() -> anyhow::Result<(String, String)> {
     Ok((bech32, recipient))
 }
 
+/// The B1 trust-anchor refusal, shared by the `--create` bootstrap preflight
+/// and [`cmd_init`] so the two paths can never drift. `init` never silently
+/// replaces an existing anchor: a re-initialization needs `--force`.
+fn refuse_existing_anchor(trust_path: &Path, force: bool) -> anyhow::Result<()> {
+    if trust_path.exists() && !force {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` on a new device, or pass --force)",
+                trust_path.display()
+            ))
+            .with_fix("Run `confidant recover` with the recovery phrase on a new device"),
+        ));
+    }
+    Ok(())
+}
+
+/// The directory `init --create` should scaffold: resolved like discovery
+/// (`--vault`, then `CONFIDANT_VAULT`, then cwd), except that the path need
+/// not exist yet and a `confidant.toml` argument is reduced to its parent.
+fn bootstrap_target(cli: &Cli) -> PathBuf {
+    fn lenient(p: &Path) -> PathBuf {
+        if !p.is_dir() && p.file_name().is_some_and(|n| n == "confidant.toml") {
+            p.parent().unwrap_or(p).to_path_buf()
+        } else {
+            p.to_path_buf()
+        }
+    }
+    if let Some(flag) = &cli.vault {
+        return lenient(flag);
+    }
+    if let Ok(env) = std::env::var("CONFIDANT_VAULT") {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(cfg) = load_user_config(home.as_deref()) {
+            if let Some(named) = cfg.named(&env) {
+                return lenient(&named);
+            }
+        }
+        return lenient(Path::new(&env));
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// True when `root` is the top level of its own git repository. A
+/// subdirectory of someone else's repo is not the vault's repo root, so
+/// `--create` must not commit the skeleton into the parent.
+fn is_git_repo_root(root: &Path, no_input: bool) -> bool {
+    let Ok(top) = confidant_core::write::git(root, &["rev-parse", "--show-toplevel"], no_input)
+    else {
+        return false;
+    };
+    let top = Path::new(top.trim());
+    let top = top.canonicalize().unwrap_or_else(|_| top.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    top == root
+}
+
+fn dir_entry_names(root: &Path) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        names.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+/// `init --create`: scaffold a vault before the key steps so one
+/// non-interactive command produces a working vault (#539).
+///
+/// Creates the directory, runs `git init` when the target is not its own
+/// repo, ensures `.confidant/` is git-ignored, writes a minimal
+/// `confidant.toml` (`packs` from the global `--packs`, default `[]`), and
+/// commits just those files. An existing vault is left to today's path; any
+/// other non-empty directory is refused with nothing written.
+fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
+    if !create {
+        return Ok(());
+    }
+    let no_input = cli.no_input;
+    let root = bootstrap_target(cli);
+
+    // An existing vault takes today's path unchanged (anchor check, clean
+    // tree, key steps).
+    if root.join("confidant.toml").is_file() {
+        return Ok(());
+    }
+
+    // B1 preflight: the very refusal `cmd_init` would produce, but before any
+    // file is written, so a refused init leaves no half-built skeleton.
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+    refuse_existing_anchor(&config_dir.join(confidant_crypt::anchor::TRUST_FILE), force)?;
+
+    // #539: only an absent, empty, or skeleton-only directory is scaffolded.
+    // A non-empty target — including a clean git repo — is refused so that
+    // running `--create` from the wrong cwd cannot turn a project checkout
+    // into a vault. Vault-inside-an-existing-repo, if ever wanted, is its own
+    // explicit flag and decision.
+    let exists = root.is_dir();
+    let entries = if exists {
+        dir_entry_names(&root)?
+    } else {
+        Vec::new()
+    };
+    let only_our_files = entries.iter().all(|n| n == ".git" || n == ".gitignore");
+    if exists && !entries.is_empty() && !only_our_files {
+        return Err(anyhow::Error::new(
+            DomainError::usage(format!(
+                "refusing to scaffold a vault in {}: the directory is not empty (--create only scaffolds an absent or empty directory)",
+                root.display()
+            ))
+            .with_fix(
+                "Use an empty directory, or create the vault by hand (`git init`, write `confidant.toml`, commit) and run `confidant init`",
+            ),
+        ));
+    }
+
+    // Validate `--packs` before writing: an unknown pack would leave the new
+    // vault failing `check`.
+    let packs: Vec<String> = cli
+        .packs
+        .as_deref()
+        .map(parse_pack_list)
+        .unwrap_or_default();
+    for name in &packs {
+        if confidant_core::packs::pack_manifest(name).is_none() {
+            return Err(anyhow::Error::new(DomainError::usage(format!(
+                "unknown pack in --packs: {name}"
+            ))));
+        }
+    }
+
+    std::fs::create_dir_all(&root).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot create vault directory {}: {e}",
+            root.display()
+        )))
+    })?;
+
+    if !is_git_repo_root(&root, no_input) {
+        confidant_core::write::git(&root, &["init"], no_input)?;
+    }
+
+    // Check the commit identity before writing any skeleton file: without
+    // one the commit below fails and would leave the files written but
+    // uncommitted, and the retry would then refuse with "tree is not clean".
+    // Nothing we own has been written yet.
+    if confidant_core::write::git(&root, &["var", "GIT_AUTHOR_IDENT"], no_input).is_err() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "git has no author identity, so the vault skeleton cannot be committed",
+            )
+            .with_fix(
+                "Set a git identity, e.g. `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com`",
+            ),
+        ));
+    }
+
+    // `.confidant/` holds the plaintext search corpus and must never be
+    // committed (ADR-6); `reindex` refuses without this entry.
+    let gitignore = root.join(".gitignore");
+    let mut text = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let already_ignored = text
+        .lines()
+        .any(|line| matches!(line.trim(), ".confidant/" | ".confidant"));
+    if !already_ignored {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(".confidant/\n");
+        std::fs::write(&gitignore, text)?;
+    }
+
+    let packs_toml = if packs.is_empty() {
+        "[]".to_string()
+    } else {
+        let quoted: Vec<String> = packs.iter().map(|p| format!("{p:?}")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    std::fs::write(
+        root.join("confidant.toml"),
+        format!(
+            "spec = {:?}\npacks = {packs_toml}\nvault_id = {:?}\n",
+            confidant_core::SPEC_VERSION,
+            confidant_core::write::new_ulid(),
+        ),
+    )?;
+
+    // Commit only the skeleton files this command wrote, never `git add -A`.
+    // The commit carries a pathspec too, so any changes an existing repo
+    // already had staged are never swept into the skeleton commit.
+    confidant_core::write::git(
+        &root,
+        &["add", "--", ".gitignore", "confidant.toml"],
+        no_input,
+    )?;
+    let staged = confidant_core::write::git(
+        &root,
+        &[
+            "status",
+            "--porcelain",
+            "--",
+            ".gitignore",
+            "confidant.toml",
+        ],
+        no_input,
+    )?;
+    if !staged.trim().is_empty() {
+        confidant_core::write::git(
+            &root,
+            &[
+                "commit",
+                "-m",
+                "init: vault skeleton",
+                "--",
+                ".gitignore",
+                "confidant.toml",
+            ],
+            no_input,
+        )?;
+    }
+
+    if !cli.json {
+        eprintln!("scaffolded vault at {}", root.display());
+    }
+    Ok(())
+}
+
 fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{
         anchor, lifecycle::KeyStore, manifest::SHARED_CLIENT_ID, recovery::Recovery,
@@ -6285,15 +6532,7 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     // anchorless).
     let trust_path = config_dir.join(anchor::TRUST_FILE);
     let trust_exists = trust_path.exists();
-    if trust_exists && !force {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` on a new device, or pass --force)",
-                trust_path.display()
-            ))
-            .with_fix("Run `confidant recover` with the recovery phrase on a new device"),
-        ));
-    }
+    refuse_existing_anchor(&trust_path, force)?;
 
     // Git repo + clean tree required.
     require_git_repo(root, no_input)?;
