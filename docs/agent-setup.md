@@ -165,6 +165,44 @@ warning. `--force` replaces existing non-symlink skill dirs (older installs);
 adds the optional qmd note ([below](#optional-search-backend-qmd)).
 Every command takes `--json` and `--no-input` per the agent contract.
 
+## Local packs
+
+The `pack-author` skill walks an agent through the decision: a pack for new
+declarative claims or checks, a skill-only workflow when existing records
+and notes suffice, and a core change when new Rust logic is needed.
+
+A pack is data plus agent text. It can declare fields, verbs, edge kinds,
+finding codes, check keys, and parameters for existing rule kinds; it cannot
+run code or define a new kind. Keep the source outside the vault:
+
+```sh
+confidant pack init ~/confidant-packs/<name>
+confidant pack add --from-dir ~/confidant-packs/<name>        # review, writes nothing
+confidant pack add --from-dir ~/confidant-packs/<name> --yes  # install
+confidant check --json --no-input
+confidant pack verify
+```
+
+`pack init` scaffolds `manifest.toml`, `SKILL.md`, `<version>.md`, and
+`README.md`; it refuses a non-empty directory or a symlink and validates the
+generated pack. Without `--yes`, `pack add --from-dir` is read-only: it
+prints the hash, claims, file list, and skill text for review. After editing
+the source, bump `[pack].version` and review the change before applying it:
+
+```sh
+confidant pack update <name> --from-dir ~/confidant-packs/<name>
+confidant pack update <name> --from-dir ~/confidant-packs/<name> --yes
+```
+
+`pack update` prints the diff and stops without `--yes`. The vendored tree
+under the vault is generated and pinned; edit the source directory instead.
+
+A local pack is unsigned but hash-pinned, so `pack verify` catches drift.
+The operator must review the manifest and `SKILL.md`: the skill text is
+served to the agent as instructions. Packs cannot widen the §12 allowlist or
+read `no-ai` content, and the CLI enforces those limits regardless of pack
+text.
+
 ## Environment
 
 | Variable | What |

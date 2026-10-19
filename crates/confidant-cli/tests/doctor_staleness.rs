@@ -346,7 +346,7 @@ fn doctor_skills_links_after_setup_is_ok() {
     let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("5/5"), "expected 5/5 linked: {msg}");
+    assert!(msg.contains("6/6"), "expected 6/6 linked: {msg}");
     assert!(msg.contains("claude-code"), "expected agent name: {msg}");
     assert_eq!(v["ok"], true, "{v}");
 }

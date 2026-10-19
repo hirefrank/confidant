@@ -251,7 +251,7 @@ fuzzy and `no-ai: true` people are ID-only.
 | Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` |
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
-| Packs | `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
+| Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred` / `device-add` / `verify-recovery` |
 | Inbox | `inbox`, `inbox rotate` |
 | Search | `reindex` + `qmd-search` skill |
@@ -306,6 +306,43 @@ and writes are blocked. It adds sessions, packages, ICF hours, balance
 assertions, and gap rules (a session with no notes; a paid client with no
 session in a configurable window). Contract:
 [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+
+### Local packs
+
+An agent can write a pack for a local need without a git host or a core
+change. Keep the source outside the vault (for example
+`~/confidant-packs/weekly-checkin/`):
+
+```sh
+confidant pack init ~/confidant-packs/weekly-checkin
+confidant pack add --from-dir ~/confidant-packs/weekly-checkin            # review only
+confidant pack add --from-dir ~/confidant-packs/weekly-checkin --yes      # install
+confidant pack verify
+```
+
+`pack init` writes `manifest.toml`, `SKILL.md`, `<version>.md`, and
+`README.md`, and validates the result. Fill in `[[fields]]`, `[[verbs]]`,
+finding codes, `[checks]` keys, and `[[rules]]` in the manifest. A rule
+names a core-implemented kind; the pack carries no code.
+
+`pack add --from-dir` without `--yes` is the review step: it validates the
+directory, prints every claim and the full skill text, and writes nothing.
+Only `--yes` vendors, pins, adds the pack to `packs`, runs `check`, and
+commits. After editing the source, bump `[pack].version`, rename the
+contract file, and review the change:
+
+```sh
+confidant pack update <name> --from-dir ~/confidant-packs/weekly-checkin
+confidant pack update <name> --from-dir ~/confidant-packs/weekly-checkin --yes
+```
+
+The first command prints the diff and stops. The generated copy under
+`<vault>/packs/` is not the editing surface.
+
+A local pack is unsigned but hash-pinned: `pack verify` detects drift. Review
+its `SKILL.md` as code, because it becomes agent instructions. It cannot
+widen the §12 allowlist or read `no-ai` content; the CLI enforces that, not
+the pack text.
 
 Packs share a vault; `--packs` scopes a read to the packs you name. They
 are vendored under `packs/` and pinned in `confidant.lock`, and `pack

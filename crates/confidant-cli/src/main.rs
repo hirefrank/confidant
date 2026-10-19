@@ -12,6 +12,7 @@
 mod embedded;
 mod mcp;
 mod pack_fetch;
+mod pack_init;
 mod record_crypto;
 mod record_decrypt;
 mod record_resolve;
@@ -616,6 +617,22 @@ enum AliasAction {
 
 #[derive(Subcommand, Debug)]
 enum PackAction {
+    /// Scaffold a local external pack directory (no vault needed).
+    ///
+    /// Writes `manifest.toml`, `SKILL.md`, `<version>.md` and `README.md`.
+    /// The directory must be new or empty; nothing is overwritten and a
+    /// symlink is refused. The generated pack is validated before the
+    /// command succeeds. `--dry-run` prints the plan and writes nothing.
+    Init {
+        /// Directory to create (or an empty directory to fill).
+        dir: PathBuf,
+        /// Pack name (default: the directory basename).
+        #[arg(long)]
+        name: Option<String>,
+        /// Pack version, `major.minor` (default: 0.1).
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Fetch a candidate pack, validate it, and print a review report.
     ///
     /// Writes nothing to the vault unless `--yes` is given: with it, the
@@ -1269,6 +1286,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
         }
         Command::Pack { action } => match action {
+            PackAction::Init { dir, name, version } => {
+                cmd_pack_init(&cli, dir, name.as_deref(), version.as_deref())
+            }
             PackAction::Add {
                 url,
                 from_dir,
@@ -1544,6 +1564,81 @@ fn vault_json(root: Option<&Path>) -> Value {
         Some(p) => Value::String(p.display().to_string()),
         None => Value::Null,
     }
+}
+
+/// Quote one argument for the `next_steps` command hint. This is display
+/// text, not an exec path: single quotes keep spaces (and `$`, `;`, …) in a
+/// copied command from splitting.
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '~'));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// `pack init <dir>`: scaffold a local external pack (#674).
+///
+/// No vault is needed and nothing outside `dir` is touched. The generated
+/// pack is read back with the installer's readers before success is
+/// reported, so a scaffold cannot be born broken.
+fn cmd_pack_init(
+    cli: &Cli,
+    dir: &Path,
+    name: Option<&str>,
+    version: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let report = pack_init::init(dir, name, version, cli.dry_run)
+        .map_err(pack_fetch::escape_domain_error)?;
+    let dir_arg = shell_quote(&report.dir.display().to_string());
+    let review = format!("confidant pack add --from-dir {dir_arg}");
+    let install = format!("{review} --yes");
+
+    if cli.json {
+        print_json(&ok_envelope(
+            None,
+            serde_json::json!({
+                "command": "pack-init",
+                "dry_run": report.dry_run,
+                "dir": report.dir.display().to_string(),
+                "name": report.name,
+                "version": report.version,
+                "files": report.files,
+                "next_steps": {
+                    "review": review,
+                    "install": install,
+                },
+            }),
+        ))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let verb = if report.dry_run {
+        "would create"
+    } else {
+        "created"
+    };
+    println!(
+        "{verb} {}@{} in {}",
+        pack_fetch::escape_line(&report.name),
+        pack_fetch::escape_line(&report.version),
+        pack_fetch::escape_line(&report.dir.display().to_string())
+    );
+    println!("files:");
+    for file in &report.files {
+        println!("  {file}");
+    }
+    println!("next:");
+    println!("  review   {}", pack_fetch::escape_line(&review));
+    println!("  install  {}", pack_fetch::escape_line(&install));
+    if report.dry_run {
+        println!("dry run: nothing was written");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Fetch a candidate pack, validate it, and print a review report (#439),
@@ -2126,7 +2221,7 @@ fn cmd_pack_verify(
 /// or control characters). Mirrors the lockfile's own `subdir` rule so a
 /// hand-edited `confidant.toml` listing can never steer a delete out of the
 /// vendored tree.
-fn is_safe_version_part(version: &str) -> bool {
+pub(crate) fn is_safe_version_part(version: &str) -> bool {
     !version.is_empty()
         && version != "."
         && version != ".."
