@@ -24,15 +24,21 @@ use crate::vault::{SourcedEntry, Vault};
 /// historic path keeps working until #444 deletes this module.
 pub use crate::touch::TOUCH_KINDS;
 
-/// Embedded manifest for `personal@0.1` (spec §9). Vendored from
-/// `packs/personal/manifest.toml` at the repo root: the path must stay
-/// inside the crate so `cargo publish` / `cargo install` can compile
-/// (crates.io tarballs do not include `../../packs`). A test fails if the
-/// vendored copy drifts from the repo-root file. The binary serves the
-/// manifest it was compiled with, same guarantee as the embedded SKILL.md.
+/// Frozen manifest for the compiled `personal@0.1` pack (spec §9).
+///
+/// The compiled pack's identity is its own 0.1 claims (#550): the repo-root
+/// `packs/personal/manifest.toml` is now the 0.2 human contract, and the
+/// embedded declarative 0.2 pack has its own manifest at
+/// `pack-manifests/personal-0.2/`. This 0.1 file is kept at a clearly-named
+/// frozen path so the compiled pack keeps claiming `personal@0.1` while it
+/// still owns the fields the 0.2 pack renamed (`relationship_to_me`). It is
+/// deleted with this module at the cutover (#551).
+///
+/// The path must stay inside the crate so `cargo publish` / `cargo install`
+/// can compile (crates.io tarballs do not include `../../packs`).
 static PERSONAL_MANIFEST_TOML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/pack-manifests/personal/manifest.toml"
+    "/pack-manifests/personal-0.1/manifest.toml"
 ));
 
 /// Claims from the embedded manifest, leaked to `&'static` so the `Pack`
@@ -61,7 +67,7 @@ pub(crate) fn manifest_claims() -> &'static ManifestClaims {
     static CLAIMS: OnceLock<ManifestClaims> = OnceLock::new();
     CLAIMS.get_or_init(|| {
         let m = parse_manifest(PERSONAL_MANIFEST_TOML)
-            .expect("embedded packs/personal/manifest.toml must parse");
+            .expect("embedded pack-manifests/personal-0.1/manifest.toml must parse");
         let name = leak_str(format!("{}@{}", m.pack.name, m.pack.version));
         let verbs: Vec<&'static str> = m.verbs.iter().map(|v| leak_str(v.name.clone())).collect();
         let verb_id_types: Vec<(&'static str, Prefix)> = m
@@ -743,23 +749,18 @@ mod tests {
         assert_eq!(pack.verb_id_type(""), None);
     }
 
-    /// The vendored manifest must match `packs/personal/manifest.toml` at
-    /// the repo root (#368 pattern). Skips gracefully when the repo-root
-    /// file is absent (e.g. a published crate), where there is nothing to
-    /// drift from.
+    /// The compiled pack's frozen manifest stays at 0.1 (#550): the repo-root
+    /// `packs/personal/manifest.toml` is the 0.2 human contract, so this
+    /// in-crate file must never be overwritten with 0.2 claims. The claim
+    /// slices themselves are pinned by
+    /// `manifest_claims_match_original_slices`.
     #[test]
-    fn vendored_manifest_matches_repo_root() {
-        let root = format!(
-            "{}/../../packs/personal/manifest.toml",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let Ok(root_text) = std::fs::read_to_string(&root) else {
-            return;
-        };
-        assert_eq!(
-            root_text, PERSONAL_MANIFEST_TOML,
-            "vendored manifest is stale; copy packs/personal/manifest.toml \
-             to crates/confidant-core/pack-manifests/personal/manifest.toml"
+    fn frozen_manifest_stays_at_0_1() {
+        let m = parse_manifest(PERSONAL_MANIFEST_TOML).expect("frozen manifest parses");
+        assert_eq!(m.pack.version, "0.1", "the compiled pack is personal@0.1");
+        assert!(
+            m.fields.iter().any(|f| f.name == "relationship_to_me"),
+            "the frozen 0.1 claims keep the old field name"
         );
     }
 

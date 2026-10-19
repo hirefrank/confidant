@@ -7337,6 +7337,212 @@ fn personal_0_2_values_do_not_echo_in_findings() {
 }
 
 // ---------------------------------------------------------------------------
+// personal@0.2 embedded declarative pack (#550)
+//
+// The built-in `personal@0.2` pack is compiled into the binary and loaded
+// through the manifest-v2 / declarative path. This is the parity gate from
+// #444: compiled `personal@0.1` and the embedded 0.2 pack must agree on the
+// 0.1 field set (`birthday`, `cadence`, `dates`, the `touch` note pair).
+// ---------------------------------------------------------------------------
+
+use confidant_core::packs::embedded as packs_embedded;
+
+/// A note id with two versions: a conflicted note. Compiled personal@0.1
+/// reports it missing; the declarative 0.2 pack treats a conflicted id as
+/// existing (#458) — a documented divergence the parity normaliser drops.
+const CONFLICTED_NOTE: &str = "n-01M3TC5H00MPJG00900000000G";
+
+/// A well-formed note id with no record file: the `missing` variant.
+const MISSING_NOTE: &str = "n-01M3TC5H00MPJG00A000000000H";
+
+/// Build a vault fixture that triggers every in-scope code at least once on
+/// the 0.1 field set, with `packs` selecting which personal pack is enabled.
+/// Fake data only.
+fn parity_fixture(packs: &str) -> Value {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        &PERSONAL_TOML.replace("packs = [\"personal@0.1\"]", &format!("packs = [{packs}]")),
+    );
+    // Ada: overdue cadence and an upcoming birthday.
+    write(
+        root,
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\ncadence: 30d\nbirthday: --10-12\n---\n\nFake person.\n"
+        ),
+    );
+    // Bea: two malformed shared fields (E_FRONTMATTER).
+    write(
+        root,
+        &format!("people/{BEA}/profile.md"),
+        &format!(
+            "---\nid: {BEA}\ntype: person\nname: Bea Demo\nbirthday: not-a-date\ncadence: 0d\n---\n\nFake person.\n"
+        ),
+    );
+    // Cam: a malformed `dates` entry (E_FRONTMATTER).
+    write(
+        root,
+        &format!("people/{CAM}/profile.md"),
+        &format!(
+            "---\nid: {CAM}\ntype: person\nname: Cam Sample\ndates: [anniv:not-a-date]\n---\n\nFake person.\n"
+        ),
+    );
+    // A real note owned by Bea, for the wrong-owner case below.
+    note(root, NOTE, BEA, "2026-10-01");
+    // A conflicted note (two versions) on Bea.
+    write(
+        root,
+        &format!("people/{BEA}/notes/{CONFLICTED_NOTE}.md"),
+        &format!(
+            "---\nid: {CONFLICTED_NOTE}\ntype: note\n<<<<<<< HEAD\nperson: {BEA}\n=======\nperson: {BEA}\n>>>>>>> other\ndate: 2026-10-01\n---\n\nFake note.\n"
+        ),
+    );
+    // Ada's last contact is 40 days before as_of (2026-10-08): overdue. Bea's
+    // touch lines carry the note problems (invalid id, wrong type, missing);
+    // Cam points at Bea's note (wrong owner). The conflicted note is a sixth
+    // touch, dropped by the normaliser (#458).
+    write(
+        root,
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-08-29 touch {ADA} call\n\
+             2026-10-02 touch {BEA} call note:not-an-id\n\
+             2026-10-03 touch {BEA} call note:{CAM}\n\
+             2026-10-04 touch {BEA} call note:{MISSING_NOTE}\n\
+             2026-10-05 touch {CAM} call note:{NOTE}\n\
+             2026-10-06 touch {BEA} call note:{CONFLICTED_NOTE}\n"
+        ),
+    );
+    report_json(root, None)
+}
+
+/// The in-scope codes the #550 parity gate compares (the #444 list).
+const PARITY_CODES: &[&str] = &[
+    "W_CADENCE_OVERDUE",
+    "W_DATE_UPCOMING",
+    "E_FRONTMATTER",
+    "E_INVALID_ID",
+    "E_WRONG_ID_TYPE",
+    "E_UNKNOWN_RECORD",
+];
+
+/// Normalise a report for the parity comparison. Kept to what the test
+/// documents:
+///
+/// - only the in-scope codes are compared. Compiled `personal@0.1` stays
+///   registered (PD14) and disabled on the embedded run, so fields both
+///   packs claim trip `W_PACK_ORPHAN`; that transitional artifact (#551
+///   removes the compiled pack) and any other non-in-scope code drop out.
+/// - the conflicted note's compiled-only `E_UNKNOWN_RECORD` is dropped
+///   (#458).
+/// - `E_FRONTMATTER` message/fix wording is blanked (compiled names the
+///   per-field problem, the declarative template is generic).
+///
+/// Everything else — code, severity, file, line, id — is compared verbatim.
+fn normalise_parity(v: &Value) -> Vec<Value> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| PARITY_CODES.contains(&f["code"].as_str().unwrap()))
+        .filter(|f| {
+            // #458: compiled personal@0.1 reports a conflicted note missing;
+            // the declarative kind treats a conflicted id as existing. Both
+            // are in-scope codes, so drop the compiled-only finding.
+            !f["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(CONFLICTED_NOTE))
+        })
+        .map(|f| {
+            let mut f = f.clone();
+            if f["code"] == "E_FRONTMATTER" {
+                // Documented divergence: compiled names the per-field problem
+                // ("must be YYYY-MM-DD or --MM-DD"); the declarative evaluator
+                // renders the manifest's generic template ("does not match its
+                // declared grammar"). Only the wording differs.
+                f["message"] = json!("<frontmatter>");
+                f["fix"] = json!("<frontmatter>");
+            }
+            f
+        })
+        .collect()
+}
+
+/// The cutover parity gate (#444/#550): compiled `personal@0.1` and the
+/// embedded declarative `personal@0.2` produce equal findings on the 0.1
+/// field set, and the fixture triggers every in-scope code.
+#[test]
+fn declarative_personal_matches_compiled_personal() {
+    let personal = parity_fixture("\"personal@0.1\"");
+    let declarative = parity_fixture("\"personal@0.2\"");
+    let personal_norm = normalise_parity(&personal);
+    let declarative_norm = normalise_parity(&declarative);
+    assert_eq!(
+        personal_norm, declarative_norm,
+        "embedded personal@0.2 must match compiled personal@0.1:\n\
+         personal: {personal:?}\ndeclarative: {declarative:?}"
+    );
+    for code in PARITY_CODES {
+        assert!(
+            personal_norm.iter().any(|f| f["code"] == **code),
+            "the parity fixture must trigger {code}: {personal_norm:?}"
+        );
+    }
+}
+
+/// The demo vault, with `personal@0.1` swapped for the embedded `personal@0.2`
+/// pack, stays clean (#550 acceptance).
+#[test]
+fn declarative_personal_demo_vault_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&demo_vault(), dir.path());
+    let cfg = fs::read_to_string(dir.path().join("confidant.toml")).unwrap();
+    fs::write(
+        dir.path().join("confidant.toml"),
+        cfg.replace("\"personal@0.1\"", "\"personal@0.2\""),
+    )
+    .unwrap();
+    let json = report_json(dir.path(), None);
+    assert_eq!(json["findings"], json!([]), "{json:?}");
+    assert_eq!(json["summary"]["errors"], 0, "{json:?}");
+    assert_eq!(json["summary"]["warnings"], 0, "{json:?}");
+}
+
+/// A vault that vendors its own `packs/personal@0.2/` is still
+/// `E_PACK_INVALID`: the stable-code allowance is keyed on compiled-in
+/// origin, never the pack name (#504 R8).
+#[test]
+fn vault_supplied_personal_pack_is_e_pack_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        &PERSONAL_TOML.replace("personal@0.1", "personal@0.2"),
+    );
+    person(root, ADA, "Ada Example");
+    let declared =
+        packs_embedded::find("personal@0.2").expect("personal@0.2 is a compiled-in pack");
+    for (rel, bytes) in declared.files() {
+        write(
+            root,
+            &format!("packs/personal@0.2/{rel}"),
+            std::str::from_utf8(bytes).unwrap(),
+        );
+    }
+    install_lockfile(root, "personal", "0.2", declared.hash());
+    let json = report_json(root, None);
+    let finding = finding_by_code(&json, "E_PACK_INVALID");
+    assert_eq!(
+        finding["file"], "packs/personal@0.2",
+        "the finding points at the vendored path: {json:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #510: core-owned personal context view, private fields and touch grammar
 // ---------------------------------------------------------------------------
 

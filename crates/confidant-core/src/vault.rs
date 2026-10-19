@@ -9,6 +9,7 @@ use crate::config::{VaultConfig, SPEC_VERSION};
 use crate::conflict::is_envelope_conflict;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
+use crate::packs::embedded as packs_embedded;
 use crate::packs::external as packs_external;
 use crate::packs::PackRegistry;
 use crate::paths::{self, EntryKind};
@@ -156,11 +157,22 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     // keys the external manifests declare (#433). On an unsupported
     // spec, external packs are not resolved at all: the spec finding
     // already fails `check`, and loading would only stack noise.
+    // Built-in declarative packs compiled into the binary (#550) are
+    // available to every vault; one is enabled only when the vault lists
+    // its name@version, and a vault cannot install or shadow it (the
+    // external loader refuses any vendored directory or pin for its name,
+    // #504 R8).
+    let builtins: &[packs_embedded::EmbeddedPack] = packs_embedded::embedded_packs();
     let (pack_registry, pack_problems, external_manifests, lockfile_error) =
         if config.spec == SPEC_VERSION {
             let compiled = PackRegistry::compiled();
-            let load =
-                packs_external::load_external_packs(root, &config.spec, &config.packs, &compiled);
+            let load = packs_external::load_external_packs(
+                root,
+                &config.spec,
+                &config.packs,
+                &compiled,
+                builtins,
+            );
             let mut registry = compiled;
             for pack in &load.packs {
                 registry.register(*pack);

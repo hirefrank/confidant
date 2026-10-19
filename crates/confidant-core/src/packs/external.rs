@@ -22,17 +22,13 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use chrono::NaiveDate;
-
-use crate::check::Finding;
-use crate::check::MergeMap;
-use crate::id::Prefix;
 use crate::packs::dir::read_pack_dir;
+use crate::packs::embedded::EmbeddedPack;
 use crate::packs::lock::{read_lockfile, Lockfile};
 use crate::packs::manifest::{parse_manifest_external, PackManifest};
+use crate::packs::manifest_pack::{build_manifest_pack, ManifestPack};
 use crate::packs::registry::PackRegistry;
-use crate::packs::{EdgeKind, Pack, PackState};
-use crate::vault::{SourcedEntry, Vault};
+use crate::packs::Pack;
 
 /// Which step of the resolution failed (mapped to finding codes in
 /// `check.rs`: `Unknown`→`E_PACK_UNKNOWN`, `Hash`→`E_PACK_HASH`,
@@ -96,17 +92,13 @@ impl std::fmt::Debug for ExternalLoad {
     }
 }
 
-fn leak_str(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
 /// Interned external packs, keyed by `(name@version, verified content
-/// hash)`. `ExternalPack` and its claims are leaked to satisfy the `Pack`
+/// hash)`. [`ManifestPack`] and its claims are leaked to satisfy the `Pack`
 /// trait's `'static` returns; without interning, every vault load in a
 /// long-lived TUI/MCP process leaks another copy. A second load of the
 /// same bytes reuses the first instance, so the map grows once per
 /// distinct `(name@version, hash)` and stops (#497 item 1).
-type PackCache = HashMap<(String, String), &'static ExternalPack>;
+type PackCache = HashMap<(String, String), &'static ManifestPack>;
 
 fn pack_cache() -> &'static Mutex<PackCache> {
     static CACHE: LazyLock<Mutex<PackCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -114,7 +106,7 @@ fn pack_cache() -> &'static Mutex<PackCache> {
 }
 
 /// The already-interned pack for `key`, if this process built it.
-fn interned_pack(key: &(String, String)) -> Option<&'static ExternalPack> {
+fn interned_pack(key: &(String, String)) -> Option<&'static ManifestPack> {
     pack_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -125,195 +117,11 @@ fn interned_pack(key: &(String, String)) -> Option<&'static ExternalPack> {
 /// Intern `pack` under `key`. A concurrent loader may have won the race;
 /// keep the instance already in the map so every caller gets the same
 /// `&'static` pack (identity checks and tests compare pointers).
-fn intern_pack(key: (String, String), pack: &'static ExternalPack) -> &'static ExternalPack {
+fn intern_pack(key: (String, String), pack: &'static ManifestPack) -> &'static ManifestPack {
     let mut cache = pack_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.entry(key).or_insert(pack)
-}
-
-/// An external pack registered at runtime: a validated, spec-compatible
-/// manifest whose claims are leaked once — the same pattern the compiled
-/// packs use in `coaching.rs` — plus the vendored skill text and the
-/// manifest for the declarative evaluator (#441). The claim slices are
-/// leaked too (the `Pack` trait returns `&'static`), so all of them are
-/// `'static` field references copied out per call.
-pub struct ExternalPack {
-    manifest: &'static PackManifest,
-    /// The vendored `[pack].skill` file text (leaked once with the pack,
-    /// so [`Pack::skill_text`] can hand out `&'static str`).
-    skill_text: &'static str,
-    name: &'static str,
-    verbs: &'static [&'static str],
-    verb_id_types: Vec<(&'static str, Prefix)>,
-    record_types: &'static [&'static str],
-    fields: &'static [&'static str],
-    balance_metrics: &'static [&'static str],
-    edge_kinds: &'static [EdgeKind],
-    finding_codes: &'static [&'static str],
-}
-
-impl ExternalPack {
-    /// Leak a validated manifest into a static pack instance.
-    fn build(manifest: PackManifest, skill_text: String) -> &'static ExternalPack {
-        let name = leak_str(format!("{}@{}", manifest.pack.name, manifest.pack.version));
-        let verbs: Vec<&'static str> = manifest
-            .verbs
-            .iter()
-            .map(|v| leak_str(v.name.clone()))
-            .collect();
-        let verb_id_types: Vec<(&'static str, Prefix)> = manifest
-            .verbs
-            .iter()
-            .filter_map(|v| v.id_type.map(|p| (leak_str(v.name.clone()), p)))
-            .collect();
-        let record_types: Vec<&'static str> = manifest
-            .record_types
-            .iter()
-            .map(|r| leak_str(r.clone()))
-            .collect();
-        let fields: Vec<&'static str> = manifest
-            .fields
-            .iter()
-            .map(|f| leak_str(f.name.clone()))
-            .collect();
-        let balance_metrics: Vec<&'static str> = manifest
-            .balance_metrics
-            .iter()
-            .map(|b| leak_str(b.clone()))
-            .collect();
-        let edge_kinds: Vec<EdgeKind> = manifest
-            .edge_kinds
-            .iter()
-            .map(|e| EdgeKind {
-                name: leak_str(e.name.clone()),
-                symmetric: e.symmetric,
-            })
-            .collect();
-        let finding_codes: Vec<&'static str> = manifest
-            .finding_codes
-            .iter()
-            .map(|c| leak_str(c.clone()))
-            .collect();
-        Box::leak(Box::new(ExternalPack {
-            manifest: Box::leak(Box::new(manifest)),
-            skill_text: leak_str(skill_text),
-            name,
-            verbs: Box::leak(verbs.into_boxed_slice()),
-            verb_id_types,
-            record_types: Box::leak(record_types.into_boxed_slice()),
-            fields: Box::leak(fields.into_boxed_slice()),
-            balance_metrics: Box::leak(balance_metrics.into_boxed_slice()),
-            edge_kinds: Box::leak(edge_kinds.into_boxed_slice()),
-            finding_codes: Box::leak(finding_codes.into_boxed_slice()),
-        }))
-    }
-
-    /// The pack's manifest (leaked once with the pack).
-    pub fn pack_manifest(&self) -> &PackManifest {
-        self.manifest
-    }
-}
-
-impl Pack for ExternalPack {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn verbs(&self) -> &'static [&'static str] {
-        self.verbs
-    }
-
-    fn record_types(&self) -> &'static [&'static str] {
-        self.record_types
-    }
-
-    fn fields(&self) -> &'static [&'static str] {
-        self.fields
-    }
-
-    fn balance_metrics(&self) -> &'static [&'static str] {
-        self.balance_metrics
-    }
-
-    fn edge_kinds(&self) -> &'static [EdgeKind] {
-        self.edge_kinds
-    }
-
-    fn finding_codes(&self) -> &'static [&'static str] {
-        self.finding_codes
-    }
-
-    /// `verb → id-type` constraints from the manifest's `[[verbs]]`.
-    fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
-        self.verb_id_types
-            .iter()
-            .find(|(v, _)| *v == verb)
-            .map(|(_, prefix)| *prefix)
-    }
-
-    /// The vendored `[pack].skill` text (#445): external pack text shown
-    /// to agents, labelled as external by the CLI (PD10).
-    fn skill_text(&self) -> Option<&'static str> {
-        Some(self.skill_text)
-    }
-
-    /// PD16: an external pack folds an empty state; only the merge view
-    /// is kept so the declarative rules (#441) already share exactly the
-    /// view a compiled pack's rules use.
-    fn fold(
-        &self,
-        _vault: &Vault,
-        merges: &MergeMap,
-        _as_of: NaiveDate,
-        _findings: &mut Vec<Finding>,
-    ) -> Box<dyn PackState> {
-        Box::new(ExternalState {
-            merge: crate::packs::groups::MergeGroups::new(merges.clone()),
-        })
-    }
-
-    /// Declarative rules + field-grammar validation (#441). Runs the
-    /// evaluator's two phases in manifest order; findings are appended
-    /// deterministically.
-    fn findings(
-        &self,
-        vault: &Vault,
-        state: &dyn PackState,
-        as_of: NaiveDate,
-        out: &mut Vec<Finding>,
-    ) {
-        let Some(external_state) = state.as_any().downcast_ref::<ExternalState>() else {
-            return; // never happens in-tree; fold always makes ExternalState
-        };
-        crate::packs::declarative::run(vault, &external_state.merge, as_of, self.manifest, out);
-    }
-
-    /// PD16: the metric is declared and owned, no rule verifies values
-    /// yet (the `ledger-balance` rule kind arrives in #446).
-    fn check_balance(
-        &self,
-        _vault: &Vault,
-        _state: &dyn PackState,
-        _sourced: &SourcedEntry,
-        _findings: &mut Vec<Finding>,
-    ) {
-    }
-}
-
-/// External state for #438: the merge view only (PD16: empty behaviour).
-/// `check` never reads it down-typed in this issue; `as_any` exists for
-/// the #441 rules.
-pub struct ExternalState {
-    /// The merge view, kept for #441's rules; nothing reads it in #438.
-    #[allow(dead_code)]
-    merge: crate::packs::groups::MergeGroups,
-}
-
-impl PackState for ExternalState {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// The manifest's verb names, when it still parses. Used to build
@@ -376,18 +184,25 @@ pub fn vendored_rel_of(listed: &str) -> String {
     }
 }
 
-/// Resolve the vault's external pack list (#438 scope item 2).
+/// Resolve the vault's pack list (#438 scope item 2, built-ins #550).
 ///
-/// For every `name@version` in `names` that no compiled pack in
-/// `compiled` implements, verify the entry against the lockfile and the
-/// vendored directory, then load it. Compiled names are simply skipped —
-/// a compiled pack always wins on the same `name@version` (PD14) and
-/// resolves without a lockfile.
+/// For every `name@version` in `names`:
+/// - a compiled pack that implements it wins and needs no lockfile (PD14);
+/// - a compiled-in built-in pack ([`EmbeddedPack`]) supplies it, provided
+///   the vault has no install state for that name — a vendored directory
+///   or a lockfile pin means the vault tried to install a built-in, which
+///   fails closed (PD12, #504 R8);
+/// - anything else must be an external pack: verify it against the
+///   lockfile and the vendored directory, then load it.
+///
+/// Load order is config order; built-ins and externals share the returned
+/// `packs`/`manifests` vectors.
 pub fn load_external_packs(
     root: &std::path::Path,
     spec: &str,
     names: &[String],
     compiled: &PackRegistry,
+    builtins: &[EmbeddedPack],
 ) -> ExternalLoad {
     let is_compiled = |listed: &str| compiled.all().iter().any(|p| p.name() == listed);
 
@@ -423,6 +238,31 @@ pub fn load_external_packs(
         if !loaded_ids.insert(listed.clone()) {
             // A repeated listing folds once (same rule as compiled packs);
             // skip loading the second time.
+            continue;
+        }
+        // A compiled-in built-in (#550) supplies its name@version without a
+        // lockfile. The vault may not install it: any lockfile pin or
+        // vendored directory for the name is a broken install, so it fails
+        // closed rather than silently shadowing the built-in (#504 R8).
+        if let Some(builtin) = builtins.iter().find(|b| b.listed() == listed) {
+            let (name, version) = listed
+                .split_once('@')
+                .expect("a built-in's listed name is always name@version");
+            let dir_rel = vendored_rel(name, version);
+            let dir = root.join(dir_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if lock.find(name, version).is_some() || dir.exists() {
+                problems.push(PackProblem {
+                    name: listed.clone(),
+                    kind: PackProblemKind::Invalid,
+                    detail: format!(
+                        "{listed} ships inside the binary; a built-in pack is not installed from the vault"
+                    ),
+                    known_verbs: builtin.pack().verbs().iter().map(|v| (*v).to_owned()).collect(),
+                });
+                continue;
+            }
+            packs.push(builtin.pack());
+            manifests.push(builtin.manifest());
             continue;
         }
         let Some((name, version)) = listed.split_once('@') else {
@@ -576,7 +416,7 @@ pub fn load_external_packs(
             .get(&manifest.pack.skill)
             .map(|bytes| String::from_utf8_lossy(bytes).to_string())
             .unwrap_or_default();
-        let pack = intern_pack(intern_key, ExternalPack::build(manifest, skill_text));
+        let pack = intern_pack(intern_key, build_manifest_pack(manifest, skill_text));
         packs.push(pack);
         manifests.push(pack.pack_manifest());
     }
@@ -662,11 +502,11 @@ grammar = "non-empty-string"
         let compiled = PackRegistry::compiled();
         let listed = ["example-pack@0.1".to_owned()];
 
-        let first = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        let first = load_external_packs(dir.path(), "0.1", &listed, &compiled, &[]);
         assert_eq!(first.problems.len(), 0, "{:?}", first.problems);
         assert_eq!(first.packs.len(), 1);
 
-        let second = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        let second = load_external_packs(dir.path(), "0.1", &listed, &compiled, &[]);
         assert_eq!(second.problems.len(), 0, "{:?}", second.problems);
         assert_eq!(second.packs.len(), 1);
 
@@ -690,10 +530,10 @@ grammar = "non-empty-string"
         let compiled = PackRegistry::compiled();
         let listed = ["example-pack@0.1".to_owned()];
 
-        let ok = load_external_packs(dir.path(), "0.1", &listed, &compiled);
+        let ok = load_external_packs(dir.path(), "0.1", &listed, &compiled, &[]);
         assert_eq!(ok.packs.len(), 1, "{:?}", ok.problems);
 
-        let bad = load_external_packs(dir.path(), "9.9", &listed, &compiled);
+        let bad = load_external_packs(dir.path(), "9.9", &listed, &compiled, &[]);
         assert!(bad.packs.is_empty());
         assert_eq!(bad.problems.len(), 1, "{:?}", bad.problems);
         assert_eq!(bad.problems[0].kind, PackProblemKind::Version);
@@ -708,6 +548,7 @@ grammar = "non-empty-string"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         assert!(load.packs.is_empty());
         assert_eq!(load.problems.len(), 1);
@@ -738,6 +579,7 @@ grammar = "non-empty-string"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         assert_eq!(load.problems[0].kind, PackProblemKind::Hash);
         assert!(load.problems[0].detail.contains("missing"));
@@ -747,7 +589,13 @@ grammar = "non-empty-string"
     fn listed_id_without_at_is_unknown() {
         let dir = tempdir().unwrap();
         let compiled = PackRegistry::compiled();
-        let load = load_external_packs(dir.path(), "0.1", &["example-pack".to_owned()], &compiled);
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["example-pack".to_owned()],
+            &compiled,
+            &[],
+        );
         assert_eq!(load.problems[0].kind, PackProblemKind::Unknown);
     }
 
@@ -765,6 +613,7 @@ grammar = "non-empty-string"
             "0.1",
             &["a@1".to_owned(), "b@2".to_owned()],
             &compiled,
+            &[],
         );
         assert!(load.lockfile_error, "{:?}", load.lockfile_error);
         assert!(load.problems.is_empty(), "{:?}", load.problems);
@@ -774,7 +623,13 @@ grammar = "non-empty-string"
     fn compiled_names_are_skipped_without_lockfile() {
         let dir = tempdir().unwrap();
         let compiled = PackRegistry::compiled();
-        let load = load_external_packs(dir.path(), "0.1", &["coaching@0.1".to_owned()], &compiled);
+        let load = load_external_packs(
+            dir.path(),
+            "0.1",
+            &["coaching@0.1".to_owned()],
+            &compiled,
+            &[],
+        );
         assert!(load.packs.is_empty());
         assert!(
             load.problems.is_empty(),

@@ -15,6 +15,17 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   accepts the literal `never`. The `cadence-overdue` rule now skips a
   `never` person and accepts an optional `snooze_field` (a declared `date`
   field) to suppress the nudge while `as_of` is before its value (#509).
+- The embedded declarative `personal@0.2` built-in pack (#550): its
+  manifest, skill text and contract ship inside the binary and load through
+  the manifest-v2 / declarative path external packs use, so its rules may
+  name the stable finding codes. A vault opts in with
+  `packs = ["personal@0.2"]`; `personal@0.1` still resolves to the compiled
+  pack (PD14) and nothing changes for a vault that keeps listing 0.1. The
+  repo-root `packs/personal/manifest.toml`, `SKILL.md` and `0.2.md` are the
+  0.2 human contract; a parity test pins the embedded pack against compiled
+  `personal@0.1` on the 0.1 field set (including `examples/demo-vault`), and
+  the stable-code allowance is keyed on compiled-in origin, so a vault
+  directory `packs/personal@…` is still `E_PACK_INVALID` (#550, #504 R8).
 
 ### Changed
 - The `touch` kind list is now `call|text|email|meet|meal|event|gift|other`

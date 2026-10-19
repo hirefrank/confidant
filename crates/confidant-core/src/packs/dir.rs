@@ -30,7 +30,9 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use crate::error::DomainError;
-use crate::packs::manifest::{parse_manifest_external, PackManifest};
+use crate::packs::manifest::{
+    parse_manifest_external, parse_manifest_with_origin, PackManifest, PackOrigin,
+};
 
 /// Maximum number of files in a pack directory.
 const MAX_FILES: usize = 200;
@@ -135,17 +137,28 @@ fn is_allowed(name: &str, skill_file: &str, version_file: &str) -> bool {
     false
 }
 
+/// Read a pack directory from the vault (an external pack), enforcing PD6
+/// limits and the PD7 allowlist, and compute the canonical tree hash.
+///
+/// Equivalent to [`read_pack_dir_with_origin`] with [`PackOrigin::External`].
+pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
+    read_pack_dir_with_origin(dir, PackOrigin::External)
+}
+
 /// Read a pack directory from disk, enforcing PD6 limits and the PD7
 /// allowlist, and compute the canonical tree hash.
 ///
 /// The directory must contain `manifest.toml`; it is read and parsed first
-/// (with [`parse_manifest_external`]) to learn the skill file name and the
+/// (with [`parse_manifest_with_origin`]) to learn the skill file name and the
 /// version for the `<version>.md` contract file. Then every other entry is
-/// validated against the allowlist.
+/// validated against the allowlist. `origin` decides the manifest's trust
+/// level (#550): the vault's own vendored packs are [`PackOrigin::External`];
+/// a test that materializes a compiled-in built-in's bytes uses
+/// [`PackOrigin::CompiledIn`].
 ///
 /// Symlinks are never followed. Every rejection names the relative path
 /// (never an absolute path) and suggests a fix.
-pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
+pub fn read_pack_dir_with_origin(dir: &Path, origin: PackOrigin) -> Result<PackDir, DomainError> {
     // Read manifest.toml first, without following symlinks.
     let manifest_path = dir.join("manifest.toml");
     let manifest_meta = fs::symlink_metadata(&manifest_path).map_err(|_| {
@@ -177,8 +190,8 @@ pub fn read_pack_dir(dir: &Path) -> Result<PackDir, DomainError> {
             "Save manifest.toml as UTF-8",
         )
     })?;
-    let manifest = parse_manifest_external(manifest_text).map_err(|e| {
-        // parse_manifest_external already returns a DomainError with file
+    let manifest = parse_manifest_with_origin(manifest_text, origin).map_err(|e| {
+        // parse_manifest_with_origin already returns a DomainError with file
         // and fix; wrap it as a pack error for the stable E_PACK_INVALID
         // code while keeping the message.
         DomainError::pack_invalid(format!("invalid manifest.toml: {}", e.message()))
