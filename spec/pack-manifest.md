@@ -482,8 +482,7 @@ own issue appends its section with the parameter table:
 | `note-ref` | #458 | the built-in personal pack's `touch` note check and `coaching@0.1`'s `session` note check |
 | `ledger-balance` | #446 | `coaching@0.1`'s `sessions_remaining` / `icf_hours` fold and `balance` checks |
 | `session-checks` | #447 | `coaching@0.1`'s per-session duration, billing-tag and notes checks |
-
-(Planned: `activity-gap` #448.)
+| `activity-gap` | #448 | `coaching@0.1`'s paid-session gap rule |
 
 #### Kind `cadence-overdue` (#442)
 
@@ -867,6 +866,78 @@ record for that day emits `E_SESSION_WITHOUT_NOTES` at the
 `coaching.session_notes` severity. Adding `note:n-…` to the line, or a
 note for the person dated `2026-10-01`, silences it. A second session
 that day tagged both `paid` and `pps` emits `E_SESSION_TAGS` as well.
+
+#### Kind `activity-gap` (#448)
+
+Warn when a paid client has no session lately. Reproduces
+`coaching@0.1`'s `paid_session_gap`: who counts as a paid client, the gap
+clock, the inclusive window edge, and the never-started / spent-package
+cases.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `activity_verb` | string, non-empty | The verb whose latest date is the activity clock (today `session`). |
+| `start_verb` | string, non-empty | A later opener also resets the clock (today `open`); the gap clock is `max(last activity_verb, last start_verb)`. |
+| `gap_days_key` | string | A declared `[[checks.int]]` key holding the window in days. Resolved as the operator's `[checks]` value when set, else the manifest default. |
+| `lookback_days_key` | string | A declared `[[checks.int]]` key holding the pay-per-session lookback in days. |
+| `balance_metric` | string | A declared `balance_metrics` entry that a `ledger-balance` rule owns as its `units_metric` (today `sessions_remaining`); the kind uses that rule's fold for the remaining count and the `pps` history. |
+
+The generic `code` is the gap code (today `E_PAID_SESSION_GAP`) and must
+be a code the pack declares (PD13: an external pack cannot name the
+builtin). Severity comes from `severity_key`; `off` skips the rule.
+
+Message variants the pack's `[messages."<CODE>"]` table must declare (the
+loader refuses a rule whose table lacks one):
+
+| Variant | Placeholders | Meaning |
+|---|---|---|
+| `none` | `id` | A paid client with no session ever. |
+| `none_fix` | `id`, `days` | Fix text. |
+| `remaining` | `id`, `start`, `d` | Remaining units, last session `d`, window start `start`. |
+| `remaining_fix` | `days` | Fix text. |
+| `no_remaining` | `id`, `start`, `d` | No remaining units, but still a paid client through `pps`. |
+| `no_remaining_fix` | `days` | Fix text. |
+
+Evaluation, for each canonical person in id order:
+
+1. Compute the remaining units through the `ledger-balance` rule's fold
+   (`balance_metric`) and whether the person has a `pps` session inside
+   the lookback window ending at `as_of` (inclusive). A person with
+   remaining `<= 0` and no `pps` history is not a paid client and is
+   skipped — a spent package stops warning.
+2. The gap clock is the latest date `<= as_of` among the person's (or a
+   merged member's) entries of `activity_verb`, and separately of
+   `start_verb`; the later of the two, when either exists.
+3. If the clock exists and `as_of − clock` is at most the window, the
+   person is current and no finding is emitted. The edge is inclusive:
+   exactly `gap_days` is inside the window.
+4. Otherwise emit the variant chosen by `(last activity_verb date,
+   remaining > 0)`: no session ever is `none`; a session with remaining
+   units is `remaining`; a session with no remaining units is
+   `no_remaining`. `start` is `as_of − gap_days` and `d` the last
+   `activity_verb` date. The finding's id is the canonical person; it has
+   no file or line.
+
+Worked example:
+
+```toml
+[[rules]]
+id = "gap"
+kind = "activity-gap"
+code = "E_PAID_SESSION_GAP"
+severity_key = "coaching.paid_session_gap"
+activity_verb = "session"
+start_verb = "open"
+gap_days_key = "coaching.paid_session_gap_days"
+lookback_days_key = "coaching.pps_lookback_days"
+balance_metric = "sessions_remaining"
+```
+
+With `as_of = 2026-10-08` and `gap_days = 45`, a client with
+`2026-08-01 open p-… package pkg-… 6 sessions` and a last session on
+`2026-08-24` is exactly on the edge and emits nothing; a last session on
+`2026-08-23` emits `remaining` with `start = 2026-08-24`. A client whose
+only event is an open on `2026-01-01` emits `none`.
 
 ### 13.3. Names
 
