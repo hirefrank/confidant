@@ -1,12 +1,17 @@
-# Pack manifest for personal@0.1 (spec/pack-manifest.md).
+# Pack manifest for personal@0.2 (spec/pack-manifest.md).
 #
-# Claims only: name, verbs, record types, front-matter fields and their
-# grammars, edge kinds and symmetry, finding codes, verb-to-ID type,
-# [checks] keys and defaults, and skill and finding text.
-# The reducers and date math (fold, findings) stay compiled in Rust
-# behind the Pack trait.
+# This is the built-in declarative pack (#550). Its bytes live inside the
+# binary and are loaded through the same manifest-v2 / declarative path
+# external packs use. Because it is loaded from compiled-in bytes it is
+# trusted as core (#504 decision 3): its rules name the stable finding
+# codes directly and it may claim the core `touch` verb. The allowance is
+# keyed on the bytes' origin, never the pack name, so a vault directory
+# `packs/personal@…` still fails `E_PACK_INVALID` (#504 R8).
+#
+# The repo-root `packs/personal/manifest.toml` is the human contract; a
+# drift test pins the two copies together.
 
-manifest_version = 1
+manifest_version = 2
 
 # Top-level keys come before the first [table] header: in TOML anything
 # after a table header belongs to that table.
@@ -25,28 +30,61 @@ finding_codes = [
 
 [pack]
 name = "personal"
-version = "0.1"
+version = "0.2"
 skill = "SKILL.md"
+requires_spec = ["0.1"]
 
 [[verbs]]
 name = "touch"
 id_type = "person"
 
 [[fields]]
+name = "title"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "company"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "location"
+grammar = "non-empty-string"
+
+[[fields]]
+name = "emails"
+grammar = "list"
+
+[[fields]]
+name = "phones"
+grammar = "list"
+
+[[fields]]
+name = "links"
+grammar = "labeled-list"
+
+[[fields]]
+name = "tags"
+grammar = "list"
+
+[[fields]]
 name = "birthday"
 grammar = "recurring-date"
+
+[[fields]]
+name = "dates"
+grammar = "dates-list"
+
+[[fields]]
+name = "relationship"
+grammar = "non-empty-string"
 
 [[fields]]
 name = "cadence"
 grammar = "cadence"
 
 [[fields]]
-name = "relationship_to_me"
-grammar = "non-empty-string"
-
-[[fields]]
-name = "dates"
-grammar = "dates-list"
+name = "snooze_until"
+grammar = "date"
 
 [[edge_kinds]]
 name = "friend"
@@ -72,6 +110,7 @@ symmetric = false
 name = "mentor"
 symmetric = false
 
+[checks]
 [[checks.severity]]
 key = "personal.cadence_overdue"
 default = "warning"
@@ -83,6 +122,35 @@ default = "warning"
 [[checks.int]]
 key = "personal.date_upcoming_days"
 default = 7
+
+# Keep-in-touch cadence. Reproduces personal@0.1's rule (ledger contacts
+# only, per the accepted §13.4 rule 7 divergence) and adds `snooze_until`.
+[[rules]]
+id = "cadence_overdue"
+kind = "cadence-overdue"
+code = "W_CADENCE_OVERDUE"
+severity_key = "personal.cadence_overdue"
+cadence_field = "cadence"
+event_verbs = ["touch", "session"]
+snooze_field = "snooze_until"
+
+# Upcoming birthdays and other recurring dates.
+[[rules]]
+id = "date_upcoming"
+kind = "date-upcoming"
+code = "W_DATE_UPCOMING"
+severity_key = "personal.date_upcoming"
+date_fields = ["birthday", "dates"]
+window_key = "personal.date_upcoming_days"
+
+# `note:` integrity on `touch` lines, with the core codes the compiled
+# pack emits (allowed because these bytes are compiled in).
+[[rules]]
+id = "touch_note"
+kind = "note-ref"
+code = "E_UNKNOWN_RECORD"
+verb = "touch"
+pair = "note"
 
 [messages."E_FRONTMATTER"]
 default = "front matter key '{key}' {problem}"

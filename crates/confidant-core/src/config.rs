@@ -774,6 +774,9 @@ vault_id = "abc"
             // v2-only `[[rules]]` (#435); empty for a v1 manifest.
             rules: Vec::new(),
             messages: BTreeMap::new(),
+            // #550: a hand-built manifest in tests is treated as external;
+            // `may_emit_builtin_codes` still allows v1's builtin codes.
+            origin: crate::packs::manifest::PackOrigin::External,
         };
 
         let mut manifests = crate::packs::pack_manifests_for_config();

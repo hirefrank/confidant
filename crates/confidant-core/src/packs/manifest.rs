@@ -26,6 +26,27 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// still rejects 2.
 pub const MANIFEST_VERSION_V2: u32 = 2;
 
+/// Where a manifest's bytes came from (#550).
+///
+/// This is the trust boundary for the stable-code allowance: a manifest
+/// loaded from **compiled-in bytes** (a built-in pack shipped inside the
+/// binary) is trusted as core (#504 decision 3) and may name the stable
+/// finding codes and claim core verbs; an external pack's vendored bytes
+/// keep the `E_FRONTMATTER`-only carve-out (#490/PD13). The allowance is
+/// keyed on this origin, **never on the pack name**, so a vault directory
+/// `packs/personal@…` still fails `E_PACK_INVALID` (`#504` R8).
+///
+/// `#[serde(skip)]` on [`PackManifest::origin`] means a manifest file can
+/// never claim its own origin; only the loader sets it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PackOrigin {
+    /// Bytes read from the vault: an external pack's vendored directory.
+    #[default]
+    External,
+    /// Bytes compiled into the binary: a built-in declarative pack.
+    CompiledIn,
+}
+
 /// Rule kinds an external pack may declare (`[[rules]]`). Derived from
 /// the evaluator's registered kinds (#441) so the manifest's list and
 /// what actually runs cannot drift. Starts empty; each kind's own issue
@@ -265,6 +286,11 @@ pub struct PackManifest {
     /// `finding_codes` needs a table with at least one variant, and every
     /// table key must be in `finding_codes`.
     pub messages: BTreeMap<String, BTreeMap<String, String>>,
+    /// Where these bytes came from (#550). Set by the loader, never read
+    /// from the file (`#[serde(skip)]`, so `origin = "…"` in TOML is an
+    /// unknown-key error): a manifest cannot claim to be compiled in.
+    #[serde(skip)]
+    pub origin: PackOrigin,
 }
 
 /// Check one message template: `{placeholder}` substitution only — no
@@ -332,10 +358,31 @@ impl PackManifest {
         self.validate_common()
     }
 
-    /// Validate an external (v2) pack manifest: the v2 schema from #431
-    /// plus the capability limits (PD8). Called by
-    /// [`parse_manifest_external`]; the finding wrapper (`E_PACK_INVALID`)
-    /// comes in #438, so errors here are `DomainError::config`.
+    /// Whether this manifest may name core (builtin) finding codes as its
+    /// rule codes (#550). Only trusted manifests can: the v1 compiled path
+    /// (the legacy files this loader still serves) and a pack loaded from
+    /// compiled-in bytes. An external pack's v2 manifest keeps the
+    /// `E_FRONTMATTER`-only carve-out (#490/PD13).
+    pub fn may_emit_builtin_codes(&self) -> bool {
+        self.manifest_version == MANIFEST_VERSION || self.origin == PackOrigin::CompiledIn
+    }
+
+    /// Whether this is a manifest loaded from compiled-in bytes (#550).
+    fn is_compiled_in(&self) -> bool {
+        self.origin == PackOrigin::CompiledIn
+    }
+
+    /// Validate a v2 pack manifest: the v2 schema from #431 plus the
+    /// capability limits (PD8). Called by [`parse_manifest_with_origin`];
+    /// the finding wrapper (`E_PACK_INVALID`) comes in #438, so errors here
+    /// are `DomainError::config`.
+    ///
+    /// A compiled-in manifest (#550) is trusted as core: the reserved-name
+    /// rejection and the PD8 capability limits are for external packs
+    /// (bytes read from the vault), so they are skipped when
+    /// [`PackManifest::origin`] is [`PackOrigin::CompiledIn`]. The v2
+    /// schema itself (rule ids, kinds, codes, message tables) still
+    /// applies in full.
     fn validate_external(&self) -> Result<(), DomainError> {
         if self.manifest_version != MANIFEST_VERSION_V2 {
             return Err(manifest_err(format!(
@@ -345,7 +392,9 @@ impl PackManifest {
             .with_fix("Set manifest_version = 2 for external packs"));
         }
 
-        // PD14: name grammar and reserved names.
+        // PD14: name grammar and reserved names. A compiled-in built-in
+        // legitimately reuses a reserved name (`personal`); an external
+        // pack may not (#504 R8).
         if !is_valid_pack_name(&self.pack.name) {
             return Err(manifest_err(format!(
                 "[pack].name '{}' is not a valid external pack name (must match ^[a-z][a-z0-9-]{{1,31}}$)",
@@ -353,7 +402,7 @@ impl PackManifest {
             ))
             .with_fix("Use a lowercase name with dashes, e.g. name = \"example-pack\""));
         }
-        if RESERVED_PACK_NAMES.contains(&self.pack.name.as_str()) {
+        if !self.is_compiled_in() && RESERVED_PACK_NAMES.contains(&self.pack.name.as_str()) {
             return Err(manifest_err(format!(
                 "[pack].name '{}' is reserved for a compiled pack",
                 self.pack.name
@@ -382,9 +431,14 @@ impl PackManifest {
         // rules. Leak once at load time (same Box::leak pattern as #434).
         // A builtin code is allowed as an *emission claim* (#441): the v2
         // spec example (spec/pack-manifest.md §2) lists `E_FRONTMATTER`
-        // this way, with the pack supplying only a template shell.
+        // this way, with the pack supplying only a template shell. A
+        // compiled-in manifest (#550) may emit any builtin — it is trusted
+        // as core, so a rule may name the stable codes directly.
         for code in &self.finding_codes {
             let leaked: &'static str = Box::leak(code.clone().into_boxed_str());
+            if self.may_emit_builtin_codes() && FindingCode::is_builtin_code(leaked) {
+                continue;
+            }
             FindingCode::from_pack_str_or_builtin(leaked).map_err(|e| {
                 manifest_err(format!("finding code '{code}' is invalid: {e}")).with_fix(
                     "Codes must match ^[EW]_[A-Z0-9_]{2,40}$; a pack-own code must not collide with an existing code",
@@ -392,38 +446,41 @@ impl PackManifest {
             })?;
         }
 
-        // PD8 rule 1: no core verbs.
-        for verb in &self.verbs {
-            if CORE_VERBS_V2.contains(&verb.name.as_str()) {
-                return Err(manifest_err(format!(
-                    "verb '{}' is a core verb and cannot be claimed by an external pack",
-                    verb.name
-                ))
-                .with_fix("Remove the verb or choose a different name"));
+        // PD8 rules 1-3: no core verbs, record types or edge kinds. These
+        // capability limits apply to external packs only; a compiled-in
+        // built-in is trusted as core (#504 decision 3) and legitimately
+        // claims `touch`, for example.
+        if !self.is_compiled_in() {
+            for verb in &self.verbs {
+                if CORE_VERBS_V2.contains(&verb.name.as_str()) {
+                    return Err(manifest_err(format!(
+                        "verb '{}' is a core verb and cannot be claimed by an external pack",
+                        verb.name
+                    ))
+                    .with_fix("Remove the verb or choose a different name"));
+                }
             }
-        }
 
-        // PD8 rule 2: no core record types.
-        for record_type in &self.record_types {
-            if CORE_RECORD_TYPES.contains(&record_type.as_str()) {
-                return Err(manifest_err(format!(
-                    "record type '{record_type}' is a core record type and cannot be claimed by an external pack",
-                ))
-                .with_fix("Remove the record type or choose a different name"));
+            for record_type in &self.record_types {
+                if CORE_RECORD_TYPES.contains(&record_type.as_str()) {
+                    return Err(manifest_err(format!(
+                        "record type '{record_type}' is a core record type and cannot be claimed by an external pack",
+                    ))
+                    .with_fix("Remove the record type or choose a different name"));
+                }
             }
-        }
 
-        // PD8 rule 3: no core edge kinds.
-        for edge_kind in &self.edge_kinds {
-            if crate::packs::CORE_EDGE_KINDS
-                .iter()
-                .any(|k| k.name == edge_kind.name)
-            {
-                return Err(manifest_err(format!(
-                    "edge kind '{}' is a core edge kind and cannot be claimed by an external pack",
-                    edge_kind.name
-                ))
-                .with_fix("Remove the edge kind or choose a different name"));
+            for edge_kind in &self.edge_kinds {
+                if crate::packs::CORE_EDGE_KINDS
+                    .iter()
+                    .any(|k| k.name == edge_kind.name)
+                {
+                    return Err(manifest_err(format!(
+                        "edge kind '{}' is a core edge kind and cannot be claimed by an external pack",
+                        edge_kind.name
+                    ))
+                    .with_fix("Remove the edge kind or choose a different name"));
+                }
             }
         }
 
@@ -464,9 +521,11 @@ impl PackManifest {
             .collect();
         for rule in &self.rules {
             // A rule's code must be a pack-own code (#494 review): a
-            // builtin as a rule's code would let a pack emit core
-            // security findings with a re-worded meaning.
-            if FindingCode::is_builtin_code(&rule.code) {
+            // builtin as a rule's code would let an external pack emit
+            // core security findings with a re-worded meaning. A
+            // compiled-in built-in is trusted as core and may name the
+            // stable codes (#550).
+            if !self.may_emit_builtin_codes() && FindingCode::is_builtin_code(&rule.code) {
                 return Err(manifest_err(format!(
                     "rule '{}' emits builtin code '{}'; a rule's code must be a pack-own code",
                     rule.id, rule.code
@@ -662,18 +721,40 @@ pub fn parse_manifest(text: &str) -> Result<PackManifest, DomainError> {
     Ok(manifest)
 }
 
-/// Parse and validate an external (v2) pack manifest. Requires
-/// `manifest_version = 2` and applies the v2 schema plus capability
-/// limits (PD8). Returns the manifest on success; nothing is read from
-/// disk.
-pub fn parse_manifest_external(text: &str) -> Result<PackManifest, DomainError> {
-    let manifest: PackManifest = toml::from_str(text).map_err(|err| {
+/// Parse and validate a v2 pack manifest from the given origin (#550).
+/// Requires `manifest_version = 2` and applies the v2 schema; the PD8
+/// capability limits and the reserved-name rejection apply only when
+/// `origin` is [`PackOrigin::External`]. Returns the manifest on success;
+/// nothing is read from disk.
+pub fn parse_manifest_with_origin(
+    text: &str,
+    origin: PackOrigin,
+) -> Result<PackManifest, DomainError> {
+    let mut manifest: PackManifest = toml::from_str(text).map_err(|err| {
         manifest_err(format!("manifest.toml is not valid TOML: {err}")).with_fix(
             "Top-level keys (record_types, balance_metrics, finding_codes) must come before the first [table] header",
         )
     })?;
+    manifest.origin = origin;
     manifest.validate_external()?;
     Ok(manifest)
+}
+
+/// Parse and validate an external (v2) pack manifest read from the vault.
+/// Requires `manifest_version = 2` and applies the v2 schema plus
+/// capability limits (PD8). Returns the manifest on success; nothing is
+/// read from disk.
+pub fn parse_manifest_external(text: &str) -> Result<PackManifest, DomainError> {
+    parse_manifest_with_origin(text, PackOrigin::External)
+}
+
+/// Parse and validate a v2 pack manifest compiled into the binary (#550).
+/// Same schema as [`parse_manifest_external`], but the bytes are trusted
+/// as core: the reserved-name rejection and the PD8 capability limits are
+/// skipped, and the resulting rules may name the stable finding codes. The
+/// manifest's [`PackManifest::origin`] is [`PackOrigin::CompiledIn`].
+pub fn parse_manifest_compiled_in(text: &str) -> Result<PackManifest, DomainError> {
+    parse_manifest_with_origin(text, PackOrigin::CompiledIn)
 }
 
 /// Render a message template: `{placeholder}` substitution only — no
@@ -1266,5 +1347,55 @@ default_fix = "{fix}"
         let text = valid_v2_toml() + "bogus_key = 1\n";
         let err = parse_manifest_external(&text).unwrap_err();
         assert!(err.to_string().contains("bogus_key"), "{err:?}");
+    }
+
+    /// #550: the origin is set by the loader only. A manifest file cannot
+    /// claim `origin`; a built-in is not trusted because a file says so.
+    #[test]
+    fn manifest_cannot_declare_its_own_origin() {
+        let text = valid_v2_toml().replace(
+            "manifest_version = 2",
+            "manifest_version = 2\norigin = \"compiled-in\"",
+        );
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("origin"), "{err:?}");
+    }
+
+    /// #550: the stable-code allowance is origin-based. The same v2 bytes
+    /// parse compiled-in but fail as an external manifest, whatever the pack
+    /// name.
+    #[test]
+    fn compiled_in_origin_allows_stable_codes() {
+        let text = valid_v2_toml()
+            .replace(
+                "finding_codes = [\"E_FRONTMATTER\", \"E_EXAMPLE_FIELD\"]",
+                "finding_codes = [\"E_FRONTMATTER\", \"W_CADENCE_OVERDUE\"]",
+            )
+            .replace(
+                "[messages.\"E_EXAMPLE_FIELD\"]",
+                "[messages.\"W_CADENCE_OVERDUE\"]",
+            )
+            + "\n[[rules]]\nid = \"cadence\"\nkind = \"cadence-overdue\"\ncode = \"W_CADENCE_OVERDUE\"\nseverity_key = \"example-pack.example_rule\"\ncadence_field = \"example_field\"\nevent_verbs = [\"touch\"]\n";
+        assert!(
+            parse_manifest_external(&text).is_err(),
+            "an external pack must not claim W_CADENCE_OVERDUE"
+        );
+        let m = parse_manifest_compiled_in(&text).expect("compiled-in bytes may claim it");
+        assert_eq!(m.origin, PackOrigin::CompiledIn);
+        assert!(m.may_emit_builtin_codes());
+    }
+
+    /// #550: a compiled-in manifest may also claim a core verb and reuse a
+    /// reserved name; an external one may not.
+    #[test]
+    fn compiled_in_origin_skips_capability_limits_and_reserved_name() {
+        let text = valid_v2_toml()
+            .replace("name = \"example-pack\"", "name = \"personal\"")
+            .replace("example-pack.example_rule", "personal.example_rule")
+            + "\n[[verbs]]\nname = \"touch\"\nid_type = \"person\"\n";
+        assert!(parse_manifest_external(&text).is_err());
+        let m = parse_manifest_compiled_in(&text).expect("compiled-in built-in parses");
+        assert_eq!(m.origin, PackOrigin::CompiledIn);
+        assert_eq!(m.verbs[0].name, "touch");
     }
 }

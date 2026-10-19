@@ -265,9 +265,12 @@ This keeps the manifest honest the same way the current test keeps the
 slices honest: the manifest cannot claim a code it cannot render, and
 cannot render a code it does not claim.
 
-## 11. Worked example: `personal@0.1`
+## 11. Worked example: `personal@0.1` (frozen)
 
-`packs/personal/manifest.toml`:
+`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`: the
+compiled `personal@0.1` pack's frozen claims. The repo-root
+`packs/personal/manifest.toml` is now the current `personal@0.2` built-in
+contract; see §13.7 for how a compiled-in built-in loads.
 
 ```toml
 manifest_version = 1
@@ -760,3 +763,26 @@ Compatibility note: this example parses with the existing v1 loader
 once `manifest_version` is set to `1` and the v2-only
 `requires_spec` key is removed (checked by hand 2026-10-17). The M1
 issue turns the v2 example into a test.
+
+### 13.7. Compiled-in built-ins (#550)
+
+A **built-in** pack (today `personal@0.2`) is a v2 manifest whose bytes
+are compiled into the binary and loaded through the same loader and rule
+kinds as an external pack. The manifest's **origin** is what differs,
+and only the loader sets it (a manifest file cannot claim it):
+
+- origin `external` (the default): the bytes came from the vault's
+  `packs/<name>@<version>/`; the PD8 capability limits and the
+  reserved-name rule of §13.3/§13.4 apply, and `finding_codes` may use a
+  builtin only as the `E_FRONTMATTER` emission claim (§10).
+- origin `compiled-in`: the bytes shipped inside the binary and are
+  trusted as core. The reserved-name rule and PD8 rules 1–3 do not
+  apply (a built-in may claim `touch`), and a rule's `code`,
+  `invalid_code` or `wrong_type_code` may name any core code.
+
+The allowance is keyed on the origin, **never on the pack name**. A
+vault directory `packs/personal@<version>/` still resolves through the
+external path and is `E_PACK_INVALID` (a built-in is never installed
+from the vault: any lockfile pin or vendored directory for its name
+fails closed). The v2 schema itself — rule ids, kinds, declared codes,
+message tables — applies in full.

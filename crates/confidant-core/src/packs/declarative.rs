@@ -5,7 +5,7 @@
 //! expression language and no WASM: the logic lives here; the manifest
 //! only names, parameterizes and turns rules on/off.
 //!
-//! [`ExternalPack::findings`] (in `external.rs`) walks the manifest's
+//! [`ManifestPack::findings`] (in `manifest_pack.rs`) walks the manifest's
 //! `[[rules]]` in manifest order, resolves each rule's severity through
 //! the operator's `[checks]` config (a rule set `off` is skipped), and
 //! dispatches to the kind's `evaluate`. A rule that panics fails closed:
@@ -17,7 +17,7 @@
 //! `check` carries on either way.
 //!
 //! Everything here is `pub(crate)`: the trait and registry only run
-//! inside `ExternalPack`'s findings, and `MergeGroups` — the merge view
+//! inside `ManifestPack`'s findings, and `MergeGroups` — the merge view
 //! rules share — is a crate-internal type, so the trait cannot be
 //! public without leaking it. The public surface stays `Pack`.
 //!
@@ -41,7 +41,7 @@ use crate::packs::grammars::{
     GRAMMAR_DATES_LIST, GRAMMAR_RECURRING_DATE,
 };
 use crate::packs::groups::MergeGroups;
-use crate::packs::manifest::{PackManifest, RuleDecl, MANIFEST_VERSION_V2};
+use crate::packs::manifest::{PackManifest, RuleDecl};
 use crate::record::Record;
 use crate::vault::Vault;
 
@@ -240,7 +240,7 @@ fn evaluate_catching_panic(
 }
 
 /// The evaluator's two phases for one external pack, called from
-/// `ExternalPack::findings` (manifest order, deterministic):
+/// `ManifestPack::findings` (manifest order, deterministic):
 /// 1. field-grammar validation over person records,
 /// 2. rule dispatch.
 pub(crate) fn run(
@@ -483,7 +483,7 @@ impl RuleKind for CadenceOverdueKind {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        let Ok(code) = FindingCode::from_pack_str_or_builtin(intern_str(&rule.code)) else {
+        let Some(code) = resolve_finding_code(&rule.code) else {
             return; // the loader validated the code; unreachable
         };
 
@@ -786,7 +786,7 @@ impl RuleKind for DateUpcomingKind {
             .unwrap_or_default();
         let window = resolve_int_check(ctx, window_key);
         let window_i = i64::try_from(window).unwrap_or(i64::MAX);
-        let Ok(code) = FindingCode::from_pack_str_or_builtin(intern_str(&rule.code)) else {
+        let Some(code) = resolve_finding_code(&rule.code) else {
             return; // the loader validated the code; unreachable
         };
 
@@ -998,9 +998,10 @@ impl RuleKind for NoteRefKind {
         // claim and every pack with fields already has its message table,
         // so a builtin here would let a pack emit a core code with a
         // re-worded meaning — the same escape the `rule.code` check in
-        // `validate_external` closes. The v1 built-in path (compiled
-        // personal) keeps the core defaults.
-        if manifest.manifest_version == MANIFEST_VERSION_V2 {
+        // `validate_external` closes. The v1 compiled path and a
+        // compiled-in built-in (#550) keep the core defaults and may name
+        // the stable codes.
+        if !manifest.may_emit_builtin_codes() {
             for (role, code) in [
                 ("invalid_code", invalid_code),
                 ("wrong_type_code", wrong_type_code),
@@ -1582,6 +1583,8 @@ default = "test rule"
         const EVALUATOR_SOURCES: &[(&str, &str)] = &[
             ("packs/declarative.rs", include_str!("declarative.rs")),
             ("packs/external.rs", include_str!("external.rs")),
+            ("packs/manifest_pack.rs", include_str!("manifest_pack.rs")),
+            ("packs/embedded.rs", include_str!("embedded.rs")),
         ];
         const FORBIDDEN: &[&str] = &[
             "std::net",
@@ -1675,6 +1678,7 @@ default_fix = "{{fix}}"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         load.problems
     }
@@ -1804,6 +1808,7 @@ default_fix = "{{fix}}"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         assert_loader_refuses(&load.problems, "has grammar 'recurring-date'");
     }
@@ -2281,6 +2286,7 @@ default_fix = "Use note:n-<ULID>"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         load.problems
     }
@@ -2505,6 +2511,7 @@ default_fix = "{{fix}}"
             "0.1",
             &["example-pack@0.1".to_owned()],
             &compiled,
+            &[],
         );
         load.problems
     }
