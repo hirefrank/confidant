@@ -7416,18 +7416,73 @@ fn parse_tui_version(output: &str) -> Option<String> {
 }
 
 /// Run `<bin> --version` and return its normalized version. `None` when
-/// the probe fails or prints no recognizable version; the caller treats
-/// that as "unknown", never as an error.
+/// the probe fails, times out, or prints no recognizable version; the
+/// caller treats that as "unknown", never as an error.
+///
+/// A broken TUI must not hang `doctor` or `confidant tui`, so this mirrors
+/// the qmd probe: spawn, poll `try_wait`, and kill after the grace period
+/// (a `--version` that takes two seconds is already pathological).
 fn tui_binary_version(bin: &Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
+    use std::io::Read as _;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_OUTPUT: u64 = 64 * 1024;
+
+    let mut child = std::process::Command::new(bin)
         .arg("--version")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    // Drain both pipes on helper threads: a chatty binary that fills a
+    // pipe would otherwise block on write and never exit, leaving only
+    // the timeout to fire.
+    let mut stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut out).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let mut stderr_thread = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut err).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do not join the drain threads: a wrapper script can
+                    // leave a grandchild (e.g. `sleep`) holding the pipes
+                    // after the direct child is killed, and joining would
+                    // wait for it. They end when the pipes close, and
+                    // process exit detaches them either way. (#659)
+                    let _ = stdout_thread.take();
+                    let _ = stderr_thread.take();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    // Both pipes are closed now, so the drain threads always terminate.
+    let stdout = stdout_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_tui_version(&stdout).or_else(|| parse_tui_version(&String::from_utf8_lossy(&out.stderr)))
+    parse_tui_version(&String::from_utf8_lossy(&stdout))
+        .or_else(|| parse_tui_version(&String::from_utf8_lossy(&stderr)))
 }
 
 /// #659: `tui-version` doctor check. `confidant-tui` is optional and
@@ -10018,6 +10073,20 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
         .as_deref()
         .map(|v| v != cli_version)
         .unwrap_or(false);
+    if cli.json {
+        // Probe-only: the TUI owns stdout and would corrupt the ADR-7
+        // envelope. Report what would launch and leave launching to a
+        // human-mode invocation.
+        print_json(&ok_envelope(
+            cli.vault.as_deref(),
+            serde_json::json!({
+                "tui_version": tui_version,
+                "version_mismatch": version_mismatch,
+                "would_launch": true,
+            }),
+        ))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if version_mismatch {
         eprintln!(
             "warning: confidant-tui {} does not match confidant-cli {cli_version}; \
@@ -10025,15 +10094,6 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
              `cargo install confidant-tui`",
             tui_version.as_deref().unwrap_or("unknown")
         );
-    }
-    if cli.json {
-        print_json(&ok_envelope(
-            cli.vault.as_deref(),
-            serde_json::json!({
-                "tui_version": tui_version,
-                "version_mismatch": version_mismatch,
-            }),
-        ))?;
     }
     // The child inherits this process's environment, so CONFIDANT_VAULT and
     // CONFIDANT_BIN pass through untouched. An explicit `--vault` on this

@@ -78,8 +78,10 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 # (the corpus itself is built by `confidant reindex`, which the script runs first)
 "$(confidant which --skills-dir)"/qmd-search/bin/qmd-index.py --vault /path/to/vault
 
-# optional: embeddings for vector search (downloads GGUF models on first run)
-qmd embed
+# optional: embeddings for hybrid/vector search (downloads GGUF models on first run)
+# use the wrapper with --embed so QMD's vault-local INDEX_PATH/QMD_CONFIG_DIR
+# store gets the vectors (a bare `qmd embed` targets the default store)
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-index.py --vault /path/to/vault --embed
 ```
 
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the

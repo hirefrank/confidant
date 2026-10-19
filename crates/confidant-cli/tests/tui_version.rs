@@ -21,8 +21,8 @@ fn demo() -> PathBuf {
 const LOCAL: &str = env!("CARGO_PKG_VERSION");
 
 /// Fake `confidant-tui` that prints `$FAKE_TUI_VERSION` for `--version`
-/// and, for a normal launch, prints `LAUNCHED` so a test can prove the
-/// launcher continued. A value without the `confidant-tui` prefix covers
+/// and, for a normal launch, writes `$FAKE_TUI_MARKER` (when set) and
+/// prints `LAUNCHED`. A value without the `confidant-tui` prefix covers
 /// the bare-version shape.
 #[cfg(unix)]
 fn write_fake_tui(dir: &Path) {
@@ -34,7 +34,29 @@ fn write_fake_tui(dir: &Path) {
            echo \"${FAKE_TUI_VERSION:-confidant-tui 0.0.0}\"\n\
            exit 0\n\
          fi\n\
+         if [ -n \"$FAKE_TUI_MARKER\" ]; then\n\
+           echo launched > \"$FAKE_TUI_MARKER\"\n\
+         fi\n\
          echo LAUNCHED\n\
+         exit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Fake `confidant-tui` whose `--version` never returns promptly, to prove
+/// the doctor probe has a timeout.
+#[cfg(unix)]
+fn write_hung_tui(dir: &Path) {
+    let script = dir.join("confidant-tui");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+           sleep 10\n\
+           exit 0\n\
+         fi\n\
          exit 0\n",
     )
     .unwrap();
@@ -99,10 +121,12 @@ fn check<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
 fn tui_launch_warns_on_version_mismatch_and_continues() {
     let dir = tempfile::tempdir().unwrap();
     write_fake_tui(dir.path());
+    let marker = dir.path().join("launched-marker");
     let out = Command::new(bin())
         .arg("tui")
         .env("PATH", path_with_fake_tui(dir.path()))
         .env("FAKE_TUI_VERSION", "confidant-tui 0.5.0")
+        .env("FAKE_TUI_MARKER", &marker)
         .output()
         .unwrap();
     assert!(
@@ -110,6 +134,7 @@ fn tui_launch_warns_on_version_mismatch_and_continues() {
         "mixing versions must still launch: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(marker.exists(), "human mode must still launch the TUI");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("warning:"), "{stderr}");
     assert!(stderr.contains("confidant-tui 0.5.0"), "{stderr}");
@@ -145,10 +170,12 @@ fn tui_launch_accepts_bare_version_and_stays_quiet_when_matching() {
 fn tui_json_reports_version_fields() {
     let dir = tempfile::tempdir().unwrap();
     write_fake_tui(dir.path());
+    let marker = dir.path().join("launched-marker");
     let out = Command::new(bin())
         .args(["tui", "--json"])
         .env("PATH", path_with_fake_tui(dir.path()))
         .env("FAKE_TUI_VERSION", "confidant-tui 0.5.0")
+        .env("FAKE_TUI_MARKER", &marker)
         .output()
         .unwrap();
     assert!(
@@ -156,16 +183,40 @@ fn tui_json_reports_version_fields() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The envelope is printed before the TUI launches, and the child owns
-    // stdout after that; parse the first line only.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().next().unwrap_or_default();
-    let v: Value = serde_json::from_str(line).unwrap_or_else(|e| {
-        panic!("first stdout line is not JSON ({e}): {stdout}");
+    // Probe-only: the envelope must be the only stdout, with no child
+    // output appended, and the TUI must not have started.
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not pure JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
     });
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["tui_version"], "0.5.0", "{v}");
     assert_eq!(v["version_mismatch"], true, "{v}");
+    assert_eq!(v["would_launch"], true, "{v}");
+    assert!(
+        !marker.exists(),
+        "--json is probe-only; it must not launch the TUI"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_tui_version_probe_times_out_and_stays_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    write_hung_tui(dir.path());
+    let started = std::time::Instant::now();
+    let v = run_doctor(&path_with_fake_tui(dir.path()), &[]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "doctor must not wait on a hung --version: {elapsed:?}"
+    );
+    let c = check(&v, "tui-version").expect("tui-version check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("did not report a version"), "{msg}");
 }
 
 #[test]
