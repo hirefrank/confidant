@@ -70,6 +70,7 @@ fn run_event_loop(
         app.set_vault_root(vault);
     }
     app.load_check();
+    app.load_roster();
 
     loop {
         terminal.draw(|frame| app.render(frame))?;

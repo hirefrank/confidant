@@ -1,4 +1,5 @@
- 1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox   7:Conflicts    confidant-tui v1
+ 1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
+vault  unknown   scope  not resolved yet   doctor  not run
 ╭─ CLI Error (exit 1) ─────────────────────────────────────────────────────────────────────────────╮
 │ code    E_LEDGER_UNREADABLE                                                                      │
 │ message 1 items                                                                                  │
@@ -19,6 +20,5 @@
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tab/1-7  view  /  search  e  exact  j/k  move  Enter  context  r  refresh  q/Esc  quit
+ 1-3  ws  Tab  view  /  filter  s  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit

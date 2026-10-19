@@ -265,6 +265,41 @@ pub struct RecentSession {
     pub tag: Option<String>,
 }
 
+/// Output of `confidant record list --json --no-input` (#558).
+///
+/// The TUI calls the roster without `--for-operator`, so this is the
+/// section 12 cleared set: a `no-ai: true` person is absent, never present
+/// with a nulled name. `no_ai` is the tri-state string (`"true"`,
+/// `"notes"`, `"false"`) the CLI reports; phase 1 does not render it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Roster {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub for_operator: bool,
+    #[serde(default)]
+    pub records: Vec<RosterEntry>,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub skipped_encrypted: u32,
+    #[serde(default)]
+    pub refused_envelopes: u32,
+}
+
+/// One roster entry inside a [`Roster`].
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct RosterEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub no_ai: String,
+    #[serde(default)]
+    pub kind: String,
+}
+
 /// Output of `confidant doctor --json --no-input`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct DoctorReport {
