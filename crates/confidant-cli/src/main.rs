@@ -2221,6 +2221,46 @@ fn cmd_pack_update(
         return Ok(ExitCode::SUCCESS);
     }
 
+    // A no-op update: the installed tree is byte-identical to the fetched
+    // pack, the lock pin would not move, and the listing already names it.
+    // Report it unchanged, the same way `pack add --yes` reports an
+    // already-installed pack (PD10).
+    //
+    // Re-vendoring here instead would emit a `DeleteFile` and a rewrite of
+    // every path, and `apply_write`'s Unchanged guard checks each change on
+    // its own: the path a `DeleteFile` targets still exists because the same
+    // list rewrites it, so the guard misses the net no-op and the empty
+    // changeset fails `git commit` with an empty message (#602). The guard's
+    // comment says it exists precisely to avoid that empty commit; the
+    // delete+rewrite list is what defeated it. Reading the tree off disk
+    // (rather than trusting the lock hash) keeps a tampered tree out of this
+    // branch: its hash no longer matches the fetched pack, so it falls
+    // through to the normal path, where the pre-check reports the mismatch.
+    let extra = serde_json::json!({
+        "pack": {
+            "name": report.name.clone(),
+            "version": report.version.clone(),
+            "hash": report.hash.clone(),
+        },
+        "from_version": entry.version.clone(),
+        "source_changed": source_changed,
+    });
+    let pin_unchanged = entry.version == report.version
+        && entry.source == fetched.source
+        && entry.rev == fetched.rev
+        && entry.subdir == fetched.subdir;
+    let listed = {
+        let cfg_text = read_config_text(root)?;
+        confidant_core::config::VaultConfig::parse(&cfg_text)
+            .map_err(anyhow::Error::new)?
+            .packs
+            .iter()
+            .any(|p| p == &format!("{}@{}", report.name, report.version))
+    };
+    if read_pack_dir(&old_dir).is_ok_and(|dir| dir.hash == report.hash) && pin_unchanged && listed {
+        return finish_write(cli, root, "pack-update", WriteOutcome::Unchanged, extra);
+    }
+
     // Re-vendor: clear the old version's files, then write the new tree and
     // rewrite `confidant.lock`/`confidant.toml` once (the old listing is
     // replaced, not appended).
@@ -2252,17 +2292,7 @@ fn cmd_pack_update(
     if report.version != entry.version && matches!(outcome, WriteOutcome::Applied { .. }) {
         let _ = std::fs::remove_dir(root.join(vendored_rel(&entry.name, &entry.version)));
     }
-    finish_write(
-        cli,
-        root,
-        "pack-update",
-        outcome,
-        serde_json::json!({
-            "pack": {"name": report.name, "version": report.version, "hash": report.hash},
-            "from_version": entry.version,
-            "source_changed": source_changed,
-        }),
-    )
+    finish_write(cli, root, "pack-update", outcome, extra)
 }
 
 /// Standard `--json` envelope for successful command output.

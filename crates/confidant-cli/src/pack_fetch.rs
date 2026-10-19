@@ -82,11 +82,24 @@ pub(crate) fn diff_dirs(old: &Path, new: &Path) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("cannot run git diff: {e}"))?;
     match out.status.code() {
         Some(0) | Some(1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-        _ => Err(DomainError::pack_invalid(format!(
-            "git diff --no-index failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-        .into()),
+        _ => {
+            // A failure here is not a diff: keep the message non-empty even
+            // when git writes nothing useful to stderr (#602).
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = stderr.trim();
+            let detail = if detail.is_empty() {
+                stdout.trim()
+            } else {
+                detail
+            };
+            let detail = if detail.is_empty() {
+                format!("exit status {}", out.status.code().unwrap_or(-1))
+            } else {
+                detail.to_owned()
+            };
+            Err(DomainError::pack_invalid(format!("git diff --no-index failed: {detail}")).into())
+        }
     }
 }
 
