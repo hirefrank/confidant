@@ -7235,13 +7235,17 @@ fn skills_links_check() -> DoctorCheck {
 }
 
 /// #386: informational `qmd` search-availability check. qmd is optional,
-/// so this is always `ok` — the same rule as the offline staleness check:
-/// a missing qmd never warns or fails, it just means search falls back to
-/// `confidant find` (see `qmd-query.py`).
+/// so a missing qmd is `ok` — the same rule as the offline staleness check:
+/// it just means search falls back to `confidant find` (see
+/// `qmd-query.py`). A qmd that is installed but has no corpus is a
+/// `warning` (#657): the fallback still works, but the operator asked for
+/// semantic search and an initial `confidant reindex` is needed to enable
+/// it, so an `ok` badge on that message is easy to miss.
 ///
 /// Reports, in order: qmd on PATH? corpus built? embeddings present?
-/// (Hybrid and vector modes need `qmd embed`; bm25 keyword search works
-/// without it.)
+/// (BM25 keyword search is ready without embeddings; semantic/hybrid
+/// ranking needs the skill wrapper's `--embed`, not a bare `qmd embed`,
+/// because QMD's store is relocated under the vault. #666)
 fn qmd_search_check(root: &Path) -> DoctorCheck {
     const ID: &str = "qmd-search";
     const INSTALL_HINT: &str = "npm install -g @tobilu/qmd";
@@ -7259,18 +7263,38 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
         ));
     };
     if !root.join(QMD_CORPUS_REL).is_dir() {
-        return ok("qmd is on PATH but the search corpus is missing; \
-             run `confidant reindex` to rebuild it \
-             (search falls back to `confidant find`)"
-            .to_owned());
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "qmd is on PATH but the search corpus is missing; \
+                 run `confidant reindex` to rebuild it \
+                 (search falls back to `confidant find`)"
+                .to_owned(),
+            fix: Some("Run `confidant reindex` to build the search corpus".to_owned()),
+        };
     }
     match qmd_embedded_vectors(root, &qmd) {
-        Some(n) if n > 0 => ok(format!("qmd search available ({n} embedded vectors)")),
-        Some(_) => ok(
-            "qmd index has no embedded vectors; hybrid/vector search needs \
-             `qmd embed` (bm25 keyword search works without it)"
+        Some(n) if n > 0 => ok(format!(
+            "hybrid/vector search available ({n} embedded vectors); \
+             keyword (BM25) search is also ready"
+        )),
+        Some(_) => DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "keyword (BM25) search ready; semantic/hybrid ranking is optional \
+                      and not enabled (no embeddings)"
                 .to_owned(),
-        ),
+            // #666: a bare `qmd embed` would target QMD's default store.
+            // This project relocates QMD under the vault via
+            // INDEX_PATH/QMD_CONFIG_DIR, so use the skill wrapper.
+            fix: Some(format!(
+                "Run \"$(confidant which --skills-dir)\"/qmd-search/bin/qmd-index.py \
+                 --vault \"{}\" --embed to enable semantic/hybrid ranking \
+                 (the first run downloads multi-GB GGUF models, needs network, \
+                 and the disk must be encrypted)",
+                root.display()
+            )),
+        },
         // The probe itself could not report (status failed or timed out):
         // do not point at `qmd embed`, which would not fix a broken status.
         None => ok(
@@ -7358,6 +7382,271 @@ fn parse_embedded_vectors(output: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Parse the version out of `confidant-tui --version` output. Accepts
+/// `confidant-tui 1.2.3`, `confidant-tui v1.2.3`, and a bare `1.2.3`;
+/// scans tokens so a build suffix (`1.2.3 (abc)`) or a leading banner
+/// line still resolves. Returns the normalized `major.minor.patch`, or
+/// `None` when no version token is present.
+fn parse_tui_version(output: &str) -> Option<String> {
+    for token in output.split_whitespace() {
+        let token = token.trim_start_matches('v');
+        let mut parts = token.split('.');
+        let major = parts.next()?;
+        if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Some(minor) = parts.next() else {
+            continue;
+        };
+        if minor.is_empty() || !minor.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Some(patch) = parts.next() else {
+            continue;
+        };
+        let patch: String = patch.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if patch.is_empty() {
+            continue;
+        }
+        return Some(format!("{major}.{minor}.{patch}"));
+    }
+    None
+}
+
+/// Run `<bin> --version` and return its normalized version. `None` when
+/// the probe fails or prints no recognizable version; the caller treats
+/// that as "unknown", never as an error.
+fn tui_binary_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_tui_version(&stdout).or_else(|| parse_tui_version(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// #659: `tui-version` doctor check. `confidant-tui` is optional and
+/// installed separately, so a missing TUI is `ok`. An installed TUI whose
+/// version differs from this CLI is a `warning`: the TUI speaks the same
+/// ADR-7 contract, and a stale one can render unknown finding codes.
+fn tui_version_check() -> DoctorCheck {
+    const ID: &str = "tui-version";
+    const INSTALL: &str = "cargo install confidant-tui";
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let Some(bin) = find_on_path("confidant-tui") else {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("optional TUI not installed; install it with `{INSTALL}`"),
+            fix: None,
+        };
+    };
+    let Some(tui_version) = tui_binary_version(&bin) else {
+        // A broken or unusual `--version` must not make doctor noisy; the
+        // TUI is optional and may still work.
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "confidant-tui is installed but did not report a version".to_owned(),
+            fix: None,
+        };
+    };
+    if tui_version == cli_version {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("confidant-tui {tui_version} matches confidant-cli {cli_version}"),
+            fix: None,
+        }
+    } else {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "confidant-tui {tui_version} does not match confidant-cli {cli_version}; \
+                 the TUI may render stale or unknown state"
+            ),
+            fix: Some(format!("Run `{INSTALL}` to install the matching version")),
+        }
+    }
+}
+
+/// Parse `git remote -v` output into unique remote names, in first-seen
+/// order. URLs are deliberately discarded: they may carry credentials.
+fn parse_git_remotes(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        if name.is_empty() || names.iter().any(|n| n == name) {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names
+}
+
+/// #660: `git-remote` doctor check. Read-only and offline: it never
+/// fetches, pushes, or contacts a remote. A remote is safe only because
+/// the vault is encrypted, so a plaintext vault with a remote warns.
+///
+/// `root` is the resolved vault. When it is not a directory (doctor never
+/// reaches this today), the check stays `ok`: a missing vault is not a
+/// remote problem.
+fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
+    const ID: &str = "git-remote";
+    if !root.is_dir() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "no vault to inspect for git remotes".to_owned(),
+            fix: None,
+        };
+    }
+    let output = match confidant_core::write::git(root, &["remote", "-v"], no_input) {
+        Ok(out) => out,
+        Err(e) => {
+            // Never a panic or an error: `git-repo` already reports a
+            // missing repository, and this check is advisory.
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!("could not read git remotes: {e}"),
+                fix: None,
+            };
+        }
+    };
+    let remotes = parse_git_remotes(&output);
+    if remotes.is_empty() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "local-only; add a remote for backup and second-device recovery".to_owned(),
+            fix: Some("Run `git remote add origin <url>`".to_owned()),
+        };
+    }
+    let named = remotes.join(", ");
+    if confidant_core::crypto_mode::is_structurally_encrypted(root) {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("git remote configured ({named}); vault is encrypted"),
+            fix: None,
+        }
+    } else {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "git remote configured ({named}) but this vault is plaintext; record bodies \
+                 are readable by anyone with repo access"
+            ),
+            fix: Some(
+                "Do not push plaintext vaults; encrypt the vault first or remove the remote"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Parse `findmnt -no SOURCE /` output into a device path. `findmnt` can
+/// append a subvolume suffix (`/dev/sda2[/@root]`); strip it. Returns
+/// `None` for a non-device source (overlay, tmpfs, `UUID=…`), where the
+/// `lsblk` ancestry cannot be resolved.
+#[cfg(target_os = "linux")]
+fn parse_findmnt_source(output: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let source = line.split('[').next().unwrap_or(line).trim();
+    if source.starts_with("/dev/") {
+        Some(source.to_owned())
+    } else {
+        None
+    }
+}
+
+/// True when `lsblk -s -no TYPE` output lists a `crypt` device in the
+/// root device's ancestry (LUKS/dm-crypt).
+#[cfg(target_os = "linux")]
+fn lsblk_types_include_crypt(output: &str) -> bool {
+    output
+        .lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("crypt"))
+}
+
+/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
+/// advisory: a missing tool, an unparseable source, or a non-block root
+/// all report `ok` "could not determine", so this can never fail doctor.
+/// It never prompts and never leaves the machine.
+#[cfg(target_os = "linux")]
+fn disk_encryption_check() -> DoctorCheck {
+    const ID: &str = "disk-encryption";
+    let unknown = |detail: &str| DoctorCheck {
+        id: ID,
+        status: "ok",
+        message: format!("could not determine disk encryption ({detail})"),
+        fix: None,
+    };
+    let findmnt = match std::process::Command::new("findmnt")
+        .args(["-no", "SOURCE", "/"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => return unknown("findmnt could not resolve the root filesystem"),
+        Err(_) => return unknown("findmnt is not available"),
+    };
+    let Some(source) = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout)) else {
+        return unknown("root filesystem is not on a block device");
+    };
+    let lsblk = match std::process::Command::new("lsblk")
+        .args(["-sno", "TYPE", &source])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => return unknown("lsblk could not read the root device"),
+        Err(_) => return unknown("lsblk is not available"),
+    };
+    let types = String::from_utf8_lossy(&lsblk.stdout);
+    if lsblk_types_include_crypt(&types) {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "root filesystem is on an encrypted device".to_owned(),
+            fix: None,
+        }
+    } else if types.lines().any(|l| !l.trim().is_empty()) {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "root filesystem is not on an encrypted disk; keep real client data on an \
+                      encrypted disk"
+                .to_owned(),
+            fix: Some(
+                "Move the vault to a full-disk-encrypted volume before storing real client data"
+                    .to_owned(),
+            ),
+        }
+    } else {
+        unknown("lsblk returned no device types")
+    }
+}
+
+/// Non-Linux platforms have no `findmnt`/`lsblk`; macOS FileVault is not
+/// probed here. Report `ok` "could not determine" so doctor still passes.
+#[cfg(not(target_os = "linux"))]
+fn disk_encryption_check() -> DoctorCheck {
+    DoctorCheck {
+        id: "disk-encryption",
+        status: "ok",
+        message: "could not determine disk encryption (unsupported platform)".to_owned(),
+        fix: None,
+    }
 }
 
 fn cmd_doctor(
@@ -7449,6 +7738,10 @@ fn cmd_doctor(
         .map(|u| !u.trust.signers.is_empty())
         .unwrap_or(false);
     checks.push(git_version_check(has_signers));
+
+    // #660: remote visibility. Read-only and offline; warns when a
+    // plaintext vault has a remote, because that leaks record bodies.
+    checks.push(git_remote_check(root, cli.no_input));
 
     // #175: leftover keys/ staging state from an interrupted swap.
     checks.push(keys_staging_check(root));
@@ -7639,6 +7932,10 @@ fn cmd_doctor(
         });
     }
 
+    // #653(d): best-effort encrypted-disk check. Advisory only: a missing
+    // tool or an unknown platform is `ok`, so doctor never fails on it.
+    checks.push(disk_encryption_check());
+
     // #541: keychain reachability and device enrollment. Headless hosts
     // have no Secret Service, so the failure an agent hits is otherwise an
     // opaque NoKey; this names the source and the env-var fix.
@@ -7699,7 +7996,10 @@ fn cmd_doctor(
         let latest = if offline { None } else { latest_release_tag() };
         checks.push(cli_staleness_check(latest, offline));
         checks.push(skills_links_check());
-        // #386: qmd search availability (informational; never warns or fails).
+        // #659: the optional TUI must match the CLI's agent contract.
+        checks.push(tui_version_check());
+        // #386/#657: qmd search availability. Missing qmd is `ok`; an
+        // installed qmd without a corpus warns and points at `reindex`.
         checks.push(qmd_search_check(root));
     }
 
@@ -9708,6 +10008,33 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     };
+    // #659: a CLI-only upgrade leaves `confidant-tui` on the old release,
+    // and the TUI then speaks an older ADR-7 contract. Warn but keep
+    // launching: mixing versions is sometimes intentional, and refusing
+    // would break working installs.
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let tui_version = tui_binary_version(&bin);
+    let version_mismatch = tui_version
+        .as_deref()
+        .map(|v| v != cli_version)
+        .unwrap_or(false);
+    if version_mismatch {
+        eprintln!(
+            "warning: confidant-tui {} does not match confidant-cli {cli_version}; \
+             the TUI may render stale or unknown state. Install the matching version with \
+             `cargo install confidant-tui`",
+            tui_version.as_deref().unwrap_or("unknown")
+        );
+    }
+    if cli.json {
+        print_json(&ok_envelope(
+            cli.vault.as_deref(),
+            serde_json::json!({
+                "tui_version": tui_version,
+                "version_mismatch": version_mismatch,
+            }),
+        ))?;
+    }
     // The child inherits this process's environment, so CONFIDANT_VAULT and
     // CONFIDANT_BIN pass through untouched. An explicit `--vault` on this
     // command is forwarded the same way the TUI already reads it.
@@ -12487,9 +12814,80 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
-        parse_git_version, reject_unsupported_prefix, InstallMethod, MIN_GIT_VERSION,
+        parse_git_remotes, parse_git_version, parse_tui_version, reject_unsupported_prefix,
+        InstallMethod, MIN_GIT_VERSION,
     };
     use std::path::Path;
+
+    /// #659: the TUI `--version` probe accepts a prefixed, `v`-prefixed,
+    /// bare, and suffix-bearing version, and refuses garbage.
+    #[test]
+    fn tui_version_parser_accepts_real_shapes() {
+        assert_eq!(
+            parse_tui_version("confidant-tui 0.6.0"),
+            Some("0.6.0".into())
+        );
+        assert_eq!(
+            parse_tui_version("confidant-tui v0.6.1\n"),
+            Some("0.6.1".into())
+        );
+        assert_eq!(parse_tui_version("0.6.0"), Some("0.6.0".into()));
+        assert_eq!(
+            parse_tui_version("confidant-tui 0.7.0 (abc123)"),
+            Some("0.7.0".into())
+        );
+        // A numeric non-version token must not abort the scan.
+        assert_eq!(
+            parse_tui_version("confidant-tui build 1 0.6.2"),
+            Some("0.6.2".into())
+        );
+        assert_eq!(parse_tui_version("confidant-tui unknown"), None);
+        assert_eq!(parse_tui_version(""), None);
+    }
+
+    /// #660: remote URLs may carry credentials, so only names survive.
+    #[test]
+    fn git_remote_parser_keeps_names_only() {
+        let out = "\
+origin\thttps://user:token@host.example/org/repo.git (fetch)
+origin\thttps://user:token@host.example/org/repo.git (push)
+backup\tgit@host.example:org/repo.git (fetch)
+backup\tgit@host.example:org/repo.git (push)
+";
+        assert_eq!(parse_git_remotes(out), vec!["origin", "backup"]);
+        assert!(parse_git_remotes("").is_empty());
+    }
+
+    /// #653(d): `findmnt` output is a device path with an optional btrfs
+    /// subvolume suffix; non-block sources cannot be traced through
+    /// `lsblk` and must report "unknown", never a warning.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn findmnt_source_parser() {
+        use super::parse_findmnt_source;
+        assert_eq!(
+            parse_findmnt_source("/dev/nvme0n1p2\n"),
+            Some("/dev/nvme0n1p2".to_owned())
+        );
+        assert_eq!(
+            parse_findmnt_source("/dev/sda2[/@root]\n"),
+            Some("/dev/sda2".to_owned())
+        );
+        assert_eq!(parse_findmnt_source("overlay\n"), None);
+        assert_eq!(parse_findmnt_source("UUID=abcd-1234\n"), None);
+        assert_eq!(parse_findmnt_source("\n"), None);
+    }
+
+    /// #653(d): only a `crypt` ancestor means the root disk is encrypted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lsblk_types_detect_crypt() {
+        use super::lsblk_types_include_crypt;
+        assert!(lsblk_types_include_crypt("lvm\ncrypt\npart\ndisk\n"));
+        assert!(lsblk_types_include_crypt("crypt\n"));
+        assert!(!lsblk_types_include_crypt("lvm\npart\ndisk\n"));
+        assert!(!lsblk_types_include_crypt(""));
+    }
 
     /// #542: a `confidant <command>` hint in `reject_unsupported_prefix`
     /// must name a subcommand clap actually has. The old package hint said
