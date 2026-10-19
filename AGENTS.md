@@ -76,11 +76,14 @@ cargo audit
 python3 .github/scripts/check-crate-paths.py   # crate path check job
 ```
 
-CI runs the test job on `ubuntu-latest` for pull requests. `macos-latest`
-runs on push to `main`, a nightly schedule, and `workflow_dispatch`.
-Native Windows is not supported (#502): Windows users run Confidant under
-WSL2, so there is no Windows CI job. Keep code portable across macOS and
-Linux.
+CI runs the test job on both `ubuntu-latest` and `macos-latest` for every
+event, pull requests included. macOS used to be main-push-only, and all
+three main-red incidents in one stretch were platform-only failures it
+found after merge (#560, #564, #581), so a portability break now fails the
+pull request instead. A nightly schedule and `workflow_dispatch` run the
+same job. Native Windows is not supported (#502): Windows users run
+Confidant under WSL2, so there is no Windows CI job. Keep code portable
+across macOS and Linux.
 
 Narrower loops while iterating:
 
@@ -157,6 +160,10 @@ These are blocking. Do not open a PR for review that breaks one.
 - Tests: add or update tests for every behaviour change. The demo vault must
   stay clean under `confidant check`. Prefer extending the existing test
   files over adding new ones.
+- Tests that write ledger lines must pin the date (`--date 2026-10-13`) or
+  assert against a fixed month. A test that relies on "today" expires when
+  the month rolls over and turns `main` red on its own (#585 shipped one and
+  review caught it).
 
 ## Workflow
 
