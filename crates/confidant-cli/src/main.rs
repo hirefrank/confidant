@@ -260,6 +260,35 @@ enum Command {
         #[arg(long)]
         clear_pending_inbox_rotation: bool,
     },
+    /// Clear this machine's Confidant state so a new vault starts clean.
+    ///
+    /// Machine state only: this command never reads, writes, or deletes
+    /// anything inside a vault. It removes `trust.toml`, `manifest-seq.toml`
+    /// and `inbox-rotation-pending.toml` from `~/.config/confidant/`, the
+    /// `default_vault`, `[vaults]`, `[trust].signers` and `[inbox].pubkey`
+    /// entries from `config.toml`, and this machine's device, operator and
+    /// inbox keys from the OS keychain.
+    ///
+    /// It refuses when any resolvable vault has a `keys/` tree, because
+    /// removing the anchor and keys would break it. It checks `--vault`,
+    /// `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up from the
+    /// current directory, `default_vault`, and every `[vaults]` entry — even
+    /// when discovery itself would fail — and names every initialized vault
+    /// in the error. `--force` overrides the guard only for vaults you have
+    /// retired. Use the global `--dry-run` to see the plan; `--yes` (or an
+    /// interactive `y`) is required to remove anything. JSON always reports
+    /// `"vault": null`: this command is machine state, not vault-scoped.
+    Reset {
+        /// Machine state only. Required: there is no vault-scoped reset.
+        #[arg(long, required = true)]
+        machine_state: bool,
+        /// Remove without asking. Required with --no-input or --json.
+        #[arg(long)]
+        yes: bool,
+        /// Proceed even when a resolvable vault has a keys/ tree.
+        #[arg(long)]
+        force: bool,
+    },
     /// Initialize the vault's trust anchor and keys (first device).
     ///
     /// Generates the operator key, a 24-word recovery phrase (shown once on
@@ -866,6 +895,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Routing
             | Command::Tui { .. }
             | Command::BenchGen { .. }
+            | Command::Reset { .. }
             | Command::Pack { .. }
             | Command::Keys {
                 action: KeysAction::DeviceAdd { initiate: true, .. },
@@ -1295,6 +1325,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 *clear_pending_inbox_rotation,
             )
         }
+        Command::Reset { yes, force, .. } => cmd_reset_machine_state(&cli, *yes, *force),
         Command::Init { force, .. } => {
             let root = vault_root.unwrap();
             cmd_init(&cli, &root, *force)
@@ -7708,6 +7739,687 @@ fn cmd_doctor(
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+// ---------------------------------------------------------------------------
+// reset --machine-state (#638)
+// ---------------------------------------------------------------------------
+
+/// One keychain slot `reset --machine-state` clears. The service/account
+/// pairs come from the public `confidant-crypt` constants; this command
+/// only orchestrates, it does not introduce a new key path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MachineKeySlot {
+    Device,
+    Operator,
+    Inbox,
+    InboxPrevious,
+}
+
+impl MachineKeySlot {
+    const ALL: [Self; 4] = [
+        Self::Device,
+        Self::Operator,
+        Self::Inbox,
+        Self::InboxPrevious,
+    ];
+
+    fn service(self) -> &'static str {
+        match self {
+            Self::Device | Self::Operator => confidant_crypt::keychain::DEVICE_SERVICE,
+            Self::Inbox | Self::InboxPrevious => confidant_crypt::keychain::INBOX_SERVICE,
+        }
+    }
+
+    fn account(self) -> &'static str {
+        match self {
+            Self::Device => confidant_crypt::keychain::DEVICE_ACCOUNT,
+            Self::Operator => confidant_crypt::keychain::OPERATOR_ACCOUNT,
+            Self::Inbox => confidant_crypt::keychain::INBOX_ACCOUNT,
+            Self::InboxPrevious => confidant_crypt::keychain::INBOX_PREVIOUS_ACCOUNT,
+        }
+    }
+}
+
+/// One thing `reset --machine-state` can remove. `present` is `None` when
+/// the keychain could not be checked (for example on a headless host with
+/// no Secret Service); JSON reports `null` rather than guessing.
+struct ResetItem {
+    kind: &'static str,
+    /// File path, or `service/account` for a keychain item.
+    location: String,
+    key: Option<&'static str>,
+    slot: Option<MachineKeySlot>,
+    present: Option<bool>,
+}
+
+impl ResetItem {
+    fn file(path: PathBuf, present: bool) -> Self {
+        Self {
+            kind: "file",
+            location: path.display().to_string(),
+            key: None,
+            slot: None,
+            present: Some(present),
+        }
+    }
+
+    fn config_key(path: &Path, key: &'static str, present: bool) -> Self {
+        Self {
+            kind: "config-key",
+            location: path.display().to_string(),
+            key: Some(key),
+            slot: None,
+            present: Some(present),
+        }
+    }
+
+    fn keychain(slot: MachineKeySlot, present: Option<bool>) -> Self {
+        Self {
+            kind: "keychain",
+            location: format!("{}/{}", slot.service(), slot.account()),
+            key: None,
+            slot: Some(slot),
+            present,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut item = serde_json::json!({
+            "kind": self.kind,
+            "present": self.present,
+        });
+        match self.kind {
+            "config-key" => {
+                item["path"] = Value::String(self.location.clone());
+                item["key"] = Value::String(self.key.unwrap_or_default().to_owned());
+            }
+            "keychain" => {
+                let slot = self.slot.expect("keychain item has a slot");
+                item["service"] = Value::String(slot.service().to_owned());
+                item["account"] = Value::String(slot.account().to_owned());
+            }
+            _ => item["path"] = Value::String(self.location.clone()),
+        }
+        item
+    }
+
+    fn label(&self) -> String {
+        match self.kind {
+            "config-key" => format!("{}: {}", self.location, self.key.unwrap_or_default()),
+            _ => self.location.clone(),
+        }
+    }
+}
+
+/// Read `config.toml` for a rewrite. A missing file is an empty document;
+/// any other read error fails instead of replacing a file we could not
+/// read (matching `inbox rotate`'s pin rewrite).
+fn read_user_config_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "could not read {}: {e} — refusing to rewrite it",
+                path.display()
+            ))))
+        }
+    };
+    text.parse().map_err(|e| {
+        anyhow::Error::new(DomainError::config(format!(
+            "{} is not valid TOML: {e}",
+            path.display()
+        )))
+    })
+}
+
+/// Whether one of the four machine-state config entries is present. A
+/// `[vaults]`/`[trust]`/`[inbox]` value of the wrong shape fails closed:
+/// rewriting a file whose structure we do not understand could drop keys.
+fn config_key_present(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+    key: &str,
+) -> anyhow::Result<bool> {
+    match key {
+        "default_vault" => Ok(doc.get("default_vault").is_some()),
+        "vaults" => Ok(match doc.get("vaults") {
+            None => false,
+            // `as_table_like` covers both `[vaults]` and the inline
+            // `vaults = { … }` form.
+            Some(item) if item.as_table_like().is_some() => true,
+            Some(_) => return Err(not_a_table(path, "vaults")),
+        }),
+        "trust.signers" => nested_config_key_present(doc, path, "trust", "signers"),
+        "inbox.pubkey" => nested_config_key_present(doc, path, "inbox", "pubkey"),
+        other => Err(anyhow::anyhow!("unknown machine-state config key {other}")),
+    }
+}
+
+fn nested_config_key_present(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+    table: &str,
+    key: &str,
+) -> anyhow::Result<bool> {
+    match doc.get(table) {
+        None => Ok(false),
+        Some(item) if item.as_table_like().is_some() => {
+            Ok(item.as_table_like().and_then(|t| t.get(key)).is_some())
+        }
+        Some(_) => Err(not_a_table(path, table)),
+    }
+}
+
+fn not_a_table(path: &Path, table: &str) -> anyhow::Error {
+    anyhow::Error::new(DomainError::config(format!(
+        "{}: [{table}] is not a table — refusing to rewrite it",
+        path.display()
+    )))
+}
+
+/// Remove the four machine-state entries, preserving every unrelated key,
+/// comment and table. Returns whether the document changed. Empty
+/// `[trust]`/`[inbox]` tables left by the removal are dropped too.
+fn remove_config_entries(doc: &mut toml_edit::DocumentMut) -> bool {
+    let mut changed = false;
+    for key in ["default_vault", "vaults"] {
+        if doc.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    for (table, key) in [("trust", "signers"), ("inbox", "pubkey")] {
+        let emptied = match doc.get_mut(table) {
+            Some(item) => match item.as_table_like_mut() {
+                Some(table_item) => {
+                    let removed = table_item.remove(key).is_some();
+                    changed |= removed;
+                    removed && table_item.is_empty()
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if emptied {
+            doc.remove(table);
+        }
+    }
+    changed
+}
+
+/// Replace the config atomically, keeping the original permissions. A
+/// crash mid-write can never leave a truncated config.
+fn write_user_config_atomically(
+    path: &Path,
+    doc: &toml_edit::DocumentMut,
+    mode: Option<std::fs::Permissions>,
+) -> anyhow::Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.reset-{}", std::process::id()));
+    std::fs::write(&tmp, doc.to_string()).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "could not write {}: {e}",
+            tmp.display()
+        )))
+    })?;
+    if let Some(mode) = mode {
+        let _ = std::fs::set_permissions(&tmp, mode);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::Error::new(DomainError::invalid(format!(
+            "could not replace {}: {e}",
+            path.display()
+        )))
+    })
+}
+
+/// Whether a keychain slot holds a key. `None` means "could not tell"
+/// (headless host, or the test-only `CONFIDANT_KEYCHAIN=off` switch):
+/// never reported as absent. Deletion still refuses under the kill switch.
+fn machine_key_present(slot: MachineKeySlot) -> anyhow::Result<Option<bool>> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        use confidant_crypt::keychain::KeychainBackend as _;
+        let present = if slot == MachineKeySlot::Device {
+            dir.join("device.key").is_file()
+        } else {
+            FileKeychain::new(dir)
+                .get_password(slot.service(), slot.account())
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        return Ok(Some(present));
+    }
+    if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
+        == confidant_crypt::keychain::KeychainSwitch::Off
+    {
+        return Ok(None);
+    }
+    use confidant_crypt::keychain::KeychainBackend as _;
+    Ok(confidant_crypt::keychain::OsKeychain
+        .get_password(slot.service(), slot.account())
+        .ok()
+        .map(|value| value.is_some()))
+}
+
+/// Delete one slot through the existing `confidant-crypt` entry points.
+/// Test builds with `CONFIDANT_TEST_KEYCHAIN_DIR` use the same file-backed
+/// backend the inbox-rotation tests use, so CI never touches a real
+/// keychain (and the device key keeps its `device.key` test path).
+fn delete_machine_key(slot: MachineKeySlot) -> anyhow::Result<()> {
+    #[cfg(feature = "test-overrides")]
+    if let Some(dir) = test_keychain_dir() {
+        use confidant_crypt::keychain::KeychainBackend as _;
+        if slot == MachineKeySlot::Device {
+            let path = dir.join("device.key");
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot delete test keychain entry {}: {e}",
+                    path.display()
+                )))),
+            };
+        }
+        return FileKeychain::new(dir)
+            .delete_credential(slot.service(), slot.account())
+            .map_err(|e| anyhow::anyhow!("{e}"));
+    }
+    let result = match slot {
+        MachineKeySlot::Device => confidant_crypt::keychain::delete_device_key(),
+        MachineKeySlot::Operator => confidant_crypt::keychain::delete_operator_key(),
+        MachineKeySlot::Inbox => confidant_crypt::keychain::delete_inbox_key(),
+        MachineKeySlot::InboxPrevious => confidant_crypt::keychain::delete_inbox_key_previous(),
+    };
+    result.map_err(anyhow::Error::new)
+}
+
+/// A keychain failure is a dead end without a pointer to the manual path;
+/// the docs page keeps the platform commands as the fallback.
+fn keychain_delete_error(slot: MachineKeySlot, err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(
+        DomainError::invalid(format!(
+            "could not remove keychain entry {}/{}: {err:#}",
+            slot.service(),
+            slot.account()
+        ))
+        .with_fix(
+            "If this host has no reachable keychain, remove the entry with `secret-tool` (Linux) or `security` (macOS); see docs/starting-fresh.md, \"Clearing keychain entries\", then re-run",
+        ),
+    )
+}
+
+/// One vault path the reset guard checked. `sources` records every input
+/// that named it (`--vault`, `CONFIDANT_VAULT`, a walk-up, `default_vault`,
+/// or a `[vaults]` entry); `initialized` means the directory exists and has
+/// a `keys/` tree.
+struct VaultCandidate {
+    path: PathBuf,
+    sources: Vec<String>,
+    initialized: bool,
+}
+
+/// Expand the `~/` form used by `config.toml` values, matching
+/// `confidant_core::discover`'s `default_vault`/`[vaults]` handling.
+fn expand_config_path(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut path = PathBuf::from(home);
+            path.push(rest);
+            return path;
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// A display/dedupe path for a candidate: a `confidant.toml` argument
+/// becomes its parent (as discovery does), and an existing path is
+/// canonicalized (macOS `/var` → `/private/var`).
+fn normalize_vault_candidate(path: &Path) -> PathBuf {
+    let path = if path.is_file()
+        && path
+            .file_name()
+            .is_some_and(|name| name == "confidant.toml")
+    {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn push_vault_candidate(
+    candidates: &mut Vec<VaultCandidate>,
+    source: impl Into<String>,
+    path: PathBuf,
+) {
+    let path = normalize_vault_candidate(&path);
+    let source = source.into();
+    if let Some(existing) = candidates.iter_mut().find(|c| c.path == path) {
+        if !existing.sources.contains(&source) {
+            existing.sources.push(source);
+        }
+        return;
+    }
+    let initialized = path.join("keys").is_dir();
+    candidates.push(VaultCandidate {
+        path,
+        sources: vec![source],
+        initialized,
+    });
+}
+
+/// The nearest ancestor of `start` holding `confidant.toml`, matching
+/// discovery's walk-up. Never fails the guard when the directory cannot be
+/// canonicalized.
+fn walk_up_vault(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
+    loop {
+        if dir.join("confidant.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn config_string_value(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    match doc.get(key) {
+        None => Ok(None),
+        Some(item) => match item.as_str() {
+            Some(value) => Ok(Some(value.to_owned())),
+            None => Err(anyhow::Error::new(DomainError::config(format!(
+                "{}: {key} is not a string — refusing to rewrite it",
+                path.display()
+            )))),
+        },
+    }
+}
+
+fn config_vault_entries(
+    doc: &toml_edit::DocumentMut,
+    path: &Path,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(item) = doc.get("vaults") else {
+        return Ok(Vec::new());
+    };
+    let Some(table) = item.as_table_like() else {
+        return Err(not_a_table(path, "vaults"));
+    };
+    let mut entries = Vec::new();
+    for (name, item) in table.iter() {
+        let Some(value) = item.as_str() else {
+            return Err(anyhow::Error::new(DomainError::config(format!(
+                "{}: [vaults].{name} is not a string — refusing to rewrite it",
+                path.display()
+            ))));
+        };
+        entries.push((name.to_owned(), value.to_owned()));
+    }
+    Ok(entries)
+}
+
+/// Build the guard's candidate set from every way a vault can resolve. It
+/// deliberately does not use `discover()`: discovery stops at the first
+/// answer, and a bad `--vault` makes it fail, which would leave a live
+/// `default_vault` or `[vaults]` entry unchecked. Read-only.
+fn vault_guard_candidates(
+    cli: &Cli,
+    doc: &toml_edit::DocumentMut,
+    config_path: &Path,
+) -> anyhow::Result<Vec<VaultCandidate>> {
+    let mut candidates = Vec::new();
+
+    if let Some(flag) = &cli.vault {
+        push_vault_candidate(&mut candidates, "--vault", flag.clone());
+    }
+
+    let vault_entries = config_vault_entries(doc, config_path)?;
+    if let Some(env) = std::env::var("CONFIDANT_VAULT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        // `CONFIDANT_VAULT` is a path unless it names a `[vaults]` entry,
+        // exactly as discovery treats it.
+        let path = vault_entries
+            .iter()
+            .find(|(name, _)| name == &env)
+            .map(|(_, raw)| expand_config_path(raw))
+            .unwrap_or_else(|| expand_config_path(&env));
+        push_vault_candidate(&mut candidates, "CONFIDANT_VAULT", path);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(found) = walk_up_vault(&cwd) {
+        push_vault_candidate(&mut candidates, "walk-up", found);
+    }
+
+    if let Some(default) = config_string_value(doc, config_path, "default_vault")? {
+        push_vault_candidate(
+            &mut candidates,
+            "default_vault",
+            expand_config_path(&default),
+        );
+    }
+
+    for (name, raw) in vault_entries {
+        push_vault_candidate(
+            &mut candidates,
+            format!("[vaults] {name}"),
+            expand_config_path(&raw),
+        );
+    }
+
+    Ok(candidates)
+}
+
+fn vault_candidates_json(candidates: &[VaultCandidate], force: bool) -> Value {
+    let items: Vec<Value> = candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "path": candidate.path.display().to_string(),
+                "sources": candidate.sources,
+                "initialized": candidate.initialized,
+            })
+        })
+        .collect();
+    let initialized: Vec<Value> = candidates
+        .iter()
+        .filter(|candidate| candidate.initialized)
+        .map(|candidate| Value::String(candidate.path.display().to_string()))
+        .collect();
+    serde_json::json!({
+        "candidates": items,
+        "initialized": initialized,
+        "forced": force,
+    })
+}
+
+/// `confidant reset --machine-state` (#638): clear the state the machine
+/// keeps *outside* the vault so `init --create` starts clean. The vault is
+/// never opened for writing; a resolvable initialized vault only triggers
+/// the guard.
+fn cmd_reset_machine_state(cli: &Cli, yes: bool, force: bool) -> anyhow::Result<ExitCode> {
+    let dry_run = cli.dry_run;
+
+    if dry_run && yes {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "--dry-run changes nothing; drop --yes to preview, or drop --dry-run to remove",
+        )));
+    }
+    if !dry_run && !yes && (cli.no_input || cli.json) {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "`reset --machine-state` needs --yes with --no-input or --json (or --dry-run to preview)",
+        )));
+    }
+
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(
+            "`reset --machine-state` needs $HOME to locate ~/.config/confidant",
+        ))
+    })?;
+    let config_path = config_dir.join("config.toml");
+
+    // Read the config once so presence, guard, and removal agree on one
+    // document.
+    let mut doc = read_user_config_document(&config_path)?;
+
+    // Guard: only an initialized vault (keys/ exists) can be broken by
+    // removing the anchor and keys. Check every way a vault can resolve,
+    // not just the one discovery would pick. Read-only.
+    let candidates = vault_guard_candidates(cli, &doc, &config_path)?;
+    let initialized: Vec<&VaultCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.initialized)
+        .collect();
+    if !initialized.is_empty() {
+        let listed = initialized
+            .iter()
+            .map(|candidate| candidate.path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (subject, verb, object, possessive) = if initialized.len() == 1 {
+            ("vault", "looks", "it", "its")
+        } else {
+            ("vaults", "look", "them", "their")
+        };
+        if !force {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "refusing to clear machine state: {subject} {listed} {verb} initialized (keys/ exists), and removing the trust anchor and keys would break {object}"
+                ))
+                .with_fix(
+                    "Pass --force only after retiring every listed vault; otherwise run from outside them or unset CONFIDANT_VAULT",
+                ),
+            ));
+        }
+        if !cli.json {
+            eprintln!(
+                "warning: --force set; initialized {subject} {listed} will be left without {possessive} anchor or keys"
+            );
+        }
+    }
+
+    let mut items: Vec<ResetItem> = Vec::new();
+    for name in [
+        "trust.toml",
+        "manifest-seq.toml",
+        "inbox-rotation-pending.toml",
+    ] {
+        let path = config_dir.join(name);
+        let present = path.exists();
+        items.push(ResetItem::file(path, present));
+    }
+    for key in ["default_vault", "vaults", "trust.signers", "inbox.pubkey"] {
+        let present = config_key_present(&doc, &config_path, key)?;
+        items.push(ResetItem::config_key(&config_path, key, present));
+    }
+    for slot in MachineKeySlot::ALL {
+        items.push(ResetItem::keychain(slot, machine_key_present(slot)?));
+    }
+
+    let changed = items.iter().any(|item| item.present != Some(false));
+
+    // Nothing present: report the no-op without asking (there is nothing
+    // to confirm).
+    if !dry_run
+        && changed
+        && !yes
+        && !confirm_yn(
+            "Remove this machine's Confidant state? This never touches a vault.",
+            cli.no_input,
+            cli.json,
+        )?
+    {
+        println!("nothing removed");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !dry_run {
+        // Keychain first: a keychain failure (unreachable, or the
+        // CONFIDANT_KEYCHAIN=off test switch) must leave the files in
+        // place so a retry can finish the job.
+        for slot in MachineKeySlot::ALL {
+            let present = items
+                .iter()
+                .find(|item| item.slot == Some(slot))
+                .and_then(|item| item.present);
+            if present != Some(false) {
+                delete_machine_key(slot).map_err(|err| keychain_delete_error(slot, err))?;
+            }
+        }
+        if remove_config_entries(&mut doc) {
+            let mode = std::fs::metadata(&config_path)
+                .ok()
+                .map(|meta| meta.permissions());
+            write_user_config_atomically(&config_path, &doc, mode)?;
+        }
+        for name in [
+            "trust.toml",
+            "manifest-seq.toml",
+            "inbox-rotation-pending.toml",
+        ] {
+            let path = config_dir.join(name);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::new(DomainError::invalid(format!(
+                        "could not remove {}: {e}",
+                        path.display()
+                    ))))
+                }
+            }
+        }
+    }
+
+    if cli.json {
+        let mut extra = serde_json::Map::new();
+        extra.insert("command".to_owned(), Value::String("reset".to_owned()));
+        extra.insert(
+            "scope".to_owned(),
+            Value::String("machine-state".to_owned()),
+        );
+        extra.insert("dry_run".to_owned(), Value::Bool(dry_run));
+        extra.insert("changed".to_owned(), Value::Bool(changed));
+        extra.insert(
+            "items".to_owned(),
+            Value::Array(items.iter().map(ResetItem::to_json).collect()),
+        );
+        extra.insert(
+            "vault_guard".to_owned(),
+            vault_candidates_json(&candidates, force),
+        );
+        print_json(&ok_envelope(None, Value::Object(extra)))?;
+    } else if !changed {
+        println!("nothing to remove: machine state is already clear");
+    } else {
+        println!("{}:", if dry_run { "would remove" } else { "removed" });
+        for item in items.iter().filter(|item| item.present != Some(false)) {
+            println!("  {:<10} {}", item.kind, item.label());
+        }
+        if dry_run {
+            println!("dry run: nothing was changed");
+        } else {
+            println!(
+                "machine state cleared; `confidant init --create` in a new directory starts with no inherited anchor, config entries, or keys"
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,14 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Added
+- `confidant reset --machine-state`, the CLI path for starting fresh: it
+  clears the trust anchor, manifest high-water marks, the pending inbox
+  rotation reminder, the `default_vault`/`[vaults]`/`[trust].signers`/
+  `[inbox].pubkey` user-config entries (preserving unrelated keys and
+  comments), and the device, operator and inbox keys from the OS keychain.
+  It never writes inside a vault, refuses while a resolvable vault still has
+  a `keys/` tree unless `--force`, supports `--dry-run`, requires `--yes`
+  with `--no-input`/`--json`, and is idempotent (#638).
 - `personal@0.2` schema: three new field grammars — `list`,
   `labeled-list`, `date` — and an extended `cadence` grammar that also
   accepts the literal `never`. The `cadence-overdue` rule now skips a

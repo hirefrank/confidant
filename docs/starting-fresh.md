@@ -13,11 +13,11 @@ This page lists that state, gives a safe order to clear it, and ends with a
 checklist you can run against the new vault.
 
 The CLI commands below were exercised on throwaway vaults with an isolated
-`HOME` and `CONFIDANT_KEYCHAIN=off` (see the note on the keychain below).
-They are the real CLI surface; where a step has no CLI command, the page says
-so and gives the platform tool instead of inventing a flag. The
-`secret-tool` / `security` commands are platform commands and were not run
-against a real keychain.
+`HOME` and a throwaway keychain backend. `confidant reset --machine-state`
+is the supported way to clear the machine state described here; the
+`secret-tool` / `security` commands are the fallback when the command cannot
+reach a platform keychain (or when you want to inspect one entry by hand).
+Those platform commands were not run against a real keychain.
 
 ## 1. What "starting fresh" actually resets
 
@@ -55,26 +55,50 @@ abandoned-vault case, destroy the old key material as described below.
 
 | State | Where | What breaks if you forget it | How to clear it |
 |---|---|---|---|
-| Trust anchor | `~/.config/confidant/trust.toml` | `init --create` refuses with `trust anchor already exists ... pass --force`. A stale anchor makes the new vault's manifests fail verification (`signature does not verify`) and records fail to decrypt. | No CLI. Archive or remove the file, or use `init --force` on a vault that has no `keys/` yet. |
-| Default vault | `~/.config/confidant/config.toml` `default_vault` | Points discovery at the old vault. If the path is gone, `E_VAULT_NOT_FOUND`; if it still exists, commands silently operate on the old vault. | No CLI. Edit the file. |
-| Named vaults | `config.toml` `[vaults]` | `CONFIDANT_VAULT=<name>` keeps resolving to the old vault. | No CLI. Edit the file. |
-| Inbox signers | `config.toml` `[trust].signers` | Stale key IDs are the only signers trusted for `inbox` commits; the new vault's commits won't verify, so `inbox` refuses (or needs `--allow-unsigned`). | No CLI. Remove or replace the entries. |
-| Inbox pin | `config.toml` `[inbox].pubkey` | This is one global pin, not per vault. Once the new vault advertises a different inbox key, `check` reports `E_INBOX_KEY_MISMATCH` and `inbox` refuses. | No CLI. Clear it, or re-pin after `inbox rotate` (which updates it for you). |
-| Shell/agent env | `CONFIDANT_VAULT` | It wins over `default_vault` and directory walk-up, so a stale export keeps every command on the old vault. | `unset CONFIDANT_VAULT`, and remove it from your shell rc and agent runtime. |
-| Manifest high-water marks | `~/.config/confidant/manifest-seq.toml` | Rows are keyed by `vault_id`. A new vault has a new id, so old rows are inert; they are not a reason `init` fails. | Optional: delete the file to forget old vaults. No CLI. |
-| Pending inbox rotation | `~/.config/confidant/inbox-rotation-pending.toml` | `doctor` keeps warning after a shred on a non-inbox device. | `confidant doctor --clear-pending-inbox-rotation` |
-| Device key | keychain service `confidant`, account `device-key` | `init` overwrites it with the new vault's device key. If you never run `init`, the old key still opens the old vault. | No CLI. `secret-tool` (Linux) or `security` (macOS), below. |
-| Operator key | keychain service `confidant`, account `operator-key` | Same as the device key: `init` overwrites it; otherwise it still signs for the old vault. | No CLI. Same platform tools. |
-| Inbox keys | keychain service `confidant-inbox`, accounts `inbox-key` and `inbox-key-previous` | `init` does **not** touch these. A new vault's first `inbox rotate` adopts the old key as current, then moves it to the previous slot; items from the old vault stay decryptable until `--finish`. | No CLI. Same platform tools. Clear before `init` if you are retiring the old vault. |
+| Trust anchor | `~/.config/confidant/trust.toml` | `init --create` refuses with `trust anchor already exists ... pass --force`. A stale anchor makes the new vault's manifests fail verification (`signature does not verify`) and records fail to decrypt. | `confidant reset --machine-state`. Manual fallback: archive or remove the file, or use `init --force` on a vault that has no `keys/` yet. |
+| Default vault | `~/.config/confidant/config.toml` `default_vault` | Points discovery at the old vault. If the path is gone, `E_VAULT_NOT_FOUND`; if it still exists, commands silently operate on the old vault. | `confidant reset --machine-state` removes the key and keeps unrelated ones. Manual fallback: edit the file. |
+| Named vaults | `config.toml` `[vaults]` | `CONFIDANT_VAULT=<name>` keeps resolving to the old vault. | `confidant reset --machine-state`. Manual fallback: edit the file. |
+| Inbox signers | `config.toml` `[trust].signers` | Stale key IDs are the only signers trusted for `inbox` commits; the new vault's commits won't verify, so `inbox` refuses (or needs `--allow-unsigned`). | `confidant reset --machine-state`. Manual fallback: remove or replace the entries. |
+| Inbox pin | `config.toml` `[inbox].pubkey` | This is one global pin, not per vault. Once the new vault advertises a different inbox key, `check` reports `E_INBOX_KEY_MISMATCH` and `inbox` refuses. | `confidant reset --machine-state`. Manual fallback: clear it, or re-pin after `inbox rotate` (which updates it for you). |
+| Shell/agent env | `CONFIDANT_VAULT` | It wins over `default_vault` and directory walk-up, so a stale export keeps every command on the old vault. | `unset CONFIDANT_VAULT`, and remove it from your shell rc and agent runtime. `reset` does not change your shell. |
+| Manifest high-water marks | `~/.config/confidant/manifest-seq.toml` | Rows are keyed by `vault_id`. A new vault has a new id, so old rows are inert; they are not a reason `init` fails. | `confidant reset --machine-state` (optional: keeping the file is harmless). Manual fallback: delete it. |
+| Pending inbox rotation | `~/.config/confidant/inbox-rotation-pending.toml` | `doctor` keeps warning after a shred on a non-inbox device. | `confidant reset --machine-state`. To clear only this file with a resolvable vault: `confidant doctor --clear-pending-inbox-rotation` |
+| Device key | keychain service `confidant`, account `device-key` | `init` overwrites it with the new vault's device key. If you never run `init`, the old key still opens the old vault. | `confidant reset --machine-state`. Manual fallback: `secret-tool` (Linux) or `security` (macOS), below. |
+| Operator key | keychain service `confidant`, account `operator-key` | Same as the device key: `init` overwrites it; otherwise it still signs for the old vault. | `confidant reset --machine-state`. Manual fallback: same platform tools. |
+| Inbox keys | keychain service `confidant-inbox`, accounts `inbox-key` and `inbox-key-previous` | `init` does **not** touch these. A new vault's first `inbox rotate` adopts the old key as current, then moves it to the previous slot; items from the old vault stay decryptable until `--finish`. | `confidant reset --machine-state`. Clear before `init` if you are retiring the old vault. Manual fallback: same platform tools. |
 | Legacy plaintext keys | `~/.config/confidant/device.key`, `inbox.key` | Any key load fails closed: `refusing to load ... legacy plaintext key file exists`. | Import into the keychain, then remove the file. |
 | Skills | `~/.local/share/confidant`, agent skill dirs | Nothing vault-specific; links are versioned to the CLI. | Leave them. `confidant setup` refreshes links. |
 | Git remotes / clones | the vault's `.git`, plus other checkouts | Deleting the local directory does not delete pushed history or other clones. A former plaintext vault may hold real data in history. | See §2.2. |
 
 ### Clearing keychain entries
 
-There is no `confidant` command that removes a device, operator, or inbox key
-from the keychain (tracked in [#638](https://github.com/hirefrank/confidant/issues/638)).
-Use the platform's tool.
+`confidant reset --machine-state` removes all four keychain entries together
+with the files and config entries above. Preview it first:
+
+```sh
+confidant reset --machine-state --dry-run
+confidant reset --machine-state --yes
+```
+
+`--dry-run` prints exactly what would go (files, config keys and keychain
+service/account pairs) and changes nothing. `--yes` is required with
+`--no-input` or `--json`; without it the command asks before removing
+anything. If nothing is present it skips the prompt and reports
+`nothing to remove`. It refuses while **any** resolvable vault has a `keys/`
+tree, because removing the anchor and keys would break that vault. The guard
+checks `--vault`, `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up
+from the current directory, `default_vault`, and every `[vaults]` entry —
+even when normal discovery would fail — and names every initialized vault in
+the error. `--force` overrides the guard for vaults you have retired. It
+never writes inside a vault, and a second run reports `nothing to remove` and
+exits 0. With `--json`, `vault` is `null` and `scope` is `machine-state`:
+this command is not vault-scoped.
+
+If the OS keychain is unreachable, the command fails before removing any
+files (so a retry can finish) and points at the platform fallback below.
+
+The platform commands below are the fallback, for example when the command
+cannot reach a keychain or you want to remove one entry by hand.
 
 On Linux with the Secret Service (`secret-tool`), the `keyring` crate stores
 the service and account as the `service` and `username` attributes — use
@@ -162,7 +186,35 @@ git -C ~/vault log --oneline -5
 
 ### 2.3 Clear or overwrite the machine state
 
-Preferred, for a genuinely fresh start:
+Preferred, for a genuinely fresh start: run one command from **outside** the
+old vault. It removes the trust anchor, manifest high-water marks, the
+pending-rotation reminder, the four config entries, and the device, operator
+and inbox keys:
+
+```sh
+unset CONFIDANT_VAULT                 # a stale export wins over everything else
+confidant reset --machine-state --dry-run   # list exactly what would go
+confidant reset --machine-state --yes       # remove it (skips the prompt)
+```
+
+It preserves unrelated keys, comments and formatting in `config.toml`, never
+writes inside a vault, and running it twice is safe (the second run, or a
+dry-run after the first, reports `nothing to remove: machine state is already
+clear`). It **refuses** if **any** resolvable vault has a `keys/` tree,
+because removing the anchor and keys would break that vault. The guard checks
+`--vault`, `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up from the
+current directory, `default_vault`, and every `[vaults]` entry — even when
+normal discovery would fail — and names every initialized vault in the error.
+That is the intended protection for "I forgot the old vault still exists".
+Move or delete the old vault first (§2.1), or pass `--force` only after you
+have retired them. `--json` reports `"vault": null`, `"scope":
+"machine-state"`, and the full candidate list (including candidates with no
+`keys/`) under `vault_guard`.
+
+If you keep the old vault recoverable, do not run the full reset: it archives
+nothing. Use the manual fallback below instead, which keeps old files.
+
+Manual fallback (also useful when the command cannot reach a keychain):
 
 ```sh
 # Archive the old anchor rather than deleting it if you may want the old vault back.
@@ -176,22 +228,25 @@ EOF
 unset CONFIDANT_VAULT
 ```
 
-If a `keys shred` on a non-inbox device left a pending-rotation reminder,
-clear it after §2.4 (it needs a resolvable vault):
+If you used the manual fallback and a `keys shred` on a non-inbox device left
+a pending-rotation reminder, clear it after §2.4 (it needs a resolvable
+vault):
 
 ```sh
 confidant doctor --clear-pending-inbox-rotation
 ```
 
-Then clear the old keychain entries if you are retiring the old vault (see
+With the manual fallback, also clear the old keychain entries if you are
+retiring the old vault (see
 [Clearing keychain entries](#clearing-keychain-entries)). If you are only
-replacing a vault on the same machine, `init`
-overwrites `device-key` and `operator-key` for you; clearing them first is
-still the cleaner choice. The inbox entries are never overwritten by `init`,
-so clear those when the old vault is gone.
+replacing a vault on the same machine, `init` overwrites `device-key` and
+`operator-key` for you; clearing them first is still the cleaner choice. The
+inbox entries are never overwritten by `init`, so clear those when the old
+vault is gone.
 
-`manifest-seq.toml` can stay. Its rows are keyed by the old `vault_id`; the
-new vault gets a new id and its own rows.
+`manifest-seq.toml` can stay — its rows are keyed by the old `vault_id`, and
+the new vault gets a new id and its own rows. `confidant reset
+--machine-state` removes it anyway; that is harmless.
 
 ### 2.4 Create the new vault
 
@@ -240,10 +295,10 @@ What it overwrites on success: the trust anchor, the device key and operator
 key in the keychain, and the new vault's `keys/` tree. It never merges old
 records or old client keys.
 
-Tracked defects from verification: [#640](https://github.com/hirefrank/confidant/issues/640)
-(`--force` dirties `keys/vault` before failing) and
-[#638](https://github.com/hirefrank/confidant/issues/638) (no CLI to clear the
-anchor or keychain).
+Tracked defect from verification:
+[#640](https://github.com/hirefrank/confidant/issues/640) (`--force` dirties
+`keys/vault` before failing). The machine-state gap is covered by
+`confidant reset --machine-state` (§2.3, [#638](https://github.com/hirefrank/confidant/issues/638)).
 
 ### 2.6 When keychain entries matter
 
@@ -303,10 +358,10 @@ coaching verbs such as `log session` become valid. Existing personal records
 stay where they are; there is no migration.
 
 Do not try to seed coaching at `init` time with `--packs coaching@0.1`.
-That is currently rejected as an unknown pack because the external pack is
-not vendored yet (tracked in
-[#639](https://github.com/hirefrank/confidant/issues/639)). Init with no
-packs, then `pack add`.
+`init` only seeds packs built into the binary (today the implicit
+`personal@0.2`); naming an external pack is a usage error (exit 2) with a fix
+telling you to install it after init ([#639](https://github.com/hirefrank/confidant/issues/639)).
+Init with no packs, then `pack add`.
 
 To undo the change, `confidant pack remove coaching --yes` removes the
 vendored files, the lock entry, and the `packs` listing. Data written under

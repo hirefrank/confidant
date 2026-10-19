@@ -38,6 +38,9 @@ serde_json.workspace = true
 # lockfile as a dev-dependency, promoted so the shipped command can use it.
 tempfile.workspace = true
 toml.workspace = true
+# Preserve comments and formatting when `reset --machine-state` rewrites
+# the user config (same writer `inbox rotate` uses in confidant-core).
+toml_edit.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
 
