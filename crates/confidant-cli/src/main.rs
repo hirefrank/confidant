@@ -39,8 +39,8 @@ use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
-    apply_write, apply_write_with_encryptor, require_git_repo, FileChange, PendingWrite,
-    WriteOptions, WriteOutcome,
+    apply_write, apply_write_repairing, apply_write_with_encryptor, require_git_repo, FileChange,
+    PendingWrite, WriteOptions, WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, search_for_operator, CheckOptions};
 use confidant_core::{ContentHook, ContentOutcome};
@@ -1696,24 +1696,7 @@ fn install_changes(
         })
         .collect();
 
-    let mut lock = read_lockfile_or_empty(root)?;
-    if let Some(old) = replace {
-        if let Some((name, version)) = old.split_once('@') {
-            lock.remove(name, version);
-        }
-    }
-    lock.upsert(confidant_core::packs::lock::LockEntry {
-        name: report.name.clone(),
-        version: report.version.clone(),
-        source: fetched.source.clone(),
-        rev: fetched.rev.clone(),
-        subdir: fetched.subdir.clone(),
-        hash: report.hash.clone(),
-    });
-    changes.push(FileChange::WriteFile {
-        path: PathBuf::from("confidant.lock"),
-        contents: lock.to_toml(),
-    });
+    changes.push(lockfile_change(root, report, fetched, replace)?);
 
     let cfg_text = read_config_text(root)?;
     let mut packs = confidant_core::config::VaultConfig::parse(&cfg_text)
@@ -1732,6 +1715,34 @@ fn install_changes(
             .map_err(anyhow::Error::new)?,
     });
     Ok(changes)
+}
+
+/// The `confidant.lock` change for installing `report`: drop the pin named
+/// by `replace` (when re-vendoring a version) and upsert the fetched one.
+fn lockfile_change(
+    root: &Path,
+    report: &pack_fetch::PackReport,
+    fetched: &pack_fetch::Fetched,
+    replace: Option<&str>,
+) -> anyhow::Result<FileChange> {
+    let mut lock = read_lockfile_or_empty(root)?;
+    if let Some(old) = replace {
+        if let Some((name, version)) = old.split_once('@') {
+            lock.remove(name, version);
+        }
+    }
+    lock.upsert(confidant_core::packs::lock::LockEntry {
+        name: report.name.clone(),
+        version: report.version.clone(),
+        source: fetched.source.clone(),
+        rev: fetched.rev.clone(),
+        subdir: fetched.subdir.clone(),
+        hash: report.hash.clone(),
+    });
+    Ok(FileChange::WriteFile {
+        path: PathBuf::from("confidant.lock"),
+        contents: lock.to_toml(),
+    })
 }
 
 /// `DeleteFile` changes for every regular file in a vendored pack dir.
@@ -2221,10 +2232,9 @@ fn cmd_pack_update(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // A no-op update: the installed tree is byte-identical to the fetched
-    // pack, the lock pin would not move, and the listing already names it.
-    // Report it unchanged, the same way `pack add --yes` reports an
-    // already-installed pack (PD10).
+    // A pin that would not move: the version/source/rev/subdir match and the
+    // listing already names it. What to do then depends on the tree and the
+    // lock hash.
     //
     // Re-vendoring here instead would emit a `DeleteFile` and a rewrite of
     // every path, and `apply_write`'s Unchanged guard checks each change on
@@ -2245,7 +2255,7 @@ fn cmd_pack_update(
         "from_version": entry.version.clone(),
         "source_changed": source_changed,
     });
-    let pin_unchanged = entry.version == report.version
+    let pin_metadata_unchanged = entry.version == report.version
         && entry.source == fetched.source
         && entry.rev == fetched.rev
         && entry.subdir == fetched.subdir;
@@ -2257,8 +2267,32 @@ fn cmd_pack_update(
             .iter()
             .any(|p| p == &format!("{}@{}", report.name, report.version))
     };
-    if read_pack_dir(&old_dir).is_ok_and(|dir| dir.hash == report.hash) && pin_unchanged && listed {
-        return finish_write(cli, root, "pack-update", WriteOutcome::Unchanged, extra);
+    let tree_matches = read_pack_dir(&old_dir).is_ok_and(|dir| dir.hash == report.hash);
+    if tree_matches && pin_metadata_unchanged && listed {
+        if entry.hash == report.hash {
+            // Nothing to do: tree, pin and listing are all current.
+            return finish_write(cli, root, "pack-update", WriteOutcome::Unchanged, extra);
+        }
+        // #606: the installed tree matches the fetched pack but the lock hash
+        // is stale. Rewrite the pin so `pack update` is usable as the repair.
+        // The stale pin is an E_PACK_HASH error to the pre-check, so the
+        // write goes through the repairing path; the post-check still gates
+        // the commit, so this cannot leave the vault broken.
+        let summary = format!(
+            "pack: update {}@{} -> {}@{} ({})",
+            entry.name,
+            entry.version,
+            report.name,
+            report.version,
+            short_hash(&report.hash)
+        );
+        let pending = PendingWrite {
+            changes: vec![lockfile_change(root, &report, &fetched, None)?],
+            canonical_request: summary.clone(),
+            summary,
+        };
+        let outcome = apply_write_repairing(root, pending, &write_options(cli))?;
+        return finish_write(cli, root, "pack-update", outcome, extra);
     }
 
     // Re-vendor: clear the old version's files, then write the new tree and
