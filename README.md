@@ -32,22 +32,26 @@ in the same vault.
 
 **The preferred path: let your agent install it.** Paste this into Claude
 Code, Cursor, Codex, or any agent that can run commands; it installs the
-CLI, links the embedded skills, and asks where your vault is. This README
-is the canonical home for the prompt; [`docs/agent-setup.md`](docs/agent-setup.md)
-covers headless hosts, environment variables, and updates.
+CLI and TUI, links the embedded skills, and asks where your vault is. This
+README is the canonical home for the prompt;
+[`docs/agent-setup.md`](docs/agent-setup.md) covers headless hosts,
+environment variables, and updates.
 
 ```text
 Set up Confidant (relationship memory you own — a CLI plus embedded agent skills) on this machine:
 
-1. Install the CLI: `cargo install confidant-cli` (needs a Rust
-   toolchain 1.88+; check with `rustc --version`). This provides the
-   `confidant` binary. Make sure `~/.cargo/bin` is on PATH first
+1. Install the CLI and TUI together: `cargo install confidant-cli
+   confidant-tui` (needs a Rust toolchain 1.88+; check with
+   `rustc --version` — if it says "no default is configured", run
+   `rustup default stable` first). The CLI provides the `confidant`
+   binary. Make sure `~/.cargo/bin` is on PATH first
    (`export PATH="$HOME/.cargo/bin:$PATH"`) or the next step fails with
    `confidant: command not found`. Verify with `confidant --help`.
-   (No Rust toolchain? Download the `confidant` binary + installer from
-   the latest GitHub Release at
-   https://github.com/hirefrank/confidant/releases instead — and verify
-   the downloaded `.tar.xz`/`.zip` first: check the published `.sha256`
+   (No Rust toolchain? Download both binaries + the installer from the
+   latest GitHub Release at
+   https://github.com/hirefrank/confidant/releases instead — install them
+   from the same release so their versions match — and verify the
+   downloaded `.tar.xz`/`.zip` first: check the published `.sha256`
    checksum file (that's what it covers), or run
    `gh attestation verify <archive> --repo hirefrank/confidant` for build
    provenance.)
@@ -61,50 +65,93 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
    shell rc too, this session and permanently, only if I want that
    request disabled.)
-3. Ask me where my vault is and set `CONFIDANT_VAULT` to it (export it for
-   this session and tell me what to add to my shell rc to keep it). If I
-   have no vault yet, ask whether to create one at a path I choose or
-   stop — do not invent a path. To create one, run
-   `confidant init --create --no-input` against an absent or empty
-   directory: it scaffolds the directory, git repo, `.gitignore`, and
-   `confidant.toml`, then the keys.
+3. Ask me where my vault is. Export it for this session only:
+   `export CONFIDANT_VAULT="<path>"`, and pass `--vault "<path>"`
+   explicitly on the commands you run. Do **not** rely on
+   `source ~/.bashrc` in a non-interactive or agent shell: an interactive
+   guard such as `[[ $- != *i* ]] && return` skips the export, and a
+   stale `CONFIDANT_VAULT` silently makes `check` and `doctor` inspect a
+   different vault. Give me the line to add to my shell rc for interactive
+   use as separate advice. If I have no vault yet, ask whether to create
+   one at a path I choose or stop — do not invent a path.
 4. Ask me whether this vault is for **real relationship data** (encrypted
    mode, the production default) or **demo / learning / fixtures only**
    (plaintext opt-out), and explain the consequences before editing
    `confidant.toml` or running `confidant init`:
-   - **Encrypted (real data):** `confidant init` creates vault keys and
-     shows a 24-word recovery phrase once (store offline); record bodies
-     are encrypted in git while ledger lines stay structural plaintext.
-     Ensure `confidant.toml` does **not** set `[crypto] mode = "plaintext"`
-     (never silently copy the demo vault's `mode = "plaintext"` into a
-     vault I described as real) and the working tree is clean
-     (`git status`), then guide `confidant init` and recovery-phrase
-     handling (never echo the phrase into chat logs).
+   - **Encrypted (real data):** ensure git has `user.name` and
+     `user.email` (init commits). For a fresh vault, run
+     `confidant init --create --no-input --phrase-out <path>` against an
+     absent or empty directory: it scaffolds the directory, starts the git
+     repo on branch `main` (and reports the branch), seeds `packs = []`
+     (packs are optional), writes `.gitignore` and `confidant.toml`, then
+     creates the keys. For an existing vault, first ensure
+     `confidant.toml` does **not** set `[crypto] mode = "plaintext"` (never
+     silently copy the demo vault's `mode = "plaintext"` into a vault I
+     described as real) and the working tree is clean (`git status`), then
+     run `confidant init`. Record bodies are encrypted in git; ledger lines
+     stay structural plaintext. The 24-word recovery phrase goes to
+     `<path>` (mode 0600, refuses to overwrite) and the command prints
+     only the path — never echo, copy, or read the phrase into this chat.
+     Have me run the human-only check
+     `confidant keys verify-recovery --phrase-file <path>` before moving
+     the file offline, then move it offline and delete the local copy
+     (agents must not handle or pipe the phrase).
    - **Plaintext (demo / learning / fixtures only):** set or keep
      `mode = "plaintext"` under `[crypto]` in `confidant.toml` (only valid
      while the vault is structurally plaintext; never for real PII), do
      **not** run `confidant init`, and warn that `git clone` exposes all
-     record content.
-5. Verify: run `confidant check --json --no-input` against the vault and
-   report the error/warning counts.
-6. Read the routing snippet (`confidant routing`) for the propose →
+     record content and that a plaintext vault must not be pushed to any
+     remote.
+5. Optional remote: ask whether I want a git remote for backup and
+   second-device recovery. `init` adds none. If I say yes, show me
+   `git remote add origin <url>` and `git push -u origin main` to run
+   myself — do not add a remote or push without my explicit confirmation.
+   A plaintext vault stays local.
+6. Verify: run `confidant check --vault "<path>" --json --no-input` and
+   `confidant doctor --vault "<path>"`; report the error/warning counts,
+   the branch `init` created, and any `git-remote` warning.
+7. Read the routing snippet (`confidant routing`) for the propose →
    confirm → apply workflow every skill follows, and the Privacy rules
    (trusted devices with encrypted disks only; `.confidant/` is never
    committed; `no-ai` records stay out of agent output — see the README's
    Encryption and privacy section and `docs/privacy.md` in the GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
-vault crypto mode (encrypted vs. plaintext opt-out), the `check` result,
-and any `confidant doctor` warnings.
+vault crypto mode (encrypted vs. plaintext opt-out), the vault branch, the
+`check` result, and any `confidant doctor` warnings.
 ```
 
-**No agent?** `cargo install confidant-cli && confidant setup --agent auto`
-(Rust 1.88+); prebuilt binaries are on
+**No agent?** `cargo install confidant-cli confidant-tui && confidant setup --agent auto`
+(Rust 1.88+; if `rustc --version` says "no default is configured", run
+`rustup default stable`). Prebuilt binaries are on
 [GitHub Releases](https://github.com/hirefrank/confidant/releases) for macOS
 and Linux (x86_64), Windows under
 [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install). To update,
-re-run the installer or `cargo install`, then `confidant setup`.
+re-run the installer or `cargo install` both packages, then `confidant setup`.
 Contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+### Remote (optional)
+
+`confidant init --create` starts a local git repo on `main` and adds **no**
+remote. Local-only is a valid setup; a remote is what makes backup and
+second-device recovery possible (`confidant recover` still needs a clone of
+the vault). To connect one, run git yourself:
+
+```sh
+git remote add origin <url>
+git push -u origin main
+```
+
+The URL is whatever your git host gives you — Confidant does not require
+GitHub, and no setup command pushes for you. `confidant doctor` reports a
+`git-remote` check: local-only is fine, an encrypted vault with a remote is
+fine, and a remote on a `[crypto] mode = "plaintext"` vault is a
+**warning**.
+
+**Never push a plaintext-mode vault to any remote**: every record body is
+readable by anyone with access to the repository. Plaintext is only for
+demo, learning, and fixtures. Details:
+[`docs/agent-setup.md`](docs/agent-setup.md#connect-a-git-remote-optional).
 
 ## First five minutes: the people in your life
 
@@ -114,9 +161,14 @@ a small coaching practice. Copy it out so writes commit to a scratch repo:
 ```sh
 git clone --depth 1 https://github.com/hirefrank/confidant
 cp -r confidant/examples/demo-vault /tmp/confidant-demo
-cd /tmp/confidant-demo && git init -q && git add -A
+cd /tmp/confidant-demo && git init -q -b main && git add -A
 git commit -qm "demo vault" && export CONFIDANT_VAULT="$PWD"
 ```
+
+In an agent or other non-interactive session, pass `--vault "$PWD"`
+explicitly instead of relying on an exported variable — and never
+`source ~/.bashrc` to set it: an interactive guard skips the export, and a
+stale `CONFIDANT_VAULT` can make `check` inspect the wrong vault.
 
 `confidant record list` prints six people (a seventh, `no-ai: true`, is
 absent). `confidant check` lists what needs attention:
@@ -167,8 +219,12 @@ confidant check
 
 `log touch` resolves the display name and writes one committed ledger line.
 The demo is plaintext fake data; for real people, `confidant init --create
---no-input` on an empty directory makes an encrypted vault and prints a
-24-word recovery phrase once (store it offline).
+--no-input --phrase-out <path>` on an empty directory makes an encrypted
+vault on branch `main` and writes a 24-word recovery phrase once to `<path>`
+(mode 0600; move it offline and delete the local copy). Never paste the
+phrase into chat or a log; `confidant keys verify-recovery --phrase-file
+<path>` is the human-only read-only check that the saved copy matches the
+vault.
 
 ## How your agents use it
 
@@ -196,7 +252,7 @@ fuzzy and `no-ai: true` people are ID-only.
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
-| Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` |
+| Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred` / `device-add` / `verify-recovery` |
 | Inbox | `inbox`, `inbox rotate` |
 | Search | `reindex` + `qmd-search` skill |
 | Health | `doctor` |
@@ -211,8 +267,10 @@ argument, and emit only `hmac:`.
 `confidant-tui` is a terminal UI for the roster, a person's context, vault
 health, quick capture, and review of queued work. It consumes only the
 ADR-7 CLI JSON contract and keeps plaintext on the alternate screen only.
-Install both with `cargo install confidant-cli confidant-tui`, then run
-`confidant tui --vault examples/demo-vault`.
+Install both from the same release — `cargo install confidant-cli
+confidant-tui` — then run `confidant tui --vault examples/demo-vault`.
+`confidant tui` and `confidant doctor` warn when the CLI and TUI versions
+differ; upgrade both together.
 
 Operator mode (`!`) is off by default; `e` edits through the operator-only
 path, `s` / `t` / `n` capture a session, touch, or note, and `2` opens the
@@ -234,16 +292,20 @@ fields, relationship edges (`friend`, `family`, `sibling`, `partner`,
 never block a write: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING`. Contract:
 [`packs/personal/0.2.md`](packs/personal/0.2.md).
 
-**`coaching@0.1` — optional, for a practice.** A vault that lists it must
-vendor it, or `check` fails with `E_PACK_UNKNOWN` and writes are blocked:
+**`coaching@0.1` — optional, for a practice.** Packs are optional:
+`init --create` seeds `packs = []`, and `check` is clean without any pack
+because `personal@0.2` is built in. Install an external pack after init
+with `confidant pack add <https-url> --yes`; for coaching:
 
 ```sh
 confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
 ```
 
-It adds sessions, packages, ICF hours, balance assertions, and gap rules
-(a session with no notes; a paid client with no session in a configurable
-window). Contract: [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+A vault that lists it must vendor it, or `check` fails with `E_PACK_UNKNOWN`
+and writes are blocked. It adds sessions, packages, ICF hours, balance
+assertions, and gap rules (a session with no notes; a paid client with no
+session in a configurable window). Contract:
+[`packs/coaching/0.1.md`](packs/coaching/0.1.md).
 
 Packs share a vault; `--packs` scopes a read to the packs you name. They
 are vendored under `packs/` and pinned in `confidant.lock`, and `pack

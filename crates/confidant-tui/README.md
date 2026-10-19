@@ -50,17 +50,22 @@ that speaks the same agent contract (`schema_version == "1"`).
 cargo install confidant-cli confidant-tui
 ```
 
-Or grab both from the GitHub Releases page (no Rust toolchain needed) and
-launch it with:
+Or grab both from the same GitHub Releases page (no Rust toolchain needed)
+and launch it with:
 
 ```sh
 confidant tui
 ```
 
+Install and upgrade both from the same release: `confidant tui` and
+`confidant doctor` warn when the two versions differ.
+
 `--vault` falls back to the `CONFIDANT_VAULT` environment variable when it
 isn't passed, so the vault path doesn't have to be given on every command
 line — same as the `confidant` CLI itself. `confidant tui` forwards an
-explicit `--vault` the same way.
+explicit `--vault` the same way. In a non-interactive or agent session,
+export `CONFIDANT_VAULT` in that process or pass `--vault`; do not rely on
+`source ~/.bashrc`, whose interactive guard skips the export.
 
 ## Status: not yet audited
 
