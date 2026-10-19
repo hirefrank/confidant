@@ -103,12 +103,14 @@ static TEST_REGISTRY: Mutex<Option<Vec<&'static dyn RuleKind>>> = Mutex::new(Non
 pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
     // The kind implementations live in Rust (PD1); each kind's issue
     // appends its static here. #442: `cadence-overdue`; #443:
-    // `date-upcoming`; #458: `note-ref`; #446: `ledger-balance`.
+    // `date-upcoming`; #458: `note-ref`; #446: `ledger-balance`;
+    // #447: `session-checks`.
     let mut kinds: Vec<&'static dyn RuleKind> = vec![
         &CADENCE_OVERDUE,
         &DATE_UPCOMING,
         &NOTE_REF,
         &crate::packs::rules::balance::LEDGER_BALANCE,
+        &crate::packs::rules::session::SESSION_CHECKS,
     ];
     kinds.extend(
         TEST_REGISTRY
@@ -1458,6 +1460,7 @@ default = "test rule"
                         "date-upcoming",
                         "note-ref",
                         "ledger-balance",
+                        "session-checks",
                         "test-rule",
                         "other-rule"
                     ]
@@ -1474,7 +1477,8 @@ default = "test rule"
                     "cadence-overdue",
                     "date-upcoming",
                     "note-ref",
-                    "ledger-balance"
+                    "ledger-balance",
+                    "session-checks"
                 ]
             );
         });
@@ -1623,6 +1627,7 @@ default = "test rule"
             ("packs/embedded.rs", include_str!("embedded.rs")),
             ("packs/rules/ledger.rs", include_str!("rules/ledger.rs")),
             ("packs/rules/balance.rs", include_str!("rules/balance.rs")),
+            ("packs/rules/session.rs", include_str!("rules/session.rs")),
         ];
         const FORBIDDEN: &[&str] = &[
             "std::net",

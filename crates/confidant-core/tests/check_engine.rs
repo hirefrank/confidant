@@ -8129,6 +8129,22 @@ package_fix = "Use a pkg-<ULID> package id"
 
 [messages."E_COACHING_EXT_TYPE"]
 package = "package id '{pkg}' must use the pkg- prefix"
+
+[messages."E_COACHING_EXT_DURATION"]
+default = "session for {id} has no parseable duration"
+default_fix = "Add a duration such as 60m or 1h30m"
+
+[messages."E_COACHING_EXT_TAGS"]
+default = "session for {id} has more than one of paid, pps, comp"
+default_fix = "Keep exactly one billing tag: paid, pps, or comp"
+
+[messages."W_COACHING_EXT_UNTAGGED"]
+default = "session for {id} has no paid, pps, or comp tag"
+default_fix = "Tag the session paid, pps (pay-per-session), or comp (complimentary)"
+
+[messages."E_COACHING_EXT_NOTES"]
+default = "session on {date} for {person} has no notes"
+default_fix = "Add a note for that person and date, or note:n-<ULID> on the session line"
 "#;
 
 /// The fixture pack's balance rule. `max_open_n` is overridable so the
@@ -8165,6 +8181,10 @@ finding_codes = [
   "E_COACHING_EXT_OPEN",
   "E_COACHING_EXT_ID",
   "E_COACHING_EXT_TYPE",
+  "E_COACHING_EXT_DURATION",
+  "E_COACHING_EXT_TAGS",
+  "W_COACHING_EXT_UNTAGGED",
+  "E_COACHING_EXT_NOTES",
 ]
 
 [pack]
@@ -8184,6 +8204,14 @@ id_type = "person"
 [[checks.severity]]
 key = "coaching-ext.balance_nonnegative"
 default = "error"
+
+[[checks.severity]]
+key = "coaching-ext.require_duration"
+default = "error"
+
+[[checks.severity]]
+key = "coaching-ext.session_notes"
+default = "warning"
 "#,
     );
     text.push_str(rules);
@@ -8216,24 +8244,51 @@ const COACHING_EXT_CHECKS: &str = "coaching-ext.balance_nonnegative = \"error\"\
 /// Build the same vault twice — once with compiled `coaching@0.1`, once
 /// with the fixture — and return both reports. `setup` writes the records
 /// and ledger; the fixture install is added to the declarative side.
-fn assert_balance_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
+fn assert_ext_parity_with(
+    setup: impl Fn(&Path),
+    rules: &str,
+    map: &[(&str, &str)],
+    compiled_checks: &str,
+    ext_checks: &str,
+) -> (Value, Value) {
     let compiled_dir = tempfile::tempdir().unwrap();
     setup(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    vault_toml(compiled_dir.path(), compiled_checks);
     let compiled = report_json(compiled_dir.path(), None);
 
     let declarative_dir = tempfile::tempdir().unwrap();
     setup(declarative_dir.path());
     install_coaching_ext(declarative_dir.path(), &coaching_ext_manifest(rules));
-    coaching_ext_vault(declarative_dir.path(), COACHING_EXT_CHECKS);
+    coaching_ext_vault(declarative_dir.path(), ext_checks);
     let declarative = report_json(declarative_dir.path(), None);
 
     assert_eq!(
-        balance_findings(&compiled, BALANCE_CODE_MAP),
-        balance_findings(&declarative, BALANCE_CODE_MAP),
+        normalized_findings(&compiled, map),
+        normalized_findings(&declarative, map),
         "declarative parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
     );
     (compiled, declarative)
+}
+
+fn assert_ext_parity(setup: impl Fn(&Path), rules: &str, map: &[(&str, &str)]) -> (Value, Value) {
+    assert_ext_parity_with(setup, rules, map, DEFAULT_CHECKS, COACHING_EXT_CHECKS)
+}
+
+fn assert_balance_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
+    assert_ext_parity(setup, rules, BALANCE_CODE_MAP)
+}
+
+fn assert_session_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
+    assert_ext_parity(setup, rules, SESSION_CODE_MAP)
+}
+
+/// The fixture report for one vault, without a compiled comparison.
+fn ext_report(setup: impl Fn(&Path), rules: &str, checks: &str) -> Value {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path());
+    install_coaching_ext(dir.path(), &coaching_ext_manifest(rules));
+    coaching_ext_vault(dir.path(), checks);
+    report_json(dir.path(), None)
 }
 
 /// Fixture code → compiled code for the balance rule.
@@ -8246,12 +8301,34 @@ const BALANCE_CODE_MAP: &[(&str, &str)] = &[
     ("E_COACHING_EXT_TYPE", "E_WRONG_ID_TYPE"),
 ];
 
+/// The fixture's `session-checks` rule.
+const COACHING_EXT_SESSION_RULE: &str = r#"[[rules]]
+id = "sessions"
+kind = "session-checks"
+code = "E_COACHING_EXT_DURATION"
+severity_duration_key = "coaching-ext.require_duration"
+severity_notes_key = "coaching-ext.session_notes"
+verb = "session"
+billing_tags = ["paid", "pps", "comp"]
+tags_code = "E_COACHING_EXT_TAGS"
+untagged_code = "W_COACHING_EXT_UNTAGGED"
+notes_code = "E_COACHING_EXT_NOTES"
+"#;
+
+/// Fixture code → compiled code for the session rule.
+const SESSION_CODE_MAP: &[(&str, &str)] = &[
+    ("E_COACHING_EXT_DURATION", "E_MISSING_DURATION"),
+    ("E_COACHING_EXT_TAGS", "E_SESSION_TAGS"),
+    ("W_COACHING_EXT_UNTAGGED", "W_SESSION_UNTAGGED"),
+    ("E_COACHING_EXT_NOTES", "E_SESSION_WITHOUT_NOTES"),
+];
+
 /// The balance-related findings of a report, normalized to the compiled
 /// code names and rendered as comparable tuples (code, severity, message,
 /// fix, file, line, id). Codes outside `map` are ignored: the fixture and
 /// compiled packs emit different *unrelated* codes on the same vault
 /// (pack-own vs. core), and parity is scoped to the kind's codes.
-fn balance_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
+fn normalized_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
     let mut out: Vec<String> = report["findings"]
         .as_array()
         .unwrap()
@@ -8279,6 +8356,17 @@ fn balance_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// The normalized codes of a report (the code column only), for the
+/// assertions that name a compiled counterpart. The compiled side can
+/// carry unrelated findings on the same vault (a session without an open
+/// is a negative balance), so filter through the map.
+fn normalized_codes(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
+    normalized_findings(report, map)
+        .iter()
+        .map(|line| line.split('|').next().unwrap().to_owned())
+        .collect()
 }
 
 /// The fixture report's findings with the given fixture code, in order.
@@ -8664,12 +8752,12 @@ fn balance_rule_matches_compiled_coaching() {
         COACHING_EXT_BALANCE_RULE,
     );
     assert!(
-        !balance_findings(&compiled, BALANCE_CODE_MAP).is_empty(),
+        !normalized_findings(&compiled, BALANCE_CODE_MAP).is_empty(),
         "the fixture must trigger something: {compiled:?}"
     );
     assert_eq!(
-        balance_findings(&compiled, BALANCE_CODE_MAP),
-        balance_findings(&declarative, BALANCE_CODE_MAP)
+        normalized_findings(&compiled, BALANCE_CODE_MAP),
+        normalized_findings(&declarative, BALANCE_CODE_MAP)
     );
 }
 
@@ -8814,4 +8902,408 @@ fn balance_rule_balance_nonnegative_off_keeps_mismatch() {
         1,
         "{on:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Declarative coaching kinds (#447 session-checks)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_checks_missing_duration() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} paid note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    let found = ext_findings(&declarative, "E_COACHING_EXT_DURATION");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!("session for {ADA} has no parseable duration")
+    );
+    assert_eq!(
+        normalized_codes(&compiled, SESSION_CODE_MAP),
+        vec!["E_MISSING_DURATION"]
+    );
+}
+
+#[test]
+fn session_checks_duration_off_suppresses() {
+    let compiled_checks = DEFAULT_CHECKS.replace(
+        "coaching.require_duration = \"error\"",
+        "coaching.require_duration = \"off\"",
+    );
+    let ext_checks = "coaching-ext.require_duration = \"off\"\n";
+    let (compiled, declarative) = assert_ext_parity_with(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} paid note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+        SESSION_CODE_MAP,
+        &compiled_checks,
+        ext_checks,
+    );
+    assert!(
+        normalized_codes(&compiled, SESSION_CODE_MAP).is_empty(),
+        "{compiled:?}"
+    );
+    assert!(codes(&declarative).is_empty(), "{declarative:?}");
+}
+
+#[test]
+fn session_checks_two_billing_tags() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m paid pps note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    let found = ext_findings(&declarative, "E_COACHING_EXT_TAGS");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!("session for {ADA} has more than one of paid, pps, comp")
+    );
+    assert_eq!(
+        normalized_codes(&compiled, SESSION_CODE_MAP),
+        vec!["E_SESSION_TAGS"]
+    );
+}
+
+#[test]
+fn session_checks_no_tag() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    let found = ext_findings(&declarative, "W_COACHING_EXT_UNTAGGED");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(found[0]["severity"], "warning");
+    assert_eq!(
+        found[0]["message"],
+        format!("session for {ADA} has no paid, pps, or comp tag")
+    );
+    assert_eq!(
+        normalized_codes(&compiled, SESSION_CODE_MAP),
+        vec!["W_SESSION_UNTAGGED"]
+    );
+}
+
+#[test]
+fn session_checks_one_tag_is_clean() {
+    let (_, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert!(codes(&declarative).is_empty(), "{declarative:?}");
+}
+
+#[test]
+fn session_checks_without_notes_matches_golden() {
+    let declarative = ext_report(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 session {ADA} 60m paid\n"
+                ),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+        "",
+    );
+    let golden: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("session_without_notes.json")).unwrap(),
+    )
+    .unwrap();
+    let golden_finding = &golden["findings"].as_array().unwrap()[0];
+    let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    for field in ["severity", "message", "fix", "file", "line", "id"] {
+        assert_eq!(
+            golden_finding[field], found[0][field],
+            "field {field} differs from the golden"
+        );
+    }
+}
+
+#[test]
+fn session_checks_note_on_line_covers() {
+    let (_, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert!(codes(&declarative).is_empty(), "{declarative:?}");
+}
+
+#[test]
+fn session_checks_note_record_same_date_covers() {
+    let (_, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m paid\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert!(codes(&declarative).is_empty(), "{declarative:?}");
+}
+
+#[test]
+fn session_checks_note_other_person_does_not_cover() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE2, BEA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {ADA} 60m paid\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert_eq!(
+        ext_findings(&declarative, "E_COACHING_EXT_NOTES").len(),
+        1,
+        "{declarative:?}"
+    );
+    assert_eq!(
+        normalized_codes(&compiled, SESSION_CODE_MAP),
+        vec!["E_SESSION_WITHOUT_NOTES"]
+    );
+}
+
+#[test]
+fn session_checks_non_person_id_notes_parity() {
+    // `session_without_notes` filters on the verb only, so a session whose
+    // id is not a person id (core reports `E_WRONG_ID_TYPE`) still gets the
+    // notes finding. The per-entry duration and tag checks skip it, as the
+    // compiled fold does.
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 session {PKG}\n"),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(found[0]["id"], PKG);
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_DURATION").is_empty(),
+        "a non-person id gets no duration check: {declarative:?}"
+    );
+    assert!(
+        ext_findings(&declarative, "W_COACHING_EXT_UNTAGGED").is_empty(),
+        "a non-person id gets no tag check: {declarative:?}"
+    );
+    assert_eq!(
+        normalized_codes(&compiled, SESSION_CODE_MAP),
+        vec!["E_SESSION_WITHOUT_NOTES"]
+    );
+}
+
+#[test]
+fn session_checks_notes_severity_warning_vs_error_vs_off() {
+    for (ext_severity, expected) in [
+        ("warning", Some("warning")),
+        ("error", Some("error")),
+        ("off", None),
+    ] {
+        let compiled_checks = DEFAULT_CHECKS.replace(
+            "coaching.session_notes = \"warning\"",
+            &format!("coaching.session_notes = \"{ext_severity}\""),
+        );
+        let ext_checks = format!("coaching-ext.session_notes = \"{ext_severity}\"\n");
+        let (compiled, declarative) = assert_ext_parity_with(
+            |root| {
+                person(root, ADA, "Ada Example");
+                write(
+                    root,
+                    "ledger/2026/10.cfd",
+                    &format!("2026-10-01 session {ADA} 60m paid\n"),
+                );
+            },
+            COACHING_EXT_SESSION_RULE,
+            SESSION_CODE_MAP,
+            &compiled_checks,
+            &ext_checks,
+        );
+        match expected {
+            Some(severity) => {
+                let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+                assert_eq!(found.len(), 1, "{declarative:?}");
+                assert_eq!(found[0]["severity"], severity, "{declarative:?}");
+                assert_eq!(
+                    normalized_codes(&compiled, SESSION_CODE_MAP),
+                    vec!["E_SESSION_WITHOUT_NOTES"]
+                );
+            }
+            None => {
+                assert!(codes(&declarative).is_empty(), "{declarative:?}");
+                assert!(
+                    normalized_codes(&compiled, SESSION_CODE_MAP).is_empty(),
+                    "{compiled:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn session_checks_merged_person_notes_cover() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            // Bea's note is dated the session day and Bea is merged into
+            // Ada before as_of, so it covers Ada's session.
+            note(root, NOTE2, BEA, "2026-10-02");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-02 merge {BEA} into {ADA}\n\
+                     2026-10-02 session {ADA} 60m paid\n"
+                ),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert!(codes(&declarative).is_empty(), "{declarative:?}");
+    assert!(
+        normalized_codes(&compiled, SESSION_CODE_MAP).is_empty(),
+        "{compiled:?}"
+    );
+}
+
+#[test]
+fn session_checks_matches_compiled_coaching() {
+    let (compiled, declarative) = assert_session_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 session {ADA} paid note:{NOTE}\n\
+                     2026-10-02 session {ADA} 60m paid pps note:{NOTE}\n\
+                     2026-10-03 session {ADA} 60m note:{NOTE}\n\
+                     2026-10-04 session {ADA} 60m paid\n"
+                ),
+            );
+        },
+        COACHING_EXT_SESSION_RULE,
+    );
+    assert_eq!(
+        normalized_findings(&compiled, SESSION_CODE_MAP),
+        normalized_findings(&declarative, SESSION_CODE_MAP)
+    );
+    assert_eq!(normalized_findings(&compiled, SESSION_CODE_MAP).len(), 4);
+}
+
+#[test]
+fn session_checks_loader_refuses_empty_billing_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_SESSION_RULE.replace(
+            "billing_tags = [\"paid\", \"pps\", \"comp\"]",
+            "billing_tags = []",
+        ),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn session_checks_loader_refuses_empty_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_SESSION_RULE.replace("verb = \"session\"", "verb = \"\""),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn session_checks_loader_refuses_unclaimed_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_SESSION_RULE.replace("verb = \"session\"", "verb = \"touch\""),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn session_checks_loader_refuses_missing_message_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let manifest = coaching_ext_manifest(COACHING_EXT_SESSION_RULE).replace(
+        "default_fix = \"Add a note for that person and date, or note:n-<ULID> on the session line\"\n",
+        "",
+    );
+    install_coaching_ext(dir.path(), &manifest);
+    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    assert_pack_invalid(dir.path());
 }

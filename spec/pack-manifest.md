@@ -481,8 +481,9 @@ own issue appends its section with the parameter table:
 | `date-upcoming` | #443 | the built-in personal pack's upcoming-dates rule |
 | `note-ref` | #458 | the built-in personal pack's `touch` note check and `coaching@0.1`'s `session` note check |
 | `ledger-balance` | #446 | `coaching@0.1`'s `sessions_remaining` / `icf_hours` fold and `balance` checks |
+| `session-checks` | #447 | `coaching@0.1`'s per-session duration, billing-tag and notes checks |
 
-(Planned: `session-checks` #447, `activity-gap` #448.)
+(Planned: `activity-gap` #448.)
 
 #### Kind `cadence-overdue` (#442)
 
@@ -779,6 +780,94 @@ one. This kind does not warn about an untagged session: that finding
 belongs to the `session-checks` kind (#447), so a pack that declares only
 `ledger-balance` gets no untagged warning.
 
+#### Kind `session-checks` (#447)
+
+Check a pack's consuming ledger verb per entry: a parseable duration is
+present, exactly one billing tag is set, and a session has notes.
+Reproduces `coaching@0.1`'s `apply_session` checks, its
+`session_without_notes` rule and its `note_coverage` map, including
+merge-aware grouping: a note for any merged member covers the canonical
+person's session. Only ledger metadata and note ids, paths and dates are
+read — **never note bodies** (PD8). The `note:` id/type/existence/
+ownership check is **not** part of this kind: a pack uses `note-ref`
+(#458) alongside it.
+
+The kind **manages its own severity** and has no generic `severity_key`:
+it always runs, and each finding's severity comes from the key named
+below (`off` suppresses only that group). The tag findings are fixed
+(`error` for more than one tag, `warning` for none), like the compiled
+checks.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `verb` | string, non-empty | The ledger verb whose entries are checked. Must be one of the pack's own `[[verbs]]`. |
+| `billing_tags` | list of strings, non-empty, unique | The tags that count as billing. Exactly one is expected per entry; none is `untagged_code`, more than one is `tags_code`. |
+| `severity_duration_key` | string | A declared `[[checks.severity]]` key for the missing-duration finding. `off` suppresses it. |
+| `severity_notes_key` | string | A declared `[[checks.severity]]` key for the session-without-notes finding. `off` suppresses it. |
+| `tags_code` | string, optional | Code for more than one billing tag. Defaults to the core code `E_SESSION_TAGS`. |
+| `untagged_code` | string, optional | Code for no billing tag. Defaults to `W_SESSION_UNTAGGED`. |
+| `notes_code` | string, optional | Code for a session with no notes. Defaults to `E_SESSION_WITHOUT_NOTES`. |
+
+The generic `code` is the missing-duration code (today
+`E_MISSING_DURATION`). Every emitted code must have a message table; a
+pack-own code must also be declared in `finding_codes`. An external pack
+cannot name a builtin code (PD13): it sets every code to a code it
+declares.
+
+Message variants the pack's tables must declare:
+
+| Code | Variants | Placeholders |
+|---|---|---|
+| `code` | `default`, `default_fix` | `default`: `id` |
+| `tags_code` | `default`, `default_fix` | `default`: `id` |
+| `untagged_code` | `default`, `default_fix` | `default`: `id` |
+| `notes_code` | `default`, `default_fix` | `default`: `date`, `person` |
+
+Evaluation, over ledger entries in ledger order (entries of other verbs
+are ignored; the duration and billing-tag checks below apply only to
+person ids):
+
+1. **Duration.** A session whose arguments contain no parseable duration
+   (`60m`, `1h30m`) emits `code` at the `severity_duration_key` severity.
+   A key set `off` suppresses the finding. Sessions dated after `as_of`
+   are still checked, exactly like the compiled fold.
+2. **Billing tags.** Count the `billing_tags` present. More than one is
+   `tags_code` at `error`; none is `untagged_code` at `warning`; exactly
+   one is clean.
+3. **Notes.** A session dated on or before `as_of` is covered when it
+   carries a `note:` pair, or when the canonical person has a note record
+   dated that same day. The note map is built from note records whose
+   owning person comes from their `person:` field or their path; a note's
+   `date` and `session` front-matter dates both count, and ownership is
+   canonicalized as of `as_of`. An uncovered session emits `notes_code` at
+   the `severity_notes_key` severity (a key set `off` suppresses it), with
+   the canonical person as the finding id. This check is not limited to
+   person ids: a session line whose id is not a person id still gets it
+   (core reports the id separately as `E_WRONG_ID_TYPE`), exactly like the
+   compiled `session_without_notes` rule.
+4. Every finding carries the ledger line's file and line. Messages carry
+   only ids — the entry id for steps 1–2, the canonical person for step 3
+   — never free text.
+
+Worked example:
+
+```toml
+[[rules]]
+id = "sessions"
+kind = "session-checks"
+code = "E_MISSING_DURATION"
+severity_duration_key = "coaching.require_duration"
+severity_notes_key = "coaching.session_notes"
+verb = "session"
+billing_tags = ["paid", "pps", "comp"]
+```
+
+A `2026-10-01 session p-… 60m paid` line with no `note:` and no note
+record for that day emits `E_SESSION_WITHOUT_NOTES` at the
+`coaching.session_notes` severity. Adding `note:n-…` to the line, or a
+note for the person dated `2026-10-01`, silences it. A second session
+that day tagged both `paid` and `pps` emits `E_SESSION_TAGS` as well.
+
 ### 13.3. Names
 
 - Pack names match `^[a-z][a-z0-9-]{1,31}$` (PD14).
@@ -820,7 +909,9 @@ violation is `E_PACK_INVALID`:
 Ledger verbs named in rule parameters (e.g. `event_verbs`) are
 read-only access to plaintext ledger metadata (date, verb, opaque id)
 and may be any verb: the built-in personal pack counts coaching's
-`session` as a touchpoint.
+`session` as a touchpoint. A kind may still require its verb to be one of
+the pack's own claims: `session-checks`' `verb` is the pack's own
+consuming verb and must be declared in `[[verbs]]`.
 
 ### 13.5. Allowed pack contents (PD7)
 
