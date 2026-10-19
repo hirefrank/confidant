@@ -46,7 +46,17 @@ fn check_demo_json_ok() {
     assert_eq!(v["schema_version"], "1");
     assert_eq!(v["spec"], "0.1");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
-    assert_eq!(v["findings"], serde_json::json!([]));
+    // Personal-first teaching content: two warnings, no errors. The default
+    // `--fail-on error` keeps the CI step exiting 0.
+    assert_eq!(v["summary"]["errors"], 0);
+    assert_eq!(v["summary"]["warnings"], 2);
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
 }
 
 #[test]
@@ -300,17 +310,41 @@ fn allowlist_demo_excludes_no_ai() {
         "{files:?}"
     );
     // Ledger lines naming Cam (open line 4, session line 8, balance line 12
-    // of ledger/2026/10.cfd) are out; every other line is in.
-    let lines: Vec<u64> = v["cleared_ledger_lines"]
+    // of ledger/2026/10.cfd) are out; every other line is in. The personal
+    // September file is cleared too, and the three personal touch lines in
+    // October are cleared and owned by the implicit personal pack.
+    let lines: Vec<(String, u64)> = v["cleared_ledger_lines"]
         .as_array()
         .unwrap()
         .iter()
         .map(|e| {
-            assert_eq!(e["file"], "ledger/2026/10.cfd");
-            e["line"].as_u64().unwrap()
+            (
+                e["file"].as_str().unwrap().to_owned(),
+                e["line"].as_u64().unwrap(),
+            )
         })
         .collect();
-    assert_eq!(lines, vec![1, 2, 3, 5, 6, 7, 9, 10, 11, 13], "{lines:?}");
+    assert_eq!(
+        lines,
+        vec![
+            ("ledger/2026/09.cfd".to_owned(), 1),
+            ("ledger/2026/09.cfd".to_owned(), 2),
+            ("ledger/2026/10.cfd".to_owned(), 1),
+            ("ledger/2026/10.cfd".to_owned(), 2),
+            ("ledger/2026/10.cfd".to_owned(), 3),
+            ("ledger/2026/10.cfd".to_owned(), 5),
+            ("ledger/2026/10.cfd".to_owned(), 6),
+            ("ledger/2026/10.cfd".to_owned(), 7),
+            ("ledger/2026/10.cfd".to_owned(), 9),
+            ("ledger/2026/10.cfd".to_owned(), 10),
+            ("ledger/2026/10.cfd".to_owned(), 11),
+            ("ledger/2026/10.cfd".to_owned(), 13),
+            ("ledger/2026/10.cfd".to_owned(), 14),
+            ("ledger/2026/10.cfd".to_owned(), 15),
+            ("ledger/2026/10.cfd".to_owned(), 16),
+        ],
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -668,7 +702,7 @@ fn allowlist_scoped_annotates_owners() {
             e["line"].as_u64().unwrap()
         })
         .collect();
-    assert_eq!(lines, vec![2, 3, 5, 6, 7, 9, 10, 11, 13], "{lines:?}");
+    assert_eq!(lines, vec![2, 3, 5, 6, 7, 9, 10, 11, 16], "{lines:?}");
     let balance = v["cleared_ledger_lines"]
         .as_array()
         .unwrap()
@@ -1982,7 +2016,17 @@ fn declarative_coaching_cli_install_then_check_clean() {
     );
     let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["findings"], serde_json::json!([]), "{v}");
+    // The demo is personal-first: its two warning-level personal nudges are
+    // expected. What this test cares about is that installing the external
+    // coaching pack introduces no coaching findings (and no errors).
+    assert_eq!(v["summary"]["errors"], 0, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"], "{v}");
 }
 
 #[cfg(unix)]
@@ -3118,8 +3162,20 @@ fn record_list_demo_is_the_cleared_set_in_name_order() {
     assert_eq!(v["for_operator"], false);
     assert_eq!(v["skipped_encrypted"], 0);
     assert_eq!(v["refused_envelopes"], 0);
-    // Deterministic: display name, case-insensitive.
-    assert_eq!(roster_names(&v), vec!["Ada Example", "Bea Demo"]);
+    // Deterministic: display name, case-insensitive. Cam Sample is `no-ai:
+    // true`, so the cleared roster omits it; the personal contacts sort after
+    // the coaching clients.
+    assert_eq!(
+        roster_names(&v),
+        vec![
+            "Ada Example",
+            "Bea Demo",
+            "Dana Example",
+            "Eli Sample",
+            "Fay Demo",
+            "Gus Example",
+        ]
+    );
     for entry in v["records"].as_array().unwrap() {
         assert_eq!(entry["no_ai"], "false");
         assert_eq!(entry["kind"], "person");
@@ -3133,7 +3189,15 @@ fn record_list_demo_for_operator_adds_no_ai_with_tri_state() {
     assert_eq!(v["for_operator"], true);
     assert_eq!(
         roster_names(&v),
-        vec!["Ada Example", "Bea Demo", "Cam Sample"]
+        vec![
+            "Ada Example",
+            "Bea Demo",
+            "Cam Sample",
+            "Dana Example",
+            "Eli Sample",
+            "Fay Demo",
+            "Gus Example",
+        ]
     );
     let cam = v["records"]
         .as_array()
@@ -3164,7 +3228,17 @@ fn record_list_packs_scope_is_reported_and_fails_closed() {
     // remove them today.
     let v = demo_roster(&["--packs", "coaching@0.1"]);
     assert_eq!(v["scope"], serde_json::json!(["coaching@0.1"]));
-    assert_eq!(roster_names(&v), vec!["Ada Example", "Bea Demo"]);
+    assert_eq!(
+        roster_names(&v),
+        vec![
+            "Ada Example",
+            "Bea Demo",
+            "Dana Example",
+            "Eli Sample",
+            "Fay Demo",
+            "Gus Example",
+        ]
+    );
 
     // Unknown or disabled pack: usage error, exit 2 (ADR-7).
     let out = Command::new(bin())
@@ -3243,7 +3317,7 @@ fn record_list_text_output_lists_one_entry_per_line() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Ada Example"), "{text}");
     assert!(text.contains("Bea Demo"), "{text}");
-    assert!(text.contains("2 people (person)"), "{text}");
+    assert!(text.contains("6 people (person)"), "{text}");
     // The no-ai person is absent without the flag.
     assert!(!text.contains("Cam Sample"), "{text}");
 }

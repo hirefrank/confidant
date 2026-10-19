@@ -127,7 +127,17 @@ mod tests {
         let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         // Cam Sample is `no-ai: true`: absent, not nulled.
-        assert_eq!(names, vec!["Ada Example", "Bea Demo"]);
+        assert_eq!(
+            names,
+            vec![
+                "Ada Example",
+                "Bea Demo",
+                "Dana Example",
+                "Eli Sample",
+                "Fay Demo",
+                "Gus Example",
+            ]
+        );
         assert!(roster.records.iter().all(|r| r.no_ai == "false"));
         assert_eq!(roster.kind, "person");
         assert!(!roster.for_operator);
@@ -139,7 +149,18 @@ mod tests {
         let vault = demo_vault();
         let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, true);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["Ada Example", "Bea Demo", "Cam Sample"]);
+        assert_eq!(
+            names,
+            vec![
+                "Ada Example",
+                "Bea Demo",
+                "Cam Sample",
+                "Dana Example",
+                "Eli Sample",
+                "Fay Demo",
+                "Gus Example",
+            ]
+        );
         let cam = roster
             .records
             .iter()
