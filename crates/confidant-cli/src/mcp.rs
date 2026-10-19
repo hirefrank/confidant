@@ -472,6 +472,8 @@ mod tests {
             "record_show",
             "record_edit",
             "record_resolve",
+            "note_show",
+            "note_edit",
             "pack",
             "pack_add",
             "pack_list",
@@ -492,6 +494,25 @@ mod tests {
         // `isError` tool result (not a JSON-RPC error), so assert on that.
         let resp = handle(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"record_show","arguments":{"id":"p-01ABC"}}}"#,
+            Path::new("/tmp"),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(
+            resp["result"]["isError"],
+            serde_json::json!(true),
+            "an unknown tool name must be refused: {resp}"
+        );
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown tool"),
+            "{resp}"
+        );
+        // #557: the note read/edit pair is operator-only for the same reason.
+        let resp = handle(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"note_edit","arguments":{"id":"n-01ABC","file":"x.md"}}}"#,
             Path::new("/tmp"),
             &None,
         )

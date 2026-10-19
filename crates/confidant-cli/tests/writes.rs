@@ -520,6 +520,293 @@ fn note_add_creates_note() {
 }
 
 // ---------------------------------------------------------------------------
+// #557: `note show --for-edit` / `note edit`
+// ---------------------------------------------------------------------------
+
+/// Add a note to the plaintext fixture and return its id and absolute path.
+fn add_note(root: &Path, vroot: &str, body: &str) -> (String, PathBuf) {
+    let scratch = tempfile::tempdir().unwrap();
+    let file = scratch.path().join("body.md");
+    std::fs::write(&file, body).unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--body-file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        vroot,
+    ]);
+    assert!(ok, "note add failed: {v}");
+    let id = v["id"].as_str().unwrap().to_owned();
+    let path = root.join(v["path"].as_str().unwrap());
+    (id, path)
+}
+
+/// Rewrite a note's plaintext body into a temp file (the canonical front
+/// matter stays as written, so an unchanged body reports `unchanged`).
+fn edited_note_file(dir: &Path, original: &str, from: &str, to: &str) -> PathBuf {
+    let file = dir.join("edited.md");
+    std::fs::write(&file, original.replace(from, to)).unwrap();
+    file
+}
+
+#[test]
+fn note_show_requires_the_for_edit_flag() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (id, _) = add_note(root, &vroot, "Body.\n");
+    let (ok, v) = run_json(&[
+        "note",
+        "show",
+        &id,
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "usage_error", "{v}");
+}
+
+#[test]
+fn note_show_for_edit_returns_the_text_and_json_shape() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (id, path) = add_note(root, &vroot, "First body.\n");
+
+    let (ok, v) = run_json(&[
+        "note",
+        "show",
+        &id,
+        "--for-edit",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["id"], id, "{v}");
+    assert_eq!(v["type"], "note", "{v}");
+    assert_eq!(v["for_edit"], true, "{v}");
+    assert_eq!(v["no_ai"], false, "{v}");
+    assert_eq!(v["path"], format!("people/{PERSON}/notes/{id}.md"), "{v}");
+    assert!(v["text"].as_str().unwrap().contains("First body."));
+
+    // Human output is byte-for-byte the record text on stdout.
+    let out = std::process::Command::new(bin())
+        .args(["note", "show", &id, "--for-edit", "--vault", &vroot])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        std::fs::read_to_string(&path).unwrap()
+    );
+}
+
+#[test]
+fn note_show_rejects_a_non_note_id() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "note",
+        "show",
+        PERSON,
+        "--for-edit",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "usage_error", "{v}");
+}
+
+#[test]
+fn note_edit_round_trips_in_one_commit() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let (id, path) = add_note(root, &vroot, "First body.\n");
+    let before = commits(root);
+
+    let original = std::fs::read_to_string(&path).unwrap();
+    let edited = edited_note_file(scratch.path(), &original, "First body.", "Second body.");
+    let (ok, v) = run_json(&[
+        "note",
+        "edit",
+        &id,
+        "--file",
+        edited.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "note-edit", "{v}");
+    assert_eq!(v["id"], id, "{v}");
+    assert_eq!(v["path"], format!("people/{PERSON}/notes/{id}.md"), "{v}");
+    assert!(
+        !v.to_string().contains("Second body."),
+        "the note body leaked into --json: {v}"
+    );
+    assert_eq!(commits(root), before + 1, "expected exactly one commit");
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("Second body."), "{on_disk}");
+    assert!(!on_disk.contains("First body."), "{on_disk}");
+
+    // The operator read hands the new body back, ready to edit again.
+    let (ok, v) = run_json(&[
+        "note",
+        "show",
+        &id,
+        "--for-edit",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert!(v["text"].as_str().unwrap().contains("Second body."), "{v}");
+}
+
+#[test]
+fn note_edit_with_identical_content_is_a_no_op() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (id, path) = add_note(root, &vroot, "Body.\n");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let before = commits(root);
+
+    // The note file already holds the canonical form: writing it back is a
+    // no-op and must commit nothing.
+    let scratch = tempfile::tempdir().unwrap();
+    let same = scratch.path().join("same.md");
+    std::fs::write(&same, &original).unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "edit",
+        &id,
+        "--file",
+        same.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["unchanged"], true, "{v}");
+    assert!(
+        v.get("commit").is_none(),
+        "no-op edit reported a commit: {v}"
+    );
+    assert_eq!(commits(root), before, "a no-op edit committed");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn note_edit_check_failure_rolls_back_and_commits_nothing() {
+    // The edited note still parses, so this exercises the post-write check
+    // rollback rather than the parser: `check` gates a note edit like any
+    // other write.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let (id, path) = add_note(root, &vroot, "Body.\n");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let before = commits(root);
+
+    // A dangling `org:` reference is a check error (E_DANGLING_REF) that
+    // only appears after the write.
+    let bad_text = original.replace(
+        "type: note\n",
+        "type: note\norg: o-01J9Z3K4QG0000000000000000\n",
+    );
+    let bad = scratch.path().join("bad.md");
+    std::fs::write(&bad, &bad_text).unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "edit",
+        &id,
+        "--file",
+        bad.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .expect("check report")
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"E_DANGLING_REF"), "{codes:?}");
+    assert_eq!(commits(root), before, "nothing committed");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        original,
+        "the note was not rolled back"
+    );
+}
+
+#[test]
+fn note_edit_refuses_a_person_that_does_not_match_the_path() {
+    // A person change would re-route the note to another client key and,
+    // in an encrypted vault, is invisible to the post-write check. Refuse
+    // before encrypting.
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let (id, path) = add_note(root, &vroot, "Body.\n");
+    let original = std::fs::read_to_string(&path).unwrap();
+    let before = commits(root);
+
+    let moved = original.replace(PERSON, PERSON2);
+    let file = scratch.path().join("moved.md");
+    std::fs::write(&file, &moved).unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "edit",
+        &id,
+        "--file",
+        file.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot move"),
+        "{v}"
+    );
+    assert_eq!(commits(root), before, "nothing committed");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+// ---------------------------------------------------------------------------
 // record add
 // ---------------------------------------------------------------------------
 

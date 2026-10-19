@@ -653,6 +653,42 @@ enum NoteAction {
         #[arg(long)]
         body_file: PathBuf,
     },
+    /// Print one note's decrypted text, to prepare an edit.
+    ///
+    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
+    /// a fixed tool whitelist), and `--for-edit` is required so a bare
+    /// invocation cannot print a decrypted note body. Notes are where
+    /// `no-ai` prose lives, so `no-ai` notes are decrypted in full here
+    /// (same operator path as `record show --for-edit`).
+    Show {
+        /// Opaque note id (n-…).
+        id: String,
+        /// Acknowledge the operator-only edit read. Required.
+        #[arg(long)]
+        for_edit: bool,
+    },
+    /// Replace an existing note's file from a markdown file or the editor.
+    ///
+    /// Operator-only (never exposed over MCP). Exactly one source is
+    /// required: `--file` reads the new note from a markdown file, `--edit`
+    /// opens $VISUAL/$EDITOR on 0600 scratch under `.confidant/` (the #455
+    /// convention). The write goes through the normal pipeline, so in an
+    /// encrypted vault it re-encrypts, runs `check` before the commit, and
+    /// makes one commit; identical bytes report `unchanged` and commit
+    /// nothing.
+    #[command(group(
+        clap::ArgGroup::new("note_edit_source").required(true).multiple(false)
+    ))]
+    Edit {
+        /// Opaque note id (n-…).
+        id: String,
+        /// Markdown file holding the new version of the note.
+        #[arg(long, group = "note_edit_source")]
+        file: Option<PathBuf>,
+        /// Edit the note in $VISUAL/$EDITOR with 0600 scratch files.
+        #[arg(long, group = "note_edit_source")]
+        edit: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -1018,6 +1054,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     no_ai,
                     body_file,
                 } => cmd_note_add(&cli, &root, person, date.clone(), *no_ai, body_file),
+                NoteAction::Show { id, for_edit } => cmd_note_show(&cli, &root, id, *for_edit),
+                NoteAction::Edit { id, file, edit } => {
+                    cmd_note_edit(&cli, &root, id, file.as_deref(), *edit)
+                }
             }
         }
         Command::Pack { action } => match action {
@@ -3955,6 +3995,351 @@ fn cmd_note_add(
         extra["person"] = echo;
     }
     finish_write(cli, root, "note-add", outcome, extra)
+}
+
+// ---------------------------------------------------------------------------
+// note show (operator-only) / note edit (#557)
+// ---------------------------------------------------------------------------
+
+/// Parse a positional note id: a usage error (exit 2, ADR-7) for a
+/// malformed id or a non-note prefix. `verb` labels the error context.
+fn parse_note_id(id_raw: &str, verb: &str) -> anyhow::Result<RecordId> {
+    let id = RecordId::parse(id_raw).map_err(|_| {
+        anyhow::Error::new(DomainError::usage(format!("not a note id: {id_raw}"))).context(format!(
+            "`{verb}` takes an opaque note id; use `confidant find <name>` to look one up"
+        ))
+    })?;
+    if id.prefix() != Prefix::Note {
+        return Err(anyhow::Error::new(DomainError::usage(format!(
+            "not a note id: {id_raw}"
+        ))));
+    }
+    Ok(id)
+}
+
+/// Vault-relative path of a note file under `people/<person>/notes/` when
+/// the loaded vault has no record for it, located by scanning the owner
+/// directories. `None` when no note file matches. Used to tell an
+/// unreadable note apart from a missing one in the error, never to derive
+/// a write target.
+fn note_path_for(root: &Path, id: &RecordId) -> Option<PathBuf> {
+    let file = format!("{id}.md");
+    let people = std::fs::read_dir(root.join("people")).ok()?;
+    for entry in people.flatten() {
+        if entry.path().join("notes").join(&file).is_file() {
+            return Some(PathBuf::from(format!(
+                "people/{}/notes/{file}",
+                entry.file_name().to_string_lossy()
+            )));
+        }
+    }
+    None
+}
+
+/// Fail-closed error for a note id whose file exists on disk but did not
+/// load: an envelope this device cannot decrypt, or a file that is not a
+/// readable note. Mirrors `record show`'s ladder; never names the body.
+fn note_unreadable_error(id_raw: &str, rel: &Path, bytes: &[u8]) -> anyhow::Error {
+    if confidant_core::crypto_mode::is_envelope_bytes(bytes) {
+        anyhow::Error::new(
+            DomainError::invalid(format!(
+                "cannot read {id_raw}: this device cannot decrypt it"
+            ))
+            .with_fix(
+                "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+            ),
+        )
+    } else {
+        anyhow::Error::new(
+            DomainError::invalid(format!(
+                "cannot read {id_raw}: {} is not a readable note",
+                rel.display()
+            ))
+            .with_fix("Run `confidant check` for the finding on that file"),
+        )
+    }
+}
+
+/// The decrypted plaintext of one note file, through the operator read
+/// path (`RecordDecryptor::for_edit`), for the editor round trip. Fail
+/// closed per outcome; never logs the body.
+fn note_plaintext(root: &Path, vault_id: &str, rel: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(root.join(rel)).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read {}: {e}",
+            rel.display()
+        )))
+    })?;
+    if !confidant_core::crypto_mode::is_envelope_bytes(&bytes) {
+        return String::from_utf8(bytes).map_err(|_| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "{} is not valid UTF-8",
+                rel.display()
+            )))
+        });
+    }
+    match record_decrypt::RecordDecryptor::for_edit(root, vault_id)
+        .decrypt_bytes(&rel.to_string_lossy(), &bytes)
+    {
+        ContentOutcome::Content(plaintext) => String::from_utf8(plaintext).map_err(|_| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "{} does not decrypt to valid UTF-8",
+                rel.display()
+            )))
+        }),
+        ContentOutcome::NoAiShell { .. } => Err(anyhow::Error::new(DomainError::internal(
+            "operator decryptor returned a no-ai shell for a note",
+        ))),
+        ContentOutcome::Skipped => Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "cannot edit {}: this device cannot decrypt the note",
+                rel.display()
+            ))
+            .with_fix(
+                "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+            ),
+        )),
+        ContentOutcome::Refused => Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "cannot edit {}: the envelope failed authentication",
+                rel.display()
+            ))
+            .with_fix("The envelope is tampered or corrupt; restore it from git history"),
+        )),
+    }
+}
+
+/// #557: print one note's decrypted text so the operator can edit it.
+///
+/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
+/// argv and this command is not in it, so no agent connection can reach
+/// it. `--for-edit` is required rather than optional so a bare invocation
+/// can never print a decrypted note body. Unlike the agent read path,
+/// `no-ai` notes are decrypted in full (`RecordDecryptor::for_edit`):
+/// notes are where `no-ai` prose lives, and the operator's tooling is the
+/// only window onto it (spec §12 is unchanged for agents).
+fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow::Result<ExitCode> {
+    if !for_edit {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "note show is operator-only and exists to prepare an edit; pass --for-edit",
+        )));
+    }
+    let vault = match load_vault_for_reads(root, cli.json, true) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
+    }
+    let id = parse_note_id(id_raw, "note show")?;
+    let Some(rec) = vault.records.get(&id) else {
+        // A file that is on disk but did not load is a problem with that
+        // file. Only claim a decryption failure when the file really is an
+        // envelope (as `record show` does).
+        if let Some(rel) = note_path_for(root, &id) {
+            if let Ok(bytes) = std::fs::read(root.join(&rel)) {
+                return Err(note_unreadable_error(id_raw, &rel, &bytes));
+            }
+        }
+        return Err(anyhow::Error::new(DomainError::not_found(format!(
+            "no note with id {id_raw}"
+        )))
+        .context("use `confidant find <name>` to look up the id"));
+    };
+    let text = rec.source.clone();
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "id": id.to_string(),
+                "type": rec.kind.as_str(),
+                "path": rec.path,
+                "no_ai": rec.no_ai(),
+                "for_edit": true,
+                "text": text,
+            }),
+        ))?;
+    } else {
+        // Byte-for-byte on stdout, so it can be redirected into an editor
+        // or a file and edited in place.
+        print!("{text}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// #557: replace an existing note's file from `--file` or the editor.
+///
+/// The write goes through [`apply_record_write`], so in an encrypted vault
+/// it re-encrypts with a fresh nonce, runs `check` before the commit, and
+/// makes one commit — exactly like `record edit`; an unchanged body reuses
+/// the existing ciphertext and reports `unchanged` with no commit. The
+/// target path is the note's existing location, never a path the caller or
+/// the edited text chose: a note's `person:` must keep matching its
+/// directory (a change re-routes the client key and, in an encrypted
+/// vault, is invisible to the post-write `check`, so it is refused before
+/// encryption).
+fn cmd_note_edit(
+    cli: &Cli,
+    root: &Path,
+    id_raw: &str,
+    file: Option<&Path>,
+    edit: bool,
+) -> anyhow::Result<ExitCode> {
+    let vault = vault_or!(root, cli.json);
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
+    }
+    let id = parse_note_id(id_raw, "note edit")?;
+    // Sweep stale `--edit` scratch from a crashed earlier run (#455
+    // convention). Harmless for a `--file` edit and for a dry run: it only
+    // zero-overwrites and removes `.confidant/notes/`.
+    record_resolve::sweep_stale_note_scratch(root);
+    // Pin the existing file first: the edit can never move the note. A note
+    // that is on disk but did not load is reported for what it is rather
+    // than as missing.
+    let rel = match vault.records.get(&id) {
+        Some(rec) if rec.kind == RecordKind::Note => PathBuf::from(&rec.path),
+        Some(_) => {
+            return Err(anyhow::Error::new(DomainError::not_found(format!(
+                "no note with id {id_raw}"
+            ))))
+        }
+        None => match note_path_for(root, &id) {
+            Some(rel) => {
+                if let Ok(bytes) = std::fs::read(root.join(&rel)) {
+                    return Err(note_unreadable_error(id_raw, &rel, &bytes));
+                }
+                return Err(anyhow::Error::new(DomainError::not_found(format!(
+                    "no note with id {id_raw}"
+                ))));
+            }
+            None => {
+                return Err(anyhow::Error::new(DomainError::not_found(format!(
+                    "no note with id {id_raw}"
+                )))
+                .context("use `confidant find <name>` to look up the id"))
+            }
+        },
+    };
+    // The owner implied by the path, so the person check below never trusts
+    // the edited text.
+    let owner =
+        confidant_core::id::person_id_from_path(&rel.to_string_lossy()).ok_or_else(|| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "note {id_raw} does not live under people/<person>/notes/"
+            )))
+        })?;
+    let (text, provisional) = if let Some(file) = file {
+        let text = std::fs::read_to_string(file).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot read {}: {e}",
+                file.display()
+            )))
+        })?;
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "note.md".to_owned());
+        (text, name)
+    } else {
+        // `--edit`: open the operator's editor on 0600 scratch (#455
+        // convention). Fail fast if no editor is configured, before any
+        // plaintext scratch exists.
+        debug_assert!(edit, "clap requires --file or --edit");
+        let current = note_plaintext(root, &vault.config.vault_id, &rel)?;
+        record_resolve::resolve_editor()?;
+        let (mut guard, scratch) = record_resolve::setup_note_edit_scratch(root, &id, &current)?;
+        let result = record_resolve::run_note_editor(&scratch).and_then(|()| {
+            std::fs::read_to_string(&scratch).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot read {}: {e}",
+                    scratch.display()
+                )))
+            })
+        });
+        // Explicit cleanup on every path; drop after is a no-op.
+        guard.cleanup();
+        (result?, "note.md".to_owned())
+    };
+    let rec = confidant_core::parse_record(&text, &provisional)
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(e.message).with_fix(e.fix)))?;
+    if rec.kind != RecordKind::Note {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "note edit takes a note; the file's type is {}",
+            rec.kind.as_str()
+        ))));
+    }
+    if rec.id != id {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!("the file's id is {}, not {id_raw}", rec.id))
+                .with_fix("Edit the note the file names, or fix `id:` in the file"),
+        ));
+    }
+    // An envelope is ciphertext, not note plaintext: re-encrypting it would
+    // bury a second layer. Point at the operator read instead.
+    if rec.field("enc").is_some() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("the file is an encrypted note envelope, not note text")
+                .with_fix(
+                    "Use `confidant note show <id> --for-edit` to get the text, edit that, then re-run `note edit`",
+                ),
+        ));
+    }
+    // Fail closed before encrypting (#412-style). The post-write `check`
+    // runs against the envelope in an encrypted vault, so a note whose
+    // `person:` no longer matches its directory would otherwise be
+    // committed and only surface on decrypt.
+    if rec.person().as_ref() != Some(&owner) {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "the edited note's person does not match its location ({}); a note cannot move",
+                rel.display()
+            ))
+            .with_fix("Keep `person:` as it is, or use `note add` for a note on another person"),
+        ));
+    }
+    let contents = confidant_core::format_record(&rec);
+    // Fail closed when the stored file is an envelope this device cannot
+    // decrypt, naming the real cause instead of re-encrypting over it.
+    let existing = std::fs::read(root.join(&rel)).unwrap_or_default();
+    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
+        if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
+            enc.decrypt_existing(&rel, &existing).map_err(|_| {
+                anyhow::Error::new(
+                    DomainError::invalid(format!(
+                        "cannot edit {id_raw}: this device cannot decrypt the note"
+                    ))
+                    .with_fix(
+                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
+                    ),
+                )
+            })?;
+        }
+    }
+    let (outcome, _created) = apply_record_write(
+        root,
+        &vault,
+        PendingWrite {
+            changes: vec![FileChange::WriteFile {
+                path: rel.clone(),
+                contents,
+            }],
+            summary: format!("note {id}"),
+            canonical_request: format!("note-edit/v1\npath={}\nbody={text}", rel.display()),
+        },
+        &write_options(cli),
+    )?;
+    finish_write(
+        cli,
+        root,
+        "note-edit",
+        outcome,
+        serde_json::json!({ "id": id.to_string(), "path": rel.display().to_string() }),
+    )
 }
 
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
