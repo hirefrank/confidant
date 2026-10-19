@@ -16,8 +16,11 @@
 //!
 //! The built-in personal pack's `packs` entry (shape, merge rule, private
 //! fields) lives in [`personal`]; `context` only strips the fields the pack
-//! declares as private.
+//! declares as private. The ledger-derived `ledger-sessions` entry lives in
+//! [`ledger_sessions`] and is served by whichever enabled pack reports it —
+//! the compiled coaching pack or a `[context]` declarative pack (#594).
 
+pub mod ledger_sessions;
 pub mod personal;
 
 use std::collections::HashSet;
@@ -25,8 +28,10 @@ use std::collections::HashSet;
 use serde::{Serialize, Serializer};
 
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
+use crate::context::ledger_sessions::{
+    owns_legacy_coaching_alias, LedgerSessionsView, LEDGER_SESSIONS_VIEW,
+};
 use crate::id::RecordId;
-use crate::packs::coaching::CoachingView;
 use crate::record::RecordKind;
 use crate::scope::{
     note_linkage_owners, owners_of_ledger_entry, record_owners, OwnerKey, PackScope,
@@ -102,11 +107,12 @@ pub struct InteractionView {
     pub no_ai: Option<&'static str>,
 }
 
-// CoachingView lives in crate::packs::coaching. Kept for the agent contract
-// (ADR-7): `context` output keeps the `coaching` field with exactly this
-// shape. Pack state is grouped by pack in PersonContext::packs; `coaching`
-// is the coaching pack's entry in that map, deserialized back into this
-// struct.
+// `LedgerSessionsView` lives in crate::context::ledger_sessions. Kept for
+// the agent contract (ADR-7): `context` output keeps the `coaching` field
+// with exactly this shape. Pack state is grouped by pack in
+// PersonContext::packs; `coaching` is the `ledger-sessions` provider's entry
+// in that map (the compiled coaching pack or a `[context]` declarative
+// pack), deserialized back into this struct.
 
 /// The full bundle returned by `context`.
 #[derive(Clone, Debug, Serialize)]
@@ -118,10 +124,12 @@ pub struct PersonContext {
     /// ledger lines. Participants in a multi-person interaction see their
     /// touchpoint here, not the interaction content.
     pub touchpoints: Vec<TouchpointView>,
-    pub coaching: Option<CoachingView>,
+    pub coaching: Option<LedgerSessionsView>,
     /// Pack state grouped by pack name (`"coaching@0.1"` today). Each pack
     /// decides its own view shape via `Pack::context_view`. `coaching` above
-    /// duplicates this map's coaching entry for contract stability.
+    /// duplicates the coaching pack's entry for contract stability; the
+    /// alias is tied to the pack named `coaching` (ADR-7), whatever origin it
+    /// came from.
     pub packs: std::collections::BTreeMap<String, serde_json::Value>,
     /// Opaque `hmac:<hex>` values from ledger `alias` lines.
     pub aliases: Vec<String>,
@@ -221,11 +229,24 @@ pub fn build_context(
         }
     }
     // Legacy contract field: the coaching pack's entry, deserialized back.
-    // `to_value` in the pack produced it from this struct, so this cannot
-    // fail unless the pack's view shape drifts from the struct.
-    let coaching = packs
-        .get("coaching@0.1")
-        .and_then(|v| serde_json::from_value::<CoachingView>(v.clone()).ok());
+    // The alias is tied to the coaching pack (ADR-7), not to the view kind:
+    // any `[context]` pack can serve the `ledger-sessions` kind, but only the
+    // pack named `coaching` (the compiled `coaching@0.1` today, the external
+    // `coaching` pack after the #449 cutover) owns the legacy alias. Another
+    // pack serving the same kind must leave `coaching` null. The key is never
+    // hardcoded: the version comes from the enabled pack, matched by base
+    // name. `to_value` in the builder produced it from this struct, so this
+    // cannot fail unless the view shape drifts from the struct.
+    let coaching = snapshots.iter().find_map(|(pack, _)| {
+        if !owns_legacy_coaching_alias(pack.name())
+            || pack.context_view_kind() != Some(LEDGER_SESSIONS_VIEW)
+        {
+            return None;
+        }
+        packs
+            .get(pack.name())
+            .and_then(|v| serde_json::from_value::<LedgerSessionsView>(v.clone()).ok())
+    });
 
     let person_dir = format!("people/{person}/notes/");
 

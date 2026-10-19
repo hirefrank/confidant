@@ -773,6 +773,8 @@ vault_id = "abc"
             },
             // v2-only `[[rules]]` (#435); empty for a v1 manifest.
             rules: Vec::new(),
+            // v2-only `[context]` (#594); absent for a v1 manifest.
+            context: None,
             messages: BTreeMap::new(),
             // #550: a hand-built manifest in tests is treated as external;
             // `may_emit_builtin_codes` still allows v1's builtin codes.

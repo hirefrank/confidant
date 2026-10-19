@@ -197,6 +197,23 @@ pub struct EdgeKindDecl {
     pub symmetric: bool,
 }
 
+/// The optional `[context]` table (v2, spec §13.9): an opt-in naming a
+/// core-built `context` view. The manifest *names* the view and supplies
+/// its parameters through the pack's `ledger-balance` rule (PD1); core
+/// implements the view. `[context]` is scope-limited to derived ledger
+/// metadata — no record fields, no PII, no decrypted content — so it does
+/// not widen the §12 allowlist and needs no `private_context_fields`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextDecl {
+    /// One of the known core view kinds; today only `"ledger-sessions"`.
+    pub view: String,
+    /// Optional cap on the view's `recent_sessions`; core's default when
+    /// absent. A present value must be positive.
+    #[serde(default)]
+    pub recent_limit: Option<u64>,
+}
+
 /// One `[[checks.severity]]` entry.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -281,6 +298,10 @@ pub struct PackManifest {
     /// declare none yet.
     #[serde(default)]
     pub rules: Vec<RuleDecl>,
+    /// Optional `[context]` table (v2, spec §13.9): names a core-built
+    /// `context` view for this pack. Absent means the pack serves no view.
+    #[serde(default)]
+    pub context: Option<ContextDecl>,
     /// Finding message and fix templates, one table per code:
     /// `messages[code][variant] = template`. Every code in
     /// `finding_codes` needs a table with at least one variant, and every
@@ -354,8 +375,26 @@ impl PackManifest {
             ))
             .with_fix("Set manifest_version = 1 or upgrade the CLI"));
         }
+        // `[context]` is a v2 surface (spec §13.9). A v1 file that names it
+        // would otherwise parse (the field is known) and silently do
+        // nothing; refuse it instead.
+        if self.context.is_some() {
+            return Err(
+                manifest_err("[context] requires manifest_version = 2 (spec §13.9)")
+                    .with_fix("Set manifest_version = 2, or remove the [context] table"),
+            );
+        }
 
         self.validate_common()
+    }
+
+    /// Validate the optional `[context]` table (spec §13.9): an unknown
+    /// view, a missing or duplicated `ledger-balance` rule, or a
+    /// non-positive `recent_limit` is refused here. The resolution lives
+    /// with the view builder so the loader and the runtime read the same
+    /// rules.
+    fn validate_context(&self) -> Result<(), DomainError> {
+        crate::context::ledger_sessions::resolve_params(self).map(drop)
     }
 
     /// Whether this manifest may name core (builtin) finding codes as its
@@ -570,6 +609,10 @@ impl PackManifest {
                 "Add \"E_FRONTMATTER\" to finding_codes and a [messages.\"E_FRONTMATTER\"] table with a `default` variant",
             ));
         }
+
+        // §13.9: the optional `[context]` table is validated here (the
+        // view name, its balance-rule parameters and the recent cap).
+        self.validate_context()?;
 
         self.validate_common()
     }
@@ -1397,5 +1440,87 @@ default_fix = "{fix}"
         let m = parse_manifest_compiled_in(&text).expect("compiled-in built-in parses");
         assert_eq!(m.origin, PackOrigin::CompiledIn);
         assert_eq!(m.verbs[0].name, "touch");
+    }
+
+    /// A minimal `ledger-balance` rule for the `[context]` tests: the five
+    /// parameters `resolve_params` reads, nothing else.
+    const CONTEXT_BALANCE_RULE: &str = r#"[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_EXAMPLE_FIELD"
+open_verb = "open"
+consume_verb = "session"
+units_metric = "sessions_remaining"
+minutes_metric = "icf_hours"
+max_open_n = 100000
+"#;
+
+    /// #594: a `[context] ledger-sessions` table with one balance rule
+    /// parses and resolves.
+    #[test]
+    fn external_accepts_ledger_sessions_context_view() {
+        let text = format!(
+            "{}\n[context]\nview = \"ledger-sessions\"\n{CONTEXT_BALANCE_RULE}",
+            valid_v2_toml()
+        );
+        let m = parse_manifest_external(&text).expect("context view parses");
+        assert_eq!(m.context.as_ref().unwrap().view, "ledger-sessions");
+        assert_eq!(m.context.as_ref().unwrap().recent_limit, None);
+    }
+
+    /// #594: an unknown `[context].view` is refused.
+    #[test]
+    fn external_rejects_unknown_context_view() {
+        let text = format!("{}\n[context]\nview = \"mystery\"\n", valid_v2_toml());
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(err.to_string().contains("known core view"), "{err:?}");
+    }
+
+    /// #594: a `[context]` view needs a balance rule to name its verbs and
+    /// metrics; none, or more than one, is refused.
+    #[test]
+    fn external_context_view_needs_exactly_one_balance_rule() {
+        let none = format!(
+            "{}\n[context]\nview = \"ledger-sessions\"\n",
+            valid_v2_toml()
+        );
+        let err = parse_manifest_external(&none).unwrap_err();
+        assert!(
+            err.to_string().contains("needs a ledger-balance rule"),
+            "{err:?}"
+        );
+
+        let two = format!(
+            "{}\n[context]\nview = \"ledger-sessions\"\n{CONTEXT_BALANCE_RULE}{}",
+            valid_v2_toml(),
+            CONTEXT_BALANCE_RULE.replace("id = \"balance\"", "id = \"balance2\"")
+        );
+        let err = parse_manifest_external(&two).unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one ledger-balance rule"),
+            "{err:?}"
+        );
+    }
+
+    /// #594: `recent_limit` must be positive.
+    #[test]
+    fn external_rejects_zero_recent_limit() {
+        let text = format!(
+            "{}\n[context]\nview = \"ledger-sessions\"\nrecent_limit = 0\n{CONTEXT_BALANCE_RULE}",
+            valid_v2_toml()
+        );
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("recent_limit must be positive"),
+            "{err:?}"
+        );
+    }
+
+    /// #594: `[context]` is a v2 surface; a v1 file cannot name it.
+    #[test]
+    fn v1_rejects_context_table() {
+        let text = valid_toml() + "\n[context]\nview = \"ledger-sessions\"\n";
+        let err = parse_manifest(&text).unwrap_err();
+        assert!(err.to_string().contains("manifest_version = 2"), "{err:?}");
     }
 }

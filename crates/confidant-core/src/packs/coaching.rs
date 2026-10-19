@@ -4,11 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
 
 use crate::check::{duration_of, Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
-use crate::ledger::LedgerEntry;
 use crate::ledger::{parse_decimal_hundredths, parse_strict_date, Arg};
 use crate::packs::manifest::{parse_manifest, PackManifest};
 use crate::packs::rules::ledger::{
@@ -126,30 +124,12 @@ fn render_fix(
 /// The compiled coaching pack. Registered in [`crate::packs::ALL_PACKS`].
 pub struct CoachingPack;
 
-/// One ledger session for the person (context view).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecentSession {
-    pub date: String,
-    pub duration_minutes: Option<u32>,
-    pub tag: Option<String>,
-}
-
-/// Merge-aware coaching facts for the person (context view).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CoachingView {
-    pub sessions_remaining: i64,
-    pub icf_hours: f64,
-    pub recent_sessions: Vec<RecentSession>,
-}
-
-fn billing_tag(entry: &LedgerEntry) -> Option<String> {
-    for tag in ["paid", "pps", "comp"] {
-        if entry.has_token(tag) {
-            return Some(tag.to_owned());
-        }
-    }
-    None
-}
+// The context-view types moved to the core `context::ledger_sessions`
+// module (#594): both the compiled pack and a `[context]` declarative pack
+// serve one builder and one shape. Re-exported here so the public paths
+// `packs::coaching::{CoachingView, RecentSession}` keep resolving until the
+// #449 cutover deletes this module.
+pub use crate::context::ledger_sessions::{LedgerSessionsView as CoachingView, RecentSession};
 
 impl Pack for CoachingPack {
     fn name(&self) -> &'static str {
@@ -244,26 +224,24 @@ impl Pack for CoachingPack {
             .as_any()
             .downcast_ref::<CoachingState>()
             .expect("CoachingPack state");
-        let mut sessions: Vec<RecentSession> = vault
-            .entries
-            .iter()
-            .filter(|s| {
-                s.entry.verb == "session" && state.canonical_on(&s.entry.id, as_of) == *canonical
-            })
-            .map(|s| RecentSession {
-                date: s.entry.date.to_string(),
-                duration_minutes: duration_of(&s.entry),
-                tag: billing_tag(&s.entry),
-            })
-            .collect();
-        sessions.sort_by(|a, b| b.date.cmp(&a.date));
-        sessions.truncate(10);
-        let view = CoachingView {
-            sessions_remaining: state.sessions_remaining_on(canonical, as_of),
-            icf_hours: state.icf_hours_hundredths_on(canonical, as_of) as f64 / 100.0,
-            recent_sessions: sessions,
-        };
-        serde_json::to_value(view).ok()
+        // #594: one builder serves the compiled pack and a `[context]`
+        // declarative pack. The compiled pack's verbs are fixed (`open`
+        // adds, `session` consumes) and it keeps the default recent cap.
+        crate::context::ledger_sessions::build_ledger_sessions_view(
+            vault,
+            canonical,
+            as_of,
+            state,
+            "session",
+            crate::context::ledger_sessions::DEFAULT_RECENT_LIMIT,
+        )
+    }
+
+    /// #594: the compiled pack serves the core `ledger-sessions` view; with
+    /// its base name `coaching`, `context` recognizes its `packs` entry as
+    /// the legacy `coaching` alias without hardcoding `"coaching@0.1"`.
+    fn context_view_kind(&self) -> Option<&'static str> {
+        Some(crate::context::ledger_sessions::LEDGER_SESSIONS_VIEW)
     }
 }
 

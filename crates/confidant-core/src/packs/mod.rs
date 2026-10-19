@@ -33,7 +33,7 @@ pub mod lock;
 pub mod manifest;
 pub mod manifest_pack;
 pub mod registry;
-mod rules;
+pub(crate) mod rules;
 pub mod untrusted;
 
 pub use registry::PackRegistry;
@@ -191,6 +191,16 @@ pub trait Pack: Send + Sync {
         _canonical: &RecordId,
         _as_of: NaiveDate,
     ) -> Option<serde_json::Value> {
+        None
+    }
+    /// The kind of `context` view this pack serves, if any (#594, spec
+    /// §13.9). Defaults to `None`. This is a secondary guard: `context`
+    /// only populates the legacy `coaching` alias from the pack named
+    /// `coaching` (any origin) that also reports the
+    /// [`crate::context::ledger_sessions::LEDGER_SESSIONS_VIEW`] kind, so a
+    /// `[context]` pack under another name serves its own `packs` entry but
+    /// never the alias. `None` for every pack that serves no core view.
+    fn context_view_kind(&self) -> Option<&'static str> {
         None
     }
     /// Top-level field names in [`Pack::context_view`]'s returned object that

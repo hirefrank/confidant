@@ -50,6 +50,13 @@ id_type = "person"
 name = "session"
 id_type = "person"
 
+# #594: opt in to the core `ledger-sessions` context view. The view's verbs
+# and metrics come from the single `ledger-balance` rule below; the manifest
+# only names the view, core implements it. This makes the fixture the
+# declarative twin of compiled coaching's `context_view`.
+[context]
+view = "ledger-sessions"
+
 [checks]
 [[checks.severity]]
 key = "coaching-ext.require_duration"

@@ -13,10 +13,12 @@
 
 use crate::check::Finding;
 use crate::check::MergeMap;
+use crate::context::ledger_sessions::LedgerSessionsParams;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
 use crate::packs::manifest::{PackManifest, PackOrigin};
+use crate::packs::rules::ledger;
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::vault::{SourcedEntry, Vault};
 use chrono::NaiveDate;
@@ -44,6 +46,9 @@ pub struct ManifestPack {
     balance_metrics: &'static [&'static str],
     edge_kinds: &'static [EdgeKind],
     finding_codes: &'static [&'static str],
+    /// The resolved `[context]` view parameters, if this manifest opts in
+    /// (#594). `None` means the pack serves no core view.
+    context_params: Option<LedgerSessionsParams>,
 }
 
 impl ManifestPack {
@@ -109,6 +114,12 @@ pub(crate) fn build_manifest_pack(
         .iter()
         .map(|c| leak_str(c.clone()))
         .collect();
+    // #594: the `[context]` view parameters. `validate_context` already
+    // refused a bad table at parse time, so this non-panicking resolve always
+    // matches `resolve_params` for a loaded manifest; a violation degrades to
+    // "no view" (see `ledger_sessions::params`) rather than panicking here on
+    // untrusted bytes.
+    let context_params = crate::context::ledger_sessions::params(&manifest);
     Box::leak(Box::new(ManifestPack {
         manifest: Box::leak(Box::new(manifest)),
         skill_text: leak_str(skill_text),
@@ -120,6 +131,7 @@ pub(crate) fn build_manifest_pack(
         balance_metrics: Box::leak(balance_metrics.into_boxed_slice()),
         edge_kinds: Box::leak(edge_kinds.into_boxed_slice()),
         finding_codes: Box::leak(finding_codes.into_boxed_slice()),
+        context_params,
     }))
 }
 
@@ -242,25 +254,55 @@ impl Pack for ManifestPack {
 
     /// The built-in personal pack serves core's merge-aware personal view
     /// (#510/#551), built from this manifest's declared fields so the view
-    /// follows the pack data.
+    /// follows the pack data. A pack with a `[context]` table (#594) serves
+    /// the core ledger-sessions view instead, folded from the same shared
+    /// ledger arithmetic; a pack with neither returns `None`.
     fn context_view(
         &self,
         vault: &Vault,
-        _state: &dyn PackState,
+        state: &dyn PackState,
         person: &RecordId,
         canonical: &RecordId,
         as_of: NaiveDate,
     ) -> Option<serde_json::Value> {
-        if !self.serves_core_personal_view() {
-            return None;
+        if self.serves_core_personal_view() {
+            return crate::context::personal::build_personal_view(
+                vault,
+                person,
+                canonical,
+                as_of,
+                &self.manifest.fields,
+            );
         }
-        crate::context::personal::build_personal_view(
+        let params = self.context_params.as_ref()?;
+        let state = state.as_any().downcast_ref::<ManifestState>()?;
+        // #594: the ledger-balance rule already owns these verbs (PD1); fold
+        // with the same shared arithmetic the check path uses, then build the
+        // view the compiled coaching pack also builds.
+        let folded = ledger::fold(vault, &state.merge, params.fold_params());
+        crate::context::ledger_sessions::build_ledger_sessions_view(
             vault,
-            person,
             canonical,
             as_of,
-            &self.manifest.fields,
+            &folded.facts,
+            &params.consume_verb,
+            params.recent_limit,
         )
+    }
+
+    /// #594: a declarative pack that declares `[context]` serves the core
+    /// `ledger-sessions` view. The legacy `coaching` alias is tied to the
+    /// base name `coaching` (`context` matches it), so this only makes the
+    /// coaching pack the alias — a `[context]` pack under another name serves
+    /// its own `packs` entry only. The built-in personal pack serves its own
+    /// view, so it is never the alias.
+    fn context_view_kind(&self) -> Option<&'static str> {
+        if self.serves_core_personal_view() {
+            return None;
+        }
+        self.context_params
+            .as_ref()
+            .map(|_| crate::context::ledger_sessions::LEDGER_SESSIONS_VIEW)
     }
 
     /// The `--exclude-private` list is core-owned (#510); only the built-in

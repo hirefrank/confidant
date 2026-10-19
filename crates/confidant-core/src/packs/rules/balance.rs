@@ -31,7 +31,7 @@ const DEFAULT_OPEN_MALFORMED_CODE: &str = "E_OPEN_MALFORMED";
 const DEFAULT_INVALID_ID_CODE: &str = "E_INVALID_ID";
 const DEFAULT_WRONG_ID_TYPE_CODE: &str = "E_WRONG_ID_TYPE";
 
-const KIND: &str = "ledger-balance";
+pub(crate) const KIND: &str = "ledger-balance";
 
 /// Read one string parameter, or the default when absent. A present but
 /// non-string value is refused rather than silently defaulted.
@@ -65,7 +65,7 @@ impl<'a> BalanceParams<'a> {
     /// Parse a rule that `validate` has already accepted. A missing or
     /// mistyped parameter here is a loader bug, so `None` means "do
     /// nothing" rather than guessing.
-    fn parse(rule: &'a RuleDecl) -> Option<Self> {
+    pub(crate) fn parse(rule: &'a RuleDecl) -> Option<Self> {
         Some(Self {
             open_verb: rule.params.get("open_verb")?.as_str()?,
             consume_verb: rule.params.get("consume_verb")?.as_str()?,
