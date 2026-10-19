@@ -11,6 +11,7 @@ use crate::theme;
 use crate::theme::palette;
 
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus, WriteOutcome};
+use crate::capture::{self, Capture, CaptureKind, CapturePhase, FieldId};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, ErrorBody,
     FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
@@ -20,9 +21,10 @@ use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposa
 use crate::runner::{RawOutput, Runner};
 use crate::search::{filter_search_result, find_result_to_search, SearchViewState};
 use crate::views::alert::{self, AlertState};
+use crate::views::capture as capture_view;
 use crate::views::check::{self, CheckViewState};
 use crate::views::confirm::{self, ConfirmState};
-use crate::views::conflict::{self, ConflictAction, ConflictListEntry, ConflictViewState};
+use crate::views::conflict::{self, ConflictAction, ConflictViewState};
 use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
@@ -38,8 +40,9 @@ use crate::views::search;
 ///
 /// The underlying [`ActiveView`] still exists per view; a workspace is the
 /// coarse job the operator is doing. `Search` and `Context` live under
-/// People; Proposals/Inbox/Conflicts live under Review until phase 3 merges
-/// them; Check and Doctor are the third workspace.
+/// People; Proposals/Inbox/Conflicts share the Review workspace and carry a
+/// pending-count badge so a queued item is visible from any workspace
+/// (#556 phase 3); Check and Doctor are the third workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Workspace {
     #[default]
@@ -187,6 +190,10 @@ pub struct App<R: Runner> {
     /// The in-flight record/note edit (`e`). While `Some`, the confirm modal
     /// owns the keyboard and the scratch file is live on disk.
     pub edit_flow: Option<EditFlow>,
+    /// The in-flight quick capture (`s`/`t`/`n`) (#556 phase 3). While `Some`,
+    /// the capture modal owns the keyboard; nothing is written until the
+    /// operator confirms the `--dry-run` preview.
+    pub capture: Option<Capture>,
     vault_root_override: Option<std::path::PathBuf>,
 }
 
@@ -214,6 +221,7 @@ impl<R: Runner> App<R> {
             suspended: None,
             operator_mode: false,
             edit_flow: None,
+            capture: None,
             vault_root_override: None,
         }
     }
@@ -783,15 +791,12 @@ impl<R: Runner> App<R> {
             }
         };
         if let Some((_, report)) = self.apply_outcome::<CheckReport>(&raw) {
-            self.conflict.entries = report
-                .findings
-                .iter()
-                .filter(|f| f.code == "E_MERGE_CONFLICT" && f.id.is_some())
-                .map(|f| ConflictListEntry {
-                    id: f.id.clone().unwrap_or_default(),
-                    message: f.message.clone(),
-                })
-                .collect();
+            self.conflict.entries = conflict::entries_from_report(Some(&report));
+            // Keep the cached check report in step: the Review Queue badge
+            // reads conflicts from it, so a resolve must move the count too.
+            // Reset the Check list cursor too, or it can open on a stale row.
+            self.check.report = Some(report);
+            self.check.selected = 0;
             self.conflict.selected = 0;
             self.conflict.detail = None;
             self.conflict.detail_id = None;
@@ -1232,7 +1237,7 @@ impl<R: Runner> App<R> {
         let noun = flow.target.kind.noun();
         match outcome {
             Ok(WriteOutcome::Applied { commit, .. }) => {
-                self.reload_after_edit();
+                self.reload_after_write();
                 self.alert = Some(AlertState {
                     title: "Edit Committed".to_owned(),
                     code: Some("committed".to_owned()),
@@ -1243,7 +1248,7 @@ impl<R: Runner> App<R> {
                 });
             }
             Ok(WriteOutcome::Idempotent { .. }) => {
-                self.reload_after_edit();
+                self.reload_after_write();
                 self.alert = Some(AlertState {
                     title: "No Changes".to_owned(),
                     code: Some("unchanged".to_owned()),
@@ -1286,14 +1291,342 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Reload the views an edit can change: the check report (a write can add
+    /// Reload the views a write can change: the check report (a write can add
     /// findings), the roster (a name or `no-ai` mode may differ), and the
-    /// selected person's context (the body/notes changed).
-    fn reload_after_edit(&mut self) {
+    /// selected person's context (the body/notes/interactions changed).
+    /// Shared by the `e` edit and the `s`/`t`/`n` captures.
+    fn reload_after_write(&mut self) {
         self.load_check();
         self.load_roster();
         if let Some(pid) = self.context.person_id.clone() {
             self.load_context(&pid);
+        }
+    }
+
+    /// The selected person's opaque id and, when known, display name. The
+    /// capture modals pre-fill this so the operator never types a ULID.
+    ///
+    /// The full-screen Context view can show a person reached from a Search
+    /// hit or a Check finding without moving the People cursor
+    /// ([`Self::activate_selected`] calls `load_context` but not
+    /// `sync_people_selection`). When Context is the visible view, the person
+    /// on screen is the capture target — never a stale People row — so the
+    /// form and the write can't disagree with what the operator is reading.
+    fn selected_person(&self) -> Option<(String, Option<String>)> {
+        let id = if self.active_view == ActiveView::Context {
+            self.context
+                .person_id
+                .clone()
+                .or_else(|| self.people.selected_person.clone())
+        } else {
+            self.people
+                .selected_person
+                .clone()
+                .or_else(|| self.context.person_id.clone())
+        }?;
+        let name = self
+            .context
+            .context
+            .as_ref()
+            .filter(|ctx| ctx.person.id == id)
+            .and_then(|ctx| ctx.person.name.clone())
+            .or_else(|| people::person_name(self.people.roster.as_ref(), &id).map(str::to_owned));
+        Some((id, name))
+    }
+
+    /// `s`/`t`/`n`: open a quick-capture form pre-filled with the selected
+    /// person. Writes nothing; the operator confirms the CLI's dry run first.
+    pub fn begin_capture(&mut self, kind: CaptureKind) {
+        if self.capture.is_some() {
+            return;
+        }
+        let Some((id, name)) = self.selected_person() else {
+            self.alert = Some(AlertState {
+                title: "No Person Selected".to_owned(),
+                code: Some("no_person".to_owned()),
+                message: format!(
+                    "{} capture needs a person: no roster row is selected",
+                    kind.noun()
+                ),
+                fix: Some("Select a person in People, then retry".to_owned()),
+                blocking: false,
+                raw: None,
+            });
+            return;
+        };
+        self.alert = None;
+        self.capture = Some(Capture::new(kind, id, name));
+    }
+
+    /// Run each capture source that is cheap to know up front so the Review
+    /// Queue badge is populated from launch: the proposal manifests from disk,
+    /// and the inbox dry run. Conflicts are derived from the check report
+    /// `load_check` already fetched.
+    ///
+    /// The inbox read must not mask an earlier startup failure: a successful
+    /// `load_inbox` clears the alert (the usual "a good reload clears the
+    /// alert" rule), and a failed one replaces it. Either way an alert raised
+    /// by the startup `check`/roster load is the one the operator should see,
+    /// so it is restored when there was one.
+    pub fn prime_review_queue(&mut self) {
+        self.load_proposals();
+        let prior_alert = self.alert.take();
+        self.load_inbox();
+        if prior_alert.is_some() {
+            self.alert = prior_alert;
+        }
+    }
+
+    /// Pending items across the Review Queue sources: proposal manifests,
+    /// inbox items to merge, and conflicted records. Derived from cached
+    /// state only; nothing here runs the CLI.
+    pub fn review_pending(&self) -> usize {
+        let proposals = self.proposals.entries.len();
+        let inbox = self
+            .inbox
+            .report
+            .as_ref()
+            .filter(|report| !report.empty)
+            .map(|report| report.items.len())
+            .unwrap_or(0);
+        let conflicts = conflict::entries_from_report(self.check.report.as_ref()).len();
+        proposals + inbox + conflicts
+    }
+
+    /// The workspace tab label, with a pending-count badge on Review Queue.
+    fn workspace_label(&self, workspace: Workspace) -> String {
+        if workspace == Workspace::Review {
+            let pending = self.review_pending();
+            if pending > 0 {
+                return format!("{} ({pending})", workspace.label());
+            }
+        }
+        workspace.label().to_owned()
+    }
+
+    /// Handle a key event while a capture modal is open. Returns true when the
+    /// key was consumed. The modal owns every key: while editing, `Enter` runs
+    /// the dry run, `Esc` cancels, `Tab` moves the field, and everything else
+    /// edits a field. In the preview, `y` writes and any other key cancels.
+    fn handle_capture_key(&mut self, key: KeyEvent) -> bool {
+        let Some(phase) = self.capture.as_ref().map(|capture| capture.phase) else {
+            return false;
+        };
+        match phase {
+            CapturePhase::Editing => {
+                match key.code {
+                    KeyCode::Esc => self.cancel_capture(),
+                    KeyCode::Enter => self.capture_begin_preview(),
+                    KeyCode::Tab => {
+                        if let Some(capture) = self.capture.as_mut() {
+                            capture.focus_next(true);
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        if let Some(capture) = self.capture.as_mut() {
+                            capture.focus_next(false);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(capture) = self.capture.as_mut() {
+                            capture.backspace();
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(capture) = self.capture.as_mut() {
+                            capture.space();
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if let Some(capture) = self.capture.as_mut() {
+                            capture.push_char(c);
+                        }
+                    }
+                    _ => {}
+                }
+                true
+            }
+            CapturePhase::Preview => {
+                if matches!(key.code, KeyCode::Char('y')) {
+                    self.capture_confirm();
+                } else {
+                    self.cancel_capture();
+                }
+                true
+            }
+        }
+    }
+
+    /// Stage the note body (for `note add --body-file`), then run the CLI's
+    /// `--dry-run` preview. Nothing is written to the vault.
+    fn capture_begin_preview(&mut self) {
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        if let Some(label) = capture.first_missing() {
+            self.set_capture_error(format!("{label} is required"));
+            return;
+        }
+
+        // Only `note add` needs a file; the inline surfaces (session/touch)
+        // pass their note as an argument.
+        let mut scratch_arg: Option<String> = None;
+        if capture.kind == CaptureKind::Note {
+            let Some(root) = resolve_vault_root(self.vault_root_override.as_deref()) else {
+                self.set_capture_error(
+                    "no vault found: pass --vault or set CONFIDANT_VAULT".to_owned(),
+                );
+                return;
+            };
+            if !self.scratch_is_gitignored(&root) {
+                self.set_capture_error(
+                    "`.confidant/` is not git-ignored in this vault, so the note scratch could be committed"
+                        .to_owned(),
+                );
+                return;
+            }
+            let Some(path) = capture::scratch_path(&root, &capture.person_id) else {
+                self.set_capture_error(format!("{} is not a usable person id", capture.person_id));
+                return;
+            };
+            if let Err(e) = edit::write_scratch(&path, capture.value(FieldId::Body)) {
+                self.set_capture_error(format!("cannot stage the note scratch: {e:#}"));
+                return;
+            }
+            if let Some(capture) = self.capture.as_mut() {
+                capture.scratch = Some(path.clone());
+            }
+            scratch_arg = path.to_str().map(str::to_owned);
+        }
+
+        let Some(capture) = self.capture.as_ref() else {
+            return;
+        };
+        let argv = capture.argv(scratch_arg.as_deref());
+        match crate::apply::run_write_step(&self.runner, &argv, true) {
+            Ok(WriteOutcome::DryRun { changes, .. }) => {
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.preview = changes;
+                    capture.phase = CapturePhase::Preview;
+                    capture.error = None;
+                }
+            }
+            Ok(WriteOutcome::CliError { code, message, fix }) => {
+                self.set_capture_error(cli_error_message(&code, &message, fix.as_deref()));
+            }
+            Ok(WriteOutcome::CheckBlocked { .. }) => {
+                self.set_capture_error(
+                    "check blocked the preview; fix the findings, then retry".to_owned(),
+                );
+            }
+            Ok(other) => {
+                self.set_capture_error(format!("unexpected preview outcome: {other:?}"));
+            }
+            Err(e) => {
+                self.set_capture_error(format!("could not run confidant: {e:#}"));
+            }
+        }
+    }
+
+    /// The operator confirmed the preview: run the real write, then report the
+    /// resulting commit. The scratch is removed on every path.
+    fn capture_confirm(&mut self) {
+        let Some(capture) = self.capture.take() else {
+            return;
+        };
+        let scratch_arg = capture
+            .scratch
+            .as_ref()
+            .and_then(|path| path.to_str())
+            .map(str::to_owned);
+        let argv = capture.argv(scratch_arg.as_deref());
+        let kind = capture.kind;
+        // Run first: for a note the CLI reads `--body-file` during the write.
+        let outcome = crate::apply::run_write_step(&self.runner, &argv, false);
+        if let Some(path) = &capture.scratch {
+            edit::remove_scratch(path);
+        }
+        match outcome {
+            Ok(WriteOutcome::Applied { commit, .. }) => {
+                self.reload_after_write();
+                self.alert = Some(AlertState {
+                    title: "Capture Committed".to_owned(),
+                    code: Some("committed".to_owned()),
+                    message: format!(
+                        "{} committed for {} (commit {})",
+                        kind.noun(),
+                        capture.person_id,
+                        short_commit(&commit)
+                    ),
+                    fix: None,
+                    blocking: false,
+                    raw: None,
+                });
+            }
+            Ok(WriteOutcome::Idempotent { .. }) => {
+                self.reload_after_write();
+                self.alert = Some(AlertState {
+                    title: "No Changes".to_owned(),
+                    code: Some("unchanged".to_owned()),
+                    message: format!(
+                        "{} for {} was unchanged; nothing was committed",
+                        kind.noun(),
+                        capture.person_id
+                    ),
+                    fix: None,
+                    blocking: false,
+                    raw: None,
+                });
+            }
+            Ok(WriteOutcome::CheckBlocked { report }) => {
+                self.check.report = Some(report);
+                self.check.selected = 0;
+                self.active_view = ActiveView::Check;
+            }
+            Ok(WriteOutcome::CliError { code, message, fix }) => {
+                self.alert = Some(AlertState {
+                    title: format!("Capture Failed ({code})"),
+                    code: Some(code),
+                    message,
+                    fix,
+                    blocking: false,
+                    raw: None,
+                });
+            }
+            Ok(WriteOutcome::DryRun { .. }) => {
+                self.alert = Some(AlertState {
+                    title: "Capture Failed".to_owned(),
+                    code: Some("unexpected_outcome".to_owned()),
+                    message: "the write command returned a dry-run preview; nothing was confirmed"
+                        .to_owned(),
+                    fix: None,
+                    blocking: false,
+                    raw: None,
+                });
+            }
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+            }
+        }
+    }
+
+    /// Cancel the pending capture: remove the note scratch, write nothing.
+    fn cancel_capture(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            if let Some(path) = &capture.scratch {
+                edit::remove_scratch(path);
+            }
+        }
+    }
+
+    /// Show an inline capture error; the modal stays open so the field can be
+    /// fixed. Nothing is written.
+    fn set_capture_error(&mut self, message: String) {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.error = Some(message);
         }
     }
 
@@ -1729,7 +2062,8 @@ impl<R: Runner> App<R> {
             "Help",
             vec![
                 "1 People & Search    2 Review Queue    3 Check".to_owned(),
-                "/ filter people   s unified search   j/k move   Enter open".to_owned(),
+                "/ filter people   f unified search   j/k move   Enter open".to_owned(),
+                "s session   t touch   n note (pre-fills the selected person)".to_owned(),
                 "Tab / Shift-Tab cycle the views inside a workspace".to_owned(),
                 "o Proposals   i Inbox   c Conflicts".to_owned(),
                 "d Doctor   p Scope   ? Help   r refresh   q quit".to_owned(),
@@ -1738,8 +2072,9 @@ impl<R: Runner> App<R> {
                 String::new(),
                 "People shows the roster and a live context pane; nudges come from".to_owned(),
                 "the cached check report. With operator mode on, the roster and".to_owned(),
-                "context include no-ai people and notes, each badged. Quick capture".to_owned(),
-                "and the merged review queue arrive in phase 3.".to_owned(),
+                "context include no-ai people and notes, each badged. The Review".to_owned(),
+                "Queue tab is badged with its pending count. Quick capture (s/t/n)".to_owned(),
+                "previews with --dry-run and writes only on an explicit y.".to_owned(),
             ],
         ));
     }
@@ -1761,8 +2096,21 @@ impl<R: Runner> App<R> {
                 self.switch_workspace(Workspace::Check);
                 true
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('f') => {
                 self.switch_to(ActiveView::Search);
+                true
+            }
+            // #556 phase 3: quick capture, pre-filled with the selected person.
+            KeyCode::Char('s') => {
+                self.begin_capture(CaptureKind::Session);
+                true
+            }
+            KeyCode::Char('t') => {
+                self.begin_capture(CaptureKind::Touch);
+                true
+            }
+            KeyCode::Char('n') => {
+                self.begin_capture(CaptureKind::Note);
                 true
             }
             KeyCode::Char('d') => {
@@ -2228,6 +2576,13 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        // The capture modal owns every key while it is open (same rule as the
+        // edit confirm): it sits above the workspace shortcuts so a pending
+        // capture cannot be escaped.
+        if self.handle_capture_key(key) {
+            return;
+        }
+
         // Proposals owns its open-flow keys and calls the workspace
         // shortcuts itself (so its phase modals keep swallowing input).
         if self.active_view == ActiveView::Proposals {
@@ -2530,6 +2885,37 @@ impl<R: Runner> App<R> {
                 );
             }
         }
+        if let Some(capture) = &self.capture {
+            match capture.phase {
+                CapturePhase::Editing => capture_view::render_form(capture, frame, area),
+                CapturePhase::Preview => {
+                    let scratch = capture.scratch.as_ref().and_then(|path| path.to_str());
+                    let command = format!("confidant {}", capture.argv(scratch).join(" "));
+                    diff::render(
+                        &DiffState::new(
+                            format!("{} {}", capture.kind.title(), capture.person_id),
+                            command,
+                            capture.preview.clone(),
+                        ),
+                        frame,
+                        area,
+                    );
+                    confirm::render(
+                        &ConfirmState::new(
+                            format!("Confirm: {}", capture.kind.title()),
+                            vec![
+                                format!("Writes one commit for {}.", capture.person_id),
+                                String::new(),
+                                "Type y to write to the vault; any other key cancels the capture."
+                                    .to_owned(),
+                            ],
+                        ),
+                        frame,
+                        area,
+                    );
+                }
+            }
+        }
     }
 
     /// Two-line borderless header: workspace pills + action pills, then the
@@ -2552,7 +2938,10 @@ impl<R: Runner> App<R> {
             if !spans.is_empty() {
                 spans.push(Span::raw(" "));
             }
-            spans.push(theme::tab_pill(workspace.label(), workspace == active));
+            spans.push(theme::tab_pill(
+                &self.workspace_label(workspace),
+                workspace == active,
+            ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), nav[0]);
 
@@ -2595,7 +2984,7 @@ impl<R: Runner> App<R> {
             ("1-3", "ws"),
             ("Tab", "view"),
             ("/", "filter"),
-            ("s", "search"),
+            ("f", "search"),
             ("j/k", "move"),
             ("Enter", "open"),
             ("r", "refresh"),
@@ -2858,6 +3247,15 @@ fn no_vault_alert() -> AlertState {
 /// The first 8 characters of a commit SHA, or the whole (short) value.
 fn short_commit(commit: &str) -> &str {
     &commit[..8.min(commit.len())]
+}
+
+/// One line for an inline capture error from a CLI error envelope, folding in
+/// the fix hint when the CLI offered one.
+fn cli_error_message(code: &str, message: &str, fix: Option<&str>) -> String {
+    match fix.filter(|fix| !fix.is_empty()) {
+        Some(fix) => format!("{code}: {message} — {fix}"),
+        None => format!("{code}: {message}"),
+    }
 }
 
 /// Pure check behind [`App::qmd_available`], taking its inputs explicitly

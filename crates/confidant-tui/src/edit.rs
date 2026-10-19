@@ -213,10 +213,16 @@ pub fn remove_scratch(path: &Path) {
     }
 }
 
-/// Best-effort overwrite-with-zeros of every stale `edit.md` under
-/// `.confidant/conflicts/*/` left by a crashed run, then prune the emptied
-/// dirs. The CLI's own resolve scratch (`ours.md`, `theirs.md`, `merged.md`)
-/// is left alone.
+/// The plaintext scratch file names the TUI stages under
+/// `.confidant/conflicts/<id>/`: the `e` edit buffer (`#556` phase 2) and the
+/// captured note body (`#556` phase 3). The CLI's own resolve scratch
+/// (`ours.md`, `theirs.md`, `merged.md`) is deliberately absent.
+const TUI_SCRATCH_FILES: &[&str] = &["edit.md", "capture.md"];
+
+/// Best-effort overwrite-with-zeros of every stale TUI scratch file
+/// ([`TUI_SCRATCH_FILES`]) under `.confidant/conflicts/*/` left by a crashed
+/// run, then prune the emptied dirs. The CLI's own resolve scratch (`ours.md`,
+/// `theirs.md`, `merged.md`) is left alone.
 ///
 /// This is not secure deletion (see [`remove_scratch`]); it is a hygiene
 /// sweep. Best-effort: every file is attempted and errors are swallowed so a
@@ -227,9 +233,11 @@ pub fn sweep_stale_edit_scratch(vault_root: &Path) {
         return;
     };
     for entry in entries.flatten() {
-        let edit = entry.path().join("edit.md");
-        if edit.is_file() {
-            remove_scratch(&edit);
+        for file in TUI_SCRATCH_FILES {
+            let path = entry.path().join(file);
+            if path.is_file() {
+                remove_scratch(&path);
+            }
         }
     }
 }
@@ -317,20 +325,24 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_only_the_tui_edit_scratch() {
+    fn sweep_removes_only_the_tui_scratch() {
         let root = test_temp_dir("tui-edit-sweep");
         let edit = scratch_path(&root, "p-01ABC").unwrap();
         write_scratch(&edit, "plaintext").unwrap();
+        // A captured note body in the same dir is the TUI's scratch too.
+        let capture = crate::capture::scratch_path(&root, "p-01ABC").unwrap();
+        write_scratch(&capture, "captured plaintext").unwrap();
         // A CLI resolve scratch file in the same dir must survive.
         let cli_scratch = edit.parent().unwrap().join("ours.md");
         std::fs::write(&cli_scratch, "cli scratch").unwrap();
-        // Another record's stale edit scratch, plus its own CLI scratch.
+        // Another record's stale edit scratch.
         let other = scratch_path(&root, "p-01DEF").unwrap();
         write_scratch(&other, "more plaintext").unwrap();
 
         sweep_stale_edit_scratch(&root);
 
         assert!(!edit.exists(), "stale edit scratch removed");
+        assert!(!capture.exists(), "stale capture scratch removed");
         assert!(!other.exists(), "every record's edit scratch removed");
         assert_eq!(
             std::fs::read_to_string(&cli_scratch).unwrap(),

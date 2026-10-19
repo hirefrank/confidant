@@ -10,6 +10,7 @@ use std::io::{self, Write};
 
 pub mod app;
 pub mod apply;
+pub mod capture;
 pub mod contract;
 pub mod edit;
 pub mod proposals;
