@@ -229,6 +229,18 @@ impl LedgerFacts {
         any
     }
 
+    /// `id`'s merge group members for `on`, sorted.
+    pub(crate) fn group_members(&self, id: &RecordId, on: NaiveDate) -> Vec<RecordId> {
+        self.ensure_members(on);
+        let groups = self.merge.groups();
+        let root = self.merge.canonical_on(id, on);
+        groups
+            .get(&on)
+            .and_then(|map| map.get(&root))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The latest open-verb date on or before `on` for `id`'s group.
     pub(crate) fn last_open_on(&self, id: &RecordId, on: NaiveDate) -> Option<NaiveDate> {
         self.ensure_members(on);

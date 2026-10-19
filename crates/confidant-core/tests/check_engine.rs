@@ -8145,6 +8145,14 @@ default_fix = "Tag the session paid, pps (pay-per-session), or comp (complimenta
 [messages."E_COACHING_EXT_NOTES"]
 default = "session on {date} for {person} has no notes"
 default_fix = "Add a note for that person and date, or note:n-<ULID> on the session line"
+
+[messages."E_COACHING_EXT_GAP"]
+none = "paid client {id} has no session logged"
+none_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
+remaining = "paid client {id} has remaining sessions and no session on or after {start} (last was {d})"
+remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
+no_remaining = "paid client {id} has no session on or after {start} (last was {d})"
+no_remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
 "#;
 
 /// The fixture pack's balance rule. `max_open_n` is overridable so the
@@ -8185,6 +8193,7 @@ finding_codes = [
   "E_COACHING_EXT_TAGS",
   "W_COACHING_EXT_UNTAGGED",
   "E_COACHING_EXT_NOTES",
+  "E_COACHING_EXT_GAP",
 ]
 
 [pack]
@@ -8212,6 +8221,18 @@ default = "error"
 [[checks.severity]]
 key = "coaching-ext.session_notes"
 default = "warning"
+
+[[checks.severity]]
+key = "coaching-ext.paid_session_gap"
+default = "warning"
+
+[[checks.int]]
+key = "coaching-ext.paid_session_gap_days"
+default = 45
+
+[[checks.int]]
+key = "coaching-ext.pps_lookback_days"
+default = 180
 "#,
     );
     text.push_str(rules);
@@ -8280,6 +8301,32 @@ fn assert_balance_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
 
 fn assert_session_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
     assert_ext_parity(setup, rules, SESSION_CODE_MAP)
+}
+
+/// The fixture's `activity-gap` rule. It counts through the
+/// `ledger-balance` rule that owns `sessions_remaining`.
+const COACHING_EXT_GAP_RULE: &str = r#"[[rules]]
+id = "gap"
+kind = "activity-gap"
+code = "E_COACHING_EXT_GAP"
+severity_key = "coaching-ext.paid_session_gap"
+activity_verb = "session"
+start_verb = "open"
+gap_days_key = "coaching-ext.paid_session_gap_days"
+lookback_days_key = "coaching-ext.pps_lookback_days"
+balance_metric = "sessions_remaining"
+"#;
+
+/// Fixture code → compiled code for the gap rule.
+const GAP_CODE_MAP: &[(&str, &str)] = &[("E_COACHING_EXT_GAP", "E_PAID_SESSION_GAP")];
+
+fn assert_gap_parity(setup: impl Fn(&Path)) -> (Value, Value) {
+    assert_ext_parity(setup, &coaching_ext_gap_rules(), GAP_CODE_MAP)
+}
+
+/// The balance rule (for the counter) plus the gap rule.
+fn coaching_ext_gap_rules() -> String {
+    format!("{COACHING_EXT_BALANCE_RULE}\n{COACHING_EXT_GAP_RULE}")
 }
 
 /// The fixture report for one vault, without a compiled comparison.
@@ -9305,5 +9352,405 @@ fn session_checks_loader_refuses_missing_message_variant() {
     );
     install_coaching_ext(dir.path(), &manifest);
     coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    assert_pack_invalid(dir.path());
+}
+
+// ---------------------------------------------------------------------------
+// Declarative coaching kinds (#448 activity-gap)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gap_rule_inclusive_window_edge() {
+    // Last session exactly `gap_days` (45) before as_of is inside the
+    // window; one day older is a gap.
+    let (_, edge) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/08.cfd",
+            &format!(
+                "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
+                 2026-08-24 session {ADA} 60m paid\n"
+            ),
+        );
+    });
+    assert!(
+        ext_findings(&edge, "E_COACHING_EXT_GAP").is_empty(),
+        "{edge:?}"
+    );
+
+    let (compiled, older) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/08.cfd",
+            &format!(
+                "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
+                 2026-08-23 session {ADA} 60m paid\n"
+            ),
+        );
+    });
+    let found = ext_findings(&older, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{older:?}");
+    assert_eq!(found[0]["id"], ADA);
+    assert_eq!(
+        normalized_codes(&compiled, GAP_CODE_MAP),
+        vec!["E_PAID_SESSION_GAP"]
+    );
+    assert_eq!(found[0]["message"], format!(
+        "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-23)"
+    ));
+}
+
+#[test]
+fn gap_rule_never_started_none_variant() {
+    // Remaining units but no session ever, and the open is older than the
+    // window: the `none` variant.
+    let (_, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/01.cfd",
+            &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+        );
+    });
+    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!("paid client {ADA} has no session logged")
+    );
+    assert_eq!(
+        found[0]["fix"],
+        "Log a session, close the package, or widen coaching.paid_session_gap_days (currently 45)"
+    );
+}
+
+#[test]
+fn gap_rule_remaining_variant() {
+    let (_, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/01.cfd",
+            &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+        );
+        write(
+            root,
+            "ledger/2026/06.cfd",
+            &format!("2026-06-01 session {ADA} 60m paid\n"),
+        );
+    });
+    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!(
+            "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-06-01)"
+        )
+    );
+}
+
+#[test]
+fn gap_rule_no_remaining_variant() {
+    // A pps session inside the lookback keeps a spent package a paid
+    // client; the last session is old, so the `no_remaining` variant.
+    let (compiled, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/05.cfd",
+            &format!(
+                "2026-05-01 open {ADA} package {PKG} 1 sessions\n\
+                 2026-05-02 session {ADA} 60m paid\n"
+            ),
+        );
+        write(
+            root,
+            "ledger/2026/08.cfd",
+            &format!("2026-08-01 session {ADA} 60m pps\n"),
+        );
+    });
+    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!("paid client {ADA} has no session on or after 2026-08-24 (last was 2026-08-01)")
+    );
+    assert_eq!(
+        normalized_codes(&compiled, GAP_CODE_MAP),
+        vec!["E_PAID_SESSION_GAP"]
+    );
+}
+
+#[test]
+fn gap_rule_spent_package_no_finding_when_expected() {
+    // Spent package, no pps, last session old: not a paid client, no gap.
+    let (_, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/01.cfd",
+            &format!(
+                "2026-01-01 open {ADA} package {PKG} 1 sessions\n\
+                 2026-01-01 session {ADA} 60m paid\n"
+            ),
+        );
+    });
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_GAP").is_empty(),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn gap_rule_open_resets_clock() {
+    // A recent opener resets the clock even when the last session is old,
+    // and the opener adds units (remaining 6).
+    let (_, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/01.cfd",
+            &format!(
+                "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
+                 2026-01-02 session {ADA} 60m paid\n"
+            ),
+        );
+        write(
+            root,
+            "ledger/2026/10.cfd",
+            &format!("2026-10-01 open {ADA} package {PKG2} 1 sessions\n"),
+        );
+    });
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_GAP").is_empty(),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn gap_rule_pps_lookback_window() {
+    // Inside the 180-day lookback a pps session keeps the spent package a
+    // paid client; outside it does not.
+    let (_, inside) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/05.cfd",
+            &format!(
+                "2026-05-01 open {ADA} package {PKG} 1 sessions\n\
+                 2026-05-02 session {ADA} 60m paid\n"
+            ),
+        );
+        write(
+            root,
+            "ledger/2026/08.cfd",
+            &format!("2026-08-01 session {ADA} 60m pps\n"),
+        );
+    });
+    assert_eq!(
+        ext_findings(&inside, "E_COACHING_EXT_GAP").len(),
+        1,
+        "{inside:?}"
+    );
+
+    let (_, outside) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/03.cfd",
+            &format!(
+                "2026-03-01 open {ADA} package {PKG} 1 sessions\n\
+                 2026-03-01 session {ADA} 60m paid\n\
+                 2026-03-02 session {ADA} 60m pps\n"
+            ),
+        );
+    });
+    assert!(
+        ext_findings(&outside, "E_COACHING_EXT_GAP").is_empty(),
+        "{outside:?}"
+    );
+}
+
+#[test]
+fn gap_rule_severity_off() {
+    let compiled_checks = DEFAULT_CHECKS.replace(
+        "coaching.paid_session_gap = \"warning\"",
+        "coaching.paid_session_gap = \"off\"",
+    );
+    let ext_checks = "coaching-ext.paid_session_gap = \"off\"\n";
+    let (compiled, declarative) = assert_ext_parity_with(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/01.cfd",
+                &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+            );
+        },
+        &coaching_ext_gap_rules(),
+        GAP_CODE_MAP,
+        &compiled_checks,
+        ext_checks,
+    );
+    assert!(
+        normalized_codes(&compiled, GAP_CODE_MAP).is_empty(),
+        "{compiled:?}"
+    );
+    assert!(
+        normalized_codes(&declarative, GAP_CODE_MAP).is_empty(),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn gap_rule_days_override_from_config() {
+    let compiled_checks = DEFAULT_CHECKS.replace(
+        "coaching.paid_session_gap_days = 45",
+        "coaching.paid_session_gap_days = 10",
+    );
+    let ext_checks = "coaching-ext.paid_session_gap_days = 10\n";
+    let (compiled, declarative) = assert_ext_parity_with(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/09.cfd",
+                &format!(
+                    "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-09-18 session {ADA} 60m paid\n"
+                ),
+            );
+        },
+        &coaching_ext_gap_rules(),
+        GAP_CODE_MAP,
+        &compiled_checks,
+        ext_checks,
+    );
+    assert_eq!(
+        normalized_codes(&compiled, GAP_CODE_MAP),
+        vec!["E_PAID_SESSION_GAP"]
+    );
+    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    assert_eq!(
+        found[0]["message"],
+        format!(
+            "paid client {ADA} has remaining sessions and no session on or after 2026-09-28 (last was 2026-09-18)"
+        )
+    );
+    assert!(
+        found[0]["fix"].as_str().unwrap().contains("currently 10"),
+        "{declarative:?}"
+    );
+}
+
+#[test]
+fn gap_rule_matches_golden_paid_session_gap() {
+    let declarative = ext_report(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-08-23");
+            write(
+                root,
+                "ledger/2026/08.cfd",
+                &format!(
+                    "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-08-23 session {ADA} 60m paid note:{NOTE}\n"
+                ),
+            );
+        },
+        &coaching_ext_gap_rules(),
+        "",
+    );
+    let golden: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("paid_session_gap.json")).unwrap())
+            .unwrap();
+    let golden_finding = &golden["findings"].as_array().unwrap()[0];
+    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    assert_eq!(found.len(), 1, "{declarative:?}");
+    for field in ["severity", "message", "fix", "id"] {
+        assert_eq!(
+            golden_finding[field], found[0][field],
+            "field {field} differs from the golden"
+        );
+    }
+}
+
+#[test]
+fn gap_rule_matches_compiled_coaching() {
+    let (compiled, declarative) = assert_gap_parity(|root| {
+        person(root, ADA, "Ada Example");
+        person(root, BEA, "Bea Demo");
+        person(root, CAM, "Cam Example");
+        // Ada: never started (none). Bea: remaining. Cam: spent but pps.
+        write(
+            root,
+            "ledger/2026/01.cfd",
+            &format!(
+                "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
+                 2026-01-01 open {BEA} package {PKG} 6 sessions\n"
+            ),
+        );
+        write(
+            root,
+            "ledger/2026/05.cfd",
+            &format!(
+                "2026-05-01 open {CAM} package {PKG2} 1 sessions\n\
+                 2026-05-02 session {CAM} 60m paid\n"
+            ),
+        );
+        write(
+            root,
+            "ledger/2026/06.cfd",
+            &format!("2026-06-01 session {BEA} 60m paid\n"),
+        );
+        write(
+            root,
+            "ledger/2026/08.cfd",
+            &format!("2026-08-01 session {CAM} 60m pps\n"),
+        );
+    });
+    assert_eq!(
+        normalized_findings(&compiled, GAP_CODE_MAP),
+        normalized_findings(&declarative, GAP_CODE_MAP)
+    );
+    assert_eq!(normalized_findings(&compiled, GAP_CODE_MAP).len(), 3);
+}
+
+#[test]
+fn gap_rule_loader_refuses_undeclared_int_key() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &format!(
+            "{}\n{}",
+            COACHING_EXT_BALANCE_RULE,
+            COACHING_EXT_GAP_RULE.replace(
+                "gap_days_key = \"coaching-ext.paid_session_gap_days\"",
+                "gap_days_key = \"coaching-ext.ghost_days\""
+            )
+        ),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn gap_rule_loader_refuses_undeclared_balance_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &format!(
+            "{}\n{}",
+            COACHING_EXT_BALANCE_RULE,
+            COACHING_EXT_GAP_RULE.replace(
+                "balance_metric = \"sessions_remaining\"",
+                "balance_metric = \"ghost_metric\""
+            )
+        ),
+    );
     assert_pack_invalid(dir.path());
 }

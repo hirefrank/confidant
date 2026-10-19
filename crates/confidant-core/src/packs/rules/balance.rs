@@ -100,7 +100,7 @@ impl<'a> BalanceParams<'a> {
         })
     }
 
-    fn fold_params(&self) -> FoldParams<'_> {
+    pub(crate) fn fold_params(&self) -> FoldParams<'_> {
         FoldParams {
             open_verb: self.open_verb,
             consume_verb: self.consume_verb,
