@@ -3,8 +3,8 @@
 
 Runs `confidant check --json` and reports the two capture-gap findings
 (architecture §9b item 3):
-  - E_SESSION_WITHOUT_NOTES: a session with no linked or same-day note
-  - E_PAID_SESSION_GAP: a paid client with no session in the gap window
+  - E_COACHING_SESSION_WITHOUT_NOTES: a session with no linked or same-day note
+  - E_COACHING_PAID_SESSION_GAP: a paid client with no session in the gap window
 
 Writes nothing. Exit 0 normally; --fail-on-gaps exits 1 when gaps exist
 (useful for scheduled runs).
@@ -24,11 +24,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bin"))
 import common  # noqa: E402  # pylint: disable=wrong-import-position
 
-GAP_CODES = ("E_SESSION_WITHOUT_NOTES", "E_PAID_SESSION_GAP")
+GAP_CODES = ("E_COACHING_SESSION_WITHOUT_NOTES", "E_COACHING_PAID_SESSION_GAP")
 
 DESCRIPTIONS = {
-    "E_SESSION_WITHOUT_NOTES": "sessions with no linked or same-day note",
-    "E_PAID_SESSION_GAP": "paid clients with no session in the gap window",
+    "E_COACHING_SESSION_WITHOUT_NOTES": "sessions with no linked or same-day note",
+    "E_COACHING_PAID_SESSION_GAP": "paid clients with no session in the gap window",
 }
 
 

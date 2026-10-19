@@ -4,7 +4,8 @@ vault  unknown   scope  not resolved yet   doctor  not run
 │  FAILED   spec 0.1  •  records 1  •  ledger 2  •  errors 0  •  warnings 1  •  findings 1         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
-│ › [warning] E_SESSION_WITHOUT_NOTES p-01M3TC5H00MPJ ││ code      E_SESSION_WITHOUT_NOTES         │
+│ › [warning] E_COACHING_SESSION_WITHOUT_NOTES p-01M3 ││ code                                      │
+│                                                     ││ E_COACHING_SESSION_WITHOUT_NOTES          │
 │                                                     ││ severity  [warning]                       │
 │                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
 │                                                     ││ location  ledger/2026/10.cfd:2            │
@@ -13,7 +14,6 @@ vault  unknown   scope  not resolved yet   doctor  not run
 │                                                     ││ fix       Add a note for that person and  │
 │                                                     ││ date, or note:n-<ULID> on the session     │
 │                                                     ││ line                                      │
-│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

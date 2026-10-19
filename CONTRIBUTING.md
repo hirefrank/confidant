@@ -78,7 +78,7 @@ Classify by code, never by message text. `internal_error` is reserved.
 ## Tests
 
 Parser tests cover round-trips and malformed lines. Check tests cover golden
-JSON for `E_BALANCE_MISMATCH`, `E_SESSION_WITHOUT_NOTES`, and
-`E_PAID_SESSION_GAP`, plus gap-rule edges (inclusive window, never-started,
+JSON for `E_COACHING_BALANCE_MISMATCH`, `E_COACHING_SESSION_WITHOUT_NOTES`, and
+`E_COACHING_PAID_SESSION_GAP`, plus gap-rule edges (inclusive window, never-started,
 spent package, rule `off`). The demo vault must stay clean under
 `confidant check`.

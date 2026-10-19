@@ -26,8 +26,8 @@ use crate::views::context::{self, ContextViewState};
 pub const ATTENTION_CODES: &[&str] = &[
     "W_DATE_UPCOMING",
     "W_CADENCE_OVERDUE",
-    "E_SESSION_WITHOUT_NOTES",
-    "E_PAID_SESSION_GAP",
+    "E_COACHING_SESSION_WITHOUT_NOTES",
+    "E_COACHING_PAID_SESSION_GAP",
 ];
 
 /// One `Needs Attention` row.

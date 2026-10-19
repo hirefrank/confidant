@@ -4,6 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
+use common::install_shipped_coaching;
+
 use serde_json::Value;
 
 fn bin() -> &'static str {
@@ -23,6 +27,7 @@ const PKG: &str = "pkg-01J9Z3K4QF0000000000000000";
 fn make_vault() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
+    install_shipped_coaching(root);
     std::fs::write(
         root.join("confidant.toml"),
         // Spec 3 (B10): the plaintext-write fixture declares the opt-out,
@@ -2391,13 +2396,13 @@ fn mcp_unknown_tool_is_error_content() {
 // fail_on: Error explicitly). These tests lock that in.
 
 /// A vault whose only findings are warnings: one untagged session fires
-/// `W_SESSION_UNTAGGED` (warning) plus the no-notes warning. No errors
+/// `W_COACHING_SESSION_UNTAGGED` (warning) plus the no-notes warning. No errors
 /// can arise from this fixture at any as-of: every rule that can fire
 /// here is warning-severity.
 fn make_warning_vault() -> tempfile::TempDir {
     let dir = make_vault();
     let root = dir.path();
-    // Untagged session: consumes a slot, fires W_SESSION_UNTAGGED.
+    // Untagged session: consumes a slot, fires W_COACHING_SESSION_UNTAGGED.
     let ledger = root.join("ledger/2026/10.cfd");
     let mut text = std::fs::read_to_string(&ledger).unwrap();
     text.push_str(&format!("2026-10-02 session {PERSON} 60m\n"));
@@ -2434,7 +2439,7 @@ fn warnings_never_block_writes() {
     assert_eq!(v["summary"]["errors"], 0);
     assert!(v["summary"]["warnings"].as_u64().unwrap() >= 1);
     assert!(
-        finding_codes(&v).contains(&"W_SESSION_UNTAGGED".to_string()),
+        finding_codes(&v).contains(&"W_COACHING_SESSION_UNTAGGED".to_string()),
         "{v}"
     );
     // The write succeeds despite the warnings: exactly one new commit.
@@ -2489,13 +2494,13 @@ fn check_as_of_makes_gap_warnings_deterministic() {
     // 7 days after the last activity: inside the 45-day gap window.
     let (_, early) = check_report(root, &["--as-of", "2026-10-08"]);
     assert!(
-        !finding_codes(&early).contains(&"E_PAID_SESSION_GAP".to_string()),
+        !finding_codes(&early).contains(&"E_COACHING_PAID_SESSION_GAP".to_string()),
         "{early}"
     );
     // 61 days after: outside the window, the gap warning fires.
     let (_, late) = check_report(root, &["--as-of", "2026-12-01"]);
     assert!(
-        finding_codes(&late).contains(&"E_PAID_SESSION_GAP".to_string()),
+        finding_codes(&late).contains(&"E_COACHING_PAID_SESSION_GAP".to_string()),
         "{late}"
     );
     // Same as-of twice: identical findings (deterministic).

@@ -3,14 +3,15 @@
 //!
 //! `context`'s `packs` map carries one entry per enabled pack. This module
 //! builds the entry for a pack that opts in with a manifest `[context]`
-//! table naming `view = "ledger-sessions"`, and it is also the one builder
-//! the compiled `coaching@0.1` pack delegates to — so a compiled pack and a
-//! declarative pack reach the same arithmetic and the same JSON shape.
+//! table naming `view = "ledger-sessions"`. The shipped external
+//! `coaching@0.1` pack is that pack (#449), so its view and any other
+//! `[context]` pack reach the same arithmetic and the same JSON shape.
 //!
 //! # The contract
 //!
-//! The view is exactly the three ledger-derived keys the compiled coaching
-//! pack served before #594:
+//! The view is exactly the three ledger-derived keys the old compiled
+//! coaching pack served before #594, and the external pack serves them
+//! after #449:
 //!
 //! ```json
 //! {
@@ -45,8 +46,8 @@
 //! provides.
 //!
 //! The arithmetic is not re-implemented here: [`crate::packs::rules::ledger`]
-//! owns the fold and the merge-aware queries, and the compiled pack's fold
-//! already produces a [`LedgerFacts`] this builder consumes.
+//! owns the fold and the merge-aware queries, and a `[context]` pack's
+//! `ledger-balance` rule produces the [`LedgerFacts`] this builder consumes.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -66,11 +67,10 @@ pub const LEDGER_SESSIONS_VIEW: &str = "ledger-sessions";
 
 /// The pack whose row is the legacy top-level `coaching` alias (ADR-7).
 ///
-/// The compiled `coaching@0.1` today and the external pack of the same base
-/// name after the #449 cutover: one pack identity at different origins and
-/// versions (PD14 reserves `coaching`). Any other `[context]` pack serves its
-/// own `packs` entry only — a different pack that happens to serve the same
-/// `ledger-sessions` kind must **not** populate the legacy alias.
+/// The shipped external `coaching@0.1` pack since #449 owns the alias. Any
+/// other `[context]` pack serves its own `packs` entry only — a different
+/// pack that happens to serve the same `ledger-sessions` kind must **not**
+/// populate the legacy alias.
 pub(crate) const LEGACY_COACHING_PACK: &str = "coaching";
 
 /// Whether a pack's `name@version` is the coaching pack that owns the legacy

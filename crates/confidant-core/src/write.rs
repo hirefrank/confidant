@@ -833,7 +833,7 @@ mod tests {
         // A minimal check-clean vault (same shape as the inbox e2e fixture).
         std::fs::write(
             root.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",
+            "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",
         )
         .expect("write config");
         let person = root.join("people/p-01M3TC5H00MPJG000000000000");
@@ -843,12 +843,6 @@ mod tests {
             "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: \"Test Person\"\n---\n\nFake.\n",
         )
         .expect("profile");
-        std::fs::create_dir_all(root.join("ledger/2026")).expect("ledger dir");
-        std::fs::write(
-            root.join("ledger/2026/10.cfd"),
-            "2026-10-01 open p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n",
-        )
-        .expect("ledger");
         git(root, &["init", "-q", "-b", "main"], false).expect("init");
         git(root, &["config", "user.name", "Test"], false).expect("name");
         git(

@@ -6,6 +6,9 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
+use common::install_shipped_coaching;
 use confidant_core::{
     queue_items, read_inbox_item, run_inbox, verify_inbox_trust, DecryptExistingFn, DecryptFn,
     DomainError, InboxOptions, QueueItem,
@@ -58,6 +61,7 @@ impl Repo {
         git(root, &["init", "-b", "main", "-q"]);
         git(root, &["config", "user.name", "Test"]);
         git(root, &["config", "user.email", "test@example.com"]);
+        install_shipped_coaching(root);
         std::fs::write(
             root.join("confidant.toml"),
             "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"inbox-e2e-vault\"\n",

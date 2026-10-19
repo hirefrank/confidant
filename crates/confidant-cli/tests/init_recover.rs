@@ -1057,7 +1057,7 @@ fn bootstrap_with_packs_writes_the_list() {
         "init",
         "--create",
         "--packs",
-        "coaching@0.1",
+        "personal@0.1",
         "--no-input",
         "--json",
     ]);
@@ -1068,7 +1068,7 @@ fn bootstrap_with_packs_writes_the_list() {
         String::from_utf8_lossy(&out.stderr)
     );
     let cfg = std::fs::read_to_string(b.vault.join("confidant.toml")).unwrap();
-    assert!(cfg.contains("packs = [\"coaching@0.1\"]"), "{cfg}");
+    assert!(cfg.contains("packs = [\"personal@0.1\"]"), "{cfg}");
 }
 
 /// #551: a `personal@…` listing is a known, no-op pack, so `init --packs`

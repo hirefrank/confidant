@@ -644,20 +644,20 @@ grammar = "non-empty-string"
     }
 
     #[test]
-    fn compiled_names_are_skipped_without_lockfile() {
+    fn builtin_names_are_skipped_without_lockfile() {
         let dir = tempdir().unwrap();
         let compiled = PackRegistry::compiled();
         let load = load_external_packs(
             dir.path(),
             "0.1",
-            &["coaching@0.1".to_owned()],
+            &["personal@0.2".to_owned()],
             &compiled,
             &[],
         );
         assert!(load.packs.is_empty());
         assert!(
             load.problems.is_empty(),
-            "compiled names must resolve silently: {:?}",
+            "built-in names must resolve silently: {:?}",
             load.problems
         );
     }

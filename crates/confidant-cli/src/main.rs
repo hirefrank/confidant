@@ -1647,13 +1647,14 @@ fn vault_root_required<'a>(root: Option<&'a Path>, what: &str) -> anyhow::Result
     })
 }
 
-/// Refuse to install a reserved (`coaching`, `personal`) or compiled pack
-/// (PD14). Both can only come from the binary.
+/// Refuse to install a reserved (`personal`) or built-in pack (PD14).
+/// Both can only come from the binary. `coaching` is an ordinary external
+/// pack since #449.
 fn refuse_uninstallable(name: &str, version: &str) -> anyhow::Result<()> {
     use confidant_core::packs::manifest::is_reserved_pack_name;
     if is_reserved_pack_name(name) {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "pack name '{name}' is reserved for a compiled pack"
+            "pack name '{name}' is reserved for a built-in pack"
         )))
         .with_fix("Choose a different pack name"));
     }
@@ -9037,7 +9038,7 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         Some(name) => {
             if name.is_empty() {
                 return Err(anyhow::Error::new(DomainError::usage(
-                    "empty pack name: use `help pack:<name>`, e.g. `help pack:coaching@0.1`",
+                    "empty pack name: use `help pack:<name>`, e.g. `help pack:personal@0.2`",
                 )));
             }
             if !names.iter().any(|n| n == name) {
@@ -9104,8 +9105,8 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
 ///
 /// The decision is the pack's `origin` in the vault's registry (#535),
 /// never whether embedded text with the same base name exists: an external
-/// pack whose base name matches a compiled pack (`coaching@0.9` next to the
-/// compiled `coaching@0.1`) is still external and must be labelled.
+/// pack whose base name matches a built-in pack (`personal@0.9` next to the
+/// built-in `personal@0.2`) is still external and must be labelled.
 ///
 /// The lockfile is the authority for source and rev; a loaded external
 /// pack always has a pin (the loader fails closed without one). A `dir`

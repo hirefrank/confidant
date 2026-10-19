@@ -131,17 +131,17 @@ fn contract_goldens_deserialize_and_render_in_check_view() {
     for (file, expected_code, snapshot_file) in [
         (
             "balance_mismatch.json",
-            "E_BALANCE_MISMATCH",
+            "E_COACHING_BALANCE_MISMATCH",
             "check_balance_mismatch.snap",
         ),
         (
             "paid_session_gap.json",
-            "E_PAID_SESSION_GAP",
+            "E_COACHING_PAID_SESSION_GAP",
             "check_paid_session_gap.snap",
         ),
         (
             "session_without_notes.json",
-            "E_SESSION_WITHOUT_NOTES",
+            "E_COACHING_SESSION_WITHOUT_NOTES",
             "check_session_without_notes.snap",
         ),
     ] {
@@ -691,7 +691,7 @@ fn check_blocked_json() -> &'static str {
         "schema_version": "1", "ok": false, "vault": "/fake/vault", "spec": "0.1",
         "summary": {"errors": 1, "warnings": 0, "records": 0, "ledger_entries": 0},
         "findings": [
-            {"code": "E_NEGATIVE_BALANCE", "severity": "error",
+            {"code": "E_COACHING_NEGATIVE_BALANCE", "severity": "error",
              "id": "p-01M3TC5H00MPJG000000000000",
              "message": "sessions_remaining is -1",
              "fix": "Add an open/renewal or remove extra session lines"}
@@ -862,7 +862,10 @@ fn proposals_check_blocked_renders_report_and_marks_nothing_done() {
     let report = app.check.report.as_ref().expect("check report shown");
     assert!(!report.ok);
     let rendered = render_to_string(&app);
-    assert!(rendered.contains("E_NEGATIVE_BALANCE"), "{rendered}");
+    assert!(
+        rendered.contains("E_COACHING_NEGATIVE_BALANCE"),
+        "{rendered}"
+    );
 
     // The step is not marked done.
     let progress = read_progress(&manifest_path);
@@ -1000,7 +1003,7 @@ fn proposals_live_apply_against_temp_git_vault() {
     git(&["commit", "-qm", "init"]);
 
     // The committed export fixture uses a `paid` session for a brand-new
-    // person, which trips E_NEGATIVE_BALANCE on import (correct domain
+    // person, which trips E_COACHING_NEGATIVE_BALANCE on import (correct domain
     // behavior, exercised by the CheckBlocked test). The live happy-path
     // test uses a `comp` session so the full apply succeeds.
     let export_src =

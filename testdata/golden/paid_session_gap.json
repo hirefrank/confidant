@@ -1,7 +1,7 @@
 {
   "findings": [
     {
-      "code": "E_PAID_SESSION_GAP",
+      "code": "E_COACHING_PAID_SESSION_GAP",
       "fix": "Log a session, close the package, or widen coaching.paid_session_gap_days (currently 45)",
       "id": "p-01M3TC5H00MPJG000000000000",
       "message": "paid client p-01M3TC5H00MPJG000000000000 has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-23)",
