@@ -4,6 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
+use common::install_shipped_coaching;
+
 use serde_json::Value;
 
 fn bin() -> &'static str {
@@ -18,27 +22,6 @@ const PERSON: &str = "p-01J9Z3K4QF0000000000000000";
 const PERSON2: &str = "p-01J9Z3K4QF0000000000000002";
 const IXN: &str = "i-01J9Z3K4QF0000000000000003";
 const PKG: &str = "pkg-01J9Z3K4QF0000000000000000";
-
-/// Vendor the shipped external `coaching@0.1` pack and pin its hash.
-fn install_shipped_coaching(root: &Path) {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
-    let dst = root.join("packs/coaching@0.1");
-    std::fs::create_dir_all(&dst).unwrap();
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
-        .unwrap()
-        .hash;
-    std::fs::write(
-        root.join("confidant.lock"),
-        format!(
-            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
-        ),
-    )
-    .unwrap();
-}
 
 /// A minimal git-backed vault with one person holding a 4-session package.
 fn make_vault() -> tempfile::TempDir {

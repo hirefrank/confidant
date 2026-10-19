@@ -287,15 +287,28 @@ impl Pack for ManifestPack {
         }
         let params = self.context_params.as_ref()?;
         let state = state.as_any().downcast_ref::<ManifestState>()?;
-        // #594: the ledger-balance rule already owns these verbs (PD1); fold
-        // with the same shared arithmetic the check path uses, then build
-        // the core ledger-sessions view.
-        let folded = ledger::fold(vault, &state.merge, params.fold_params());
+        // #594/#449: reuse the facts `fold` already cached for the single
+        // `ledger-balance` rule the loader required, rather than refolding.
+        // The fallback keeps the view correct if a future state lacks it.
+        let cached = self
+            .manifest
+            .rules
+            .iter()
+            .find(|rule| rule.kind == crate::packs::rules::balance::KIND)
+            .and_then(|rule| state.ledger.get(&rule.id));
+        let folded;
+        let facts = match cached {
+            Some(facts) => facts,
+            None => {
+                folded = ledger::fold(vault, &state.merge, params.fold_params());
+                &folded.facts
+            }
+        };
         crate::context::ledger_sessions::build_ledger_sessions_view(
             vault,
             canonical,
             as_of,
-            &folded.facts,
+            facts,
             &params.consume_verb,
             params.recent_limit,
         )

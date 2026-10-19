@@ -33,7 +33,7 @@ pub(crate) fn billing_tag_count(entry: &LedgerEntry, tags: &[&str]) -> usize {
 }
 
 /// Format hundredths of an hour as a decimal with two places (`150` ->
-/// `"1.50"`). Three decimal places, no floating point: the balance rule
+/// `"1.50"`). Two decimal places, no floating point: the balance rule
 /// renders an `icf_hours` mismatch from it.
 pub(crate) fn format_hundredths(n: i64) -> String {
     let sign = if n < 0 { "-" } else { "" };

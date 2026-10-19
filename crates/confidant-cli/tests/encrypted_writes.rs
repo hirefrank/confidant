@@ -5,6 +5,10 @@
 //! is fake.
 
 use std::path::{Path, PathBuf};
+
+mod common;
+
+use common::install_shipped_coaching;
 use std::process::{Command, Output};
 
 /// Generate a throwaway age identity, returning the Bech32 secret.
@@ -41,27 +45,6 @@ fn git(vault: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(st.success(), "git {args:?} failed");
-}
-
-/// Vendor the shipped external `coaching@0.1` pack and pin its hash (#449).
-fn install_shipped_coaching(vault: &Path) {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
-    let dst = vault.join("packs/coaching@0.1");
-    std::fs::create_dir_all(&dst).unwrap();
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
-        .unwrap()
-        .hash;
-    std::fs::write(
-        vault.join("confidant.lock"),
-        format!(
-            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
-        ),
-    )
-    .unwrap();
 }
 
 /// Test harness: temp HOME + vault + throwaway device key. The vault

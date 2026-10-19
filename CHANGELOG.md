@@ -29,6 +29,44 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   for a built-in name is still `E_PACK_INVALID`, listed or not (#504 R8).
 
 ### Changed
+- **Breaking: the coaching pack is external (#449).** `coaching@0.1` is no
+  longer compiled into the binary. A vault that lists `coaching@0.1`
+  without vendoring it now fails `check` with `E_PACK_UNKNOWN` and blocks
+  writes until the pack is installed. Install it from this repo:
+
+  ```sh
+  confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
+  confidant check --json --no-input
+  ```
+
+  The pack keeps the `coaching.*` `[checks]` keys and the
+  `packs["coaching@0.1"]` `context` key; only the finding codes change
+  (below). A vault that does not list coaching but still has `open`/`session`
+  ledger lines now gets `E_UNKNOWN_VERB` (an error) instead of the old
+  non-blocking `W_PACK_ORPHAN` warning.
+
+  Coaching finding-code renames (old → new):
+
+  | Old | New |
+  |---|---|
+  | `E_BALANCE_MISMATCH` | `E_COACHING_BALANCE_MISMATCH` |
+  | `E_MISSING_DURATION` | `E_COACHING_MISSING_DURATION` |
+  | `E_PAID_SESSION_GAP` | `E_COACHING_PAID_SESSION_GAP` |
+  | `E_PARSE` (coaching balance parse) | `E_COACHING_PARSE` |
+  | `E_NEGATIVE_BALANCE` | `E_COACHING_NEGATIVE_BALANCE` |
+  | `E_OPEN_MALFORMED` | `E_COACHING_OPEN_MALFORMED` |
+  | `E_INVALID_ID` (package id) | `E_COACHING_INVALID_ID` |
+  | `E_WRONG_ID_TYPE` (package id) | `E_COACHING_WRONG_ID_TYPE` |
+  | `E_SESSION_TAGS` | `E_COACHING_SESSION_TAGS` |
+  | `W_SESSION_UNTAGGED` | `W_COACHING_SESSION_UNTAGGED` |
+  | `E_SESSION_WITHOUT_NOTES` | `E_COACHING_SESSION_WITHOUT_NOTES` |
+  | `E_INVALID_ID` (`note:` id) | `E_COACHING_NOTE_INVALID_ID` |
+  | `E_WRONG_ID_TYPE` (`note:` id) | `E_COACHING_NOTE_WRONG_TYPE` |
+  | `E_UNKNOWN_RECORD` (coaching `note:`) | `E_COACHING_UNKNOWN_RECORD` |
+
+  The old coaching-only names are retired: never emitted, never reused.
+  An external consumer that branches on them (`capture-gap-summary` did)
+  must move to the new names; that is the known cost of the rename.
 - `context --json`'s `packs["personal@0.2"]` entry gains `cadence_never:
   true` when, and only when, the person's declared `cadence` is the literal
   `never`. It tells a deliberate never-nudge apart from no cadence set (both
@@ -54,6 +92,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   does not count.
 
 ### Removed
+- `crates/confidant-core/src/packs/coaching.rs`, its registry entries and
+  the in-crate vendored `coaching` manifest/skill copies. `coaching@0.1`
+  ships from `packs/coaching/` as an external pack (#449).
 - Compiled `personal@0.1` (`crates/confidant-core/src/packs/personal.rs`),
   its frozen manifest (`pack-manifests/personal-0.1/`) and its human 0.1
   contract (`packs/personal/0.1.md`). `personal@0.2` is the only personal

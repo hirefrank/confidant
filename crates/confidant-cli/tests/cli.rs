@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
+use common::install_shipped_coaching;
 use confidant_core::packs::dir::read_pack_dir;
 
 fn bin() -> &'static str {
@@ -24,28 +27,6 @@ fn copy_tree(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
-}
-
-/// Vendor the shipped external `coaching@0.1` pack into `root` and pin
-/// its hash, as `pack add --from-dir` does (#449).
-#[cfg(unix)]
-fn install_shipped_coaching(root: &Path) -> String {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
-    let dst = root.join("packs/coaching@0.1");
-    std::fs::create_dir_all(&dst).unwrap();
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = read_pack_dir(&dst).unwrap().hash;
-    std::fs::write(
-        root.join("confidant.lock"),
-        format!(
-            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
-        ),
-    )
-    .unwrap();
-    hash
 }
 
 #[test]

@@ -74,6 +74,15 @@ present, for CI users who want the stricter gate.
 | `E_KEY_COMMITMENT` | error | | A reader refused to use a key epoch because the verified key manifest carries no commitment for it. Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
 | `E_ENVELOPE` | error | | An encrypted record envelope is structurally invalid keylessly: duplicate header keys, unknown header keys, a missing required header, an `enc` other than `xchacha20poly1305`, a nonce that is not 24 bytes, bad base64, or a `key_id` that is not `<client_id>/e<epoch>` (shape only). Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
 
+**Retired, not emitted, never reused.** The #449 cutover moved the
+coaching findings to the pack-own `E_COACHING_*` / `W_COACHING_*` family.
+These codes remain reserved built-in names (no pack may claim them) and
+must never be reused for a new meaning; nothing emits them in 0.1:
+
+`E_BALANCE_MISMATCH`, `E_NEGATIVE_BALANCE`, `E_OPEN_MALFORMED`,
+`E_MISSING_DURATION`, `E_SESSION_TAGS`, `W_SESSION_UNTAGGED`,
+`E_SESSION_WITHOUT_NOTES`, `E_PAID_SESSION_GAP`.
+
 `confidant find` uses the same codes and the section 12 allowlist: only
 cleared records and ledger lines are searchable. A note, interaction, or
 deal is cleared only when every ledger line that names it is allowed

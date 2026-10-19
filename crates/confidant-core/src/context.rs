@@ -231,8 +231,8 @@ pub fn build_context(
     // Legacy contract field: the coaching pack's entry, deserialized back.
     // The alias is tied to the coaching pack (ADR-7), not to the view kind:
     // any `[context]` pack can serve the `ledger-sessions` kind, but only the
-    // pack named `coaching` (the compiled `coaching@0.1` today, the external
-    // `coaching` pack after the #449 cutover) owns the legacy alias. Another
+    // pack named `coaching` (the shipped external `coaching@0.1`) owns the
+    // legacy alias. Another
     // pack serving the same kind must leave `coaching` null. The key is never
     // hardcoded: the version comes from the enabled pack, matched by base
     // name. `to_value` in the builder produced it from this struct, so this

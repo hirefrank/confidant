@@ -144,12 +144,19 @@ balance metrics, and check rules. Packs are the extension mechanism: the
 core stays generic, and a pack turns Confidant into a tool for a specific
 domain.
 
-- **`coaching@0.1`** ships as an external pack (vendored into the vault
-  with `confidant pack add`). It adds sessions, packages, ICF hours, balance
-  assertions, and gap rules (a session with no notes; a paid client with no
-  session inside a configurable window). If you run a coaching practice, this
-  pack covers what you'd otherwise need a coaching CRM for — without the
-  sales-pipeline baggage.
+- **`coaching@0.1`** ships as an external pack in this repo. A vault that
+  lists it must vendor it; otherwise `check` fails with `E_PACK_UNKNOWN` and
+  writes are blocked. Install it with:
+
+  ```sh
+  confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
+  ```
+
+  It adds sessions, packages, ICF hours, balance assertions, and gap rules
+  (a session with no notes; a paid client with no session inside a
+  configurable window). If you run a coaching practice, this pack covers what
+  you'd otherwise need a coaching CRM for — without the sales-pipeline
+  baggage.
 - **`personal@0.2`** is the built-in personal pack. It is **implicit**:
   every vault has it, whether or not `packs` lists it (`packs = []` still
   enables it), and a `personal@…` entry is a no-op. It adds birthdays,

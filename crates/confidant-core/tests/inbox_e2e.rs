@@ -6,6 +6,9 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
+use common::install_shipped_coaching;
 use confidant_core::{
     queue_items, read_inbox_item, run_inbox, verify_inbox_trust, DecryptExistingFn, DecryptFn,
     DomainError, InboxOptions, QueueItem,
@@ -44,27 +47,6 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
         .expect("git failed to run");
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Vendor the shipped external `coaching@0.1` pack and pin its hash.
-fn install_shipped_coaching(root: &Path) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
-    let dst = root.join("packs/coaching@0.1");
-    std::fs::create_dir_all(&dst).unwrap();
-    for entry in std::fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = confidant_core::packs::dir::read_pack_dir(&dst)
-        .unwrap()
-        .hash;
-    std::fs::write(
-        root.join("confidant.lock"),
-        format!(
-            "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
-        ),
-    )
-    .unwrap();
 }
 
 struct Repo {

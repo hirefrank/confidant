@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::{install_shipped_coaching, shipped_coaching_dir};
 use confidant_core::check::{CheckOptions, FindingCode, Severity};
 use confidant_core::{check_vault, load_vault};
 use serde_json::{json, Value};
@@ -46,34 +49,6 @@ fn note(root: &Path, id: &str, person: &str, date: &str) {
         &format!("people/{person}/notes/{id}.md"),
         &format!("---\nid: {id}\ntype: note\nperson: {person}\ndate: {date}\n---\n\nFake note.\n"),
     );
-}
-
-/// The shipped external coaching pack directory (#449).
-fn shipped_coaching_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching")
-}
-
-/// Vendor the shipped `coaching@0.1` pack into `root/packs/coaching@0.1`
-/// and pin its canonical hash, exactly as `pack add` does. Returns the
-/// hash.
-fn install_shipped_coaching(root: &Path) -> String {
-    let src = shipped_coaching_dir();
-    let dst = root.join("packs/coaching@0.1");
-    fs::create_dir_all(&dst).unwrap();
-    for entry in fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        assert!(
-            entry.file_type().unwrap().is_file(),
-            "shipped pack dir must be flat: {}",
-            entry.path().display()
-        );
-        fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = read_pack_dir(&dst)
-        .expect("shipped coaching pack dir must read")
-        .hash;
-    install_lockfile(root, "coaching", "0.1", &hash);
-    hash
 }
 
 /// A vault enabling the shipped `coaching@0.1` external pack. Every test
