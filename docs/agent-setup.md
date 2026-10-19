@@ -200,9 +200,10 @@ environment **before** `confidant init`. Generate them once, store them in
 the host's secret store, and re-inject them into each session:
 
 ```sh
-# Device identity (age). Without -o, age-keygen writes the secret key to
-# stdout and the public key/comment to stderr.
-export CONFIDANT_DEVICE_KEY="$(age-keygen 2>/dev/null)"
+# Device identity (age). age-keygen also prints comment/public-key text
+# (`# created:`, `# public key:`); only the AGE-SECRET-KEY-1... line is the
+# identity. The CLI rejects a value that combines lines.
+export CONFIDANT_DEVICE_KEY="$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')"
 
 # Operator Ed25519 seed: 32 random bytes, 64 hex chars.
 export CONFIDANT_OPERATOR_KEY="$(openssl rand -hex 32)"
@@ -213,13 +214,15 @@ confidant init --create --no-input --phrase-out "$HOME/confidant-recovery.txt"
 
 `age-keygen` (from `age`) or an equivalent existing tool is fine for the
 device identity; `openssl rand -hex 32` is just a CSPRNG for the operator
-seed. The variables are **per-process secrets**, not a file fallback: the
-CLI reads them from the environment of the process that runs it, so export
-them in that process or have the host's secret store inject them. Do not
-write them into the vault, a git file, or a shell history line. Generate
-each value **once** and retrieve the stored copy later; re-running
-`age-keygen` or `openssl rand` would create a new identity that no longer
-opens the vault.
+seed. Keep only the `AGE-SECRET-KEY-1…` line: `age-keygen` prints
+`# created:` and `# public key:` lines too, and a value that contains them
+is not an identity and is rejected. The variables are **per-process
+secrets**, not a file fallback: the CLI reads them from the environment of
+the process that runs it, so export them in that process or have the host's
+secret store inject them. Do not write them into the vault, a git file, or
+a shell history line. Generate each value **once** and retrieve the stored
+copy later; re-running `age-keygen` or `openssl rand` would create a new
+identity that no longer opens the vault.
 
 On a desktop the keychain is still the default; an env var wins over it
 for the same key and holds the value the keychain would (an age identity
