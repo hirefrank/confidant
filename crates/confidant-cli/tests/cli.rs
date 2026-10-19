@@ -2042,6 +2042,13 @@ fn pack_update_shows_diff_then_applies_a_version_change() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    // Exactly one commit for the apply: the delete+rewrite change list must
+    // not double-commit (regression guard for #602).
+    let after: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(after, before.trim().parse::<u32>().unwrap() + 1);
     assert!(vault
         .path()
         .join("packs/example-pack@0.2/SKILL.md")
@@ -2139,6 +2146,88 @@ fn pack_update_same_version_replaces_content() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #602: re-applying the identical source must be a clean no-op, the same
+/// as `pack add --yes` on an already-installed pack. Before the fix this was
+/// an `internal_error` with an empty git message and exit 1.
+#[cfg(unix)]
+#[test]
+fn pack_update_noop_is_unchanged_with_exit_0() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(pack.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["unchanged"], true, "{v}");
+    assert!(
+        v["error"].is_null(),
+        "a no-op update must not be an error: {v}"
+    );
+
+    // No new commit, and nothing staged: the tree is untouched.
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #587: a non-regular entry inside the vendored tree must still be refused
+/// before any delete is queued. The no-op short-circuit (#602) is reached
+/// only after the tree is proven diffable, so it cannot let this through.
+#[cfg(unix)]
+#[test]
+fn pack_update_refuses_a_symlinked_file_in_the_vendored_tree() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    std::os::unix::fs::symlink(&victim, vendored.join("evil.txt")).unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "plant symlink",
+        ],
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(pack.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot diff"), "{stderr}");
+    // No partial apply: the pack's own files survive, the symlink target is
+    // untouched, and nothing was committed.
+    assert!(vendored.join("SKILL.md").is_file(), "SKILL.md was deleted");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
 #[cfg(unix)]

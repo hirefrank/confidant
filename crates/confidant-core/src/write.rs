@@ -154,12 +154,24 @@ pub fn git(root: &Path, args: &[&str], no_input: bool) -> anyhow::Result<String>
         .output()
         .map_err(|e| anyhow::anyhow!("git is not available: {e}"))?;
     if !out.status.success() {
+        // Some git failures print their reason on stdout, not stderr —
+        // `git commit` with nothing to commit is the canonical example. Never
+        // surface an empty message: fall back to stdout, then the exit
+        // status (#602).
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!(
-            "git {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        ));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            stdout.trim()
+        } else {
+            detail
+        };
+        let message = if detail.is_empty() {
+            format!("git {} failed ({})", args.join(" "), out.status)
+        } else {
+            format!("git {} failed: {}", args.join(" "), detail)
+        };
+        return Err(anyhow::anyhow!(message));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -607,5 +619,37 @@ mod tests {
         assert!(crate::record::has_conflict_markers(">>>>>>> branch\n"));
         assert!(!crate::record::has_conflict_markers("a\n=======\nb\n"));
         assert!(!crate::record::has_conflict_markers("plain text\n"));
+    }
+
+    #[test]
+    fn git_failure_message_is_never_empty() {
+        // #602: `git commit` with nothing staged writes its reason
+        // ("nothing to commit") to stdout, not stderr. The surfaced error
+        // must still be non-empty and keep git's own detail. Pass an
+        // identity inline so a runner without a global one still fails on
+        // the staged-set, not on the missing author.
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q"], false).expect("init");
+        let err = git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "nothing",
+            ],
+            false,
+        )
+        .expect_err("commit with nothing staged must fail");
+        let message = format!("{err:#}");
+        assert!(!message.trim().is_empty(), "empty git error message");
+        assert!(message.contains("failed"), "unhelpful message: {message:?}");
+        assert!(
+            message.contains("nothing to commit") || message.contains("no changes"),
+            "message lost git's own detail: {message:?}"
+        );
     }
 }
