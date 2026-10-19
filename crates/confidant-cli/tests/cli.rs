@@ -11,6 +11,21 @@ fn demo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
 }
 
+/// Recursively copy a directory tree (the demo vault) into `dst`.
+#[cfg(unix)]
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
 #[test]
 fn check_demo_json_ok() {
     let out = Command::new(bin())
@@ -1814,6 +1829,83 @@ fn pack_add_refuses_reserved_names() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("reserved"), "{stderr}");
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+}
+
+/// #449: the on-disk parity fixture installs as a real external pack on a
+/// copy of the demo vault, and the vault then checks clean. The copy swaps
+/// compiled coaching for the fixture: both claim `open`/`session`, so a
+/// vault enabling both is `E_PACK_CONFLICT`. The compiled `coaching.*`
+/// check keys are dropped; the fixture's manifest defaults are the same
+/// values, and the core parity tests cover the `coaching-ext.*` keys.
+#[cfg(unix)]
+#[test]
+fn declarative_coaching_cli_install_then_check_clean() {
+    let vault = tempfile::tempdir().unwrap();
+    copy_tree(&demo(), vault.path());
+    let config = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    let config: String = config
+        .replace("packs = [\"coaching@0.1\"]", "packs = []")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("coaching."))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    std::fs::write(vault.path().join("confidant.toml"), config).unwrap();
+    git(vault.path(), &["init", "-q"]);
+    git(vault.path(), &["config", "user.name", "Test"]);
+    git(
+        vault.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+
+    let pack_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/coaching-ext");
+    let out = pack_add(&pack_dir, vault.path(), true);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `pack verify` accepts the vendored fixture...
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    // ...and `check` is clean under the external pack.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["findings"], serde_json::json!([]), "{v}");
 }
 
 #[cfg(unix)]

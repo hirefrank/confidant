@@ -1058,3 +1058,46 @@ external path and is `E_PACK_INVALID` (a built-in is never installed
 from the vault: any lockfile pin or vendored directory for its name
 fails closed). The v2 schema itself — rule ids, kinds, declared codes,
 message tables — applies in full.
+
+### 13.8. Removing the compiled coaching path (#449)
+
+*Switch criteria, not a behaviour change. This note needs Frank's
+explicit OK (AGENTS.md rule 7); it describes a future removal, and
+nothing here removes the compiled path.*
+
+`coaching@0.1` stays compiled into the binary and `coaching` stays a
+reserved name (§13.3) until an external pack can match it. The #449 parity
+fixture (`testdata/packs/coaching-ext/`) is a v2 pack using `note-ref`
+(#458), `ledger-balance` (#446), `session-checks` (#447) and
+`activity-gap` (#448). The core tests run it and the compiled pack over
+the same vaults — the three golden vaults and `examples/demo-vault` — and
+compare findings after the documented code and `[checks]`-key
+normalisation; the CLI test installs it as a real external pack and checks
+the vault clean. That proves the **check** behaviour is reproducible.
+
+What the declarative path does **not** reproduce yet, which is why the
+compiled path stays (R1 in #504):
+
+- `context_view`: compiled coaching serves the per-person
+  `sessions_remaining` / `icf_hours` / `recent_sessions` view. External
+  packs are check-only (PD16); core owns no declarative replacement.
+- `private_context_fields` (the PII fields compiled coaching marks for
+  the privacy filter): the declarative loader has no equivalent hook.
+- `validate_verb_args` / `verb_kind` (the `open` and `session` argument
+  grammars): these stay compiled behind the pack trait; the rule kinds
+  read ledger metadata but do not validate newly written lines.
+
+Criteria for removing the compiled path, all in one change:
+
+1. Core owns `context_view`, the PII-field handling and verb-argument
+   validation, or has a declared, reviewed home for them.
+2. The parity and CLI tests are green against the *final* `coaching` pack
+   (the fixture is renamed to `coaching` only then).
+3. `coaching` is dropped from `RESERVED_PACK_NAMES`, the hard-coded
+   `COACHING_PACK` in `config.rs` / `check.rs` is removed, and compiled
+   `coaching.rs` is deleted in the same change.
+
+Until all three hold, the reservation and the compiled path stay (PD14:
+compiled wins on equal `name@version`). **Removing the compiled coaching
+path needs Frank's explicit OK**; #504 records the sequencing and the
+core-ownership scope, and #449 tracks the switch.
