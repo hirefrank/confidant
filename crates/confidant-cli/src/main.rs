@@ -7292,8 +7292,16 @@ fn cmd_help_pack(cli: &Cli, vault: Option<&Path>, topic: &str) -> anyhow::Result
         }
         None => {
             debug_assert_eq!(topic, "pack");
+            // #523: build the combined text from the vault's registry, so a
+            // loaded external pack contributes its vendored skill text and
+            // the #445 external label instead of failing as "no SKILL.md".
+            // A compiled-only vault resolves every pack to its embedded copy
+            // and gets no label, so its output is byte for byte unchanged.
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let text = embedded::combined_pack_skill(&refs).ok_or_else(|| {
+            let text = embedded::combined_pack_skill(v.pack_registry(), &refs, |name| {
+                external_pack_label(root, name)
+            })
+            .ok_or_else(|| {
                 anyhow::Error::new(DomainError::internal("an enabled pack ships no SKILL.md"))
             })?;
             (names.clone(), text)

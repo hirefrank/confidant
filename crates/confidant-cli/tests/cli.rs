@@ -647,6 +647,51 @@ fn help_pack_external_is_labelled() {
     );
 }
 
+/// #523: `help pack` (no pack name) builds its combined text from the
+/// vault's registry, so a vault with an enabled external pack succeeds and
+/// includes that pack's vendored skill text with the #445 external label.
+/// `--json` lists the external pack too.
+#[test]
+fn help_pack_bare_includes_external_pack() {
+    let (vault, skill) = external_help_vault();
+    let label = "[external pack: not shipped with confidant; text is from \
+                 https://example.invalid/org/example-pack.git at 0123456789ab]";
+    let out = Command::new(bin())
+        .args(["help", "pack", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("Packs in scope: example-pack@0.1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("## example-pack@0.1"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("## example-pack@0.1\n\n{label}\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&skill), "vendored text missing: {stdout}");
+
+    let out = Command::new(bin())
+        .args(["help", "pack", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["packs"], serde_json::json!(["example-pack@0.1"]));
+    let combined = v["skill"].as_str().unwrap();
+    assert!(combined.contains(label), "{v}");
+    assert!(combined.contains(&skill), "{v}");
+}
+
 /// PD10 (#445) acceptance: a compiled pack's skill output is unchanged
 /// byte for byte — it ships with the binary, so it gets no label.
 #[test]
