@@ -170,6 +170,17 @@ pub trait Pack: Send + Sync {
     fn skill_text(&self) -> Option<&'static str> {
         None
     }
+    /// Where this pack's bytes came from (#535, PD7): a compiled-in pack
+    /// ships with the binary; an external pack's bytes were read from the
+    /// vault. The label that marks agent-facing external-pack text keys on
+    /// this, never on the pack's name — an external pack whose base name
+    /// matches a compiled pack (`coaching@0.9` next to `coaching@0.1`) is
+    /// still external. Defaults to compiled-in; the runtime declarative
+    /// pack ([`manifest_pack::ManifestPack`]) carries the manifest's
+    /// origin.
+    fn origin(&self) -> manifest::PackOrigin {
+        manifest::PackOrigin::CompiledIn
+    }
     /// Per-person state for `context`, if this pack has any. Defaults to
     /// `None`. `canonical` is the merge-canonical person ID.
     fn context_view(

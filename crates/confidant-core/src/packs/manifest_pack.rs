@@ -182,6 +182,12 @@ impl Pack for ManifestPack {
         Some(self.skill_text)
     }
 
+    /// The manifest's origin (#535): the built-ins are compiled in, a
+    /// loaded external pack is not.
+    fn origin(&self) -> PackOrigin {
+        self.manifest.origin
+    }
+
     /// The merge view only: the declarative rules (#441) read the same view
     /// a compiled pack's rules use.
     fn fold(
