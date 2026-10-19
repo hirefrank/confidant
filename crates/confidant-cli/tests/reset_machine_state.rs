@@ -371,6 +371,8 @@ fn guard_refuses_live_vault_and_force_allows_without_touching_it() {
     h.write_fixture();
     let vault_before = h.snapshot(&h.vault);
     let vault_arg = h.vault.display().to_string();
+    // Discovery canonicalizes the path (macOS `/var` → `/private/var`).
+    let vault_canonical = std::fs::canonicalize(&h.vault).unwrap();
 
     // Dry-run is safe, but it still refuses: showing a plan that would
     // break a live vault invites the follow-up --yes.
@@ -397,7 +399,11 @@ fn guard_refuses_live_vault_and_force_allows_without_touching_it() {
     let (out, v) = h.reset_json(&["--yes", "--no-input", "--force", "--vault", &vault_arg]);
     assert!(out.status.success(), "{v}");
     assert_eq!(v["changed"], true, "{v}");
-    assert_eq!(v["vault_guard"]["vault"], vault_arg, "{v}");
+    assert_eq!(
+        v["vault_guard"]["vault"],
+        vault_canonical.display().to_string(),
+        "{v}"
+    );
     assert_eq!(v["vault_guard"]["initialized"], true, "{v}");
     assert_eq!(v["vault_guard"]["forced"], true, "{v}");
     assert!(h.keychain_entries().is_empty());
