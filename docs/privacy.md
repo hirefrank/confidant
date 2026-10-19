@@ -25,10 +25,20 @@ mismatch or duplicate on a person's profile unclears that whole person.
 `no-ai` has three values: `true`, `false`, and `notes` (person records
 only). There are no field-level flags — the record is the unit.
 
-- **`no-ai: true`** hides everything about the person (or record) from
-  agents: the all-or-nothing guarantee. Findings about such a person never
-  carry their name or other PII to agents — the warning is suppressed or
-  reduced to a code and a count.
+- **`no-ai: true`** hides the person's (or record's) content from agents —
+  names, bodies, profile fields, notes, and free text — the all-or-nothing
+  guarantee. `context` still serves the person's **derived, ledger-based
+  metadata**: the personal pack's cadence and touch state (`cadence_days`,
+  `cadence_never`, `last_touch`, `days_since_touch`, `overdue`,
+  `recent_touches`, and the declared `snooze_until`), the top-level
+  `touchpoints` list (dates and kinds of the `touch` lines), the coaching
+  pack's `sessions_remaining`, `icf_hours`, and `recent_sessions` (dates,
+  durations, billing tags), and opaque `hmac:` alias hashes. These are
+  structural, not content: a schedule and the dates it ran against, so an
+  agent can still tell that the person is overdue or deliberately set to
+  `never`. `find`, the allowlist, and the search corpus return none of that.
+  Findings about such a person never carry their name or other PII to
+  agents — the warning is suppressed or reduced to a code and a count.
 - **`no-ai: notes`** on a person keeps the person visible — name, birthday,
   cadence and other pack fields reach `find`, `context`, and MCP — while
   their notes and interactions default to hidden. Findings may name the
