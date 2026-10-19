@@ -86,6 +86,8 @@ Narrower loops while iterating:
 cargo test -p confidant-core --test check_engine   # check engine + golden JSON
 cargo test -p confidant-cli --test cli             # CLI contract tests
 UPDATE_GOLDEN=1 cargo test -p confidant-core --test check_engine   # only after an intentional message change
+python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
+                                                    # skill allowlist/verification tests (needs a built CLI; the "skills smoke" job)
 ```
 
 `--locked` means the lockfile must already be right. If you add a
