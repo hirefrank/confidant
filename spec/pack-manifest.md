@@ -1079,18 +1079,39 @@ What the declarative path does **not** reproduce yet, which is why the
 compiled path stays (R1 in #504):
 
 - `context_view`: compiled coaching serves the per-person
-  `sessions_remaining` / `icf_hours` / `recent_sessions` view. External
-  packs are check-only (PD16); core owns no declarative replacement.
-- `private_context_fields` (the PII fields compiled coaching marks for
-  the privacy filter): the declarative loader has no equivalent hook.
-- `validate_verb_args` / `verb_kind` (the `open` and `session` argument
-  grammars): these stay compiled behind the pack trait; the rule kinds
-  read ledger metadata but do not validate newly written lines.
+  `sessions_remaining` / `icf_hours` / `recent_sessions` view
+  (`packs/coaching.rs`). External packs are check-only (PD16); core owns
+  no declarative replacement. This is the **only** genuinely
+  compiled-only behaviour.
+
+An earlier version of this section listed three hooks. Two of them are
+already core-owned or never implemented by compiled coaching, so they
+add no blocker; the reasoning is in the #594 proposal comment
+(<https://github.com/hirefrank/confidant/issues/594#issuecomment-6260159832>):
+
+- `private_context_fields`: a trait default (`packs/mod.rs`) that
+  `ManifestPack` already implements for declarative packs
+  (`packs/manifest_pack.rs`); compiled coaching does not override it.
+  The hook is generic, but the only non-empty list today is core-owned:
+  the built-in personal pack returns `context/personal.rs`'s
+  `PRIVATE_CONTEXT_FIELDS`, selected by `ManifestPack` solely for the
+  compiled-in `personal` manifest. A pack loaded as external gets the
+  empty list, so no external pack can yet declare its own PII fields.
+  Coaching's view carries no PII, so it has nothing to declare.
+- `validate_verb_args` / `verb_kind`: trait defaults that compiled
+  coaching does not override, so neither hook answers for `open` or
+  `session`. The `open` and `session` grammars already live in shared
+  core (`packs/rules/ledger.rs`, `packs/rules/session.rs`), the compiled
+  fold delegates to the same code (`packs/coaching.rs`), and the
+  declarative kinds reproduce it under the #449 parity tests. The one
+  grammar served through the trait is `touch` (core-owned, #510), which
+  is neither verb.
 
 Criteria for removing the compiled path, all in one change:
 
-1. Core owns `context_view`, the PII-field handling and verb-argument
-   validation, or has a declared, reviewed home for them.
+1. Core owns `context_view`, or it has a declared, reviewed home. The
+   PII-field and verb-argument hooks are already core-owned or shared
+   (above), so they add no blocker.
 2. The parity and CLI tests are green against the *final* `coaching` pack
    (the fixture is renamed to `coaching` only then).
 3. `coaching` is dropped from `RESERVED_PACK_NAMES`, the hard-coded
