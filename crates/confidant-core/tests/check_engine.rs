@@ -10240,7 +10240,7 @@ fn declarative_coaching_matches_compiled_coaching_note_ref() {
 fn declarative_coaching_fixture_hash_is_stable() {
     let pack = read_pack_dir(&coaching_ext_fixture_dir()).expect("fixture pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:0b6b25cedc6add72a75ac26a77a085888eed5ed9600a10ca69e8d4891bc131b3",
+        pack.hash, "sha256:1cb2a1f197a555e7c833ddf629f7bbc3224bc041e6f2934225a58d1d74904711",
         "the #449 fixture changed; re-run the fixture parity tests and update \
          this pin in the same commit"
     );
@@ -10275,4 +10275,259 @@ fn declarative_coaching_skill_documents_all_codes_and_keys() {
             "fixture declares [checks] key {key} but its SKILL.md does not document it"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #594: core-owned ledger-sessions context view ([context] opt-in)
+// ---------------------------------------------------------------------------
+
+/// One `context` bundle, serialized, for `person`.
+fn context_bundle(root: &Path, person: &str) -> Value {
+    let vault = load_vault(root).unwrap();
+    let id = confidant_core::RecordId::parse(person).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
+    serde_json::to_value(&bundle).unwrap()
+}
+
+/// The `ledger-sessions` row at `key` in a `context` bundle's `packs` map.
+fn ledger_sessions_row<'a>(bundle: &'a Value, key: &str) -> &'a Value {
+    &bundle["packs"][key]
+}
+
+/// Build the same vault twice — compiled `coaching@0.1` and the `[context]`
+/// fixture — and assert the per-pack view is structurally equal (keys, array
+/// ordering and values). The legacy `coaching` alias belongs to the coaching
+/// pack, so the compiled side populates it and the `coaching-ext` fixture must
+/// not. `setup` writes the records and ledger.
+fn assert_context_view_parity(setup: impl Fn(&Path), person: &str) -> (Value, Value) {
+    let compiled_dir = tempfile::tempdir().unwrap();
+    setup(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    let compiled = context_bundle(compiled_dir.path(), person);
+
+    let declarative_dir = tempfile::tempdir().unwrap();
+    setup(declarative_dir.path());
+    install_coaching_ext_fixture(declarative_dir.path());
+    external_vault_toml(
+        declarative_dir.path(),
+        "\"coaching-ext@0.1\"",
+        FIXTURE_CHECKS,
+    );
+    let declarative = context_bundle(declarative_dir.path(), person);
+
+    assert_eq!(
+        compiled["packs"]["coaching@0.1"], declarative["packs"]["coaching-ext@0.1"],
+        "context view parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
+    );
+    // The alias is tied to the coaching pack: the compiled side serves it, the
+    // fixture (a `[context]` pack under another name) must not.
+    assert_eq!(
+        compiled["coaching"], compiled["packs"]["coaching@0.1"],
+        "the coaching pack must populate the legacy alias: {compiled:?}"
+    );
+    assert!(
+        declarative["coaching"].is_null(),
+        "a non-coaching [context] pack must not populate the legacy alias: {declarative:?}"
+    );
+    (compiled, declarative)
+}
+
+/// #594: the demo vault, compiled coaching vs. the `[context]` fixture.
+#[test]
+fn declarative_coaching_context_view_matches_compiled_demo_vault() {
+    let (compiled, declarative) = assert_context_view_parity(demo_vault_records, ADA);
+    // Ada: 6 opened minus two paid sessions; 60m + 45m = 1.75h.
+    let row = ledger_sessions_row(&compiled, "coaching@0.1");
+    assert_eq!(row["sessions_remaining"], 4, "{compiled:?}");
+    assert_eq!(row["icf_hours"], 1.75, "{compiled:?}");
+    let dates: Vec<&str> = row["recent_sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["date"].as_str().unwrap())
+        .collect();
+    // Newest first, and the declarative side preserves the same order.
+    assert_eq!(dates, vec!["2026-10-08", "2026-10-01"], "{compiled:?}");
+    assert_eq!(
+        declarative["packs"]["coaching-ext@0.1"]["recent_sessions"],
+        compiled["packs"]["coaching@0.1"]["recent_sessions"]
+    );
+}
+
+/// #594: the three golden vaults, compiled coaching vs. the `[context]`
+/// fixture. Each compares the full view, so a mismatch in the balance
+/// arithmetic or the recent-session shape fails.
+#[test]
+fn declarative_coaching_context_view_matches_compiled_goldens() {
+    for setup in [
+        balance_mismatch_vault as fn(&Path),
+        paid_session_gap_vault,
+        session_without_notes_vault,
+    ] {
+        let (compiled, _) = assert_context_view_parity(setup, ADA);
+        assert_eq!(
+            ledger_sessions_row(&compiled, "coaching@0.1")["sessions_remaining"],
+            5,
+            "{compiled:?}"
+        );
+        assert_eq!(
+            ledger_sessions_row(&compiled, "coaching@0.1")["icf_hours"],
+            1.0,
+            "{compiled:?}"
+        );
+    }
+}
+
+/// #594 privacy: the coaching row is byte-identical with and without the
+/// private data (`--exclude-private` maps to `include_private = false`). The
+/// view is ledger metadata only, so neither the §12 gate nor
+/// `private_context_fields` has anything to strip. Checked on the compiled
+/// pack and the `[context]` fixture.
+#[test]
+fn context_ledger_sessions_view_is_identical_without_private() {
+    let compiled_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+
+    let declarative_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(declarative_dir.path());
+    install_coaching_ext_fixture(declarative_dir.path());
+    external_vault_toml(
+        declarative_dir.path(),
+        "\"coaching-ext@0.1\"",
+        FIXTURE_CHECKS,
+    );
+
+    for (root, key) in [
+        (compiled_dir.path(), "coaching@0.1"),
+        (declarative_dir.path(), "coaching-ext@0.1"),
+    ] {
+        let vault = load_vault(root).unwrap();
+        let ada = confidant_core::RecordId::parse(ADA).unwrap();
+        let full = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
+        let stripped = build_context(&vault, &ada, false, &PackScope::All, false).unwrap();
+        assert_eq!(full.coaching, stripped.coaching, "{root:?}");
+        assert_eq!(full.packs[key], stripped.packs[key], "{root:?}");
+        // The JSON bytes of the row are unchanged, so a reader that diffs the
+        // two flags sees no difference at all.
+        assert_eq!(
+            serde_json::to_string(&full.coaching).unwrap(),
+            serde_json::to_string(&stripped.coaching).unwrap()
+        );
+    }
+}
+
+/// #594 privacy: a `no-ai` person's row carries only the ledger keys — the
+/// view reads no record content, so the §12 cleared set does not gate it and
+/// nothing beyond the three metadata keys can appear. Checked on both the
+/// compiled and the declarative side.
+#[test]
+fn context_ledger_sessions_view_no_ai_carries_only_ledger_keys() {
+    let ledger_keys = ["icf_hours", "recent_sessions", "sessions_remaining"];
+
+    let compiled_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    let compiled = context_bundle(compiled_dir.path(), CAM);
+
+    let declarative_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(declarative_dir.path());
+    install_coaching_ext_fixture(declarative_dir.path());
+    external_vault_toml(
+        declarative_dir.path(),
+        "\"coaching-ext@0.1\"",
+        FIXTURE_CHECKS,
+    );
+    let declarative = context_bundle(declarative_dir.path(), CAM);
+
+    for (bundle, key) in [
+        (&compiled, "coaching@0.1"),
+        (&declarative, "coaching-ext@0.1"),
+    ] {
+        let row = ledger_sessions_row(bundle, key).as_object().unwrap();
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ledger_keys, "{bundle:?}");
+        // Cam's own figures: 4 opened, one 45m paid session.
+        assert_eq!(row["sessions_remaining"], 3, "{bundle:?}");
+        assert_eq!(row["icf_hours"], 0.75, "{bundle:?}");
+    }
+    assert_eq!(
+        compiled["packs"]["coaching@0.1"],
+        declarative["packs"]["coaching-ext@0.1"]
+    );
+}
+
+/// #594: the legacy `coaching` alias is tied to the coaching pack, not to the
+/// view kind. The compiled `coaching@0.1` populates it; a `[context]` pack
+/// under another name (the fixture) serves its own row but leaves the alias
+/// null; and a vault with no coaching pack has no alias at all. Fails if the
+/// alias is served by the wrong pack or by any pack at all.
+#[test]
+fn context_legacy_coaching_alias_is_tied_to_the_coaching_pack() {
+    // Compiled coaching: the alias is present and equals its `packs` entry.
+    let compiled_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    let compiled = context_bundle(compiled_dir.path(), ADA);
+    assert!(!compiled["coaching"].is_null(), "{compiled:?}");
+    assert_eq!(compiled["coaching"], compiled["packs"]["coaching@0.1"]);
+
+    // The `coaching-ext` fixture serves the ledger-sessions kind under a
+    // different name: its own row is present, the alias must be null.
+    let fixture_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(fixture_dir.path());
+    install_coaching_ext_fixture(fixture_dir.path());
+    external_vault_toml(fixture_dir.path(), "\"coaching-ext@0.1\"", FIXTURE_CHECKS);
+    let fixture = context_bundle(fixture_dir.path(), ADA);
+    assert!(
+        !fixture["packs"]["coaching-ext@0.1"].is_null(),
+        "{fixture:?}"
+    );
+    assert!(
+        fixture["coaching"].is_null(),
+        "a non-coaching [context] pack must not own the legacy alias: {fixture:?}"
+    );
+
+    // No coaching pack at all (only the implicit built-in personal pack): the
+    // alias is null and there is no coaching `packs` entry.
+    let none_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(none_dir.path());
+    external_vault_toml(none_dir.path(), "", "");
+    let none = context_bundle(none_dir.path(), ADA);
+    assert!(none["coaching"].is_null(), "{none:?}");
+    assert!(none["packs"].get("coaching@0.1").is_none(), "{none:?}");
+}
+
+/// #594: a `[context]` the loader refuses (here an unknown view) fails the
+/// external pack closed as `E_PACK_INVALID`, before anything folds.
+#[test]
+fn external_context_unknown_view_is_pack_invalid() {
+    let manifest = fs::read_to_string(coaching_ext_fixture_dir().join("manifest.toml"))
+        .unwrap()
+        .replace("view = \"ledger-sessions\"", "view = \"nope\"");
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "packs/coaching-ext@0.1/manifest.toml",
+        &manifest,
+    );
+    write(
+        dir.path(),
+        "packs/coaching-ext@0.1/SKILL.md",
+        "# coaching-ext fixture.\n",
+    );
+    // `read_pack_dir` validates the manifest, so the bad `[context]` makes it
+    // fail here too; the pin only has to be well-formed so the lockfile
+    // parses and the failure is the manifest, not the pin.
+    let pack_dir = dir.path().join("packs/coaching-ext@0.1");
+    let hash = read_pack_dir(&pack_dir)
+        .map(|p| p.hash)
+        .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
+    install_lockfile(dir.path(), "coaching-ext", "0.1", &hash);
+    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    let json = report_json(dir.path(), None);
+    let finding = finding_by_code(&json, "E_PACK_INVALID");
+    assert_eq!(finding["file"], "packs/coaching-ext@0.1", "{json:?}");
 }
