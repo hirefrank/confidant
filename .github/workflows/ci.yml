@@ -39,7 +39,55 @@ jobs:
         run: |
           # No `set -e`: any failure below falls through to docs_only=false
           # (fail open = run the full suite) so required checks always report.
-          # Docs patterns mirror the old paths-ignore: **.md, docs/**, LICENSE*.
+          #
+          # Docs patterns mirror the retired paths-ignore: *.md, docs/*,
+          # LICENSE*. A `.md` file is NOT documentation, though, when it sits
+          # in a tree that is hash-pinned or embedded in the binary: editing
+          # one does not update its pin, and a stale pin only surfaces when a
+          # later non-docs change runs the suite. #633 edited
+          # packs/coaching/SKILL.md plus its vendored and embedded copies
+          # without re-pinning examples/demo-vault/confidant.lock; every heavy
+          # step was skipped, the jobs reported SUCCESS, and main went red on
+          # the next non-docs merge. Never classify these trees as docs,
+          # whatever the extension.
+          is_docs() {
+            case "$1" in
+              packs/*|examples/*|testdata/*) return 1 ;;
+              crates/confidant-core/pack-manifests/*|crates/confidant-cli/pack-skills/*|crates/confidant-cli/skills/*) return 1 ;;
+              *.md|docs/*|LICENSE*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          classify() {
+            local f seen=false
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              seen=true
+              is_docs "$f" || { echo false; return; }
+            done
+            [ "$seen" = true ] && echo true || echo false
+          }
+          # Self-test: this job runs on every event (it is never docs-skipped),
+          # so a regression in these patterns fails here instead of silently
+          # re-opening the hole.
+          for f in README.md docs/architecture.md LICENSE; do
+            if ! is_docs "$f"; then
+              echo "docs-detector self-test: $f should count as docs" >&2
+              exit 1
+            fi
+          done
+          for f in packs/coaching/SKILL.md packs/personal/README.md \
+                   examples/demo-vault/confidant.lock examples/README.md \
+                   testdata/golden/check.json \
+                   crates/confidant-core/pack-manifests/personal-0.2/SKILL.md \
+                   crates/confidant-cli/pack-skills/personal/SKILL.md \
+                   crates/confidant-cli/skills/qmd-search/SKILL.md \
+                   Cargo.toml .github/workflows/ci.yml; do
+            if is_docs "$f"; then
+              echo "docs-detector self-test: $f should NOT count as docs" >&2
+              exit 1
+            fi
+          done
           docs_only=false
           range=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -50,13 +98,7 @@ jobs:
           if [ -n "$range" ]; then
             files="$(git diff --name-only "$range" 2>/dev/null || true)"
             if [ -n "$files" ]; then
-              docs_only=true
-              while IFS= read -r f; do
-                case "$f" in
-                  *.md|docs/*|LICENSE*) ;;
-                  *) docs_only=false; break ;;
-                esac
-              done <<< "$files"
+              docs_only="$(printf '%s\n' "$files" | classify)"
             fi
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
