@@ -24,6 +24,13 @@ pub struct RawOutput {
 pub trait Runner {
     fn run(&self, args: &[&str]) -> Result<RawOutput>;
 
+    /// The resolved path of the `confidant` binary this runner invokes, when
+    /// known. Used only for display (the Scope modal and the version-skew
+    /// alert, #591); a runner that does not spawn a process returns `None`.
+    fn bin(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Run an external program (not the `confidant` binary): no `--json`,
     /// `--no-input`, or `--vault` is injected. Used for skill `--cleanup`
     /// scripts, which are plain programs with their own flags.
@@ -92,6 +99,10 @@ impl ProcessRunner {
 }
 
 impl Runner for ProcessRunner {
+    fn bin(&self) -> Option<&std::path::Path> {
+        Some(&self.bin)
+    }
+
     fn run(&self, args: &[&str]) -> Result<RawOutput> {
         let mut cmd = Command::new(&self.bin);
         cmd.stdin(Stdio::null());
@@ -196,6 +207,7 @@ pub struct FakeRunner {
     interactive_calls: RefCell<Vec<Vec<String>>>,
     interactive_program_calls: RefCell<Vec<(String, Vec<String>)>>,
     interactive_status: RefCell<i32>,
+    bin: Option<PathBuf>,
 }
 
 impl FakeRunner {
@@ -220,7 +232,15 @@ impl FakeRunner {
             interactive_calls: RefCell::new(Vec::new()),
             interactive_program_calls: RefCell::new(Vec::new()),
             interactive_status: RefCell::new(0),
+            bin: None,
         }
+    }
+
+    /// Set the fake resolved `confidant` path the app reports in the Scope
+    /// modal and version-skew alerts (#591).
+    pub fn with_bin(mut self, bin: impl Into<PathBuf>) -> Self {
+        self.bin = Some(bin.into());
+        self
     }
 
     /// Construct a `FakeRunner` from a JSON string and exit status.
@@ -343,6 +363,10 @@ fn argv_prefix_matches(pattern: &[String], actual: &[String]) -> bool {
 }
 
 impl Runner for FakeRunner {
+    fn bin(&self) -> Option<&std::path::Path> {
+        self.bin.as_deref()
+    }
+
     fn run(&self, args: &[&str]) -> Result<RawOutput> {
         let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
         self.calls.borrow_mut().push(args.clone());
