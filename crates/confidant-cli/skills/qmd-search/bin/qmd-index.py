@@ -32,8 +32,10 @@ Guardrails:
   `confidant reindex` (it writes the corpus); this script no longer checks
   them itself.
 
-Re-run after pulls/merges/writes. A stale index can only miss results:
-query-time allowlist filtering means staleness can never leak.
+Re-run after pulls/merges/writes. A stale index can only miss (or
+mislabel) results: query-time allowlist filtering runs against the live
+cleared set, so staleness can never return a record or ledger line the
+CLI does not clear (#538).
 """
 import argparse
 import json

@@ -19,7 +19,7 @@ vault/                                  trusted device, encrypted disk
                                         (INDEX_PATH/QMD_CONFIG_DIR env; was ~/.cache/qmd)
 
 agent ── bin/qmd-query ──┬── qmd query --json ──▶ ranked hits
-                        └── confidant find ────▶ allowlist oracle (per hit)
+                        └── confidant allowlist ▶ cleared set (one call per query)
 
 bin/qmd-index ── confidant reindex ──▶ corpus (+ gitignore/perm guardrails)
               └── qmd collection add/embed ──▶ QMD registration
@@ -39,10 +39,10 @@ Two processes, two responsibilities:
   reindexes, so the corpus stays sensitive, gitignored, and on trusted
   devices (§4 threat model).
 - **Query time** (`bin/qmd-query.py`): run QMD, then verify *every* hit
-  through `confidant find` before returning it. A hit is kept only if the
-  same file appears in `find`'s matches with full detail, which happens
-  exactly when the content is cleared under §12. Anything unverifiable is
-  dropped — fail closed.
+  against the live cleared set before returning it, in one
+  `confidant allowlist --json` call per query (#538) — record hits by path
+  (`cleared_files`), ledger hits by `(file, line)` (`cleared_ledger_lines`).
+  Anything unverifiable is dropped — fail closed.
 
 ## Guardrails on where the plaintext lives (Silas's PR review, 2026-10-08)
 
@@ -122,26 +122,45 @@ a QMD quirk — flagged in #37's review; #37 chose to leave it in the CLI.
 With query-time filtering (unchanged):
 - No duplicated logic to drift. The §12 implementation lives in exactly
   one place (the Rust CLI).
-- Index staleness can only *miss* results, never leak: a hit for content
-  that has since become uncleared is dropped by the live check.
+- A hit for content that has since become uncleared is dropped by the live
+  check (#538: records by path, ledger lines by `(file, line)`).
 - `no-ai` is honored by construction: `no-ai` records are uncleared, so
   their hits never verify — and the corpus never contains their content.
 
-The cost is one `find` invocation per distinct hit file (~100–160 ms each
-on a 400-record vault) — acceptable for an interactive search skill, and
-the script dedupes files before verifying. Indexing costs one `reindex`
-run per rebuild (it decrypts and hashes the cleared set internally).
+The cost was one `find` invocation per distinct hit file (~100–160 ms each
+on a 400-record vault) for a text probe. #538 replaced that N+1 with one
+`confidant allowlist --json` call per query: clearance is a path/line
+question, so ask it directly. Indexing costs one `reindex` run per rebuild
+(it decrypts and hashes the cleared set internally).
 
-## Verification method
+## Verification method (#538)
 
-For each distinct hit file, the script extracts a distinctive substring
-(longest clean alphanumeric run, 24–60 chars) from the hit text and runs
-`confidant find "<substring>" --json`. The hit is kept iff some match has
-`path` equal to the hit's vault-relative path *and* a full `excerpt`
-(reduced findings carry no excerpt, so they can't pass). This works
-uniformly for keyword and semantic hits — even a pure vector match
-contains file text, and `find` does substring matching — and for ledger
-lines as well as record files, without any ID parsing in the skill.
+One `confidant allowlist --json [--packs <same scope>]` call per query
+returns the cleared set (`cleared_files`, `cleared_ledger_lines`). Every
+merged hit file is then:
+
+- a **record file**: kept iff its vault-relative path is in `cleared_files`.
+  This replaced the old text probe (longest ≥ 24-character ASCII run, then
+  `confidant find`), which dropped every cleared CJK or short/punctuated
+  note: no run, no probe, hit silently dropped. Clearance is a path
+  question, so nothing is re-searched.
+- a **ledger file** (`ledger/*.cfd`): kept iff the hit's `(file, line)`
+  resolves to a line in `cleared_ledger_lines`. The file mixes people and
+  the corpus can be stale after a `no-ai` change, so the file alone is not
+  enough. `reindex` writes only cleared ledger lines into the corpus, in
+  order, so the corpus file is a subsequence of the vault file; the script
+  aligns the two by exact line text to recover the real vault line number
+  (qmd only knows corpus lines). A line that does not align — edited,
+  dropped, or cleared-never — resolves to nothing and is dropped. The
+  first record ID on the resolved line supplies `id` (display only, the
+  CLI's `find` did the same from its parsed line).
+
+Anything else is dropped and counted in `dropped_uncleared`, never
+returned. Snippets come from the QMD hit (records) or the aligned corpus
+line (ledger). Verification is therefore path/line-based, not text-based:
+rerun `qmd-index` (and `qmd embed`) after vault writes so a stale *index*
+does not mislabel line numbers — an unaligned hit drops rather than
+returning something unverified.
 
 Two real-qmd contract details the scripts handle:
 
@@ -149,7 +168,7 @@ Two real-qmd contract details the scripts handle:
   filesystem paths; `qmd-query` strips the scheme to get the
   vault-relative path (hits that don't resolve inside the corpus are
   ignored). Snippets carry a leading `@@ -a,b @@ (x before, y after)`
-  diff header, which is stripped before probing.
+  diff header, which is stripped.
 - qmd collections match `**/*.md` only, so ledger `.cfd` files would be
   invisible. `confidant reindex` mirrors each `ledger/*.cfd` as a sibling
   `.cfd.md` in the corpus (the CLI owns the mirror; see #37's review flag);

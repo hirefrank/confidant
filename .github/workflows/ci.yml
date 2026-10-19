@@ -129,6 +129,12 @@ jobs:
       - name: proposer smoke
         if: needs.changes.outputs.docs_only != 'true'
         run: python3 crates/confidant-cli/skills/bin/smoke-proposers.py --vault examples/demo-vault --cli target/debug/confidant
+      - name: qmd-query allowlist tests
+        if: needs.changes.outputs.docs_only != 'true'
+        # Drives bin/qmd-query.py with a fake qmd on PATH (no QMD install),
+        # so the §12 verification and the one-allowlist-call contract stay
+        # covered (#538).
+        run: python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
 
   deny:
     name: cargo deny

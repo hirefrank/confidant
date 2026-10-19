@@ -42,9 +42,12 @@ truth for the search allowlist.
   cleared set computed by the CLI (cleared record files and cleared ledger
   lines) into the corpus, so a query-path bug degrades to missing results
   rather than risking a leak — this is #38's index-time exclusion, now
-  enforced inside the CLI. `bin/qmd-query` still drops every hit whose
-  record is not cleared *before* returning anything, by asking
-  `confidant find` — the CLI stays the single source of truth, so
+  enforced inside the CLI. `bin/qmd-query` still verifies every hit against
+  the live cleared set *before* returning anything, in one
+  `confidant allowlist --json` call per query (#538): record hits by path
+  (`cleared_files`), ledger hits by `(file, line)` (`cleared_ledger_lines`) —
+  the corpus mixes people and can be stale after a `no-ai` change, so the
+  file alone is not enough. The CLI stays the single source of truth, so
   allowlist logic can never drift between the index and the CLI. A hit that
   cannot be verified as cleared is dropped (fail closed).
 - **`no-ai` records are never decrypted into the corpus.** The build goes
@@ -72,8 +75,9 @@ qmd embed
 
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the
 collection. Re-run it after pulls, merges, or anything that changes vault
-content — a stale index can only *miss* results (hits are allowlist-filtered
-at query time, so staleness can never leak).
+content — hits are verified against the live cleared set at query time
+(record paths, ledger lines), so a stale index can only miss or mislabel:
+it cannot surface a record the CLI does not clear.
 
 ## Querying
 
@@ -91,7 +95,9 @@ at query time, so staleness can never leak).
 ```
 
 Output is JSON on stdout (mirrors `confidant find --json`, plus `score` and
-`via` per match):
+`via` per match). `id` is derived from the hit's path (records) or from the
+first record ID on the line (ledger), and `excerpt` comes from the QMD hit
+or the corpus line — no per-hit `find` is run:
 
 ```json
 {
@@ -131,10 +137,14 @@ it on stderr.
   covers ledger facts too (hits map back to the real `.cfd` path). `--embed`
   runs `qmd embed` afterwards.
 - `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY`
-  — queries QMD, allowlist-filters every hit through `confidant find`, and
-  emits the JSON above. `--packs` scopes the verification `find` calls, so a
-  scoped agent never sees hits owned by another pack (issue #178). Falls back
-  to plain `find` when QMD/index is absent.
+  — queries QMD, verifies every hit against `confidant allowlist --json`
+  (one call per query; #538), and emits the JSON above. A ledger hit is kept
+  only when its (corpus) line resolves to a cleared vault line: `reindex`
+  writes only cleared ledger lines into the corpus, in order, so
+  `qmd-query` aligns corpus and vault lines by text to report real vault
+  line numbers. `--packs` scopes the allowlist call, so a scoped agent
+  never sees hits owned by another pack (issue #178). Falls back to plain
+  `find` when QMD/index is absent.
 
 ## Operating rules
 
@@ -145,5 +155,5 @@ it on stderr.
 3. `no-ai` records must never surface: they are uncleared by construction,
    so the filter drops them. If a `no-ai` record ever appears in output,
    treat it as a bug, not a tuning knob.
-4. Keep `confidant find` working — it is the fallback and the allowlist
-   oracle. This skill must not change the CLI.
+4. Keep the plain `confidant find` fallback working — it is what `qmd-query`
+   uses when QMD or the index is missing. This skill must not change the CLI.
