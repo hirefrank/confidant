@@ -1,11 +1,10 @@
 //! The `touch` core verb: its closed kind list and argument grammar (#510).
 //!
-//! `touch` is a core verb (spec §6). The compiled `personal@0.1` pack claims
-//! it while enabled, but the kind list and the parser live here so there is
-//! exactly one list: the compiled pack delegates through these functions
-//! (#185/#296), `check` routes malformed lines through them, `context` reads
-//! kinds through them, and `confidant log touch` validates against the same
-//! constant. After #444 the pack wrapper is deleted and this module remains.
+//! `touch` is a core verb (spec §6). The built-in personal pack claims it,
+//! but the kind list and the parser live here so there is exactly one list:
+//! the pack delegates through these functions (#185/#296), `check` routes
+//! malformed lines through them, `context` reads kinds through them, and
+//! `confidant log touch` validates against the same constant.
 
 use crate::ledger::{Arg, LedgerEntry};
 

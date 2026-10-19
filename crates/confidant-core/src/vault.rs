@@ -158,10 +158,9 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     // spec, external packs are not resolved at all: the spec finding
     // already fails `check`, and loading would only stack noise.
     // Built-in declarative packs compiled into the binary (#550) are
-    // available to every vault; one is enabled only when the vault lists
-    // its name@version, and a vault cannot install or shadow it (the
-    // external loader refuses any vendored directory or pin for its name,
-    // #504 R8).
+    // implicit in every vault (#551): the registry always holds them, and a
+    // vault cannot install or shadow one (the external loader refuses any
+    // vendored directory or pin for its name, #504 R8).
     let builtins: &[packs_embedded::EmbeddedPack] = packs_embedded::embedded_packs();
     let (pack_registry, pack_problems, external_manifests, lockfile_error) =
         if config.spec == SPEC_VERSION {

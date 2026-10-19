@@ -103,47 +103,86 @@ pub fn parse_pack_list(raw: &str) -> Vec<String> {
 /// `None` means unscoped ([`PackScope::All`]). Naming a pack that is
 /// unknown or not enabled in this vault is a hard error (fail closed),
 /// never a silent empty scope (#232 Q1).
+///
+/// `implicit` are the built-ins enabled in every vault (#551). A scoped
+/// read includes a built-in **only when the request names it**: a
+/// `--packs` ceiling names the optional packs a caller wants, so a
+/// coaching-only ceiling sees only coaching (core-owned items stay
+/// visible regardless). A requested `personal@…` at any version names the
+/// built-in, so it is in scope. An unscoped read ([`PackScope::All`])
+/// covers every enabled pack, implicit built-ins included.
 pub fn resolve_scope(
     requested: Option<&[String]>,
     enabled: &[&dyn Pack],
+    implicit: &[&dyn Pack],
 ) -> Result<PackScope, DomainError> {
     let Some(names) = requested else {
         return Ok(PackScope::All);
     };
     let mut set = BTreeSet::new();
     for name in names {
-        if !enabled.iter().any(|p| p.name() == name.as_str()) {
-            return Err(DomainError::usage(format!(
-                "unknown or disabled pack in --packs: {name}"
-            )));
+        if let Some(pack) = enabled.iter().find(|p| p.name() == name.as_str()) {
+            set.insert(pack.name().to_string());
+            continue;
         }
-        set.insert(name.clone());
+        if let Some(pack) = implicit_for_listing(implicit, name) {
+            set.insert(pack.name().to_string());
+            continue;
+        }
+        return Err(DomainError::usage(format!(
+            "unknown or disabled pack in --packs: {name}"
+        )));
     }
     Ok(PackScope::Only(set))
+}
+
+/// The implicit built-in a `name@version` listing names, at any version
+/// (#551): `personal@0.1` names the built-in `personal@0.2`. The version
+/// must be non-empty, so a malformed `personal@` names nothing.
+fn implicit_for_listing<'a>(implicit: &[&'a dyn Pack], listed: &str) -> Option<&'a dyn Pack> {
+    let (name, version) = listed.split_once('@')?;
+    if version.is_empty() {
+        return None;
+    }
+    implicit
+        .iter()
+        .copied()
+        .find(|p| p.name().split_once('@').map(|(n, _)| n) == Some(name))
 }
 
 /// Intersect a per-call scope with a connection ceiling (MCP, #232 Q1).
 /// `None` per-call means the ceiling. A per-call scope can only narrow
 /// the ceiling, never widen it: naming a pack outside the ceiling is an
-/// error. The result is validated against the enabled packs.
+/// error, with no implicit bypass (#551). A built-in listing still names
+/// the built-in at any version, so `personal@0.1` matches a ceiling that
+/// already includes `personal@0.2`; it never adds it. The result is
+/// validated against the enabled packs.
 pub fn intersect_scope(
     ceiling: &PackScope,
     requested: Option<&[String]>,
     enabled: &[&dyn Pack],
+    implicit: &[&dyn Pack],
 ) -> Result<PackScope, DomainError> {
     let Some(names) = requested else {
         return Ok(ceiling.clone());
     };
     if let PackScope::Only(allowed) = ceiling {
         for name in names {
-            if !allowed.contains(name) {
+            // Canonicalize a built-in alias before the membership check,
+            // so `personal@0.1` matches a `personal@0.2` ceiling. The name
+            // must still be in the ceiling: the per-call scope never
+            // widens it (#551).
+            let canonical = implicit_for_listing(implicit, name)
+                .map(|p| p.name())
+                .unwrap_or(name.as_str());
+            if !allowed.contains(canonical) {
                 return Err(DomainError::usage(format!(
                     "per-call scope {name} is outside the connection's pack scope"
                 )));
             }
         }
     }
-    resolve_scope(requested, enabled)
+    resolve_scope(requested, enabled, implicit)
 }
 
 /// Owner of one front-matter field: the enabled pack claiming it, core
@@ -420,8 +459,11 @@ mod tests {
 
     #[test]
     fn resolve_none_is_all_and_unknown_is_error() {
-        assert_eq!(resolve_scope(None, &registry()).unwrap(), PackScope::All);
-        let err = resolve_scope(Some(&["nope@1".to_string()]), &registry()).unwrap_err();
+        assert_eq!(
+            resolve_scope(None, &registry(), &[]).unwrap(),
+            PackScope::All
+        );
+        let err = resolve_scope(Some(&["nope@1".to_string()]), &registry(), &[]).unwrap_err();
         assert!(err.message().contains("nope@1"));
     }
 
@@ -429,8 +471,78 @@ mod tests {
     fn resolve_disabled_pack_is_error() {
         // testpack is in the registry but not in this enabled set.
         let enabled: Vec<&dyn Pack> = vec![&COACHING];
-        let err = resolve_scope(Some(&["testpack@0.1".to_string()]), &enabled).unwrap_err();
+        let err = resolve_scope(Some(&["testpack@0.1".to_string()]), &enabled, &[]).unwrap_err();
         assert!(err.message().contains("testpack@0.1"));
+    }
+
+    /// The implicit built-in (`personal@0.2`) for scope tests.
+    fn implicit_personal() -> Vec<&'static dyn Pack> {
+        vec![
+            crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_2)
+                .expect("personal@0.2 is embedded")
+                .pack(),
+        ]
+    }
+
+    /// #551: a scoped read includes the implicit built-in only when the
+    /// request names it. A `--packs` ceiling naming only an optional pack
+    /// excludes personal; a `personal@…` listing names the built-in at any
+    /// version; an unscoped read still covers everything.
+    #[test]
+    fn resolve_scope_includes_implicit_builtin_only_when_named() {
+        let implicit = implicit_personal();
+        let enabled: Vec<&dyn Pack> = vec![&COACHING, implicit[0]];
+        // A ceiling naming only an optional pack excludes the built-in.
+        let scoped =
+            resolve_scope(Some(&["coaching@0.1".to_string()]), &enabled, &implicit).unwrap();
+        assert_eq!(
+            scoped,
+            PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+        );
+        // A built-in listing at any version resolves to the built-in.
+        for listed in ["personal@0.1", "personal@0.2", "personal@9.9"] {
+            let alias = resolve_scope(Some(&[listed.to_string()]), &enabled, &implicit).unwrap();
+            assert_eq!(
+                alias,
+                PackScope::Only(["personal@0.2".to_string()].into_iter().collect()),
+                "{listed}"
+            );
+        }
+        // An unscoped read still covers everything.
+        assert_eq!(
+            resolve_scope(None, &enabled, &implicit).unwrap(),
+            PackScope::All
+        );
+    }
+
+    /// #551: the ceiling check has no implicit bypass. Naming the built-in
+    /// cannot widen a coaching-only ceiling, but the any-version alias still
+    /// matches a ceiling that already names it.
+    #[test]
+    fn intersect_scope_never_widens_past_ceiling_with_implicit() {
+        let implicit = implicit_personal();
+        let enabled: Vec<&dyn Pack> = vec![&COACHING, implicit[0]];
+        let coaching_ceiling = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
+        let err = intersect_scope(
+            &coaching_ceiling,
+            Some(&["personal@0.1".to_string()]),
+            &enabled,
+            &implicit,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("outside"), "{}", err.message());
+        // A ceiling that names the built-in accepts the any-version alias.
+        let personal_ceiling = PackScope::Only(["personal@0.2".to_string()].into_iter().collect());
+        assert_eq!(
+            intersect_scope(
+                &personal_ceiling,
+                Some(&["personal@0.1".to_string()]),
+                &enabled,
+                &implicit,
+            )
+            .unwrap(),
+            personal_ceiling
+        );
     }
 
     #[test]
@@ -438,16 +550,27 @@ mod tests {
         let ceiling = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
         // Narrowing to the ceiling itself is fine.
         assert_eq!(
-            intersect_scope(&ceiling, Some(&["coaching@0.1".to_string()]), &registry()).unwrap(),
+            intersect_scope(
+                &ceiling,
+                Some(&["coaching@0.1".to_string()]),
+                &registry(),
+                &[]
+            )
+            .unwrap(),
             ceiling
         );
         // A pack outside the ceiling is an error, even though it exists.
-        let err = intersect_scope(&ceiling, Some(&["testpack@0.1".to_string()]), &registry())
-            .unwrap_err();
+        let err = intersect_scope(
+            &ceiling,
+            Some(&["testpack@0.1".to_string()]),
+            &registry(),
+            &[],
+        )
+        .unwrap_err();
         assert!(err.message().contains("outside"));
         // No per-call scope means the ceiling.
         assert_eq!(
-            intersect_scope(&ceiling, None, &registry()).unwrap(),
+            intersect_scope(&ceiling, None, &registry(), &[]).unwrap(),
             ceiling
         );
         // With an All ceiling, per-call resolves normally.
@@ -455,7 +578,8 @@ mod tests {
             intersect_scope(
                 &PackScope::All,
                 Some(&["testpack@0.1".to_string()]),
-                &registry()
+                &registry(),
+                &[]
             )
             .unwrap(),
             PackScope::Only(["testpack@0.1".to_string()].into_iter().collect())

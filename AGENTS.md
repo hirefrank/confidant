@@ -29,7 +29,8 @@ Read before changing behaviour:
 - [`docs/crypto-design.md`](docs/crypto-design.md): milestone 2 encryption
   design (key hierarchy, envelope, AAD, recovery, test plan).
 - [`packs/coaching/0.1.md`](packs/coaching/0.1.md): the coaching schema pack.
-- [`packs/personal/0.1.md`](packs/personal/0.1.md): the personal relationships pack.
+- [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
+  relationships pack (implicit built-in).
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
   format. The manifest (`packs/<name>/manifest.toml`) is the single
   source of truth for a pack's claims (verbs, fields, edge kinds,

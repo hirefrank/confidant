@@ -9,8 +9,7 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Added
-- `personal@0.2` schema (fixtures only; the shipped `personal@0.1`
-  manifest is unchanged until #444b): three new field grammars — `list`,
+- `personal@0.2` schema: three new field grammars — `list`,
   `labeled-list`, `date` — and an extended `cadence` grammar that also
   accepts the literal `never`. The `cadence-overdue` rule now skips a
   `never` person and accepts an optional `snooze_field` (a declared `date`
@@ -18,14 +17,16 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - The embedded declarative `personal@0.2` built-in pack (#550): its
   manifest, skill text and contract ship inside the binary and load through
   the manifest-v2 / declarative path external packs use, so its rules may
-  name the stable finding codes. A vault opts in with
-  `packs = ["personal@0.2"]`; `personal@0.1` still resolves to the compiled
-  pack (PD14) and nothing changes for a vault that keeps listing 0.1. The
-  repo-root `packs/personal/manifest.toml`, `SKILL.md` and `0.2.md` are the
-  0.2 human contract; a parity test pins the embedded pack against compiled
-  `personal@0.1` on the 0.1 field set (including `examples/demo-vault`), and
-  the stable-code allowance is keyed on compiled-in origin, so a vault
-  directory `packs/personal@…` is still `E_PACK_INVALID` (#550, #504 R8).
+  name the stable finding codes. The repo-root `packs/personal/manifest.toml`,
+  `SKILL.md` and `0.2.md` are the human contract, and the stable-code
+  allowance is keyed on compiled-in origin, so a vault directory
+  `packs/personal@…` is `E_PACK_INVALID` (#550, #504 R8).
+- The built-in personal pack is **implicit** (#551): it is enabled in every
+  vault whether or not `packs` lists it, so `packs = []` enables it, and a
+  `personal@…` entry is accepted as a no-op. A scoped read sees it only when
+  the scope names it: an unscoped `context`/`find` call covers it, while a
+  `--packs coaching@0.1` ceiling does not. A vault directory or lockfile pin
+  for a built-in name is still `E_PACK_INVALID`, listed or not (#504 R8).
 
 ### Changed
 - The `touch` kind list is now `call|text|email|meet|meal|event|gift|other`
@@ -33,14 +34,25 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   writes using `coffee` are a usage error, and an existing `coffee` ledger line
   (positional or `kind:coffee`) now fails `check` with `E_TOUCH_MALFORMED`.
 - Core owns the personal pack's `context` view, its `--exclude-private`
-  field list and the `touch` kind grammar; `personal@0.1` delegates to them
-  (#510). `context --json` output is unchanged, and the declarative
-  `personal@0.2` pack can serve the same view after the #444 cutover.
+  field list and the `touch` kind grammar; the built-in personal pack serves
+  them (#510, #551). `context --json` output is unchanged apart from the
+  pack key below.
+- `context`'s `packs` map key for the built-in personal pack is now
+  `personal@0.2` (was `personal@0.1`). Pre-v1 JSON key change; the values are
+  unchanged (#551).
+- `confidant log touch` no longer requires the vault to list the personal
+  pack: it is implicit (#551).
 - `record add` mirrors a `touch` ledger line for an interaction's primary
   `person:` as well as for each `with:` participant, in the same commit, so a
   logged interaction counts as contact for everyone on it (#505). The rules
   stay ledger-only: a hand-written interaction with no mirrored line still
   does not count.
+
+### Removed
+- Compiled `personal@0.1` (`crates/confidant-core/src/packs/personal.rs`),
+  its frozen manifest (`pack-manifests/personal-0.1/`) and its human 0.1
+  contract (`packs/personal/0.1.md`). `personal@0.2` is the only personal
+  pack and it is implicit (#551).
 
 ## [0.5.0] - 2026-10-18
 

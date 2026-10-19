@@ -304,12 +304,12 @@ mod tests {
     #[test]
     fn combined_pack_skill_labels_labelled_packs_only() {
         let registry = confidant_core::packs::PackRegistry::compiled();
-        let combined = combined_pack_skill(&registry, &["coaching@0.1", "personal@0.1"], |name| {
-            (name == "personal@0.1").then(|| "[external pack: test]".to_owned())
+        let combined = combined_pack_skill(&registry, &["coaching@0.1", "personal@0.2"], |name| {
+            (name == "personal@0.2").then(|| "[external pack: test]".to_owned())
         })
         .unwrap();
         assert!(
-            combined.contains("## personal@0.1\n\n[external pack: test]\n"),
+            combined.contains("## personal@0.2\n\n[external pack: test]\n"),
             "{combined}"
         );
         assert!(

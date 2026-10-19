@@ -350,7 +350,7 @@ enum Command {
         /// Fill note bodies with no-space CJK prose (quadratic-scan guard).
         #[arg(long)]
         cjk: bool,
-        /// Enable personal@0.1 and write a touch-heavy ledger (#188).
+        /// Write a touch-heavy ledger (#188).
         #[arg(long)]
         touch: bool,
         /// Encrypt every record so find/check measure the decrypt path (#188).
@@ -1297,7 +1297,11 @@ fn resolve_cli_scope(
 ) -> Result<(PackScope, Vec<String>), DomainError> {
     let requested = raw.map(parse_pack_list);
     let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    let scope = resolve_scope(requested.as_deref(), &enabled)?;
+    let scope = resolve_scope(
+        requested.as_deref(),
+        &enabled,
+        vault.pack_registry().implicit(),
+    )?;
     let names = scope.names(&enabled);
     Ok((scope, names))
 }
@@ -3430,23 +3434,8 @@ fn cmd_log_touch(
     fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
-    // #510: keep today's gate until #444 — the pack that owns `touch` is
-    // still the enable switch — but name the owner from the registry instead
-    // of hardcoding it, so #444 only deletes the gate.
-    if !enabled.iter().any(|p| p.verbs().contains(&"touch")) {
-        let owner = vault
-            .pack_registry()
-            .all()
-            .iter()
-            .find(|p| p.verbs().contains(&"touch"))
-            .map(|p| p.name())
-            .unwrap_or("the pack that owns `touch`");
-        return Err(anyhow::Error::new(
-            DomainError::invalid(format!("log touch requires pack {owner}"))
-                .with_fix(format!("Add \"{owner}\" to packs in confidant.toml")),
-        ));
-    }
+    // #551: the built-in personal pack is implicit, so `touch` is always
+    // owned by an enabled pack; the #510 enable gate is gone.
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
     // #510: the kind grammar is core-owned; validate against the core list
@@ -7119,7 +7108,7 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
         .map(parse_pack_list)
         .unwrap_or_default();
     for name in &packs {
-        if confidant_core::packs::pack_manifest(name).is_none() {
+        if !confidant_core::packs::is_known_pack_id(name) {
             return Err(anyhow::Error::new(DomainError::usage(format!(
                 "unknown pack in --packs: {name}"
             ))));

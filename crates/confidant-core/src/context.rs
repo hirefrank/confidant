@@ -229,7 +229,8 @@ pub fn build_context(
         .map(|s| TouchpointView {
             date: s.entry.date.to_string(),
             // The touchpoint kind is the claiming pack's grammar (#185/#296):
-            // ask the registered pack through the trait, not `packs::personal`.
+            // ask the registered pack through the trait, never a specific
+            // pack module.
             kind: vault
                 .pack_registry()
                 .all()

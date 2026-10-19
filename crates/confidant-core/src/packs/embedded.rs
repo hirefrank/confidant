@@ -31,6 +31,29 @@ use crate::packs::Pack;
 /// `name@version` of the built-in personal pack (#550).
 pub const PERSONAL_0_2: &str = "personal@0.2";
 
+/// Whether `listed` names a built-in pack, at any version (#551).
+///
+/// A built-in is implicit: it is enabled in every vault and a
+/// `personal@…` entry in `confidant.toml` is accepted as a no-op. The check
+/// is by name against the embedded packs (not every reserved name): a
+/// `coaching@9.9` listing is still an unknown external pin. The version
+/// must be non-empty, so a malformed `personal@` is not a listing.
+pub fn is_builtin_listing(listed: &str) -> bool {
+    let Some((name, version)) = listed.split_once('@') else {
+        return false;
+    };
+    !version.is_empty() && embedded_packs().iter().any(|p| p.reserved_name() == name)
+}
+
+/// The embedded pack a built-in listing resolves to, at any version.
+pub fn find_listing(listed: &str) -> Option<&'static EmbeddedPack> {
+    let (name, _version) = listed.split_once('@')?;
+    embedded_packs()
+        .iter()
+        .find(|p| p.listed == listed)
+        .or_else(|| embedded_packs().iter().find(|p| p.reserved_name() == name))
+}
+
 /// The embedded personal@0.2 manifest (vendored from
 /// `packs/personal/manifest.toml`).
 const PERSONAL_0_2_MANIFEST: &str = include_str!(concat!(
@@ -73,6 +96,22 @@ impl EmbeddedPack {
     /// The `name@version` a vault lists to enable this pack.
     pub fn listed(&self) -> &'static str {
         self.listed
+    }
+
+    /// The pack's reserved name (`personal`), without the version.
+    pub fn reserved_name(&self) -> &'static str {
+        self.listed
+            .split_once('@')
+            .map(|(name, _)| name)
+            .unwrap_or(self.listed)
+    }
+
+    /// Whether a vault listing names this built-in, at any version (#551).
+    /// The version must be non-empty: a malformed `personal@` names nothing.
+    pub fn matches_listing(&self, listed: &str) -> bool {
+        listed
+            .split_once('@')
+            .is_some_and(|(name, version)| !version.is_empty() && name == self.reserved_name())
     }
 
     /// The registered pack.
@@ -281,5 +320,21 @@ mod tests {
             skill.contains("snooze_until"),
             "SKILL must document snooze_until"
         );
+    }
+
+    /// #551 nit: a malformed `personal@` (empty version) is not a built-in
+    /// listing; a real version is, at any value.
+    #[test]
+    fn builtin_listings_require_a_nonempty_version() {
+        assert!(is_builtin_listing("personal@0.1"));
+        assert!(is_builtin_listing("personal@0.2"));
+        assert!(is_builtin_listing("personal@9.9"));
+        assert!(!is_builtin_listing("personal@"));
+        assert!(!is_builtin_listing("personal"));
+        assert!(!is_builtin_listing("coaching@0.1"));
+        let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
+        assert!(declared.matches_listing("personal@0.1"));
+        assert!(!declared.matches_listing("personal@"));
+        assert!(!declared.matches_listing("personal"));
     }
 }
