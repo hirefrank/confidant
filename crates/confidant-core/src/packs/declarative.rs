@@ -82,6 +82,15 @@ pub(crate) trait RuleKind: Send + Sync {
     fn fixed_severity(&self) -> Option<Severity> {
         None
     }
+    /// Whether the kind resolves its own finding severities and always
+    /// runs (#446 `ledger-balance`, #447 `session-checks`). Such a rule
+    /// may omit `severity_key`, or declare one the kind itself reads
+    /// (balance's negative-balance severity); `off` on a key the kind
+    /// reads suppresses only the findings it governs, never the whole
+    /// rule. `ctx.severity` is a placeholder for these kinds.
+    fn manages_severity(&self) -> bool {
+        false
+    }
 }
 
 /// Test-only rule registration (#441's acceptance needs a hook a test
@@ -94,8 +103,13 @@ static TEST_REGISTRY: Mutex<Option<Vec<&'static dyn RuleKind>>> = Mutex::new(Non
 pub(crate) fn registered_rule_kinds() -> Vec<&'static dyn RuleKind> {
     // The kind implementations live in Rust (PD1); each kind's issue
     // appends its static here. #442: `cadence-overdue`; #443:
-    // `date-upcoming`; #458: `note-ref`.
-    let mut kinds: Vec<&'static dyn RuleKind> = vec![&CADENCE_OVERDUE, &DATE_UPCOMING, &NOTE_REF];
+    // `date-upcoming`; #458: `note-ref`; #446: `ledger-balance`.
+    let mut kinds: Vec<&'static dyn RuleKind> = vec![
+        &CADENCE_OVERDUE,
+        &DATE_UPCOMING,
+        &NOTE_REF,
+        &crate::packs::rules::balance::LEDGER_BALANCE,
+    ];
     kinds.extend(
         TEST_REGISTRY
             .lock()
@@ -152,21 +166,37 @@ pub(crate) fn resolve_rule_severity(
     manifest: &PackManifest,
     rule: &RuleDecl,
 ) -> Option<Severity> {
+    let kind = rule_kind(&rule.kind)?;
     // A kind with a fixed severity is never operator-tunable (`note-ref`
     // is always an error, like the compiled functions it reproduces).
-    if let Some(fixed) = rule_kind(&rule.kind).and_then(|k| k.fixed_severity()) {
+    if let Some(fixed) = kind.fixed_severity() {
         return Some(fixed);
     }
-    let Some(key) = &rule.severity_key else {
-        return None;
-    };
+    // A managed kind always runs and reads its own keys. `Some(Error)` is
+    // only the "run it" marker; `ctx.severity` is not used by these kinds.
+    if kind.manages_severity() {
+        return Some(Severity::Error);
+    }
+    let key = rule.severity_key.as_deref()?;
+    resolve_declared_severity(vault, manifest, key)
+}
+
+/// Resolve one declared `[[checks.severity]]` key: the operator's
+/// `[checks]` override wins, with the manifest default as the fallback.
+/// `None` means off. Shared by the evaluator and the rule kinds that
+/// manage several severities (#446/#447).
+pub(crate) fn resolve_declared_severity(
+    vault: &Vault,
+    manifest: &PackManifest,
+    key: &str,
+) -> Option<Severity> {
     // The manifest loader (#435) guarantees a declared severity_key has
     // an `[[checks.severity]]` entry; be defensive anyway.
     let manifest_default = manifest
         .checks
         .severity
         .iter()
-        .find(|s| s.key == *key)
+        .find(|s| s.key == key)
         .and_then(|s| parse_severity_token(&s.default).ok())?;
     // The manifest default itself may be `off` (Ok(None)).
     manifest_default?;
@@ -186,9 +216,9 @@ pub(crate) fn validate_rule(rule: &RuleDecl, manifest: &PackManifest) -> Result<
         ))
         .with_fix("The kind is not implemented in this binary; see spec/pack-manifest.md")
     })?;
-    // A rule with neither a declared severity key nor a kind-fixed
-    // severity has no way to resolve: refuse at load.
-    if rule.severity_key.is_none() && kind.fixed_severity().is_none() {
+    // A rule with neither a declared severity key nor a kind that resolves
+    // its own severities has no way to resolve: refuse at load.
+    if rule.severity_key.is_none() && kind.fixed_severity().is_none() && !kind.manages_severity() {
         return Err(DomainError::config(format!(
             "rule '{}' declares no severity_key and kind '{}' has no fixed severity",
             rule.id, rule.kind
@@ -866,7 +896,7 @@ impl RuleKind for DateUpcomingKind {
 /// refuses a negative int default (#528). Neither is silently folded to
 /// 0 — a missing key or negative default here is a loader bug, and the
 /// rule fails closed as `E_PACK_INVALID`.
-fn resolve_int_check(ctx: &RuleCtx, key: &str) -> u64 {
+pub(crate) fn resolve_int_check(ctx: &RuleCtx, key: &str) -> u64 {
     if let Some(value) = ctx.vault.config.checks.int(key) {
         return value;
     }
@@ -1176,7 +1206,7 @@ impl RuleKind for NoteRefKind {
 
 /// Resolve a manifest-supplied code string: a core code keeps its builtin
 /// variant (the compiled packs' codes), anything else becomes a pack code.
-fn resolve_finding_code(code: &str) -> Option<FindingCode> {
+pub(crate) fn resolve_finding_code(code: &str) -> Option<FindingCode> {
     if let Some(builtin) = FindingCode::builtin_from_str(code) {
         return Some(builtin);
     }
@@ -1427,6 +1457,7 @@ default = "test rule"
                         "cadence-overdue",
                         "date-upcoming",
                         "note-ref",
+                        "ledger-balance",
                         "test-rule",
                         "other-rule"
                     ]
@@ -1439,7 +1470,12 @@ default = "test rule"
         crate::packs::declarative::with_rule_kinds_for_test(vec![], || {
             assert_eq!(
                 crate::packs::manifest::known_rule_kinds(),
-                vec!["cadence-overdue", "date-upcoming", "note-ref"]
+                vec![
+                    "cadence-overdue",
+                    "date-upcoming",
+                    "note-ref",
+                    "ledger-balance"
+                ]
             );
         });
     }
@@ -1585,6 +1621,8 @@ default = "test rule"
             ("packs/external.rs", include_str!("external.rs")),
             ("packs/manifest_pack.rs", include_str!("manifest_pack.rs")),
             ("packs/embedded.rs", include_str!("embedded.rs")),
+            ("packs/rules/ledger.rs", include_str!("rules/ledger.rs")),
+            ("packs/rules/balance.rs", include_str!("rules/balance.rs")),
         ];
         const FORBIDDEN: &[&str] = &[
             "std::net",

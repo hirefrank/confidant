@@ -466,7 +466,7 @@ error.
 | `id` | string | Unique within the pack. Must match `^[a-z][a-z0-9_]*$`. |
 | `kind` | string | One of the fixed kind list below. |
 | `code` | string | The finding code this rule emits. Must be in the pack's `finding_codes`. |
-| `severity_key` | string, optional | A declared `[[checks.severity]]` key (without the pack prefix is not accepted; write the full `example-pack.some_rule` key). When present, the operator controls severity through `confidant.toml`. Kinds with a fixed severity omit it. |
+| `severity_key` | string, optional | A declared `[[checks.severity]]` key (without the pack prefix is not accepted; write the full `example-pack.some_rule` key). When present, the operator controls severity through `confidant.toml`. Kinds with a fixed severity omit it. Kinds that manage several severities (`ledger-balance`, `session-checks`) resolve their own keys; see their sections. |
 
 After the generic keys come the kind-specific keys, defined by each
 kind's own spec section. Unknown keys — generic or kind-specific — are
@@ -480,9 +480,9 @@ own issue appends its section with the parameter table:
 | `cadence-overdue` | #442 | the built-in personal pack's keep-in-touch rule |
 | `date-upcoming` | #443 | the built-in personal pack's upcoming-dates rule |
 | `note-ref` | #458 | the built-in personal pack's `touch` note check and `coaching@0.1`'s `session` note check |
+| `ledger-balance` | #446 | `coaching@0.1`'s `sessions_remaining` / `icf_hours` fold and `balance` checks |
 
-(Planned: `ledger-balance` #446, `session-checks` #447, `activity-gap`
-#448.)
+(Planned: `session-checks` #447, `activity-gap` #448.)
 
 #### Kind `cadence-overdue` (#442)
 
@@ -674,6 +674,110 @@ pair = "note"
 invalid_code = "E_EXAMPLE_NOTE_BAD_ID"
 wrong_type_code = "E_EXAMPLE_NOTE_BAD_TYPE"
 ```
+
+#### Kind `ledger-balance` (#446)
+
+Keep a running count of units a person opened, less the units their
+consuming ledger entries used, and verify `balance` assertions against it.
+Reproduces `coaching@0.1`'s fold for `sessions_remaining` and `icf_hours`,
+including its merge semantics: opens and sessions from every merged member
+accumulate into the canonical person's balance.
+
+The kind **manages its own severity**: it always runs (a `balance` line
+must not silently stop being verified), and `severity_key` is the severity
+of the **negative-balance** finding only. Setting that key `off` suppresses
+the negative finding; it does not turn off open validation or balance
+checking. Every other finding is a fixed `error`.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `open_verb` | string, non-empty | The ledger verb that adds units: `DATE <open_verb> <person-id> package <pkg-id> <N> sessions`. |
+| `consume_verb` | string, non-empty, different from `open_verb` | The ledger verb that consumes a unit. An entry consumes unless it is tagged `pps` or `comp`; an untagged entry consumes too, so a balance cannot silently drop a session. |
+| `units_metric` | string | The declared `balance_metrics` entry holding the integer unit count (today `sessions_remaining`). |
+| `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (today `icf_hours`). |
+| `max_open_n` | integer > 0 | Cap for one `open` line (today `100000`). A larger `N` is refused and not counted. |
+| `parse_code` | string, optional | Code for `balance`-line parse problems and the minutes-overflow problem. Defaults to the core code `E_PARSE`. |
+| `negative_code` | string, optional | Code for a negative unit balance. Defaults to `E_NEGATIVE_BALANCE`. |
+| `open_malformed_code` | string, optional | Code for malformed `open` lines. Defaults to `E_OPEN_MALFORMED`. |
+| `invalid_code` | string, optional | Code for a package id that does not parse. Defaults to `E_INVALID_ID`. |
+| `wrong_type_code` | string, optional | Code for a parsed package id that is not a `pkg-` id. Defaults to `E_WRONG_ID_TYPE`. |
+
+The generic `code` is the `balance`-mismatch code (today
+`E_BALANCE_MISMATCH`). Every emitted code must have a message table; a
+pack-own code must also be declared in `finding_codes`. An external pack
+cannot name a builtin code (PD13): it sets every code parameter to a code
+it declares. A compiled-in pack may keep the defaults.
+
+Message variants the pack's tables must declare (`<units>` and `<minutes>`
+are the two metric names, so a coaching copy declares
+`sessions_remaining` / `icf_hours` variants):
+
+| Code | Variants | Placeholders |
+|---|---|---|
+| `code` | `<units>`, `<units>_fix`, `<minutes>`, `<minutes>_fix` | `<units>`: `asserted`, `computed` (integers); `<minutes>`: `asserted`, `computed` (decimal hours, two places); fixes: `person` |
+| `parse_code` | `missing_number`; `expected_integer`, `expected_integer_fix`; `expected_decimal`, `expected_decimal_fix`; `minutes_overflow` (optional `minutes_overflow_fix`) | `minutes_overflow`: `id` |
+| `negative_code` | `default`, `default_fix` | `default`: `id`, `remaining` |
+| `open_malformed_code` | `shape`, `shape_fix`; `not_integer`, `not_integer_fix`; `exceeds_cap`, `exceeds_cap_fix`; `total_overflow` (optional `total_overflow_fix`) | `exceeds_cap`: `n`, `cap`; `total_overflow`: `id` |
+| `invalid_code` | `package`, `package_fix` | none |
+| `wrong_type_code` | `package` | `pkg` |
+
+Evaluation order:
+
+1. Fold the ledger: entries whose verb is `open_verb` or `consume_verb`
+   and whose id is a person id, ordered by date, then opens before
+   sessions on the same date, then line, then file. Opens accumulate per
+   person; a consuming entry adds one use unless it carries `pps` or
+   `comp`. Only opens, sessions and ids are read (PD8).
+2. `open` lines: the shape is `package <pkg-id> <positive integer>
+   sessions`. A non-shape line is `open_malformed_code`/`shape`; an
+   unparseable id is `invalid_code`/`package`; a non-integer count is
+   `open_malformed_code`/`not_integer`; `N > max_open_n` is
+   `open_malformed_code`/`exceeds_cap` and is not counted; an open total
+   that would overflow `i64` is `open_malformed_code`/`total_overflow` and
+   is not counted. A parsed id that is not a `pkg-` id is
+   `wrong_type_code`/`package`, but the line still counts.
+3. Session minutes add to the person's hours total; a minutes total that
+   would overflow `u32` is `parse_code`/`minutes_overflow` (the session is
+   still counted). Hours are hundredths of an hour, never floating point:
+   `minutes_to_hundredths` rounds half up to two places.
+4. A negative unit balance (remaining `< 0`) for any canonical person in
+   id order is `negative_code`/`default` at the `severity_key` severity,
+   with no file or line.
+5. For each `balance` line whose metric is one of this rule's two
+   metrics (core routes it through the pack's `check_balance`): a missing
+   number is `parse_code`/`missing_number`; a non-integer unit assertion
+   is `parse_code`/`expected_integer`; a non-decimal hours assertion is
+   `parse_code`/`expected_decimal`; otherwise the assertion is compared
+   with the computed value as of the line's date (and the person's merge
+   canonical at that date). A difference is the generic `code` with the
+   metric-named variant. The finding's `id` is the canonical person; parse
+   problems carry the line's own id.
+6. Two `ledger-balance` rules may not own the same metric; the loader
+   refuses the pack (`E_PACK_INVALID`).
+
+Worked example:
+
+```toml
+[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_BALANCE_MISMATCH"
+severity_key = "coaching.balance_nonnegative"
+open_verb = "open"
+consume_verb = "session"
+units_metric = "sessions_remaining"
+minutes_metric = "icf_hours"
+max_open_n = 100000
+```
+
+With `2026-10-01 open p-… package pkg-… 6 sessions`, a paid session on
+`2026-10-01`, and `2026-10-08 balance p-… sessions_remaining 4`, the
+computed value is 5, so the finding message is
+`sessions_remaining asserted 4, computed 5` and its fix names the person.
+A `comp` or `pps` session consumes nothing; an untagged session consumes
+one. This kind does not warn about an untagged session: that finding
+belongs to the `session-checks` kind (#447), so a pack that declares only
+`ledger-balance` gets no untagged warning.
 
 ### 13.3. Names
 

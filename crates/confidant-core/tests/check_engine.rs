@@ -8086,3 +8086,732 @@ fn touch_args_table_malformed() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Declarative coaching kinds (#446 ledger-balance)
+// ---------------------------------------------------------------------------
+
+/// Messages for the `coaching-ext` fixture's `ledger-balance` rule. The
+/// text is copied verbatim from `packs/coaching/manifest.toml` so parity
+/// compares behaviour, not wording; only the codes differ (an external
+/// pack cannot claim a builtin code, PD13).
+const COACHING_EXT_BALANCE_MESSAGES: &str = r#"
+[messages."E_COACHING_EXT_PARSE"]
+missing_number = "balance line is missing a number"
+expected_integer = "expected integer"
+expected_integer_fix = "Use an integer such as 3 for sessions_remaining"
+expected_decimal = "expected decimal"
+expected_decimal_fix = "Use a decimal such as 1.50 for icf_hours"
+minutes_overflow = "session minutes for {id} overflow"
+
+[messages."E_COACHING_EXT_BALANCE"]
+sessions_remaining = "sessions_remaining asserted {asserted}, computed {computed}"
+sessions_remaining_fix = "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
+icf_hours = "icf_hours asserted {asserted}, computed {computed}"
+icf_hours_fix = "Check session durations for {person} or correct the assertion"
+
+[messages."E_COACHING_EXT_NEGATIVE"]
+default = "sessions_remaining for {id} is {remaining}"
+default_fix = "Add an open/renewal or remove extra session lines"
+
+[messages."E_COACHING_EXT_OPEN"]
+shape = "open line must be: DATE open PERSON-ID package PKG-ID N sessions"
+shape_fix = "Example: 2026-10-01 open p-… package pkg-… 6 sessions"
+not_integer = "expected integer"
+not_integer_fix = "Use open <pkg-id> <positive-integer> on its own ledger line"
+exceeds_cap = "open N {n} exceeds the cap of {cap}"
+exceeds_cap_fix = "Use a package size between 1 and {cap}"
+total_overflow = "open total for {id} overflows"
+
+[messages."E_COACHING_EXT_ID"]
+package = "package id is not a record ID"
+package_fix = "Use a pkg-<ULID> package id"
+
+[messages."E_COACHING_EXT_TYPE"]
+package = "package id '{pkg}' must use the pkg- prefix"
+"#;
+
+/// The fixture pack's balance rule. `max_open_n` is overridable so the
+/// total-overflow case (unreachable under the 100000 cap) can be built.
+const COACHING_EXT_BALANCE_RULE: &str = r#"[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_COACHING_EXT_BALANCE"
+severity_key = "coaching-ext.balance_nonnegative"
+open_verb = "open"
+consume_verb = "session"
+units_metric = "sessions_remaining"
+minutes_metric = "icf_hours"
+max_open_n = 100000
+parse_code = "E_COACHING_EXT_PARSE"
+negative_code = "E_COACHING_EXT_NEGATIVE"
+open_malformed_code = "E_COACHING_EXT_OPEN"
+invalid_code = "E_COACHING_EXT_ID"
+wrong_type_code = "E_COACHING_EXT_TYPE"
+"#;
+
+/// A v2 `coaching-ext@0.1` manifest using the given `[[rules]]` body. The
+/// fixture never ships; it exists to prove the declarative kinds reproduce
+/// compiled coaching until #449 switches the real pack.
+fn coaching_ext_manifest(rules: &str) -> String {
+    let mut text = String::from(
+        r#"manifest_version = 2
+record_types = []
+balance_metrics = ["sessions_remaining", "icf_hours"]
+finding_codes = [
+  "E_COACHING_EXT_PARSE",
+  "E_COACHING_EXT_BALANCE",
+  "E_COACHING_EXT_NEGATIVE",
+  "E_COACHING_EXT_OPEN",
+  "E_COACHING_EXT_ID",
+  "E_COACHING_EXT_TYPE",
+]
+
+[pack]
+name = "coaching-ext"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[verbs]]
+name = "open"
+id_type = "person"
+
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[checks.severity]]
+key = "coaching-ext.balance_nonnegative"
+default = "error"
+"#,
+    );
+    text.push_str(rules);
+    text.push_str(COACHING_EXT_BALANCE_MESSAGES);
+    text
+}
+
+/// Vendor the fixture pack and pin it. Returns the manifest text used, so
+/// a loader-negative test can edit it first.
+fn install_coaching_ext(root: &Path, manifest: &str) {
+    let hash = install_external_pack_with_manifest(
+        root,
+        "coaching-ext",
+        "0.1",
+        manifest,
+        "# coaching-ext fixture.\n",
+    );
+    install_lockfile(root, "coaching-ext", "0.1", &hash);
+}
+
+/// `confidant.toml` enabling only the fixture pack. The operator keys are
+/// the fixture's own namespace; compiled coaching is not enabled, so its
+/// `coaching.*` keys would be unknown here.
+fn coaching_ext_vault(root: &Path, checks: &str) {
+    external_vault_toml(root, "\"coaching-ext@0.1\"", checks);
+}
+
+const COACHING_EXT_CHECKS: &str = "coaching-ext.balance_nonnegative = \"error\"\n";
+
+/// Build the same vault twice — once with compiled `coaching@0.1`, once
+/// with the fixture — and return both reports. `setup` writes the records
+/// and ledger; the fixture install is added to the declarative side.
+fn assert_balance_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
+    let compiled_dir = tempfile::tempdir().unwrap();
+    setup(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    let compiled = report_json(compiled_dir.path(), None);
+
+    let declarative_dir = tempfile::tempdir().unwrap();
+    setup(declarative_dir.path());
+    install_coaching_ext(declarative_dir.path(), &coaching_ext_manifest(rules));
+    coaching_ext_vault(declarative_dir.path(), COACHING_EXT_CHECKS);
+    let declarative = report_json(declarative_dir.path(), None);
+
+    assert_eq!(
+        balance_findings(&compiled, BALANCE_CODE_MAP),
+        balance_findings(&declarative, BALANCE_CODE_MAP),
+        "declarative parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
+    );
+    (compiled, declarative)
+}
+
+/// Fixture code → compiled code for the balance rule.
+const BALANCE_CODE_MAP: &[(&str, &str)] = &[
+    ("E_COACHING_EXT_PARSE", "E_PARSE"),
+    ("E_COACHING_EXT_BALANCE", "E_BALANCE_MISMATCH"),
+    ("E_COACHING_EXT_NEGATIVE", "E_NEGATIVE_BALANCE"),
+    ("E_COACHING_EXT_OPEN", "E_OPEN_MALFORMED"),
+    ("E_COACHING_EXT_ID", "E_INVALID_ID"),
+    ("E_COACHING_EXT_TYPE", "E_WRONG_ID_TYPE"),
+];
+
+/// The balance-related findings of a report, normalized to the compiled
+/// code names and rendered as comparable tuples (code, severity, message,
+/// fix, file, line, id). Codes outside `map` are ignored: the fixture and
+/// compiled packs emit different *unrelated* codes on the same vault
+/// (pack-own vs. core), and parity is scoped to the kind's codes.
+fn balance_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
+    let mut out: Vec<String> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| {
+            let code = f["code"].as_str().unwrap();
+            let normalized = map
+                .iter()
+                .find(|(from, _)| *from == code)
+                .map(|(_, to)| *to)
+                .or_else(|| map.iter().find(|(_, to)| *to == code).map(|(_, to)| *to))?;
+            Some(format!(
+                "{normalized}|{}|{}|{}|{}|{}|{}",
+                f["severity"].as_str().unwrap_or(""),
+                f["message"].as_str().unwrap_or(""),
+                f["fix"].as_str().unwrap_or(""),
+                f["file"].as_str().unwrap_or(""),
+                f["line"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                f["id"].as_str().unwrap_or(""),
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The fixture report's findings with the given fixture code, in order.
+fn ext_findings<'a>(report: &'a Value, code: &str) -> Vec<&'a Value> {
+    report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == code)
+        .collect()
+}
+
+#[test]
+fn balance_rule_open_then_sessions_remaining() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (compiled, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
+                     2026-10-05 session {ADA} 60m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} sessions_remaining 4\n"
+                ),
+            );
+        },
+        rules,
+    );
+    // Matching assertion: no mismatch on either side.
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        "{declarative:?}"
+    );
+    assert!(
+        !codes(&compiled).contains(&"E_BALANCE_MISMATCH".to_string()),
+        "{compiled:?}"
+    );
+}
+
+#[test]
+fn balance_rule_negative_balance() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (compiled, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+            for day in 1..=7 {
+                ledger.push_str(&format!(
+                    "2026-10-{day:02} session {ADA} 60m paid note:{NOTE}\n"
+                ));
+            }
+            write(root, "ledger/2026/10.cfd", &ledger);
+        },
+        rules,
+    );
+    let negative = ext_findings(&declarative, "E_COACHING_EXT_NEGATIVE");
+    assert_eq!(negative.len(), 1, "{declarative:?}");
+    assert_eq!(negative[0]["id"], ADA);
+    assert_eq!(
+        negative[0]["message"],
+        format!("sessions_remaining for {ADA} is -1")
+    );
+    assert_eq!(codes(&compiled), vec!["E_NEGATIVE_BALANCE"], "{compiled:?}");
+}
+
+#[test]
+fn balance_rule_comp_and_pps_do_not_consume() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 session {ADA} 60m comp note:{NOTE}\n\
+                     2026-10-02 session {ADA} 60m pps note:{NOTE}\n\
+                     2026-10-03 session {ADA} 60m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} sessions_remaining 5\n"
+                ),
+            );
+        },
+        rules,
+    );
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        "comp and pps must not consume: {declarative:?}"
+    );
+}
+
+#[test]
+fn balance_rule_open_malformed_shape() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 open {ADA} 6\n"),
+            );
+        },
+        rules,
+    );
+    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    assert_eq!(malformed.len(), 1, "{declarative:?}");
+    assert_eq!(
+        malformed[0]["message"],
+        "open line must be: DATE open PERSON-ID package PKG-ID N sessions"
+    );
+    assert_eq!(malformed[0]["file"], "ledger/2026/10.cfd");
+    assert_eq!(malformed[0]["line"], 1);
+}
+
+#[test]
+fn balance_rule_open_not_integer() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 open {ADA} package {PKG} six sessions\n"),
+            );
+        },
+        rules,
+    );
+    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    assert_eq!(malformed.len(), 1, "{declarative:?}");
+    assert_eq!(malformed[0]["message"], "expected integer");
+    assert_eq!(
+        malformed[0]["fix"],
+        "Use open <pkg-id> <positive-integer> on its own ledger line"
+    );
+}
+
+#[test]
+fn balance_rule_open_exceeds_cap() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!("2026-10-01 open {ADA} package {PKG} 100001 sessions\n"),
+            );
+        },
+        rules,
+    );
+    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    assert_eq!(malformed.len(), 1, "{declarative:?}");
+    assert_eq!(
+        malformed[0]["message"],
+        "open N 100001 exceeds the cap of 100000"
+    );
+}
+
+#[test]
+fn balance_rule_open_total_overflow() {
+    // The 100000 cap makes a total overflow unreachable with default
+    // parameters, so this case raises the cap and opens `i64::MAX` twice.
+    // The compiled side cannot be configured, so this one asserts the
+    // declarative behaviour only (the arithmetic is shared).
+    let rules = COACHING_EXT_BALANCE_RULE
+        .replace("max_open_n = 100000", "max_open_n = 9223372036854775807");
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 9223372036854775807 sessions\n\
+             2026-10-02 open {ADA} package {PKG2} 9223372036854775807 sessions\n"
+        ),
+    );
+    install_coaching_ext(dir.path(), &coaching_ext_manifest(&rules));
+    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    let declarative = report_json(dir.path(), None);
+    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    assert_eq!(malformed.len(), 1, "{declarative:?}");
+    assert_eq!(
+        malformed[0]["message"],
+        format!("open total for {ADA} overflows")
+    );
+}
+
+#[test]
+fn balance_rule_package_id_wrong_prefix() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            // A person id where a package id belongs: parsed, wrong type;
+            // the line still counts as an open.
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {ADA} package {BEA} 6 sessions\n\
+                     2026-10-08 balance {ADA} sessions_remaining 6\n"
+                ),
+            );
+        },
+        rules,
+    );
+    let wrong = ext_findings(&declarative, "E_COACHING_EXT_TYPE");
+    assert_eq!(wrong.len(), 1, "{declarative:?}");
+    assert_eq!(
+        wrong[0]["message"],
+        format!("package id '{BEA}' must use the pkg- prefix")
+    );
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        "the line still opens 6: {declarative:?}"
+    );
+}
+
+#[test]
+fn balance_rule_merged_people_accumulate_to_canonical() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (compiled, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE, BEA, "2026-10-03");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {BEA} package {PKG} 6 sessions\n\
+                     2026-10-02 merge {BEA} into {ADA}\n\
+                     2026-10-03 session {ADA} 60m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} sessions_remaining 5\n"
+                ),
+            );
+        },
+        rules,
+    );
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        "Bea's open and Ada's session share the canonical balance: {declarative:?}"
+    );
+    assert!(
+        !codes(&compiled).contains(&"E_BALANCE_MISMATCH".to_string()),
+        "{compiled:?}"
+    );
+}
+
+#[test]
+fn balance_rule_icf_hours_decimal_rounding() {
+    let rules = COACHING_EXT_BALANCE_RULE;
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 session {ADA} 1h30m paid note:{NOTE}\n\
+                     2026-10-02 session {ADA} 45m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} icf_hours 2.25\n"
+                ),
+            );
+        },
+        rules,
+    );
+    assert!(
+        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        "135 minutes is exactly 2.25h in hundredths: {declarative:?}"
+    );
+
+    // A mismatch renders the decimal, not a float: 135m computed vs 2.30.
+    let (_, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 session {ADA} 1h30m paid note:{NOTE}\n\
+                     2026-10-02 session {ADA} 45m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} icf_hours 2.30\n"
+                ),
+            );
+        },
+        rules,
+    );
+    let mismatch = ext_findings(&declarative, "E_COACHING_EXT_BALANCE");
+    assert_eq!(mismatch.len(), 1, "{declarative:?}");
+    assert_eq!(
+        mismatch[0]["message"],
+        "icf_hours asserted 2.30, computed 2.25"
+    );
+}
+
+#[test]
+fn balance_rule_mismatch_matches_golden() {
+    // The same vault as `balance_mismatch_golden`: open 6, one paid
+    // session, assert 4 (computed 5). The fixture's finding must equal the
+    // compiled finding field for field, modulo the pack's code.
+    let (compiled, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            note(root, NOTE, ADA, "2026-10-01");
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
+                     2026-10-08 balance {ADA} sessions_remaining 4\n"
+                ),
+            );
+        },
+        COACHING_EXT_BALANCE_RULE,
+    );
+    let golden: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("balance_mismatch.json")).unwrap())
+            .unwrap();
+    let golden_finding = &golden["findings"].as_array().unwrap()[0];
+    let compiled_finding = &compiled["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "E_BALANCE_MISMATCH")
+        .expect("compiled mismatch");
+    assert_eq!(golden_finding, *compiled_finding, "compiled side drifted");
+
+    let declarative_finding = &ext_findings(&declarative, "E_COACHING_EXT_BALANCE")[0];
+    for field in ["severity", "message", "fix", "file", "line", "id"] {
+        assert_eq!(
+            golden_finding[field], declarative_finding[field],
+            "field {field} differs from the golden"
+        );
+    }
+}
+
+#[test]
+fn balance_rule_matches_compiled_coaching() {
+    // One vault that exercises every balance code the kind emits, on both
+    // packs: the normalized findings must be equal.
+    let (compiled, declarative) = assert_balance_parity(
+        |root| {
+            person(root, ADA, "Ada Example");
+            person(root, BEA, "Bea Demo");
+            note(root, NOTE, BEA, "2026-10-03");
+            write(
+                root,
+                "ledger/2026/08.cfd",
+                &format!(
+                    "2026-08-01 open {BEA} package {PKG} 3 sessions\n\
+                     2026-08-01 open {ADA} package bad-package 2 sessions\n\
+                     2026-08-02 open {ADA} package {PKG2} two sessions\n\
+                     2026-08-03 open {ADA} 6\n\
+                     2026-08-04 open {ADA} package {PKG2} 100001 sessions\n\
+                     2026-08-05 open {ADA} package {PKG2} 1 sessions\n"
+                ),
+            );
+            write(
+                root,
+                "ledger/2026/10.cfd",
+                &format!(
+                    "2026-10-01 merge {BEA} into {ADA}\n\
+                     2026-10-02 session {ADA} 1h30m paid note:{NOTE}\n\
+                     2026-10-03 session {BEA} 45m pps note:{NOTE}\n\
+                     2026-10-04 session {ADA} 30m comp note:{NOTE}\n\
+                     2026-10-08 balance {ADA} sessions_remaining 4\n\
+                     2026-10-08 balance {ADA} icf_hours 2.30\n"
+                ),
+            );
+        },
+        COACHING_EXT_BALANCE_RULE,
+    );
+    assert!(
+        !balance_findings(&compiled, BALANCE_CODE_MAP).is_empty(),
+        "the fixture must trigger something: {compiled:?}"
+    );
+    assert_eq!(
+        balance_findings(&compiled, BALANCE_CODE_MAP),
+        balance_findings(&declarative, BALANCE_CODE_MAP)
+    );
+}
+
+/// The fixture with one parameter patched, for the loader negatives.
+fn install_invalid_coaching_ext(root: &Path, rules: &str) {
+    install_coaching_ext(root, &coaching_ext_manifest(rules));
+    coaching_ext_vault(root, COACHING_EXT_CHECKS);
+}
+
+fn assert_pack_invalid(root: &Path) {
+    let json = report_json(root, None);
+    assert!(
+        codes(&json).contains(&"E_PACK_INVALID".to_string()),
+        "expected E_PACK_INVALID: {json:?}"
+    );
+}
+
+#[test]
+fn balance_rule_loader_refuses_undeclared_units_metric() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_BALANCE_RULE.replace(
+            "units_metric = \"sessions_remaining\"",
+            "units_metric = \"ghost_metric\"",
+        ),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn balance_rule_loader_refuses_same_verbs() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_BALANCE_RULE.replace("consume_verb = \"session\"", "consume_verb = \"open\""),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn balance_rule_loader_refuses_zero_cap_and_negative_cap() {
+    for cap in ["0", "-1"] {
+        let dir = tempfile::tempdir().unwrap();
+        person(dir.path(), ADA, "Ada Example");
+        install_invalid_coaching_ext(
+            dir.path(),
+            &COACHING_EXT_BALANCE_RULE
+                .replace("max_open_n = 100000", &format!("max_open_n = {cap}")),
+        );
+        assert_pack_invalid(dir.path());
+    }
+}
+
+#[test]
+fn balance_rule_loader_refuses_builtin_code_param() {
+    // #494/PD13: an external pack may not set any of the kind's code
+    // parameters to a builtin code, even when the manifest declares the
+    // pack-own code it could use instead.
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    install_invalid_coaching_ext(
+        dir.path(),
+        &COACHING_EXT_BALANCE_RULE.replace(
+            "parse_code = \"E_COACHING_EXT_PARSE\"",
+            "parse_code = \"E_PARSE\"",
+        ),
+    );
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn balance_rule_loader_refuses_metric_owned_twice() {
+    // Two ledger-balance rules sharing a metric would verify each
+    // `balance` line twice; the loader refuses the pack.
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let two_rules = format!(
+        "{COACHING_EXT_BALANCE_RULE}\n{}",
+        COACHING_EXT_BALANCE_RULE.replace("id = \"balance\"", "id = \"balance2\"")
+    );
+    install_invalid_coaching_ext(dir.path(), &two_rules);
+    assert_pack_invalid(dir.path());
+}
+
+#[test]
+fn balance_rule_balance_nonnegative_off_keeps_mismatch() {
+    // The managed-severity decision: `balance_nonnegative = "off"`
+    // suppresses only the negative-balance finding. A wrong `balance`
+    // line must still report the mismatch, so turning the key off cannot
+    // silently stop assertions from being verified.
+    let setup = |root: &Path| {
+        person(root, ADA, "Ada Example");
+        let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+        for day in 1..=7 {
+            ledger.push_str(&format!("2026-10-{day:02} session {ADA} 60m paid\n"));
+        }
+        ledger.push_str(&format!("2026-10-08 balance {ADA} sessions_remaining 5\n"));
+        write(root, "ledger/2026/10.cfd", &ledger);
+    };
+
+    let off_dir = tempfile::tempdir().unwrap();
+    setup(off_dir.path());
+    install_coaching_ext(
+        off_dir.path(),
+        &coaching_ext_manifest(COACHING_EXT_BALANCE_RULE),
+    );
+    coaching_ext_vault(
+        off_dir.path(),
+        "coaching-ext.balance_nonnegative = \"off\"\n",
+    );
+    let off = report_json(off_dir.path(), None);
+    assert!(
+        ext_findings(&off, "E_COACHING_EXT_NEGATIVE").is_empty(),
+        "off must suppress the negative finding: {off:?}"
+    );
+    let mismatch = ext_findings(&off, "E_COACHING_EXT_BALANCE");
+    assert_eq!(mismatch.len(), 1, "{off:?}");
+    assert_eq!(
+        mismatch[0]["message"],
+        "sessions_remaining asserted 5, computed -1"
+    );
+
+    // The positive control: with the key on, both findings appear.
+    let on_dir = tempfile::tempdir().unwrap();
+    setup(on_dir.path());
+    install_coaching_ext(
+        on_dir.path(),
+        &coaching_ext_manifest(COACHING_EXT_BALANCE_RULE),
+    );
+    coaching_ext_vault(on_dir.path(), COACHING_EXT_CHECKS);
+    let on = report_json(on_dir.path(), None);
+    assert_eq!(
+        ext_findings(&on, "E_COACHING_EXT_NEGATIVE").len(),
+        1,
+        "{on:?}"
+    );
+    assert_eq!(
+        ext_findings(&on, "E_COACHING_EXT_BALANCE").len(),
+        1,
+        "{on:?}"
+    );
+}

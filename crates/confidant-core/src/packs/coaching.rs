@@ -9,13 +9,20 @@ use serde::{Deserialize, Serialize};
 use crate::check::{duration_of, Finding, FindingCode, MergeMap, Severity};
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
-use crate::ledger::{minutes_to_hundredths, parse_decimal_hundredths, parse_strict_date, Arg};
+use crate::ledger::{parse_decimal_hundredths, parse_strict_date, Arg};
 use crate::packs::manifest::{parse_manifest, PackManifest};
+use crate::packs::rules::ledger::{
+    billing_tag_count, fold as fold_ledger, format_hundredths, FoldParams, LedgerFacts,
+    LedgerIssue, BILLING_TAGS, DEFAULT_MAX_OPEN_N,
+};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::record::RecordKind;
 use crate::vault::{SourcedEntry, Vault};
 
-const MAX_OPEN_N: i64 = 100_000;
+/// The compiled pack's state is the shared ledger facts, so the compiled
+/// behaviours and the `ledger-balance` rule kind cannot drift apart
+/// (#446).
+type CoachingState = LedgerFacts;
 
 /// Embedded manifest for `coaching@0.1` (spec §9). Vendored from
 /// `packs/coaching/manifest.toml` at the repo root: the path must stay
@@ -116,82 +123,6 @@ fn render_fix(
     manifest_claims().manifest.render_fix(code, variant, args)
 }
 
-#[derive(Clone, Debug)]
-struct OpenEvent {
-    date: NaiveDate,
-    n: i64,
-}
-
-#[derive(Clone, Debug)]
-struct SessionEvent {
-    date: NaiveDate,
-    minutes: Option<u32>,
-    pps: bool,
-    consumes: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PersonCoaching {
-    opens: Vec<OpenEvent>,
-    sessions: Vec<SessionEvent>,
-}
-
-impl PersonCoaching {
-    fn remaining_on(&self, on: NaiveDate) -> Option<i64> {
-        let mut opened: i64 = 0;
-        for o in self.opens.iter().filter(|o| o.date <= on) {
-            opened = opened.checked_add(o.n)?;
-        }
-        let used = i64::try_from(
-            self.sessions
-                .iter()
-                .filter(|s| s.date <= on && s.consumes)
-                .count(),
-        )
-        .ok()?;
-        opened.checked_sub(used)
-    }
-
-    fn minutes_on(&self, on: NaiveDate) -> u32 {
-        self.sessions
-            .iter()
-            .filter(|s| s.date <= on)
-            .filter_map(|s| s.minutes)
-            .fold(0u32, |acc, m| acc.saturating_add(m))
-    }
-
-    fn last_session_on(&self, on: NaiveDate) -> Option<NaiveDate> {
-        self.sessions
-            .iter()
-            .map(|s| s.date)
-            .filter(|d| *d <= on)
-            .max()
-    }
-
-    fn last_open_on(&self, on: NaiveDate) -> Option<NaiveDate> {
-        self.opens.iter().map(|o| o.date).filter(|d| *d <= on).max()
-    }
-
-    fn pps_in_lookback(&self, as_of: NaiveDate, window: chrono::Duration) -> bool {
-        self.sessions
-            .iter()
-            .any(|s| s.pps && s.date <= as_of && as_of.signed_duration_since(s.date) <= window)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CoachingState {
-    merge: crate::packs::groups::MergeGroups,
-    people: HashMap<RecordId, PersonCoaching>,
-    pub packages: HashSet<RecordId>,
-}
-
-impl PackState for CoachingState {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 /// The compiled coaching pack. Registered in [`crate::packs::ALL_PACKS`].
 pub struct CoachingPack;
 
@@ -218,14 +149,6 @@ fn billing_tag(entry: &LedgerEntry) -> Option<String> {
         }
     }
     None
-}
-
-fn format_hundredths(n: i64) -> String {
-    let sign = if n < 0 { "-" } else { "" };
-    let Some(n) = n.checked_abs() else {
-        return n.to_string();
-    };
-    format!("{sign}{}.{:02}", n / 100, n % 100)
 }
 
 impl Pack for CoachingPack {
@@ -452,122 +375,170 @@ fn check_balance(state: &CoachingState, sourced: &SourcedEntry, findings: &mut V
     }
 }
 
-impl CoachingState {
-    pub fn canonical_on(&self, id: &RecordId, on: NaiveDate) -> RecordId {
-        self.merge.canonical_on(id, on)
-    }
-
-    fn ensure_members(&self, on: NaiveDate) {
-        self.merge.ensure_members(self.people.keys().cloned(), on);
-    }
-
-    fn group_people<'a>(
-        &'a self,
-        groups: &'a HashMap<RecordId, Vec<RecordId>>,
-        id: &RecordId,
-        on: NaiveDate,
-    ) -> impl Iterator<Item = &'a PersonCoaching> {
-        let root = self.merge.canonical_on(id, on);
-        let members = groups.get(&root).map(Vec::as_slice).unwrap_or(&[]);
-        members.iter().filter_map(|pid| self.people.get(pid))
-    }
-
-    fn remaining_with(
-        &self,
-        groups: &HashMap<RecordId, Vec<RecordId>>,
-        id: &RecordId,
-        on: NaiveDate,
-    ) -> i64 {
-        let mut total: i64 = 0;
-        for person in self.group_people(groups, id, on) {
-            let Some(n) = person.remaining_on(on) else {
-                continue;
-            };
-            match total.checked_add(n) {
-                Some(sum) => total = sum,
-                None => return total,
-            }
-        }
-        total
-    }
-
-    pub fn sessions_remaining(&self, id: &RecordId) -> i64 {
-        self.sessions_remaining_on(id, NaiveDate::MAX)
-    }
-
-    pub fn sessions_remaining_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        self.ensure_members(on);
-        let groups = self.merge.groups();
-        self.remaining_with(groups.get(&on).expect("members cached"), id, on)
-    }
-
-    pub fn icf_hours_hundredths(&self, id: &RecordId) -> i64 {
-        self.icf_hours_hundredths_on(id, NaiveDate::MAX)
-    }
-
-    pub fn icf_hours_hundredths_on(&self, id: &RecordId, on: NaiveDate) -> i64 {
-        self.ensure_members(on);
-        let groups = self.merge.groups();
-        let mut minutes: u32 = 0;
-        for person in self.group_people(groups.get(&on).expect("members cached"), id, on) {
-            minutes = minutes.saturating_add(person.minutes_on(on));
-        }
-        minutes_to_hundredths(minutes)
-    }
-}
-
 fn fold(
     vault: &Vault,
     parent: MergeMap,
     as_of: NaiveDate,
     findings: &mut Vec<Finding>,
 ) -> CoachingState {
-    let mut state = CoachingState {
-        merge: crate::packs::groups::MergeGroups::new(parent),
-        people: HashMap::new(),
-        packages: HashSet::new(),
-    };
+    let folded = fold_ledger(
+        vault,
+        &crate::packs::groups::MergeGroups::new(parent),
+        FoldParams {
+            open_verb: "open",
+            consume_verb: "session",
+            max_open_n: DEFAULT_MAX_OPEN_N,
+        },
+    );
 
-    let mut events: Vec<_> = vault
-        .entries
-        .iter()
-        .filter(|s| s.entry.verb == "open" || s.entry.verb == "session")
-        .collect();
-    events.sort_by_key(|s| {
-        (
-            s.entry.date,
-            u8::from(s.entry.verb != "open"),
-            s.line,
-            s.file.clone(),
-        )
-    });
+    // Compile the fold's open issues into the compiled manifest's messages.
+    for (sourced, issue) in folded.issues {
+        let file = sourced.file.as_str();
+        let line = sourced.line;
+        let id = &sourced.entry.id;
+        let finding = match issue {
+            LedgerIssue::OpenShape => Finding::new(
+                FindingCode::OpenMalformed,
+                Severity::Error,
+                render_msg("E_OPEN_MALFORMED", "shape", &[]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(id)
+            .with_fix(render_msg("E_OPEN_MALFORMED", "shape_fix", &[])),
+            LedgerIssue::OpenInvalidPackageId => Finding::new(
+                FindingCode::InvalidId,
+                Severity::Error,
+                render_msg("E_INVALID_ID", "package", &[]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(id)
+            .with_fix(render_msg("E_INVALID_ID", "package_fix", &[])),
+            LedgerIssue::OpenNotInteger => Finding::new(
+                FindingCode::OpenMalformed,
+                Severity::Error,
+                render_msg("E_OPEN_MALFORMED", "not_integer", &[]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(id)
+            .with_fix(render_msg("E_OPEN_MALFORMED", "not_integer_fix", &[])),
+            LedgerIssue::OpenWrongPackageType(pkg) => Finding::new(
+                FindingCode::WrongIdType,
+                Severity::Error,
+                render_msg("E_WRONG_ID_TYPE", "package", &[("pkg", &pkg)]),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(id),
+            LedgerIssue::OpenExceedsCap(n) => Finding::new(
+                FindingCode::OpenMalformed,
+                Severity::Error,
+                render_msg(
+                    "E_OPEN_MALFORMED",
+                    "exceeds_cap",
+                    &[("n", &n), ("cap", &DEFAULT_MAX_OPEN_N)],
+                ),
+            )
+            .at_file(file)
+            .at_line(line)
+            .for_id(id)
+            .with_fix(render_msg(
+                "E_OPEN_MALFORMED",
+                "exceeds_cap_fix",
+                &[("cap", &DEFAULT_MAX_OPEN_N)],
+            )),
+            LedgerIssue::OpenTotalOverflow => {
+                let mut f = Finding::new(
+                    FindingCode::OpenMalformed,
+                    Severity::Error,
+                    render_msg("E_OPEN_MALFORMED", "total_overflow", &[("id", id)]),
+                )
+                .at_file(file)
+                .at_line(line)
+                .for_id(id);
+                if let Some(fx) = render_fix("E_OPEN_MALFORMED", "total_overflow", &[("id", id)]) {
+                    f = f.with_fix(fx);
+                }
+                f
+            }
+            LedgerIssue::MinutesOverflow => {
+                let mut f = Finding::new(
+                    FindingCode::Parse,
+                    Severity::Error,
+                    render_msg("E_PARSE", "minutes_overflow", &[("id", id)]),
+                )
+                .at_file(file)
+                .at_line(line)
+                .for_id(id);
+                if let Some(fx) = render_fix("E_PARSE", "minutes_overflow", &[("id", id)]) {
+                    f = f.with_fix(fx);
+                }
+                f
+            }
+        };
+        findings.push(finding);
+    }
 
-    for sourced in events {
-        let e = &sourced.entry;
-        if e.id.prefix() != Prefix::Person {
+    // Session checks stay with the compiled fold (the `session-checks`
+    // rule kind owns them for declarative packs, #447). The shared fold
+    // records the events; the messages are the compiled manifest's.
+    for sourced in &vault.entries {
+        let entry = &sourced.entry;
+        if entry.verb != "session" || entry.id.prefix() != Prefix::Person {
             continue;
         }
-        match e.verb.as_str() {
-            "open" => apply_open(&mut state, sourced.file.as_str(), sourced.line, e, findings),
-            "session" => {
-                apply_session(&mut state, sourced.file.as_str(), sourced.line, e, findings)
-            }
-            _ => {}
+        if duration_of(entry).is_none() {
+            findings.push(
+                Finding::new(
+                    FindingCode::MissingDuration,
+                    Severity::Error,
+                    render_msg("E_MISSING_DURATION", "default", &[("id", &entry.id)]),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&entry.id)
+                .with_fix(render_msg("E_MISSING_DURATION", "default_fix", &[])),
+            );
+        }
+        let tag_count = billing_tag_count(entry, &BILLING_TAGS);
+        if tag_count > 1 {
+            findings.push(
+                Finding::new(
+                    FindingCode::SessionTags,
+                    Severity::Error,
+                    render_msg("E_SESSION_TAGS", "default", &[("id", &entry.id)]),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&entry.id)
+                .with_fix(render_msg("E_SESSION_TAGS", "default_fix", &[])),
+            );
+        }
+        if tag_count == 0 {
+            findings.push(
+                Finding::new(
+                    FindingCode::SessionUntagged,
+                    Severity::Warning,
+                    render_msg("W_SESSION_UNTAGGED", "default", &[("id", &entry.id)]),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&entry.id)
+                .with_fix(render_msg("W_SESSION_UNTAGGED", "default_fix", &[])),
+            );
         }
     }
 
+    let state = folded.facts;
     let nonnegative = vault
         .config
         .checks
         .severity("coaching.balance_nonnegative", Severity::Error);
     if let Some(sev) = nonnegative {
-        state.ensure_members(as_of);
-        let groups = state.merge.groups();
-        let groups = groups.get(&as_of).expect("members cached");
-        let mut roots: Vec<_> = groups.keys().cloned().collect();
-        roots.sort();
-        for id in roots {
-            let remaining = state.remaining_with(groups, &id, as_of);
+        for id in state.roots_on(as_of) {
+            let remaining = state.sessions_remaining_on(&id, as_of);
             if remaining < 0 {
                 findings.push(
                     Finding::new(
@@ -590,225 +561,6 @@ fn fold(
         }
     }
     state
-}
-
-fn person_mut<'a>(state: &'a mut CoachingState, id: &RecordId) -> &'a mut PersonCoaching {
-    state.people.entry(id.clone()).or_default()
-}
-
-fn apply_open(
-    state: &mut CoachingState,
-    file: &str,
-    line: u32,
-    entry: &LedgerEntry,
-    findings: &mut Vec<Finding>,
-) {
-    match parse_open(entry) {
-        None => findings.push(
-            Finding::new(
-                FindingCode::OpenMalformed,
-                Severity::Error,
-                render_msg("E_OPEN_MALFORMED", "shape", &[]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("E_OPEN_MALFORMED", "shape_fix", &[])),
-        ),
-        Some(Err(OpenIssue::InvalidId(_raw))) => findings.push(
-            Finding::new(
-                FindingCode::InvalidId,
-                Severity::Error,
-                render_msg("E_INVALID_ID", "package", &[]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("E_INVALID_ID", "package_fix", &[])),
-        ),
-        Some(Err(OpenIssue::Malformed)) => findings.push(
-            Finding::new(
-                FindingCode::OpenMalformed,
-                Severity::Error,
-                render_msg("E_OPEN_MALFORMED", "not_integer", &[]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("E_OPEN_MALFORMED", "not_integer_fix", &[])),
-        ),
-        Some(Ok((pkg, n))) => {
-            if pkg.prefix() != Prefix::Package {
-                findings.push(
-                    Finding::new(
-                        FindingCode::WrongIdType,
-                        Severity::Error,
-                        render_msg("E_WRONG_ID_TYPE", "package", &[("pkg", &pkg)]),
-                    )
-                    .at_file(file)
-                    .at_line(line)
-                    .for_id(&entry.id),
-                );
-            }
-            if n > MAX_OPEN_N {
-                findings.push(
-                    Finding::new(
-                        FindingCode::OpenMalformed,
-                        Severity::Error,
-                        render_msg(
-                            "E_OPEN_MALFORMED",
-                            "exceeds_cap",
-                            &[("n", &n), ("cap", &MAX_OPEN_N)],
-                        ),
-                    )
-                    .at_file(file)
-                    .at_line(line)
-                    .for_id(&entry.id)
-                    .with_fix(render_msg(
-                        "E_OPEN_MALFORMED",
-                        "exceeds_cap_fix",
-                        &[("cap", &MAX_OPEN_N)],
-                    )),
-                );
-                return;
-            }
-            {
-                let person = person_mut(state, &entry.id);
-                let opened: Option<i64> = person
-                    .opens
-                    .iter()
-                    .try_fold(0i64, |acc, o| acc.checked_add(o.n));
-                if opened.and_then(|acc| acc.checked_add(n)).is_none() {
-                    let mut f = Finding::new(
-                        FindingCode::OpenMalformed,
-                        Severity::Error,
-                        render_msg("E_OPEN_MALFORMED", "total_overflow", &[("id", &entry.id)]),
-                    )
-                    .at_file(file)
-                    .at_line(line)
-                    .for_id(&entry.id);
-                    if let Some(fx) =
-                        render_fix("E_OPEN_MALFORMED", "total_overflow", &[("id", &entry.id)])
-                    {
-                        f = f.with_fix(fx);
-                    }
-                    findings.push(f);
-                    return;
-                }
-                person.opens.push(OpenEvent {
-                    date: entry.date,
-                    n,
-                });
-            }
-            state.packages.insert(pkg);
-        }
-    }
-}
-
-#[derive(Debug)]
-enum OpenIssue {
-    InvalidId(String),
-    Malformed,
-}
-
-fn parse_open(entry: &LedgerEntry) -> Option<Result<(RecordId, i64), OpenIssue>> {
-    let tokens: Vec<&str> = entry.args.iter().filter_map(Arg::as_token).collect();
-    if tokens.len() < 4 {
-        return None;
-    }
-    if tokens[0] != "package" || tokens[3] != "sessions" {
-        return None;
-    }
-    let pkg = match RecordId::parse(tokens[1]) {
-        Ok(id) => id,
-        Err(_) => return Some(Err(OpenIssue::InvalidId(tokens[1].to_owned()))),
-    };
-    let n: i64 = match tokens[2].parse() {
-        Ok(n) if n > 0 => n,
-        Ok(_) => return None,
-        Err(_) => return Some(Err(OpenIssue::Malformed)),
-    };
-    Some(Ok((pkg, n)))
-}
-
-fn apply_session(
-    state: &mut CoachingState,
-    file: &str,
-    line: u32,
-    entry: &LedgerEntry,
-    findings: &mut Vec<Finding>,
-) {
-    let duration = duration_of(entry);
-    if duration.is_none() {
-        findings.push(
-            Finding::new(
-                FindingCode::MissingDuration,
-                Severity::Error,
-                render_msg("E_MISSING_DURATION", "default", &[("id", &entry.id)]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("E_MISSING_DURATION", "default_fix", &[])),
-        );
-    }
-    let paid = entry.has_token("paid");
-    let pps = entry.has_token("pps");
-    let comp = entry.has_token("comp");
-    let tag_count = [paid, pps, comp].into_iter().filter(|tag| *tag).count();
-    if tag_count > 1 {
-        findings.push(
-            Finding::new(
-                FindingCode::SessionTags,
-                Severity::Error,
-                render_msg("E_SESSION_TAGS", "default", &[("id", &entry.id)]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("E_SESSION_TAGS", "default_fix", &[])),
-        );
-    }
-    if tag_count == 0 {
-        findings.push(
-            Finding::new(
-                FindingCode::SessionUntagged,
-                Severity::Warning,
-                render_msg("W_SESSION_UNTAGGED", "default", &[("id", &entry.id)]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id)
-            .with_fix(render_msg("W_SESSION_UNTAGGED", "default_fix", &[])),
-        );
-    }
-    // `paid` consumes. `pps` and `comp` never do. Untagged still consumes so
-    // balances cannot silently drop a session.
-    let consumes = paid || tag_count == 0;
-    let person = person_mut(state, &entry.id);
-    if let Some(mins) = duration {
-        let current = person.minutes_on(NaiveDate::MAX);
-        if current.checked_add(mins).is_none() {
-            let mut f = Finding::new(
-                FindingCode::Parse,
-                Severity::Error,
-                render_msg("E_PARSE", "minutes_overflow", &[("id", &entry.id)]),
-            )
-            .at_file(file)
-            .at_line(line)
-            .for_id(&entry.id);
-            if let Some(fx) = render_fix("E_PARSE", "minutes_overflow", &[("id", &entry.id)]) {
-                f = f.with_fix(fx);
-            }
-            findings.push(f);
-        }
-    }
-    person.sessions.push(SessionEvent {
-        date: entry.date,
-        minutes: duration,
-        pps,
-        consumes,
-    });
 }
 
 fn gap_rules(vault: &Vault, state: &CoachingState, as_of: NaiveDate, findings: &mut Vec<Finding>) {
@@ -1015,27 +767,14 @@ fn paid_session_gap(
     let lookback_i = i64::try_from(lookback).unwrap_or(i64::MAX);
     let window = chrono::Duration::days(days_i);
     let lookback_window = chrono::Duration::days(lookback_i);
-    state.ensure_members(as_of);
-    let groups = state.merge.groups();
-    let groups = groups.get(&as_of).expect("members cached");
-    let mut ids: Vec<_> = groups.keys().cloned().collect();
-    ids.sort();
-    for id in ids {
-        let remaining = state.remaining_with(groups, &id, as_of);
-        let pps_client = state
-            .group_people(groups, &id, as_of)
-            .any(|person| person.pps_in_lookback(as_of, lookback_window));
+    for id in state.roots_on(as_of) {
+        let remaining = state.sessions_remaining_on(&id, as_of);
+        let pps_client = state.pps_in_lookback(&id, as_of, lookback_window);
         if remaining <= 0 && !pps_client {
             continue;
         }
-        let last_session = state
-            .group_people(groups, &id, as_of)
-            .filter_map(|person| person.last_session_on(as_of))
-            .max();
-        let last_open = state
-            .group_people(groups, &id, as_of)
-            .filter_map(|person| person.last_open_on(as_of))
-            .max();
+        let last_session = state.last_session_on(&id, as_of);
+        let last_open = state.last_open_on(&id, as_of);
         let clock = match (last_session, last_open) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (Some(a), None) => Some(a),
@@ -1101,28 +840,10 @@ pub fn apply_duration_off(vault: &Vault, findings: &mut Vec<Finding>) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_open;
     use super::{CoachingPack, COACHING_MANIFEST_TOML};
     use crate::id::Prefix;
-    use crate::ledger::parse_line;
     use crate::packs::manifest::parse_manifest;
     use crate::packs::Pack;
-
-    #[test]
-    fn open_grammar() {
-        let e = parse_line(
-            "2026-10-01 open p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 6 sessions",
-        )
-        .unwrap()
-        .unwrap();
-        let (pkg, n) = parse_open(&e).unwrap().unwrap();
-        assert_eq!(n, 6);
-        assert_eq!(pkg.to_string(), "pkg-01M3TC5H00MPJG004SK4000009");
-        let bad = parse_line("2026-10-01 open p-01M3TC5H00MPJG000000000000 6")
-            .unwrap()
-            .unwrap();
-        assert!(parse_open(&bad).is_none());
-    }
 
     /// Parity test (#344): the manifest-derived claims must equal the
     /// `&'static` slices the trait served before the manifest existed.
