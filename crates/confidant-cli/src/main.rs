@@ -105,7 +105,7 @@ struct Cli {
 
     /// Pack scope for reads (`find`, `context`, `allowlist`,
     /// `record list`) and `mcp`. Comma-separated pack names, e.g.
-    /// `coaching@0.1`. Unset = all enabled packs. Naming an unknown or
+    /// `example-pack@0.1`. Unset = all enabled packs. Naming an unknown or
     /// disabled pack is a hard error. `init --create` also uses it to seed
     /// the vault's `packs` list, where only packs built into this binary
     /// are accepted. Ignored by `check` / `doctor` (always unscoped) and by
@@ -1818,7 +1818,7 @@ fn vault_root_required<'a>(root: Option<&'a Path>, what: &str) -> anyhow::Result
 }
 
 /// Refuse to install a reserved (`personal`) or built-in pack (PD14).
-/// Both can only come from the binary. `coaching` is an ordinary external
+/// Both can only come from the binary. An external pack is an ordinary
 /// pack since #449.
 fn refuse_uninstallable(name: &str, version: &str) -> anyhow::Result<()> {
     use confidant_core::packs::manifest::is_reserved_pack_name;
@@ -10421,6 +10421,11 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
         "unknown_agents": result.unknown_agents,
         "linked": result.linked_count(),
         "skipped": result.skipped_count(),
+        "removed_stale": result
+            .removed_stale
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
         "dry_run": result.dry_run,
     })
 }
@@ -10474,6 +10479,17 @@ fn cmd_setup(
                 );
                 if result.skipped_count() > 0 {
                     println!("  replace existing dirs with: confidant setup --force");
+                }
+                if !result.removed_stale.is_empty() {
+                    println!(
+                        "  {:<9} {} stale skill link(s)",
+                        if result.dry_run {
+                            "would drop"
+                        } else {
+                            "removed"
+                        },
+                        result.removed_stale.len()
+                    );
                 }
                 if result.dry_run {
                     println!("  re-run without --dry-run to apply");
@@ -10715,6 +10731,13 @@ fn relink_after_update(
             "re-linked {} skills → {}",
             result.linked_count(),
             result.agent_labels().join(", ")
+        );
+    }
+    if !result.removed_stale.is_empty() {
+        println!(
+            "{} {} stale skill link(s)",
+            if dry_run { "would remove" } else { "removed" },
+            result.removed_stale.len()
         );
     }
     Ok(ExitCode::SUCCESS)

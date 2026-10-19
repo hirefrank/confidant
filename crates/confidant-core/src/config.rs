@@ -368,11 +368,11 @@ impl VaultConfig {
             }
             // Legacy bare pack key: `[checks] <pack> = <value>` is accepted
             // when `<pack>` is a known pack name (#433; was hard-coded to
-            // coaching/personal). Only the key itself matches a pack name:
+            // the pack names). Only the key itself matches a pack name:
             // a *leaf* under a pack name is not automatically known. A
-            // declared leaf (`coaching.paid_session_gap_days`) was already
+            // declared leaf (`example-pack.gap_days`) was already
             // accepted above by the severity/int key checks; an undeclared
-            // one (`coaching.bogus`, or a typo) is still an unknown key
+            // one (`example-pack.bogus`, or a typo) is still an unknown key
             // rather than a silently ignored config line.
             if manifests.iter().any(|m| m.pack.name == key.as_str()) {
                 continue;
@@ -554,16 +554,16 @@ mod tests {
     use super::{VaultConfig, MAX_GAP_DAYS};
     use crate::check::{Finding, Severity};
 
-    /// Run config validation with the shipped external coaching manifest
-    /// appended, the way a vault load does after #449 (#438).
-    fn config_findings_with_coaching(cfg: &mut VaultConfig) -> Vec<Finding> {
+    /// Run config validation with the neutral external example-pack manifest
+    /// appended, the way a vault load does for an external pack (#438).
+    fn config_findings_with_example_pack(cfg: &mut VaultConfig) -> Vec<Finding> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../packs/coaching/manifest.toml"
+            "/../../testdata/packs/example-pack/manifest.toml"
         );
-        let text = std::fs::read_to_string(path).expect("shipped coaching manifest");
+        let text = std::fs::read_to_string(path).expect("example pack manifest");
         let manifest =
-            crate::packs::manifest::parse_manifest_external(&text).expect("coaching manifest");
+            crate::packs::manifest::parse_manifest_external(&text).expect("example pack manifest");
         let mut manifests = crate::packs::pack_manifests_for_config();
         manifests.push(&manifest);
         cfg.config_findings_with(&manifests)
@@ -574,28 +574,27 @@ mod tests {
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "abc"
 
 [checks]
-coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.paid_session_gap_days = 45
+example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.gap_days = 45
 "#,
         )
         .unwrap();
-        assert!(config_findings_with_coaching(&mut cfg).is_empty());
+        assert!(config_findings_with_example_pack(&mut cfg).is_empty());
         assert_eq!(cfg.spec, "0.1");
-        assert!(cfg.has_pack("coaching@0.1"));
+        assert!(cfg.has_pack("example-pack@0.1"));
         assert_eq!(
             cfg.checks
-                .severity("coaching.require_duration", Severity::Warning),
+                .severity("example-pack.require_duration", Severity::Warning),
             Some(Severity::Error)
         );
-        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(45));
+        assert_eq!(cfg.checks.int("example-pack.gap_days"), Some(45));
         assert_eq!(
-            cfg.checks
-                .severity("coaching.session_notes", Severity::Warning),
+            cfg.checks.severity("example-pack.notes", Severity::Warning),
             Some(Severity::Warning)
         );
     }
@@ -607,13 +606,12 @@ coaching.paid_session_gap_days = 45
 spec = "0.1"
 vault_id = "abc"
 [checks]
-coaching.session_notes = "off"
+example-pack.notes = "off"
 "#,
         )
         .unwrap();
         assert_eq!(
-            cfg.checks
-                .severity("coaching.session_notes", Severity::Warning),
+            cfg.checks.severity("example-pack.notes", Severity::Warning),
             None
         );
     }
@@ -625,19 +623,16 @@ coaching.session_notes = "off"
 spec = "0.1"
 vault_id = "abc"
 [checks]
-coaching.session_notes = "warn"
-coaching.paid_session_gap = "disable"
-coaching.paid_session_gap_days = 999999
+example-pack.notes = "warn"
+example-pack.gap = "disable"
+example-pack.gap_days = 999999
 unknown_key = true
 "#,
         )
         .unwrap();
-        let findings = config_findings_with_coaching(&mut cfg);
+        let findings = config_findings_with_example_pack(&mut cfg);
         assert!(findings.iter().any(|f| f.code.as_str() == "E_CONFIG"));
-        assert_eq!(
-            cfg.checks.int("coaching.paid_session_gap_days"),
-            Some(MAX_GAP_DAYS)
-        );
+        assert_eq!(cfg.checks.int("example-pack.gap_days"), Some(MAX_GAP_DAYS));
         assert!(findings.iter().any(|f| f.message.contains("warn")));
         assert!(findings.iter().any(|f| f.message.contains("unknown")));
     }
@@ -657,7 +652,7 @@ vault_id = "abc"
         assert_eq!(cfg.checks.date_upcoming_days(), 7);
         // Coaching is external now, so its defaults arrive only with its
         // manifest (the vault load appends it, #449).
-        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), None);
+        assert_eq!(cfg.checks.int("example-pack.gap_days"), None);
     }
 
     #[test]
@@ -815,12 +810,12 @@ vault_id = "abc"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "abc"
 [checks]
-coaching.require_duration = "error"
-coaching.paid_session_gap_days = 45
-coaching.bogus = "warning"
+example-pack.require_duration = "error"
+example-pack.gap_days = 45
+example-pack.bogus = "warning"
 "#,
         )
         .unwrap();
@@ -830,20 +825,20 @@ coaching.bogus = "warning"
             assert_eq!(f.code.as_str(), "E_CONFIG");
             assert!(
                 f.message
-                    .contains("requires pack coaching@0.1, which is not installed"),
+                    .contains("requires pack example-pack@0.1, which is not installed"),
                 "{f:?}"
             );
         }
         assert!(
             findings
                 .iter()
-                .any(|f| f.message.contains("'coaching.require_duration'")),
+                .any(|f| f.message.contains("'example-pack.require_duration'")),
             "{findings:?}"
         );
         assert!(
             findings
                 .iter()
-                .any(|f| f.message.contains("'coaching.paid_session_gap_days'")),
+                .any(|f| f.message.contains("'example-pack.gap_days'")),
             "{findings:?}"
         );
         for f in &findings {
@@ -860,10 +855,10 @@ coaching.bogus = "warning"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["other-pack@0.1"]
 vault_id = "abc"
 [checks]
-coaching = "error"
+other-pack = "error"
 "#,
         )
         .unwrap();
@@ -872,7 +867,7 @@ coaching = "error"
         assert!(
             findings[0]
                 .message
-                .contains("'coaching' requires pack coaching@0.1"),
+                .contains("'other-pack' requires pack other-pack@0.1"),
             "{findings:?}"
         );
         assert!(!findings[0]
@@ -884,9 +879,9 @@ coaching = "error"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["other-pack@0.1"]
 vault_id = "abc"
-[checks.coaching]
+[checks.other-pack]
 "#,
         )
         .unwrap();
@@ -895,7 +890,7 @@ vault_id = "abc"
         assert!(
             findings[0]
                 .message
-                .contains("'coaching' requires pack coaching@0.1"),
+                .contains("'other-pack' requires pack other-pack@0.1"),
             "{findings:?}"
         );
     }
@@ -908,21 +903,21 @@ vault_id = "abc"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "abc"
 [checks]
-coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.bogus = "warning"
+example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.bogus = "warning"
 "#,
         )
         .unwrap();
-        let findings = config_findings_with_coaching(&mut cfg);
+        let findings = config_findings_with_example_pack(&mut cfg);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
             findings[0]
                 .message
-                .contains("unknown [checks] key 'coaching.bogus'"),
+                .contains("unknown [checks] key 'example-pack.bogus'"),
             "{findings:?}"
         );
         assert!(findings[0]
@@ -939,7 +934,7 @@ coaching.bogus = "warning"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "abc"
 [checks]
 bogus.key = 1
@@ -965,10 +960,10 @@ otherpack.thing = "error"
         let mut cfg = VaultConfig::parse(
             r#"
 spec = "0.1"
-packs = ["coaching@nightly"]
+packs = ["other-pack@nightly"]
 vault_id = "abc"
 [checks]
-coaching.require_duration = "error"
+example-pack.require_duration = "error"
 "#,
         )
         .unwrap();
@@ -977,7 +972,7 @@ coaching.require_duration = "error"
         assert!(
             findings[0]
                 .message
-                .contains("unknown [checks] key 'coaching.require_duration'"),
+                .contains("unknown [checks] key 'example-pack.require_duration'"),
             "{findings:?}"
         );
         assert!(!findings[0].message.contains("nightly"), "{findings:?}");
@@ -1043,15 +1038,15 @@ example.window_days = 10
 
     #[test]
     fn set_packs_preserves_comments_and_rewrites_in_place() {
-        let text = "spec = \"0.1\"\n# which packs this vault enables\npacks = [\"coaching@0.1\"]\nvault_id = \"x\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
+        let text = "spec = \"0.1\"\n# which packs this vault enables\npacks = [\"example-pack@0.1\"]\nvault_id = \"x\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
         let out = VaultConfig::set_packs(
             text,
-            &["coaching@0.1".to_owned(), "example-pack@0.1".to_owned()],
+            &["example-pack@0.1".to_owned(), "other-pack@0.1".to_owned()],
         )
         .unwrap();
         assert!(out.contains("# which packs this vault enables"), "{out}");
         assert!(
-            out.contains("packs = [\"coaching@0.1\", \"example-pack@0.1\"]"),
+            out.contains("packs = [\"example-pack@0.1\", \"other-pack@0.1\"]"),
             "{out}"
         );
         assert!(
@@ -1060,7 +1055,7 @@ example.window_days = 10
         );
         assert_eq!(
             VaultConfig::parse(&out).unwrap().packs,
-            vec!["coaching@0.1", "example-pack@0.1"]
+            vec!["example-pack@0.1", "other-pack@0.1"]
         );
     }
 

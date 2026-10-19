@@ -6,7 +6,7 @@ use std::process::Command;
 
 mod common;
 
-use common::install_shipped_coaching;
+use common::install_example_pack;
 
 use serde_json::Value;
 
@@ -27,12 +27,12 @@ const PKG: &str = "pkg-01J9Z3K4QF0000000000000000";
 fn make_vault() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    install_shipped_coaching(root);
+    install_example_pack(root);
     std::fs::write(
         root.join("confidant.toml"),
         // Spec 3 (B10): the plaintext-write fixture declares the opt-out,
         // so the suite keeps exercising the plaintext path.
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -46,7 +46,7 @@ fn make_vault() -> tempfile::TempDir {
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package {PKG} 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package {PKG} 4 sessions\n"),
     )
     .unwrap();
     git(root, &["init", "-q"]);
@@ -411,7 +411,7 @@ fn conflict_markers_block_write() {
     let vroot = vault_arg(root);
     std::fs::write(
         root.join("ledger/2026/10.cfd"),
-        format!("2026-10-01 open {PERSON} package {PKG} 4 sessions\n<<<<<<< HEAD\n"),
+        format!("2026-10-01 grant {PERSON} package {PKG} 4 sessions\n<<<<<<< HEAD\n"),
     )
     .unwrap();
     git(root, &["add", "-A"]);
@@ -453,7 +453,7 @@ fn import_appends_validated_lines() {
     let file = scratch.path().join("import.cfd");
     std::fs::write(
         &file,
-        format!("2026-10-03 session {PERSON} 45m pps\n; a comment\n\n2026-11-01 session {PERSON} 30m comp\n"),
+        format!("2026-10-03 use {PERSON} 45m full\n; a comment\n\n2026-11-01 use {PERSON} 30m metered\n"),
     )
     .unwrap();
     let (ok, v) = run_json(&[
@@ -470,8 +470,8 @@ fn import_appends_validated_lines() {
     // Lines land in the monthly file matching their date.
     let oct = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     let nov = std::fs::read_to_string(root.join("ledger/2026/11.cfd")).unwrap();
-    assert!(oct.contains("45m pps"));
-    assert!(nov.contains("30m comp"));
+    assert!(oct.contains("45m full"));
+    assert!(nov.contains("30m metered"));
     assert_eq!(commits(root), 2);
 }
 
@@ -513,7 +513,7 @@ fn import_refuses_a_dirty_target_month_file() {
     let before_commits = commits(root);
 
     let file = scratch.path().join("import.cfd");
-    std::fs::write(&file, format!("2026-10-06 session {PERSON} 45m pps\n")).unwrap();
+    std::fs::write(&file, format!("2026-10-06 use {PERSON} 45m full\n")).unwrap();
     let (ok, v) = run_json(&[
         "import",
         "--file",
@@ -547,7 +547,7 @@ fn import_refuses_a_dirty_target_month_file() {
     assert!(ok, "{v}");
     assert!(std::fs::read_to_string(&ledger)
         .unwrap()
-        .contains("45m pps"));
+        .contains("45m full"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1263,7 +1263,7 @@ fn cadence_overdue_clears_after_interaction_logged() {
     // the person a cadence with no contact on record.
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\nexample-pack.notes = \"off\"\nexample-pack.gap = \"off\"\n\n[crypto]\nmode = \"plaintext\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -1339,7 +1339,7 @@ fn write_commit_includes_agent_trailer_when_set() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn context_bundle_has_coaching_facts() {
+fn context_bundle_has_pack_facts() {
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);
@@ -1352,33 +1352,52 @@ fn context_bundle_has_coaching_facts() {
         .as_str()
         .unwrap()
         .contains("Test bio"));
-    assert_eq!(v["coaching"]["sessions_remaining"], 4);
-    // #177: pack state is grouped by pack; `coaching` duplicates the entry.
-    assert_eq!(v["packs"]["coaching@0.1"]["sessions_remaining"], 4);
+    // The pack opts into the ledger-sessions view; its entry carries the
+    // computed balance. No shipped pack owns the legacy top-level field.
+    assert_eq!(v["packs"]["example-pack@0.1"]["sessions_remaining"], 4);
 }
 
 #[test]
 fn context_honors_no_ai() {
-    // The demo vault ships a fake no-ai person.
-    let no_ai = "p-01M3TC5H00MPJG001248000002";
-    let demo_str = demo().display().to_string();
-    let (ok, v) = run_json(&[
-        "context",
-        no_ai,
-        "--json",
-        "--no-input",
-        "--vault",
-        &demo_str,
-    ]);
+    // A local no-ai person: the demo vault is personal-only and carries no
+    // no-ai record.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let no_ai = "p-01J9Z3K4QF0000000000000009";
+    install_example_pack(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(format!("people/{no_ai}"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{no_ai}/profile.md")),
+        format!("---\nid: {no_ai}\ntype: person\nname: \"Hidden Person\"\nno-ai: true\n---\n\nSecret bio.\n"),
+    )
+    .unwrap();
+    let nid = "n-01J9Z3K4QF0000000000000008";
+    std::fs::create_dir_all(root.join(format!("people/{no_ai}/notes"))).unwrap();
+    std::fs::write(
+        root.join(format!("people/{no_ai}/notes/{nid}.md")),
+        format!(
+            "---\nid: {nid}\ntype: note\nperson: {no_ai}\ndate: 2026-10-01\n---\n\nHidden note.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&["context", no_ai, "--json", "--no-input", "--vault", &vroot]);
     assert!(ok, "{v}");
     assert_eq!(v["person"]["no_ai"], true);
     assert_eq!(v["person"]["name"], Value::Null);
     assert_eq!(v["person"]["profile"], Value::Null);
-    for note in v["notes"].as_array().unwrap() {
-        assert_eq!(note["body"], Value::Null);
-    }
-    // Ledger facts are metadata, not content: still present.
-    assert!(v["coaching"]["sessions_remaining"].is_number());
+    assert_eq!(v["notes"], serde_json::json!([]));
 }
 
 #[test]
@@ -2351,24 +2370,30 @@ fn mcp_tool_failure_returns_cli_error_envelope() {
 
 #[test]
 fn mcp_context_honors_no_ai_by_default() {
-    let resps = mcp_exchange(
-        demo().as_path(),
-        &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"context","arguments":{"person":"p-01M3TC5H00MPJG001248000002"}}}"#,
-        ],
+    let dir = make_vault();
+    let root = dir.path();
+    std::fs::write(
+        root.join(format!("people/{PERSON}/profile.md")),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Hidden Person\"\nno-ai: true\n---\n\nHidden body.\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "no-ai fixture"]);
+    let msg = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"context","arguments":{{"person":"{PERSON}"}}}}}}"#
     );
+    let resps = mcp_exchange(root, &[msg.as_str()]);
     let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        !text.contains("Cam Sample"),
+        !text.contains("Hidden Person"),
         "no-ai person name leaked through MCP: {text}"
     );
     assert!(
-        !text.contains("Fake client"),
+        !text.contains("Hidden body"),
         "no-ai body leaked through MCP: {text}"
     );
     let body: Value = serde_json::from_str(text).unwrap();
     assert_eq!(body["ok"], true);
-    assert!(body["vault"].as_str().unwrap().contains("demo-vault"));
 }
 
 #[test]
@@ -2387,28 +2412,26 @@ fn mcp_unknown_tool_is_error_content() {
 // #183: warnings never block writes
 // ---------------------------------------------------------------------------
 //
-// The personal pack's cadence/date warnings (W_CADENCE_OVERDUE,
-// W_DATE_UPCOMING) do not exist yet — they arrive with #184. The guarantee
-// below is producer-independent, so it is tested with the warning findings
-// that exist today (coaching warnings). No code change was needed: every
-// gate already thresholds on errors (write.rs pre/post checks and doctor
-// use CheckOptions::default() -> Error; the inbox merge passes
-// fail_on: Error explicitly). These tests lock that in.
+// The guarantee below is producer-independent, so it is tested with a
+// pack warning. No code change was needed: every gate already thresholds on
+// errors (write.rs pre/post checks and doctor use CheckOptions::default() ->
+// Error; the inbox merge passes fail_on: Error explicitly). These tests lock
+// that in.
 
-/// A vault whose only findings are warnings: one untagged session fires
-/// `W_COACHING_SESSION_UNTAGGED` (warning) plus the no-notes warning. No errors
-/// can arise from this fixture at any as-of: every rule that can fire
-/// here is warning-severity.
+/// A vault whose only findings are warnings: one untagged entry fires
+/// `W_EXAMPLE_UNTAGGED` (warning) plus the no-notes warning. No errors can
+/// arise from this fixture at any as-of: every rule that can fire here is
+/// warning-severity.
 fn make_warning_vault() -> tempfile::TempDir {
     let dir = make_vault();
     let root = dir.path();
-    // Untagged session: consumes a slot, fires W_COACHING_SESSION_UNTAGGED.
+    // Untagged use: consumes a slot, fires W_EXAMPLE_UNTAGGED.
     let ledger = root.join("ledger/2026/10.cfd");
     let mut text = std::fs::read_to_string(&ledger).unwrap();
-    text.push_str(&format!("2026-10-02 session {PERSON} 60m\n"));
+    text.push_str(&format!("2026-10-02 use {PERSON} 60m\n"));
     std::fs::write(&ledger, text).unwrap();
     git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "untagged session"]);
+    git(root, &["commit", "-qm", "untagged entry"]);
     dir
 }
 
@@ -2439,7 +2462,7 @@ fn warnings_never_block_writes() {
     assert_eq!(v["summary"]["errors"], 0);
     assert!(v["summary"]["warnings"].as_u64().unwrap() >= 1);
     assert!(
-        finding_codes(&v).contains(&"W_COACHING_SESSION_UNTAGGED".to_string()),
+        finding_codes(&v).contains(&"W_EXAMPLE_UNTAGGED".to_string()),
         "{v}"
     );
     // The write succeeds despite the warnings: exactly one new commit.
@@ -2481,26 +2504,26 @@ fn check_fail_on_warning_exits_nonzero_while_default_exits_zero() {
 
 #[test]
 fn check_as_of_makes_gap_warnings_deterministic() {
-    // Paid client: open 4 sessions + one paid session on 2026-10-01, so
-    // sessions_remaining is 3 and the gap clock starts 2026-10-01.
+    // Client: grant 4 units + one entry on 2026-10-01, so units_remaining
+    // is 3 and the gap clock starts 2026-10-01.
     let dir = make_vault();
     let root = dir.path();
     let ledger = root.join("ledger/2026/10.cfd");
     let mut text = std::fs::read_to_string(&ledger).unwrap();
-    text.push_str(&format!("2026-10-01 session {PERSON} 60m paid\n"));
+    text.push_str(&format!("2026-10-01 use {PERSON} 60m full\n"));
     std::fs::write(&ledger, text).unwrap();
     git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "paid session"]);
+    git(root, &["commit", "-qm", "entry"]);
     // 7 days after the last activity: inside the 45-day gap window.
     let (_, early) = check_report(root, &["--as-of", "2026-10-08"]);
     assert!(
-        !finding_codes(&early).contains(&"E_COACHING_PAID_SESSION_GAP".to_string()),
+        !finding_codes(&early).contains(&"E_EXAMPLE_GAP".to_string()),
         "{early}"
     );
     // 61 days after: outside the window, the gap warning fires.
     let (_, late) = check_report(root, &["--as-of", "2026-12-01"]);
     assert!(
-        finding_codes(&late).contains(&"E_COACHING_PAID_SESSION_GAP".to_string()),
+        finding_codes(&late).contains(&"E_EXAMPLE_GAP".to_string()),
         "{late}"
     );
     // Same as-of twice: identical findings (deterministic).
@@ -2757,7 +2780,7 @@ fn plaintext_vault_note_inherits_notes_mode_via_id_list_field() {
     assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
 }
 
-/// Append a no-op `personal@0.2` listing next to `coaching@0.1` and commit
+/// Append a no-op `personal@0.2` listing next to `example-pack@0.1` and commit
 /// the config change. #551: the built-in personal pack is implicit, so the
 /// listing changes nothing; the commit keeps the fixture's commit counts.
 fn enable_personal(root: &Path) {
@@ -2766,8 +2789,8 @@ fn enable_personal(root: &Path) {
     std::fs::write(
         &toml_path,
         toml.replace(
-            "packs = [\"coaching@0.1\"]",
-            "packs = [\"coaching@0.1\", \"personal@0.2\"]",
+            "packs = [\"example-pack@0.1\"]",
+            "packs = [\"example-pack@0.1\", \"personal@0.2\"]",
         ),
     )
     .unwrap();
@@ -2778,7 +2801,7 @@ fn enable_personal(root: &Path) {
 #[test]
 fn log_touch_works_without_listing_personal() {
     // #551: the built-in personal pack is implicit, so `log touch` works in
-    // a vault that only lists coaching.
+    // a vault that only lists the external pack.
     let dir = make_vault();
     let vroot = vault_arg(dir.path());
     let (ok, v) = run_json(&[

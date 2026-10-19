@@ -1,5 +1,5 @@
  1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
-vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
+vault  /fake/demo-vault   scope  personal@0.2   doctor  not run
 ╭ Filter ─╭─ Help ───────────────────────────────────────────────────────────────────────╮─────────╮
 │ press / │ Workspaces                                                                   │ple      │
 ╰─────────│   1 People & Search   2 Review Queue   3 Check   Tab/Shift-Tab cycles        │         │
@@ -8,9 +8,9 @@ vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
 │   W_DATE│   f search   s/t/n session/touch/note   a new person                         │         │
 │     birt│   s/t/n pre-fill the selected person; a composes a fresh one                 │         │
 │   People│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
-│ › Ada Ex│ Review Queue                                                                 │         │
+│ › Ada Ex│ Review Queue                                                                 │0008     │
 │   Bea De│   o Proposals   i Inbox   c Conflicts   r refresh   Enter open/detail        │         │
-│         │   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │0008     │
+│         │   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │         │
 │         │ Check                                                                        │         │
 │         │   3 Check   d Doctor   r refresh   x raw CLI output (from an alert)          │         │
 │         │ Anywhere                                                                     │         │

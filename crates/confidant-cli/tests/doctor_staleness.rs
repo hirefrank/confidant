@@ -346,7 +346,7 @@ fn doctor_skills_links_after_setup_is_ok() {
     let c = check(&v, "skills-links").expect("skills-links check missing");
     assert_eq!(c["status"], "ok", "{v}");
     let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("6/6"), "expected 6/6 linked: {msg}");
+    assert!(msg.contains("2/2"), "expected 2/2 linked: {msg}");
     assert!(msg.contains("claude-code"), "expected agent name: {msg}");
     assert_eq!(v["ok"], true, "{v}");
 }
@@ -385,7 +385,7 @@ fn doctor_skills_links_missing_warns() {
     let share_str = share.path().to_str().unwrap().to_owned();
     run_setup(&home_str, &share_str, "claude-code");
     // Break one link: targeted but incomplete.
-    remove_skill_entry(&home.path().join(".claude/skills/portal-sync"));
+    remove_skill_entry(&home.path().join(".claude/skills/pack-author"));
     let v = run_doctor_env(
         Some(&unreachable_url()),
         &DoctorEnv {

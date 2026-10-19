@@ -4,7 +4,7 @@ vault  /tmp/tui-test-proposals-dryrun   scope  not resolved yet   doctor  not ru
 │ command import                                                                                   │
 │                                                                                                  │
 │ ─── ledger/2026/09.cfd (append)                                                                  │
-│ 2026-09-01 open d-01M3TC5H00MPJG00248G000004 proposal src:test/1                                 │
+│ 2026-09-01 touch p-01M3TC5H00MPJG000000000000 call src:test/1                                    │
 │                                                                                                  │
 │ y: confirm and apply   Esc: back (nothing is written until you confirm)                          │
 │                                                                                                  │

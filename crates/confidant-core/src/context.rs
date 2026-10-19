@@ -370,37 +370,85 @@ mod tests {
         assert!(build_context(&vault, &id, true, &PackScope::All, false).is_none());
     }
 
-    fn demo_vault() -> crate::vault::Vault {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
-        crate::vault::load_vault(&root).unwrap()
+    fn example_pack_vault() -> (tempfile::TempDir, crate::vault::Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/packs/example-pack");
+        let dst = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&dst).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+        let hash = crate::packs::dir::read_pack_dir(&dst).unwrap().hash;
+        std::fs::write(
+            dir.path().join("confidant.lock"),
+            format!(
+                "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let ada = "p-01M3TC5H00MPJG000000000000";
+        std::fs::create_dir_all(dir.path().join("people").join(ada).join("notes")).unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("profile.md"),
+            format!("---\nid: {ada}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("notes/n-01M3TC5H00MPJG002NAM000005.md"),
+            format!("---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: {ada}\ndate: 2026-10-02\n---\n\nKickofftoken.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("notes/n-01M3TC5H00MPJG00600000000D.md"),
+            format!("---\nid: n-01M3TC5H00MPJG00600000000D\ntype: note\nperson: {ada}\ndate: 2026-10-04\n---\n\nUnattributed note.\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("interactions/i-01M3TC5H00MPJG0048H0000008"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("interactions/i-01M3TC5H00MPJG0048H0000008/interaction.md"),
+            format!("---\nid: i-01M3TC5H00MPJG0048H0000008\ntype: interaction\nname: Intro call\ndate: 2026-10-01\nperson: {ada}\n---\n\nFake call.\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!("2026-10-01 grant {ada} package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n2026-10-02 use {ada} 60m full note:n-01M3TC5H00MPJG002NAM000005\n"),
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        (dir, vault)
     }
 
-    fn coaching_scope() -> PackScope {
-        PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+    fn example_scope() -> PackScope {
+        PackScope::Only(["example-pack@0.1".to_string()].into_iter().collect())
     }
 
     #[test]
     fn scoped_context_hides_unattributed_notes_and_interactions() {
-        // Demo vault Ada: one session-linked note (coaching), one
-        // unattributed note, one unattributed interaction.
-        let vault = demo_vault();
+        let (_dir, vault) = example_pack_vault();
         let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
         let unscoped = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
         assert_eq!(unscoped.notes.len(), 2);
         assert_eq!(unscoped.interactions.len(), 1);
-        assert!(unscoped.coaching.is_some());
+        assert!(unscoped.packs.contains_key("example-pack@0.1"));
 
-        let scoped = build_context(&vault, &ada, true, &coaching_scope(), false).unwrap();
-        // Only the session-linked note survives; the unattributed note and
-        // the interaction are hidden. Core identity stays visible.
+        let scoped = build_context(&vault, &ada, true, &example_scope(), false).unwrap();
+        // Only the pack-linked note survives; the unattributed note and the
+        // interaction are hidden. Core identity stays visible.
         assert_eq!(scoped.notes.len(), 1);
         assert_eq!(scoped.notes[0].id, "n-01M3TC5H00MPJG002NAM000005");
         assert!(scoped.interactions.is_empty());
-        assert!(scoped.coaching.is_some());
+        assert!(scoped.packs.contains_key("example-pack@0.1"));
         assert_eq!(scoped.person.name.as_deref(), Some("Ada Example"));
-        assert!(!scoped.aliases.is_empty());
-        assert_eq!(scoped.scope, vec!["coaching@0.1"]);
+        assert_eq!(scoped.scope, vec!["example-pack@0.1"]);
     }
 
     #[test]
@@ -451,14 +499,13 @@ mod tests {
     #[test]
     fn scoped_context_drops_other_packs_views() {
         // The packs map only carries views for packs in scope.
-        let vault = demo_vault();
+        let (_dir, vault) = example_pack_vault();
         let ada = RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap();
-        let scoped = build_context(&vault, &ada, true, &coaching_scope(), false).unwrap();
-        assert!(scoped.packs.contains_key("coaching@0.1"));
+        let scoped = build_context(&vault, &ada, true, &example_scope(), false).unwrap();
+        assert!(scoped.packs.contains_key("example-pack@0.1"));
         let empty = PackScope::Only(std::collections::BTreeSet::new());
         let none = build_context(&vault, &ada, true, &empty, false).unwrap();
         assert!(none.packs.is_empty());
-        assert!(none.coaching.is_none());
         // Core identity is still there even with an empty scope.
         assert_eq!(none.person.name.as_deref(), Some("Ada Example"));
     }
@@ -468,8 +515,26 @@ mod tests {
     /// The agent bundle is unchanged: name withheld, note absent, boolean.
     #[test]
     fn operator_context_shows_no_ai_person_and_badges_inherited_note() {
-        let vault = demo_vault();
-        let cam = RecordId::parse("p-01M3TC5H00MPJG001248000002").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let cam = "p-01M3TC5H00MPJG001248000002";
+        std::fs::create_dir_all(dir.path().join("people").join(cam).join("notes")).unwrap();
+        std::fs::write(
+            dir.path().join("people").join(cam).join("profile.md"),
+            format!("---\nid: {cam}\ntype: person\nname: Cam Sample\nno-ai: true\n---\n\nFake profile.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(cam).join("notes/n-01M3TC5H00MPJG0060000000CC.md"),
+            format!("---\nid: n-01M3TC5H00MPJG0060000000CC\ntype: note\nperson: {cam}\ndate: 2026-10-07\n---\n\nHidden note.\n"),
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let cam = RecordId::parse(cam).unwrap();
 
         let agent = build_context(&vault, &cam, true, &PackScope::All, false).unwrap();
         assert!(agent.person.name.is_none());

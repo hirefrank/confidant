@@ -249,6 +249,10 @@ pub struct SetupResult {
     pub dry_run: bool,
     /// Set when `--agent auto` fell back to `claude-code` (#653c).
     pub fallback_note: Option<String>,
+    /// Confidant-owned skill links/copies removed because the skill no
+    /// longer ships in this binary (the 0.6.1 removal). Unowned entries are
+    /// never listed here.
+    pub removed_stale: Vec<PathBuf>,
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -292,6 +296,81 @@ fn remove_symlink(path: &Path) -> std::io::Result<()> {
 
 fn write_managed_marker(dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join(MANAGED_MARKER), env!("CARGO_PKG_VERSION"))
+}
+
+/// Remove confidant-owned entries for skills that no longer ship.
+///
+/// A previous install can leave a link or copy for a skill this binary no
+/// longer embeds (the 0.6.1 removal of operator-specific skills). The link
+/// keeps its old version dir alive and misleads agents, so `setup`/`update`
+/// remove it. Ownership is the same rule as [`is_owned`]: the entry must be
+/// a symlink resolving under our skills root *with the same leaf name*, or
+/// a copy carrying [`MANAGED_MARKER`]. Anything else is the user's and is
+/// never touched. Returns the removed (or, in a dry run, would-be removed)
+/// paths plus verbose lines.
+fn prune_stale_skill_entries(
+    parent: &Path,
+    current: &[&str],
+    skills_root: &Path,
+    dry_run: bool,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut lines = Vec::new();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return (removed, lines);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if current.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // A setup link is `<parent>/<skill>` -> `<skills_root>/<version>/<skill>`.
+        // Require the leaf names to match so a user's differently-named
+        // symlink into the tree is not mistaken for ours.
+        let owned_link = meta.is_symlink()
+            && is_owned(&path, skills_root)
+            && std::fs::read_link(&path).is_ok_and(|target| {
+                let resolved = if target.is_absolute() {
+                    target
+                } else {
+                    path.parent().unwrap_or(Path::new(".")).join(target)
+                };
+                resolved.file_name().and_then(|n| n.to_str()) == Some(name)
+            });
+        let owned_copy = !meta.is_symlink() && meta.is_dir() && path.join(MANAGED_MARKER).is_file();
+        if !owned_link && !owned_copy {
+            continue;
+        }
+        let kind = if owned_link { "link" } else { "copy" };
+        if dry_run {
+            lines.push(format!("would remove stale {kind} {}", path.display()));
+            removed.push(path);
+            continue;
+        }
+        let outcome = if owned_link {
+            remove_symlink(&path)
+        } else {
+            std::fs::remove_dir_all(&path)
+        };
+        match outcome {
+            Ok(()) => {
+                lines.push(format!("removed stale {kind} {}", path.display()));
+                removed.push(path);
+            }
+            Err(e) => lines.push(format!(
+                "warning: cannot remove stale {kind} {}: {e}",
+                path.display()
+            )),
+        }
+    }
+    (removed, lines)
 }
 
 /// True if `path` resolves to somewhere under `root`. Canonicalizes what
@@ -686,12 +765,20 @@ pub fn run_setup(
 
     let mut agents = Vec::new();
     let mut any_installed = false;
+    let mut removed_stale = Vec::new();
     for (label, parent) in targets {
         if !dry_run {
             std::fs::create_dir_all(&parent)
                 .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
         }
         verbose_lines.push(format!("-- {label} ({})", parent.display()));
+        // Drop links/copies for skills this binary no longer ships before
+        // installing the current set. An old link also keeps its version
+        // dir "referenced", so this must run before the version prune.
+        let (removed, mut stale_lines) =
+            prune_stale_skill_entries(&parent, &skill_ids, &skills_root, dry_run);
+        removed_stale.extend(removed);
+        verbose_lines.append(&mut stale_lines);
         let mut links = Vec::new();
         for skill in &skill_ids {
             let src = skills_dir.join(skill);
@@ -738,6 +825,7 @@ pub fn run_setup(
         verbose_lines,
         dry_run,
         fallback_note,
+        removed_stale,
     })
 }
 
@@ -853,7 +941,7 @@ pub fn agents_health(home: &Path) -> Vec<AgentHealth> {
         .collect()
 }
 
-pub const ROUTING_SNIPPET: &str = "## Confidant\n\nLocal skill suite for the Confidant vault. Skills are self-describing, so agents normally route on their own. This snippet is only useful if you want to pin the workflow explicitly in a project's instructions.\n\n### Routing\n\n| User intent | Skill |\n|-------------|-------|\n| Pull portal events into the vault | `portal-sync` |\n| Import a transcript | `transcript-import` |\n| Import a Lightfield export | `lightfield-import` |\n| Summarize capture gaps (read-only) | `capture-gap-summary` |\n| Search via QMD (optional backend) | `qmd-search` |\n| Author a local schema pack | `pack-author` |\n\n### Rules\n\n- Skills propose only; wait for explicit human confirmation before applying.\n- Apply through the CLI (`import --file`, `note add`, `record add`) with `--dry-run` first.\n- Never invent IDs, verbs, or dates. Bad rows are warnings + skips.\n- Run `confidant which --skills-dir` to locate the installed skills.\n";
+pub const ROUTING_SNIPPET: &str = "## Confidant\n\nLocal skill suite for the Confidant vault. Skills are self-describing, so agents normally route on their own. This snippet is only useful if you want to pin the workflow explicitly in a project's instructions.\n\n### Routing\n\n| User intent | Skill |\n|-------------|-------|\n| Search via QMD (optional backend) | `qmd-search` |\n| Author a local schema pack | `pack-author` |\n\n### Rules\n\n- Skills never write the vault; apply changes through the CLI (`record add`, `note add`, `import --file`) with `--dry-run` first.\n- Never invent IDs, verbs, or dates.\n- Run `confidant which --skills-dir` to locate the installed skills.\n";
 
 #[cfg(test)]
 mod tests {

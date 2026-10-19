@@ -57,14 +57,7 @@ fn run(args: &[&str], env: &Env, extra: &[(&str, &str)]) -> (bool, Value, String
 }
 
 fn skill_ids() -> Vec<&'static str> {
-    vec![
-        "capture-gap-summary",
-        "lightfield-import",
-        "pack-author",
-        "portal-sync",
-        "qmd-search",
-        "transcript-import",
-    ]
+    vec!["pack-author", "qmd-search"]
 }
 
 #[test]
@@ -72,7 +65,7 @@ fn setup_links_all_skills_as_symlinks() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 6, "{v}");
+    assert_eq!(v["linked"], 2, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     for id in skill_ids() {
@@ -86,14 +79,17 @@ fn setup_links_all_skills_as_symlinks() {
             "{id} should be a symlink by default: {v}"
         );
     }
-    // Shared helper materialized and executable.
-    let common = PathBuf::from(v["skills_dir"].as_str().unwrap()).join("bin/common.py");
-    assert!(common.exists(), "{v}");
+    // The qmd helper materialized and executable.
+    let qmd = PathBuf::from(v["skills_dir"].as_str().unwrap())
+        .join("qmd-search")
+        .join("bin")
+        .join("qmd-query.py");
+    assert!(qmd.exists(), "{v}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&common).unwrap().permissions().mode();
-        assert!(mode & 0o111 != 0, "bin/common.py should be +x: {v}");
+        let mode = std::fs::metadata(&qmd).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "qmd-query.py should be +x: {v}");
     }
 }
 
@@ -113,7 +109,7 @@ fn setup_copy_mode_copies_instead() {
 fn setup_force_replaces_existing_dirs() {
     let env = fresh_env();
     // Pre-create a real dir where a skill link will go.
-    let stale = PathBuf::from(env.skills.clone()).join("portal-sync");
+    let stale = PathBuf::from(env.skills.clone()).join("pack-author");
     std::fs::create_dir_all(&stale).unwrap();
     std::fs::write(stale.join("stale.txt"), "old install").unwrap();
 
@@ -151,7 +147,7 @@ fn setup_update_never_touches_unowned_dirs() {
     // High 1: a user's own (non-confidant) dir must survive both `setup`
     // and `update`; only an explicit `--force` may replace it.
     let env = fresh_env();
-    let mine = PathBuf::from(env.skills.clone()).join("portal-sync");
+    let mine = PathBuf::from(env.skills.clone()).join("pack-author");
     std::fs::create_dir_all(&mine).unwrap();
     std::fs::write(mine.join("my-notes.md"), "my own skill").unwrap();
 
@@ -183,20 +179,94 @@ fn setup_update_never_touches_unowned_dirs() {
 }
 
 #[test]
+fn setup_prunes_stale_confidant_entries_and_keeps_unowned() {
+    // A previous binary installed `old-example-skill`; this binary no longer
+    // ships it. setup/update must remove the confidant-owned link or copy,
+    // report it, and leave a user's own directory alone.
+    let env = fresh_env();
+    let skills = PathBuf::from(env.skills.clone());
+    let skills_root = PathBuf::from(env.share.clone()).join("skills");
+
+    let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
+    assert!(ok, "{v}");
+
+    // A stale link into an old version dir, exactly as an older setup left it.
+    let old_version = skills_root.join("0.0.0");
+    let old_skill = old_version.join("old-example-skill");
+    std::fs::create_dir_all(&old_skill).unwrap();
+    std::fs::write(old_skill.join("SKILL.md"), "# old\n").unwrap();
+    let stale_link = skills.join("old-example-skill");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&old_skill, &stale_link).unwrap();
+
+    // A stale managed copy (marker written by `setup --copy`).
+    let stale_copy = skills.join("old-copied-skill");
+    std::fs::create_dir_all(&stale_copy).unwrap();
+    std::fs::write(stale_copy.join("SKILL.md"), "# old copy\n").unwrap();
+    std::fs::write(stale_copy.join(".confidant-managed"), "0.0.0").unwrap();
+
+    // A user's own directory with a stale-looking name must survive.
+    let mine = skills.join("my-own-skill");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("notes.md"), "mine\n").unwrap();
+
+    // Dry run reports the removals and writes nothing.
+    let (ok, v, _) = run(
+        &["setup", "--agent", "all", "--dry-run", "--json"],
+        &env,
+        &[],
+    );
+    assert!(ok, "{v}");
+    let removed = v["removed_stale"].as_array().unwrap();
+    assert!(
+        removed
+            .iter()
+            .any(|p| p.as_str().unwrap().ends_with("old-example-skill")),
+        "stale link not reported: {v}"
+    );
+    assert!(
+        removed
+            .iter()
+            .any(|p| p.as_str().unwrap().ends_with("old-copied-skill")),
+        "stale copy not reported: {v}"
+    );
+    #[cfg(unix)]
+    assert!(stale_link.is_symlink(), "dry run removed the link");
+    assert!(stale_copy.exists(), "dry run removed the copy");
+
+    // The real run removes both, then prunes the now-unreferenced version.
+    let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
+    assert!(ok, "{v}");
+    #[cfg(unix)]
+    assert!(
+        std::fs::symlink_metadata(&stale_link).is_err(),
+        "stale link survived: {v}"
+    );
+    assert!(!stale_copy.exists(), "stale copy survived: {v}");
+    assert!(
+        !old_version.exists(),
+        "unreferenced version not pruned: {v}"
+    );
+    assert!(mine.join("notes.md").exists(), "user dir was removed: {v}");
+    assert!(skills.join("pack-author").is_symlink(), "{v}");
+    assert!(skills.join("qmd-search").is_symlink(), "{v}");
+}
+
+#[test]
 fn setup_preserves_foreign_symlinks() {
     // High 2: a symlink pointing outside our skills root is not owned;
     // setup skips it, --force re-points it.
     let env = fresh_env();
     let foreign_target = PathBuf::from(env.home.clone()).join("foreign-skills");
-    std::fs::create_dir_all(foreign_target.join("portal-sync")).unwrap();
-    let dest = PathBuf::from(env.skills.clone()).join("portal-sync");
-    std::os::unix::fs::symlink(foreign_target.join("portal-sync"), &dest).unwrap();
+    std::fs::create_dir_all(foreign_target.join("pack-author")).unwrap();
+    let dest = PathBuf::from(env.skills.clone()).join("pack-author");
+    std::os::unix::fs::symlink(foreign_target.join("pack-author"), &dest).unwrap();
 
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
     assert_eq!(
         std::fs::read_link(&dest).unwrap(),
-        foreign_target.join("portal-sync"),
+        foreign_target.join("pack-author"),
         "foreign symlink was re-pointed: {v}"
     );
 
@@ -218,7 +288,7 @@ fn setup_rejects_skills_dir_overlapping_install_tree() {
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
     let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
-    assert!(version_dir.join("portal-sync").exists());
+    assert!(version_dir.join("pack-author").exists());
 
     // Point the override at the version dir itself.
     let mut cmd = Command::new(bin());
@@ -233,7 +303,7 @@ fn setup_rejects_skills_dir_overlapping_install_tree() {
     assert!(stdout.contains("overlap"), "unexpected error: {stdout}");
     // Nothing was deleted: the installed tree is intact.
     assert!(
-        version_dir.join("portal-sync").join("SKILL.md").exists(),
+        version_dir.join("pack-author").join("SKILL.md").exists(),
         "installed skills were deleted!"
     );
 }
@@ -244,7 +314,7 @@ fn setup_copy_writes_managed_marker_and_update_replaces_it() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--copy", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    let dest = PathBuf::from(env.skills.clone()).join("portal-sync");
+    let dest = PathBuf::from(env.skills.clone()).join("pack-author");
     let marker = dest.join(".confidant-managed");
     assert!(marker.is_file(), "copy must write the marker: {v}");
     assert_eq!(
@@ -311,7 +381,7 @@ fn setup_prunes_old_version_dirs() {
     // install; non-version dirs and symlinks are left alone.
     let env = fresh_env();
     let skills_root = PathBuf::from(env.share.clone()).join("skills");
-    std::fs::create_dir_all(skills_root.join("0.0.0").join("portal-sync")).unwrap();
+    std::fs::create_dir_all(skills_root.join("0.0.0").join("pack-author")).unwrap();
     std::fs::create_dir_all(skills_root.join("notes")).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(skills_root.join("0.0.0"), skills_root.join("0.0.1")).unwrap();
@@ -345,15 +415,15 @@ fn setup_per_agent_run_keeps_versions_other_agents_link_to() {
     let skills_root = PathBuf::from(env.share.clone()).join("skills");
 
     // Fake an old version dir with one skill, as a previous install left it.
-    let old_skill = skills_root.join("0.0.0").join("portal-sync");
+    let old_skill = skills_root.join("0.0.0").join("pack-author");
     std::fs::create_dir_all(&old_skill).unwrap();
-    std::fs::write(old_skill.join("SKILL.md"), "# portal-sync\n").unwrap();
+    std::fs::write(old_skill.join("SKILL.md"), "# pack-author\n").unwrap();
 
     // claude-code links into the old version (as a previous
     // `setup --agent claude-code` from the old binary would have left it).
     let claude_dir = PathBuf::from(env.home.clone()).join(".claude/skills");
     std::fs::create_dir_all(&claude_dir).unwrap();
-    std::os::unix::fs::symlink(&old_skill, claude_dir.join("portal-sync")).unwrap();
+    std::os::unix::fs::symlink(&old_skill, claude_dir.join("pack-author")).unwrap();
 
     // Per-agent setup without the skills-dir override (which would bypass
     // agent dirs entirely).
@@ -373,13 +443,13 @@ fn setup_per_agent_run_keeps_versions_other_agents_link_to() {
         "pruned a version claude-code still links into: {v}"
     );
     assert!(
-        claude_dir.join("portal-sync").join("SKILL.md").exists(),
+        claude_dir.join("pack-author").join("SKILL.md").exists(),
         "claude-code's link is broken: {v}"
     );
     // Cursor got the current version.
     assert!(
         PathBuf::from(env.home.clone())
-            .join(".cursor/skills/portal-sync")
+            .join(".cursor/skills/pack-author")
             .is_symlink(),
         "cursor was not linked: {v}"
     );
@@ -429,7 +499,7 @@ fn update_behind_relinks_nothing() {
     let env = fresh_env();
     // A pre-existing user dir proves nothing was relinked: with behind=true
     // the run must not touch anything.
-    let mine = PathBuf::from(env.skills.clone()).join("portal-sync");
+    let mine = PathBuf::from(env.skills.clone()).join("pack-author");
     std::fs::create_dir_all(&mine).unwrap();
 
     let (ok, v, out) = run(
@@ -522,8 +592,8 @@ fn routing_prints_snippet() {
     let out = cmd.output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("portal-sync"), "{stdout:?}");
     assert!(stdout.contains("pack-author"), "{stdout:?}");
+    assert!(stdout.contains("qmd-search"), "{stdout:?}");
 }
 
 #[test]
@@ -536,7 +606,7 @@ fn update_offline_relinks_without_network() {
         &[("CONFIDANT_OFFLINE", "1")],
     );
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 6, "{v}");
+    assert_eq!(v["linked"], 2, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 }
 
@@ -1099,7 +1169,7 @@ fn setup_json_next_steps_are_additive() {
     assert_eq!(v["next_steps"]["vault_set"], true, "{v}");
     assert!(v["next_steps"]["vault_export"].is_null(), "{v}");
     // Existing contract intact.
-    assert_eq!(v["linked"], 6, "{v}");
+    assert_eq!(v["linked"], 2, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
 }
 
@@ -1173,7 +1243,7 @@ fn setup_json_reports_qmd_availability_additively() {
     assert_eq!(v["next_steps"]["qmd_available"], false, "{v}");
     let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
     assert!(note.contains("confidant find"), "{v}");
-    assert_eq!(v["linked"], 6, "{v}");
+    assert_eq!(v["linked"], 2, "{v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,7 +1345,7 @@ fn setup_dry_run_json_reports_planned_counts() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 48, "{v}");
+    assert_eq!(v["linked"], 16, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     // Nothing materialized or linked.
     assert!(
@@ -1299,8 +1369,8 @@ fn setup_counts_shared_agent_dir_once() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
 
-    // 9 agent entries, 8 distinct dirs, 6 skills each.
-    assert_eq!(v["linked"], 48, "{v}");
+    // 9 agent entries, 8 distinct dirs, 2 skills each.
+    assert_eq!(v["linked"], 16, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert!(
         v["agents"]
@@ -1314,7 +1384,7 @@ fn setup_counts_shared_agent_dir_once() {
     // The shared dir got one link per skill, not two.
     let shared = std::path::Path::new(&env.home).join(".agents/skills");
     let entries: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().collect();
-    assert_eq!(entries.len(), 6, "shared dir linked twice: {v}");
+    assert_eq!(entries.len(), 2, "shared dir linked twice: {v}");
     for entry in entries {
         assert!(entry.path().is_symlink(), "{:?}", entry.path());
     }
@@ -1363,7 +1433,7 @@ fn agents_human_lists_all_nine_before_setup() {
             r.stdout
         );
     }
-    assert!(r.stdout.contains("0/6"), "{}", r.stdout);
+    assert!(r.stdout.contains("0/2"), "{}", r.stdout);
     assert!(
         r.stdout
             .contains("`confidant setup --agent <name>` or `confidant setup --agent auto`"),
@@ -1404,7 +1474,7 @@ fn setup_auto_with_detected_agent_does_not_warn() {
         "unexpected fallback warning:\n{}",
         r.stderr
     );
-    assert!(cursor.join("portal-sync").is_symlink());
+    assert!(cursor.join("pack-author").is_symlink());
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,7 +1492,7 @@ fn update_dry_run_writes_nothing() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 48, "{v}");
+    assert_eq!(v["linked"], 16, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 
     assert!(
@@ -1449,7 +1519,7 @@ fn update_dry_run_human_reports_planned_relink() {
     );
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(
-        r.stdout.contains("would re-link 48 skills"),
+        r.stdout.contains("would re-link 16 skills"),
         "planned relink not reported:\n{}",
         r.stdout
     );

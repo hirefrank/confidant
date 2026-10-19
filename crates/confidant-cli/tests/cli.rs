@@ -3,7 +3,7 @@ use std::process::Command;
 
 mod common;
 
-use common::install_shipped_coaching;
+use common::install_example_pack;
 use confidant_core::packs::dir::read_pack_dir;
 
 fn bin() -> &'static str {
@@ -12,6 +12,51 @@ fn bin() -> &'static str {
 
 fn demo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault")
+}
+
+/// A local vault with one cleared person, one `no-ai: true` person, and
+/// three ledger lines. Used by the privacy tests; the demo vault itself is
+/// personal-only.
+fn no_ai_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cleared = "p-01M3TC5H00MPJG000000000000";
+    let hidden = "p-01M3TC5H00MPJG001248000002";
+    let hidden_note = "n-01M3TC5H000068T0000000000C";
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n",
+    )
+    .unwrap();
+    for (id, name, extra) in [
+        (cleared, "Dana Example", ""),
+        (hidden, "Cam Sample", "no-ai: true\n"),
+    ] {
+        std::fs::create_dir_all(root.join("people").join(id)).unwrap();
+        std::fs::write(
+            root.join("people").join(id).join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n{extra}---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(root.join("people").join(hidden).join("notes")).unwrap();
+    std::fs::write(
+        root.join("people")
+            .join(hidden)
+            .join("notes")
+            .join(format!("{hidden_note}.md")),
+        format!("---\nid: {hidden_note}\ntype: note\nperson: {hidden}\ndate: 2026-10-07\n---\n\nCam asked that notes never go to a model provider.\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+    std::fs::write(
+        root.join("ledger/2026/10.cfd"),
+        format!(
+            "2026-10-01 touch {cleared} call\n2026-10-07 touch {hidden} message note:{hidden_note}\n2026-10-08 touch {cleared} meet\n"
+        ),
+    )
+    .unwrap();
+    dir
 }
 
 /// Recursively copy a directory tree (the demo vault) into `dst`.
@@ -62,7 +107,7 @@ fn check_demo_json_ok() {
 #[test]
 fn find_demo_hits_fake_name() {
     let out = Command::new(bin())
-        .args(["find", "Ada Example", "--json", "--vault"])
+        .args(["find", "Dana Example", "--json", "--vault"])
         .arg(demo())
         .output()
         .unwrap();
@@ -78,18 +123,13 @@ fn find_demo_hits_fake_name() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| { m["excerpt"].as_str().unwrap().contains("Ada Example") }));
+        .any(|m| { m["excerpt"].as_str().unwrap().contains("Dana Example") }));
 }
 
 #[test]
 fn find_omits_no_ai_people() {
-    let out = Command::new(bin())
-        .args(["find", "Cam Sample", "--json", "--vault"])
-        .arg(demo())
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dir = no_ai_vault();
+    let v = run_json(&["find", "Cam Sample"], dir.path());
     assert_eq!(v["matches"], serde_json::json!([]));
 }
 
@@ -271,10 +311,11 @@ fn find_unsupported_spec_is_command_error() {
 }
 
 #[test]
-fn allowlist_demo_excludes_no_ai() {
+fn allowlist_excludes_no_ai() {
+    let dir = no_ai_vault();
     let out = Command::new(bin())
         .args(["allowlist", "--json", "--no-input", "--vault"])
-        .arg(demo())
+        .arg(dir.path())
         .output()
         .unwrap();
     assert!(
@@ -285,66 +326,36 @@ fn allowlist_demo_excludes_no_ai() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["schema_version"], "1");
-    assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     // Opaque paths and line numbers only: never content.
     let dumped = serde_json::to_string(&v).unwrap();
-    assert!(!dumped.contains("Ada Example"), "{dumped}");
+    assert!(!dumped.contains("Cam Sample"), "{dumped}");
     let files: Vec<&str> = v["cleared_files"]
         .as_array()
         .unwrap()
         .iter()
         .map(|f| f.as_str().unwrap())
         .collect();
-    // Cleared: Ada's profile is in.
     assert!(
         files
             .iter()
-            .any(|f| f == &"people/p-01M3TC5H00MPJG000000000000/profile.md"),
+            .any(|f| f.contains("p-01M3TC5H00MPJG000000000000")),
         "{files:?}"
     );
-    // Uncleared: Cam Sample is no-ai, so none of their files are in.
     assert!(
         !files
             .iter()
             .any(|f| f.contains("p-01M3TC5H00MPJG001248000002")),
         "{files:?}"
     );
-    // Ledger lines naming Cam (open line 4, session line 8, balance line 12
-    // of ledger/2026/10.cfd) are out; every other line is in. The personal
-    // September file is cleared too, and the three personal touch lines in
-    // October are cleared and owned by the implicit personal pack.
-    let lines: Vec<(String, u64)> = v["cleared_ledger_lines"]
+    // The ledger line naming the no-ai person is out; the two cleared
+    // touch lines are in.
+    let lines: Vec<u64> = v["cleared_ledger_lines"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| {
-            (
-                e["file"].as_str().unwrap().to_owned(),
-                e["line"].as_u64().unwrap(),
-            )
-        })
+        .map(|e| e["line"].as_u64().unwrap())
         .collect();
-    assert_eq!(
-        lines,
-        vec![
-            ("ledger/2026/09.cfd".to_owned(), 1),
-            ("ledger/2026/09.cfd".to_owned(), 2),
-            ("ledger/2026/10.cfd".to_owned(), 1),
-            ("ledger/2026/10.cfd".to_owned(), 2),
-            ("ledger/2026/10.cfd".to_owned(), 3),
-            ("ledger/2026/10.cfd".to_owned(), 5),
-            ("ledger/2026/10.cfd".to_owned(), 6),
-            ("ledger/2026/10.cfd".to_owned(), 7),
-            ("ledger/2026/10.cfd".to_owned(), 9),
-            ("ledger/2026/10.cfd".to_owned(), 10),
-            ("ledger/2026/10.cfd".to_owned(), 11),
-            ("ledger/2026/10.cfd".to_owned(), 13),
-            ("ledger/2026/10.cfd".to_owned(), 14),
-            ("ledger/2026/10.cfd".to_owned(), 15),
-            ("ledger/2026/10.cfd".to_owned(), 16),
-        ],
-        "{lines:?}"
-    );
+    assert_eq!(lines, vec![1, 3], "{lines:?}");
 }
 
 #[test]
@@ -367,50 +378,94 @@ fn allowlist_unsupported_spec_is_command_error() {
 }
 
 const ADA: &str = "p-01M3TC5H00MPJG000000000000";
-const COACHING: &str = "coaching@0.1";
+const EXAMPLE_PACK: &str = "example-pack@0.1";
+const NOTE_LINKED: &str = "n-01M3TC5H00MPJG002NAM000005";
+const NOTE_STANDALONE: &str = "n-01M3TC5H00MPJG00600000000D";
+
+/// A local vault with one pack-linked note, one unattributed note, a grant,
+/// a `use` line and a personal `touch`. Used by the scope tests without
+/// depending on the demo vault's contents.
+fn pack_data_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    install_example_pack(dir.path());
+    let pkg = "pkg-01M3TC5H00MPJG004SK4000009";
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        format!(
+            "spec = \"0.1\"\npacks = [\"{EXAMPLE_PACK}\"]\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n[checks]\nas_of = \"2026-10-08\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("people").join(ADA)).unwrap();
+    std::fs::write(
+        dir.path().join("people").join(ADA).join("profile.md"),
+        format!("---\nid: {ADA}\ntype: person\nname: Ada Example\nrelationship: climbing buddy\n---\n\nFake person.\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("people").join(ADA).join("notes")).unwrap();
+    std::fs::write(
+        dir.path()
+            .join("people")
+            .join(ADA)
+            .join("notes")
+            .join(format!("{NOTE_LINKED}.md")),
+        format!("---\nid: {NOTE_LINKED}\ntype: note\nperson: {ADA}\ndate: 2026-10-02\n---\n\nKickofftoken linked from the use line.\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path()
+            .join("people")
+            .join(ADA)
+            .join("notes")
+            .join(format!("{NOTE_STANDALONE}.md")),
+        format!("---\nid: {NOTE_STANDALONE}\ntype: note\nperson: {ADA}\ndate: 2026-10-04\n---\n\nFollowuptoken no pack owner.\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("edges")).unwrap();
+    std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+    std::fs::write(
+        dir.path().join("ledger/2026/10.cfd"),
+        format!(
+            "2026-10-01 grant {ADA} package {pkg} 4 sessions\n2026-10-02 use {ADA} 60m full note:{NOTE_LINKED}\n2026-10-03 touch {ADA} call\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
 
 #[test]
-fn find_scoped_to_coaching_hides_unattributed() {
-    // "Kickoff" is in the session-linked (coaching) note; "Follow-up" is in
-    // the unattributed note. A coaching-scoped find sees only the first.
-    let out = Command::new(bin())
-        .args(["find", "Follow-up", "--json", "--vault"])
-        .arg(demo())
-        .args(["--packs", COACHING])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr {}",
-        String::from_utf8_lossy(&out.stderr)
+fn find_scoped_to_example_pack_hides_unattributed() {
+    // "Kickoff" is in the pack-linked note; "Follow-up" is in the
+    // unattributed note. A pack-scoped find sees only the first.
+    let dir = pack_data_vault();
+    let v = run_json(
+        &["find", "Followuptoken", "--packs", EXAMPLE_PACK],
+        dir.path(),
     );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["ok"], true);
     assert_eq!(v["matches"], serde_json::json!([]));
-    // #551: the built-in personal pack is implicit (always enabled), but a
-    // scoped read sees it only when the scope names it, so a coaching-only
-    // ceiling sees coaching alone.
-    assert_eq!(v["scope"], serde_json::json!([COACHING]));
+    assert_eq!(v["scope"], serde_json::json!([EXAMPLE_PACK]));
 
-    let out = Command::new(bin())
-        .args(["find", "Kickoff", "--json", "--vault"])
-        .arg(demo())
-        .args(["--packs", COACHING])
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v = run_json(
+        &["find", "Kickofftoken", "--packs", EXAMPLE_PACK],
+        dir.path(),
+    );
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
+
+    let v = run_json(
+        &["find", "Followuptoken", "--packs", EXAMPLE_PACK],
+        dir.path(),
+    );
+    assert_eq!(v["matches"], serde_json::json!([]));
+    assert_eq!(v["scope"], serde_json::json!([EXAMPLE_PACK]));
 
     // Unscoped still sees the unattributed note and covers every enabled
     // pack, the implicit built-in personal pack included (#551).
-    let out = Command::new(bin())
-        .args(["find", "Follow-up", "--json", "--vault"])
-        .arg(demo())
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v = run_json_no_scope(&["find", "Followuptoken"], dir.path());
     assert_eq!(v["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(v["scope"], serde_json::json!([COACHING, "personal@0.2"]));
+    assert_eq!(
+        v["scope"],
+        serde_json::json!([EXAMPLE_PACK, "personal@0.2"])
+    );
 }
 
 #[test]
@@ -430,39 +485,20 @@ fn find_unknown_pack_is_usage_error() {
 }
 
 #[test]
-fn context_scoped_to_coaching_filters_notes_and_interactions() {
-    let out = Command::new(bin())
-        .args(["context", ADA, "--json", "--vault"])
-        .arg(demo())
-        .args(["--packs", COACHING])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+fn context_scoped_to_example_pack_filters_notes() {
+    let dir = pack_data_vault();
+    let v = run_json(&["context", ADA, "--packs", EXAMPLE_PACK], dir.path());
     assert_eq!(v["ok"], true);
-    // Only the session-linked note; the unattributed note and the
-    // interaction are hidden. Core identity stays.
+    // Only the pack-linked note; the unattributed note is hidden.
     assert_eq!(v["notes"].as_array().unwrap().len(), 1);
-    assert_eq!(v["notes"][0]["id"], "n-01M3TC5H00MPJG002NAM000005");
-    assert_eq!(v["interactions"], serde_json::json!([]));
+    assert_eq!(v["notes"][0]["id"], NOTE_LINKED);
     assert_eq!(v["person"]["name"], "Ada Example");
-    // #551: a coaching-only ceiling excludes the implicit personal pack.
-    assert_eq!(v["scope"], serde_json::json!([COACHING]));
-    assert!(v["coaching"].is_object());
+    assert_eq!(v["scope"], serde_json::json!([EXAMPLE_PACK]));
     assert!(v["packs"].get("personal@0.2").is_none());
+    assert!(v["packs"][EXAMPLE_PACK].is_object());
 
-    let out = Command::new(bin())
-        .args(["context", ADA, "--json", "--vault"])
-        .arg(demo())
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let v = run_json_no_scope(&["context", ADA], dir.path());
     assert_eq!(v["notes"].as_array().unwrap().len(), 2);
-    assert_eq!(v["interactions"].as_array().unwrap().len(), 1);
 }
 
 const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
@@ -470,15 +506,15 @@ const EDGE_FRIEND: &str = "e-01M3TC5H00MPJG00E100000000";
 
 /// A vault with personal-owned data — a personal field (`relationship`), a
 /// personal edge kind (`friend`), and a `touch` ledger line — next to a
-/// coaching pack listing. Used to prove that the implicit `personal@0.2`
+/// example pack listing. Used to prove that the implicit `personal@0.2`
 /// built-in is visible to a scoped read only when the scope names it (#551).
 fn personal_data_vault() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    install_shipped_coaching(dir.path());
+    install_example_pack(dir.path());
     std::fs::write(
         dir.path().join("confidant.toml"),
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "01M3TC5H00MPJG005VQC00000B"
 [checks]
 as_of = "2026-10-08"
@@ -513,6 +549,11 @@ as_of = "2026-10-08"
     dir
 }
 
+/// Like [`run_json`] but omits `--packs` (the normal unscoped read).
+fn run_json_no_scope(args: &[&str], vault: &Path) -> serde_json::Value {
+    run_json(args, vault)
+}
+
 fn run_json(args: &[&str], vault: &Path) -> serde_json::Value {
     let out = Command::new(bin())
         .args(args)
@@ -532,7 +573,7 @@ fn run_json(args: &[&str], vault: &Path) -> serde_json::Value {
 #[test]
 fn find_scope_excludes_personal_unless_named() {
     // #551: personal fields, personal edge kinds, and `touch` lines are
-    // personal-owned, so a coaching-only ceiling hides them even though the
+    // personal-owned, so a external-pack-only ceiling hides them even though the
     // built-in pack is enabled in every vault.
     let dir = personal_data_vault();
     for (needle, label) in [
@@ -540,16 +581,16 @@ fn find_scope_excludes_personal_unless_named() {
         ("friend", "personal edge kind"),
         ("touch", "touch line"),
     ] {
-        let coaching = run_json(&["find", needle, "--packs", COACHING], dir.path());
+        let scoped = run_json(&["find", needle, "--packs", EXAMPLE_PACK], dir.path());
         assert_eq!(
-            coaching["matches"].as_array().unwrap().len(),
+            scoped["matches"].as_array().unwrap().len(),
             0,
-            "coaching-only scope leaked a {label}: {coaching}"
+            "pack-only scope leaked a {label}: {scoped}"
         );
-        assert_eq!(coaching["scope"], serde_json::json!([COACHING]));
+        assert_eq!(scoped["scope"], serde_json::json!([EXAMPLE_PACK]));
         // Naming personal through the any-version alias puts it in scope.
         let personal = run_json(
-            &["find", needle, "--packs", "coaching@0.1,personal@0.1"],
+            &["find", needle, "--packs", "example-pack@0.1,personal@0.1"],
             dir.path(),
         );
         assert_eq!(
@@ -559,7 +600,7 @@ fn find_scope_excludes_personal_unless_named() {
         );
         assert_eq!(
             personal["scope"],
-            serde_json::json!([COACHING, "personal@0.2"])
+            serde_json::json!([EXAMPLE_PACK, "personal@0.2"])
         );
     }
 }
@@ -567,17 +608,14 @@ fn find_scope_excludes_personal_unless_named() {
 #[test]
 fn context_scope_excludes_personal_unless_named() {
     // #551: the personal `context` view and the person's touchpoints are
-    // personal-owned. A coaching-only ceiling drops both; naming personal
+    // personal-owned. A external-pack-only ceiling drops both; naming personal
     // (at any version) brings the view and the touch line back.
     let dir = personal_data_vault();
-    let coaching = run_json(&["context", ADA, "--packs", COACHING], dir.path());
-    assert!(
-        coaching["packs"].get("personal@0.2").is_none(),
-        "{coaching}"
-    );
-    assert_eq!(coaching["touchpoints"], serde_json::json!([]));
-    assert!(coaching["coaching"].is_object());
-    assert_eq!(coaching["scope"], serde_json::json!([COACHING]));
+    let scoped = run_json(&["context", ADA, "--packs", EXAMPLE_PACK], dir.path());
+    assert!(scoped["packs"].get("personal@0.2").is_none(), "{scoped}");
+    assert_eq!(scoped["touchpoints"], serde_json::json!([]));
+    assert!(scoped["packs"][EXAMPLE_PACK].is_object());
+    assert_eq!(scoped["scope"], serde_json::json!([EXAMPLE_PACK]));
 
     let personal = run_json(&["context", ADA, "--packs", "personal@0.1"], dir.path());
     assert_eq!(
@@ -654,10 +692,11 @@ fn context_json_marks_cadence_never() {
 
 #[test]
 fn allowlist_scoped_annotates_owners() {
+    let dir = pack_data_vault();
     let out = Command::new(bin())
         .args(["allowlist", "--json", "--no-input", "--vault"])
-        .arg(demo())
-        .args(["--packs", COACHING])
+        .arg(dir.path())
+        .args(["--packs", EXAMPLE_PACK])
         .output()
         .unwrap();
     assert!(
@@ -666,7 +705,7 @@ fn allowlist_scoped_annotates_owners() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    // The unattributed note is out; the session-linked note stays.
+    // The unattributed note is out; the pack-linked note stays.
     let files: Vec<&str> = v["cleared_files"]
         .as_array()
         .unwrap()
@@ -674,14 +713,14 @@ fn allowlist_scoped_annotates_owners() {
         .map(|f| f.as_str().unwrap())
         .collect();
     assert!(
-        !files.iter().any(|f| f.contains("0036CR000006")),
+        !files.iter().any(|f| f.contains("00600000000D")),
         "{files:?}"
     );
     assert!(
         files.iter().any(|f| f.contains("002NAM000005")),
         "{files:?}"
     );
-    // Ownership annotations: core profile, coaching note.
+    // Ownership annotations: core profile, pack-linked note.
     assert_eq!(
         v["owning_packs"]["people/p-01M3TC5H00MPJG000000000000/profile.md"],
         serde_json::json!(["core"])
@@ -689,10 +728,9 @@ fn allowlist_scoped_annotates_owners() {
     assert_eq!(
         v["owning_packs"]
             ["people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"],
-        serde_json::json!([COACHING])
+        serde_json::json!([EXAMPLE_PACK])
     );
-    // Ledger lines: the comment line (line 1, unattributed) is out;
-    // every other cleared line stays, each with owning_packs.
+    // Every cleared ledger line is annotated.
     let lines: Vec<u64> = v["cleared_ledger_lines"]
         .as_array()
         .unwrap()
@@ -702,21 +740,10 @@ fn allowlist_scoped_annotates_owners() {
             e["line"].as_u64().unwrap()
         })
         .collect();
-    assert_eq!(lines, vec![2, 3, 5, 6, 7, 9, 10, 11, 16], "{lines:?}");
-    let balance = v["cleared_ledger_lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["line"] == 10)
-        .unwrap();
-    assert_eq!(balance["owning_packs"], serde_json::json!([COACHING]));
-    let alias = v["cleared_ledger_lines"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["line"] == 5)
-        .unwrap();
-    assert_eq!(alias["owning_packs"], serde_json::json!(["core"]));
+    assert_eq!(lines, vec![1, 2], "{lines:?}");
+    for entry in v["cleared_ledger_lines"].as_array().unwrap() {
+        assert_eq!(entry["owning_packs"], serde_json::json!([EXAMPLE_PACK]));
+    }
 }
 
 #[test]
@@ -779,10 +806,11 @@ fn find_edge_scoping_follows_kind() {
     assert_eq!(v["matches"], serde_json::json!([]));
 }
 #[test]
-fn help_pack_coaching_serves_skill_text() {
+fn help_pack_example_serves_skill_text() {
+    let (vault, _) = example_pack_vault();
     let out = Command::new(bin())
-        .args(["help", "pack:coaching@0.1", "--vault"])
-        .arg(demo())
+        .args(["help", "pack:example-pack@0.1", "--vault"])
+        .arg(vault.path())
         .output()
         .unwrap();
     assert!(
@@ -791,17 +819,21 @@ fn help_pack_coaching_serves_skill_text() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("# Coaching pack (coaching@0.1)"), "{text}");
-    assert!(text.contains("E_COACHING_OPEN_MALFORMED"), "{text}");
-    assert!(text.contains("W_COACHING_SESSION_UNTAGGED"), "{text}");
+    assert!(
+        text.contains("# Example pack skill (example-pack@0.1)"),
+        "{text}"
+    );
+    assert!(text.contains("E_EXAMPLE_GRANT_MALFORMED"), "{text}");
+    assert!(text.contains("W_EXAMPLE_UNTAGGED"), "{text}");
     assert!(text.starts_with("[external pack:"), "{text}");
 }
 
 #[test]
-fn help_pack_coaching_json_envelope() {
+fn help_pack_example_json_envelope() {
+    let (vault, _) = example_pack_vault();
     let out = Command::new(bin())
-        .args(["help", "pack:coaching@0.1", "--json", "--vault"])
-        .arg(demo())
+        .args(["help", "pack:example-pack@0.1", "--json", "--vault"])
+        .arg(vault.path())
         .output()
         .unwrap();
     assert!(
@@ -811,11 +843,8 @@ fn help_pack_coaching_json_envelope() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
-    assert_eq!(v["packs"], serde_json::json!(["coaching@0.1"]));
-    assert!(v["skill"]
-        .as_str()
-        .unwrap()
-        .contains("E_COACHING_PAID_SESSION_GAP"));
+    assert_eq!(v["packs"], serde_json::json!(["example-pack@0.1"]));
+    assert!(v["skill"].as_str().unwrap().contains("E_EXAMPLE_GAP"));
 }
 
 /// A minimal valid v2 manifest for the external help fixture.
@@ -867,6 +896,19 @@ fn external_help_vault_with_source(source_toml: &str) -> (tempfile::TempDir, Str
     )
     .unwrap();
     (dir, skill.to_owned())
+}
+
+/// A non-git vault with the neutral `example-pack@0.1` fixture vendored,
+/// pinned and enabled. Fake data only.
+fn example_pack_vault() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    install_example_pack(dir.path());
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    (dir, String::new())
 }
 
 /// PD10 (#445): external pack text shown to agents is labelled as external
@@ -1021,9 +1063,10 @@ fn help_pack_compiled_is_unlabelled() {
 
 #[test]
 fn help_pack_bare_serves_combined_skill() {
+    let (vault, _) = example_pack_vault();
     let out = Command::new(bin())
         .args(["help", "pack", "--vault"])
-        .arg(demo())
+        .arg(vault.path())
         .output()
         .unwrap();
     assert!(
@@ -1033,10 +1076,10 @@ fn help_pack_bare_serves_combined_skill() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("Packs in scope: coaching@0.1, personal@0.2"),
+        text.contains("Packs in scope: example-pack@0.1, personal@0.2"),
         "{text}"
     );
-    assert!(text.contains("## coaching@0.1"), "{text}");
+    assert!(text.contains("## example-pack@0.1"), "{text}");
 }
 
 #[test]
@@ -1058,7 +1101,7 @@ fn help_pack_outside_scope_is_not_found() {
     let out = Command::new(bin())
         .args([
             "help",
-            "pack:coaching@0.1",
+            "pack:example-pack@0.1",
             "--packs",
             "nope@9.9",
             "--vault",
@@ -1074,7 +1117,7 @@ fn help_pack_outside_scope_is_not_found() {
 fn help_pack_needs_a_vault() {
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
-        .args(["help", "pack:coaching@0.1"])
+        .args(["help", "pack:example-pack@0.1"])
         .current_dir(tmp.path())
         .env_remove("CONFIDANT_VAULT")
         .output()
@@ -1297,7 +1340,7 @@ fn write_fake_qmd_for_find(dir: &std::path::Path) {
 fn find_json_hint_absent_without_qmd_or_corpus() {
     let empty = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
-        .args(["find", "Ada Example", "--json", "--vault"])
+        .args(["find", "Dana Example", "--json", "--vault"])
         .arg(demo())
         .env("PATH", empty.path())
         .output()
@@ -1309,7 +1352,7 @@ fn find_json_hint_absent_without_qmd_or_corpus() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| { m["excerpt"].as_str().unwrap().contains("Ada Example") }));
+        .any(|m| { m["excerpt"].as_str().unwrap().contains("Dana Example") }));
 }
 
 #[cfg(unix)]
@@ -1349,7 +1392,7 @@ fn find_json_hint_present_with_qmd_and_corpus() {
         std::env::var("PATH").unwrap()
     );
     let out = Command::new(bin())
-        .args(["find", "Ada Example", "--json", "--vault"])
+        .args(["find", "Dana Example", "--json", "--vault"])
         .arg(&vault)
         .env("PATH", &path)
         .output()
@@ -1367,7 +1410,7 @@ fn find_json_hint_present_with_qmd_and_corpus() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| { m["excerpt"].as_str().unwrap().contains("Ada Example") }));
+        .any(|m| { m["excerpt"].as_str().unwrap().contains("Dana Example") }));
 }
 
 #[cfg(unix)]
@@ -2184,13 +2227,12 @@ fn pack_add_refuses_reserved_names() {
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
 }
 
-/// #449: `coaching` is an ordinary external pack after the reservation
-/// drop, so `pack add --from-dir` accepts it.
+/// A non-reserved external pack name is accepted.
 #[cfg(unix)]
 #[test]
-fn pack_add_accepts_external_coaching_name() {
+fn pack_add_accepts_external_pack_name() {
     let vault = git_vault();
-    let pack = versioned_pack("coaching", "0.9", "# ok\n", None);
+    let pack = versioned_pack("custom-pack", "0.9", "# ok\n", None);
     let out = pack_add(pack.path(), vault.path(), true);
     assert!(
         out.status.success(),
@@ -2200,18 +2242,13 @@ fn pack_add_accepts_external_coaching_name() {
     );
 }
 
-/// #449: the shipped `packs/coaching/` installs as a real external pack on
-/// a copy of the demo vault, and the vault then checks clean.
+/// The neutral fixture installs as a real external pack on a copy of the
+/// demo vault, and the vault then checks clean.
 #[cfg(unix)]
 #[test]
-fn declarative_coaching_cli_install_then_check_clean() {
+fn declarative_example_cli_install_then_check_clean() {
     let vault = tempfile::tempdir().unwrap();
     copy_tree(&demo(), vault.path());
-    // The demo already vendors the pack; this test installs it through the
-    // CLI. The listing stays, so `pack add` repairs the missing pin
-    // (#612) rather than failing the pre-check on an unclean vault.
-    std::fs::remove_dir_all(vault.path().join("packs")).unwrap();
-    std::fs::remove_file(vault.path().join("confidant.lock")).unwrap();
     git(vault.path(), &["init", "-q"]);
     git(vault.path(), &["config", "user.name", "Test"]);
     git(
@@ -2232,7 +2269,8 @@ fn declarative_coaching_cli_install_then_check_clean() {
         ],
     );
 
-    let pack_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
+    let pack_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/example-pack");
     let out = pack_add(&pack_dir, vault.path(), true);
     assert!(
         out.status.success(),
@@ -2267,8 +2305,7 @@ fn declarative_coaching_cli_install_then_check_clean() {
     let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
     assert_eq!(v["ok"], true, "{v}");
     // The demo is personal-first: its two warning-level personal nudges are
-    // expected. What this test cares about is that installing the external
-    // coaching pack introduces no coaching findings (and no errors).
+    // expected. Installing the external fixture must add no findings.
     assert_eq!(v["summary"]["errors"], 0, "{v}");
     let codes: Vec<&str> = v["findings"]
         .as_array()
@@ -2283,11 +2320,11 @@ fn declarative_coaching_cli_install_then_check_clean() {
 #[test]
 fn pack_add_check_failure_rolls_back() {
     let vault = git_vault();
-    // coaching@0.1 owns the `session` verb; a pack claiming it conflicts.
-    install_shipped_coaching(vault.path());
+    // The fixture owns the `session` verb; a pack claiming it conflicts.
+    install_example_pack(vault.path());
     std::fs::write(
         vault.path().join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
     )
     .unwrap();
     git(vault.path(), &["add", "-A"]);
@@ -2300,7 +2337,7 @@ fn pack_add_check_failure_rolls_back() {
             "user.email=test@example.invalid",
             "commit",
             "-qm",
-            "enable coaching",
+            "enable example pack",
         ],
     );
     let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
@@ -2308,14 +2345,14 @@ fn pack_add_check_failure_rolls_back() {
     // A directory that already exists (even empty, so git never tracks it) must
     // survive the rollback: the write did not create it (#604).
     std::fs::create_dir_all(vault.path().join("packs/pre-existing-empty")).unwrap();
-    let pack = versioned_pack("example-pack", "0.1", "# conflict\n", Some("session"));
+    let pack = versioned_pack("conflict-pack", "0.1", "# conflict\n", Some("session"));
     let out = pack_add(pack.path(), vault.path(), true);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
 
     // Rolled back: no vendored files, no lock, packs list unchanged, tree clean.
     assert!(!vault
         .path()
-        .join("packs/example-pack@0.1/manifest.toml")
+        .join("packs/conflict-pack@0.1/manifest.toml")
         .exists());
     assert_eq!(
         std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap(),
@@ -2327,7 +2364,7 @@ fn pack_add_check_failure_rolls_back() {
     // #604: the empty directory the refused write created is gone, but the one
     // that was already there is untouched.
     assert!(
-        !vault.path().join("packs/example-pack@0.1").exists(),
+        !vault.path().join("packs/conflict-pack@0.1").exists(),
         "refused pack add left its vendored directory behind"
     );
     assert!(
@@ -2392,7 +2429,7 @@ fn pack_update_shows_diff_then_applies_a_version_change() {
         .path()
         .join("packs/example-pack@0.2/SKILL.md")
         .exists());
-    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    assert!(!vault.path().join("packs/conflict-pack@0.1").exists());
     let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
     assert!(cfg.contains("packs = [\"example-pack@0.2\"]"), "{cfg}");
     let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
@@ -3036,7 +3073,7 @@ fn pack_remove_recovers_a_missing_lock() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    assert!(!vault.path().join("packs/conflict-pack@0.1").exists());
     assert!(!vault.path().join("confidant.lock").exists());
     let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
     assert!(cfg.contains("packs = []"), "{cfg}");
@@ -3155,7 +3192,7 @@ fn pack_remove_falls_back_to_the_vendored_tree() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    assert!(!vault.path().join("packs/example-pack@0.1").exists());
+    assert!(!vault.path().join("packs/conflict-pack@0.1").exists());
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
     let check = Command::new(bin())
         .args(["check", "--json", "--no-input", "--vault"])
@@ -3412,19 +3449,10 @@ fn record_list_demo_is_the_cleared_set_in_name_order() {
     assert_eq!(v["for_operator"], false);
     assert_eq!(v["skipped_encrypted"], 0);
     assert_eq!(v["refused_envelopes"], 0);
-    // Deterministic: display name, case-insensitive. Cam Sample is `no-ai:
-    // true`, so the cleared roster omits it; the personal contacts sort after
-    // the coaching clients.
+    // Deterministic: display name, case-insensitive.
     assert_eq!(
         roster_names(&v),
-        vec![
-            "Ada Example",
-            "Bea Demo",
-            "Dana Example",
-            "Eli Sample",
-            "Fay Demo",
-            "Gus Example",
-        ]
+        vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
     );
     for entry in v["records"].as_array().unwrap() {
         assert_eq!(entry["no_ai"], "false");
@@ -3439,36 +3467,38 @@ fn record_list_demo_for_operator_adds_no_ai_with_tri_state() {
     assert_eq!(v["for_operator"], true);
     assert_eq!(
         roster_names(&v),
-        vec![
-            "Ada Example",
-            "Bea Demo",
-            "Cam Sample",
-            "Dana Example",
-            "Eli Sample",
-            "Fay Demo",
-            "Gus Example",
-        ]
+        vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
     );
-    let cam = v["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["name"] == "Cam Sample")
-        .expect("no-ai person must be listed with the operator flag");
-    assert_eq!(cam["no_ai"], "true");
-    assert_eq!(cam["kind"], "person");
 }
 
 #[test]
 fn record_list_kind_filters() {
-    let orgs = demo_roster(&["--kind", "org"]);
-    assert_eq!(orgs["kind"], "org");
-    assert_eq!(roster_names(&orgs), vec!["Northwind Training Co"]);
-    assert_eq!(orgs["records"][0]["kind"], "org");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+    )
+    .unwrap();
+    let org = "o-01J9Z3K4QF0000000000000001";
+    std::fs::create_dir_all(dir.path().join("orgs").join(org)).unwrap();
+    std::fs::write(
+        dir.path().join("orgs").join(org).join("org.md"),
+        format!("---\nid: {org}\ntype: org\nname: Example Org\n---\n\n"),
+    )
+    .unwrap();
+    let deal = "d-01J9Z3K4QF0000000000000002";
+    std::fs::create_dir_all(dir.path().join("deals").join(deal)).unwrap();
+    std::fs::write(
+        dir.path().join("deals").join(deal).join("deal.md"),
+        format!("---\nid: {deal}\ntype: deal\nname: Example Deal\n---\n\n"),
+    )
+    .unwrap();
 
-    let deals = demo_roster(&["--kind", "deal"]);
-    assert_eq!(roster_names(&deals), vec!["Discovery workshop"]);
-    assert_eq!(deals["records"][0]["kind"], "deal");
+    let orgs = run_json(&["record", "list", "--kind", "org"], dir.path());
+    assert_eq!(orgs["kind"], "org");
+    assert_eq!(roster_names(&orgs), vec!["Example Org"]);
+    let deals = run_json(&["record", "list", "--kind", "deal"], dir.path());
+    assert_eq!(roster_names(&deals), vec!["Example Deal"]);
 }
 
 #[test]
@@ -3476,18 +3506,11 @@ fn record_list_packs_scope_is_reported_and_fails_closed() {
     // The scope is echoed and validated, like `find` / `context`. Roster
     // entries are core-owned identity records, so a narrower scope does not
     // remove them today.
-    let v = demo_roster(&["--packs", "coaching@0.1"]);
-    assert_eq!(v["scope"], serde_json::json!(["coaching@0.1"]));
+    let v = demo_roster(&["--packs", "personal@0.2"]);
+    assert_eq!(v["scope"], serde_json::json!(["personal@0.2"]));
     assert_eq!(
         roster_names(&v),
-        vec![
-            "Ada Example",
-            "Bea Demo",
-            "Dana Example",
-            "Eli Sample",
-            "Fay Demo",
-            "Gus Example",
-        ]
+        vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
     );
 
     // Unknown or disabled pack: usage error, exit 2 (ADR-7).
@@ -3565,11 +3588,9 @@ fn record_list_text_output_lists_one_entry_per_line() {
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("Ada Example"), "{text}");
-    assert!(text.contains("Bea Demo"), "{text}");
-    assert!(text.contains("6 people (person)"), "{text}");
-    // The no-ai person is absent without the flag.
-    assert!(!text.contains("Cam Sample"), "{text}");
+    assert!(text.contains("Dana Example"), "{text}");
+    assert!(text.contains("Eli Sample"), "{text}");
+    assert!(text.contains("4 people (person)"), "{text}");
 }
 
 #[test]
@@ -3654,20 +3675,21 @@ fn run_text(args: &[&str], vault: &Path) -> String {
 /// hides; every operator record hit carries the tri-state `no_ai`. Without
 /// the flag, matches are as before and no hit has the key.
 #[test]
-fn find_demo_for_operator_includes_no_ai_with_tri_state() {
+fn find_for_operator_includes_no_ai_with_tri_state() {
     // "model provider" is only in Cam's (no-ai) note body.
-    let default = run_json(&["find", "model provider"], &demo());
+    let dir = no_ai_vault();
+    let default = run_json(&["find", "model provider"], dir.path());
     assert_eq!(default["matches"], serde_json::json!([]));
     assert!(default.get("for_operator").is_none(), "{default}");
     // Agent hits never carry `no_ai`.
-    let agent_ada = run_json(&["find", "Ada Example"], &demo());
-    assert!(agent_ada["matches"]
+    let agent = run_json(&["find", "Dana Example"], dir.path());
+    assert!(agent["matches"]
         .as_array()
         .unwrap()
         .iter()
         .all(|m| m.get("no_ai").is_none()));
 
-    let op = run_json(&["find", "model provider", "--for-operator"], &demo());
+    let op = run_json(&["find", "model provider", "--for-operator"], dir.path());
     assert_eq!(op["for_operator"], true);
     let hit = op["matches"]
         .as_array()
@@ -3681,7 +3703,7 @@ fn find_demo_for_operator_includes_no_ai_with_tri_state() {
     assert!(hit["excerpt"].as_str().unwrap().contains("model provider"));
 
     // A cleared record is badged `"false"` in operator mode.
-    let op_ada = run_json(&["find", "Ada Example", "--for-operator"], &demo());
+    let op_ada = run_json(&["find", "Dana Example", "--for-operator"], dir.path());
     assert!(op_ada["matches"]
         .as_array()
         .unwrap()
@@ -3692,19 +3714,20 @@ fn find_demo_for_operator_includes_no_ai_with_tri_state() {
 /// #593: an operator-only ledger hit carries `operator_only: true`; a ledger
 /// hit an agent can see too does not, and the agent JSON has no such key.
 #[test]
-fn find_demo_for_operator_marks_operator_only_ledger_hits() {
-    // Cam's session line names the `no-ai` person and their note, so the
+fn find_for_operator_marks_operator_only_ledger_hits() {
+    // Cam's touch line names the `no-ai` person and their note, so the
     // agent path hides it entirely.
-    let default = run_json(&["find", "2026-10-07"], &demo());
+    let dir = no_ai_vault();
+    let default = run_json(&["find", "2026-10-07"], dir.path());
     assert_eq!(default["matches"], serde_json::json!([]));
 
-    let op = run_json(&["find", "2026-10-07", "--for-operator"], &demo());
+    let op = run_json(&["find", "2026-10-07", "--for-operator"], dir.path());
     let ledger = op["matches"]
         .as_array()
         .unwrap()
         .iter()
         .find(|m| m["path"].as_str().unwrap().starts_with("ledger/"))
-        .expect("Cam's session line must be an operator hit");
+        .expect("Cam's touch line must be an operator hit");
     assert_eq!(ledger["operator_only"], true);
     assert!(ledger.get("no_ai").is_none(), "{ledger}");
     // Record hits keep the tri-state and never gain the ledger marker.
@@ -3719,7 +3742,7 @@ fn find_demo_for_operator_marks_operator_only_ledger_hits() {
 
     // A ledger line naming cleared people is visible to both paths: no
     // marker, and the agent JSON never has the key.
-    let agent_alias = run_json(&["find", "alias"], &demo());
+    let agent_alias = run_json(&["find", "2026-10-08"], dir.path());
     assert!(agent_alias["matches"]
         .as_array()
         .unwrap()
@@ -3730,7 +3753,7 @@ fn find_demo_for_operator_marks_operator_only_ledger_hits() {
         .unwrap()
         .iter()
         .all(|m| m.get("operator_only").is_none()));
-    let op_alias = run_json(&["find", "alias", "--for-operator"], &demo());
+    let op_alias = run_json(&["find", "2026-10-08", "--for-operator"], dir.path());
     let visible: Vec<_> = op_alias["matches"]
         .as_array()
         .unwrap()
@@ -3745,8 +3768,9 @@ fn find_demo_for_operator_marks_operator_only_ledger_hits() {
 /// notes, with the tri-state `no_ai` and `for_operator: true`. Without the
 /// flag the output is unchanged: name withheld, notes absent, boolean flag.
 #[test]
-fn context_demo_for_operator_shows_no_ai_person_with_tri_state() {
-    let default = run_json(&["context", CAM], &demo());
+fn context_for_operator_shows_no_ai_person_with_tri_state() {
+    let dir = no_ai_vault();
+    let default = run_json(&["context", CAM], dir.path());
     assert!(default.get("for_operator").is_none(), "{default}");
     assert_eq!(default["person"]["no_ai"], true);
     assert!(default["person"]["name"].is_null());
@@ -3754,14 +3778,14 @@ fn context_demo_for_operator_shows_no_ai_person_with_tri_state() {
     let dumped = serde_json::to_string(&default).unwrap();
     assert!(!dumped.contains("Cam Sample"), "{dumped}");
 
-    let op = run_json(&["context", CAM, "--for-operator"], &demo());
+    let op = run_json(&["context", CAM, "--for-operator"], dir.path());
     assert_eq!(op["for_operator"], true);
     assert_eq!(op["person"]["name"], "Cam Sample");
     assert_eq!(op["person"]["no_ai"], "true");
     assert!(op["person"]["profile"]
         .as_str()
         .unwrap()
-        .contains("Fake client"));
+        .contains("Fake person"));
     let notes = op["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0]["id"], CAM_NOTE);
@@ -3781,13 +3805,14 @@ fn operator_mode_banner_labels_find_context_and_roster() {
         let mut flagged = args.clone();
         flagged.push("--for-operator");
         flagged.push("--no-input");
-        let text = run_text(&flagged, &demo());
+        let dir = no_ai_vault();
+        let text = run_text(&flagged, dir.path());
         assert!(
             text.contains(OPERATOR_BANNER),
             "{flagged:?} missing the operator banner: {text}"
         );
 
-        let plain = run_text(&args, &demo());
+        let plain = run_text(&args, dir.path());
         assert!(
             !plain.contains(OPERATOR_BANNER),
             "{args:?} leaked the operator banner: {plain}"

@@ -785,7 +785,7 @@ fn resolve_as_of(vault: &Vault, options: &CheckOptions) -> NaiveDate {
     resolve_as_of_date(vault)
 }
 
-/// The effective as-of date for coaching folds: config override, else today.
+/// The effective as-of date for pack folds: config override, else today.
 pub fn resolve_as_of_date(vault: &Vault) -> NaiveDate {
     if let Some(raw) = vault.config.checks.as_of.as_deref() {
         if let Ok(d) = parse_iso_date(raw) {

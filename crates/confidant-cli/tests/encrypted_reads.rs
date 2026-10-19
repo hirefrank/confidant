@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 
 mod common;
 
-use common::install_shipped_coaching;
+use common::install_example_pack;
 
 /// Generate a throwaway age identity, returning the Bech32 secret.
 fn age_generate_bech32() -> String {
@@ -67,10 +67,10 @@ impl Harness {
 
         std::fs::write(
             vault.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
         )
         .unwrap();
-        install_shipped_coaching(&vault);
+        install_example_pack(&vault);
         git(&vault, &["init", "-q"]);
         git(&vault, &["config", "user.email", "test@example.com"]);
         git(&vault, &["config", "user.name", "Test"]);

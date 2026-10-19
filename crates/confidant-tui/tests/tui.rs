@@ -26,10 +26,6 @@ fn demo_vault() -> PathBuf {
     repo_root().join("examples/demo-vault")
 }
 
-fn golden_path(name: &str) -> PathBuf {
-    repo_root().join("testdata/golden").join(name)
-}
-
 fn snapshot_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/snapshots")
@@ -128,29 +124,33 @@ fn key(code: KeyCode) -> KeyEvent {
 
 #[test]
 fn contract_goldens_deserialize_and_render_in_check_view() {
-    for (file, expected_code, snapshot_file) in [
+    // Neutral pack findings keep the TUI's check rendering covered without
+    // depending on a shipped pack or the core golden fixtures.
+    for (code, message, snapshot_file) in [
         (
-            "balance_mismatch.json",
-            "E_COACHING_BALANCE_MISMATCH",
+            "E_EXAMPLE_BALANCE_MISMATCH",
+            "units_remaining asserted 4, computed 5",
             "check_balance_mismatch.snap",
         ),
         (
-            "paid_session_gap.json",
-            "E_COACHING_PAID_SESSION_GAP",
-            "check_paid_session_gap.snap",
+            "E_EXAMPLE_GAP",
+            "client p-01M3TC5H00MPJG000000000000 has remaining units",
+            "check_session_gap.snap",
         ),
         (
-            "session_without_notes.json",
-            "E_COACHING_SESSION_WITHOUT_NOTES",
+            "E_EXAMPLE_WITHOUT_NOTES",
+            "entry on 2026-10-01 for p-01M3TC5H00MPJG000000000000 has no notes",
             "check_session_without_notes.snap",
         ),
     ] {
-        let raw_json = fs::read_to_string(golden_path(file)).expect("read golden file");
+        let raw_json = format!(
+            r#"{{"schema_version":"1","ok":false,"vault":"/fake/demo-vault","spec":"0.1","summary":{{"errors":1,"warnings":0,"records":0,"ledger_entries":1}},"findings":[{{"code":"{code}","severity":"error","id":"p-01M3TC5H00MPJG000000000000","message":"{message}","fix":"Fix the fixture"}}]}}"#
+        );
         let report: CheckReport = serde_json::from_str(&raw_json).expect("deserialize CheckReport");
         assert_eq!(report.schema_version, "1");
         assert!(!report.ok);
         assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.findings[0].code, expected_code);
+        assert_eq!(report.findings[0].code, code);
 
         // Even though `check` exits 1 when `--fail-on` trips, the TUI must
         // parse stdout before looking at the exit status and treat it as a
@@ -164,10 +164,7 @@ fn contract_goldens_deserialize_and_render_in_check_view() {
         assert!(app.blocking_alert.is_none());
 
         let rendered = render_to_string(&app);
-        assert!(
-            rendered.contains(expected_code),
-            "expected {expected_code} in:\n{rendered}"
-        );
+        assert!(rendered.contains(code), "expected {code} in:\n{rendered}");
         assert_snapshot(snapshot_file, &rendered);
     }
 }
@@ -190,7 +187,7 @@ fn search_context_and_doctor_views_snapshot() {
         "findings": [],
         "skipped_encrypted": 0,
         "refused_envelopes": 0,
-        "scope": ["coaching@0.1"]
+        "scope": ["personal@0.2"]
     }"#;
     let context_json = r#"{
         "ok": true,
@@ -200,13 +197,13 @@ fn search_context_and_doctor_views_snapshot() {
             "id": "p-01M3TC5H00MPJG000000000000",
             "name": "Ada Example",
             "no_ai": false,
-            "profile": "Fake executive coaching client at Acme Corp."
+            "profile": "Fake contact at Example Co."
         },
         "notes": [
             {
                 "id": "n-01M3TC5H00MPJG002NAM000005",
                 "date": "2026-10-01",
-                "body": "Kickoff session notes for Ada Example."
+                "body": "Kickoff notes for Ada Example."
             }
         ],
         "interactions": [
@@ -223,22 +220,11 @@ fn search_context_and_doctor_views_snapshot() {
                 "kind": "call"
             }
         ],
-        "coaching": {
-            "sessions_remaining": 5,
-            "icf_hours": 1.0,
-            "recent_sessions": [
-                {
-                    "date": "2026-10-01",
-                    "duration_minutes": 60,
-                    "tag": "paid"
-                }
-            ]
-        },
         "packs": {},
         "aliases": ["hmac:0123456789abcdef0123456789abcdef"],
         "skipped_encrypted": 0,
         "refused_envelopes": 0,
-        "scope": ["coaching@0.1"]
+        "scope": ["personal@0.2"]
     }"#;
     let doctor_json = r#"{
         "ok": true,
@@ -309,7 +295,6 @@ fn search_context_and_doctor_views_snapshot() {
     assert_eq!(app.active_view, ActiveView::Context);
     let context_rendered = render_to_string(&app);
     assert!(context_rendered.contains("Ada Example"));
-    assert!(context_rendered.contains("sessions_remaining 5"));
     assert_snapshot("context_view.snap", &context_rendered);
 
     // Switch to Doctor view with `d` (a pill, not a workspace).
@@ -556,31 +541,28 @@ fn live_shape_against_demo_vault_check_find_context_doctor() {
         other => panic!("unexpected check outcome: {other:?}"),
     }
 
-    // 2. find "Ada Example": deserializes and finds Ada.
+    // 2. find "Dana Example": deserializes and finds Dana.
     let raw_find = runner
-        .run(&["find", "--", "Ada Example"])
-        .expect("run find Ada Example");
+        .run(&["find", "--", "Dana Example"])
+        .expect("run find Dana Example");
     match parse_raw_output::<FindResult>(&raw_find) {
         ContractOutcome::Ok { ok, data, .. } => {
             assert!(ok);
             assert!(data
                 .matches
                 .iter()
-                .any(|m| m.excerpt.contains("Ada Example")));
+                .any(|m| m.excerpt.contains("Dana Example")));
         }
         other => panic!("unexpected find outcome: {other:?}"),
     }
 
-    // 3. context p-01M3TC5H00MPJG000000000000: deserializes Ada's bundle.
-    let raw_ctx = runner
-        .run(&["context", "--", "p-01M3TC5H00MPJG000000000000"])
-        .expect("run context");
+    // 3. context: deserializes Dana's bundle.
+    let raw_ctx = runner.run(&["context", "--", DANA]).expect("run context");
     match parse_raw_output::<Context>(&raw_ctx) {
         ContractOutcome::Ok { ok, data, .. } => {
             assert!(ok);
-            assert_eq!(data.person.id, "p-01M3TC5H00MPJG000000000000");
-            assert_eq!(data.person.name.as_deref(), Some("Ada Example"));
-            assert!(data.coaching.is_some());
+            assert_eq!(data.person.id, DANA);
+            assert_eq!(data.person.name.as_deref(), Some("Dana Example"));
         }
         other => panic!("unexpected context outcome: {other:?}"),
     }
@@ -614,27 +596,6 @@ fn live_shape_against_demo_vault_check_find_context_doctor() {
         check_screen.contains("W_DATE_UPCOMING"),
         "expected the upcoming-date nudge:\n{check_screen}"
     );
-}
-
-#[test]
-fn live_find_omits_no_ai_people_in_tui() {
-    // Mirrors `find_omits_no_ai_people` in `crates/confidant-cli/tests/cli.rs`:
-    // "Cam Sample" only appears in a `no-ai: true` record in `examples/demo-vault`.
-    let runner =
-        ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
-    let mut app = App::new(runner);
-    app.active_view = ActiveView::Search;
-    app.search.exact = true;
-    app.run_search("Cam Sample");
-
-    let res = app.search.result.as_ref().expect("search result populated");
-    assert!(
-        res.kept.is_empty(),
-        "expected no matches for no-ai person, got {:?}",
-        res.kept
-    );
-    let rendered = render_to_string(&app);
-    assert!(rendered.contains("0 matches"));
 }
 
 // ---------------------------------------------------------------------------
@@ -671,13 +632,13 @@ fn write_test_manifest(dir: &Path, stem: &str, records_json: &str) -> (PathBuf, 
     let lines_file = proposals.join(format!("{stem}.cfd"));
     fs::write(
         &lines_file,
-        "2026-09-01 open d-01M3TC5H00MPJG00248G000004 proposal src:test/1\n",
+        "2026-09-01 touch p-01M3TC5H00MPJG000000000000 call src:test/1\n",
     )
     .expect("write lines file");
     let request_id = "01M3TC5H00MPJG005VQC00000B".to_owned();
     let manifest_path = proposals.join(format!("{stem}.json"));
     let manifest = format!(
-        r#"{{"skill": "portal-sync", "vault": "", "request_id": "{request_id}", "lines_file": {}, "records": [{records_json}], "records_blocked": true}}"#,
+        r#"{{"skill": "example-pack", "vault": "", "request_id": "{request_id}", "lines_file": {}, "records": [{records_json}], "records_blocked": true}}"#,
         serde_json::to_string(&lines_file.to_string_lossy()).unwrap(),
     );
     fs::write(&manifest_path, manifest).expect("write manifest");
@@ -690,7 +651,7 @@ fn dry_run_import_json() -> &'static str {
         "command": "import", "dry_run": true, "commit": null,
         "changes": [
             {"path": "ledger/2026/09.cfd", "action": "append",
-             "content": "2026-09-01 open d-01M3TC5H00MPJG00248G000004 proposal src:test/1\n"}
+             "content": "2026-09-01 touch p-01M3TC5H00MPJG000000000000 call src:test/1\n"}
         ]
     }"#
 }
@@ -706,10 +667,10 @@ fn check_blocked_json() -> &'static str {
         "schema_version": "1", "ok": false, "vault": "/fake/vault", "spec": "0.1",
         "summary": {"errors": 1, "warnings": 0, "records": 0, "ledger_entries": 0},
         "findings": [
-            {"code": "E_COACHING_NEGATIVE_BALANCE", "severity": "error",
+            {"code": "E_EXAMPLE_NEGATIVE_BALANCE", "severity": "error",
              "id": "p-01M3TC5H00MPJG000000000000",
-             "message": "sessions_remaining is -1",
-             "fix": "Add an open/renewal or remove extra session lines"}
+             "message": "units_remaining is -1",
+             "fix": "Add a grant or remove extra use lines"}
         ]
     }"#
 }
@@ -727,7 +688,7 @@ fn proposals_dry_run_renders_path_action_and_content() {
     // #581: pinned root so the header's vault pill is identical on Linux and
     // macOS; see `proposals_temp_dir_at`.
     let dir = proposals_temp_dir_at(Path::new("/tmp"), "tui-test-proposals-dryrun");
-    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    write_test_manifest(&dir, "example-20261015T000000Z", "");
 
     let fake = FakeRunner::new().with_response("import", 0, dry_run_import_json());
     let mut app = open_proposals_app(&dir, fake);
@@ -742,7 +703,7 @@ fn proposals_dry_run_renders_path_action_and_content() {
     let rendered = render_to_string(&app);
     assert!(rendered.contains("ledger/2026/09.cfd"), "{rendered}");
     assert!(rendered.contains("append"), "{rendered}");
-    assert!(rendered.contains("2026-09-01 open"), "{rendered}");
+    assert!(rendered.contains("2026-09-01 touch"), "{rendered}");
     assert_snapshot("proposals_dry_run.snap", &rendered);
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -750,7 +711,7 @@ fn proposals_dry_run_renders_path_action_and_content() {
 #[test]
 fn proposals_cancel_confirm_writes_nothing() {
     let dir = proposals_temp_dir("tui-test-proposals-cancel");
-    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    write_test_manifest(&dir, "example-20261015T000000Z", "");
 
     let fake = FakeRunner::new().with_response("import", 0, dry_run_import_json());
     let mut app = open_proposals_app(&dir, fake);
@@ -778,7 +739,7 @@ fn proposals_cancel_sweeps_the_staged_source() {
     // CLI is handed the scratch, never the shared `.cfd`. Esc cancels the
     // review and sweeps the scratch, so no plaintext lingers.
     let dir = proposals_temp_dir("tui-test-proposals-staged-cancel");
-    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    write_test_manifest(&dir, "example-20261015T000000Z", "");
 
     let fake = FakeRunner::new().with_response("import", 0, dry_run_import_json());
     let mut app = open_proposals_app(&dir, fake);
@@ -786,9 +747,9 @@ fn proposals_cancel_sweeps_the_staged_source() {
     app.handle_key(key(KeyCode::Char('a')));
 
     let proposals = dir.join(".confidant").join("proposals");
-    let lines = proposals.join("portal-20261015T000000Z.cfd");
+    let lines = proposals.join("example-20261015T000000Z.cfd");
     let staged = proposals
-        .join("portal-20261015T000000Z")
+        .join("example-20261015T000000Z")
         .join("staged")
         .join("ledger.cfd");
     assert!(staged.exists(), "the reviewed lines are staged for the CLI");
@@ -929,7 +890,7 @@ fn apply_rs_has_no_id_generation() {
 #[test]
 fn proposals_check_blocked_renders_report_and_marks_nothing_done() {
     let dir = proposals_temp_dir("tui-test-proposals-blocked");
-    let (manifest_path, _) = write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    let (manifest_path, _) = write_test_manifest(&dir, "example-20261015T000000Z", "");
 
     let fake = FakeRunner::new();
     fake.push_response(0, dry_run_import_json());
@@ -947,7 +908,7 @@ fn proposals_check_blocked_renders_report_and_marks_nothing_done() {
     assert!(!report.ok);
     let rendered = render_to_string(&app);
     assert!(
-        rendered.contains("E_COACHING_NEGATIVE_BALANCE"),
+        rendered.contains("E_EXAMPLE_NEGATIVE_BALANCE"),
         "{rendered}"
     );
 
@@ -960,93 +921,12 @@ fn proposals_check_blocked_renders_report_and_marks_nothing_done() {
     let staged = dir
         .join(".confidant")
         .join("proposals")
-        .join("portal-20261015T000000Z")
+        .join("example-20261015T000000Z")
         .join("staged")
         .join("ledger.cfd");
     assert!(
         staged.exists(),
         "a check-blocked step keeps its staged copy for the retry"
-    );
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn proposals_list_shows_counts_from_lightfield_proposer() {
-    // No git repo here: the proposer skips the gitignore check then.
-    let dir = proposals_temp_dir("tui-test-proposals-proposer");
-    for entry in fs::read_dir(demo_vault()).expect("read demo vault") {
-        let entry = entry.unwrap();
-        let dest = dir.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            fs::create_dir_all(&dest).unwrap();
-            for f in walk_files(&entry.path()) {
-                let rel = f.strip_prefix(entry.path()).unwrap();
-                let d = dest.join(rel);
-                fs::create_dir_all(d.parent().unwrap()).unwrap();
-                fs::copy(&f, &d).unwrap();
-            }
-        } else {
-            fs::copy(entry.path(), &dest).unwrap();
-        }
-    }
-    let script =
-        repo_root().join("crates/confidant-cli/skills/lightfield-import/bin/lightfield-import.py");
-    let export =
-        repo_root().join("crates/confidant-cli/skills/lightfield-import/testdata/export.json");
-    let out = std::process::Command::new("python3")
-        .args([
-            script.to_string_lossy().as_ref(),
-            "--vault",
-            dir.to_string_lossy().as_ref(),
-            "--export",
-            export.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .expect("run lightfield proposer");
-    assert!(out.status.success(), "proposer failed: {out:?}");
-
-    let proposals_dir = dir.join(".confidant").join("proposals");
-    let manifest_path = fs::read_dir(&proposals_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|e| e == "json"))
-        .expect("manifest written");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-    let records = manifest["records"].as_array().unwrap();
-    let expected_notes = records
-        .iter()
-        .filter(|r| r.get("note_id").is_some())
-        .count();
-    let expected_records = records.len() - expected_notes;
-    let lines_file = manifest["lines_file"].as_str().unwrap();
-    let expected_lines = fs::read_to_string(lines_file).unwrap().lines().count();
-
-    let mut app = App::new(FakeRunner::new());
-    app.set_vault_root(dir.clone());
-    app.handle_key(key(KeyCode::Char('o')));
-    assert_eq!(app.proposals.entries.len(), 1);
-    let entry = &app.proposals.entries[0];
-    assert_eq!(entry.skill, "lightfield-import");
-    assert!(
-        entry.detail.contains(&format!("{expected_notes} notes")),
-        "detail: {}",
-        entry.detail
-    );
-    assert!(
-        entry
-            .detail
-            .contains(&format!("{expected_records} records")),
-        "detail: {}",
-        entry.detail
-    );
-    assert!(
-        entry
-            .detail
-            .contains(&format!("{expected_lines} ledger lines")),
-        "detail: {}",
-        entry.detail
     );
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -1062,149 +942,6 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-#[test]
-fn proposals_live_apply_against_temp_git_vault() {
-    let dir = proposals_temp_dir("tui-test-proposals-live");
-    // Fresh git copy of the demo vault (the proposer needs the gitignore
-    // check to pass, and writes need commits).
-    for entry in fs::read_dir(demo_vault()).expect("read demo vault") {
-        let entry = entry.unwrap();
-        let dest = dir.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            fs::create_dir_all(&dest).unwrap();
-            for f in walk_files(&entry.path()) {
-                let rel = f.strip_prefix(entry.path()).unwrap();
-                let d = dest.join(rel);
-                fs::create_dir_all(d.parent().unwrap()).unwrap();
-                fs::copy(&f, &d).unwrap();
-            }
-        } else {
-            fs::copy(entry.path(), &dest).unwrap();
-        }
-    }
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&dir)
-            .output()
-            .expect("git");
-        assert!(st.status.success(), "git {args:?} failed: {st:?}");
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "test@example.com"]);
-    git(&["config", "user.name", "test"]);
-    fs::write(dir.join(".gitignore"), ".confidant/\n").unwrap();
-    git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
-
-    // The committed export fixture uses a `paid` session for a brand-new
-    // person, which trips E_COACHING_NEGATIVE_BALANCE on import (correct domain
-    // behavior, exercised by the CheckBlocked test). The live happy-path
-    // test uses a `comp` session so the full apply succeeds.
-    let export_src =
-        repo_root().join("crates/confidant-cli/skills/lightfield-import/testdata/export.json");
-    let export: serde_json::Value = serde_json::from_slice(&fs::read(export_src).unwrap()).unwrap();
-    let mut export = export;
-    for t in export["transcripts"].as_array_mut().unwrap() {
-        t["billing"] = serde_json::Value::String("comp".to_owned());
-    }
-    let export_path = dir.join("export-comp.json");
-    fs::write(&export_path, serde_json::to_vec(&export).unwrap()).unwrap();
-
-    let script =
-        repo_root().join("crates/confidant-cli/skills/lightfield-import/bin/lightfield-import.py");
-    let out = std::process::Command::new("python3")
-        .args([
-            script.to_string_lossy().as_ref(),
-            "--vault",
-            dir.to_string_lossy().as_ref(),
-            "--export",
-            export_path.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .expect("run lightfield proposer");
-    assert!(out.status.success(), "proposer failed: {out:?}");
-    fs::remove_file(&export_path).unwrap();
-
-    let proposals_dir = dir.join(".confidant").join("proposals");
-    let manifest_path = fs::read_dir(&proposals_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|e| e == "json"))
-        .expect("manifest written");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-
-    // Pre-M2 skill workflow: hand-create the record files from the manifest
-    // (the TUI never writes into the vault tree itself).
-    for r in manifest["records"].as_array().unwrap() {
-        if r.get("note_id").is_some() {
-            continue;
-        }
-        let dest = dir.join(r["path"].as_str().unwrap());
-        fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        fs::write(&dest, r["content"].as_str().unwrap()).unwrap();
-    }
-    git(&["add", "-A"]);
-    git(&["commit", "-qm", "test: hand-create pre-M2 records"]);
-
-    // Drive the real apply engine with the real CLI.
-    let runner = ProcessRunner::new(confidant_bin(), Some(dir.clone()));
-    let mut flow = ApplyFlow::open(&manifest_path, &dir).expect("open flow");
-    let mut applied = 0;
-    while let Some(step) = flow.first_pending() {
-        flow.dry_run_step(&runner, step)
-            .expect("dry-run against live vault");
-        match flow
-            .apply_step(&runner, step)
-            .expect("apply against live vault")
-        {
-            StepApplyOutcome::Done { .. } => applied += 1,
-            StepApplyOutcome::CheckBlocked { report } => {
-                panic!("unexpected check block: {:?}", report.findings)
-            }
-            StepApplyOutcome::Failed => panic!("step failed"),
-        }
-    }
-    // Ledger + note applied; records refused with the pre-M2 message.
-    assert_eq!(applied, 2, "expected ledger + note to apply");
-    assert!(flow
-        .steps
-        .iter()
-        .any(|s| matches!(&s.status, StepStatus::Blocked { .. })));
-
-    // #611: the note landed at the manifest's own path/id, not a freshly
-    // minted one, so the reviewed dry-run named the exact file written.
-    let mut note_records = 0;
-    for r in manifest["records"].as_array().unwrap() {
-        if r.get("note_id").is_none() || r["person"].is_null() {
-            continue;
-        }
-        note_records += 1;
-        let path = dir.join(r["path"].as_str().unwrap());
-        assert!(
-            path.exists(),
-            "note not applied at its reviewed path: {}",
-            path.display()
-        );
-    }
-    assert_eq!(note_records, 1, "expected one person-linked note record");
-
-    let report = flow.final_check(&runner).expect("final check runs");
-    assert!(report.is_none(), "final check should be clean");
-
-    // Commits exist in git.
-    let log = std::process::Command::new("git")
-        .args(["log", "--oneline"])
-        .current_dir(&dir)
-        .output()
-        .expect("git log");
-    let log = String::from_utf8_lossy(&log.stdout);
-    assert!(log.lines().count() >= 4, "expected apply commits:\n{log}");
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 fn inbox_dry_run_json() -> &'static str {
@@ -1660,7 +1397,7 @@ fn search_live_fallback_against_demo_vault_without_qmd() {
                 &script.display().to_string(),
                 "--vault",
                 &demo_vault().display().to_string(),
-                "Ada Example",
+                "Dana Example",
             ],
         )
         .expect("run qmd-query.py");
@@ -1679,8 +1416,8 @@ fn search_live_fallback_against_demo_vault_without_qmd() {
             assert!(
                 data.matches
                     .iter()
-                    .any(|m| m.excerpt.contains("Ada Example")),
-                "fallback finds Ada: {:?}",
+                    .any(|m| m.excerpt.contains("Dana Example")),
+                "fallback finds Dana: {:?}",
                 data.matches.iter().map(|m| &m.excerpt).collect::<Vec<_>>()
             );
             // Fail-closed filter keeps every fallback match.
@@ -2073,6 +1810,7 @@ fn conflict_esc_from_detail_returns_to_list() {
 
 const ADA: &str = "p-01M3TC5H00MPJG000000000000";
 const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
+const DANA: &str = "p-01M3TC5H00MPJG000000000101";
 
 fn people_roster_json() -> String {
     serde_json::json!({
@@ -2085,7 +1823,7 @@ fn people_roster_json() -> String {
             {"id": ADA, "name": "Ada Example", "no_ai": "false", "kind": "person"},
             {"id": BEA, "name": "Bea Demo", "no_ai": "false", "kind": "person"}
         ],
-        "scope": ["coaching@0.1"],
+        "scope": ["personal@0.2"],
         "skipped_encrypted": 0,
         "refused_envelopes": 0
     })
@@ -2107,18 +1845,11 @@ fn people_context_json(id: &str, name: &str, profile: &str) -> String {
              "title": "Intro call", "body": "Fake intro call transcript."}
         ],
         "touchpoints": [{"date": "2026-10-05", "kind": "call"}],
-        "coaching": {
-            "sessions_remaining": 5,
-            "icf_hours": 1.0,
-            "recent_sessions": [
-                {"date": "2026-10-01", "duration_minutes": 60, "tag": "paid"}
-            ]
-        },
         "packs": {},
         "aliases": ["hmac:0123456789abcdef0123456789abcdef"],
         "skipped_encrypted": 0,
         "refused_envelopes": 0,
-        "scope": ["coaching@0.1"]
+        "scope": ["personal@0.2"]
     })
     .to_string()
 }
@@ -2155,7 +1886,7 @@ fn people_runner() -> FakeRunner {
         .with_response(
             "context",
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         )
 }
 
@@ -2179,13 +1910,12 @@ fn people_workspace_is_default_with_roster_nudges_and_live_context() {
     assert!(rendered.contains("Ada Example"), "{rendered}");
     assert!(rendered.contains("Bea Demo"), "{rendered}");
     assert!(rendered.contains("Context — Ada Example"), "{rendered}");
-    assert!(rendered.contains("sessions_remaining 5"), "{rendered}");
     assert!(
         rendered.contains("Fake note about Ada Example."),
         "{rendered}"
     );
     assert!(rendered.contains("vault  /fake/demo-vault"), "{rendered}");
-    assert!(rendered.contains("scope  coaching@0.1"), "{rendered}");
+    assert!(rendered.contains("scope  personal@0.2"), "{rendered}");
     assert!(rendered.contains("doctor  not run"), "{rendered}");
     assert_snapshot("people_master_detail.snap", &rendered);
 
@@ -2215,10 +1945,8 @@ fn people_filter_is_local_and_enter_loads_the_selected_person() {
     app.load_check();
     app.load_roster();
     // Queue Bea's context; it is consumed by the Enter below, not by typing.
-    app.runner.push_response(
-        0,
-        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
-    );
+    app.runner
+        .push_response(0, people_context_json(BEA, "Bea Demo", "Fake friend."));
     let before = app.runner.recorded_calls().len();
 
     app.handle_key(key(KeyCode::Char('/')));
@@ -2237,10 +1965,7 @@ fn people_filter_is_local_and_enter_loads_the_selected_person() {
     assert_eq!(app.people.selected_person.as_deref(), Some(BEA));
     let rendered = render_to_string(&app);
     assert!(rendered.contains("Context — Bea Demo"), "{rendered}");
-    assert!(
-        rendered.contains("Fake pay-per-session client."),
-        "{rendered}"
-    );
+    assert!(rendered.contains("Fake friend."), "{rendered}");
     assert!(app
         .runner
         .recorded_calls()
@@ -2265,15 +1990,13 @@ fn nudge_enter_focuses_the_person_the_finding_names() {
         .with_response(
             "context",
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         );
     let mut app = App::new(fake);
     app.load_check();
     app.load_roster();
-    app.runner.push_response(
-        0,
-        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
-    );
+    app.runner
+        .push_response(0, people_context_json(BEA, "Bea Demo", "Fake friend."));
 
     // Initial selection is the first person, below the nudge.
     assert_eq!(app.people.selected, 1);
@@ -2370,7 +2093,7 @@ fn scope_and_help_pills_open_cached_modals_without_cli_calls() {
     assert!(app.info_modal.is_some(), "scope modal open");
     let scope = render_to_string(&app);
     assert!(scope.contains("Scope"), "{scope}");
-    assert!(scope.contains("coaching@0.1"), "{scope}");
+    assert!(scope.contains("personal@0.2"), "{scope}");
     assert!(scope.contains("source:"), "{scope}");
     assert_eq!(app.runner.recorded_calls().len(), before, "no CLI call");
 
@@ -2402,20 +2125,12 @@ fn live_roster_against_demo_vault_omits_no_ai_people() {
         .collect();
     assert_eq!(
         names,
-        vec![
-            "Ada Example",
-            "Bea Demo",
-            "Dana Example",
-            "Eli Sample",
-            "Fay Demo",
-            "Gus Example",
-        ]
+        vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
     );
-    assert!(!names.contains(&"Cam Sample"), "no-ai person must stay out");
-    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    assert_eq!(app.people.selected_person.as_deref(), Some(DANA));
     let rendered = render_to_string(&app);
-    assert!(rendered.contains("Context — Ada Example"), "{rendered}");
-    assert!(rendered.contains("scope  coaching@0.1"), "{rendered}");
+    assert!(rendered.contains("Context — Dana Example"), "{rendered}");
+    assert!(rendered.contains("scope  personal@0.2"), "{rendered}");
 }
 
 fn check_cli_error_json() -> &'static str {
@@ -2441,7 +2156,7 @@ fn people_needs_attention_reports_check_not_loaded() {
         .with_response(
             "context",
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         );
     let mut app = App::new(fake);
     app.load_check();
@@ -2466,16 +2181,10 @@ fn failed_check_refresh_clears_a_stale_report() {
     // Interleaved order: check, roster, context, failing check, roster, context.
     fake.push_response(0, people_check_json());
     fake.push_response(0, people_roster_json());
-    fake.push_response(
-        0,
-        people_context_json(ADA, "Ada Example", "Fake coaching client."),
-    );
+    fake.push_response(0, people_context_json(ADA, "Ada Example", "Fake contact."));
     fake.push_response(1, check_cli_error_json());
     fake.push_response(0, people_roster_json());
-    fake.push_response(
-        0,
-        people_context_json(ADA, "Ada Example", "Fake coaching client."),
-    );
+    fake.push_response(0, people_context_json(ADA, "Ada Example", "Fake contact."));
 
     let mut app = App::new(fake);
     app.load_check();
@@ -2506,14 +2215,14 @@ fn failed_check_refresh_clears_a_stale_report() {
 #[test]
 fn pending_apply_confirm_is_not_escaped_by_workspace_shortcuts() {
     let dir = proposals_temp_dir("tui-test-proposals-confirm-gate");
-    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    write_test_manifest(&dir, "example-20261015T000000Z", "");
     let fake = FakeRunner::new()
         .with_response("import", 0, dry_run_import_json())
         .with_response("record", 0, people_roster_json())
         .with_response(
             "context",
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         );
     let mut app = App::new(fake);
     app.set_vault_root(dir.clone());
@@ -2634,7 +2343,7 @@ fn operator_roster_json() -> String {
             {"id": CAM, "name": "Cam Sample", "no_ai": "true", "kind": "person"},
             {"id": NIA, "name": "Nia Notes", "no_ai": "notes", "kind": "person"}
         ],
-        "scope": ["coaching@0.1"],
+        "scope": ["personal@0.2"],
         "skipped_encrypted": 0,
         "refused_envelopes": 0
     })
@@ -2661,7 +2370,7 @@ fn operator_context_json(person_mode: &str, note_mode: &str) -> String {
         "aliases": [],
         "skipped_encrypted": 0,
         "refused_envelopes": 0,
-        "scope": ["coaching@0.1"]
+        "scope": ["personal@0.2"]
     })
     .to_string()
 }
@@ -2699,10 +2408,7 @@ fn operator_mode_toggle_reloads_with_flag_and_badges_no_ai() {
     // Boot (flag off).
     fake.push_response(0, people_check_json());
     fake.push_response(0, people_roster_json());
-    fake.push_response(
-        0,
-        people_context_json(ADA, "Ada Example", "Fake coaching client."),
-    );
+    fake.push_response(0, people_context_json(ADA, "Ada Example", "Fake contact."));
     // Toggle: check, roster, context all reload through the operator path.
     fake.push_response(0, people_check_json());
     fake.push_response(0, operator_roster_json());
@@ -2818,10 +2524,7 @@ fn operator_mode_off_fails_closed_when_roster_reload_fails() {
     // clears the alert so the panes actually render.
     fake.push_response(0, people_check_json());
     fake.push_response(1, check_cli_error_json());
-    fake.push_response(
-        0,
-        people_context_json(ADA, "Ada Example", "Fake coaching client."),
-    );
+    fake.push_response(0, people_context_json(ADA, "Ada Example", "Fake contact."));
 
     let mut app = App::new(fake);
     app.operator_mode = true;
@@ -2899,7 +2602,7 @@ fn edit_app(root: &Path) -> App<FakeRunner> {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         )
         .with_argv_response(
             &["record", "show", ADA, "--for-edit"],
@@ -3152,7 +2855,7 @@ fn edit_refused_when_scratch_is_not_gitignored() {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         );
     runner.push_program_response("git", 0, ""); // rev-parse: a git repo
     runner.push_program_response("git", 1, ""); // check-ignore: NOT ignored
@@ -3224,58 +2927,6 @@ fn pending_edit_confirm_is_not_escaped_by_workspace_shortcuts() {
     );
 }
 
-#[test]
-fn live_operator_roster_and_context_include_no_ai_person() {
-    // The real CLI with `--for-operator` against the demo vault: Cam Sample
-    // is `no-ai: true` and must appear (and be editable) only on the
-    // operator path.
-    let runner =
-        ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
-    let mut app = App::new(runner);
-    app.load_check();
-    app.load_roster();
-    let agent_names: Vec<String> = app
-        .people
-        .roster
-        .as_ref()
-        .unwrap()
-        .records
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect();
-    assert!(!agent_names.iter().any(|n| n == "Cam Sample"));
-
-    app.handle_key(key(KeyCode::Char('!')));
-    assert!(app.operator_mode);
-    let roster = app.people.roster.as_ref().expect("roster loaded");
-    let cam = roster
-        .records
-        .iter()
-        .find(|entry| entry.name == "Cam Sample")
-        .expect("no-ai person visible in operator mode");
-    assert_eq!(cam.no_ai, confidant_tui::contract::NoAiMode::Hidden);
-
-    // The operator context decrypts the hidden person and badges it.
-    app.load_context(CAM);
-    let ctx = app
-        .context
-        .context
-        .as_ref()
-        .expect("operator context loaded");
-    assert!(ctx.for_operator);
-    assert_eq!(ctx.person.name.as_deref(), Some("Cam Sample"));
-    assert_eq!(ctx.person.no_ai, confidant_tui::contract::NoAiMode::Hidden);
-    let rendered = render_to_string(&app);
-    assert!(rendered.contains(OPERATOR_MODE_BANNER), "{rendered}");
-    // Full-screen Context at a wider buffer keeps the identity line together.
-    app.active_view = ActiveView::Context;
-    let context_screen = render_to_string_at(&app, 160, HEIGHT);
-    assert!(
-        line_with(&context_screen, CAM).contains("[no-ai]"),
-        "{context_screen}"
-    );
-}
-
 /// End-to-end: the real CLI and a real `$EDITOR` edit a person record in a
 /// throwaway git vault, committing exactly once and leaving the tree clean.
 #[test]
@@ -3336,11 +2987,11 @@ fn live_edit_commits_once_through_the_real_cli_and_editor() {
     app.set_vault_root(root.to_path_buf());
     app.load_check();
     app.load_roster();
-    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    assert_eq!(app.people.selected_person.as_deref(), Some(DANA));
 
     app.handle_key(key(KeyCode::Char('e')));
     assert!(app.edit_flow.is_some(), "edit flow started");
-    let scratch = scratch_path(root, ADA).unwrap();
+    let scratch = scratch_path(root, DANA).unwrap();
     assert!(scratch.exists(), "scratch staged");
 
     let cmd = app.take_suspended_command().expect("editor queued");
@@ -3365,7 +3016,7 @@ fn live_edit_commits_once_through_the_real_cli_and_editor() {
         .expect("git log");
     let log = String::from_utf8_lossy(&log.stdout);
     assert_eq!(log.lines().count(), 2, "one edit commit:\n{log}");
-    let profile = fs::read_to_string(root.join("people").join(ADA).join("profile.md")).unwrap();
+    let profile = fs::read_to_string(root.join("people").join(DANA).join("profile.md")).unwrap();
     assert!(profile.contains("live-edit-marker"), "{profile}");
     // The edit scratch is git-ignored: the tree is clean after the commit.
     let status_out = std::process::Command::new("git")
@@ -3435,7 +3086,7 @@ fn capture_base_runner() -> FakeRunner {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         )
 }
 
@@ -4140,7 +3791,7 @@ fn review_queue_badge_counts_sources_and_is_visible_from_people() {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         )
         .with_argv_response(&["inbox", "--dry-run"], 0, inbox_dry_run_json());
     let mut app = App::new(runner);
@@ -4148,7 +3799,7 @@ fn review_queue_badge_counts_sources_and_is_visible_from_people() {
     app.load_roster();
     app.load_inbox();
     app.proposals.entries.push(ProposalListEntry {
-        name: "portal-1".to_owned(),
+        name: "example-1".to_owned(),
         ..ProposalListEntry::default()
     });
 
@@ -4169,7 +3820,7 @@ fn review_queue_badge_counts_sources_and_is_visible_from_people() {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         );
     let mut clean_app = App::new(clean);
     clean_app.load_check();
@@ -4231,7 +3882,7 @@ fn live_capture_note_commits_once_through_the_real_cli() {
     app.set_vault_root(root.to_path_buf());
     app.load_check();
     app.load_roster();
-    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    assert_eq!(app.people.selected_person.as_deref(), Some(DANA));
 
     app.handle_key(key(KeyCode::Char('n')));
     type_text(&mut app, "live captured note body");
@@ -4241,7 +3892,7 @@ fn live_capture_note_commits_once_through_the_real_cli() {
         Some(CapturePhase::Preview),
         "the real dry run produced a preview"
     );
-    let scratch = capture_scratch_path(root, ADA).expect("scratch path");
+    let scratch = capture_scratch_path(root, DANA).expect("scratch path");
     assert!(scratch.exists(), "the note body is staged");
 
     app.handle_key(key(KeyCode::Char('y')));
@@ -4262,7 +3913,7 @@ fn live_capture_note_commits_once_through_the_real_cli() {
     assert_eq!(log.lines().count(), 2, "one capture commit:\n{log}");
 
     // The note landed under the person, with the captured body.
-    let notes_dir = root.join("people").join(ADA).join("notes");
+    let notes_dir = root.join("people").join(DANA).join("notes");
     let notes: Vec<_> = fs::read_dir(&notes_dir)
         .expect("notes dir")
         .flatten()
@@ -4409,7 +4060,7 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
         "findings": [],
         "skipped_encrypted": 0,
         "refused_envelopes": 0,
-        "scope": ["coaching@0.1"]
+        "scope": ["personal@0.2"]
     })
     .to_string();
     let runner = FakeRunner::new()
@@ -4418,12 +4069,12 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
         .with_argv_response(
             &["context", "--", ADA],
             0,
-            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+            people_context_json(ADA, "Ada Example", "Fake contact."),
         )
         .with_argv_response(
             &["context", "--", BEA],
             0,
-            people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
+            people_context_json(BEA, "Bea Demo", "Fake friend."),
         )
         .with_argv_response(&["find", "--", "bea"], 0, find)
         .with_argv_response(
@@ -4716,10 +4367,8 @@ fn g_and_shift_g_jump_to_the_first_and_last_row() {
     app.load_roster();
     assert_eq!(app.people.selected, 1, "nudge, then Ada");
 
-    app.runner.push_response(
-        0,
-        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
-    );
+    app.runner
+        .push_response(0, people_context_json(BEA, "Bea Demo", "Fake friend."));
     app.handle_key(key(KeyCode::Char('G')));
     assert_eq!(app.people.selected, 2, "G lands on the last person");
     assert_eq!(app.people.selected_person.as_deref(), Some(BEA));

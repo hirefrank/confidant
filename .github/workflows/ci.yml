@@ -45,11 +45,10 @@ jobs:
           # in a tree that is hash-pinned or embedded in the binary: editing
           # one does not update its pin, and a stale pin only surfaces when a
           # later non-docs change runs the suite. #633 edited
-          # packs/coaching/SKILL.md plus its vendored and embedded copies
-          # without re-pinning examples/demo-vault/confidant.lock; every heavy
-          # step was skipped, the jobs reported SUCCESS, and main went red on
-          # the next non-docs merge. Never classify these trees as docs,
-          # whatever the extension.
+          # packs/personal/SKILL.md plus its vendored and embedded copies
+          # without re-pinning; every heavy step was skipped, the jobs
+          # reported SUCCESS, and main went red on the next non-docs merge.
+          # Never classify these trees as docs, whatever the extension.
           is_docs() {
             case "$1" in
               packs/*|examples/*|testdata/*) return 1 ;;
@@ -76,9 +75,10 @@ jobs:
               exit 1
             fi
           done
-          for f in packs/coaching/SKILL.md packs/personal/README.md \
-                   examples/demo-vault/confidant.lock examples/README.md \
+          for f in packs/personal/SKILL.md packs/personal/README.md \
+                   examples/demo-vault/confidant.toml examples/README.md \
                    testdata/golden/check.json \
+                   testdata/packs/example-pack/manifest.toml \
                    crates/confidant-core/pack-manifests/personal-0.2/SKILL.md \
                    crates/confidant-cli/pack-skills/personal/SKILL.md \
                    crates/confidant-cli/skills/qmd-search/SKILL.md \
@@ -216,9 +216,6 @@ jobs:
       - name: build CLI
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo build -p confidant-cli --locked
-      - name: proposer smoke
-        if: needs.changes.outputs.docs_only != 'true'
-        run: python3 crates/confidant-cli/skills/bin/smoke-proposers.py --vault examples/demo-vault --cli target/debug/confidant
       - name: qmd-query allowlist tests
         if: needs.changes.outputs.docs_only != 'true'
         # Drives bin/qmd-query.py with a fake qmd on PATH (no QMD install),

@@ -1,3 +1,0 @@
-{"event_id": "evt-001", "type": "renewal", "occurred_at": "2026-10-08", "person_id": "p-01M3TC5H00MPJG000000000000", "package_id": "pkg-01M3TC5H00MPJG004SK4000009", "sessions": 6}
-{"event_id": "evt-002", "type": "checkout_sent", "occurred_at": "2026-10-08", "deal_id": "d-01M3TC5H00MPJG00248G000004"}
-{"event_id": "evt-003", "type": "deal_lost", "occurred_at": "2026-10-09", "deal_id": "d-01M3TC5H00MPJG00248G000004"}

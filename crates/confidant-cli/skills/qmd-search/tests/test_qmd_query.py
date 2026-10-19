@@ -38,15 +38,17 @@ QUERY = SKILL_DIR / "bin" / "qmd-query.py"
 INDEX = SKILL_DIR / "bin" / "qmd-index.py"
 DEMO = REPO_ROOT / "examples" / "demo-vault"
 
-PERSON = "p-01M3TC5H00MPJG000000000000"
+PERSON = "p-01M3TC5H00MPJG000000000101"
+NO_AI_PERSON = "p-01M3TC5H00MPJG001248000002"
 CJK_ID = "n-01M3TC5H00MPJG00CJK0000001"
 SHORT_ID = "n-01M3TC5H00MPJG00N0TE000002"
-# The demo vault's no-ai person: cleared_files never contains these paths.
-NO_AI_NOTE = ("people/p-01M3TC5H00MPJG001248000002/notes/"
+# The fixture's no-ai person: cleared_files never contains these paths.
+NO_AI_NOTE = (f"people/{NO_AI_PERSON}/notes/"
               "n-01M3TC5H000068T0000000000C.md")
-# Cleared unscoped; owned by coaching (referenced by a ledger line).
-COACHING_NOTE = f"people/{PERSON}/notes/n-01M3TC5H00MPJG002NAM000005.md"
-# Cleared unscoped, but unattributed: out of scope for --packs coaching.
+# Cleared unscoped; owned by the implicit personal pack (a `touch` line
+# references it).
+LINKED_NOTE = f"people/{PERSON}/notes/n-01M3TC5H00MPJG002NAM000005.md"
+# Cleared unscoped, but unattributed: out of scope for a `--packs` ceiling.
 UNATTRIBUTED_NOTE = f"people/{PERSON}/notes/n-01M3TC5H00MPJG0036CR000006.md"
 
 CJK_NOTE = f"people/{PERSON}/notes/{CJK_ID}.md"
@@ -54,11 +56,10 @@ SHORT_NOTE = f"people/{PERSON}/notes/{SHORT_ID}.md"
 
 CJK_BODY = "山田さんと面談。日本語だけのメモ。"
 SHORT_BODY = "OK? #12 — done."
-LEDGER_REL = "ledger/2026/10.cfd"
-# reindex writes only cleared ledger lines into the corpus, in order, so the
-# corpus line is not the vault line: corpus line 8 is vault line 10.
-LEDGER_CORPUS_LINE = 8
-LEDGER_VAULT_LINE = 10
+LEDGER_REL = "ledger/2026/11.cfd"
+# A small file: reindex writes the cleared line at the same position.
+LEDGER_CORPUS_LINE = 1
+LEDGER_VAULT_LINE = 1
 
 # The retired probe rule (qmd-query.py before #538): a >= 24-char ASCII run.
 OLD_PROBE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\- ]{8,}")
@@ -96,10 +97,20 @@ def write_exec(path, text):
     path.chmod(0o755)
 
 
-def add_note(vault, note_id, body):
-    path = vault / "people" / PERSON / "notes" / f"{note_id}.md"
+def add_person(vault, person_id, name, extra=""):
+    path = vault / "people" / person_id / "profile.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        f"---\nid: {note_id}\ntype: note\nperson: {PERSON}\n"
+        f"---\nid: {person_id}\ntype: person\nname: {name}\n{extra}---\n\nFake person.\n",
+        encoding="utf-8",
+    )
+
+
+def add_note(vault, note_id, body, person=PERSON):
+    path = vault / "people" / person / "notes" / f"{note_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nid: {note_id}\ntype: note\nperson: {person}\n"
         f"date: 2026-10-01\nsession: 2026-10-01\n---\n\n{body}\n",
         encoding="utf-8",
     )
@@ -130,8 +141,16 @@ class QmdQueryTest(unittest.TestCase):
         cls.root = Path(cls.tmp.name)
         cls.vault = cls.root / "vault"
         shutil.copytree(DEMO, cls.vault)
+        add_person(cls.vault, NO_AI_PERSON, "Cam Sample", "no-ai: true\n")
         add_note(cls.vault, CJK_ID, CJK_BODY)
         add_note(cls.vault, SHORT_ID, SHORT_BODY)
+        add_note(cls.vault, "n-01M3TC5H00MPJG002NAM000005", "Kickofftoken. Dana wants a vault that agents can write.")
+        add_note(cls.vault, "n-01M3TC5H00MPJG0036CR000006", "Followuptoken. Balance assertions caught a duplicate.")
+        add_note(cls.vault, "n-01M3TC5H000068T0000000000C", "Cam asked that notes never go to a model provider.", person=NO_AI_PERSON)
+        (cls.vault / "ledger/2026/11.cfd").write_text(
+            f"2026-11-01 touch {PERSON} meeting note:n-01M3TC5H00MPJG002NAM000005\n",
+            encoding="utf-8",
+        )
         (cls.vault / ".gitignore").write_text(".confidant/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=cls.vault, check=True)
         # Build the real corpus: the ledger alignment reads the file reindex
@@ -196,7 +215,7 @@ class QmdQueryTest(unittest.TestCase):
             hit(SHORT_NOTE, 5, SHORT_BODY, score=0.8),
             hit(NO_AI_NOTE, 5, "Cam asked that notes never go to a model provider.", score=0.7),
             hit(LEDGER_REL, LEDGER_CORPUS_LINE,
-                "2026-10-08 balance p-01M3TC5H00MPJG000000000000 sessions_remaining 4",
+                f"2026-11-01 touch {PERSON} meeting note:n-01M3TC5H00MPJG002NAM000005",
                 score=0.6),
         ])
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -212,7 +231,7 @@ class QmdQueryTest(unittest.TestCase):
         ledger = by_path[LEDGER_REL]
         self.assertEqual(ledger["line"], LEDGER_VAULT_LINE)
         self.assertEqual(ledger["id"], PERSON)
-        self.assertIn("sessions_remaining 4", ledger["excerpt"])
+        self.assertIn("touch", ledger["excerpt"])
         self.assertEqual(data["dropped_uncleared"], 1)
         # #538: one vault load per query, not one per hit file.
         self.assertEqual(len(spawns), 1, spawns)
@@ -231,15 +250,13 @@ class QmdQueryTest(unittest.TestCase):
     def test_scope_drops_out_of_scope_ledger_and_note_hits(self):
         """`--packs` scopes the one allowlist call: out-of-scope hits drop."""
         p, data, _ = self.query([
-            hit(COACHING_NOTE, 5, "Kickoff. Ada wants a vault that agents can write.", score=0.9),
-            hit(UNATTRIBUTED_NOTE, 6, "Follow-up. Balance assertions caught a duplicate.", score=0.8),
-            # Corpus line 1 is the unattributed ledger comment: cleared
-            # unscoped, out of scope for coaching.
-            hit(LEDGER_REL, 1, "; Demo ledger. FAKE data only.", score=0.7),
-        ], packs="coaching@0.1")
+            hit(LINKED_NOTE, 5, "Kickofftoken. Dana wants a vault that agents can write.", score=0.9),
+            hit(UNATTRIBUTED_NOTE, 6, "Followuptoken. Balance assertions caught a duplicate.", score=0.8),
+            hit(LEDGER_REL, 1, f"2026-11-01 touch {PERSON} meeting", score=0.7),
+        ], packs="personal@0.2")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(self.paths(data), [COACHING_NOTE])
-        self.assertEqual(data["dropped_uncleared"], 2)
+        self.assertEqual(self.paths(data), [LINKED_NOTE, LEDGER_REL])
+        self.assertEqual(data["dropped_uncleared"], 1)
 
     def test_fallback_when_qmd_is_missing(self):
         """No qmd: plain `find` fallback and the JSON contract are unchanged."""
@@ -249,7 +266,7 @@ class QmdQueryTest(unittest.TestCase):
         self.assertEqual(data["dropped_uncleared"], 0)
         self.assertTrue(data["matches"])
         self.assertEqual(data["matches"][0]["via"], "find")
-        self.assertEqual(data["matches"][0]["path"], COACHING_NOTE)
+        self.assertEqual(data["matches"][0]["path"], LINKED_NOTE)
         self.assertEqual(len(spawns), 1, spawns)
         self.assertIn("find Kickoff", spawns[0])
 

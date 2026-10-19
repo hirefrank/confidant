@@ -96,6 +96,12 @@ pub trait Pack: Send + Sync {
     fn fields(&self) -> &'static [&'static str];
     /// Balance metrics this pack verifies on `balance` lines.
     fn balance_metrics(&self) -> &'static [&'static str];
+    /// Ledger verbs this pack's `ledger-balance` rules use to open units
+    /// (the manifest's `open_verb`). Used by the search allowlist to clear
+    /// package IDs from opener lines only. Defaults to none.
+    fn balance_open_verbs(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Edge kinds this pack owns (#179). Core ships
     /// [`CORE_EDGE_KINDS`]; a pack that introduces a kind claims it here.
     /// Defaults to none.

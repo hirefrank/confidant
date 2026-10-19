@@ -1,21 +1,21 @@
  1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
-vault  unknown   scope  not resolved yet   doctor  not run
+vault  /fake/demo-vault   scope  not resolved yet   doctor  not run
 ╭ Check Summary ───────────────────────────────────────────────────────────────────────────────────╮
-│  FAILED   spec 0.1  •  records 2  •  ledger 2  •  errors 0  •  warnings 1  •  findings 1         │
+│  FAILED   spec 0.1  •  records 0  •  ledger 1  •  errors 1  •  warnings 0  •  findings 1         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
-│ › [warning] E_COACHING_PAID_SESSION_GAP p-01M3TC5H0 ││ code      E_COACHING_PAID_SESSION_GAP     │
-│                                                     ││ severity  [warning]                       │
+│ › [error] E_EXAMPLE_GAP p-01M3TC5H00MPJG00000000000 ││ code      E_EXAMPLE_GAP                   │
+│                                                     ││ severity  [error]                         │
 │                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
 │                                                     ││ location  -                               │
-│                                                     ││ message   paid client                     │
+│                                                     ││ message   client                          │
 │                                                     ││ p-01M3TC5H00MPJG000000000000 has          │
-│                                                     ││ remaining sessions and no session on or   │
-│                                                     ││ after 2026-08-24 (last was 2026-08-23)    │
-│                                                     ││ fix       Log a session, close the        │
-│                                                     ││ package, or widen                         │
-│                                                     ││ coaching.paid_session_gap_days (currently │
-│                                                     ││ 45)                                       │
+│                                                     ││ remaining units                           │
+│                                                     ││ fix       Fix the fixture                 │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

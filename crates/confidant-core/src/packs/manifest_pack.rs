@@ -44,6 +44,7 @@ pub struct ManifestPack {
     record_types: &'static [&'static str],
     fields: &'static [&'static str],
     balance_metrics: &'static [&'static str],
+    balance_open_verbs: &'static [&'static str],
     edge_kinds: &'static [EdgeKind],
     finding_codes: &'static [&'static str],
     /// The resolved `[context]` view parameters, if this manifest opts in
@@ -101,6 +102,13 @@ pub(crate) fn build_manifest_pack(
         .iter()
         .map(|b| leak_str(b.clone()))
         .collect();
+    let balance_open_verbs: Vec<&'static str> = manifest
+        .rules
+        .iter()
+        .filter(|r| r.kind == "ledger-balance")
+        .filter_map(|r| r.params.get("open_verb").and_then(|v| v.as_str()))
+        .map(|v| leak_str(v.to_owned()))
+        .collect();
     let edge_kinds: Vec<EdgeKind> = manifest
         .edge_kinds
         .iter()
@@ -129,6 +137,7 @@ pub(crate) fn build_manifest_pack(
         record_types: Box::leak(record_types.into_boxed_slice()),
         fields: Box::leak(fields.into_boxed_slice()),
         balance_metrics: Box::leak(balance_metrics.into_boxed_slice()),
+        balance_open_verbs: Box::leak(balance_open_verbs.into_boxed_slice()),
         edge_kinds: Box::leak(edge_kinds.into_boxed_slice()),
         finding_codes: Box::leak(finding_codes.into_boxed_slice()),
         context_params,
@@ -154,6 +163,10 @@ impl Pack for ManifestPack {
 
     fn balance_metrics(&self) -> &'static [&'static str] {
         self.balance_metrics
+    }
+
+    fn balance_open_verbs(&self) -> &'static [&'static str] {
+        self.balance_open_verbs
     }
 
     fn edge_kinds(&self) -> &'static [EdgeKind] {

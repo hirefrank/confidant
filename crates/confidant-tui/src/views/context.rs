@@ -187,8 +187,8 @@ fn render_with_title(state: &ContextViewState, title: &str, frame: &mut Frame<'_
     frame.render_widget(paragraph, area);
 }
 
-/// Front matter as pills, then the profile, coaching numbers, notes,
-/// interactions, touchpoints, and aliases. Bodies are plain text (the TUI
+/// Front matter as pills, then the profile, notes, interactions,
+/// touchpoints, and aliases. Bodies are plain text (the TUI
 /// does not link a Markdown renderer). `edit_index` marks the item `e` would
 /// edit and badges the tri-state `no-ai` mode the operator path reports.
 fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
@@ -229,26 +229,6 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
         "profile ",
         Span::raw(first_line(p.profile.as_deref()).to_owned()),
     ));
-
-    if let Some(c) = &ctx.coaching {
-        lines.push(Line::from(vec![
-            theme::label("coaching "),
-            theme::pill(&format!("sessions_remaining {}", c.sessions_remaining)),
-            Span::raw(" "),
-            theme::pill(&format!("icf_hours {:.2}", c.icf_hours)),
-        ]));
-        for s in &c.recent_sessions {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                theme::pill(&s.date),
-                Span::raw(format!(
-                    " {}m, {}",
-                    s.duration_minutes.unwrap_or(0),
-                    s.tag.as_deref().unwrap_or("untagged")
-                )),
-            ]));
-        }
-    }
 
     lines.push(Line::from(Span::styled(
         format!("notes ({})", ctx.notes.len()),

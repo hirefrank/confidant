@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::install_shipped_coaching;
+use common::install_example_pack;
 use std::process::{Command, Output};
 
 /// Generate a throwaway age identity, returning the Bech32 secret.
@@ -48,7 +48,7 @@ fn git(vault: &Path, args: &[&str]) {
 }
 
 /// Test harness: temp HOME + vault + throwaway device key. The vault
-/// starts with the coaching pack (for `log session`) and no `[crypto]`
+/// starts with the example pack and no `[crypto]`
 /// table (keyed tests exercise the encrypted path).
 struct Harness {
     home: PathBuf,
@@ -74,10 +74,10 @@ impl Harness {
 
         std::fs::write(
             vault.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
         )
         .unwrap();
-        install_shipped_coaching(&vault);
+        install_example_pack(&vault);
         // Pin the initial branch to `master`: the conflict tests check it
         // out by name, and `git init` alone would follow the machine's
         // `init.defaultBranch` (`main` on most machines) and fail there.
@@ -339,12 +339,12 @@ fn log_session_note_writes_envelope() {
         .unwrap();
     assert!(out.status.success());
 
-    // Coaching pack needs an open package before a session can be logged.
+    // The example pack needs a grant before an entry can be logged.
     let ledger_dir = h.vault.join("ledger/2026");
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -421,7 +421,7 @@ fn log_session_by_display_name_decrypts_and_resolves() {
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -1431,7 +1431,7 @@ fn ledger_and_import_stay_plaintext() {
     let import_file = write_file(
         h._tmp.path(),
         "import.txt",
-        &format!("2026-10-12 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        &format!("2026-10-12 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     );
     let out = h
         .cmd(&[
@@ -1447,7 +1447,7 @@ fn ledger_and_import_stay_plaintext() {
         let mut found = false;
         for entry in walk(&h.vault.join("ledger")) {
             let t = std::fs::read_to_string(&entry).unwrap();
-            if t.contains("open") {
+            if t.contains("grant") {
                 found = true;
                 assert!(!t.contains("enc:"), "ledger must stay plaintext");
             }
@@ -1456,12 +1456,12 @@ fn ledger_and_import_stay_plaintext() {
     }
 
     // log session without --note appends only a ledger line.
-    // (Needs an open package for the coaching balance check.)
+    // (Needs a grant for the example pack balance rule.)
     let ledger_dir = h.vault.join("ledger/2026");
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -1506,12 +1506,12 @@ fn log_session_without_note_works_without_device_key() {
         .unwrap();
     assert!(out.status.success());
 
-    // Needs an open package for the coaching balance check.
+    // Needs a grant for the example pack balance rule.
     let ledger_dir = h.vault.join("ledger/2026");
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -1569,12 +1569,12 @@ fn log_session_note_fails_closed_without_device_key() {
         .unwrap();
     assert!(out.status.success());
 
-    // Needs an open package for the coaching balance check.
+    // Needs a grant for the example pack balance rule.
     let ledger_dir = h.vault.join("ledger/2026");
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -2378,7 +2378,7 @@ fn fallback_setup(h: &Harness) -> PathBuf {
     std::fs::create_dir_all(&ledger_dir).unwrap();
     std::fs::write(
         ledger_dir.join("10.cfd"),
-        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+        format!("2026-10-01 grant {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
     )
     .unwrap();
     git(&h.vault, &["add", "-A"]);
@@ -3441,7 +3441,7 @@ fn record_edit_rekeys_a_deal_to_the_new_persons_key() {
     const DEAL: &str = "d-01J9Z3K4QJ0000000000000000";
     let deal = |person: &str| {
         format!(
-            "---\nid: {DEAL}\ntype: deal\nname: \"Coaching package\"\nperson: {person}\n---\n\nDeal body.\n"
+            "---\nid: {DEAL}\ntype: deal\nname: \"Example package\"\nperson: {person}\n---\n\nDeal body.\n"
         )
     };
     let first = write_file(h._tmp.path(), "deal.md", &deal(PERSON));
@@ -6372,7 +6372,7 @@ fn merged_file_rekey_reported_for_deal_person_change() {
     const DEAL: &str = "d-01J9Z3K4QJ0000000000000000";
     let deal = |person: &str| {
         format!(
-            "---\nid: {DEAL}\ntype: deal\nname: \"Coaching package\"\nperson: {person}\n---\n\nDeal body.\n"
+            "---\nid: {DEAL}\ntype: deal\nname: \"Example package\"\nperson: {person}\n---\n\nDeal body.\n"
         )
     };
 

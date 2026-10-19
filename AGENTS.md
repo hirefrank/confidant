@@ -28,7 +28,7 @@ Read before changing behaviour:
   binding).
 - [`docs/crypto-design.md`](docs/crypto-design.md): milestone 2 encryption
   design (key hierarchy, envelope, AAD, recovery, test plan).
-- [`packs/coaching/0.1.md`](packs/coaching/0.1.md): the coaching schema pack.
+- [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
 - [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
   relationships pack (implicit built-in).
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
@@ -50,7 +50,7 @@ Read before changing behaviour:
 | `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary and on crates.io; launched via `confidant tui` |
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser and §14 envelope decoder (own workspace, excluded from the main one; not run in CI) |
 | `spec/` | Format spec and finding codes |
-| `packs/` | Schema packs (coaching and personal) |
+| `packs/` | Schema packs (the built-in personal pack) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |

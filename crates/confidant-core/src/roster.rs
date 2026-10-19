@@ -126,48 +126,27 @@ mod tests {
         let vault = demo_vault();
         let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
-        // Cam Sample is `no-ai: true`: absent, not nulled.
         assert_eq!(
             names,
-            vec![
-                "Ada Example",
-                "Bea Demo",
-                "Dana Example",
-                "Eli Sample",
-                "Fay Demo",
-                "Gus Example",
-            ]
+            vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
         );
         assert!(roster.records.iter().all(|r| r.no_ai == "false"));
         assert_eq!(roster.kind, "person");
         assert!(!roster.for_operator);
-        assert!(roster.scope.contains(&"coaching@0.1".to_string()));
+        assert!(roster.scope.contains(&"personal@0.2".to_string()));
     }
 
     #[test]
-    fn operator_roster_includes_no_ai_with_tri_state() {
+    fn operator_roster_lists_the_demo_people_with_tri_state() {
         let vault = demo_vault();
         let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, true);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
-            vec![
-                "Ada Example",
-                "Bea Demo",
-                "Cam Sample",
-                "Dana Example",
-                "Eli Sample",
-                "Fay Demo",
-                "Gus Example",
-            ]
+            vec!["Dana Example", "Eli Sample", "Fay Demo", "Gus Example"]
         );
-        let cam = roster
-            .records
-            .iter()
-            .find(|r| r.name == "Cam Sample")
-            .unwrap();
-        assert_eq!(cam.no_ai, "true");
-        assert_eq!(cam.kind, "person");
+        assert!(roster.records.iter().all(|r| r.no_ai == "false"));
+        assert!(roster.for_operator);
     }
 
     #[test]
@@ -249,14 +228,35 @@ mod tests {
 
     #[test]
     fn roster_lists_orgs_and_deals_without_no_ai() {
-        let vault = demo_vault();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let org = "o-01J9Z3K4QF0000000000000001";
+        std::fs::create_dir_all(dir.path().join("orgs").join(org)).unwrap();
+        std::fs::write(
+            dir.path().join("orgs").join(org).join("org.md"),
+            format!("---\nid: {org}\ntype: org\nname: Example Org\n---\n\n"),
+        )
+        .unwrap();
+        let deal = "d-01J9Z3K4QF0000000000000002";
+        std::fs::create_dir_all(dir.path().join("deals").join(deal)).unwrap();
+        std::fs::write(
+            dir.path().join("deals").join(deal).join("deal.md"),
+            format!("---\nid: {deal}\ntype: deal\nname: Example Deal\n---\n\n"),
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
         let orgs = build_roster(&vault, RecordKind::Org, &PackScope::All, false);
         assert_eq!(orgs.records.len(), 1);
-        assert_eq!(orgs.records[0].name, "Northwind Training Co");
+        assert_eq!(orgs.records[0].name, "Example Org");
         assert_eq!(orgs.records[0].kind, "org");
         assert_eq!(orgs.records[0].no_ai, "false");
         let deals = build_roster(&vault, RecordKind::Deal, &PackScope::All, false);
         assert_eq!(deals.records.len(), 1);
+        assert_eq!(deals.records[0].name, "Example Deal");
         assert_eq!(deals.records[0].kind, "deal");
     }
 }

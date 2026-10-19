@@ -333,19 +333,19 @@ mod tests {
 
     #[test]
     fn progress_path_replaces_json_extension() {
-        let manifest = Path::new("/vault/.confidant/proposals/lightfield-20261015T120000Z.json");
+        let manifest = Path::new("/vault/.confidant/proposals/example-20261015T120000Z.json");
         assert_eq!(
             progress_path(manifest),
-            Path::new("/vault/.confidant/proposals/lightfield-20261015T120000Z.tui-progress.json")
+            Path::new("/vault/.confidant/proposals/example-20261015T120000Z.tui-progress.json")
         );
     }
 
     #[test]
     fn manifest_stem_strips_extension() {
-        let manifest = Path::new("/vault/.confidant/proposals/lightfield-abc.json");
+        let manifest = Path::new("/vault/.confidant/proposals/example-abc.json");
         assert_eq!(
             manifest_stem(manifest),
-            Path::new("/vault/.confidant/proposals/lightfield-abc")
+            Path::new("/vault/.confidant/proposals/example-abc")
         );
     }
 

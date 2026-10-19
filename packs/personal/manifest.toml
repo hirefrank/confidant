@@ -131,6 +131,8 @@ kind = "cadence-overdue"
 code = "W_CADENCE_OVERDUE"
 severity_key = "personal.cadence_overdue"
 cadence_field = "cadence"
+# Only these verbs count as touchpoints; the list is fixed and does not
+# auto-extend with other packs' verbs.
 event_verbs = ["touch", "session"]
 snooze_field = "snooze_until"
 
