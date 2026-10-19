@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::contract::{parse_raw_output, CheckReport, ContractOutcome};
 use crate::proposals::{
@@ -170,6 +171,13 @@ pub struct PlannedStep {
     pub argv: Vec<String>,
     /// Scratch file this step stages before running (records only).
     pub scratch: Option<StagedScratch>,
+    /// Manifest-declared file the CLI reads at run time: the ledger
+    /// `lines_file` or a note's `body_file`. Its bytes are hashed when the
+    /// step is dry-run and re-checked before the real apply, so a source
+    /// that changed after the review refuses instead of committing content
+    /// the operator never saw (#611). Records pin their content in memory
+    /// via [`PlannedStep::scratch`], so they carry `None` here.
+    pub source_file: Option<PathBuf>,
     /// Set when the step must not run: the message to show instead.
     pub blocked: Option<String>,
 }
@@ -216,6 +224,7 @@ pub fn plan_manifest(
                     manifest.request_id.clone(),
                 ],
                 scratch: None,
+                source_file: Some(lf),
                 blocked: None,
             });
         }
@@ -249,14 +258,18 @@ fn plan_note(
     let request_id = record.request_id.clone().filter(|s| !s.is_empty());
     let person = record.person.clone().filter(|s| !s.is_empty());
     let body_file = record.body_file.clone().filter(|s| !s.is_empty());
-    let (Some(request_id), Some(person), Some(body_file)) = (request_id, person, body_file) else {
+    let note_id_value = record.note_id.clone().filter(|s| !s.is_empty());
+    let (Some(note_id_value), Some(request_id), Some(person), Some(body_file)) =
+        (note_id_value, request_id, person, body_file)
+    else {
         return Ok(PlannedStep {
             key: format!("note:refused-{index}"),
             label,
             argv: Vec::new(),
             scratch: None,
+            source_file: None,
             blocked: Some(format!(
-                "note {note_id} is missing person, body_file or request_id; \
+                "note {note_id} is missing note_id, person, body_file or request_id; \
                  re-run the proposer (the TUI never mints ids)"
             )),
         });
@@ -269,11 +282,19 @@ fn plan_note(
             "note {note_id} body_file is outside .confidant/proposals/: {body_file}"
         ));
     };
+    // #611: pass the manifest's own note id through, so the dry-run the
+    // operator reviews names the exact path and id the apply writes. The
+    // CLI still mints an id when `--id` is absent (the skill workflow), and
+    // refuses a forced id that already exists unless this request already
+    // committed it.
+    let source_file = PathBuf::from(&body_file);
     let mut argv = vec![
         "note".to_owned(),
         "add".to_owned(),
         "--person".to_owned(),
         person,
+        "--id".to_owned(),
+        note_id_value,
     ];
     if let Some(date) = record.date.as_deref().filter(|s| !s.is_empty()) {
         argv.push("--date".to_owned());
@@ -291,6 +312,7 @@ fn plan_note(
         label,
         argv,
         scratch: None,
+        source_file: Some(source_file),
         blocked: None,
     })
 }
@@ -309,6 +331,7 @@ fn plan_record(
             label,
             argv: Vec::new(),
             scratch: None,
+            source_file: None,
             blocked: Some("pre-M2 records must be applied by the skill workflow".to_owned()),
         });
     }
@@ -318,6 +341,7 @@ fn plan_record(
             label,
             argv: Vec::new(),
             scratch: None,
+            source_file: None,
             blocked: Some(format!(
                 "record {} has no request_id; re-run the proposer \
                  (the TUI never mints ids)",
@@ -349,6 +373,7 @@ fn plan_record(
             path: scratch_path,
             content: record.content.clone(),
         }),
+        source_file: None,
         blocked: None,
     })
 }
@@ -432,6 +457,11 @@ pub struct ApplyFlow {
 pub struct FlowStep {
     pub plan: PlannedStep,
     pub status: StepStatus,
+    /// SHA-256 (lowercase hex) of [`PlannedStep::source_file`]'s bytes as
+    /// they were when the last dry-run reviewed the step. `apply_step`
+    /// refuses when the file no longer matches, so the confirm can only
+    /// commit what was on screen (#611).
+    pub reviewed_source_hash: Option<String>,
 }
 
 /// Status of a single step.
@@ -502,6 +532,17 @@ pub enum StepApplyOutcome {
     CheckBlocked { report: CheckReport },
 }
 
+/// Lowercase hex SHA-256 of `bytes`, for the #611 source pin.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl ApplyFlow {
     /// Open a proposal: parse the manifest, build the plan, load progress,
     /// and mark already-done steps.
@@ -523,7 +564,11 @@ impl ApplyFlow {
                 } else {
                     StepStatus::Pending
                 };
-                FlowStep { plan, status }
+                FlowStep {
+                    plan,
+                    status,
+                    reviewed_source_hash: None,
+                }
             })
             .collect();
         Ok(Self {
@@ -567,16 +612,73 @@ impl ApplyFlow {
 
     /// Run the dry-run for `step`, stage scratch files first for records.
     /// On success the phase becomes `Diff`; on failure `StepFailed`.
+    ///
+    /// #611: for a step whose CLI run re-reads a manifest file
+    /// (`source_file`), its bytes are read before the CLI and again after,
+    /// and the stable hash is remembered as the reviewed source. A file
+    /// that changes while the preview is built refuses instead of pinning
+    /// bytes the operator never saw.
     pub fn dry_run_step<R: Runner>(&mut self, runner: &R, step: usize) -> Result<()> {
         let plan = self.steps.get(step).map(|s| s.plan.clone());
         let Some(plan) = plan else {
             return Err(anyhow::anyhow!("no such step {step}"));
+        };
+        let before = match plan.source_file.as_deref().map(std::fs::read).transpose() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let path = plan
+                    .source_file
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.mark_failed(
+                    step,
+                    "source_unreadable",
+                    &format!("cannot read the reviewed source {path}: {e}"),
+                    Some("Re-run the proposer so the file exists, then review again".to_owned()),
+                );
+                return Ok(());
+            }
         };
         if let Some(scratch) = &plan.scratch {
             stage_scratch(scratch)?;
         }
         match run_write_step(runner, &plan.argv, true)? {
             WriteOutcome::DryRun { command, changes } => {
+                if let (Some(path), Some(before)) = (plan.source_file.as_deref(), before.as_deref())
+                {
+                    match std::fs::read(path) {
+                        Ok(after) if after == before => {
+                            self.steps[step].reviewed_source_hash = Some(sha256_hex(before));
+                        }
+                        Ok(_) => {
+                            self.mark_failed(
+                                step,
+                                "source_changed",
+                                &format!(
+                                    "{} changed while the dry-run ran; the preview cannot be trusted",
+                                    path.display()
+                                ),
+                                Some("Re-open the proposal and review the dry-run again".to_owned()),
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            self.mark_failed(
+                                step,
+                                "source_unreadable",
+                                &format!(
+                                    "cannot re-read the reviewed source {}: {e}",
+                                    path.display()
+                                ),
+                                Some(
+                                    "Re-open the proposal and review the dry-run again".to_owned(),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
                 self.phase = FlowPhase::Diff {
                     step,
                     outcome: DryRunData { command, changes },
@@ -611,8 +713,6 @@ impl ApplyFlow {
     }
 
     /// Run the real apply for `step` (the operator already confirmed).
-    /// Updates the progress file; returns true when more steps remain.
-    /// Run the real apply for `step` (the operator already confirmed).
     /// Updates the progress file on success. A check-blocked write is
     /// returned to the caller so the report can be shown in the Check view;
     /// the step is not marked done.
@@ -621,6 +721,53 @@ impl ApplyFlow {
         let Some(plan) = plan else {
             return Err(anyhow::anyhow!("no such step {step}"));
         };
+        // #611: only apply the bytes the dry-run pinned. Refusing here
+        // happens before any CLI call, so the vault and the progress file
+        // are untouched.
+        if let Some(path) = plan.source_file.as_deref() {
+            let reviewed = self.steps[step].reviewed_source_hash.clone();
+            match (std::fs::read(path), reviewed) {
+                (Ok(bytes), Some(hash)) if sha256_hex(&bytes) == hash => {}
+                (Ok(_), Some(_)) => {
+                    self.mark_failed(
+                        step,
+                        "source_changed",
+                        &format!(
+                            "{} changed after the dry-run you reviewed; nothing was applied",
+                            path.display()
+                        ),
+                        Some(
+                            "Re-open the proposal and review the new content, then confirm"
+                                .to_owned(),
+                        ),
+                    );
+                    return Ok(StepApplyOutcome::Failed);
+                }
+                (Ok(_), None) => {
+                    self.mark_failed(
+                        step,
+                        "source_unreviewed",
+                        &format!(
+                            "{} has not been dry-run in this session, so there is nothing to confirm",
+                            path.display()
+                        ),
+                        Some("Re-open the proposal and review the dry-run first".to_owned()),
+                    );
+                    return Ok(StepApplyOutcome::Failed);
+                }
+                (Err(e), _) => {
+                    self.mark_failed(
+                        step,
+                        "source_unreadable",
+                        &format!("cannot read the reviewed source {}: {e}", path.display()),
+                        Some(
+                            "Re-run the proposer so the file exists, then review again".to_owned(),
+                        ),
+                    );
+                    return Ok(StepApplyOutcome::Failed);
+                }
+            }
+        }
         match run_write_step(runner, &plan.argv, false)? {
             WriteOutcome::Applied { commit, .. } | WriteOutcome::Idempotent { commit, .. } => {
                 self.progress.mark_done(&plan.key, &commit);
@@ -1013,6 +1160,76 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].key, "note:01EEEEEEEEEEEEEEEEEEEEEEEE");
         assert!(steps[0].blocked.is_none());
+        // #611: the manifest's own note id is passed through, so the
+        // dry-run the operator reviews names the id and path the apply
+        // writes, and the body file is the reviewed source to pin.
+        let id_pos = steps[0]
+            .argv
+            .iter()
+            .position(|a| a == "--id")
+            .expect("plan_note must pass --id");
+        assert_eq!(steps[0].argv[id_pos + 1], "n-1");
+        assert_eq!(steps[0].source_file.as_deref(), Some(body.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A minimal `import --dry-run` envelope for the fake runner.
+    const DRY_RUN_IMPORT: &str = r#"{
+        "ok": true, "schema_version": "1", "vault": "/v",
+        "command": "import", "dry_run": true, "commit": null,
+        "changes": [
+            {"path": "ledger/2026/10.cfd", "action": "append",
+             "content": "2026-10-01 open d-1 proposal src:test/1\n"}
+        ]
+    }"#;
+
+    #[test]
+    fn apply_refuses_when_the_reviewed_source_changed() {
+        // #611: the file the dry-run read changed before the operator
+        // confirmed. The apply must refuse without running the CLI, so the
+        // vault stays clean and the proposal state is untouched.
+        use crate::proposals::read_progress;
+        use crate::runner::FakeRunner;
+        let dir = test_temp_dir("tui-apply-test-source-changed");
+        let proposals = dir.join(".confidant").join("proposals");
+        std::fs::create_dir_all(&proposals).unwrap();
+        let lines = proposals.join("m.cfd");
+        std::fs::write(&lines, "2026-10-01 open d-1 proposal src:test/1\n").unwrap();
+        let manifest = serde_json::json!({
+            "skill": "s",
+            "request_id": "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            "lines_file": lines.to_string_lossy(),
+            "records": [],
+        });
+        let manifest_path = proposals.join("m.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let fake = FakeRunner::new().with_response("import", 0, DRY_RUN_IMPORT);
+        let mut flow = ApplyFlow::open(&manifest_path, &dir).expect("open flow");
+        flow.dry_run_step(&fake, 0).expect("dry-run");
+        assert!(matches!(flow.phase, FlowPhase::Diff { .. }));
+        // Change the source after the review, before the confirm.
+        std::fs::write(&lines, "2026-10-01 open d-1 proposal src:test/CHANGED\n").unwrap();
+        // Put the step in the Confirm phase the way the keymap does.
+        if let FlowPhase::Diff { step, outcome } = flow.phase.clone() {
+            flow.phase = FlowPhase::Confirm { step, outcome };
+        }
+
+        let outcome = flow.apply_step(&fake, 0).expect("apply call");
+        assert_eq!(outcome, StepApplyOutcome::Failed);
+        assert!(
+            matches!(&flow.phase, FlowPhase::StepFailed { code, .. } if code == "source_changed"),
+            "expected source_changed, got {:?}",
+            flow.phase
+        );
+        // Only the dry-run reached the runner: nothing was applied.
+        assert!(fake
+            .recorded_calls()
+            .iter()
+            .all(|c| c.iter().any(|a| a == "--dry-run")));
+        // The proposal state is intact: the step is not done.
+        assert!(read_progress(&manifest_path).commit_for("ledger").is_none());
+        assert!(matches!(flow.steps[0].status, StepStatus::Failed { .. }));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
