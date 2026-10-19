@@ -82,13 +82,12 @@ jobs:
     needs: [changes]
     strategy:
       fail-fast: false
+      # Both platforms on every event, including pull requests. macOS used to
+      # be main-push-only, and every main-red incident in this stretch was a
+      # platform-only failure it found after merge: #560 and #564 (CLI tests)
+      # and #581 (a TUI snapshot that embedded a TMPDIR-dependent path).
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # PRs: ubuntu only. macOS on push to main, nightly, and workflow_dispatch.
-        event: ["${{ github.event_name }}"]
-        exclude:
-          - os: macos-latest
-            event: pull_request
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
