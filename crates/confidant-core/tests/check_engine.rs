@@ -139,14 +139,13 @@ fn demo_vault_is_clean() {
     assert!(report.summary.records >= 8);
 }
 
-#[test]
-fn balance_mismatch_golden() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    person(dir.path(), ADA, "Ada Example");
-    note(dir.path(), NOTE, ADA, "2026-10-01");
+/// The `balance_mismatch` golden vault's records and ledger, shared by the
+/// golden test and the #449 fixture parity test.
+fn balance_mismatch_vault(root: &Path) {
+    person(root, ADA, "Ada Example");
+    note(root, NOTE, ADA, "2026-10-01");
     write(
-        dir.path(),
+        root,
         "ledger/2026/10.cfd",
         &format!(
             "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
@@ -154,24 +153,37 @@ fn balance_mismatch_golden() {
              2026-10-08 balance {ADA} sessions_remaining 4\n"
         ),
     );
+}
+
+#[test]
+fn balance_mismatch_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    balance_mismatch_vault(dir.path());
     let json = report_json(dir.path(), None);
     assert_eq!(codes(&json), vec!["E_BALANCE_MISMATCH"]);
     assert_golden("balance_mismatch.json", &json);
 }
 
-#[test]
-fn session_without_notes_golden() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    person(dir.path(), ADA, "Ada Example");
+/// The `session_without_notes` golden vault's records and ledger (shared
+/// with the #449 fixture parity test).
+fn session_without_notes_vault(root: &Path) {
+    person(root, ADA, "Ada Example");
     write(
-        dir.path(),
+        root,
         "ledger/2026/10.cfd",
         &format!(
             "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
              2026-10-01 session {ADA} 60m paid\n"
         ),
     );
+}
+
+#[test]
+fn session_without_notes_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    session_without_notes_vault(dir.path());
     let json = report_json(dir.path(), None);
     assert_eq!(codes(&json), vec!["E_SESSION_WITHOUT_NOTES"]);
     assert_golden("session_without_notes.json", &json);
@@ -220,19 +232,25 @@ fn paid_gap_boundary() {
     // one day older → gap
     let dir2 = tempfile::tempdir().unwrap();
     vault_toml(dir2.path(), DEFAULT_CHECKS);
-    person(dir2.path(), ADA, "Ada Example");
-    note(dir2.path(), NOTE, ADA, "2026-08-23");
+    paid_session_gap_vault(dir2.path());
+    let json = report_json(dir2.path(), Some("2026-10-08"));
+    assert_eq!(codes(&json), vec!["E_PAID_SESSION_GAP"]);
+    assert_golden("paid_session_gap.json", &json);
+}
+
+/// The `paid_session_gap` golden vault's records and ledger: one day past
+/// the 45-day window (shared with the #449 fixture parity test).
+fn paid_session_gap_vault(root: &Path) {
+    person(root, ADA, "Ada Example");
+    note(root, NOTE, ADA, "2026-08-23");
     write(
-        dir2.path(),
+        root,
         "ledger/2026/08.cfd",
         &format!(
             "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
              2026-08-23 session {ADA} 60m paid note:{NOTE}\n"
         ),
     );
-    let json = report_json(dir2.path(), Some("2026-10-08"));
-    assert_eq!(codes(&json), vec!["E_PAID_SESSION_GAP"]);
-    assert_golden("paid_session_gap.json", &json);
 }
 
 #[test]
@@ -9842,4 +9860,306 @@ fn gap_rule_loader_refuses_undeclared_balance_metric() {
         ),
     );
     assert_pack_invalid(dir.path());
+}
+
+// ---------------------------------------------------------------------------
+// #449: the on-disk `coaching-ext` fixture, loaded verbatim
+//
+// The inline `coaching_ext_manifest` above tunes one rule per test to pin
+// each kind in isolation. This section loads `testdata/packs/coaching-ext/`
+// — the shippable-unit fixture, all four rules at once — and compares it
+// with compiled `coaching@0.1` on the three golden vaults and the demo
+// vault. It is the parity gate for replacing compiled coaching.
+// ---------------------------------------------------------------------------
+
+/// The on-disk parity fixture (#449).
+fn coaching_ext_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/coaching-ext")
+}
+
+/// Copy the fixture into `root/packs/coaching-ext@0.1`, exactly as
+/// `pack add` vendors it, and pin the canonical hash. Returns the hash.
+fn install_coaching_ext_fixture(root: &Path) -> String {
+    let src = coaching_ext_fixture_dir();
+    let dst = root.join("packs/coaching-ext@0.1");
+    fs::create_dir_all(&dst).unwrap();
+    for entry in fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        assert!(
+            entry.file_type().unwrap().is_file(),
+            "fixture pack dir must be flat: {}",
+            entry.path().display()
+        );
+        fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+    }
+    let hash = read_pack_dir(&dst)
+        .expect("fixture pack dir must read")
+        .hash;
+    install_lockfile(root, "coaching-ext", "0.1", &hash);
+    hash
+}
+
+/// Fixture code → compiled code for every rule the fixture can emit. The
+/// two `E_INVALID_ID` / `E_WRONG_ID_TYPE` rows are intentional: the balance
+/// rule's package ids and the `note-ref` rule's note ids normalise onto the
+/// same compiled codes, and the message text keeps them apart.
+const FIXTURE_CODE_MAP: &[(&str, &str)] = &[
+    ("E_COACHING_EXT_PARSE", "E_PARSE"),
+    ("E_COACHING_EXT_BALANCE", "E_BALANCE_MISMATCH"),
+    ("E_COACHING_EXT_NEGATIVE", "E_NEGATIVE_BALANCE"),
+    ("E_COACHING_EXT_OPEN", "E_OPEN_MALFORMED"),
+    ("E_COACHING_EXT_ID", "E_INVALID_ID"),
+    ("E_COACHING_EXT_TYPE", "E_WRONG_ID_TYPE"),
+    ("E_COACHING_EXT_DURATION", "E_MISSING_DURATION"),
+    ("E_COACHING_EXT_TAGS", "E_SESSION_TAGS"),
+    ("W_COACHING_EXT_UNTAGGED", "W_SESSION_UNTAGGED"),
+    ("E_COACHING_EXT_NOTES", "E_SESSION_WITHOUT_NOTES"),
+    ("E_COACHING_EXT_GAP", "E_PAID_SESSION_GAP"),
+    ("E_COACHING_EXT_NOTE_ID", "E_INVALID_ID"),
+    ("E_COACHING_EXT_NOTE_TYPE", "E_WRONG_ID_TYPE"),
+    ("E_COACHING_EXT_UNKNOWN", "E_UNKNOWN_RECORD"),
+];
+
+/// The fixture's operator keys: the compiled `coaching.*` keys with the
+/// pack namespace swapped, same values. That is the #449 `[checks]`-key
+/// normalisation: each side is configured through its own namespace, then
+/// the findings are compared after the code map above.
+const FIXTURE_CHECKS: &str = "coaching-ext.require_duration = \"error\"\n\
+coaching-ext.balance_nonnegative = \"error\"\n\
+coaching-ext.session_notes = \"warning\"\n\
+coaching-ext.paid_session_gap = \"warning\"\n\
+coaching-ext.paid_session_gap_days = 45\n\
+coaching-ext.pps_lookback_days = 180\n";
+
+/// The raw finding codes of a report, in order — for failure messages.
+fn raw_codes(report: &Value) -> Vec<String> {
+    report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap_or("").to_owned())
+        .collect()
+}
+
+/// Normalise `report`'s findings through `map`, failing if any finding's
+/// code is not covered. The map must cover every code the vault can emit,
+/// so a code that fails to map is a parity gap and must fail the test
+/// rather than be dropped silently by [`normalized_findings`].
+fn mapped_findings(report: &Value, map: &[(&str, &str)], side: &str) -> Vec<String> {
+    let normalized = normalized_findings(report, map);
+    let raw = raw_codes(report);
+    assert_eq!(
+        raw.len(),
+        normalized.len(),
+        "{side} emitted a finding code the parity map does not cover \
+         (raw: {raw:?}); add it to FIXTURE_CODE_MAP"
+    );
+    normalized
+}
+
+/// Build the same vault twice — compiled `coaching@0.1` and the on-disk
+/// fixture — and assert the mapped findings match. `setup` writes the
+/// records and ledger; each side then gets its own `confidant.toml`.
+///
+/// The comparison is strict in both directions: every finding on each side
+/// must map (no silent drops), the raw counts must agree before
+/// normalisation, and the normalised findings must agree after it.
+fn assert_fixture_parity(setup: impl Fn(&Path)) -> (Value, Value) {
+    let compiled_dir = tempfile::tempdir().unwrap();
+    setup(compiled_dir.path());
+    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
+    let compiled = report_json(compiled_dir.path(), None);
+
+    let declarative_dir = tempfile::tempdir().unwrap();
+    setup(declarative_dir.path());
+    install_coaching_ext_fixture(declarative_dir.path());
+    external_vault_toml(
+        declarative_dir.path(),
+        "\"coaching-ext@0.1\"",
+        FIXTURE_CHECKS,
+    );
+    let declarative = report_json(declarative_dir.path(), None);
+
+    let compiled_findings = mapped_findings(&compiled, FIXTURE_CODE_MAP, "compiled");
+    let declarative_findings = mapped_findings(&declarative, FIXTURE_CODE_MAP, "fixture");
+    assert_eq!(
+        raw_codes(&compiled).len(),
+        raw_codes(&declarative).len(),
+        "raw finding counts differ before normalisation:\n\
+         compiled: {:?}\nfixture: {:?}",
+        raw_codes(&compiled),
+        raw_codes(&declarative)
+    );
+    assert_eq!(
+        compiled_findings, declarative_findings,
+        "fixture parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
+    );
+    (compiled, declarative)
+}
+
+/// Recursively copy `src` into `dst` (the demo vault is a tree).
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// The demo vault's records and ledger without its `confidant.toml`; the
+/// parity harness writes the compiled/fixture config itself.
+fn demo_vault_records(root: &Path) {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+    copy_tree(&src, root);
+    fs::remove_file(root.join("confidant.toml")).unwrap();
+}
+
+/// #449 parity: the `balance_mismatch` golden vault, compiled vs. fixture.
+#[test]
+fn declarative_coaching_matches_compiled_coaching_balance() {
+    let (compiled, declarative) = assert_fixture_parity(balance_mismatch_vault);
+    assert_eq!(
+        normalized_codes(&compiled, FIXTURE_CODE_MAP),
+        vec!["E_BALANCE_MISMATCH"]
+    );
+    assert_eq!(
+        normalized_codes(&declarative, FIXTURE_CODE_MAP),
+        vec!["E_BALANCE_MISMATCH"]
+    );
+    assert_eq!(
+        codes(&declarative),
+        vec!["E_COACHING_EXT_BALANCE"],
+        "{declarative:?}"
+    );
+}
+
+/// #449 parity: the `paid_session_gap` golden vault, compiled vs. fixture.
+#[test]
+fn declarative_coaching_matches_compiled_coaching_gap() {
+    let (compiled, declarative) = assert_fixture_parity(paid_session_gap_vault);
+    assert_eq!(
+        normalized_codes(&compiled, FIXTURE_CODE_MAP),
+        vec!["E_PAID_SESSION_GAP"]
+    );
+    assert_eq!(
+        normalized_codes(&declarative, FIXTURE_CODE_MAP),
+        vec!["E_PAID_SESSION_GAP"]
+    );
+    assert_eq!(
+        codes(&declarative),
+        vec!["E_COACHING_EXT_GAP"],
+        "{declarative:?}"
+    );
+}
+
+/// #449 parity: the `session_without_notes` golden vault, compiled vs.
+/// fixture.
+#[test]
+fn declarative_coaching_matches_compiled_coaching_session_notes() {
+    let (compiled, declarative) = assert_fixture_parity(session_without_notes_vault);
+    assert_eq!(
+        normalized_codes(&compiled, FIXTURE_CODE_MAP),
+        vec!["E_SESSION_WITHOUT_NOTES"]
+    );
+    assert_eq!(
+        normalized_codes(&declarative, FIXTURE_CODE_MAP),
+        vec!["E_SESSION_WITHOUT_NOTES"]
+    );
+    assert_eq!(
+        codes(&declarative),
+        vec!["E_COACHING_EXT_NOTES"],
+        "{declarative:?}"
+    );
+}
+
+/// #449 parity: the demo vault, compiled vs. fixture. Both sides are clean,
+/// so a fixture that over-fires fails here.
+#[test]
+fn declarative_coaching_matches_compiled_coaching_demo_vault_clean() {
+    let (compiled, declarative) = assert_fixture_parity(demo_vault_records);
+    assert!(
+        normalized_findings(&compiled, FIXTURE_CODE_MAP).is_empty(),
+        "{compiled:?}"
+    );
+    assert!(
+        normalized_findings(&declarative, FIXTURE_CODE_MAP).is_empty(),
+        "{declarative:?}"
+    );
+}
+
+/// #449 parity extra: the `note-ref` fourth rule, invalid / wrong-type /
+/// missing note ids on `session` lines, compiled vs. fixture.
+#[test]
+fn declarative_coaching_matches_compiled_coaching_note_ref() {
+    let (compiled, declarative) = assert_fixture_parity(|root| {
+        person(root, ADA, "Ada Example");
+        write(
+            root,
+            "ledger/2026/10.cfd",
+            &format!(
+                "2026-10-01 open {ADA} package {PKG} 10 sessions\n\
+                 2026-10-01 session {ADA} 60m paid note:not-an-id\n\
+                 2026-10-02 session {ADA} 60m paid note:{ADA}\n\
+                 2026-10-03 session {ADA} 60m paid note:{NOTE2}\n"
+            ),
+        );
+    });
+    // `normalized_codes` sorts, so the order is the sorted code names.
+    assert_eq!(
+        normalized_codes(&compiled, FIXTURE_CODE_MAP),
+        vec!["E_INVALID_ID", "E_UNKNOWN_RECORD", "E_WRONG_ID_TYPE"]
+    );
+    assert_eq!(
+        normalized_codes(&declarative, FIXTURE_CODE_MAP),
+        vec!["E_INVALID_ID", "E_UNKNOWN_RECORD", "E_WRONG_ID_TYPE"]
+    );
+}
+
+/// #449: the fixture is a pinned, shippable unit. Any edit to its bytes
+/// changes this hash, so the parity tests above must be re-run and this pin
+/// updated deliberately.
+#[test]
+fn declarative_coaching_fixture_hash_is_stable() {
+    let pack = read_pack_dir(&coaching_ext_fixture_dir()).expect("fixture pack dir must read");
+    assert_eq!(
+        pack.hash, "sha256:0b6b25cedc6add72a75ac26a77a085888eed5ed9600a10ca69e8d4891bc131b3",
+        "the #449 fixture changed; re-run the fixture parity tests and update \
+         this pin in the same commit"
+    );
+    assert_eq!(pack.files.len(), 3);
+}
+
+/// #449 drift test: the fixture's SKILL.md must document every code and
+/// every `[checks]` key the manifest declares, exactly like the compiled
+/// packs' skill drift test (`crates/confidant-cli/src/embedded.rs`).
+#[test]
+fn declarative_coaching_skill_documents_all_codes_and_keys() {
+    let dir = coaching_ext_fixture_dir();
+    let manifest_text = fs::read_to_string(dir.join("manifest.toml")).unwrap();
+    let manifest = confidant_core::packs::manifest::parse_manifest_external(&manifest_text)
+        .expect("fixture manifest parses");
+    let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+    for code in &manifest.finding_codes {
+        assert!(
+            skill.contains(code.as_str()),
+            "fixture can emit {code} but its SKILL.md does not document it"
+        );
+    }
+    for key in manifest
+        .checks
+        .severity
+        .iter()
+        .map(|s| &s.key)
+        .chain(manifest.checks.int.iter().map(|i| &i.key))
+    {
+        assert!(
+            skill.contains(&format!("`{key}`")),
+            "fixture declares [checks] key {key} but its SKILL.md does not document it"
+        );
+    }
 }
