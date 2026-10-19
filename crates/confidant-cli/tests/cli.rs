@@ -2801,6 +2801,58 @@ fn find_demo_for_operator_includes_no_ai_with_tri_state() {
         .any(|m| m["no_ai"] == "false"));
 }
 
+/// #593: an operator-only ledger hit carries `operator_only: true`; a ledger
+/// hit an agent can see too does not, and the agent JSON has no such key.
+#[test]
+fn find_demo_for_operator_marks_operator_only_ledger_hits() {
+    // Cam's session line names the `no-ai` person and their note, so the
+    // agent path hides it entirely.
+    let default = run_json(&["find", "2026-10-07"], &demo());
+    assert_eq!(default["matches"], serde_json::json!([]));
+
+    let op = run_json(&["find", "2026-10-07", "--for-operator"], &demo());
+    let ledger = op["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["path"].as_str().unwrap().starts_with("ledger/"))
+        .expect("Cam's session line must be an operator hit");
+    assert_eq!(ledger["operator_only"], true);
+    assert!(ledger.get("no_ai").is_none(), "{ledger}");
+    // Record hits keep the tri-state and never gain the ledger marker.
+    let record = op["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == CAM_NOTE)
+        .expect("the no-ai note must be an operator hit");
+    assert_eq!(record["no_ai"], "true");
+    assert!(record.get("operator_only").is_none(), "{record}");
+
+    // A ledger line naming cleared people is visible to both paths: no
+    // marker, and the agent JSON never has the key.
+    let agent_alias = run_json(&["find", "alias"], &demo());
+    assert!(agent_alias["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["path"].as_str().unwrap().starts_with("ledger/")));
+    assert!(agent_alias["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m.get("operator_only").is_none()));
+    let op_alias = run_json(&["find", "alias", "--for-operator"], &demo());
+    let visible: Vec<_> = op_alias["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["path"].as_str().unwrap().starts_with("ledger/"))
+        .collect();
+    assert!(!visible.is_empty());
+    assert!(visible.iter().all(|m| m.get("operator_only").is_none()));
+}
+
 /// #572: `context --for-operator` decrypts a `no-ai` person and their
 /// notes, with the tri-state `no_ai` and `for_operator: true`. Without the
 /// flag the output is unchanged: name withheld, notes absent, boolean flag.
