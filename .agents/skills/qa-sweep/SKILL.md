@@ -51,10 +51,18 @@ changed since the last sweep.
    `CONFIDANT_DEVICE_KEY` / `CONFIDANT_TEST_OPERATOR_KEY` with
    `CONFIDANT_KEYCHAIN=off` (ADR-14: CI never holds vault keys). Never
    point a write at the operator's real config dir or keychain.
-4. **Pin dates.** Ledger writes take `--date`; pass a fixed date so a run
+4. **Give throwaway vaults their own git identity, and cut off the real
+   one.** Writes need `git user.name`/`user.email`; a developer machine
+   supplies them from the real config, a runner does not, so a sweep that
+   passes locally can fail with `E_INVALID: git user.name is not
+   configured`. Write a fake identity into the throwaway `HOME`'s
+   `.gitconfig` and point `GIT_CONFIG_GLOBAL` at it; clear
+   `XDG_CONFIG_HOME` and set `GIT_CONFIG_NOSYSTEM=1` so git cannot fall
+   back to the operator's config at all (#623, and the #560 lesson).
+5. **Pin dates.** Ledger writes take `--date`; pass a fixed date so a run
    does not depend on the wall clock and turn red on a month rollover
    (#585).
-5. **Drive it, then poke it.** Run the happy path, then refuse things:
+6. **Drive it, then poke it.** Run the happy path, then refuse things:
    bad input, a second write, a conflicting pack, a stale pin, a symlink,
    a missing key.
 

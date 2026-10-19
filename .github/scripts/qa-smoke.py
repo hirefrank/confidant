@@ -155,6 +155,15 @@ class Smoke:
 
         self.device_key = age_secret_key()
         self.operator_hex = os.urandom(32).hex()
+        # A throwaway git identity, written into the throwaway HOME *and* named
+        # explicitly via GIT_CONFIG_GLOBAL. Without this the smoke passes on a
+        # developer machine (git falls back to the real user's config) and fails
+        # on a runner, which has no identity: the first write is refused with
+        # "git user.name is not configured". XDG_CONFIG_HOME is cleared in
+        # env() for the same reason (#623, the #560 lesson).
+        (self.home / ".gitconfig").write_text(
+            "[user]\n\tname = QA Smoke\n\temail = qa-smoke@example.invalid\n"
+        )
         self.steps: list[str] = []
         self.step_count = 0
 
@@ -164,9 +173,15 @@ class Smoke:
         """A hermetic environment: throwaway HOME, keys and git identity."""
         e = dict(os.environ)
         e.pop("CONFIDANT_VAULT", None)
+        # The throwaway HOME must be the *only* place git can find config:
+        # XDG_CONFIG_HOME would otherwise still point at the real user's
+        # ~/.config/git/config, and GIT_CONFIG_GLOBAL makes the throwaway file
+        # the global config explicitly rather than by HOME inference (#623).
+        e.pop("XDG_CONFIG_HOME", None)
         e.update(
             {
                 "HOME": str(self.home),
+                "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
                 "CONFIDANT_KEYCHAIN": "off",
                 "CONFIDANT_DEVICE_KEY": self.device_key,
                 "CONFIDANT_TEST_OPERATOR_KEY": self.operator_hex,
