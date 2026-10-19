@@ -274,7 +274,25 @@ pub fn apply_write(
     pending: PendingWrite,
     opts: &WriteOptions,
 ) -> anyhow::Result<WriteOutcome> {
-    apply_write_inner(root, pending, opts, None)
+    apply_write_inner(root, pending, opts, None, false)
+}
+
+/// Like [`apply_write`], but a failing pre-check does not block the write:
+/// the change is applied and the post-check decides.
+///
+/// The post-check still fails closed. If the vault is not clean after the
+/// change, every touched file is rolled back and the outcome is
+/// [`WriteOutcome::CheckBlocked`], so this can never commit into a vault
+/// that is still broken. Use it only when the write repairs the exact
+/// problem the pre-check reports. `pack update` is the one caller: a stale
+/// `confidant.lock` hash makes the pre-check report `E_PACK_HASH` for the
+/// pin the pending write rewrites (#606).
+pub fn apply_write_repairing(
+    root: &Path,
+    pending: PendingWrite,
+    opts: &WriteOptions,
+) -> anyhow::Result<WriteOutcome> {
+    apply_write_inner(root, pending, opts, None, true)
 }
 
 /// Like [`apply_write`], but record-file contents are transformed through
@@ -291,7 +309,7 @@ pub fn apply_write_with_encryptor(
     opts: &WriteOptions,
     encrypt: &RecordEncryptor,
 ) -> anyhow::Result<WriteOutcome> {
-    apply_write_inner(root, pending, opts, Some(encrypt))
+    apply_write_inner(root, pending, opts, Some(encrypt), false)
 }
 
 fn apply_write_inner(
@@ -299,6 +317,7 @@ fn apply_write_inner(
     mut pending: PendingWrite,
     opts: &WriteOptions,
     encrypt: Option<&RecordEncryptor>,
+    repairing: bool,
 ) -> anyhow::Result<WriteOutcome> {
     if let Some(rid) = &opts.request_id {
         if rid.trim().is_empty() {
@@ -403,10 +422,12 @@ fn apply_write_inner(
         }
     }
 
-    // 3. Pre-check: fail fast on an already-broken vault.
+    // 3. Pre-check: fail fast on an already-broken vault. A repairing write
+    // skips this gate because it exists to fix the reported problem; the
+    // post-check below still refuses to commit an unclean result.
     let vault = load_vault(root).map_err(anyhow::Error::new)?;
     let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
+    if !pre.ok && !repairing {
         return Ok(WriteOutcome::CheckBlocked { report: pre });
     }
 
@@ -619,6 +640,74 @@ mod tests {
         assert!(crate::record::has_conflict_markers(">>>>>>> branch\n"));
         assert!(!crate::record::has_conflict_markers("a\n=======\nb\n"));
         assert!(!crate::record::has_conflict_markers("plain text\n"));
+    }
+
+    /// #606: a repairing write may proceed past a failing pre-check, but the
+    /// post-check still gates the commit. A write that does not leave the
+    /// vault clean is rolled back and reported blocked.
+    #[test]
+    fn repairing_write_still_refuses_an_unclean_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"9.9\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
+        )
+        .expect("write config");
+        git(dir.path(), &["init", "-q"], false).expect("init");
+        git(dir.path(), &["config", "user.name", "Test"], false).expect("name");
+        git(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+            false,
+        )
+        .expect("email");
+        git(dir.path(), &["add", "-A"], false).expect("add");
+        git(dir.path(), &["commit", "-qm", "init"], false).expect("commit");
+
+        // The unsupported spec is an error finding, and this write does not
+        // fix it: nothing is committed and the file is rolled back.
+        let unrelated = PendingWrite {
+            changes: vec![FileChange::WriteFile {
+                path: PathBuf::from("README.md"),
+                contents: "unrelated\n".to_owned(),
+            }],
+            summary: "test: unrelated".to_owned(),
+            canonical_request: "test: unrelated".to_owned(),
+        };
+        let outcome = apply_write_repairing(dir.path(), unrelated, &WriteOptions::default())
+            .expect("apply should report, not error");
+        assert!(
+            matches!(outcome, WriteOutcome::CheckBlocked { .. }),
+            "{outcome:?}"
+        );
+        assert!(!dir.path().join("README.md").exists(), "rolled back");
+        assert_eq!(
+            git(dir.path(), &["rev-list", "--count", "HEAD"], false)
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        assert_eq!(
+            git(dir.path(), &["status", "--porcelain"], false).unwrap(),
+            ""
+        );
+
+        // A write that repairs the reported problem commits.
+        let repair = PendingWrite {
+            changes: vec![FileChange::WriteFile {
+                path: PathBuf::from("confidant.toml"),
+                contents: "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n"
+                    .to_owned(),
+            }],
+            summary: "test: repair".to_owned(),
+            canonical_request: "test: repair".to_owned(),
+        };
+        let outcome = apply_write_repairing(dir.path(), repair, &WriteOptions::default())
+            .expect("repairing apply should commit");
+        assert!(
+            matches!(outcome, WriteOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]

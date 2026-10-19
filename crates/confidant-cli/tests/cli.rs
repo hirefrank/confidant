@@ -2181,6 +2181,95 @@ fn pack_update_noop_is_unchanged_with_exit_0() {
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
+/// #606: a stale lock hash with an otherwise current tree must not be
+/// reported unchanged. The stale pin is an `E_PACK_HASH` error to the
+/// pre-check, so this exercises the repair path; the post-check still gates
+/// the commit.
+#[cfg(unix)]
+#[test]
+fn pack_update_repairs_a_stale_lock_hash() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    let lock_path = vault.path().join("confidant.lock");
+    let good = std::fs::read_to_string(&lock_path).unwrap();
+    let good_hash = good
+        .lines()
+        .find_map(|line| line.strip_prefix("hash = \"sha256:"))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("pack add wrote a hash");
+    let stale = if good_hash.starts_with('0') { "1" } else { "0" }.repeat(64);
+    let stale_lock = good.replace(&format!("sha256:{good_hash}"), &format!("sha256:{stale}"));
+    assert_ne!(stale_lock, good);
+    std::fs::write(&lock_path, &stale_lock).unwrap();
+    // Commit the planted pin so the starting point is a clean tree: the diff
+    // under test must be the one repair commit.
+    git(vault.path(), &["add", "confidant.lock"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "plant stale pin",
+        ],
+    );
+
+    // The scenario is real: `check` flags the stale pin before the update.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "E_PACK_HASH"),
+        "{v}"
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(pack.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["unchanged"].is_null(), "a stale pin is not a no-op: {v}");
+    assert_eq!(v["files"], serde_json::json!(["confidant.lock"]), "{v}");
+
+    // The lock is byte-identical to the pin `pack add` wrote, exactly one
+    // commit landed, and the tree is clean.
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), good);
+    let after: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(after, before.trim().parse::<u32>().unwrap() + 1);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    // The repair leaves the vault clean.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+}
+
 /// #587: a non-regular entry inside the vendored tree must still be refused
 /// before any delete is queued. The no-op short-circuit (#602) is reached
 /// only after the tree is proven diffable, so it cannot let this through.
