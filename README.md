@@ -108,13 +108,23 @@ The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 | Area | Commands | Notes |
 |---|---|---|
 | Write | `record add`, `record edit`, `note add`, `log session`, `log touch`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
-| Read | `find`, `context`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record show <id> --for-edit` is operator-only and decrypts `no-ai` records |
+| Read | `find`, `context`, `resolve`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record show <id> --for-edit` is operator-only and decrypts `no-ai` records |
 | Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
 | Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |
 | Search | `reindex` + `qmd-search` skill | QMD index is local, gitignored, built from the cleared set only |
 | Health | `doctor` | Staleness checks, skills-link health |
 | Agents | `mcp`, `setup`, `update`, `agents`, `which`, `routing` | MCP is a thin stdio wrapper over the CLI — never a second code path |
+
+Wherever a command takes a person (`--person` on `log session`, `log touch`,
+`note add`, and `context`), it accepts either a `p-<ULID>` or an **exact
+display name**: trimmed, case-insensitive, whole-string equality against the
+§12 cleared set (`find` stays the fuzzy path). A name belonging to a
+merged-away member resolves to the canonical person. Writes resolved by name
+echo the resolved `p-<ULID>` (and name) so a wrong pick is visible.
+`confidant resolve <query>` is the read-only lookup. A `no-ai: true` person
+is addressed by `p-<ULID>` only — never by name — and an ambiguous name fails
+closed with `E_AMBIGUOUS_PERSON` rather than guessing.
 
 ## Packs
 

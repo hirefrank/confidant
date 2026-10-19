@@ -140,6 +140,16 @@ enum Command {
     /// The query-time allowlist stays the authority; this only narrows what
     /// an indexer copies into its local corpus.
     Allowlist,
+    /// Resolve a person by `p-<ULID>` or exact display name (read-only).
+    ///
+    /// A display name matches the §12 cleared set exactly (trimmed,
+    /// case-insensitive, whole-string), so `no-ai: notes` people resolve by
+    /// name and `no-ai: true` people only by id. Names are canonicalized
+    /// across merges; an ambiguous name fails closed (`E_AMBIGUOUS_PERSON`).
+    Resolve {
+        /// A `p-<ULID>` or an exact display name (cleared records only).
+        query: String,
+    },
     /// Rebuild the local search corpus under `<vault>/.confidant/qmd-corpus/`.
     ///
     /// Cleared records are decrypted through the read path, so `no-ai`
@@ -209,7 +219,8 @@ enum Command {
     },
     /// Context bundle for one person (honors no-ai).
     Context {
-        /// Opaque person id (p-…).
+        /// Opaque person id (p-…) or an exact display name (cleared people
+        /// only; see `confidant resolve`).
         person: String,
         /// Strip private data: name, profile, bodies, and the personal pack's
         /// PII fields (`birthday`, `dates`, `relationship`, `location`,
@@ -439,7 +450,8 @@ enum InboxAction {
 enum LogAction {
     /// Append a session ledger line, e.g. `log session p-… 60m paid`.
     Session {
-        /// Opaque person id (p-…).
+        /// Opaque person id (p-…) or an exact display name (cleared people
+        /// only; see `confidant resolve`).
         person: String,
         /// Duration like 60m or 1h30m.
         duration: String,
@@ -464,7 +476,8 @@ enum LogAction {
     },
     /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
-        /// Opaque person id (p-…).
+        /// Opaque person id (p-…) or an exact display name (cleared people
+        /// only; see `confidant resolve`).
         person: String,
         /// Touchpoint kind: call, text, email, meet, meal, event, gift, or other.
         kind: String,
@@ -626,7 +639,8 @@ impl Side {
 enum NoteAction {
     /// Create a note record under people/<person>/notes/.
     Add {
-        /// Opaque person id (p-…).
+        /// Opaque person id (p-…) or an exact display name (cleared people
+        /// only; see `confidant resolve`).
         #[arg(long)]
         person: String,
         /// Note date YYYY-MM-DD (default today).
@@ -801,6 +815,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Find { query, limit } => {
             let root = vault_root.unwrap();
             cmd_find(json, &root, query, *limit, cli.packs.as_deref())
+        }
+        Command::Resolve { query } => {
+            let root = vault_root.unwrap();
+            cmd_resolve(&cli, &root, query)
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
@@ -2917,18 +2935,125 @@ fn finish_write(
     }
 }
 
-fn parse_person_arg(vault: &confidant_core::Vault, raw: &str) -> anyhow::Result<RecordId> {
-    let id = RecordId::parse(raw).map_err(|_| {
-        anyhow::Error::new(DomainError::usage(format!("not a record id: {raw}"))).context(
-            "write commands take an opaque person id; use `confidant find <name>` to look one up",
-        )
-    })?;
-    match vault.records.get(&id) {
-        Some(r) if r.kind == RecordKind::Person => Ok(id),
-        _ => Err(
-            anyhow::Error::new(DomainError::not_found(format!("no person with id {raw}")))
-                .context("use `confidant find <name>` to look up the id"),
+/// A `--person` / positional person argument resolved to a canonical person
+/// (#537). `matched_name` is `Some` only for an exact display-name argument,
+/// so a write resolved by name can echo the pick (Refinement B) while a
+/// write by `p-<ULID>` keeps its previous output.
+struct ResolvedPersonArg {
+    id: RecordId,
+    matched_name: Option<String>,
+}
+
+impl ResolvedPersonArg {
+    /// JSON object echoing the resolved person, or `None` for an id argument
+    /// (so id writes produce byte-identical output).
+    fn echo_json(&self) -> Option<Value> {
+        self.matched_name
+            .as_ref()
+            .map(|name| serde_json::json!({ "id": self.id.to_string(), "name": name }))
+    }
+}
+
+/// The vault loaded through the agent read path (`operator: false`), so
+/// cleared people's names decrypt. Unlike [`load_vault_for_reads`] this
+/// returns the classified error instead of printing it: the write commands
+/// resolve names *in addition to* loading their own (un-hooked) vault, and
+/// the error must reach the top-level handler once.
+fn load_read_vault(root: &Path) -> anyhow::Result<confidant_core::Vault> {
+    let probe = confidant_core::load_vault(root).map_err(anyhow::Error::new)?;
+    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
+        root,
+        &probe.config.vault_id,
+    ));
+    confidant_core::load_vault_with_hook(root, Some(decryptor.hook())).map_err(anyhow::Error::new)
+}
+
+/// Map a failed name resolution to the command-error layer. The not-found
+/// fix is deliberately generic (Refinement A): it must not confirm that a
+/// hidden `no-ai: true` person exists.
+fn person_resolve_error(
+    query: &str,
+    err: confidant_core::resolve::PersonResolveError,
+) -> anyhow::Error {
+    use confidant_core::resolve::PersonResolveError;
+    match err {
+        PersonResolveError::NotFound => anyhow::Error::new(
+            DomainError::not_found(format!("no person matches '{query}'")).with_fix(
+                "Use an exact display name (trimmed, case-insensitive) or the p-<ULID>; if this \
+                 person is `no-ai: true`, pass their p-<ULID>",
+            ),
         ),
+        PersonResolveError::Ambiguous { candidates } => {
+            let ids: Vec<String> = candidates.iter().map(RecordId::to_string).collect();
+            anyhow::Error::new(DomainError::ambiguous_person(query, &ids))
+        }
+    }
+}
+
+/// Resolve a `--person` / positional person argument: a `p-<ULID>` against
+/// the already-loaded write vault (its id and type sit in the plaintext
+/// envelope header, so a `no-ai: true` person stays addressable by id without
+/// decrypting), or an exact display name against the `for_reads` cleared set.
+fn resolve_person_arg(
+    root: &Path,
+    vault: &confidant_core::Vault,
+    raw: &str,
+) -> anyhow::Result<ResolvedPersonArg> {
+    if let Ok(id) = RecordId::parse(raw) {
+        return match vault.records.get(&id) {
+            Some(r) if r.kind == RecordKind::Person => Ok(ResolvedPersonArg {
+                id,
+                matched_name: None,
+            }),
+            _ => Err(anyhow::Error::new(DomainError::not_found(format!(
+                "no person with id {raw}"
+            )))),
+        };
+    }
+    let read_vault = load_read_vault(root)?;
+    match confidant_core::resolve::resolve_person(&read_vault, raw) {
+        Ok(m) => {
+            // Belt-and-braces (#537 review): never echo a canonical the §12
+            // cleared set excludes, even if resolution ever regresses. A
+            // cleared person merged into a `no-ai: true` person must not
+            // print (or serialize) that hidden person's name; fall back to
+            // the same generic not-found as a miss.
+            if !confidant_core::cleared_record_ids(&read_vault).contains(&m.id) {
+                return Err(person_resolve_error(
+                    raw,
+                    confidant_core::resolve::PersonResolveError::NotFound,
+                ));
+            }
+            // Echo the canonical person's own name; fall back to the query
+            // for the rare merged-away name whose canonical has none.
+            let matched_name = read_vault
+                .records
+                .get(&m.id)
+                .and_then(|r| r.name.clone())
+                .or_else(|| Some(raw.trim().to_owned()));
+            Ok(ResolvedPersonArg {
+                id: m.id,
+                matched_name,
+            })
+        }
+        Err(err) => Err(person_resolve_error(raw, err)),
+    }
+}
+
+/// Refinement B (#537): a write resolved by exact display name prints the
+/// resolved `p-<ULID>` (and name) so a wrong pick is immediately visible.
+/// Id writes print nothing extra; under `--json` the envelope carries it.
+///
+/// The line is printed before the remaining validation (bad duration, bad
+/// touch kind, keychain/inbox fallback), so it says "resolving to" rather
+/// than claiming a completed write: the human may still see an error and no
+/// commit after it (#537 review).
+fn announce_resolved_person(cli: &Cli, person: &ResolvedPersonArg) {
+    if cli.json {
+        return;
+    }
+    if let Some(name) = &person.matched_name {
+        println!("resolving to {} ({name})", person.id);
     }
 }
 
@@ -3078,7 +3203,8 @@ fn cmd_log_session(
     fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let person = parse_person_arg(&vault, person_raw)?;
+    let person = resolve_person_arg(root, &vault, person_raw)?;
+    announce_resolved_person(cli, &person);
     if parse_duration_minutes(duration).is_none() {
         return Err(anyhow::Error::new(DomainError::usage(format!(
             "bad duration '{duration}'; use like 60m or 1h30m"
@@ -3094,14 +3220,14 @@ fn cmd_log_session(
     if let Some(text) = note {
         let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
-        let rel = PathBuf::from(format!("people/{person}/notes/{nid}.md"));
+        let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
         let rec = Record {
             id: nid.clone(),
             kind: RecordKind::Note,
             path: rel.display().to_string(),
             name: None,
             fields: BTreeMap::from([
-                ("person".to_owned(), person.to_string()),
+                ("person".to_owned(), person.id.to_string()),
                 ("date".to_owned(), date.to_string()),
             ]),
             body: text.clone(),
@@ -3123,7 +3249,7 @@ fn cmd_log_session(
     let mut parts = vec![
         date.to_string(),
         "session".to_owned(),
-        person.to_string(),
+        person.id.to_string(),
         duration.to_owned(),
     ];
     if let Some(t) = &tag {
@@ -3142,13 +3268,15 @@ fn cmd_log_session(
     });
 
     let canonical = format!(
-        "log-session/v1\nperson={person}\ndate={date}\nduration={duration}\ntag={}\nnote={}\nsrc={}\n",
+        "log-session/v1\nperson={}\ndate={date}\nduration={duration}\ntag={}\nnote={}\nsrc={}\n",
+        person.id,
         tag.as_deref().unwrap_or(""),
         note_body.as_deref().unwrap_or(""),
         src.as_deref().unwrap_or(""),
     );
     let summary = format!(
-        "session {person} {duration}{}",
+        "session {} {duration}{}",
+        person.id,
         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
     );
     // #176: a session WITH a note needs the device key (the note record
@@ -3187,6 +3315,7 @@ fn cmd_log_session(
                     &line,
                     &note_rel,
                     &note_contents,
+                    &person,
                 );
             }
             return Err(note_keychain_error());
@@ -3202,13 +3331,11 @@ fn cmd_log_session(
         },
         &write_options(cli),
     )?;
-    finish_write(
-        cli,
-        root,
-        "log-session",
-        outcome,
-        serde_json::json!({"lines": [line]}),
-    )
+    let mut extra = serde_json::json!({"lines": [line]});
+    if let Some(echo) = person.echo_json() {
+        extra["person"] = echo;
+    }
+    finish_write(cli, root, "log-session", outcome, extra)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3241,7 +3368,8 @@ fn cmd_log_touch(
                 .with_fix(format!("Add \"{owner}\" to packs in confidant.toml")),
         ));
     }
-    let person = parse_person_arg(&vault, person_raw)?;
+    let person = resolve_person_arg(root, &vault, person_raw)?;
+    announce_resolved_person(cli, &person);
     // #510: the kind grammar is core-owned; validate against the core list
     // directly instead of probing the owning pack's trait.
     if !confidant_core::touch::is_valid_touch_kind(kind) {
@@ -3259,14 +3387,14 @@ fn cmd_log_touch(
     if let Some(text) = note {
         let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
-        let rel = PathBuf::from(format!("people/{person}/notes/{nid}.md"));
+        let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
         let rec = Record {
             id: nid.clone(),
             kind: RecordKind::Note,
             path: rel.display().to_string(),
             name: None,
             fields: BTreeMap::from([
-                ("person".to_owned(), person.to_string()),
+                ("person".to_owned(), person.id.to_string()),
                 ("date".to_owned(), date.to_string()),
             ]),
             body: text.clone(),
@@ -3287,7 +3415,7 @@ fn cmd_log_touch(
     let mut parts = vec![
         date.to_string(),
         "touch".to_owned(),
-        person.to_string(),
+        person.id.to_string(),
         kind.to_owned(),
     ];
     if let Some(n) = &note_arg {
@@ -3303,11 +3431,12 @@ fn cmd_log_touch(
     });
 
     let canonical = format!(
-        "log-touch/v1\nperson={person}\ndate={date}\nkind={kind}\nnote={}\nsrc={}\n",
+        "log-touch/v1\nperson={}\ndate={date}\nkind={kind}\nnote={}\nsrc={}\n",
+        person.id,
         note_body.as_deref().unwrap_or(""),
         src.as_deref().unwrap_or(""),
     );
-    let summary = format!("touch {person} {kind}");
+    let summary = format!("touch {} {kind}", person.id);
     if note_body.is_some() {
         let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
             .map_err(anyhow::Error::new)?;
@@ -3332,6 +3461,7 @@ fn cmd_log_touch(
                     &line,
                     &note_rel,
                     &note_contents,
+                    &person,
                 );
             }
             return Err(note_keychain_error());
@@ -3347,13 +3477,11 @@ fn cmd_log_touch(
         },
         &write_options(cli),
     )?;
-    finish_write(
-        cli,
-        root,
-        "log-touch",
-        outcome,
-        serde_json::json!({"lines": [line]}),
-    )
+    let mut extra = serde_json::json!({"lines": [line]});
+    if let Some(echo) = person.echo_json() {
+        extra["person"] = echo;
+    }
+    finish_write(cli, root, "log-touch", outcome, extra)
 }
 
 /// Interactive prompt for the #213 fallback: queue the note to the inbox
@@ -3547,6 +3675,7 @@ fn queue_session_note_to_inbox(
     line: &str,
     note_rel: &Path,
     note_contents: &str,
+    person: &ResolvedPersonArg,
 ) -> anyhow::Result<ExitCode> {
     use confidant_core::QueueItem;
     // The pin is the verification: the fallback encrypts to the pinned
@@ -3625,15 +3754,16 @@ fn queue_session_note_to_inbox(
             ));
         }
         if cli.json {
-            print_json(&ok_envelope(
-                Some(root),
-                serde_json::json!({
-                    "dry_run": true,
-                    "queued": false,
-                    "fallback_inbox": true,
-                    "items": stems,
-                }),
-            ))?;
+            let mut obj = serde_json::json!({
+                "dry_run": true,
+                "queued": false,
+                "fallback_inbox": true,
+                "items": stems,
+            });
+            if let Some(echo) = person.echo_json() {
+                obj["person"] = echo;
+            }
+            print_json(&ok_envelope(Some(root), obj))?;
         } else {
             println!(
                 "dry run — would queue {} item(s) to inbox: {}",
@@ -3659,15 +3789,16 @@ fn queue_session_note_to_inbox(
         Err(err) => return Err(err),
     };
     if cli.json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "queued": true,
-                "fallback_inbox": true,
-                "items": stems,
-                "tip": tip,
-            }),
-        ))?;
+        let mut obj = serde_json::json!({
+            "queued": true,
+            "fallback_inbox": true,
+            "items": stems,
+            "tip": tip,
+        });
+        if let Some(echo) = person.echo_json() {
+            obj["person"] = echo;
+        }
+        print_json(&ok_envelope(Some(root), obj))?;
     } else {
         println!("queued to inbox; run `confidant inbox` when the keychain is back");
     }
@@ -3769,7 +3900,8 @@ fn cmd_note_add(
     body_file: &Path,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    let person = parse_person_arg(&vault, person_raw)?;
+    let person = resolve_person_arg(root, &vault, person_raw)?;
+    announce_resolved_person(cli, &person);
     let date = parse_date_arg(&date_raw)?;
     let body = std::fs::read_to_string(body_file).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
@@ -3780,9 +3912,9 @@ fn cmd_note_add(
 
     let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
         .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
-    let rel = PathBuf::from(format!("people/{person}/notes/{nid}.md"));
+    let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
     let mut fields = BTreeMap::from([
-        ("person".to_owned(), person.to_string()),
+        ("person".to_owned(), person.id.to_string()),
         ("date".to_owned(), date.to_string()),
     ]);
     if no_ai {
@@ -3807,23 +3939,22 @@ fn cmd_note_add(
                 path: rel.clone(),
                 contents: confidant_core::format_record(&rec),
             }],
-            summary: format!("note {person} {nid}"),
+            summary: format!("note {} {nid}", person.id),
             canonical_request: format!(
-                "note-add/v1\nperson={person}\ndate={date}\nno_ai={no_ai}\nbody={body}"
+                "note-add/v1\nperson={}\ndate={date}\nno_ai={no_ai}\nbody={body}",
+                person.id
             ),
         },
         &write_options(cli),
     )?;
-    finish_write(
-        cli,
-        root,
-        "note-add",
-        outcome,
-        serde_json::json!({
-            "id": nid.to_string(),
-            "path": rel.display().to_string(),
-        }),
-    )
+    let mut extra = serde_json::json!({
+        "id": nid.to_string(),
+        "path": rel.display().to_string(),
+    });
+    if let Some(echo) = person.echo_json() {
+        extra["person"] = echo;
+    }
+    finish_write(cli, root, "note-add", outcome, extra)
 }
 
 fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
@@ -5313,11 +5444,18 @@ fn cmd_context(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    let person = RecordId::parse(person_raw).map_err(|_| {
-        anyhow::Error::new(DomainError::usage(format!("not a record id: {person_raw}"))).context(
-            "`context` takes an opaque person id; use `confidant find <name>` to look one up",
-        )
-    })?;
+    // #537: a `p-<ULID>` keeps its exact previous behaviour (unsupported id
+    // shapes still fall through to the ⚠2b / not-found branches below); a
+    // non-id argument is an exact display name resolved against the cleared
+    // set and canonicalized. Id args are not canonicalized here — `context`
+    // already folds merge groups when it builds the bundle.
+    let person = match RecordId::parse(person_raw) {
+        Ok(id) => id,
+        Err(_) => match confidant_core::resolve::resolve_person(&vault, person_raw) {
+            Ok(m) => m.id,
+            Err(err) => return Err(person_resolve_error(person_raw, err)),
+        },
+    };
     let (scope, _scope_names) = match resolve_cli_scope(&vault, cli.packs.as_deref()) {
         Ok(pair) => pair,
         Err(err) => {
@@ -5382,6 +5520,59 @@ fn cmd_context(
         if bundle.refused_envelopes > 0 {
             println!("refused_envelopes: {}", bundle.refused_envelopes);
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `confidant resolve <query>` (#537, phase 3a): resolve a `p-<ULID>` or an
+/// exact display name to the canonical person. Read-only.
+///
+/// Uses the `for_reads` (`operator: false`) cleared set, so a `no-ai: notes`
+/// person resolves by name and a `no-ai: true` person resolves by id only.
+/// An ambiguous name fails closed with `E_AMBIGUOUS_PERSON` (candidate ids
+/// are opaque, never names).
+fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> {
+    let vault = match load_vault_for_reads(root, cli.json, false) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let matched = match confidant_core::resolve::resolve_person(&vault, query) {
+        Ok(m) => m,
+        Err(err) => return Err(person_resolve_error(query, err)),
+    };
+    let id = matched.id.clone();
+    let record = vault.records.get(&id);
+    // Rule 3: an id-resolved `no-ai: true` person is outside the cleared set,
+    // so withhold its name (a name-resolved person is cleared by
+    // construction). The mode itself is not content and stays visible.
+    let cleared = confidant_core::cleared_record_ids(&vault);
+    let name = record
+        .and_then(|r| r.name.clone())
+        .filter(|_| cleared.contains(&id));
+    let no_ai = record.map(Record::no_ai).unwrap_or(false);
+    let matched_by = if matched.matched_by_name {
+        "name"
+    } else {
+        "id"
+    };
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "resolve",
+                "query": query,
+                "matched_by": matched_by,
+                "person": {
+                    "id": id.to_string(),
+                    "name": name,
+                    "no_ai": no_ai,
+                },
+            }),
+        ))?;
+    } else if let Some(name) = &name {
+        println!("{id} {name}");
+    } else {
+        println!("{id}");
     }
     Ok(ExitCode::SUCCESS)
 }

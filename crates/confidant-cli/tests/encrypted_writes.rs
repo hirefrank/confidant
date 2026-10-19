@@ -365,6 +365,66 @@ fn log_session_note_writes_envelope() {
     assert!(found, "ledger line not found");
 }
 
+#[test]
+fn log_session_by_display_name_decrypts_and_resolves() {
+    // #537 phase 3a on an encrypted vault: the person's name lives only
+    // inside the envelope, so resolving by name exercises the for_reads
+    // decrypt path. The ledger line still carries the opaque id.
+    let h = Harness::new();
+    h.keyed(PERSON);
+
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    let out = h
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            input.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 open {PERSON} package pkg-01J9Z3K4QF0000000000000000 4 sessions\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "package"]);
+
+    let out = h
+        .cmd(&[
+            "log",
+            "session",
+            "Ada Example",
+            "60m",
+            "paid",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "log session failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON, "{v}");
+    assert_eq!(v["person"]["name"], "Ada Example", "{v}");
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("session {PERSON} 60m paid")),
+        "{ledger}"
+    );
+    assert!(!ledger.contains("Ada Example"), "name leaked into ledger");
+}
+
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {

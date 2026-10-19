@@ -103,6 +103,34 @@ fn vault_arg(root: &Path) -> String {
     root.display().to_string()
 }
 
+/// Run the CLI and return `(success, stdout, stderr)` for human-output tests.
+fn run_raw(args: &[&str]) -> (bool, String, String) {
+    let tmp_home = tempfile::tempdir().unwrap();
+    let out = Command::new(bin())
+        .args(args)
+        .env("HOME", tmp_home.path())
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Add a person record to an existing fixture vault and commit it.
+fn add_person(root: &Path, id: &str, name: &str, extra: &str) {
+    let d = root.join(format!("people/{id}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("profile.md"),
+        format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n{extra}---\n\nFake bio.\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "add person fixture"]);
+}
+
 // ---------------------------------------------------------------------------
 // log session
 // ---------------------------------------------------------------------------
@@ -1062,6 +1090,407 @@ fn context_omits_interaction_referencing_no_ai_person() {
 }
 
 // ---------------------------------------------------------------------------
+// resolve / display-name person arguments (#537 phase 3a)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_by_name_and_by_id_json_shape() {
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Test Person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["command"], "resolve");
+    assert_eq!(v["query"], "Test Person");
+    assert_eq!(v["matched_by"], "name");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Test Person");
+    assert_eq!(v["person"]["no_ai"], false);
+    assert!(v["vault"].is_string());
+
+    let (ok, v) = run_json(&["resolve", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{v}");
+    assert_eq!(v["matched_by"], "id");
+    assert_eq!(v["person"]["id"], PERSON);
+}
+
+#[test]
+fn resolve_name_is_trimmed_and_case_insensitive() {
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let (ok, v) = run_json(&[
+        "resolve",
+        "  test PERSON  ",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["matched_by"], "name");
+}
+
+#[test]
+fn resolve_rejects_substring_and_prefix() {
+    // The exact-match rule only; `find` stays the fuzzy path.
+    let dir = make_vault();
+    let vroot = vault_arg(dir.path());
+    let (ok, v) = run_json(&["resolve", "Test", "--json", "--no-input", "--vault", &vroot]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+}
+
+#[test]
+fn resolve_ambiguous_name_fails_closed_with_candidate_ids() {
+    let dir = make_vault();
+    let root = dir.path();
+    add_person(root, PERSON2, "Test Person", "");
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Test Person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_AMBIGUOUS_PERSON");
+    let msg = v["error"]["message"].as_str().unwrap();
+    // The candidate list is opaque ids, so the pick can be disambiguated.
+    assert!(msg.contains(PERSON), "{msg}");
+    assert!(msg.contains(PERSON2), "{msg}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("p-<ULID>"));
+}
+
+#[test]
+fn resolve_no_ai_true_is_not_name_resolvable_and_leaks_nothing() {
+    let dir = make_vault();
+    let root = dir.path();
+    let hidden = "p-01J9Z3K4QF0000000000000009";
+    add_person(root, hidden, "Hidden Person", "no-ai: true\n");
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Hidden Person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    // Generic hint only: it must not confirm the hidden person exists.
+    assert!(fix.contains("no-ai: true"), "{fix}");
+    assert!(fix.contains("p-<ULID>"), "{fix}");
+    assert!(!fix.contains(hidden), "{fix}");
+    assert!(!v["error"]["message"].as_str().unwrap().contains(hidden));
+
+    // Indistinguishable from a name that matches nobody at all.
+    let (ok2, v2) = run_json(&[
+        "resolve",
+        "Nobody At All",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok2);
+    assert_eq!(v2["error"]["fix"], v["error"]["fix"]);
+
+    // The id still resolves: writes by `p-<ULID>` keep working, including
+    // for a no-ai person.
+    let (ok3, v3) = run_json(&["resolve", hidden, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok3, "{v3}");
+    assert_eq!(v3["matched_by"], "id");
+    assert_eq!(v3["person"]["id"], hidden);
+    assert_eq!(v3["person"]["no_ai"], true);
+    // Rule 3: resolving an id must not leak the no-ai person's name.
+    assert_eq!(v3["person"]["name"], Value::Null, "{v3}");
+}
+
+#[test]
+fn resolve_cleared_name_merged_into_no_ai_person_leaks_nothing() {
+    // A cleared person ("Ada Old") merged into a `no-ai: true` person: the
+    // cleared name canonicalizes to the hidden id. It must not resolve, or
+    // `log session` / `log touch` / `note add` would print and serialize
+    // the hidden person's name. The by-name query gets the same generic
+    // not-found as a miss, in human and `--json` output, and writes nothing.
+    let dir = make_vault();
+    let root = dir.path();
+    let old = "p-01J9Z3K4QF000000000000000B";
+    let hidden = "p-01J9Z3K4QF000000000000000C";
+    add_person(root, old, "Ada Old", "");
+    add_person(root, hidden, "Hidden Canonical", "no-ai: true\n");
+    let ledger = root.join("ledger/2026/10.cfd");
+    std::fs::write(
+        &ledger,
+        std::fs::read_to_string(&ledger).unwrap()
+            + &format!("2026-10-09 merge {old} into {hidden}\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "merge into hidden fixture"]);
+    let before = std::fs::read_to_string(&ledger).unwrap();
+    let vroot = vault_arg(root);
+
+    // `resolve` by the cleared name: generic E_NOT_FOUND, indistinguishable
+    // (same fix) from a name that matches nobody.
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Ada Old",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    let (ok_miss, v_miss) = run_json(&[
+        "resolve",
+        "Nobody Here",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok_miss);
+    assert_eq!(v["error"]["code"], v_miss["error"]["code"]);
+    assert_eq!(v["error"]["fix"], v_miss["error"]["fix"]);
+    assert!(!v.to_string().contains("Hidden Canonical"), "{v}");
+
+    // The by-name write fails the same way and writes nothing.
+    let (ok_w, v_w) = run_json(&[
+        "log",
+        "session",
+        "Ada Old",
+        "60m",
+        "paid",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok_w, "{v_w}");
+    assert_eq!(v_w["error"]["code"], "E_NOT_FOUND");
+    assert!(!v_w.to_string().contains("Hidden Canonical"), "{v_w}");
+    assert!(!v_w.to_string().contains(hidden), "{v_w}");
+
+    // Human output carries no resolved-person line and no hidden name.
+    let (ok_h, stdout, stderr) = run_raw(&[
+        "log",
+        "session",
+        "Ada Old",
+        "60m",
+        "paid",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok_h, "stdout={stdout} stderr={stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(!combined.contains("Hidden Canonical"), "{combined}");
+    assert!(!combined.contains(hidden), "{combined}");
+    assert!(!combined.contains("resolving to"), "{combined}");
+
+    // No ledger write happened.
+    assert_eq!(before, std::fs::read_to_string(&ledger).unwrap());
+}
+
+#[test]
+fn resolve_no_ai_notes_person_resolves_by_name() {
+    let dir = make_vault();
+    let root = dir.path();
+    let notes = "p-01J9Z3K4QF000000000000000A";
+    add_person(root, notes, "Notes Person", "no-ai: notes\n");
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Notes Person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["person"]["id"], notes);
+    assert_eq!(v["matched_by"], "name");
+}
+
+#[test]
+fn resolve_merged_away_name_resolves_to_canonical() {
+    let dir = make_vault();
+    let root = dir.path();
+    let old = "p-01J9Z3K4QF0000000000000003";
+    add_person(root, old, "Old Name", "");
+    let ledger = root.join("ledger/2026/10.cfd");
+    std::fs::write(
+        &ledger,
+        std::fs::read_to_string(&ledger).unwrap()
+            + &format!("2026-10-09 merge {old} into {PERSON}\n"),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "merge fixture"]);
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "resolve",
+        "Old Name",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["matched_by"], "name");
+}
+
+#[test]
+fn log_session_by_name_echoes_resolved_person() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        "Test Person",
+        "60m",
+        "paid",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    // Refinement B: the resolved id and name are visible in JSON.
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Test Person");
+    // The ledger line carries the id, never the display name.
+    let ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("session {PERSON} 60m paid")),
+        "{ledger}"
+    );
+
+    // Human output echoes the pick too. It says "resolving to" because the
+    // line prints before the remaining validation (#537 review).
+    let (ok, stdout, stderr) = run_raw(&[
+        "log",
+        "session",
+        "Test Person",
+        "60m",
+        "paid",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("resolving to {PERSON} (Test Person)")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn log_session_by_id_does_not_echo_a_person_object() {
+    // Id writes keep their previous output shape (no `person` echo).
+    let dir = make_vault();
+    let root = dir.path();
+    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert!(v.get("person").is_none(), "{v}");
+    let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+    assert!(after.starts_with(&before));
+    assert!(after.contains(&format!("session {PERSON} 60m paid")));
+}
+
+#[test]
+fn context_and_note_add_accept_display_name() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let (ok, v) = run_json(&[
+        "context",
+        "Test Person",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Test Person");
+
+    let scratch = tempfile::tempdir().unwrap();
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "note body").unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        "Test Person",
+        "--body-file",
+        body.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert!(
+        v["path"].as_str().unwrap().contains(PERSON),
+        "note not written under the resolved id: {v}"
+    );
+}
+
+#[test]
+fn note_add_by_unknown_name_is_not_found() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+    let body = scratch.path().join("body.md");
+    std::fs::write(&body, "note body").unwrap();
+    let (ok, v) = run_json(&[
+        "note",
+        "add",
+        "--person",
+        "Nobody Here",
+        "--body-file",
+        body.to_str().unwrap(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    assert_eq!(commits(root), 1, "a failed resolve writes nothing");
+}
+
+// ---------------------------------------------------------------------------
 // doctor / schema / help
 // ---------------------------------------------------------------------------
 
@@ -1192,7 +1621,9 @@ fn usage_error_envelope_matches_contract() {
     let out = Command::new(bin())
         .args([
             "context",
-            "n-DOESNOTEXIST",
+            PERSON,
+            "--packs",
+            "nosuchpack@9.9",
             "--json",
             "--no-input",
             "--vault",
@@ -1251,7 +1682,8 @@ fn help_json_lists_every_subcommand() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     for expected in [
-        "check", "find", "log", "import", "note", "context", "doctor", "schema", "help", "mcp",
+        "check", "find", "resolve", "log", "import", "note", "context", "doctor", "schema", "help",
+        "mcp",
     ] {
         assert!(names.contains(&expected), "missing subcommand {expected}");
     }
@@ -1350,7 +1782,9 @@ fn mcp_tool_failure_returns_cli_error_envelope() {
     let text = resps[0]["result"]["content"][0]["text"].as_str().unwrap();
     let body: Value = serde_json::from_str(text).unwrap();
     assert_eq!(body["ok"], false);
-    assert_eq!(body["error"]["code"], "usage_error");
+    // #537: a non-id argument is now an exact display-name lookup, so an
+    // unmatched one is E_NOT_FOUND (fail closed), not a usage error.
+    assert_eq!(body["error"]["code"], "E_NOT_FOUND");
 }
 
 #[test]

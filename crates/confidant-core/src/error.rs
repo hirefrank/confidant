@@ -69,6 +69,9 @@ pub enum ErrorKind {
     /// file, symlink, size limit, or hash mismatch). Packs ship data and
     /// agent-facing text, never executables.
     PackInvalid,
+    /// `--person` / `resolve` matched more than one cleared person by exact
+    /// display name. Fail closed: the caller must disambiguate.
+    AmbiguousPerson,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -97,6 +100,7 @@ impl ErrorKind {
             Self::InboxSkip => "E_INBOX_SKIP",
             Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::PackInvalid => "E_PACK_INVALID",
+            Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
             Self::Internal => "internal_error",
         }
     }
@@ -144,6 +148,22 @@ impl DomainError {
 
     pub fn pack_invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::PackInvalid, message)
+    }
+
+    /// A `--person` / `resolve` display-name query matched more than one
+    /// cleared person. Only cleared people are searched, so naming the
+    /// candidates leaks no `no-ai` content; they are opaque ids, never
+    /// names. Fail closed rather than guess.
+    pub fn ambiguous_person(query: impl Display, candidates: &[String]) -> Self {
+        Self::new(
+            ErrorKind::AmbiguousPerson,
+            format!(
+                "person name '{query}' matches {} people: {}",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+        )
+        .with_fix("Pass the exact p-<ULID> of the intended person")
     }
 
     pub fn spec_unsupported(spec: impl Display) -> Self {
@@ -537,6 +557,14 @@ mod tests {
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"
         );
+        let ambiguous = DomainError::ambiguous_person(
+            "Ada Example",
+            &["p-01HZZZ".to_owned(), "p-01HYYY".to_owned()],
+        );
+        assert_eq!(ambiguous.code(), "E_AMBIGUOUS_PERSON");
+        assert_eq!(ambiguous.exit_code(), 1);
+        assert!(ambiguous.message().contains("p-01HZZZ, p-01HYYY"));
+        assert!(ambiguous.fix().unwrap().contains("p-<ULID>"));
     }
 
     #[test]
