@@ -166,6 +166,22 @@ impl DomainError {
         .with_fix("Pass the exact p-<ULID> of the intended person")
     }
 
+    /// An alias `kind:value` matched more than one cleared person. The raw
+    /// value is deliberately absent from the message (it is PII, and the
+    /// caller only ever holds its HMAC): only the kind and the opaque
+    /// candidate ids appear. Fail closed rather than guess.
+    pub fn ambiguous_alias(kind: impl Display, candidates: &[String]) -> Self {
+        Self::new(
+            ErrorKind::AmbiguousPerson,
+            format!(
+                "alias kind '{kind}' matches {} people: {}",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+        )
+        .with_fix("Pass the exact p-<ULID> of the intended person")
+    }
+
     pub fn spec_unsupported(spec: impl Display) -> Self {
         Self::new(
             ErrorKind::SpecUnsupported,

@@ -143,6 +143,28 @@ impl Harness {
         c
     }
 
+    /// Run a command with `input` on stdin (the value-via-stdin paths for
+    /// `alias add` / `alias resolve`). Stdin is closed after the write so
+    /// `read_to_string` returns.
+    fn cmd_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = self
+            .cmd(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        child.wait_with_output().unwrap()
+    }
+
     /// Run a command without the device key (fail-closed paths).
     fn cmd_no_device_key(&self, args: &[&str]) -> Command {
         let mut c = Command::new(bin());
@@ -7365,4 +7387,411 @@ fn from_inbox_dry_run_refuses_unsigned_tip() {
         tree_text.contains(&stem),
         "the refused dry run must keep the item queued: {tree_text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// alias add / alias resolve (#537 phase 3b)
+// ---------------------------------------------------------------------------
+
+/// Create (or re-create) a person record via the real encrypted write path.
+fn add_person_record(h: &Harness, id: &str, name: &str, extra: &str) -> Output {
+    let input = write_file(
+        h._tmp.path(),
+        &format!("person-{id}.md"),
+        &format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n{extra}---\n\nBio.\n"),
+    );
+    h.cmd(&[
+        "record",
+        "add",
+        "--file",
+        input.to_str().unwrap(),
+        "--no-input",
+    ])
+    .output()
+    .unwrap()
+}
+
+/// Fixed alias date: every `alias add` in these tests passes `--date`, so the
+/// ledger path and the assertions do not depend on the wall clock (a default
+/// "today" date would write `ledger/2026/11.cfd` from 2026-11-01 and turn the
+/// tests red).
+const ALIAS_DATE: &str = "2026-10-13";
+
+/// `git rev-parse HEAD` for the vault, to assert a refused write moved nothing.
+fn git_head(vault: &Path) -> String {
+    let out = Command::new("git")
+        .current_dir(vault)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Assert a refused write committed nothing: HEAD is unchanged and no ledger
+/// file (committed or working tree) holds an `alias` line. Walks every ledger
+/// file, so a default-date line landing in another month cannot slip past.
+fn assert_no_alias_committed(vault: &Path, head_before: &str) {
+    assert_eq!(git_head(vault), head_before, "a refused write moved HEAD");
+    let mut stack = vec![vault.join("ledger")];
+    let mut found: Vec<String> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (n, line) in text.lines().enumerate() {
+                if line.split_whitespace().nth(1) == Some("alias") {
+                    found.push(format!("{}:{}: {line}", path.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "a refused write committed an alias line: {found:?}"
+    );
+}
+
+#[test]
+fn alias_add_then_resolve_round_trips() {
+    // #537 phase 3b: add an alias from --value-file, resolve it via stdin,
+    // and land on the canonical person. The value normalizes (NFC, trim,
+    // lowercase) on both sides, so the round-trip is case/whitespace
+    // insensitive.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = add_person_record(&h, PERSON, "Ada Example", "");
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    let value_file = write_file(h._tmp.path(), "alias-email.txt", " Ada@Example.com \n");
+    // By exact display name: the write echoes the resolved p-<ULID> (and
+    // name) so a wrong pick is visible (Refinement B).
+    let out = h
+        .cmd(&[
+            "alias",
+            "add",
+            "Ada Example",
+            "email",
+            "--value-file",
+            value_file.to_str().unwrap(),
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    assert_eq!(v["kind"], "email");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    let hmac = v["hmac"].as_str().unwrap();
+    assert!(hmac.starts_with("hmac:"), "{v}");
+    assert!(!stdout(&out).contains("Ada@Example.com"), "value leaked");
+
+    // The ledger line carries the HMAC, never the value.
+    let ledger = std::fs::read_to_string(h.vault.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("alias {PERSON} email {hmac}")),
+        "{ledger}"
+    );
+    assert!(
+        !ledger.contains("Ada@Example.com"),
+        "value leaked into ledger"
+    );
+
+    // Resolve via stdin, with different case/whitespace: same HMAC.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        "ada@example.com",
+    );
+    assert!(
+        out.status.success(),
+        "alias resolve failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-resolve");
+    assert_eq!(v["matched_by"], "alias");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert_eq!(v["person"]["no_ai"], false);
+    assert!(v["vault"].is_string(), "{v}");
+    assert!(!stdout(&out).contains("ada@example.com"), "value leaked");
+}
+
+#[test]
+fn alias_resolve_ambiguous_value_fails_closed() {
+    // One value on two cleared people: fail closed rather than guess, with
+    // opaque candidate ids.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "")
+            .status
+            .success(),
+        "person 1"
+    );
+    assert!(
+        add_person_record(&h, PERSON2, "Bea Demo", "")
+            .status
+            .success(),
+        "person 2"
+    );
+    for person in [PERSON, PERSON2] {
+        let out = h.cmd_stdin(
+            &[
+                "alias",
+                "add",
+                person,
+                "handle",
+                "--date",
+                ALIAS_DATE,
+                "--no-input",
+            ],
+            "@shared-handle",
+        );
+        assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    }
+
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "handle", "--json", "--no-input"],
+        "@shared-handle",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_AMBIGUOUS_PERSON");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains(PERSON), "{msg}");
+    assert!(msg.contains(PERSON2), "{msg}");
+    // The raw alias value must never appear in the error.
+    assert!(!msg.contains("@shared-handle"), "{msg}");
+    assert!(!stdout(&out).contains("@shared-handle"));
+}
+
+#[test]
+fn alias_value_never_appears_in_output_or_errors() {
+    // The value is PII: not in success output, not in a not-found error, not
+    // in a bad-kind usage error, in human or `--json` form.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    const SECRET: &str = "secret-value@example.com";
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        SECRET,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains(SECRET));
+    assert!(!stderr(&out).contains(SECRET));
+
+    // A not-found resolve (wrong kind, same value) must not echo the value.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "phone", "--json", "--no-input"],
+        SECRET,
+    );
+    assert!(!out.status.success());
+    assert!(!stdout(&out).contains(SECRET), "{}", stdout(&out));
+    assert!(!stderr(&out).contains(SECRET));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+
+    // A bad kind with the value on stdin errors before the value is read:
+    // the value must not be echoed either.
+    let out = h.cmd_stdin(&["alias", "add", PERSON, "twitter", "--no-input"], SECRET);
+    assert!(!out.status.success());
+    assert!(!stdout(&out).contains(SECRET));
+    assert!(!stderr(&out).contains(SECRET));
+}
+
+#[test]
+fn alias_resolve_does_not_surface_no_ai_true_person() {
+    // An alias on a `no-ai: true` person is not surfaced: the query gets the
+    // same generic not-found as an unmatched alias, and the hidden name never
+    // appears.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = add_person_record(&h, PERSON, "Hidden Person", "no-ai: true\n");
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    // The write still works by id, even for a no-ai person.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "hidden@example.com",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        "hidden@example.com",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    // Generic hint only: no hidden id, no hidden name.
+    assert!(fix.contains("no-ai: true"), "{fix}");
+    assert!(fix.contains("p-<ULID>"), "{fix}");
+    assert!(!stdout(&out).contains("Hidden Person"));
+    assert!(!stdout(&out).contains(PERSON), "{}", stdout(&out));
+
+    // Indistinguishable from an alias that matches nobody.
+    let (ok2, v2) = {
+        let out = h.cmd_stdin(
+            &["alias", "resolve", "email", "--json", "--no-input"],
+            "nobody@example.com",
+        );
+        (
+            out.status.success(),
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+        )
+    };
+    assert!(!ok2);
+    assert_eq!(v2["error"]["fix"], v["error"]["fix"]);
+}
+
+#[test]
+fn alias_missing_lookup_key_fails_closed() {
+    // No lookup key → no HMAC → both add and resolve fail closed, and the
+    // plaintext value is never echoed.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+
+    std::fs::remove_file(h.vault.join("keys/vault/lookup.age")).unwrap();
+    let head_before = git_head(&h.vault);
+
+    const SECRET: &str = "secret-value@example.com";
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        SECRET,
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(!stdout(&out).contains(SECRET));
+    assert!(!stderr(&out).contains(SECRET));
+    assert_no_alias_committed(&h.vault, &head_before);
+
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        SECRET,
+    );
+    assert!(!out.status.success());
+    assert!(!stdout(&out).contains(SECRET));
+    assert!(!stderr(&out).contains(SECRET));
+}
+
+#[test]
+fn alias_wrong_lookup_key_fails_closed() {
+    // A tampered lookup.age fails the commitment/unwrap check: no key, no
+    // HMAC, fail closed — never a silent plaintext alias.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    std::fs::write(h.vault.join("keys/vault/lookup.age"), b"not an age file").unwrap();
+    let head_before = git_head(&h.vault);
+
+    const SECRET: &str = "secret-value@example.com";
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        SECRET,
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(!stdout(&out).contains(SECRET));
+    assert!(!stderr(&out).contains(SECRET));
+    assert_no_alias_committed(&h.vault, &head_before);
+
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        SECRET,
+    );
+    assert!(!out.status.success());
+    assert!(!stdout(&out).contains(SECRET));
+}
+
+#[test]
+fn alias_malformed_kind_and_empty_value_are_refused() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+
+    let head_before = git_head(&h.vault);
+
+    // Bad kind: usage error (exit 2), nothing read or written.
+    let out = h.cmd_stdin(&["alias", "add", PERSON, "twitter", "--no-input"], "x@y.z");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("bad alias kind"), "{err}");
+
+    let out = h.cmd_stdin(&["alias", "resolve", "twitter", "--no-input"], "x@y.z");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    // Empty value: usage error, nothing committed.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "   \n",
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let out = h.cmd_stdin(&["alias", "resolve", "email", "--json", "--no-input"], "\n");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    assert_no_alias_committed(&h.vault, &head_before);
 }

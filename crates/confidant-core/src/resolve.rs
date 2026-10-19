@@ -1,6 +1,8 @@
 //! Resolve a `--person` / `resolve` query to the canonical person (#537).
 //!
-//! Two forms are accepted:
+//! [`resolve_person`] accepts two forms; [`resolve_alias`] takes a
+//! precomputed `(kind, hmac)` alias and resolves it against the same cleared
+//! set:
 //!
 //! - an opaque `p-<ULID>`, resolved directly against the loaded vault. The
 //!   id and record type live in the outer envelope header on an encrypted
@@ -21,7 +23,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use crate::check::{canonical_on, check_aliases_and_merges, resolve_as_of_date};
+use crate::check::{canonical_on, check_aliases_and_merges, parse_alias, resolve_as_of_date};
 use crate::id::RecordId;
 use crate::record::RecordKind;
 use crate::search::{case_fold, cleared_record_ids};
@@ -130,9 +132,69 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
     }
 }
 
+/// Resolve a `(kind, hmac)` alias to exactly one cleared person (#537 phase 3b).
+///
+/// `hmac_hex` is the lowercase hex of `HMAC(vault_lookup_key, normalized
+/// value)` (spec §6). The caller computes it — core never touches keys — so
+/// the plaintext value never reaches this function or its errors.
+///
+/// The match is against the §12 cleared set, exactly like a display-name
+/// lookup: an alias line whose canonical person is `no-ai: true` is
+/// indistinguishable from an unmatched alias ([`PersonResolveError::NotFound`]),
+/// so the error never confirms a hidden person exists. Ledger `alias` lines
+/// for a merged-away member canonicalize to the canonical person; two
+/// distinct cleared canonical people sharing one alias fail closed
+/// ([`PersonResolveError::Ambiguous`]).
+pub fn resolve_alias(
+    vault: &Vault,
+    kind: &str,
+    hmac_hex: &str,
+) -> Result<PersonMatch, PersonResolveError> {
+    let needle = hmac_hex.to_ascii_lowercase();
+    let cleared = cleared_record_ids(vault);
+    let as_of = resolve_as_of_date(vault);
+    let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
+    let mut merge_findings = Vec::new();
+    let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut merge_findings);
+    drop(merge_findings);
+
+    let mut matches: BTreeSet<RecordId> = BTreeSet::new();
+    for sourced in &vault.entries {
+        if sourced.entry.verb != "alias" {
+            continue;
+        }
+        // Reuse the check engine's parser so the accepted `hmac:HEX` shapes
+        // (token or pair) stay identical to what `check` validates.
+        match parse_alias(&sourced.entry) {
+            Ok((k, hex)) if k == kind && hex == needle => {}
+            _ => continue,
+        }
+        let canonical = canonical_on(&sourced.entry.id, &merges, as_of);
+        // Only cleared people resolve. A cleared member merged into a
+        // `no-ai: true` canonical maps to a hidden id and is dropped, so a
+        // hidden person is never surfaced by an alias either.
+        match vault.records.get(&canonical) {
+            Some(record) if record.kind == RecordKind::Person && cleared.contains(&canonical) => {}
+            _ => continue,
+        }
+        matches.insert(canonical);
+    }
+
+    match matches.len() {
+        0 => Err(PersonResolveError::NotFound),
+        1 => Ok(PersonMatch {
+            id: matches.into_iter().next().expect("one match"),
+            matched_by_name: false,
+        }),
+        _ => Err(PersonResolveError::Ambiguous {
+            candidates: matches.into_iter().collect(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_person, PersonMatch, PersonResolveError};
+    use super::{resolve_alias, resolve_person, PersonMatch, PersonResolveError};
     use crate::id::RecordId;
     use crate::vault::Vault;
     use std::path::{Path, PathBuf};
@@ -377,6 +439,135 @@ mod tests {
         let vault = load(&root);
         assert_eq!(
             resolve_person(&vault, "o-01J9Z3K4QF0000000000000000"),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    // Fake 64-hex HMACs (the real ones come from the lookup key in the CLI).
+    const H1: &str = "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677";
+    const H2: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
+
+    fn ledger_line(root: &Path, line: &str) {
+        let dir = root.join("ledger/2026");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("10.cfd");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(line);
+        text.push('\n');
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn alias(root: &Path, date: &str, id: &str, kind: &str, hmac: &str) {
+        ledger_line(root, &format!("{date} alias {id} {kind} hmac:{hmac}"));
+    }
+
+    #[test]
+    fn resolve_alias_matches_one_cleared_person() {
+        let (_tmp, root) = vault("alias", |root| {
+            person(root, ADA, Some("Ada Example"), None);
+            alias(root, "2026-10-03", ADA, "email", H1);
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "email", H1),
+            Ok(PersonMatch {
+                id: RecordId::parse(ADA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+        // HMAC hex comparison is case-insensitive.
+        assert_eq!(
+            resolve_alias(&vault, "email", &H1.to_ascii_uppercase()),
+            Ok(PersonMatch {
+                id: RecordId::parse(ADA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+        // Wrong kind, wrong hmac, and unknown kinds never match.
+        assert_eq!(
+            resolve_alias(&vault, "phone", H1),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "email", H2),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "twitter", H1),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn resolve_alias_canonicalizes_merged_away_member() {
+        let (_tmp, root) = vault("alias-merged", |root| {
+            person(root, ADA, Some("Ada Old"), None);
+            person(root, BEA, Some("Bea New"), None);
+            alias(root, "2026-10-03", ADA, "handle", H1);
+            alias(root, "2026-10-04", BEA, "handle", H2);
+            // The merge is dated after the alias lines; current-state
+            // resolution folds both onto the canonical.
+            ledger_line(root, &format!("2026-10-05 merge {ADA} into {BEA}"));
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "handle", H1),
+            Ok(PersonMatch {
+                id: RecordId::parse(BEA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+        assert_eq!(
+            resolve_alias(&vault, "handle", H2),
+            Ok(PersonMatch {
+                id: RecordId::parse(BEA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_alias_no_ai_true_person_is_not_surfaced() {
+        let (_tmp, root) = vault("alias-hidden", |root| {
+            person(root, ADA, Some("Hidden Person"), Some("true"));
+            alias(root, "2026-10-03", ADA, "email", H1);
+        });
+        let vault = load(&root);
+        // Indistinguishable from an unmatched alias: no existence oracle.
+        assert_eq!(
+            resolve_alias(&vault, "email", H1),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn resolve_alias_shared_by_two_cleared_people_is_ambiguous() {
+        let (_tmp, root) = vault("alias-dup", |root| {
+            person(root, ADA, Some("Ada Example"), None);
+            person(root, BEA, Some("Bea Demo"), None);
+            alias(root, "2026-10-03", ADA, "email", H1);
+            alias(root, "2026-10-03", BEA, "email", H1);
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "email", H1),
+            Err(PersonResolveError::Ambiguous {
+                candidates: vec![RecordId::parse(ADA).unwrap(), RecordId::parse(BEA).unwrap()],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_alias_cleared_name_merged_into_no_ai_is_not_surfaced() {
+        let (_tmp, root) = vault("alias-merged-hidden", |root| {
+            person(root, ADA, Some("Ada Old"), None);
+            person(root, BEA, Some("Hidden Canonical"), Some("true"));
+            alias(root, "2026-10-03", ADA, "email", H1);
+            ledger_line(root, &format!("2026-10-05 merge {ADA} into {BEA}"));
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "email", H1),
             Err(PersonResolveError::NotFound)
         );
     }

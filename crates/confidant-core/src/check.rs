@@ -1188,7 +1188,7 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
 
 const ALIAS_HMAC_MIN_HEX: usize = 32;
 
-fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
+pub(crate) fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
     if entry.args.len() != 2 {
         return Err("alias line must be exactly KIND hmac:HEX".to_owned());
     }

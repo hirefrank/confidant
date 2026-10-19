@@ -150,6 +150,15 @@ enum Command {
         /// A `p-<ULID>` or an exact display name (cleared records only).
         query: String,
     },
+    /// Add or resolve person aliases (email/phone/handle → keyed HMAC).
+    ///
+    /// The raw alias value is PII: it is read from stdin or `--value-file`
+    /// only, never an argument, and never echoed in output or errors.
+    /// Operator-only.
+    Alias {
+        #[command(subcommand)]
+        action: AliasAction,
+    },
     /// Rebuild the local search corpus under `<vault>/.confidant/qmd-corpus/`.
     ///
     /// Cleared records are decrypted through the read path, so `no-ai`
@@ -495,6 +504,40 @@ enum LogAction {
         /// instead of failing closed.
         #[arg(long)]
         fallback_inbox: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AliasAction {
+    /// Append an alias ledger line: `DATE alias <p-ULID> KIND hmac:HEX`.
+    ///
+    /// The raw value (email, phone, or handle) is read from stdin or
+    /// `--value-file` only — never an argument — and is never echoed in
+    /// output, errors, or logs. One commit; check-gated.
+    Add {
+        /// Opaque person id (p-…) or an exact display name (cleared people
+        /// only; see `confidant resolve`).
+        person: String,
+        /// Alias kind: email, phone, or handle.
+        kind: String,
+        /// File holding the alias value (alternative to stdin).
+        #[arg(long, value_name = "FILE")]
+        value_file: Option<PathBuf>,
+        /// Alias date YYYY-MM-DD (default today).
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Resolve a `kind` + value alias to the canonical person (read-only).
+    ///
+    /// The raw value is read from stdin or `--value-file` only — never an
+    /// argument. Honors `no-ai` like other reads: an alias on a `no-ai: true`
+    /// person is not surfaced.
+    Resolve {
+        /// Alias kind: email, phone, or handle.
+        kind: String,
+        /// File holding the alias value (alternative to stdin).
+        #[arg(long, value_name = "FILE")]
+        value_file: Option<PathBuf>,
     },
 }
 
@@ -891,6 +934,27 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Resolve { query } => {
             let root = vault_root.unwrap();
             cmd_resolve(&cli, &root, query)
+        }
+        Command::Alias { action } => {
+            let root = vault_root.unwrap();
+            match action {
+                AliasAction::Add {
+                    person,
+                    kind,
+                    value_file,
+                    date,
+                } => cmd_alias_add(
+                    &cli,
+                    &root,
+                    person,
+                    kind,
+                    value_file.as_deref(),
+                    date.clone(),
+                ),
+                AliasAction::Resolve { kind, value_file } => {
+                    cmd_alias_resolve(&cli, &root, kind, value_file.as_deref())
+                }
+            }
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
@@ -6078,6 +6142,213 @@ fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> 
                 "command": "resolve",
                 "query": query,
                 "matched_by": matched_by,
+                "person": {
+                    "id": id.to_string(),
+                    "name": name,
+                    "no_ai": no_ai,
+                },
+            }),
+        ))?;
+    } else if let Some(name) = &name {
+        println!("{id} {name}");
+    } else {
+        println!("{id}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read an alias value (email/phone/handle) from `--value-file` or stdin.
+///
+/// B7/#547: the raw value is PII and never arrives as an argument or leaves
+/// this process in output, errors, or `Debug`. Wrapped in [`Zeroizing`] so
+/// the plaintext copy is wiped on drop. An empty (or whitespace-only) value
+/// is refused: it normalizes to the empty string, which would alias every
+/// such value together.
+fn read_alias_value(value_file: Option<&Path>) -> anyhow::Result<Zeroizing<String>> {
+    let value = if let Some(path) = value_file {
+        Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "--value-file {} unreadable: {e}",
+                path.display()
+            )))
+        })?)
+    } else {
+        let mut buf = String::new();
+        use std::io::Read;
+        io::stdin().read_to_string(&mut buf).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "cannot read alias value from stdin: {e}"
+            )))
+        })?;
+        Zeroizing::new(buf)
+    };
+    if value.trim().is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "alias value is required via stdin or --value-file",
+        )));
+    }
+    Ok(value)
+}
+
+/// Alias kinds are fixed by spec §6. A bad kind is a usage error (exit 2),
+/// refused before any key is touched or anything is read from stdin.
+fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
+    if matches!(kind, "email" | "phone" | "handle") {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(DomainError::usage(format!(
+            "bad alias kind '{kind}'; use one of: email, phone, handle"
+        ))))
+    }
+}
+
+/// Read the vault lookup key through the verified `KeyStore::read_lookup_key`
+/// path (#547): the `vault:lookup` manifest is verified against the anchor and
+/// the key commitment checked before the key is returned. No new crypt API.
+///
+/// Needs an enrolled device key, a `keys/` tree, and the trust anchor; any of
+/// those missing fails closed (no key is returned).
+fn read_vault_lookup_key(
+    root: &Path,
+    vault_id: &str,
+) -> anyhow::Result<confidant_crypt::keys::LookupKey> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
+    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    let identity = keys_device_identity()?;
+    let keys_dir = root.join("keys");
+    if !keys_dir.exists() {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "this vault has no keys/ tree, so alias HMACs cannot be computed; run `confidant init` first",
+        )));
+    }
+    let mut store =
+        KeyStore::with_config_dir(keys_dir, vault_id, &config_dir).map_err(anyhow::Error::new)?;
+    let (key, _commitments, _seq) =
+        store
+            .read_lookup_key(identity.as_ref(), &anchor)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot read the vault lookup key: {e}"
+                )))
+            })?;
+    Ok(key)
+}
+
+/// Map a failed alias resolution to the command-error layer. The not-found
+/// fix is generic (no existence oracle): it must not confirm that a hidden
+/// `no-ai: true` person exists, and it never carries the alias value.
+fn alias_resolve_error(
+    kind: &str,
+    err: confidant_core::resolve::PersonResolveError,
+) -> anyhow::Error {
+    use confidant_core::resolve::PersonResolveError;
+    match err {
+        PersonResolveError::NotFound => anyhow::Error::new(
+            DomainError::not_found("no person matches this alias").with_fix(
+                "Check the alias kind and value; if this person is `no-ai: true`, pass their \
+                 p-<ULID>",
+            ),
+        ),
+        PersonResolveError::Ambiguous { candidates } => {
+            let ids: Vec<String> = candidates.iter().map(RecordId::to_string).collect();
+            anyhow::Error::new(DomainError::ambiguous_alias(kind, &ids))
+        }
+    }
+}
+
+/// `confidant alias add <person> <kind>` (#537 phase 3b): append
+/// `DATE alias <p-ULID> KIND hmac:HEX` using the vault lookup key.
+///
+/// The value arrives via stdin or `--value-file` only. The line carries the
+/// HMAC, never the value; the same is true of `--json` output, errors, and
+/// `--dry-run` previews.
+fn cmd_alias_add(
+    cli: &Cli,
+    root: &Path,
+    person_raw: &str,
+    kind: &str,
+    value_file: Option<&Path>,
+    date_raw: Option<String>,
+) -> anyhow::Result<ExitCode> {
+    validate_alias_kind(kind)?;
+    let vault = vault_or!(root, cli.json);
+    // Refinement B: a by-name person echoes the resolved p-<ULID> (and name).
+    let person = resolve_person_arg(root, &vault, person_raw)?;
+    announce_resolved_person(cli, &person);
+    let date = parse_date_arg(&date_raw)?;
+
+    let value = read_alias_value(value_file)?;
+    let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
+    let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
+
+    let line = format!("{date} alias {} {kind} hmac:{hmac}", person.id);
+    let canonical = format!(
+        "alias-add/v1\nperson={}\ndate={date}\nkind={kind}\nhmac={hmac}\n",
+        person.id
+    );
+    let summary = format!("alias {} {kind}", person.id);
+    let changes = vec![FileChange::AppendLines {
+        path: month_path(&date),
+        lines: vec![line.clone()],
+    }];
+    let (outcome, _) = apply_record_write(
+        root,
+        &vault,
+        PendingWrite {
+            changes,
+            summary,
+            canonical_request: canonical,
+        },
+        &write_options(cli),
+    )?;
+    let mut extra = serde_json::json!({
+        "kind": kind,
+        "hmac": format!("hmac:{hmac}"),
+        "lines": [line],
+    });
+    if let Some(echo) = person.echo_json() {
+        extra["person"] = echo;
+    }
+    finish_write(cli, root, "alias-add", outcome, extra)
+}
+
+/// `confidant alias resolve <kind>` (#537 phase 3b): resolve a `kind` + value
+/// alias to the canonical person. Read-only.
+///
+/// Uses the `for_reads` cleared set, so an alias on a `no-ai: true` person is
+/// not surfaced (the same generic not-found as an unmatched alias). Two
+/// cleared people sharing an alias fail closed with `E_AMBIGUOUS_PERSON`.
+fn cmd_alias_resolve(
+    cli: &Cli,
+    root: &Path,
+    kind: &str,
+    value_file: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    validate_alias_kind(kind)?;
+    let vault = match load_vault_for_reads(root, cli.json, false) {
+        Ok(v) => v,
+        Err(code) => return Ok(code),
+    };
+    let value = read_alias_value(value_file)?;
+    let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
+    let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
+    let id = match confidant_core::resolve::resolve_alias(&vault, kind, &hmac) {
+        Ok(m) => m.id,
+        Err(err) => return Err(alias_resolve_error(kind, err)),
+    };
+    // `resolve_alias` returns only cleared people, so the name is safe. The
+    // mode is not content and stays visible (mirrors `cmd_resolve`).
+    let record = vault.records.get(&id);
+    let name = record.and_then(|r| r.name.clone());
+    let no_ai = record.map(Record::no_ai).unwrap_or(false);
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "command": "alias-resolve",
+                "kind": kind,
+                "matched_by": "alias",
                 "person": {
                     "id": id.to_string(),
                     "name": name,
