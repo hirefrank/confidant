@@ -202,8 +202,13 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
 
 ## Privacy notes
 
-- **`no-ai` is honored.** `no-ai: true` keeps the person out of `find`,
-  `context`, and agent output. `no-ai: notes` keeps the person visible while
+- **`no-ai` is honored.** `no-ai: true` hides the person's content from
+  agents — names, profile fields, note and interaction text, and free
+  text — and `find` returns none of it. `context` still serves their
+  derived, ledger-based metadata: `cadence_days`, `cadence_never`,
+  `last_touch`, `days_since_touch`, `overdue`, `recent_touches`, the
+  declared `snooze_until`, the `touchpoints` list, and opaque `hmac:`
+  alias hashes (spec §12). `no-ai: notes` keeps the person visible while
   their notes and interactions default to hidden (spec §13). An explicit
   `no-ai: false` on a child overrides the inherited default.
 - **Scope pack reads.** `--packs personal@0.2` limits reads to core and

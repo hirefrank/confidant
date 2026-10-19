@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
+      qa_relevant: ${{ steps.detect.outputs.qa_relevant }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,7 +39,55 @@ jobs:
         run: |
           # No `set -e`: any failure below falls through to docs_only=false
           # (fail open = run the full suite) so required checks always report.
-          # Docs patterns mirror the old paths-ignore: **.md, docs/**, LICENSE*.
+          #
+          # Docs patterns mirror the retired paths-ignore: *.md, docs/*,
+          # LICENSE*. A `.md` file is NOT documentation, though, when it sits
+          # in a tree that is hash-pinned or embedded in the binary: editing
+          # one does not update its pin, and a stale pin only surfaces when a
+          # later non-docs change runs the suite. #633 edited
+          # packs/coaching/SKILL.md plus its vendored and embedded copies
+          # without re-pinning examples/demo-vault/confidant.lock; every heavy
+          # step was skipped, the jobs reported SUCCESS, and main went red on
+          # the next non-docs merge. Never classify these trees as docs,
+          # whatever the extension.
+          is_docs() {
+            case "$1" in
+              packs/*|examples/*|testdata/*) return 1 ;;
+              crates/confidant-core/pack-manifests/*|crates/confidant-cli/pack-skills/*|crates/confidant-cli/skills/*) return 1 ;;
+              *.md|docs/*|LICENSE*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          classify() {
+            local f seen=false
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              seen=true
+              is_docs "$f" || { echo false; return; }
+            done
+            [ "$seen" = true ] && echo true || echo false
+          }
+          # Self-test: this job runs on every event (it is never docs-skipped),
+          # so a regression in these patterns fails here instead of silently
+          # re-opening the hole.
+          for f in README.md docs/architecture.md LICENSE; do
+            if ! is_docs "$f"; then
+              echo "docs-detector self-test: $f should count as docs" >&2
+              exit 1
+            fi
+          done
+          for f in packs/coaching/SKILL.md packs/personal/README.md \
+                   examples/demo-vault/confidant.lock examples/README.md \
+                   testdata/golden/check.json \
+                   crates/confidant-core/pack-manifests/personal-0.2/SKILL.md \
+                   crates/confidant-cli/pack-skills/personal/SKILL.md \
+                   crates/confidant-cli/skills/qmd-search/SKILL.md \
+                   Cargo.toml .github/workflows/ci.yml; do
+            if is_docs "$f"; then
+              echo "docs-detector self-test: $f should NOT count as docs" >&2
+              exit 1
+            fi
+          done
           docs_only=false
           range=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -49,16 +98,24 @@ jobs:
           if [ -n "$range" ]; then
             files="$(git diff --name-only "$range" 2>/dev/null || true)"
             if [ -n "$files" ]; then
-              docs_only=true
-              while IFS= read -r f; do
-                case "$f" in
-                  *.md|docs/*|LICENSE*) ;;
-                  *) docs_only=false; break ;;
-                esac
-              done <<< "$files"
+              docs_only="$(printf '%s\n' "$files" | classify)"
             fi
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          # qa smoke runs on a pull request only when the change could affect
+          # it (#628): the fixtures/vaults it drives, the script itself, or the
+          # workflow. Fail open — if the range cannot be inspected, run it.
+          qa_relevant=true
+          if [ -n "$range" ] && [ -n "$files" ]; then
+            qa_relevant=false
+            while IFS= read -r f; do
+              case "$f" in
+                testdata/*|packs/*|examples/*|.github/scripts/*|.github/workflows/ci.yml)
+                  qa_relevant=true; break ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "qa_relevant=$qa_relevant" >> "$GITHUB_OUTPUT"
 
   msrv:
     name: msrv (1.88)
@@ -139,11 +196,13 @@ jobs:
     name: qa smoke
     runs-on: ubuntu-latest
     needs: [changes]
-    # Nightly, manual, and push-to-main only. A sweep is not a gate on every
-    # PR: it is slower than the unit suite and its value is finding what the
-    # suite missed, so keep it off the PR critical path (see
-    # `.agents/skills/qa-sweep/SKILL.md`).
-    if: github.event_name != 'pull_request'
+    # Nightly, manual, and push-to-main; on a pull request only when the change
+    # can affect it (fixtures, pack content, the smoke script, or this
+    # workflow), so a fixture move cannot break a job that only runs after
+    # merge (#628). A sweep is not a gate on ordinary PRs: it is slower than
+    # the unit suite, so it stays off the critical path for everything else
+    # (see `.agents/skills/qa-sweep/SKILL.md`).
+    if: github.event_name != 'pull_request' || needs.changes.outputs.qa_relevant == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f

@@ -185,8 +185,12 @@ a duration total overflows the metric.
 
 ## Privacy notes
 
-- `no-ai` is honored everywhere: a `no-ai` record never appears in
-  `find`, `context`, or agent-facing JSON. When in doubt, leave it out.
+- `no-ai` is honored: a `no-ai` record's content — names, profile fields,
+  note and session text, and free text — never reaches `find` or
+  `context`. `context` still serves the client's derived, ledger-based
+  metadata: `sessions_remaining`, `icf_hours`,
+  `recent_sessions` (dates, durations, billing tags), and opaque `hmac:`
+  alias hashes. When in doubt, leave it out.
 - Findings carry a code and a count, never raw text, paths, or ids for
   uncleared items. Never echo a `src:` value or id token in a fix
   message — say what to change, not the value.
