@@ -3387,7 +3387,7 @@ fn live_edit_commits_once_through_the_real_cli_and_editor() {
 // ---------------------------------------------------------------------------
 
 use confidant_tui::capture::{
-    scratch_path as capture_scratch_path, CaptureKind, CapturePhase, FieldId,
+    scratch_path as capture_scratch_path, Capture, CaptureKind, CapturePhase, FieldId,
 };
 use confidant_tui::views::proposals::ProposalListEntry;
 
@@ -3775,6 +3775,362 @@ fn capture_note_no_ai_toggle_is_passed() {
     assert!(write.contains(&"--no-ai".to_owned()), "{write:?}");
 }
 
+/// Whether an argv slice is the new-person write (`record add …`).
+fn is_record_add(call: &[String]) -> bool {
+    call.len() >= 2 && call[0] == "record" && call[1] == "add"
+}
+
+#[test]
+fn new_person_form_snapshot_is_deterministic() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    // A fixed id keeps the snapshot independent of the clock and
+    // /dev/urandom; the real flow mints a fresh `p-<ULID>` at open.
+    app.capture = Some(Capture::new(
+        CaptureKind::NewPerson,
+        "p-01M3TC5H00MPJG000000000000".to_owned(),
+        None,
+    ));
+    assert_snapshot("new_person_form.snap", &render_to_string(&app));
+}
+
+#[test]
+fn new_person_form_starts_empty_and_mints_a_prefixed_ulid() {
+    let mut app = App::new(capture_base_runner());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('a')));
+    let capture = app.capture.as_ref().expect("new-person form open");
+    assert_eq!(capture.kind, CaptureKind::NewPerson);
+    assert_eq!(capture.phase, CapturePhase::Editing);
+    assert!(
+        capture.person_id.starts_with("p-"),
+        "prefixed person id: {}",
+        capture.person_id
+    );
+    assert_eq!(capture.person_id.len(), 28, "p- plus a 26-char ULID");
+    for id in [
+        FieldId::Name,
+        FieldId::Relationship,
+        FieldId::Cadence,
+        FieldId::Profile,
+    ] {
+        assert_eq!(capture.value(id), "", "{id:?} must pre-fill nothing");
+    }
+    assert!(!capture.enabled(FieldId::NoAi));
+    assert_eq!(capture.first_missing(), Some("name"));
+    assert!(
+        !app.operator_mode,
+        "opening the form does not change operator mode"
+    );
+
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("New person"), "{rendered}");
+    assert!(rendered.contains(&capture.person_id), "{rendered}");
+}
+
+/// A new-person app with a throwaway vault root and the `git check-ignore`
+/// gate answered as "a repo that ignores `.confidant/`".
+fn new_person_app() -> (tempfile::TempDir, App<FakeRunner>) {
+    let dir = tempfile::tempdir().expect("temp vault");
+    let runner = capture_base_runner();
+    runner.push_program_response("git", 0, "");
+    runner.push_program_response("git", 0, "");
+    let mut app = App::new(runner);
+    app.set_vault_root(dir.path().to_path_buf());
+    app.load_check();
+    app.load_roster();
+    (dir, app)
+}
+
+#[test]
+fn new_person_dry_run_previews_and_writes_nothing() {
+    let (dir, mut app) = new_person_app();
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app.capture.as_ref().expect("form").person_id.clone();
+    let scratch = capture_scratch_path(dir.path(), &id).expect("scratch path");
+    let preview = capture_dry_json(
+        "record-add",
+        &format!("people/{id}/profile.md"),
+        "add",
+        &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n"),
+    );
+    app.runner.push_response(0, preview);
+
+    type_text(&mut app, "Ada Example");
+    app.handle_key(key(KeyCode::Tab));
+    type_text(&mut app, "client");
+    app.handle_key(key(KeyCode::Tab));
+    type_text(&mut app, "30d");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(
+        fs::read_to_string(&scratch).unwrap(),
+        format!(
+            "---\nid: {id}\ntype: person\nname: Ada Example\n\
+             relationship: client\ncadence: 30d\n---\n"
+        ),
+        "the composed record is staged for record add --file"
+    );
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls.iter().any(|call| call
+            == &s(&[
+                "record",
+                "add",
+                "--file",
+                &scratch.display().to_string(),
+                "--dry-run"
+            ])),
+        "the new-person dry run targets record add with the staged file: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| { is_record_add(call) && !call.contains(&"--dry-run".to_owned()) }),
+        "nothing is written before the confirm: {calls:?}"
+    );
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview),
+        "the preview is on screen"
+    );
+
+    let rendered = render_to_string_at(&app, 160, HEIGHT);
+    assert!(rendered.contains("New person"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("people/{id}/profile.md")),
+        "{rendered}"
+    );
+    assert!(rendered.contains("name: Ada Example"), "{rendered}");
+}
+
+#[test]
+fn new_person_confirm_commits_exactly_once_and_sweeps_the_scratch() {
+    let (dir, mut app) = new_person_app();
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app.capture.as_ref().expect("form").person_id.clone();
+    let scratch = capture_scratch_path(dir.path(), &id).expect("scratch path");
+    app.runner.push_response(
+        0,
+        capture_dry_json(
+            "record-add",
+            &format!("people/{id}/profile.md"),
+            "add",
+            &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n"),
+        ),
+    );
+    app.runner
+        .push_response(0, capture_applied_json("record-add"));
+
+    type_text(&mut app, "Ada Example");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(scratch.exists(), "staged for the preview");
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.capture.is_none(), "form closed after the write");
+    assert!(!scratch.exists(), "the scratch is removed after the write");
+
+    let calls = app.runner.recorded_calls();
+    let writes: Vec<_> = calls
+        .iter()
+        .filter(|call| is_record_add(call) && !call.contains(&"--dry-run".to_owned()))
+        .collect();
+    assert_eq!(writes.len(), 1, "exactly one write: {calls:?}");
+    assert_eq!(
+        writes[0],
+        &s(&["record", "add", "--file", &scratch.display().to_string()])
+    );
+    let alert = app.alert.as_ref().expect("result alert");
+    assert_eq!(alert.title, "Capture Committed");
+    assert!(alert.message.contains(&id), "{}", alert.message);
+    // The roster was reloaded, so the new person can now be listed.
+    let roster_reads = calls
+        .iter()
+        .filter(|call| call.first().map(String::as_str) == Some("record") && !is_record_add(call))
+        .count();
+    assert!(roster_reads >= 2, "the roster is reloaded: {calls:?}");
+}
+
+#[test]
+fn new_person_refuses_to_apply_bytes_that_changed_after_the_preview() {
+    let (dir, mut app) = new_person_app();
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app.capture.as_ref().expect("form").person_id.clone();
+    let scratch = capture_scratch_path(dir.path(), &id).expect("scratch path");
+    app.runner.push_response(
+        0,
+        capture_dry_json(
+            "record-add",
+            &format!("people/{id}/profile.md"),
+            "add",
+            &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n"),
+        ),
+    );
+    type_text(&mut app, "Ada Example");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview)
+    );
+
+    // A writer swaps the staged bytes after the operator reviewed them.
+    fs::write(
+        &scratch,
+        "---\nid: EVIL\ntype: person\nname: Someone Else\n---\n",
+    )
+    .unwrap();
+    app.handle_key(key(KeyCode::Char('y')));
+
+    assert!(app.capture.is_none(), "the form closes on refusal");
+    assert!(!scratch.exists(), "the stale scratch is swept");
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| is_record_add(call) && !call.contains(&"--dry-run".to_owned())),
+        "nothing unreviewed is written"
+    );
+    let alert = app.alert.as_ref().expect("refusal alert");
+    assert_eq!(alert.title, "Record Changed After Preview");
+    assert_eq!(alert.code.as_deref(), Some("source_changed"));
+}
+
+#[test]
+fn new_person_cancel_writes_nothing_and_sweeps_the_scratch() {
+    let (dir, mut app) = new_person_app();
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app.capture.as_ref().expect("form").person_id.clone();
+    let scratch = capture_scratch_path(dir.path(), &id).expect("scratch path");
+    app.runner.push_response(
+        0,
+        capture_dry_json(
+            "record-add",
+            &format!("people/{id}/profile.md"),
+            "add",
+            &format!("---\nid: {id}\ntype: person\nname: Ada Example\n---\n"),
+        ),
+    );
+    type_text(&mut app, "Ada Example");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview)
+    );
+
+    // Any key other than `y` cancels the preview.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.capture.is_none(), "form cancelled");
+    assert!(!scratch.exists(), "scratch swept on cancel");
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| is_record_add(call) && !call.contains(&"--dry-run".to_owned())),
+        "a cancelled form writes nothing"
+    );
+}
+
+#[test]
+fn new_person_failed_preview_writes_nothing_and_sweeps_the_scratch() {
+    let (dir, mut app) = new_person_app();
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app.capture.as_ref().expect("form").person_id.clone();
+    let scratch = capture_scratch_path(dir.path(), &id).expect("scratch path");
+    let error = serde_json::json!({
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "error": {"code": "E_FRONTMATTER", "message": "name is not valid", "fix": "Use a name"}
+    })
+    .to_string();
+    app.runner.push_response(1, error);
+
+    type_text(&mut app, "Ada Example");
+    app.handle_key(key(KeyCode::Enter));
+
+    let capture = app.capture.as_ref().expect("form stays open");
+    assert_eq!(capture.phase, CapturePhase::Editing);
+    assert!(
+        capture
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("name is not valid"),
+        "{:?}",
+        capture.error
+    );
+    assert!(!scratch.exists(), "a failed preview sweeps the scratch");
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| is_record_add(call) && !call.contains(&"--dry-run".to_owned())),
+        "a failed preview writes nothing"
+    );
+}
+
+#[test]
+fn new_person_cannot_open_while_a_write_is_pending() {
+    // A pending capture owns the keyboard: pressing `a` cancels the preview
+    // instead of opening a second form.
+    let runner = capture_base_runner().with_argv_response(
+        &["log", "session", ADA, "60m", "--dry-run"],
+        0,
+        capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+    );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('s')));
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview),
+        "a preview is pending"
+    );
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(app.capture.is_none(), "a did not open a new form");
+
+    // The programmatic guard is a no-op while any capture is open.
+    app.handle_key(key(KeyCode::Char('s')));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.kind),
+        Some(CaptureKind::Session)
+    );
+    app.begin_new_person();
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.kind),
+        Some(CaptureKind::Session),
+        "a pending capture is not replaced"
+    );
+}
+
+#[test]
+fn command_palette_new_person_opens_the_same_form() {
+    let mut app = App::new(capture_base_runner());
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char(':')));
+    type_text(&mut app, "new person");
+    assert_eq!(
+        app.palette
+            .as_ref()
+            .and_then(|state| state.selected_entry())
+            .map(|entry| entry.id),
+        Some("person.new")
+    );
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.kind),
+        Some(CaptureKind::NewPerson),
+        "the palette starts the same new-person form"
+    );
+}
+
 #[test]
 fn review_queue_badge_counts_sources_and_is_visible_from_people() {
     // Conflict check report: two E_MERGE_CONFLICT findings with ids.
@@ -3921,6 +4277,117 @@ fn live_capture_note_commits_once_through_the_real_cli() {
         })
         .collect();
     assert_eq!(captured.len(), 1, "exactly one captured note: {notes:?}");
+}
+
+/// End-to-end: the real CLI creates a brand-new person from the `a` form in
+/// a throwaway git vault, committing once. The minted ULID is accepted by the
+/// CLI, and the record resolves through `record list` afterwards.
+#[test]
+#[cfg(unix)]
+fn live_new_person_commits_once_and_resolves_through_the_real_cli() {
+    // A fresh git copy of the demo vault (same shape as the live note test).
+    let dir = tempfile::tempdir().expect("temp vault");
+    let root = dir.path();
+    for entry in fs::read_dir(demo_vault()).expect("read demo vault") {
+        let entry = entry.unwrap();
+        let dest = root.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&dest).unwrap();
+            for f in walk_files(&entry.path()) {
+                let rel = f.strip_prefix(entry.path()).unwrap();
+                let d = dest.join(rel);
+                fs::create_dir_all(d.parent().unwrap()).unwrap();
+                fs::copy(&f, &d).unwrap();
+            }
+        } else {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    };
+    git(&["init", "-b", "main", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(root.join(".gitignore"), ".confidant/\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let runner = ProcessRunner::new(confidant_bin(), Some(root.to_path_buf()))
+        .with_env("CONFIDANT_OFFLINE", "1");
+    let mut app = App::new(runner);
+    app.set_vault_root(root.to_path_buf());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('a')));
+    let id = app
+        .capture
+        .as_ref()
+        .expect("new-person form")
+        .person_id
+        .clone();
+    assert!(id.starts_with("p-"), "{id}");
+    type_text(&mut app, "Nia Example");
+    app.handle_key(key(KeyCode::Tab));
+    type_text(&mut app, "client");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview),
+        "the real dry run produced a preview"
+    );
+    let scratch = capture_scratch_path(root, &id).expect("scratch path");
+    assert!(scratch.exists(), "the composed record is staged");
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.capture.is_none(), "form finished");
+    assert!(!scratch.exists(), "the scratch is removed after the write");
+    assert_eq!(
+        app.alert.as_ref().map(|alert| alert.title.as_str()),
+        Some("Capture Committed")
+    );
+
+    // Exactly one new commit (init + the person).
+    let log = std::process::Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(root)
+        .output()
+        .expect("git log");
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert_eq!(log.lines().count(), 2, "one person commit:\n{log}");
+
+    // The minted id was accepted by the CLI and the record landed on disk
+    // with the fields the form collected.
+    let profile = root.join("people").join(&id).join("profile.md");
+    let text = fs::read_to_string(&profile).expect("new person profile");
+    assert!(text.contains(&format!("id: {id}")), "{text}");
+    assert!(text.contains("type: person"), "{text}");
+    // The CLI canonicalizes the front matter and quotes a value with a
+    // space; assert the content, not the exact quoting.
+    assert!(text.contains("Nia Example"), "{text}");
+    assert!(text.contains("relationship: client"), "{text}");
+
+    // It resolves afterwards through the ordinary roster read.
+    let out = std::process::Command::new(confidant_bin())
+        .args(["--json", "--no-input", "--vault"])
+        .arg(root)
+        .args(["record", "list", "--kind", "person"])
+        .output()
+        .expect("record list");
+    assert!(out.status.success(), "record list failed: {out:?}");
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains(&id), "the new id resolves:\n{json}");
+    assert!(
+        json.contains("Nia Example"),
+        "the new name resolves:\n{json}"
+    );
 }
 
 #[test]

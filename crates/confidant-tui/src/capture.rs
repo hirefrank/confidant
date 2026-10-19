@@ -1,17 +1,21 @@
-//! Quick capture (#556 phase 3): `s` session, `t` touch, `n` note.
+//! Quick capture (#556 phase 3): `s` session, `t` touch, `n` note, plus the
+//! `a` new-person form (#621).
 //!
-//! Each capture collects the fields the CLI needs, pre-filling the selected
-//! person's opaque id so the operator never types a ULID. Nothing is written
-//! until the operator confirms the CLI's own `--dry-run` preview with `y`; the
-//! real write goes out through the same `confidant` subprocess contract
-//! (`--json --no-input`, one commit per write).
+//! Each capture collects the fields the CLI needs. `s`/`t`/`n` pre-fill the
+//! selected person's opaque id so the operator never types a ULID; `a` is the
+//! one surface that mints a fresh `p-<ULID>` for a brand-new person (see
+//! [`crate::ids`]). Nothing is written until the operator confirms the CLI's
+//! own `--dry-run` preview with `y`; the real write goes out through the same
+//! `confidant` subprocess contract (`--json --no-input`, one commit per
+//! write).
 //!
 //! A note body is the one field the CLI only takes from a file
-//! (`note add --body-file`), so it is staged in the same 0600 gitignored
-//! scratch the conflict/edit flows use (`#455`, `#556` phase 2) and removed on
-//! every exit path. This module never links `confidant-core`: the only file it
-//! touches is this crate's own scratch, and nothing here logs the captured
-//! text (the manual `Debug` impl redacts it).
+//! (`note add --body-file`) — and a new person's record is composed into a
+//! file for `record add --file` — so both are staged in the same 0600
+//! gitignored scratch the conflict/edit flows use (`#455`, `#556` phase 2)
+//! and removed on every exit path. This module never links `confidant-core`:
+//! the only file it touches is this crate's own scratch, and nothing here logs
+//! the captured text (the manual `Debug` impl redacts it).
 
 use std::path::{Path, PathBuf};
 
@@ -26,6 +30,10 @@ pub enum CaptureKind {
     Touch,
     /// `note add --person <person> … --body-file <scratch>`.
     Note,
+    /// `record add --file <scratch>`: compose a brand-new person record
+    /// (#621). The id is minted by the caller (see [`crate::ids`]); this
+    /// surface pre-fills nothing and needs no selected person.
+    NewPerson,
 }
 
 impl CaptureKind {
@@ -35,6 +43,7 @@ impl CaptureKind {
             Self::Session => "Log session",
             Self::Touch => "Log touch",
             Self::Note => "Add note",
+            Self::NewPerson => "New person",
         }
     }
 
@@ -44,7 +53,14 @@ impl CaptureKind {
             Self::Session => "session",
             Self::Touch => "touch",
             Self::Note => "note",
+            Self::NewPerson => "person",
         }
+    }
+
+    /// Whether this surface stages its input to a scratch file before running
+    /// the CLI (`note add --body-file`, `record add --file`).
+    pub fn stages_scratch(self) -> bool {
+        matches!(self, Self::Note | Self::NewPerson)
     }
 
     /// The fields this surface collects, in focus order.
@@ -91,6 +107,32 @@ impl CaptureKind {
                 text(FieldId::Date, "date", false, "YYYY-MM-DD (blank for today)"),
                 toggle(FieldId::NoAi, "no-ai", "space toggles (hide from agents)"),
             ],
+            // The pack's optional person front-matter fields the CLI accepts
+            // (personal@0.2) plus the profile body. `aliases` is *not* a
+            // front-matter field — aliases are ledger lines managed by
+            // `confidant alias` — so it is deliberately absent here.
+            Self::NewPerson => vec![
+                text(FieldId::Name, "name", true, "display name (required)"),
+                text(
+                    FieldId::Relationship,
+                    "relation",
+                    false,
+                    "how they relate, e.g. client (blank for none)",
+                ),
+                text(
+                    FieldId::Cadence,
+                    "cadence",
+                    false,
+                    "30d or never (blank for none)",
+                ),
+                text(
+                    FieldId::Profile,
+                    "profile",
+                    false,
+                    "one-line body (edit after for prose)",
+                ),
+                toggle(FieldId::NoAi, "no-ai", "space toggles (hide from agents)"),
+            ],
         }
     }
 }
@@ -115,6 +157,14 @@ pub enum FieldId {
     NoteText,
     Body,
     NoAi,
+    /// The new person's display name (#621).
+    Name,
+    /// The new person's `relationship:` value (#621).
+    Relationship,
+    /// The new person's `cadence:` value (#621).
+    Cadence,
+    /// The new person's profile body (#621).
+    Profile,
 }
 
 /// Whether a field is free text or a boolean toggle.
@@ -179,7 +229,15 @@ pub struct Capture {
     pub preview: Vec<DryRunChange>,
     /// The staged note body, for `note add --body-file`. `None` for the
     /// inline surfaces (session/touch), whose note travels as an argument.
+    /// For a new person it is the composed record staged for `record add
+    /// --file`.
     pub scratch: Option<PathBuf>,
+    /// SHA-256 (lowercase hex) of the bytes staged to `scratch` when the last
+    /// dry-run preview ran. The file-backed captures re-read the scratch and
+    /// refuse to apply if it changed after the review (#611/#618), so `y`
+    /// can only commit what the preview showed. `None` for the inline
+    /// surfaces and before a preview.
+    pub reviewed_hash: Option<String>,
     /// A validation or CLI error shown inline under the form; the modal stays
     /// open so the operator can fix the field.
     pub error: Option<String>,
@@ -201,6 +259,7 @@ impl std::fmt::Debug for Capture {
             .field("phase", &self.phase)
             .field("preview", &self.preview.len())
             .field("scratch", &self.scratch)
+            .field("reviewed_hash", &self.reviewed_hash)
             .field("error", &self.error)
             .finish()
     }
@@ -218,6 +277,7 @@ impl Capture {
             phase: CapturePhase::Editing,
             preview: Vec::new(),
             scratch: None,
+            reviewed_hash: None,
             error: None,
         }
     }
@@ -289,8 +349,8 @@ impl Capture {
         }
     }
 
-    /// The CLI argv for this capture. `scratch` is the staged note body file
-    /// (only `note add` uses it; the inline surfaces ignore it).
+    /// The CLI argv for this capture. `scratch` is the staged file (only
+    /// `note add` and `record add` use it; the inline surfaces ignore it).
     ///
     /// No `--dry-run` here: [`crate::apply::run_write_step`] adds it for the
     /// preview and omits it for the confirmed write.
@@ -337,7 +397,49 @@ impl Capture {
                 argv.push(scratch.unwrap_or_default().to_owned());
                 argv
             }
+            CaptureKind::NewPerson => vec![
+                "record".to_owned(),
+                "add".to_owned(),
+                "--file".to_owned(),
+                scratch.unwrap_or_default().to_owned(),
+            ],
         }
+    }
+
+    /// Compose the new person's record text staged for `record add --file`.
+    ///
+    /// Only the fields the personal pack actually owns are emitted, and only
+    /// when set (`id`/`type`/`name` always; `relationship`, `cadence` and
+    /// `no-ai` when present; the profile as the body). The CLI re-formats the
+    /// file canonically, so the preview shows exactly what a write would
+    /// commit. Returns an empty string for the other surfaces.
+    pub fn compose_record(&self) -> String {
+        if self.kind != CaptureKind::NewPerson {
+            return String::new();
+        }
+        let mut out = String::from("---\n");
+        out.push_str(&format!("id: {}\n", self.person_id));
+        out.push_str("type: person\n");
+        out.push_str(&format!("name: {}\n", self.value(FieldId::Name).trim()));
+        let relationship = self.value(FieldId::Relationship).trim();
+        if !relationship.is_empty() {
+            out.push_str(&format!("relationship: {relationship}\n"));
+        }
+        let cadence = self.value(FieldId::Cadence).trim();
+        if !cadence.is_empty() {
+            out.push_str(&format!("cadence: {cadence}\n"));
+        }
+        if self.enabled(FieldId::NoAi) {
+            out.push_str("no-ai: true\n");
+        }
+        out.push_str("---\n");
+        let profile = self.value(FieldId::Profile).trim();
+        if !profile.is_empty() {
+            out.push('\n');
+            out.push_str(profile);
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -350,8 +452,9 @@ fn push_opt(argv: &mut Vec<String>, flag: &str, value: &str) {
     }
 }
 
-/// The scratch file for a captured note body:
-/// `<vault>/.confidant/conflicts/<person-id>/capture.md`.
+/// The scratch file for a captured note body (`note add --body-file`) or a
+/// composed new person (`record add --file` #621):
+/// `<vault>/.confidant/conflicts/<id>/capture.md`.
 ///
 /// Reuses the conflict scratch directory (`#455`, `#556` phase 2) rather than
 /// inventing a new root; the file name never collides with the CLI's
@@ -448,6 +551,64 @@ mod tests {
                 "--body-file",
                 "/tmp/x/capture.md",
             ])
+        );
+    }
+
+    #[test]
+    fn new_person_argv_targets_record_add_with_the_staged_file() {
+        let mut capture = Capture::new(CaptureKind::NewPerson, "p-01NEW".to_owned(), None);
+        capture.fields[0].value = "Ada Example".to_owned();
+        assert_eq!(
+            capture.argv(Some("/v/.confidant/conflicts/p-01NEW/capture.md")),
+            s(&[
+                "record",
+                "add",
+                "--file",
+                "/v/.confidant/conflicts/p-01NEW/capture.md",
+            ])
+        );
+        assert_eq!(capture.kind.noun(), "person");
+        assert!(capture.kind.stages_scratch());
+        assert!(!CaptureKind::Session.stages_scratch());
+    }
+
+    #[test]
+    fn new_person_starts_empty_and_requires_a_name() {
+        let capture = Capture::new(CaptureKind::NewPerson, "p-01NEW".to_owned(), None);
+        for id in [
+            FieldId::Name,
+            FieldId::Relationship,
+            FieldId::Cadence,
+            FieldId::Profile,
+        ] {
+            assert_eq!(capture.value(id), "", "{id:?} pre-filled");
+        }
+        assert!(!capture.enabled(FieldId::NoAi));
+        assert_eq!(capture.first_missing(), Some("name"));
+    }
+
+    #[test]
+    fn new_person_record_composes_only_present_optional_fields() {
+        let mut capture = Capture::new(CaptureKind::NewPerson, "p-01NEW".to_owned(), None);
+        capture.fields[0].value = "Ada Example".to_owned();
+        assert_eq!(
+            capture.compose_record(),
+            "---\nid: p-01NEW\ntype: person\nname: Ada Example\n---\n"
+        );
+
+        capture.fields[1].value = "client".to_owned();
+        capture.fields[2].value = "30d".to_owned();
+        capture.fields[3].value = "  Fake profile.  ".to_owned();
+        capture.fields[4].enabled = true;
+        assert_eq!(
+            capture.compose_record(),
+            "---\nid: p-01NEW\ntype: person\nname: Ada Example\n\
+             relationship: client\ncadence: 30d\nno-ai: true\n---\n\nFake profile.\n"
+        );
+        // Other surfaces never compose a record.
+        assert_eq!(
+            Capture::new(CaptureKind::Note, "p-01ABC".to_owned(), None).compose_record(),
+            ""
         );
     }
 

@@ -26,12 +26,12 @@ pub struct Entry {
 
 /// The command catalog, in browse order (used verbatim for an empty query).
 ///
-/// Every write-ish entry (`capture.*`, `record.edit`, `inbox.apply`) routes
-/// through a flow that previews with `--dry-run` and waits for an explicit
-/// `y`. `inbox.apply` re-runs the dry run and opens the confirm only when it
-/// succeeded, so a palette launch is never staler than pressing `a` on the
-/// tab. `record.edit` is refused outside People and the Context view, where
-/// the operator can see the context it would edit.
+/// Every write-ish entry (`person.new`, `capture.*`, `record.edit`,
+/// `inbox.apply`) routes through a flow that previews with `--dry-run` and
+/// waits for an explicit `y`. `inbox.apply` re-runs the dry run and opens the
+/// confirm only when it succeeded, so a palette launch is never staler than
+/// pressing `a` on the tab. `record.edit` is refused outside People and the
+/// Context view, where the operator can see the context it would edit.
 pub const ENTRIES: &[Entry] = &[
     Entry {
         id: "workspace.people",
@@ -82,6 +82,11 @@ pub const ENTRIES: &[Entry] = &[
         id: "search.open",
         label: "Search (open the tab)",
         group: "People",
+    },
+    Entry {
+        id: "person.new",
+        label: "New person",
+        group: "Write",
     },
     Entry {
         id: "capture.session",

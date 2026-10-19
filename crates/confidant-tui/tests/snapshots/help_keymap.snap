@@ -5,12 +5,13 @@ vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
 ╰─────────│   1 People & Search   2 Review Queue   3 Check   Tab/Shift-Tab cycles        │         │
 ╭ Roster ─│ People & Search                                                              │         │
 │   Needs │   list: j/k move   g/G first/last   / filter   Enter open                    │         │
-│   W_DATE│   f search   s/t/n session/touch/note (pre-filled with the person)           │         │
-│     birt│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
-│   People│ Review Queue                                                                 │         │
-│ › Ada Ex│   o Proposals   i Inbox   c Conflicts   r refresh   Enter open/detail        │         │
-│   Bea De│   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │         │
-│         │ Check                                                                        │0008     │
+│   W_DATE│   f search   s/t/n session/touch/note   a new person                         │         │
+│     birt│   s/t/n pre-fill the selected person; a composes a fresh one                 │         │
+│   People│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
+│ › Ada Ex│ Review Queue                                                                 │         │
+│   Bea De│   o Proposals   i Inbox   c Conflicts   r refresh   Enter open/detail        │         │
+│         │   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │0008     │
+│         │ Check                                                                        │         │
 │         │   3 Check   d Doctor   r refresh   x raw CLI output (from an alert)          │         │
 │         │ Anywhere                                                                     │         │
 │         │   : or Ctrl-P palette   p scope   ? help   q quit                            │         │
@@ -19,6 +20,5 @@ vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
 │         │   Enter never writes; y confirms after a preview (--dry-run/both sides)      │         │
 │         │   Esc clears a filter or goes back; at the People home it does not quit      │         │
 │         ╰ Press any key to close. ─────────────────────────────────────────────────────╯         │
-│                                    ││                                                            │
 ╰────────────────────────────────────╯╰────────────────────────────────────────────────────────────╯
  1-3  ws  Tab  view  j/k  move  /  filter  [ ]  item  !  op  :  palette  ?  help  q  quit
