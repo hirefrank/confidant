@@ -30,7 +30,7 @@ use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
 use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
-use confidant_core::error::DomainError;
+use confidant_core::error::{DomainError, ErrorKind};
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::packs::dir::read_pack_dir;
@@ -442,6 +442,18 @@ enum KeysAction {
     Shred {
         /// Client id to shred.
         client_id: String,
+    },
+    /// Verify a saved recovery phrase against this vault (read-only).
+    ///
+    /// The phrase arrives via stdin or `--phrase-file` only (never as an
+    /// argument). Works on an enrolled device and on a fresh device: it
+    /// needs no device key and writes nothing (no config dir, no `keys/`,
+    /// no git, no keychain). Exits 0 only when the phrase matches the
+    /// pinned public halves and opens every current client's wrapping.
+    VerifyRecovery {
+        /// File containing the 24-word recovery phrase (alternative to stdin).
+        #[arg(long)]
+        phrase_file: Option<PathBuf>,
     },
     /// Add a new device: two-step ceremony.
     ///
@@ -1388,6 +1400,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                             cmd_keys_revoke(&cli, &root, client_id, key_ids)
                         }
                         KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
+                        KeysAction::VerifyRecovery { phrase_file } => {
+                            cmd_keys_verify_recovery(&cli, &root, phrase_file.as_deref())
+                        }
                         KeysAction::DeviceAdd { .. } => {
                             unreachable!("handled by the outer match arm")
                         }
@@ -7235,13 +7250,17 @@ fn skills_links_check() -> DoctorCheck {
 }
 
 /// #386: informational `qmd` search-availability check. qmd is optional,
-/// so this is always `ok` — the same rule as the offline staleness check:
-/// a missing qmd never warns or fails, it just means search falls back to
-/// `confidant find` (see `qmd-query.py`).
+/// so a missing qmd is `ok` — the same rule as the offline staleness check:
+/// it just means search falls back to `confidant find` (see
+/// `qmd-query.py`). A qmd that is installed but has no corpus is a
+/// `warning` (#657): the fallback still works, but the operator asked for
+/// semantic search and an initial `confidant reindex` is needed to enable
+/// it, so an `ok` badge on that message is easy to miss.
 ///
 /// Reports, in order: qmd on PATH? corpus built? embeddings present?
-/// (Hybrid and vector modes need `qmd embed`; bm25 keyword search works
-/// without it.)
+/// (BM25 keyword search is ready without embeddings; semantic/hybrid
+/// ranking needs the skill wrapper's `--embed`, not a bare `qmd embed`,
+/// because QMD's store is relocated under the vault. #666)
 fn qmd_search_check(root: &Path) -> DoctorCheck {
     const ID: &str = "qmd-search";
     const INSTALL_HINT: &str = "npm install -g @tobilu/qmd";
@@ -7259,18 +7278,38 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
         ));
     };
     if !root.join(QMD_CORPUS_REL).is_dir() {
-        return ok("qmd is on PATH but the search corpus is missing; \
-             run `confidant reindex` to rebuild it \
-             (search falls back to `confidant find`)"
-            .to_owned());
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "qmd is on PATH but the search corpus is missing; \
+                 run `confidant reindex` to rebuild it \
+                 (search falls back to `confidant find`)"
+                .to_owned(),
+            fix: Some("Run `confidant reindex` to build the search corpus".to_owned()),
+        };
     }
     match qmd_embedded_vectors(root, &qmd) {
-        Some(n) if n > 0 => ok(format!("qmd search available ({n} embedded vectors)")),
-        Some(_) => ok(
-            "qmd index has no embedded vectors; hybrid/vector search needs \
-             `qmd embed` (bm25 keyword search works without it)"
+        Some(n) if n > 0 => ok(format!(
+            "hybrid/vector search available ({n} embedded vectors); \
+             keyword (BM25) search is also ready"
+        )),
+        Some(_) => DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "keyword (BM25) search ready; semantic/hybrid ranking is optional \
+                      and not enabled (no embeddings)"
                 .to_owned(),
-        ),
+            // #666: a bare `qmd embed` would target QMD's default store.
+            // This project relocates QMD under the vault via
+            // INDEX_PATH/QMD_CONFIG_DIR, so use the skill wrapper.
+            fix: Some(format!(
+                "Run \"$(confidant which --skills-dir)\"/qmd-search/bin/qmd-index.py \
+                 --vault \"{}\" --embed to enable semantic/hybrid ranking \
+                 (the first run downloads multi-GB GGUF models, needs network, \
+                 and the disk must be encrypted)",
+                root.display()
+            )),
+        },
         // The probe itself could not report (status failed or timed out):
         // do not point at `qmd embed`, which would not fix a broken status.
         None => ok(
@@ -7358,6 +7397,326 @@ fn parse_embedded_vectors(output: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Parse the version out of `confidant-tui --version` output. Accepts
+/// `confidant-tui 1.2.3`, `confidant-tui v1.2.3`, and a bare `1.2.3`;
+/// scans tokens so a build suffix (`1.2.3 (abc)`) or a leading banner
+/// line still resolves. Returns the normalized `major.minor.patch`, or
+/// `None` when no version token is present.
+fn parse_tui_version(output: &str) -> Option<String> {
+    for token in output.split_whitespace() {
+        let token = token.trim_start_matches('v');
+        let mut parts = token.split('.');
+        let major = parts.next()?;
+        if major.is_empty() || !major.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Some(minor) = parts.next() else {
+            continue;
+        };
+        if minor.is_empty() || !minor.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Some(patch) = parts.next() else {
+            continue;
+        };
+        let patch: String = patch.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if patch.is_empty() {
+            continue;
+        }
+        return Some(format!("{major}.{minor}.{patch}"));
+    }
+    None
+}
+
+/// Run `<bin> --version` and return its normalized version. `None` when
+/// the probe fails, times out, or prints no recognizable version; the
+/// caller treats that as "unknown", never as an error.
+///
+/// A broken TUI must not hang `doctor` or `confidant tui`, so this mirrors
+/// the qmd probe: spawn, poll `try_wait`, and kill after the grace period
+/// (a `--version` that takes two seconds is already pathological).
+fn tui_binary_version(bin: &Path) -> Option<String> {
+    use std::io::Read as _;
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX_OUTPUT: u64 = 64 * 1024;
+
+    let mut child = std::process::Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    // Drain both pipes on helper threads: a chatty binary that fills a
+    // pipe would otherwise block on write and never exit, leaving only
+    // the timeout to fire.
+    let mut stdout_thread = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut out).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let mut stderr_thread = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut err).take(MAX_OUTPUT).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None => {
+                if start.elapsed() >= PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do not join the drain threads: a wrapper script can
+                    // leave a grandchild (e.g. `sleep`) holding the pipes
+                    // after the direct child is killed, and joining would
+                    // wait for it. They end when the pipes close, and
+                    // process exit detaches them either way. (#659)
+                    let _ = stdout_thread.take();
+                    let _ = stderr_thread.take();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    // Both pipes are closed now, so the drain threads always terminate.
+    let stdout = stdout_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !status.success() {
+        return None;
+    }
+    parse_tui_version(&String::from_utf8_lossy(&stdout))
+        .or_else(|| parse_tui_version(&String::from_utf8_lossy(&stderr)))
+}
+
+/// #659: `tui-version` doctor check. `confidant-tui` is optional and
+/// installed separately, so a missing TUI is `ok`. An installed TUI whose
+/// version differs from this CLI is a `warning`: the TUI speaks the same
+/// ADR-7 contract, and a stale one can render unknown finding codes.
+fn tui_version_check() -> DoctorCheck {
+    const ID: &str = "tui-version";
+    const INSTALL: &str = "cargo install confidant-tui";
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let Some(bin) = find_on_path("confidant-tui") else {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("optional TUI not installed; install it with `{INSTALL}`"),
+            fix: None,
+        };
+    };
+    let Some(tui_version) = tui_binary_version(&bin) else {
+        // A broken or unusual `--version` must not make doctor noisy; the
+        // TUI is optional and may still work.
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "confidant-tui is installed but did not report a version".to_owned(),
+            fix: None,
+        };
+    };
+    if tui_version == cli_version {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("confidant-tui {tui_version} matches confidant-cli {cli_version}"),
+            fix: None,
+        }
+    } else {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "confidant-tui {tui_version} does not match confidant-cli {cli_version}; \
+                 the TUI may render stale or unknown state"
+            ),
+            fix: Some(format!("Run `{INSTALL}` to install the matching version")),
+        }
+    }
+}
+
+/// Parse `git remote -v` output into unique remote names, in first-seen
+/// order. URLs are deliberately discarded: they may carry credentials.
+fn parse_git_remotes(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        if name.is_empty() || names.iter().any(|n| n == name) {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names
+}
+
+/// #660: `git-remote` doctor check. Read-only and offline: it never
+/// fetches, pushes, or contacts a remote. A remote is safe only because
+/// the vault is encrypted, so a plaintext vault with a remote warns.
+///
+/// `root` is the resolved vault. When it is not a directory (doctor never
+/// reaches this today), the check stays `ok`: a missing vault is not a
+/// remote problem.
+fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
+    const ID: &str = "git-remote";
+    if !root.is_dir() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "no vault to inspect for git remotes".to_owned(),
+            fix: None,
+        };
+    }
+    let output = match confidant_core::write::git(root, &["remote", "-v"], no_input) {
+        Ok(out) => out,
+        Err(e) => {
+            // Never a panic or an error: `git-repo` already reports a
+            // missing repository, and this check is advisory.
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!("could not read git remotes: {e}"),
+                fix: None,
+            };
+        }
+    };
+    let remotes = parse_git_remotes(&output);
+    if remotes.is_empty() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "local-only; add a remote for backup and second-device recovery".to_owned(),
+            fix: Some("Run `git remote add origin <url>`".to_owned()),
+        };
+    }
+    let named = remotes.join(", ");
+    if confidant_core::crypto_mode::is_structurally_encrypted(root) {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: format!("git remote configured ({named}); vault is encrypted"),
+            fix: None,
+        }
+    } else {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "git remote configured ({named}) but this vault is plaintext; record bodies \
+                 are readable by anyone with repo access"
+            ),
+            fix: Some(
+                "Do not push plaintext vaults; encrypt the vault first or remove the remote"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Parse `findmnt -no SOURCE /` output into a device path. `findmnt` can
+/// append a subvolume suffix (`/dev/sda2[/@root]`); strip it. Returns
+/// `None` for a non-device source (overlay, tmpfs, `UUID=…`), where the
+/// `lsblk` ancestry cannot be resolved.
+#[cfg(target_os = "linux")]
+fn parse_findmnt_source(output: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let source = line.split('[').next().unwrap_or(line).trim();
+    if source.starts_with("/dev/") {
+        Some(source.to_owned())
+    } else {
+        None
+    }
+}
+
+/// True when `lsblk -s -no TYPE` output lists a `crypt` device in the
+/// root device's ancestry (LUKS/dm-crypt).
+#[cfg(target_os = "linux")]
+fn lsblk_types_include_crypt(output: &str) -> bool {
+    output
+        .lines()
+        .map(str::trim)
+        .any(|line| line.eq_ignore_ascii_case("crypt"))
+}
+
+/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
+/// advisory: a missing tool, an unparseable source, or a non-block root
+/// all report `ok` "could not determine", so this can never fail doctor.
+/// It never prompts and never leaves the machine.
+#[cfg(target_os = "linux")]
+fn disk_encryption_check() -> DoctorCheck {
+    const ID: &str = "disk-encryption";
+    let unknown = |detail: &str| DoctorCheck {
+        id: ID,
+        status: "ok",
+        message: format!("could not determine disk encryption ({detail})"),
+        fix: None,
+    };
+    let findmnt = match std::process::Command::new("findmnt")
+        .args(["-no", "SOURCE", "/"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => return unknown("findmnt could not resolve the root filesystem"),
+        Err(_) => return unknown("findmnt is not available"),
+    };
+    let Some(source) = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout)) else {
+        return unknown("root filesystem is not on a block device");
+    };
+    let lsblk = match std::process::Command::new("lsblk")
+        .args(["-sno", "TYPE", &source])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => return unknown("lsblk could not read the root device"),
+        Err(_) => return unknown("lsblk is not available"),
+    };
+    let types = String::from_utf8_lossy(&lsblk.stdout);
+    if lsblk_types_include_crypt(&types) {
+        DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "root filesystem is on an encrypted device".to_owned(),
+            fix: None,
+        }
+    } else if types.lines().any(|l| !l.trim().is_empty()) {
+        DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "root filesystem is not on an encrypted disk; keep real client data on an \
+                      encrypted disk"
+                .to_owned(),
+            fix: Some(
+                "Move the vault to a full-disk-encrypted volume before storing real client data"
+                    .to_owned(),
+            ),
+        }
+    } else {
+        unknown("lsblk returned no device types")
+    }
+}
+
+/// Non-Linux platforms have no `findmnt`/`lsblk`; macOS FileVault is not
+/// probed here. Report `ok` "could not determine" so doctor still passes.
+#[cfg(not(target_os = "linux"))]
+fn disk_encryption_check() -> DoctorCheck {
+    DoctorCheck {
+        id: "disk-encryption",
+        status: "ok",
+        message: "could not determine disk encryption (unsupported platform)".to_owned(),
+        fix: None,
+    }
 }
 
 fn cmd_doctor(
@@ -7449,6 +7808,10 @@ fn cmd_doctor(
         .map(|u| !u.trust.signers.is_empty())
         .unwrap_or(false);
     checks.push(git_version_check(has_signers));
+
+    // #660: remote visibility. Read-only and offline; warns when a
+    // plaintext vault has a remote, because that leaks record bodies.
+    checks.push(git_remote_check(root, cli.no_input));
 
     // #175: leftover keys/ staging state from an interrupted swap.
     checks.push(keys_staging_check(root));
@@ -7639,6 +8002,10 @@ fn cmd_doctor(
         });
     }
 
+    // #653(d): best-effort encrypted-disk check. Advisory only: a missing
+    // tool or an unknown platform is `ok`, so doctor never fails on it.
+    checks.push(disk_encryption_check());
+
     // #541: keychain reachability and device enrollment. Headless hosts
     // have no Secret Service, so the failure an agent hits is otherwise an
     // opaque NoKey; this names the source and the env-var fix.
@@ -7699,7 +8066,10 @@ fn cmd_doctor(
         let latest = if offline { None } else { latest_release_tag() };
         checks.push(cli_staleness_check(latest, offline));
         checks.push(skills_links_check());
-        // #386: qmd search availability (informational; never warns or fails).
+        // #659: the optional TUI must match the CLI's agent contract.
+        checks.push(tui_version_check());
+        // #386/#657: qmd search availability. Missing qmd is `ok`; an
+        // installed qmd without a corpus warns and points at `reindex`.
         checks.push(qmd_search_check(root));
     }
 
@@ -8983,6 +9353,84 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Read a recovery phrase from stdin or `--phrase-file` (B7: never argv).
+///
+/// Both channels read straight into a [`Zeroizing<String>`]; the trimmed
+/// copy is zeroizing too, so neither the raw nor the trimmed buffer is ever
+/// dropped as a plain `String`. Empty input is a usage error.
+fn read_phrase(phrase_file: Option<&Path>) -> anyhow::Result<Zeroizing<String>> {
+    use std::io::Read;
+
+    let mut buf: Zeroizing<String> = Zeroizing::new(String::new());
+    if let Some(path) = phrase_file {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "--phrase-file {} unreadable: {e}",
+                path.display()
+            )))
+        })?;
+        *buf = text;
+    } else {
+        io::stdin().read_to_string(&mut buf).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "cannot read phrase from stdin: {e}"
+            )))
+        })?;
+    }
+
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "recovery phrase is required via stdin or --phrase-file",
+        )));
+    }
+    if trimmed.len() == buf.len() {
+        return Ok(buf);
+    }
+    // A separate zeroizing buffer, so dropping the untrimmed original does
+    // not leave the phrase bytes in a plain `String` (#663).
+    Ok(Zeroizing::new(trimmed.to_owned()))
+}
+
+/// Compare a phrase-derived recovery identity with a trust anchor: **both**
+/// halves must match (Ed25519 pubkey and X25519 age recipient). The two
+/// comparisons live here so `recover` and `keys verify-recovery` cannot
+/// drift apart (#663).
+fn recovery_matches_anchor(
+    anchor: &confidant_crypt::anchor::Anchor,
+    recovery: &confidant_crypt::recovery::Recovery,
+) -> (bool, bool) {
+    (
+        anchor.recovery == recovery.verifying_key(),
+        anchor.recovery_age == recovery.age_identity().to_recipient_string(),
+    )
+}
+
+/// Fail closed unless the phrase-derived recovery identity matches the
+/// anchor's Ed25519 pubkey and X25519 age recipient. Shared by `recover`
+/// and `keys verify-recovery`.
+fn check_recovery(
+    anchor: &confidant_crypt::anchor::Anchor,
+    recovery: &confidant_crypt::recovery::Recovery,
+) -> anyhow::Result<()> {
+    let (pubkey_matches, recipient_matches) = recovery_matches_anchor(anchor, recovery);
+    if !pubkey_matches {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "recovery phrase does not match this vault's trust anchor",
+        )));
+    }
+    // The X25519 recovery recipient is a separate HKDF branch of the
+    // phrase; it must match too, or a tampered anchor file could get a
+    // forged recipient recorded in the denylist and the real retired
+    // recipient missed (#154 must-fix 1).
+    if !recipient_matches {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+        )));
+    }
+    Ok(())
+}
+
 fn cmd_recover(
     cli: &Cli,
     root: &Path,
@@ -8999,35 +9447,9 @@ fn cmd_recover(
     let json = cli.json;
     let no_input = cli.no_input;
 
-    // B7: phrase via stdin or --phrase-file only — never argv.
-    // Wrapped in Zeroizing: the plaintext phrase is wiped on drop.
-    let phrase: zeroize::Zeroizing<String> = if let Some(path) = phrase_file {
-        zeroize::Zeroizing::new(
-            std::fs::read_to_string(path)
-                .map_err(|e| {
-                    anyhow::Error::new(DomainError::usage(format!(
-                        "--phrase-file {} unreadable: {e}",
-                        path.display()
-                    )))
-                })?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        let mut buf = String::new();
-        use std::io::Read;
-        io::stdin().read_to_string(&mut buf).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "cannot read phrase from stdin: {e}"
-            )))
-        })?;
-        zeroize::Zeroizing::new(buf.trim().to_string())
-    };
-    if phrase.is_empty() {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "recovery phrase is required via stdin or --phrase-file",
-        )));
-    }
+    // B7: phrase via stdin or --phrase-file only — never argv. Both
+    // channels read into zeroizing buffers (shared `read_phrase`).
+    let phrase = read_phrase(phrase_file)?;
 
     // B8: validate (typo-in-word-N errors; never echoes the word).
     let old_recovery = Recovery::from_phrase(&phrase).map_err(anyhow::Error::new)?;
@@ -9079,23 +9501,6 @@ fn cmd_recover(
     //    phrase alone re-establishes trust.
     //
     // Nothing is written to the config dir until this succeeds.
-    let check_recovery = |a: &anchor::Anchor| -> anyhow::Result<()> {
-        if a.recovery != old_recovery.verifying_key() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "recovery phrase does not match this vault's trust anchor",
-            )));
-        }
-        // The X25519 recovery recipient is a separate HKDF branch of the
-        // phrase; it must match too, or a tampered anchor file could get a
-        // forged recipient recorded in the denylist and the real retired
-        // recipient missed (#154 must-fix 1).
-        if a.recovery_age != old_recovery.age_identity().to_recipient_string() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "recovery phrase does not match this vault's trust anchor (recovery recipient)",
-            )));
-        }
-        Ok(())
-    };
     let anchor = if let Some(path) = anchor_file {
         let a = anchor::load_from(path, root).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
@@ -9103,7 +9508,7 @@ fn cmd_recover(
                 path.display()
             )))
         })?;
-        check_recovery(&a)?;
+        check_recovery(&a, &old_recovery)?;
         // #154 must-fix 3: the supplied operator key may only be accepted
         // when the vault has no operator certificate (the pre-cert case the
         // backup exists for). When a cert is present it must verify against
@@ -9135,7 +9540,7 @@ fn cmd_recover(
             Ok((a, _warnings)) => {
                 // The phrase must be for THIS vault: the recovery public key
                 // in the anchor must match the phrase-derived one.
-                check_recovery(&a)?;
+                check_recovery(&a, &old_recovery)?;
                 a
             }
             Err(_) => {
@@ -9325,6 +9730,9 @@ fn cmd_recover(
         println!("recovered {} client(s); anchor re-pinned", clients.len());
         println!("committed ({})", &commit[..8.min(commit.len())]);
         println!("note: only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery). Enroll more devices with `keys device-add`.");
+        println!(
+            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -9365,6 +9773,7 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
         "unknown_agents": result.unknown_agents,
         "linked": result.linked_count(),
         "skipped": result.skipped_count(),
+        "dry_run": result.dry_run,
     })
 }
 
@@ -9375,8 +9784,13 @@ fn cmd_setup(
     copy: bool,
     verbose: bool,
 ) -> anyhow::Result<ExitCode> {
-    match setup::run_setup(agent, force, copy) {
+    match setup::run_setup(agent, force, copy, cli.dry_run) {
         Ok(result) => {
+            // #653c: `--agent auto` falls back to claude-code when nothing is
+            // detected; say so instead of creating ~/.claude silently.
+            if let Some(note) = &result.fallback_note {
+                eprintln!("warning: {note}");
+            }
             if cli.json {
                 let mut value = setup_result_json(&result);
                 if let Value::Object(ref mut obj) = value {
@@ -9393,19 +9807,32 @@ fn cmd_setup(
                     eprintln!("warning: unknown agent '{unknown}' — skipped");
                 }
                 let labels = result.agent_labels().join(", ");
-                println!("Confidant skills installed");
+                if result.dry_run {
+                    println!("Confidant skills (dry run; nothing written)");
+                } else {
+                    println!("Confidant skills installed");
+                }
                 println!("  skills   {} → {labels}", result.skills_dir.display());
                 println!("  version  {}", result.version);
                 println!(
-                    "  linked   {} ({} skipped)",
+                    "  {:<9} {} ({} skipped)",
+                    if result.dry_run {
+                        "would link"
+                    } else {
+                        "linked"
+                    },
                     result.linked_count(),
                     result.skipped_count()
                 );
                 if result.skipped_count() > 0 {
                     println!("  replace existing dirs with: confidant setup --force");
                 }
-                println!();
-                setup_next_steps(cli)?;
+                if result.dry_run {
+                    println!("  re-run without --dry-run to apply");
+                } else {
+                    println!();
+                    setup_next_steps(cli, verbose)?;
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -9459,7 +9886,10 @@ fn setup_next_steps_json(cli: &Cli) -> Value {
 /// check command. When unset, the exact export line replaces the old
 /// generic wording. The vault is never read or probed here — the check
 /// runs only after an explicit `y`, inheriting the environment.
-fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
+///
+/// #653e: the optional qmd npm note is only printed with `-v/--verbose`;
+/// JSON keeps `qmd_available`/`qmd_note` for agents either way.
+fn setup_next_steps(cli: &Cli, verbose: bool) -> anyhow::Result<()> {
     println!("Next:");
     if vault_env_set() {
         println!("  Run `confidant check` against your vault.");
@@ -9476,8 +9906,10 @@ fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
     }
     // #386: informational qmd note. Optional, never prompts, never fails,
     // never changes exit status.
-    if let Some(note) = qmd_setup_note() {
-        println!("  {note}");
+    if verbose {
+        if let Some(note) = qmd_setup_note() {
+            println!("  {note}");
+        }
     }
     Ok(())
 }
@@ -9537,7 +9969,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             print_json(&ok_envelope(None, value))?;
             return Ok(ExitCode::SUCCESS);
         }
-        let result = setup::run_setup(agent, force, false)?;
+        let result = setup::run_setup(agent, force, false, cli.dry_run)?;
         let mut value = setup_result_json(&result);
         if let Value::Object(ref mut obj) = value {
             obj.insert("update".to_owned(), update_info);
@@ -9555,26 +9987,36 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     // Never re-link from a behind binary: the installed
                     // skills would be stale on arrival. Print the single
                     // command that fits this install; in an interactive
-                    // terminal, offer to run it (default No).
+                    // terminal, offer to run it (default No). `--dry-run`
+                    // prints the command and never offers or runs it (#668).
                     if let (Some(cmd), Some((program, args))) =
                         (method.update_command(), method.run_spec())
                     {
-                        println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
-                        if offerable_update(method, true)
-                            && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
-                        {
-                            match run_offered_command(cmd, program, args) {
-                                Ok(()) => {
-                                    println!("updated via `{cmd}`.");
-                                    if confirm_yn(
-                                        "run `confidant setup` now?",
-                                        cli.no_input,
-                                        cli.json,
-                                    )? {
-                                        return relink_after_update(agent, force, verbose);
+                        if cli.dry_run {
+                            println!("confidant {local} is behind the latest release {tag}; would run `{cmd}`, then re-run `confidant setup`.");
+                        } else {
+                            println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
+                            if offerable_update(method, true)
+                                && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
+                            {
+                                match run_offered_command(cmd, program, args) {
+                                    Ok(()) => {
+                                        println!("updated via `{cmd}`.");
+                                        if confirm_yn(
+                                            "run `confidant setup` now?",
+                                            cli.no_input,
+                                            cli.json,
+                                        )? {
+                                            return relink_after_update(
+                                                agent,
+                                                force,
+                                                verbose,
+                                                cli.dry_run,
+                                            );
+                                        }
                                     }
+                                    Err(err) => eprintln!("update failed: {err:#}"),
                                 }
-                                Err(err) => eprintln!("update failed: {err:#}"),
                             }
                         }
                     } else {
@@ -9584,18 +10026,28 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                if cli.dry_run {
+                    println!("confidant {local} is current (latest: {tag}). Would re-link skills…");
+                } else {
+                    println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                }
             }
         }
     }
-    relink_after_update(agent, force, verbose)
+    relink_after_update(agent, force, verbose, cli.dry_run)
 }
 
 /// Shared tail of `update`: re-link skills from this binary and report.
 /// `force` is the operator's own flag: owned entries are re-pointed
-/// regardless, unowned entries need it.
-fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
-    let result = setup::run_setup(agent, force, false)?;
+/// regardless, unowned entries need it. `dry_run` (#668) plans the relink
+/// and writes nothing.
+fn relink_after_update(
+    agent: &str,
+    force: bool,
+    verbose: bool,
+    dry_run: bool,
+) -> anyhow::Result<ExitCode> {
+    let result = setup::run_setup(agent, force, false, dry_run)?;
     if verbose {
         for line in &result.verbose_lines {
             println!("{line}");
@@ -9604,15 +10056,23 @@ fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Resul
     for unknown in &result.unknown_agents {
         eprintln!("warning: unknown agent '{unknown}' — skipped");
     }
-    println!(
-        "re-linked {} skills → {}",
-        result.linked_count(),
-        result.agent_labels().join(", ")
-    );
+    if dry_run {
+        println!(
+            "would re-link {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    } else {
+        println!(
+            "re-linked {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_agents(cli: &Cli, verbose: bool) -> anyhow::Result<ExitCode> {
+fn cmd_agents(cli: &Cli, _verbose: bool) -> anyhow::Result<ExitCode> {
     let home = setup::home_dir()?;
     let health = setup::agents_health(&home);
     if cli.json {
@@ -9630,11 +10090,24 @@ fn cmd_agents(cli: &Cli, verbose: bool) -> anyhow::Result<ExitCode> {
             .collect();
         print_json(&ok_envelope(None, serde_json::json!({"agents": agents})))?;
     } else {
+        // #652: always show the full table, including before `setup` has run.
+        println!("{:<14} {:<9} {:<7} PATH", "AGENT", "DETECTED", "LINKED");
+        let mut any_linked = false;
         for h in &health {
-            let status = if h.detected { "detected" } else { "" };
-            if verbose || h.detected {
-                println!("{}\t{}\t{status}", h.name, h.dir.display());
-            }
+            any_linked |= h.linked > 0;
+            println!(
+                "{:<14} {:<9} {:<7} {}",
+                h.name,
+                if h.detected { "yes" } else { "no" },
+                format!("{}/{}", h.linked, h.total),
+                h.dir.display()
+            );
+        }
+        if !any_linked {
+            println!();
+            println!(
+                "No skills linked yet. Run `confidant setup --agent <name>` or `confidant setup --agent auto`."
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -9708,6 +10181,38 @@ fn cmd_tui(cli: &Cli, args: &[String]) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     };
+    // #659: a CLI-only upgrade leaves `confidant-tui` on the old release,
+    // and the TUI then speaks an older ADR-7 contract. Warn but keep
+    // launching: mixing versions is sometimes intentional, and refusing
+    // would break working installs.
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let tui_version = tui_binary_version(&bin);
+    let version_mismatch = tui_version
+        .as_deref()
+        .map(|v| v != cli_version)
+        .unwrap_or(false);
+    if cli.json {
+        // Probe-only: the TUI owns stdout and would corrupt the ADR-7
+        // envelope. Report what would launch and leave launching to a
+        // human-mode invocation.
+        print_json(&ok_envelope(
+            cli.vault.as_deref(),
+            serde_json::json!({
+                "tui_version": tui_version,
+                "version_mismatch": version_mismatch,
+                "would_launch": true,
+            }),
+        ))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if version_mismatch {
+        eprintln!(
+            "warning: confidant-tui {} does not match confidant-cli {cli_version}; \
+             the TUI may render stale or unknown state. Install the matching version with \
+             `cargo install confidant-tui`",
+            tui_version.as_deref().unwrap_or("unknown")
+        );
+    }
     // The child inherits this process's environment, so CONFIDANT_VAULT and
     // CONFIDANT_BIN pass through untouched. An explicit `--vault` on this
     // command is forwarded the same way the TUI already reads it.
@@ -12461,6 +12966,326 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
                 "inbox rotation pending: this device does not hold the inbox key; reminder written"
             );
         }
+        println!(
+            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print the structured failure for `keys verify-recovery`.
+///
+/// The error envelope is the ordinary ADR-7 shape (`ok:false`, stable
+/// `code`); `outcome` and `checks` are additive so `--json` still reports
+/// which checks passed. Never include words, positions, derived keys, or
+/// recipient fingerprints.
+fn verify_recovery_failure(
+    cli: &Cli,
+    root: &Path,
+    outcome: &str,
+    checks: Option<Value>,
+    err: DomainError,
+) -> anyhow::Result<ExitCode> {
+    let code = err.exit_code() as u8;
+    if cli.json {
+        let mut body = serde_json::json!({
+            "ok": false,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": vault_json(Some(root)),
+            "outcome": outcome,
+            "error": err.to_json(),
+        });
+        if let Some(checks) = checks {
+            body["checks"] = checks;
+        }
+        print_json(&body)?;
+    } else {
+        print_error(false, None, &err)?;
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// `confidant keys verify-recovery` (#663): check a saved phrase without
+/// changing anything.
+///
+/// Match requires all of:
+/// 1. when `~/.config/confidant/trust.toml` exists, both its Ed25519
+///    `recovery_pubkey` and X25519 `recovery_age_recipient` match the
+///    phrase (and a disagreement never falls back to `keys/`);
+/// 2. when `keys/operator.toml` exists, its certificate verifies against
+///    the phrase-derived recovery pubkey;
+/// 3. the phrase identity trial-unwraps the current-epoch
+///    `wrapped/recovery.age` for every initialized client except the
+///    device-only `vault:lookup` key.
+fn cmd_keys_verify_recovery(
+    cli: &Cli,
+    root: &Path,
+    phrase_file: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{
+        anchor,
+        lifecycle::KeyStore,
+        manifest::{RECOVERY_KEY_ID, VAULT_CLIENT_ID},
+        recovery::Recovery,
+    };
+
+    // B7: stdin or --phrase-file only, never argv; zeroizing buffers.
+    let phrase = read_phrase(phrase_file)?;
+    let recovery = match Recovery::from_phrase(&phrase) {
+        Ok(recovery) => recovery,
+        Err(e) => {
+            drop(phrase);
+            // The position hint is stderr-only. The JSON error message is
+            // deliberately generic so no word position reaches --json.
+            eprintln!("hint: {e}");
+            return verify_recovery_failure(
+                cli,
+                root,
+                "malformed",
+                None,
+                DomainError::new(
+                    ErrorKind::RecoveryMalformed,
+                    "recovery phrase is malformed (expected 24 BIP39 words)",
+                )
+                .with_fix("Check the saved copy and re-enter the 24 words from it"),
+            );
+        }
+    };
+    drop(phrase);
+
+    let vault = load_vault(root)?;
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+    let keys_dir = root.join("keys");
+    let trust_path = config_dir.join(anchor::TRUST_FILE);
+    let trust_exists = trust_path.is_file();
+
+    let derived_pubkey = recovery.verifying_key();
+    let derived_recipient = recovery.age_identity().to_recipient_string();
+
+    let mut anchor_pin: Option<anchor::Anchor> = None;
+    let mut anchor_state = "absent";
+    let mut recipient_state = "absent";
+    if trust_exists {
+        match anchor::load(&config_dir, root) {
+            Ok((loaded, _warnings)) => {
+                let (pubkey_matches, recipient_matches) =
+                    recovery_matches_anchor(&loaded, &recovery);
+                anchor_state = if pubkey_matches { "pass" } else { "fail" };
+                recipient_state = if recipient_matches { "pass" } else { "fail" };
+                anchor_pin = Some(loaded);
+            }
+            Err(e) => {
+                // The anchor exists but cannot be used: fail closed. Never
+                // fall back to the keys/ tree in this case.
+                let checks = serde_json::json!({
+                    "anchor": "fail",
+                    "recipient": "fail",
+                    "cert": "absent",
+                    "unwrap": {},
+                });
+                let err = DomainError::new(
+                    ErrorKind::RecoveryMismatch,
+                    format!(
+                        "trust anchor exists at {} but cannot be used: {e}",
+                        trust_path.display()
+                    ),
+                )
+                .with_fix(
+                    "Restore a valid trust.toml from backup; verify-recovery never falls back \
+                     to the vault's keys/ tree when an anchor exists",
+                );
+                return verify_recovery_failure(cli, root, "mismatch", Some(checks), err);
+            }
+        }
+    }
+
+    let store = KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+
+    // A retired phrase is only knowable against a current anchor: the
+    // append-only history also records the current recipient, so membership
+    // alone would flag a healthy phrase after any rotation.
+    let retired = trust_exists
+        && recipient_state == "fail"
+        && store.recovery_history().contains(&derived_recipient);
+
+    // The operator certificate is what a fresh-device `recover` relies on.
+    let mut cert_state = "absent";
+    let mut cert_error: Option<String> = None;
+    if keys_dir.join(anchor::OPERATOR_CERT_FILE).is_file() {
+        match anchor::verify_operator_cert(&keys_dir, &vault.config.vault_id, &derived_pubkey) {
+            Ok(operator) => {
+                cert_state = "pass";
+                if anchor_pin.is_none() {
+                    // Fresh device: rebuild the anchor from the verified
+                    // certificate, exactly as `recover` does.
+                    anchor_pin = Some(anchor::Anchor {
+                        operator,
+                        recovery: derived_pubkey,
+                        recovery_age: derived_recipient.clone(),
+                        source: trust_path.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                cert_state = "fail";
+                cert_error = Some(e.to_string());
+            }
+        }
+    }
+
+    let identity = recovery.age_identity().to_age_identity().map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!("bad recovery identity: {e}")))
+    })?;
+
+    let mut clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != VAULT_CLIENT_ID)
+        .collect();
+    clients.sort();
+
+    let mut unwrap = serde_json::Map::new();
+    let mut unwrap_failed = false;
+    let mut unwrap_error: Option<(String, String)> = None;
+    if let Some(anchor) = &anchor_pin {
+        for client_id in &clients {
+            let result = (|| -> Result<(), String> {
+                let epoch = store.current_epoch(client_id).map_err(|e| e.to_string())?;
+                // The trial key is a DataKey (zeroizing). Drop it right
+                // here: it is never returned, logged, or cached.
+                let key = store
+                    .trial_unwrap_data_key(client_id, RECOVERY_KEY_ID, epoch, &identity, anchor)
+                    .map_err(|e| e.to_string())?;
+                drop(key);
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    unwrap.insert(client_id.clone(), Value::String("pass".to_owned()));
+                }
+                Err(e) => {
+                    unwrap_failed = true;
+                    unwrap_error.get_or_insert_with(|| (client_id.clone(), e));
+                    unwrap.insert(client_id.clone(), Value::String("fail".to_owned()));
+                }
+            }
+        }
+    }
+
+    let checks = serde_json::json!({
+        "anchor": anchor_state,
+        "recipient": recipient_state,
+        "cert": cert_state,
+        "unwrap": Value::Object(unwrap),
+    });
+
+    let outcome = if retired {
+        "retired"
+    } else if anchor_state == "fail" || recipient_state == "fail" || cert_state == "fail" {
+        "mismatch"
+    } else if unwrap_failed {
+        "unwrap_failed"
+    } else if anchor_pin.is_none() {
+        // Nothing to verify against: no anchor, no operator certificate.
+        "mismatch"
+    } else {
+        "match"
+    };
+
+    if outcome != "match" {
+        let err = match outcome {
+            "retired" => DomainError::new(
+                ErrorKind::RecoveryRetired,
+                "this is a retired recovery phrase (a later `recover` or `keys shred` replaced it)",
+            )
+            .with_fix(
+                "Destroy that copy: it still opens the vault's history, but it cannot recover \
+                 the current device. Use the current phrase.",
+            ),
+            "unwrap_failed" => {
+                let (client_id, detail) = unwrap_error
+                    .unwrap_or_else(|| ("unknown".to_owned(), "unwrap failed".to_owned()));
+                DomainError::new(
+                    ErrorKind::RecoveryUnwrap,
+                    format!(
+                        "the phrase matches the pinned keys but cannot unwrap the current data \
+                         key for {client_id}: {detail}"
+                    ),
+                )
+                .with_fix(
+                    "Re-check the saved copy; if trust.toml was restored from an old backup, \
+                     restore the current one",
+                )
+            }
+            _ => {
+                if anchor_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "recovery phrase does not match this vault's trust anchor",
+                    )
+                    .with_fix("Use the current phrase; do not run `recover` with this copy")
+                } else if recipient_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+                    )
+                    .with_fix("Use the current phrase; do not run `recover` with this copy")
+                } else if cert_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        format!(
+                            "operator certificate does not verify against this recovery phrase: {}",
+                            cert_error.as_deref().unwrap_or("signature check failed")
+                        ),
+                    )
+                    .with_fix(
+                        "Use the current phrase; a fresh-device `recover` with this copy would \
+                         fail the same way",
+                    )
+                } else {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "cannot verify this phrase: the vault has neither a trust anchor nor an \
+                         operator certificate",
+                    )
+                    .with_fix(
+                        "Restore ~/.config/confidant/trust.toml from a backup; pre-certificate \
+                         vaults cannot verify a phrase without one",
+                    )
+                }
+            }
+        };
+        return verify_recovery_failure(cli, root, outcome, Some(checks), err);
+    }
+
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "outcome": "match",
+                "checks": checks,
+                "clients_checked": clients.len(),
+            }),
+        ))?;
+    } else {
+        println!("recovery phrase matches this vault");
+        match anchor_state {
+            "pass" => println!("  trust anchor  both recovery halves match"),
+            _ => println!("  trust anchor  not on this device (verified from keys/)"),
+        }
+        match cert_state {
+            "pass" => println!("  certificate   verified against the phrase"),
+            _ => println!("  certificate   not present in keys/"),
+        }
+        println!(
+            "  data keys     {} client(s) opened with the phrase",
+            clients.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -12487,9 +13312,80 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
-        parse_git_version, reject_unsupported_prefix, InstallMethod, MIN_GIT_VERSION,
+        parse_git_remotes, parse_git_version, parse_tui_version, reject_unsupported_prefix,
+        InstallMethod, MIN_GIT_VERSION,
     };
     use std::path::Path;
+
+    /// #659: the TUI `--version` probe accepts a prefixed, `v`-prefixed,
+    /// bare, and suffix-bearing version, and refuses garbage.
+    #[test]
+    fn tui_version_parser_accepts_real_shapes() {
+        assert_eq!(
+            parse_tui_version("confidant-tui 0.6.0"),
+            Some("0.6.0".into())
+        );
+        assert_eq!(
+            parse_tui_version("confidant-tui v0.6.1\n"),
+            Some("0.6.1".into())
+        );
+        assert_eq!(parse_tui_version("0.6.0"), Some("0.6.0".into()));
+        assert_eq!(
+            parse_tui_version("confidant-tui 0.7.0 (abc123)"),
+            Some("0.7.0".into())
+        );
+        // A numeric non-version token must not abort the scan.
+        assert_eq!(
+            parse_tui_version("confidant-tui build 1 0.6.2"),
+            Some("0.6.2".into())
+        );
+        assert_eq!(parse_tui_version("confidant-tui unknown"), None);
+        assert_eq!(parse_tui_version(""), None);
+    }
+
+    /// #660: remote URLs may carry credentials, so only names survive.
+    #[test]
+    fn git_remote_parser_keeps_names_only() {
+        let out = "\
+origin\thttps://user:token@host.example/org/repo.git (fetch)
+origin\thttps://user:token@host.example/org/repo.git (push)
+backup\tgit@host.example:org/repo.git (fetch)
+backup\tgit@host.example:org/repo.git (push)
+";
+        assert_eq!(parse_git_remotes(out), vec!["origin", "backup"]);
+        assert!(parse_git_remotes("").is_empty());
+    }
+
+    /// #653(d): `findmnt` output is a device path with an optional btrfs
+    /// subvolume suffix; non-block sources cannot be traced through
+    /// `lsblk` and must report "unknown", never a warning.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn findmnt_source_parser() {
+        use super::parse_findmnt_source;
+        assert_eq!(
+            parse_findmnt_source("/dev/nvme0n1p2\n"),
+            Some("/dev/nvme0n1p2".to_owned())
+        );
+        assert_eq!(
+            parse_findmnt_source("/dev/sda2[/@root]\n"),
+            Some("/dev/sda2".to_owned())
+        );
+        assert_eq!(parse_findmnt_source("overlay\n"), None);
+        assert_eq!(parse_findmnt_source("UUID=abcd-1234\n"), None);
+        assert_eq!(parse_findmnt_source("\n"), None);
+    }
+
+    /// #653(d): only a `crypt` ancestor means the root disk is encrypted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lsblk_types_detect_crypt() {
+        use super::lsblk_types_include_crypt;
+        assert!(lsblk_types_include_crypt("lvm\ncrypt\npart\ndisk\n"));
+        assert!(lsblk_types_include_crypt("crypt\n"));
+        assert!(!lsblk_types_include_crypt("lvm\npart\ndisk\n"));
+        assert!(!lsblk_types_include_crypt(""));
+    }
 
     /// #542: a `confidant <command>` hint in `reject_unsupported_prefix`
     /// must name a subcommand clap actually has. The old package hint said

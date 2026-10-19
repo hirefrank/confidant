@@ -1115,21 +1115,39 @@ fn setup_json_next_steps_unset_carries_export_line() {
     );
 }
 
-// #386: `setup` mentions qmd as optional when it is not on PATH.
-// Informational only: setup still succeeds and the exit status is unchanged.
+// #386/#653e: `setup` mentions qmd as optional only with `-v`; the note is
+// informational and setup still succeeds without qmd.
 #[test]
-fn setup_without_qmd_mentions_fallback_and_still_succeeds() {
+fn setup_without_qmd_is_quiet_by_default_and_notes_it_with_verbose() {
     let env = fresh_env();
     let empty = tempfile::tempdir().unwrap();
-    let r = run_raw(
+    let quiet = run_raw(
         &["setup", "--agent", "all"],
         &env,
         &[("PATH", empty.path().to_str().unwrap())],
         &["CONFIDANT_VAULT"],
         true,
     );
-    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
-    let both = format!("{}{}", r.stdout, r.stderr);
+    assert!(quiet.ok, "stdout={}\nstderr={}", quiet.stdout, quiet.stderr);
+    let both = format!("{}{}", quiet.stdout, quiet.stderr);
+    assert!(
+        !both.contains("npm install -g @tobilu/qmd"),
+        "qmd note is noise on a first install: {both}"
+    );
+
+    let verbose = run_raw(
+        &["setup", "--agent", "all", "-v"],
+        &env,
+        &[("PATH", empty.path().to_str().unwrap())],
+        &["CONFIDANT_VAULT"],
+        true,
+    );
+    assert!(
+        verbose.ok,
+        "stdout={}\nstderr={}",
+        verbose.stdout, verbose.stderr
+    );
+    let both = format!("{}{}", verbose.stdout, verbose.stderr);
     assert!(both.contains("confidant find"), "{both}");
     assert!(both.contains("npm install -g @tobilu/qmd"), "{both}");
 }
@@ -1149,4 +1167,336 @@ fn setup_json_reports_qmd_availability_additively() {
     let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
     assert!(note.contains("confidant find"), "{v}");
     assert_eq!(v["linked"], 5, "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// #649: `setup --dry-run` writes nothing.
+// ---------------------------------------------------------------------------
+
+/// Recursive snapshot of `root`: relative path -> kind, link target, or file
+/// content. Used to prove a dry run left a tree byte-for-byte unchanged.
+fn snapshot(root: &std::path::Path) -> Vec<(PathBuf, String)> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let state = if meta.is_symlink() {
+                format!("link:{}", std::fs::read_link(&path).unwrap().display())
+            } else if meta.is_dir() {
+                "dir".to_owned()
+            } else {
+                format!(
+                    "file:{}",
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                )
+            };
+            out.push((path.strip_prefix(root).unwrap().to_path_buf(), state));
+            if meta.is_dir() {
+                walk(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// `run_raw` without the `CONFIDANT_SKILLS_DIR` override, so setup resolves
+/// real agent dirs under the temp HOME.
+fn run_no_override(args: &[&str], env: &Env, extra: &[(&str, &str)]) -> RawOut {
+    run_raw(args, env, extra, &["CONFIDANT_SKILLS_DIR"], true)
+}
+
+#[test]
+fn setup_dry_run_writes_nothing() {
+    let env = fresh_env();
+    let vault = tempfile::tempdir().unwrap();
+    std::fs::write(vault.path().join("confidant.toml"), "version = 1\n").unwrap();
+    let vault_env = vault.path().to_str().unwrap();
+
+    let home_before = snapshot(std::path::Path::new(&env.home));
+    let share_before = snapshot(std::path::Path::new(&env.share));
+    let vault_before = snapshot(vault.path());
+
+    let r = run_no_override(
+        &["setup", "--agent", "all", "--dry-run"],
+        &env,
+        &[("CONFIDANT_VAULT", vault_env)],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("dry run"), "{}", r.stdout);
+    assert!(r.stdout.contains("would link"), "{}", r.stdout);
+
+    assert_eq!(
+        snapshot(std::path::Path::new(&env.home)),
+        home_before,
+        "dry run changed $HOME"
+    );
+    assert_eq!(
+        snapshot(std::path::Path::new(&env.share)),
+        share_before,
+        "dry run materialized the skills tree"
+    );
+    assert_eq!(
+        snapshot(vault.path()),
+        vault_before,
+        "dry run changed the vault"
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude"
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".agents").exists(),
+        "dry run created ~/.agents"
+    );
+}
+
+#[test]
+fn setup_dry_run_json_reports_planned_counts() {
+    let env = fresh_env();
+    let r = run_no_override(
+        &["setup", "--agent", "all", "--dry-run", "--json"],
+        &env,
+        &[],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["skipped"], 0, "{v}");
+    // Nothing materialized or linked.
+    assert!(
+        !std::path::Path::new(&env.share).join("skills").exists(),
+        "dry run materialized the skills tree: {v}"
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #655: muse/agents share ~/.agents/skills; link and count it once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_counts_shared_agent_dir_once() {
+    let env = fresh_env();
+    let r = run_no_override(&["setup", "--agent", "all", "--json"], &env, &[]);
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+
+    // 9 agent entries, 8 distinct dirs, 5 skills each.
+    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["skipped"], 0, "{v}");
+    assert!(
+        v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == "muse, agents"),
+        "shared dir should keep both labels: {v}"
+    );
+
+    // The shared dir got one link per skill, not two.
+    let shared = std::path::Path::new(&env.home).join(".agents/skills");
+    let entries: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().collect();
+    assert_eq!(entries.len(), 5, "shared dir linked twice: {v}");
+    for entry in entries {
+        assert!(entry.path().is_symlink(), "{:?}", entry.path());
+    }
+
+    // Same counting rule as `agents_health`/doctor: dedupe by dir.
+    let a = run_no_override(&["agents", "--json"], &env, &[]);
+    assert!(a.ok, "stdout={}\nstderr={}", a.stdout, a.stderr);
+    let agents: Value = serde_json::from_str(&a.stdout).unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    let mut total = 0u64;
+    for agent in agents["agents"].as_array().unwrap() {
+        let path = agent["path"].as_str().unwrap().to_owned();
+        if seen.contains(&path) {
+            continue;
+        }
+        seen.push(path);
+        total += agent["linked"].as_u64().unwrap();
+    }
+    assert_eq!(seen.len(), 8, "{agents}");
+    assert_eq!(total as usize, v["linked"].as_u64().unwrap() as usize);
+}
+
+// ---------------------------------------------------------------------------
+// #652 / #653c: `agents` always lists; `--agent auto` fallback is explicit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agents_human_lists_all_nine_before_setup() {
+    let env = fresh_env();
+    let r = run_no_override(&["agents"], &env, &[]);
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    for name in [
+        "claude-code",
+        "cursor",
+        "codex",
+        "opencode",
+        "pi",
+        "gemini-cli",
+        "hermes-agent",
+        "muse",
+        "agents",
+    ] {
+        assert!(
+            r.stdout.lines().any(|line| line.starts_with(name)),
+            "missing {name} in:\n{}",
+            r.stdout
+        );
+    }
+    assert!(r.stdout.contains("0/5"), "{}", r.stdout);
+    assert!(
+        r.stdout
+            .contains("`confidant setup --agent <name>` or `confidant setup --agent auto`"),
+        "missing setup hint:\n{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn setup_auto_fallback_to_claude_code_is_reported() {
+    let env = fresh_env();
+    let r = run_no_override(&["setup", "--agent", "auto"], &env, &[]);
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stderr
+            .contains("claude-code was not detected; --agent auto falls back to it"),
+        "fallback was silent:\n{}",
+        r.stderr
+    );
+    // Selection itself is unchanged.
+    assert!(
+        std::path::Path::new(&env.home)
+            .join(".claude/skills")
+            .is_dir(),
+        "auto should still link claude-code"
+    );
+}
+
+#[test]
+fn setup_auto_with_detected_agent_does_not_warn() {
+    let env = fresh_env();
+    let cursor = std::path::Path::new(&env.home).join(".cursor/skills");
+    std::fs::create_dir_all(&cursor).unwrap();
+    let r = run_no_override(&["setup", "--agent", "auto"], &env, &[]);
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        !r.stderr.contains("falls back"),
+        "unexpected fallback warning:\n{}",
+        r.stderr
+    );
+    assert!(cursor.join("portal-sync").is_symlink());
+}
+
+// ---------------------------------------------------------------------------
+// #668: `update --dry-run` writes nothing and does not run the upgrade.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_dry_run_writes_nothing() {
+    let env = fresh_env();
+    let r = run_no_override(
+        &["update", "--agent", "all", "--dry-run", "--json"],
+        &env,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["update"]["status"], "disabled", "{v}");
+
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude: {v}"
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".agents").exists(),
+        "dry run created ~/.agents: {v}"
+    );
+    assert!(
+        !std::path::Path::new(&env.share).join("skills").exists(),
+        "dry run materialized the skills tree: {v}"
+    );
+}
+
+#[test]
+fn update_dry_run_human_reports_planned_relink() {
+    let env = fresh_env();
+    let r = run_no_override(
+        &["update", "--agent", "all", "--dry-run"],
+        &env,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("would re-link 40 skills"),
+        "planned relink not reported:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("re-linked"),
+        "past-tense wording under --dry-run:\n{}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude:\n{}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&env.share).join("skills").exists(),
+        "dry run materialized the skills tree:\n{}",
+        r.stdout
+    );
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_behind_dry_run_prints_command_without_offering() {
+    // #668: behind + `--dry-run` prints the command it would run, never
+    // prompts for it, and never records/executes it.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all", "--dry-run"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("would run `cargo install confidant-cli`"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "dry run executed the upgrade command");
 }

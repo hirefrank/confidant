@@ -72,6 +72,23 @@ pub enum ErrorKind {
     /// `--person` / `resolve` matched more than one cleared person by exact
     /// display name. Fail closed: the caller must disambiguate.
     AmbiguousPerson,
+    /// `keys verify-recovery` found a phrase that a later `recover` or
+    /// `keys shred` replaced. The derived recipient is in the vault's
+    /// append-only recovery history but is not the anchor's current one.
+    /// It still opens history; the operator must destroy that copy.
+    RecoveryRetired,
+    /// `keys verify-recovery` found a phrase that does not match the trust
+    /// anchor or the operator certificate.
+    RecoveryMismatch,
+    /// `keys verify-recovery` could not parse the 24-word phrase (wrong
+    /// word count, a word outside the BIP39 list, or a bad checksum). The
+    /// word-position hint stays on stderr; the JSON message never carries
+    /// it.
+    RecoveryMalformed,
+    /// `keys verify-recovery` matched the pinned public halves but could
+    /// not trial-unwrap a current data key through the phrase identity
+    /// (missing or tampered wrapping, or a commitment mismatch).
+    RecoveryUnwrap,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -101,6 +118,10 @@ impl ErrorKind {
             Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
+            Self::RecoveryRetired => "E_RECOVERY_RETIRED",
+            Self::RecoveryMismatch => "E_RECOVERY_MISMATCH",
+            Self::RecoveryMalformed => "E_RECOVERY_MALFORMED",
+            Self::RecoveryUnwrap => "E_RECOVERY_UNWRAP",
             Self::Internal => "internal_error",
         }
     }
