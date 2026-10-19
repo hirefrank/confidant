@@ -336,6 +336,60 @@ fn init_refuses_existing_anchor() {
     assert!(msg.contains("recover"), "{msg}");
 }
 
+/// #640: `--force` only replaces a trust anchor; it never re-initializes an
+/// existing key tree. The refusal must happen before any key write, so the
+/// tree, the HEAD commit, and the ability to use the vault are untouched.
+#[test]
+fn init_force_on_initialized_vault_fails_closed() {
+    let h = Harness::new();
+    assert!(h.init(&[]).status.success());
+    let head_before = git_out(&h.vault, &["rev-parse", "HEAD"]);
+    assert!(
+        git_out(&h.vault, &["status", "--porcelain"])
+            .trim()
+            .is_empty(),
+        "precondition: tree is not clean"
+    );
+
+    let out = h.init(&["--force"]);
+    assert!(
+        !out.status.success(),
+        "init --force on an initialized vault must refuse"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    let message = v["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("already exist"), "{message}");
+    assert!(message.contains("never re-initializes"), "{message}");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(fix.contains("keys rotate"), "{fix}");
+
+    // Fail closed: byte-identical working tree and no new commit.
+    let porcelain = git_out(&h.vault, &["status", "--porcelain"]);
+    assert!(
+        porcelain.trim().is_empty(),
+        "failed init --force dirtied the tree:\n{porcelain}"
+    );
+    assert_eq!(
+        git_out(&h.vault, &["rev-parse", "HEAD"]),
+        head_before,
+        "failed init --force created a commit"
+    );
+
+    // The vault still works normally after the refusal (a dirty tree would
+    // block the next write).
+    let out = h.cmd(&["check", "--no-input", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "check after refused init --force failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
 #[test]
 fn init_phrase_stderr_once_never_in_json() {
     let h = Harness::new();
@@ -1129,6 +1183,72 @@ fn bootstrap_unknown_pack_is_usage_error_and_writes_nothing() {
     ]);
     assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
     assert!(!b.vault.exists(), "nothing should be created on refusal");
+}
+
+/// #639: `--packs` only seeds packs the binary implements. An external pack
+/// is vendored by `pack add` into an existing vault, so naming one at init is
+/// refused with that fix instead of the old "unknown pack" surprise.
+#[test]
+fn bootstrap_refuses_external_pack_with_pack_add_guidance() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--packs",
+        "coaching@0.1",
+        "--no-input",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "usage_error");
+    let message = v["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("coaching@0.1"), "{message}");
+    assert!(message.contains("external pack"), "{message}");
+    assert!(message.contains("init cannot vendor"), "{message}");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(fix.contains("confidant pack add"), "{fix}");
+    assert!(
+        !b.vault.exists(),
+        "nothing should be created when an external pack is refused"
+    );
+}
+
+/// #639: the help must promise exactly what init accepts. External packs are
+/// installed after init, never seeded by `--packs`.
+#[test]
+fn init_help_says_external_packs_are_installed_after_init() {
+    let b = Boot::new();
+    let out = b.cmd(&["init", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains("Only packs built into this binary"),
+        "init --help does not constrain --packs:\n{text}"
+    );
+    assert!(
+        text.contains("install it after `init`"),
+        "init --help does not say when external packs are installed:\n{text}"
+    );
+}
+
+/// #639: `--packs` with an empty list behaves as documented (`packs = []`).
+#[test]
+fn bootstrap_with_empty_packs_writes_an_empty_list() {
+    let b = Boot::new();
+    let out = b.at_vault(&["init", "--create", "--packs", "", "--no-input", "--json"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cfg = std::fs::read_to_string(b.vault.join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
 }
 
 #[test]

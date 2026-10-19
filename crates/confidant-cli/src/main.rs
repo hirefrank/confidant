@@ -105,8 +105,10 @@ struct Cli {
     /// Pack scope for reads (`find`, `context`, `allowlist`,
     /// `record list`) and `mcp`. Comma-separated pack names, e.g.
     /// `coaching@0.1`. Unset = all enabled packs. Naming an unknown or
-    /// disabled pack is a hard error. Ignored by `check` / `doctor` (always
-    /// unscoped) and by writes.
+    /// disabled pack is a hard error. `init --create` also uses it to seed
+    /// the vault's `packs` list, where only packs built into this binary
+    /// are accepted. Ignored by `check` / `doctor` (always unscoped) and by
+    /// other writes.
     #[arg(long, global = true)]
     packs: Option<String>,
 
@@ -269,9 +271,13 @@ enum Command {
     /// first: the directory is created, `git init` runs when needed,
     /// `.gitignore` gains `.confidant/`, and a minimal `confidant.toml` is
     /// written (its `packs` list comes from the global `--packs` flag,
-    /// defaulting to `[]`) and committed. The key steps then run unchanged.
+    /// defaulting to `[]`) and committed. Only packs built into this binary
+    /// (today the implicit `personal@0.2`) may be listed: an external pack
+    /// is vendored into an existing vault by `confidant pack add`, so
+    /// install it after `init`. The key steps then run unchanged.
     Init {
-        /// Proceed even if a trust anchor already exists (re-initialization).
+        /// Replace an existing trust anchor after initialization succeeds.
+        /// Never re-initializes an existing `keys/` tree (that is refused).
         #[arg(long)]
         force: bool,
         /// Scaffold the vault directory (create, `git init`, `.gitignore`,
@@ -7864,6 +7870,42 @@ fn dir_entry_names(root: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+/// Validate `init --create --packs` before the skeleton is written (#639).
+///
+/// `init` can only seed packs the binary already implements: compiled packs
+/// or the implicit built-ins (today `personal@0.2`). An external pack is
+/// vendored into an existing vault by `confidant pack add`, so naming one
+/// here is a usage error with the install-after-init fix, not the opaque
+/// "unknown pack" it used to be.
+fn validate_init_packs(packs: &[String]) -> anyhow::Result<()> {
+    for name in packs {
+        if confidant_core::packs::is_known_pack_id(name) {
+            continue;
+        }
+        let fix = "Run `confidant init --create` without `--packs`, then \
+                   install the pack with `confidant pack add <source> --yes`";
+        let (message, fix) = match name.split_once('@') {
+            Some((pack, version)) if !pack.is_empty() && !version.is_empty() => (
+                format!(
+                    "`--packs {name}` names an external pack, which init cannot vendor; \
+                     init only seeds packs built into this binary (today the implicit \
+                     personal@0.2)"
+                ),
+                fix,
+            ),
+            _ => (
+                format!(
+                    "`--packs {name}` is not a pack this binary implements; init only \
+                     seeds built-in packs written as name@version (today personal@0.2)"
+                ),
+                fix,
+            ),
+        };
+        return Err(anyhow::Error::new(DomainError::usage(message)).with_fix(fix));
+    }
+    Ok(())
+}
+
 /// `init --create`: scaffold a vault before the key steps so one
 /// non-interactive command produces a working vault (#539).
 ///
@@ -7919,19 +7961,14 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<()> {
     }
 
     // Validate `--packs` before writing: an unknown pack would leave the new
-    // vault failing `check`.
+    // vault failing `check`, and an external pack cannot be vendored before
+    // the vault exists (#639).
     let packs: Vec<String> = cli
         .packs
         .as_deref()
         .map(parse_pack_list)
         .unwrap_or_default();
-    for name in &packs {
-        if !confidant_core::packs::is_known_pack_id(name) {
-            return Err(anyhow::Error::new(DomainError::usage(format!(
-                "unknown pack in --packs: {name}"
-            ))));
-        }
-    }
+    validate_init_packs(&packs)?;
 
     std::fs::create_dir_all(&root).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
@@ -8065,6 +8102,27 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
         ));
     }
 
+    // #640: `init` creates a first-device key tree; it never re-initializes
+    // one. `init_client` refuses once `keys/shared/epoch` exists, but only
+    // after `init_lookup_key` has already rewritten `keys/vault`. Check the
+    // same condition before any key material is generated, stored, or
+    // written, so a refused `--force` leaves the working tree
+    // byte-identical (and does not replace the keychain entries either).
+    let keys_dir = root.join("keys");
+    if keys_dir.join("shared").join("epoch").exists() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "vault keys already exist at {}; init creates a new key tree and never \
+                 re-initializes an existing one (--force only replaces a trust anchor)",
+                keys_dir.display()
+            ))
+            .with_fix(
+                "Start in a fresh vault, run `confidant recover` on a new device, or use \
+                 `confidant keys rotate` to rotate existing keys",
+            ),
+        ));
+    }
+
     // B2: generate operator key, recovery phrase, and device keypair.
     // None of this material is ever written into the vault.
     // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
@@ -8121,7 +8179,6 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
             ),
         ));
     }
-    let keys_dir = root.join("keys");
     let mut store =
         KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
             .map_err(anyhow::Error::new)?;
