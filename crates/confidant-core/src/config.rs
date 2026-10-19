@@ -1041,12 +1041,12 @@ example.window_days = 10
         let text = "spec = \"0.1\"\n# which packs this vault enables\npacks = [\"example-pack@0.1\"]\nvault_id = \"x\"\n\n[checks]\nas_of = \"2026-10-08\"\n";
         let out = VaultConfig::set_packs(
             text,
-            &["example-pack@0.1".to_owned(), "example-pack@0.1".to_owned()],
+            &["example-pack@0.1".to_owned(), "other-pack@0.1".to_owned()],
         )
         .unwrap();
         assert!(out.contains("# which packs this vault enables"), "{out}");
         assert!(
-            out.contains("packs = [\"example-pack@0.1\", \"example-pack@0.1\"]"),
+            out.contains("packs = [\"example-pack@0.1\", \"other-pack@0.1\"]"),
             "{out}"
         );
         assert!(
@@ -1055,7 +1055,7 @@ example.window_days = 10
         );
         assert_eq!(
             VaultConfig::parse(&out).unwrap().packs,
-            vec!["example-pack@0.1", "example-pack@0.1"]
+            vec!["example-pack@0.1", "other-pack@0.1"]
         );
     }
 

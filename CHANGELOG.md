@@ -8,6 +8,23 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Removed
+- The four operator-specific embedded skills (`capture-gap-summary`,
+  `lightfield-import`, `portal-sync`, `transcript-import`). `qmd-search` and
+  `pack-author` remain.
+- The shipped `packs/coaching/` asset. A local coaching-shaped pack can be
+  authored with the `pack-author` skill and installed with `pack add`.
+- The demo vault's coaching client, notes, pack listing, lockfile and
+  coaching ledger data; the demo is personal-only.
+- The TUI's Lightfield-specific proposal cleanup prompt.
+
+### Changed
+- `setup`/`update` now prune confidant-owned links/copies for skills this
+  binary no longer embeds, and report them as `removed_stale`. Unowned files
+  are left alone.
+- The test, QA-smoke and benchmark fixtures now use the neutral
+  `testdata/packs/example-pack/` fixture instead of the shipped pack.
+
 ## [0.6.0] - 2026-10-19
 
 **Disclosure:** the milestone 2 encryption has had no outside review

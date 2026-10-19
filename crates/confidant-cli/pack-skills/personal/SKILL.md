@@ -185,7 +185,7 @@ name the key when it is a known spec key, otherwise give the line number.
 
 A person with `cadence: <N>d` has no touchpoint on or after
 `as_of - N days` (and on or before `as_of`). Touchpoints are `touch` lines
-and `session` or `use` lines, after merge canonicalization. Skipped entirely
+and `session` lines, after merge canonicalization. Skipped entirely
 when `cadence: never`, and while `snooze_until` is later than `as_of` (the
 person is eligible again on the snooze date; a past date has no effect).
 

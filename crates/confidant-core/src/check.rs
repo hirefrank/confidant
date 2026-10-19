@@ -233,12 +233,10 @@ impl FindingCode {
         "W_DATE_UPCOMING",
     ];
 
-    /// Codes retired by the #449 cutover and the 0.6.1 coaching-pack
-    /// removal (`spec/findings.md`): reserved builtin names that nothing
-    /// emits and that no pack may reuse for a new meaning. Older entries
-    /// still have enum variants in [`Self::ALL_BUILTIN_STRS`]; the
-    /// coaching family has no variant but is reserved by
-    /// [`Self::is_builtin_code`], so a pack-declared code cannot shadow it.
+    /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
+    /// builtin names that nothing emits in 0.1 and that no pack may reuse
+    /// for a new meaning. They stay in [`Self::ALL_BUILTIN_STRS`] so a
+    /// pack-declared code cannot shadow them.
     pub const RETIRED_CODES: &[&str] = &[
         "E_BALANCE_MISMATCH",
         "E_NEGATIVE_BALANCE",
@@ -248,29 +246,11 @@ impl FindingCode {
         "W_SESSION_UNTAGGED",
         "E_SESSION_WITHOUT_NOTES",
         "E_PAID_SESSION_GAP",
-        // The `coaching@0.1` pack-own family. The pack shipped in 0.6.0
-        // and was removed in 0.6.1; these names are never reusable.
-        "E_COACHING_PARSE",
-        "E_COACHING_BALANCE_MISMATCH",
-        "E_COACHING_NEGATIVE_BALANCE",
-        "E_COACHING_OPEN_MALFORMED",
-        "E_COACHING_INVALID_ID",
-        "E_COACHING_WRONG_ID_TYPE",
-        "E_COACHING_MISSING_DURATION",
-        "E_COACHING_SESSION_TAGS",
-        "W_COACHING_SESSION_UNTAGGED",
-        "E_COACHING_SESSION_WITHOUT_NOTES",
-        "E_COACHING_PAID_SESSION_GAP",
-        "E_COACHING_NOTE_INVALID_ID",
-        "E_COACHING_NOTE_WRONG_TYPE",
-        "E_COACHING_UNKNOWN_RECORD",
     ];
 
-    /// Whether `s` is a builtin code or a retired builtin name (not a
-    /// `Pack` code). Retired names stay reserved even without an enum
-    /// variant, so no pack can claim them for a new meaning.
+    /// Whether `s` is the string of a builtin enum variant (not a `Pack` code).
     pub fn is_builtin_code(s: &str) -> bool {
-        Self::ALL_BUILTIN_STRS.contains(&s) || Self::RETIRED_CODES.contains(&s)
+        Self::ALL_BUILTIN_STRS.contains(&s)
     }
 
     /// Whether `s` is one of the retired codes (`spec/findings.md`). A
@@ -1907,7 +1887,7 @@ mod tests {
             assert!(FindingCode::is_retired_code(code));
         }
         assert!(!FindingCode::is_retired_code("E_PARSE"));
-        assert!(FindingCode::is_retired_code("E_COACHING_PARSE"));
+        assert!(!FindingCode::is_retired_code("E_COACHING_PARSE"));
     }
 
     #[test]

@@ -799,7 +799,37 @@ struct OpenLine {
     pkgs: HashSet<RecordId>,
 }
 
+/// The verb token of a ledger line, without restricting the vocabulary.
+/// Handles `DATE verb ...` and `verb ...`, comments, and markdown bullets.
+fn ledger_verb_token(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return None;
+    }
+    let trimmed = trimmed
+        .strip_prefix("* ")
+        .or_else(|| trimmed.strip_prefix("- "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
+    let mut toks = trimmed.split_whitespace();
+    let first = toks.next()?;
+    let verb = if crate::ledger::parse_strict_date(first).is_some() {
+        toks.next()?
+    } else {
+        first
+    };
+    Some(verb.trim_end_matches(':').to_ascii_lowercase())
+}
+
 fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
+    let opener_verbs: HashSet<&str> = allow
+        .enabled
+        .iter()
+        .flat_map(|pack| pack.balance_open_verbs().iter().copied())
+        .collect();
+    if opener_verbs.is_empty() {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     for (line, toks) in allow
         .vault
@@ -807,10 +837,14 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
         .iter()
         .zip(allow.ledger_tokens.iter())
     {
-        // Package clearing is driven by the line's shape (`... package
-        // <pkg-id> ...`), not by one pack's verb name: a declarative pack
-        // chooses its own opener verb (`open`, `grant`, ...).
-        if !line.text.split_whitespace().any(|word| word == "package") {
+        // Only a pack's declared `open_verb` opens a package. A line that
+        // merely contains `package` (a note reference, a stray argument)
+        // must not clear a package ID.
+        // Lexical, so an unparsable opener line still contributes: a bare
+        // or malformed ID must fail closed (the package stays uncleared).
+        let is_opener =
+            ledger_verb_token(&line.text).is_some_and(|verb| opener_verbs.contains(verb.as_str()));
+        if !is_opener {
             continue;
         }
         let mut people = HashSet::new();
@@ -1211,7 +1245,7 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, excerpt, still_cleared, Allowlist};
+    use super::{case_fold, excerpt, pkg_open_lines, still_cleared, Allowlist};
     use crate::{
         cleared_ledger_line_owners, cleared_record_owners, search, search_for_operator, OwnerKey,
         PackScope,
@@ -1358,11 +1392,17 @@ mod tests {
             format!("---\nid: i-01M3TC5H00MPJG0048H0000008\ntype: interaction\nname: Intro call\ndate: 2026-10-01\nperson: {ada}\n---\n\nFake intro call body.\n"),
         )
         .unwrap();
+        std::fs::create_dir_all(dir.path().join("deals/d-01M3TC5H00MPJG00248G000004")).unwrap();
+        std::fs::write(
+            dir.path().join("deals/d-01M3TC5H00MPJG00248G000004/deal.md"),
+            "---\nid: d-01M3TC5H00MPJG00248G000004\ntype: deal\nname: Example deal\n---\n\nFake deal.\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
         std::fs::write(
             dir.path().join("ledger/2026/10.cfd"),
             format!(
-                "2026-10-01 grant {ada} package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n2026-10-02 use {ada} 60m full note:n-01M3TC5H00MPJG002NAM000005\n2026-10-03 balance {ada} units_remaining 3\n2026-10-04 stage d-01M3TC5H00MPJG00248G000004 proposal\n2026-10-05 touch {ada} meeting note:n-01M3TC5H00MPJG0036CR000006\n2026-10-07 touch {cam} message note:n-01M3TC5H000068T0000000000C\n"
+                "2026-10-01 grant {ada} package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n2026-10-02 use {ada} 60m full note:n-01M3TC5H00MPJG002NAM000005\n2026-10-03 balance {ada} units_remaining 3\n2026-10-04 stage d-01M3TC5H00MPJG00248G000004 proposal\n2026-10-05 touch {ada} meeting note:n-01M3TC5H00MPJG0036CR000006\n2026-10-06 alias {ada} email hmac:6f2c9a1d8b7e4f301122334455667788\n2026-10-07 touch {cam} message note:n-01M3TC5H000068T0000000000C\n"
             ),
         )
         .unwrap();
@@ -1376,7 +1416,7 @@ mod tests {
 
     #[test]
     fn scoped_search_filters_by_pack_ownership() {
-        // Demo vault: "Kickoff" is in the session-linked (coaching) note;
+        // "Kickoff" is in the pack-linked note;
         // "Follow-up" is in the unattributed note; "Fake intro call" is in
         // the unattributed interaction body.
         let (_dir, vault) = example_pack_vault();
@@ -1398,9 +1438,9 @@ mod tests {
         let intro_name = search(&vault, "Intro call", &scoped).unwrap();
         assert!(intro_name.hits.is_empty());
 
-        // The unattributed note is undiscoverable under a coaching scope:
+        // The unattributed note is undiscoverable under a pack-only scope:
         // not by its id, and not via its `type: note` front-matter line.
-        // (`type: note` still matches the in-scope coaching note's own
+        // (`type: note` still matches the in-scope pack note's own
         // line — that record is legitimately visible — so assert the
         // unattributed note's path is absent, not zero hits.)
         let by_id = search(&vault, "n-01M3TC5H00MPJG0036CR000006", &scoped).unwrap();
@@ -1424,13 +1464,56 @@ mod tests {
         let balance = search(&vault, "units_remaining", &scoped).unwrap();
         assert!(!balance.hits.is_empty());
         assert!(balance.hits.iter().all(|h| h.path.contains("10.cfd")));
+        // `stage` is core-owned: it stays visible under a pack-only scope.
+        let stage = search(&vault, "proposal", &scoped).unwrap();
+        assert!(!stage.hits.is_empty(), "{stage:?}");
+    }
+
+    #[test]
+    fn package_clearing_uses_declared_opener_verbs() {
+        let (dir, _) = example_pack_vault();
+        let root = dir.path();
+        let mut ledger = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+        ledger.push_str(
+            "2026-10-09 touch p-01M3TC5H00MPJG001248000002 package pkg-01M3TC5H00MPJG009ZZ000000 note:n-01M3TC5H000068T0000000000C\n",
+        );
+        std::fs::write(root.join("ledger/2026/10.cfd"), ledger).unwrap();
+        let vault = crate::vault::load_vault(root).unwrap();
+        let allow = Allowlist::build(&vault, &PackScope::All);
+        let verbs: Vec<&str> = allow
+            .enabled
+            .iter()
+            .flat_map(|p| p.balance_open_verbs().iter().copied())
+            .collect();
+        assert_eq!(
+            verbs,
+            vec!["grant"],
+            "enabled: {:?}",
+            allow.enabled.iter().map(|p| p.name()).collect::<Vec<_>>()
+        );
+        let lines = pkg_open_lines(&allow);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]
+            .pkgs
+            .iter()
+            .any(|p| p.to_string().contains("004SK")));
+        // A non-opener line naming a package (here on a no-ai person) must
+        // not open it or clear it.
+        assert!(!lines[0]
+            .pkgs
+            .iter()
+            .any(|p| p.to_string().contains("009ZZ")));
+        assert!(!lines[0]
+            .people
+            .iter()
+            .any(|p| p.to_string().contains("001248")));
     }
 
     #[test]
     fn allowlist_owners_cover_records_and_ledger_lines() {
         let (_dir, vault) = example_pack_vault();
         let records = cleared_record_owners(&vault);
-        // Ada's profile is core; the session-linked note is coaching;
+        // Ada's profile is core; the linked note is example-pack-owned;
         // the unattributed note has no owners.
         assert_eq!(
             records.get("people/p-01M3TC5H00MPJG000000000000/profile.md"),
@@ -1449,9 +1532,16 @@ mod tests {
             Some(&[OwnerKey::Pack("personal@0.2")].into_iter().collect())
         );
         let lines = cleared_ledger_line_owners(&vault);
-        // The balance line is pack-owned; the stage line is core.
+        // The balance line is pack-owned; `stage`/`touch` lines are core.
         assert!(lines.iter().any(|(f, _, o)| f.contains("10.cfd")
             && o == &[OwnerKey::Pack("example-pack@0.1")].into_iter().collect()));
+        assert!(
+            lines
+                .iter()
+                .any(|(f, _, o)| f.contains("10.cfd")
+                    && o == &[OwnerKey::Core].into_iter().collect()),
+            "a core-owned ledger line must stay cleared: {lines:?}"
+        );
     }
 
     /// #572: the operator search is the agent search plus everything hidden

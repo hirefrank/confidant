@@ -135,7 +135,7 @@ fn contract_goldens_deserialize_and_render_in_check_view() {
         (
             "E_EXAMPLE_GAP",
             "client p-01M3TC5H00MPJG000000000000 has remaining units",
-            "check_paid_session_gap.snap",
+            "check_session_gap.snap",
         ),
         (
             "E_EXAMPLE_WITHOUT_NOTES",

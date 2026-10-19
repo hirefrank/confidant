@@ -131,9 +131,9 @@ kind = "cadence-overdue"
 code = "W_CADENCE_OVERDUE"
 severity_key = "personal.cadence_overdue"
 cadence_field = "cadence"
-# `use` is the neutral external-pack event verb used by the test fixture;
-# this list is fixed and does not auto-extend with other packs' verbs.
-event_verbs = ["touch", "session", "use"]
+# Only these verbs count as touchpoints; the list is fixed and does not
+# auto-extend with other packs' verbs.
+event_verbs = ["touch", "session"]
 snooze_field = "snooze_until"
 
 # Upcoming birthdays and other recurring dates.

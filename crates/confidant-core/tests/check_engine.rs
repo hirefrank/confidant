@@ -5078,8 +5078,8 @@ fn personal_cadence_overdue_fires_when_no_touchpoint() {
 
 #[test]
 fn personal_cadence_counts_sessions_as_touchpoints() {
-    // #227 Q2: a example-pack session counts as a touchpoint, so a example-pack
-    // client who is also a friend does not get a false overdue.
+    // #227 Q2: a pack-declared `session` counts as a touchpoint, so a
+    // contact who is also a friend does not get a false overdue.
     let dir = tempfile::tempdir().unwrap();
     install_example_pack(dir.path());
     write(
@@ -5098,7 +5098,7 @@ fn personal_cadence_counts_sessions_as_touchpoints() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n2026-10-01 use {ADA} 60m full\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n2026-10-01 session {ADA} 60m full\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -6140,7 +6140,7 @@ kind = "cadence-overdue"
 code = "W_EXAMPLE_CADENCE"
 severity_key = "example-pack.cadence_overdue"
 cadence_field = "example_cadence"
-event_verbs = ["touch", "session", "use"]
+event_verbs = ["touch", "session"]
 
 [messages."W_EXAMPLE_CADENCE"]
 last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
@@ -6356,7 +6356,7 @@ fn cadence_rule_session_counts_as_contact() {
     // suppresses the nudge (#227 Q2).
     let ledger = vec![(
         "ledger/2026/10.cfd",
-        format!("2026-10-02 use {ADA} 60m full\n"),
+        format!("2026-10-02 session {ADA} 60m full\n"),
     )];
     let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
     assert!(
