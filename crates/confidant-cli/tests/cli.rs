@@ -740,9 +740,10 @@ fn allowlist_scoped_annotates_owners() {
             e["line"].as_u64().unwrap()
         })
         .collect();
-    assert_eq!(lines, vec![2], "{lines:?}");
-    let entry = &v["cleared_ledger_lines"][0];
-    assert_eq!(entry["owning_packs"], serde_json::json!([EXAMPLE_PACK]));
+    assert_eq!(lines, vec![1, 2], "{lines:?}");
+    for entry in v["cleared_ledger_lines"].as_array().unwrap() {
+        assert_eq!(entry["owning_packs"], serde_json::json!([EXAMPLE_PACK]));
+    }
 }
 
 #[test]

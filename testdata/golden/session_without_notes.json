@@ -1,12 +1,12 @@
 {
   "findings": [
     {
-      "code": "E_COACHING_SESSION_WITHOUT_NOTES",
+      "code": "E_EXAMPLE_WITHOUT_NOTES",
       "file": "ledger/2026/10.cfd",
-      "fix": "Add a note for that person and date, or note:n-<ULID> on the session line",
+      "fix": "Add a note for that person and date, or note:n-<ULID> on the entry line",
       "id": "p-01M3TC5H00MPJG000000000000",
       "line": 2,
-      "message": "session on 2026-10-01 for p-01M3TC5H00MPJG000000000000 has no notes",
+      "message": "entry on 2026-10-01 for p-01M3TC5H00MPJG000000000000 has no notes",
       "severity": "warning"
     }
   ],

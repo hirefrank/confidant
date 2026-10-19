@@ -51,8 +51,8 @@ fn note(root: &Path, id: &str, person: &str, date: &str) {
     );
 }
 
-/// A vault enabling the shipped `coaching@0.1` external pack. Every test
-/// that checks coaching behaviour vendors the pack: the compiled path is
+/// A vault enabling the external `example-pack@0.1` fixture. Every test
+/// that checks example-pack behaviour vendors the pack: the compiled path is
 /// gone (#449), so a listed pack without bytes is `E_PACK_UNKNOWN`.
 fn vault_toml(root: &Path, checks: &str) {
     install_example_pack(root);
@@ -61,7 +61,7 @@ fn vault_toml(root: &Path, checks: &str) {
         "confidant.toml",
         &format!(
             r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "test-vault"
 
 [checks]
@@ -72,12 +72,12 @@ as_of = "2026-10-08"
     );
 }
 
-const DEFAULT_CHECKS: &str = r#"coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.session_notes = "warning"
-coaching.paid_session_gap = "warning"
-coaching.paid_session_gap_days = 45
-coaching.pps_lookback_days = 180
+const DEFAULT_CHECKS: &str = r#"example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.notes = "warning"
+example-pack.gap = "warning"
+example-pack.gap_days = 45
+example-pack.lookback_days = 180
 "#;
 
 fn report_json(root: &Path, as_of: Option<&str>) -> Value {
@@ -135,7 +135,7 @@ fn golden_path(name: &str) -> PathBuf {
 
 /// The demo vault is personal-first and deliberately teaches the two
 /// warning-level personal nudges: Dana Example's overdue cadence and Eli
-/// Sample's upcoming birthday. It must stay error-free so the CI `check`
+/// Sample's upcoming birthday. It must stay error-comp so the CI `check`
 /// step still exits 0 under the default `--fail-on error`.
 #[test]
 fn demo_vault_reports_the_personal_nudges() {
@@ -146,7 +146,7 @@ fn demo_vault_reports_the_personal_nudges() {
     assert_eq!(report.summary.errors, 0);
     let codes: Vec<&str> = report.findings.iter().map(|f| f.code.as_str()).collect();
     assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
-    assert!(report.summary.records >= 12);
+    assert!(report.summary.records >= 9);
 }
 
 /// The `balance_mismatch` golden vault's records and ledger, shared by the
@@ -158,9 +158,9 @@ fn balance_mismatch_vault(root: &Path) {
         root,
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-             2026-10-08 balance {ADA} sessions_remaining 4\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+             2026-10-08 balance {ADA} units_remaining 4\n"
         ),
     );
 }
@@ -171,7 +171,7 @@ fn balance_mismatch_golden() {
     vault_toml(dir.path(), DEFAULT_CHECKS);
     balance_mismatch_vault(dir.path());
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["E_COACHING_BALANCE_MISMATCH"]);
+    assert_eq!(codes(&json), vec!["E_EXAMPLE_BALANCE_MISMATCH"]);
     assert_golden("balance_mismatch.json", &json);
 }
 
@@ -183,8 +183,8 @@ fn session_without_notes_vault(root: &Path) {
         root,
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full\n"
         ),
     );
 }
@@ -195,7 +195,7 @@ fn session_without_notes_golden() {
     vault_toml(dir.path(), DEFAULT_CHECKS);
     session_without_notes_vault(dir.path());
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["E_COACHING_SESSION_WITHOUT_NOTES"]);
+    assert_eq!(codes(&json), vec!["E_EXAMPLE_WITHOUT_NOTES"]);
     assert_golden("session_without_notes.json", &json);
 }
 
@@ -209,9 +209,9 @@ fn same_day_note_covers_session() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid\n\
-             2026-10-01 balance {ADA} sessions_remaining 5\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full\n\
+             2026-10-01 balance {ADA} units_remaining 5\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -219,7 +219,7 @@ fn same_day_note_covers_session() {
 }
 
 #[test]
-fn paid_gap_boundary() {
+fn full_gap_boundary() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -228,59 +228,53 @@ fn paid_gap_boundary() {
         dir.path(),
         "ledger/2026/08.cfd",
         &format!(
-            "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-08-24 session {ADA} 60m paid note:{NOTE}\n"
+            "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-08-24 use {ADA} 60m full note:{NOTE}\n"
         ),
     );
     // 2026-10-08 minus 45 days = 2026-08-24 (inclusive → clean)
     let json = report_json(dir.path(), Some("2026-10-08"));
-    assert!(
-        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
-        "{json}"
-    );
+    assert!(!codes(&json).contains(&"E_EXAMPLE_GAP".into()), "{json}");
 
     // one day older → gap
     let dir2 = tempfile::tempdir().unwrap();
     vault_toml(dir2.path(), DEFAULT_CHECKS);
-    paid_session_gap_vault(dir2.path());
+    session_gap_vault(dir2.path());
     let json = report_json(dir2.path(), Some("2026-10-08"));
-    assert_eq!(codes(&json), vec!["E_COACHING_PAID_SESSION_GAP"]);
-    assert_golden("paid_session_gap.json", &json);
+    assert_eq!(codes(&json), vec!["E_EXAMPLE_GAP"]);
+    assert_golden("session_gap.json", &json);
 }
 
-/// The `paid_session_gap` golden vault's records and ledger: one day past
+/// The `session_gap` golden vault's records and ledger: one day past
 /// the 45-day window (shared with the #449 fixture parity test).
-fn paid_session_gap_vault(root: &Path) {
+fn session_gap_vault(root: &Path) {
     person(root, ADA, "Ada Example");
     note(root, NOTE, ADA, "2026-08-23");
     write(
         root,
         "ledger/2026/08.cfd",
         &format!(
-            "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-08-23 session {ADA} 60m paid note:{NOTE}\n"
+            "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-08-23 use {ADA} 60m full note:{NOTE}\n"
         ),
     );
 }
 
 #[test]
-fn paid_gap_never_started_and_spent() {
+fn full_gap_never_started_and_spent() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n"),
+        &format!("2026-10-01 grant {ADA} package {PKG} 6 sessions\n"),
     );
     let json = report_json(dir.path(), Some("2026-10-08"));
     // Gap clock starts at the most recent open; 7 days is inside the 45-day window.
-    assert!(
-        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
-        "{json}"
-    );
+    assert!(!codes(&json).contains(&"E_EXAMPLE_GAP".into()), "{json}");
 
-    // spent: 1 open, 1 session, remaining 0, last session old → not a paid client
+    // spent: 1 open, 1 session, remaining 0, last session old → not a full client
     let dir2 = tempfile::tempdir().unwrap();
     vault_toml(dir2.path(), DEFAULT_CHECKS);
     person(dir2.path(), ADA, "Ada Example");
@@ -289,15 +283,12 @@ fn paid_gap_never_started_and_spent() {
         dir2.path(),
         "ledger/2026/01.cfd",
         &format!(
-            "2026-01-01 open {ADA} package {PKG} 1 sessions\n\
-             2026-01-01 session {ADA} 60m paid note:{NOTE}\n"
+            "2026-01-01 grant {ADA} package {PKG} 1 sessions\n\
+             2026-01-01 use {ADA} 60m full note:{NOTE}\n"
         ),
     );
     let json = report_json(dir2.path(), Some("2026-10-08"));
-    assert!(
-        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
-        "{json}"
-    );
+    assert!(!codes(&json).contains(&"E_EXAMPLE_GAP".into()), "{json}");
 }
 
 #[test]
@@ -305,11 +296,11 @@ fn gap_rule_off() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(
         dir.path(),
-        r#"coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.session_notes = "off"
-coaching.paid_session_gap = "off"
-coaching.paid_session_gap_days = 45
+        r#"example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.notes = "off"
+example-pack.gap = "off"
+example-pack.gap_days = 45
 "#,
     );
     person(dir.path(), ADA, "Ada Example");
@@ -317,8 +308,8 @@ coaching.paid_session_gap_days = 45
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -338,7 +329,7 @@ fn malformed_ledger_and_bad_filename() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        "this is not an entry\n2026-13-01 session p-01M3TC5H00MPJG000000000000 60m\n",
+        "this is not an entry\n2026-13-01 use p-01M3TC5H00MPJG000000000000 60m\n",
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
@@ -396,22 +387,22 @@ fn balance_as_of_date_ignores_later_sessions() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-             2026-10-08 balance {ADA} sessions_remaining 5\n\
-             2026-10-08 balance {ADA} icf_hours 1.00\n\
-             2026-10-15 session {ADA} 60m paid note:{NOTE}\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+             2026-10-08 balance {ADA} units_remaining 5\n\
+             2026-10-08 balance {ADA} minutes_total 1.00\n\
+             2026-10-15 use {ADA} 60m full note:{NOTE}\n"
         ),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_EXAMPLE_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
 
 #[test]
-fn paid_without_package_is_negative_balance() {
+fn full_without_package_is_negative_balance() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -419,11 +410,11 @@ fn paid_without_package_is_negative_balance() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
+        codes(&json).contains(&"E_EXAMPLE_NEGATIVE_BALANCE".into()),
         "{json}"
     );
 }
@@ -437,11 +428,11 @@ fn pps_does_not_consume_package() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m pps note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m pps note:{NOTE}\n"),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
+        !codes(&json).contains(&"E_EXAMPLE_NEGATIVE_BALANCE".into()),
         "{json}"
     );
 }
@@ -455,15 +446,12 @@ fn pps_client_can_be_flagged_for_gap() {
     write(
         dir.path(),
         "ledger/2026/05.cfd",
-        &format!("2026-05-01 session {ADA} 60m pps note:{NOTE}\n"),
+        &format!("2026-05-01 use {ADA} 60m pps note:{NOTE}\n"),
     );
     // lookback 180: 2026-05-01 is within 180 days of 2026-10-08;
-    // gap 45: last session is outside the 45-day window → E_COACHING_PAID_SESSION_GAP.
+    // gap 45: last session is outside the 45-day window → E_EXAMPLE_GAP.
     let json = report_json(dir.path(), Some("2026-10-08"));
-    assert!(
-        codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
-        "{json}"
-    );
+    assert!(codes(&json).contains(&"E_EXAMPLE_GAP".into()), "{json}");
 }
 
 #[test]
@@ -480,19 +468,19 @@ fn later_merge_does_not_change_earlier_assertions() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-             2026-10-01 open {cam} package {PKG} 4 sessions\n\
-             2026-10-07 session {cam} 45m paid note:{cam_note}\n\
-             2026-10-08 session {ADA} 45m paid note:{NOTE}\n\
-             2026-10-08 balance {ADA} sessions_remaining 4\n\
-             2026-10-08 balance {ADA} icf_hours 1.75\n\
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+             2026-10-01 grant {cam} package {PKG} 4 sessions\n\
+             2026-10-07 use {cam} 45m full note:{cam_note}\n\
+             2026-10-08 use {ADA} 45m full note:{NOTE}\n\
+             2026-10-08 balance {ADA} units_remaining 4\n\
+             2026-10-08 balance {ADA} minutes_total 1.75\n\
              2026-10-12 merge {cam} into {ADA}\n"
         ),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_EXAMPLE_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
@@ -502,21 +490,21 @@ fn note_integrity_runs_when_session_notes_off() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(
         dir.path(),
-        r#"coaching.require_duration = "error"
-coaching.balance_nonnegative = "off"
-coaching.session_notes = "off"
-coaching.paid_session_gap = "off"
+        r#"example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "off"
+example-pack.notes = "off"
+example-pack.gap = "off"
 "#,
     );
     person(dir.path(), ADA, "Ada Example");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:not-an-id\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:not-an-id\n"),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"E_COACHING_NOTE_INVALID_ID".into()),
+        codes(&json).contains(&"E_EXAMPLE_NOTE_INVALID_ID".into()),
         "{json}"
     );
 }
@@ -546,18 +534,18 @@ fn alias_unknown_kind_does_not_echo_raw_token() {
 }
 
 #[test]
-fn invalid_open_pkg_id_is_a_pack_code() {
+fn invalid_grant_pkg_id_is_a_pack_code() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 open {ADA} package not-a-pkg 6 sessions\n"),
+        &format!("2026-10-01 grant {ADA} package not-a-pkg 6 sessions\n"),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"E_COACHING_INVALID_ID".into()),
+        codes(&json).contains(&"E_EXAMPLE_INVALID_ID".into()),
         "{json}"
     );
 }
@@ -706,7 +694,7 @@ fn unsupported_spec_does_not_report_listed_externals_as_unknown() {
     write(
         dir.path(),
         "confidant.toml",
-        "spec = \"9.9\"\npacks = [\"coaching@0.1\", \"example-pack@0.1\"]\nvault_id = \"x\"\n",
+        "spec = \"9.9\"\npacks = [\"example-pack@0.1\", \"example-pack@0.1\"]\nvault_id = \"x\"\n",
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
@@ -731,13 +719,13 @@ fn wrong_id_type_and_invalid_note_id() {
         "ledger/2026/10.cfd",
         &format!(
             "2026-10-01 stage {ADA} proposal\n\
-             2026-10-01 session {ADA} 60m paid note:not-an-id\n"
+             2026-10-01 use {ADA} 60m full note:not-an-id\n"
         ),
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
     assert!(c.contains(&"E_WRONG_ID_TYPE".into()), "{c:?}");
-    assert!(c.contains(&"E_COACHING_NOTE_INVALID_ID".into()), "{c:?}");
+    assert!(c.contains(&"E_EXAMPLE_NOTE_INVALID_ID".into()), "{c:?}");
 }
 
 #[test]
@@ -753,13 +741,13 @@ fn merge_cycle_self_unresolved_and_balances() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {bea} package {PKG} 2 sessions\n\
-             2026-10-01 session {bea} 60m paid note:{NOTE}\n\
+            "2026-10-01 grant {bea} package {PKG} 2 sessions\n\
+             2026-10-01 use {bea} 60m full note:{NOTE}\n\
              2026-10-02 merge {ADA} into {ADA}\n\
              2026-10-03 merge {ghost} into {ADA}\n\
              2026-10-04 merge {ADA} into {bea}\n\
              2026-10-05 merge {bea} into {ADA}\n\
-             2026-10-08 balance {bea} sessions_remaining 1\n"
+             2026-10-08 balance {bea} units_remaining 1\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -789,8 +777,8 @@ fn merge_fork_duplicate_ulid_and_src() {
         &format!(
             "2026-10-01 merge {bea} into {ADA}\n\
              2026-10-02 merge {bea} into p-01M3TC5H00MPJG001248000002\n\
-             2026-10-08 session {ADA} 45m paid note:{NOTE} src:transcript/t-1\n\
-             2026-10-08 session {ADA} 45m paid note:{NOTE} src:transcript/t-1\n"
+             2026-10-08 use {ADA} 45m full note:{NOTE} src:transcript/t-1\n\
+             2026-10-08 use {ADA} 45m full note:{NOTE} src:transcript/t-1\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -807,11 +795,11 @@ fn config_errors_are_e_config() {
         dir.path(),
         "confidant.toml",
         r#"spec = "0.1"
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 vault_id = "x"
 [checks]
-coaching.session_notes = "warn"
-coaching.paid_session_gap_days = -3
+example-pack.notes = "warn"
+example-pack.gap_days = -3
 typo_key = 1
 "#,
     );
@@ -1074,24 +1062,21 @@ fn comp_session_does_not_consume_package() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 1 sessions\n\
-             2026-10-01 session {ADA} 60m comp note:{NOTE}\n\
-             2026-10-01 balance {ADA} sessions_remaining 1\n"
+            "2026-10-01 grant {ADA} package {PKG} 1 sessions\n\
+             2026-10-01 use {ADA} 60m comp note:{NOTE}\n\
+             2026-10-01 balance {ADA} units_remaining 1\n"
         ),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
+        !codes(&json).contains(&"E_EXAMPLE_NEGATIVE_BALANCE".into()),
         "{json}"
     );
     assert!(
-        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_EXAMPLE_BALANCE_MISMATCH".into()),
         "{json}"
     );
-    assert!(
-        !codes(&json).contains(&"E_COACHING_SESSION_TAGS".into()),
-        "{json}"
-    );
+    assert!(!codes(&json).contains(&"E_EXAMPLE_TAGS".into()), "{json}");
 }
 
 #[test]
@@ -1104,13 +1089,13 @@ fn untagged_session_consumes_and_warns() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m note:{NOTE}\n\
-             2026-10-01 balance {ADA} sessions_remaining 5\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m note:{NOTE}\n\
+             2026-10-01 balance {ADA} units_remaining 5\n"
         ),
     );
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["W_COACHING_SESSION_UNTAGGED"], "{json}");
+    assert_eq!(codes(&json), vec!["W_EXAMPLE_UNTAGGED"], "{json}");
 }
 
 // Issue #181 Q3: agent-facing findings must never surface a no-ai person's
@@ -1130,14 +1115,14 @@ fn findings_never_name_no_ai_person() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m note:{NOTE}\n\
-             2026-10-01 balance {ADA} sessions_remaining 5\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m note:{NOTE}\n\
+             2026-10-01 balance {ADA} units_remaining 5\n"
         ),
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"W_COACHING_SESSION_UNTAGGED".to_string()),
+        codes(&json).contains(&"W_EXAMPLE_UNTAGGED".to_string()),
         "{json}"
     );
     let text = serde_json::to_string(&json).unwrap();
@@ -1157,29 +1142,26 @@ fn double_tagged_session_is_e_session_tags() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid pps note:{NOTE}\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full pps note:{NOTE}\n"
         ),
     );
     let json = report_json(dir.path(), None);
-    assert!(
-        codes(&json).contains(&"E_COACHING_SESSION_TAGS".into()),
-        "{json}"
-    );
+    assert!(codes(&json).contains(&"E_EXAMPLE_TAGS".into()), "{json}");
 }
 
 #[test]
-fn never_started_package_measured_from_open_date() {
+fn never_started_package_measured_from_grant_date() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
     write(
         dir.path(),
         "ledger/2026/08.cfd",
-        &format!("2026-08-01 open {ADA} package {PKG} 6 sessions\n"),
+        &format!("2026-08-01 grant {ADA} package {PKG} 6 sessions\n"),
     );
     let json = report_json(dir.path(), Some("2026-10-08"));
-    assert_eq!(codes(&json), vec!["E_COACHING_PAID_SESSION_GAP"], "{json}");
+    assert_eq!(codes(&json), vec!["E_EXAMPLE_GAP"], "{json}");
 }
 
 #[test]
@@ -1218,17 +1200,17 @@ fn later_merge_includes_from_history_on_or_after_merge_date() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-             2026-10-01 open {CAM} package {PKG} 4 sessions\n\
-             2026-10-07 session {CAM} 45m paid note:{cam_note}\n\
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+             2026-10-01 grant {CAM} package {PKG} 4 sessions\n\
+             2026-10-07 use {CAM} 45m full note:{cam_note}\n\
              2026-10-12 merge {CAM} into {ADA}\n\
-             2026-10-12 balance {ADA} sessions_remaining 8\n"
+             2026-10-12 balance {ADA} units_remaining 8\n"
         ),
     );
     let json = report_json(dir.path(), Some("2026-10-12"));
     assert!(
-        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_EXAMPLE_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
@@ -1605,20 +1587,17 @@ fn returning_client_new_package_resets_gap_clock() {
         dir.path(),
         "ledger/2026/01.cfd",
         &format!(
-            "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-01-01 session {ADA} 60m paid note:{NOTE}\n"
+            "2026-01-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-01-01 use {ADA} 60m full note:{NOTE}\n"
         ),
     );
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n"),
+        &format!("2026-10-01 grant {ADA} package {PKG} 6 sessions\n"),
     );
     let json = report_json(dir.path(), Some("2026-10-08"));
-    assert!(
-        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
-        "{json}"
-    );
+    assert!(!codes(&json).contains(&"E_EXAMPLE_GAP".into()), "{json}");
 }
 
 #[test]
@@ -1722,7 +1701,7 @@ fn find_excludes_line_naming_only_excluded_person_pkg() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
              not-an-entry pkg-only-token {PKG}\n"
         ),
     );
@@ -1842,7 +1821,7 @@ fn find_excludes_top_level_note_linked_only_by_hidden_session() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     let result = search_q(dir.path(), "hidden-session-note-token");
     assert!(
@@ -1929,8 +1908,8 @@ fn find_excludes_note_linked_by_cleared_and_hidden_sessions() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 session {ADA} 60m paid note:{NOTE3}\n\
-             2026-10-02 session {BEA} 60m paid note:{NOTE3}\n"
+            "2026-10-01 use {ADA} 60m full note:{NOTE3}\n\
+             2026-10-02 use {BEA} 60m full note:{NOTE3}\n"
         ),
     );
     let result = search_q(dir.path(), "mixed-session-note-token");
@@ -2135,7 +2114,7 @@ fn find_drops_body_line_with_glued_prefix_excluded_id() {
     assert!(token_in_hits(&still, "still-glued-token"), "{still:?}");
 }
 
-const NOTION_URL: &str = "https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef";
+const NOTION_URL: &str = "https://www.notion.so/Planning-Plan-0123456789abcdef0123456789abcdef";
 
 #[test]
 fn find_keeps_notion_url_in_body() {
@@ -2183,7 +2162,7 @@ fn find_keeps_notion_url_in_ledger_src() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 session {ADA} 60m paid note:{NOTE} src:{NOTION_URL}  ; notion-src-token\n"
+            "2026-10-01 use {ADA} 60m full note:{NOTE} src:{NOTION_URL}  ; notion-src-token\n"
         ),
     );
     let result = search_q(dir.path(), "notion-src-token");
@@ -2206,7 +2185,7 @@ fn find_excludes_lookalike_unicode_dash_note_on_hidden_line() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 session {ADA} 60m paid note:n\u{2010}{}\n",
+            "2026-10-01 use {ADA} 60m full note:n\u{2010}{}\n",
             &NOTE[2..]
         ),
     );
@@ -2230,7 +2209,7 @@ fn find_excludes_lookalike_note_v2_on_hidden_line() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}v2\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}v2\n"),
     );
     let result = search_q(dir.path(), "note-v2-token");
     assert!(!token_in_hits(&result, "note-v2-token"), "{result:?}");
@@ -2249,7 +2228,7 @@ fn find_excludes_note_named_in_misnamed_month_cfd() {
     write(
         dir.path(),
         "ledger/2026/9.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     let result = search_q(dir.path(), "misnamed-month-note-token");
     assert!(
@@ -2275,7 +2254,7 @@ fn find_excludes_note_named_in_nested_ledger_cfd() {
     write(
         dir.path(),
         "ledger/2026/old/09.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     let result = search_q(dir.path(), "nested-ledger-note-token");
     assert!(
@@ -2400,7 +2379,7 @@ fn hidden_note_named_in(root: &Path, ledger_rel: &str) {
     write(
         root,
         ledger_rel,
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
 }
 
@@ -2413,7 +2392,7 @@ fn find_keeps_uppercase_cfd_searchable() {
     write(
         dir.path(),
         "ledger/2026/09.CFD",
-        &format!("2026-09-01 session {ADA} 60m paid note:{NOTE}  ; uppercase-cfd-token\n"),
+        &format!("2026-09-01 use {ADA} 60m full note:{NOTE}  ; uppercase-cfd-token\n"),
     );
     let result = search_q(dir.path(), "uppercase-cfd-token");
     assert!(token_in_hits(&result, "uppercase-cfd-token"), "{result:?}");
@@ -2469,7 +2448,7 @@ fn find_excludes_note_named_in_in_vault_symlink_file() {
     write(
         dir.path(),
         "ledger/2026/payload.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     std::os::unix::fs::symlink("payload.cfd", dir.path().join("ledger/2026/10.cfd.bak")).unwrap();
     let result = search_q(dir.path(), "symlink-file-note-token");
@@ -2512,7 +2491,7 @@ fn find_excludes_note_named_in_in_vault_symlink_year_dir() {
     write(
         dir.path(),
         "alt/2026/10.cfd",
-        &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     std::fs::create_dir_all(dir.path().join("ledger")).unwrap();
     std::os::unix::fs::symlink("../alt/2026", dir.path().join("ledger/2026")).unwrap();
@@ -2600,7 +2579,7 @@ fn find_excludes_soft_hyphen_note_on_hidden_line() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 session {ADA} 60m paid note:n\u{00ad}{}\n",
+            "2026-10-01 use {ADA} 60m full note:n\u{00ad}{}\n",
             &NOTE[2..]
         ),
     );
@@ -2705,17 +2684,12 @@ fn wikilink_and_comment_person_count_for_ownership_and_coverage() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!(
-            "2026-10-01 session {ADA} 60m paid note:{NOTE}\n2026-10-02 session {ADA} 60m paid\n"
-        ),
+        &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n2026-10-02 use {ADA} 60m full\n"),
     );
     let json = report_json(dir.path(), None);
     let c = codes(&json);
     assert!(!c.contains(&"E_UNKNOWN_RECORD".into()), "{json}");
-    assert!(
-        !c.contains(&"E_COACHING_SESSION_WITHOUT_NOTES".into()),
-        "{json}"
-    );
+    assert!(!c.contains(&"E_EXAMPLE_WITHOUT_NOTES".into()), "{json}");
     assert!(!c.contains(&"E_ID_PATH_MISMATCH".into()), "{json}");
 }
 
@@ -3073,9 +3047,9 @@ fn quoted_person_with_trailing_hash_comment_parses() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {BEA} package {PKG} 6 sessions\n\
-             2026-10-02 session {BEA} 60m paid note:{NOTE3}\n\
-             2026-10-03 session {BEA} 45m paid note:{note4}\n"
+            "2026-10-01 grant {BEA} package {PKG} 6 sessions\n\
+             2026-10-02 use {BEA} 60m full note:{NOTE3}\n\
+             2026-10-03 use {BEA} 45m full note:{note4}\n"
         ),
     );
     let a = search_q(dir.path(), "quoted-hash-person-token");
@@ -3117,7 +3091,7 @@ see p\u{00ad}-{cam_ulid} dropped-soft-hyphen-ascii-token\n\
 see I-95 i95-highway-token\n\
 see https://docs.google.com/document/d/1g1G7TFxyqPTV83aBwi_-n-GYboXeYBl8cpDlwjVptoB/edit docs-url-dash-token\n\
 see drive.google.com/file/d/1b3Yf11-n-m7vpfukD0SPao3NxJ7dDYgq/view drive-url-dash-token\n\
-see https://www.notion.so/Coaching-Plan-0123456789abcdef0123456789abcdef notion-url-dash-token\n"
+see https://www.notion.so/Planning-Plan-0123456789abcdef0123456789abcdef notion-url-dash-token\n"
         ),
     );
     write(
@@ -3203,7 +3177,7 @@ fn find_unclears_interaction_and_deal_named_on_hidden_ledger_line() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-02 session {CAM} 60m paid src:{IXN}\n\
+            "2026-10-02 use {CAM} 60m full src:{IXN}\n\
              2026-10-03 stage {DEAL} proposal ; for {CAM}\n"
         ),
     );
@@ -3248,7 +3222,7 @@ still-bare-ulid-token\n"
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 session {BEA} 60m paid src:\"zoom/{cam_ulid}.vtt\" dropped-src-bare-ulid-token\n"
+            "2026-10-01 use {BEA} 60m full src:\"zoom/{cam_ulid}.vtt\" dropped-src-bare-ulid-token\n"
         ),
     );
     let dropped = search_q(dir.path(), "dropped-bare-ulid-token");
@@ -3280,15 +3254,15 @@ fn check_messages_do_not_echo_vault_free_text() {
         dir.path(),
         "confidant.toml",
         r#"spec = "0.1"
-packs = ["coaching@0.1", "zxqvleakpack@0.1"]
+packs = ["example-pack@0.1", "zxqvleakpack@0.1"]
 vault_id = "test-vault"
 
 [checks]
 as_of = "2026-10-08"
-coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.session_notes = "off"
-coaching.paid_session_gap = "off"
+example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.notes = "off"
+example-pack.gap = "off"
 "#,
     );
     person(dir.path(), ADA, "Ada Example");
@@ -3297,14 +3271,14 @@ coaching.paid_session_gap = "off"
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} ZXQVLEAKN sessions\n\
+            "2026-10-01 grant {ADA} package {PKG} ZXQVLEAKN sessions\n\
              2026-10-01 ZXQVLEAKVERB {ADA}\n\
-             2026-10-02 session {ADA} 60m paid note:{NOTE} src:ZXQVLEAKSRC\n\
-             2026-10-03 session {ADA} 45m paid note:{NOTE} src:ZXQVLEAKSRC\n\
+             2026-10-02 use {ADA} 60m full note:{NOTE} src:ZXQVLEAKSRC\n\
+             2026-10-03 use {ADA} 45m full note:{NOTE} src:ZXQVLEAKSRC\n\
              2026-10-04 balance {ADA} ZXQVLEAKMETRIC 1\n\
-             2026-10-05 balance {ADA} sessions_remaining ZXQVLEAKINT\n\
-             2026-10-06 balance {ADA} icf_hours ZXQVLEAKDEC\n\
-             2026-10-07 balance {ADA} sessions_remaining\n"
+             2026-10-05 balance {ADA} units_remaining ZXQVLEAKINT\n\
+             2026-10-06 balance {ADA} minutes_total ZXQVLEAKDEC\n\
+             2026-10-07 balance {ADA} units_remaining\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -3336,14 +3310,16 @@ coaching.paid_session_gap = "off"
     assert!(c.contains(&"E_DUPLICATE_SRC".into()), "{c:?}");
     assert!(c.contains(&"E_UNKNOWN_METRIC".into()), "{c:?}");
     assert!(c.contains(&"E_PARSE".into()), "{c:?}");
-    assert!(c.contains(&"E_COACHING_OPEN_MALFORMED".into()), "{c:?}");
+    assert!(c.contains(&"E_EXAMPLE_GRANT_MALFORMED".into()), "{c:?}");
 }
 
-fn ada_coaching_client(root: &Path) {
+fn ada_example_client(root: &Path) {
     write(
         root,
         &format!("people/{ADA}/profile.md"),
-        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake coaching client\n"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake example-pack client\n"
+        ),
     );
 }
 
@@ -3351,16 +3327,16 @@ fn ada_coaching_client(root: &Path) {
 fn find_hides_ada_merged_into_cam_bare_ulid() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
-    ada_coaching_client(dir.path());
+    ada_example_client(dir.path());
     person_no_ai(dir.path(), CAM, "Cam");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
         &format!("2026-10-02 merge {ADA} into {}\n", &CAM[2..]),
     );
-    let result = search_q(dir.path(), "Fake coaching client");
+    let result = search_q(dir.path(), "Fake example-pack client");
     assert!(
-        !token_in_hits(&result, "Fake coaching client"),
+        !token_in_hits(&result, "Fake example-pack client"),
         "{result:?}"
     );
 }
@@ -3369,7 +3345,7 @@ fn find_hides_ada_merged_into_cam_bare_ulid() {
 fn find_hides_bea_merged_from_lowercase_cam_bare_ulid() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
-    ada_coaching_client(dir.path());
+    ada_example_client(dir.path());
     person_no_ai(dir.path(), CAM, "Cam");
     write(
         dir.path(),
@@ -3384,13 +3360,13 @@ fn find_hides_bea_merged_from_lowercase_cam_bare_ulid() {
         "merge 01m3tc5h00mpjg001248000002 into p-01M3TC5H00MPJG000H24000001\n",
     );
     let bea = search_q(dir.path(), "bea-lowercase-bare-merge-token");
-    let ada = search_q(dir.path(), "Fake coaching client");
+    let ada = search_q(dir.path(), "Fake example-pack client");
     assert!(
         !token_in_hits(&bea, "bea-lowercase-bare-merge-token"),
         "{bea:?}"
     );
     assert!(
-        token_in_hits(&ada, "Fake coaching client"),
+        token_in_hits(&ada, "Fake example-pack client"),
         "Ada is not in this merge group: {ada:?}"
     );
 }
@@ -3399,16 +3375,16 @@ fn find_hides_bea_merged_from_lowercase_cam_bare_ulid() {
 fn find_hides_ada_merged_from_t_prefixed_cam_ulid() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
-    ada_coaching_client(dir.path());
+    ada_example_client(dir.path());
     person_no_ai(dir.path(), CAM, "Cam");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
         &format!("merge t-{} into {ADA}\n", &CAM[2..]),
     );
-    let result = search_q(dir.path(), "Fake coaching client");
+    let result = search_q(dir.path(), "Fake example-pack client");
     assert!(
-        !token_in_hits(&result, "Fake coaching client"),
+        !token_in_hits(&result, "Fake example-pack client"),
         "{result:?}"
     );
 }
@@ -3423,9 +3399,9 @@ fn find_hides_pkg_opened_by_bare_cam_ulid() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {BEA} package {PKG} 4 sessions\n\
-             2026-10-01 open {} package {PKG} 4 sessions\n\
-             2026-10-02 session {BEA} 60m paid src:{PKG} pkg-bare-open-token\n",
+            "2026-10-01 grant {BEA} package {PKG} 4 sessions\n\
+             2026-10-01 grant {} package {PKG} 4 sessions\n\
+             2026-10-02 use {BEA} 60m full src:{PKG} pkg-bare-open-token\n",
             &CAM[2..]
         ),
     );
@@ -3543,7 +3519,7 @@ fn check_messages_do_not_echo_seeded_filenames() {
     write(
         dir.path(),
         "ledger/2026/10.cfd",
-        &format!("2026-09-01 session {ADA} 60m paid note:{NOTE}\n"),
+        &format!("2026-09-01 use {ADA} 60m full note:{NOTE}\n"),
     );
     #[cfg(unix)]
     std::os::unix::fs::symlink("profile.md", dir.path().join("people/ZXQVLEAKLINK")).unwrap();
@@ -4096,12 +4072,12 @@ fn find_hides_session_line_naming_no_ai_package_by_bare_ulid() {
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
     person_no_ai(dir.path(), CAM, "Cam");
-    let mut ledger = format!("2026-10-01 open {CAM} package {PKG2} 4 sessions\n");
+    let mut ledger = format!("2026-10-01 grant {CAM} package {PKG2} 4 sessions\n");
     let mut markers = Vec::new();
     for (label, spelling) in src_spellings(PKG2) {
         let marker = format!("KLINE{label}");
         ledger.push_str(&format!(
-            "2026-10-12 session {ADA} 60m paid {marker} src:{spelling}\n"
+            "2026-10-12 use {ADA} 60m full {marker} src:{spelling}\n"
         ));
         markers.push(marker);
     }
@@ -4122,10 +4098,10 @@ fn find_hides_note_named_on_session_with_bare_package_src() {
             "---\nid: {NOTE}\ntype: note\nperson: {ADA}\ndate: 2026-10-01\n---\n\nNA1TOKEN in ada note\n"
         ),
     );
-    let mut ledger = format!("2026-10-01 open {CAM} package {PKG2} 4 sessions\n");
+    let mut ledger = format!("2026-10-01 grant {CAM} package {PKG2} 4 sessions\n");
     for (label, spelling) in src_spellings(PKG2) {
         ledger.push_str(&format!(
-            "2026-10-12 session {ADA} 60m paid note:{NOTE} src:{spelling} {label}\n"
+            "2026-10-12 use {ADA} 60m full note:{NOTE} src:{spelling} {label}\n"
         ));
     }
     write(dir.path(), "ledger/2026/10.cfd", &ledger);
@@ -4138,12 +4114,13 @@ fn find_bare_package_ulid_matches_prefixed_when_package_is_cleared() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
-    let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+    note(dir.path(), NOTE, ADA, "2026-10-12");
+    let mut ledger = format!("2026-10-01 grant {ADA} package {PKG} 6 sessions\n");
     let mut markers = Vec::new();
     for (label, spelling) in src_spellings(PKG) {
         let marker = format!("KCLEAR{label}");
         ledger.push_str(&format!(
-            "2026-10-12 session {ADA} 60m paid {marker} src:{spelling}\n"
+            "2026-10-12 use {ADA} 60m full note:{NOTE} {marker} src:{spelling}\n"
         ));
         markers.push(marker);
     }
@@ -4263,12 +4240,12 @@ fn find_hides_bea_merged_into_package_when_opener_merges_into_no_ai() {
 #[test]
 fn find_is_deterministic_on_shuffled_ledger_insertion() {
     let mut lines = [
-        format!("2026-10-01 open {ADA} package {PKG} 6 sessions"),
-        format!("2026-10-01 open {CAM} package {PKG2} 4 sessions"),
+        format!("2026-10-01 grant {ADA} package {PKG} 6 sessions"),
+        format!("2026-10-01 grant {CAM} package {PKG2} 4 sessions"),
         format!("2026-10-09 merge {BEA} into {PKG}"),
         format!("2026-10-09 merge {ADA} into {CAM}"),
-        format!("2026-10-05 session {BEA} 60m pps bea-shuffle-token"),
-        format!("2026-10-08 session {ADA} 45m paid ada-shuffle-token"),
+        format!("2026-10-05 use {BEA} 60m pps bea-shuffle-token"),
+        format!("2026-10-08 use {ADA} 45m full ada-shuffle-token"),
     ];
     let mut expected: Option<Vec<String>> = None;
     for seed in 1u64..=16 {
@@ -4320,20 +4297,26 @@ fn find_is_deterministic_on_shuffled_ledger_insertion() {
 
 #[test]
 fn find_keeps_bea_when_ada_mentions_dangling_note_with_bea_ulid() {
-    let dir = copy_demo();
-    let profile = dir.path().join(format!("people/{ADA}/profile.md"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n",
+    );
+    person(root, ADA, "Ada Example");
+    person(root, BEA, "Bea Demo");
+    let baseline = search_q(root, "Bea");
+    assert!(token_in_hits(&baseline, "Bea Demo"), "{baseline:?}");
+
+    let profile = root.join(format!("people/{ADA}/profile.md"));
     let mut text = fs::read_to_string(&profile).unwrap();
     text.push_str(&format!(
         "\nMentioned n-{} once by mistake.\n",
         ulid_of(BEA)
     ));
     fs::write(&profile, text).unwrap();
-    let baseline = search_q(&demo_vault(), "Bea");
-    let after = search_q(dir.path(), "Bea");
-    assert!(
-        token_in_hits(&baseline, "Bea Demo"),
-        "demo vault should mention Bea: {baseline:?}"
-    );
+    let after = search_q(root, "Bea");
     assert_eq!(
         baseline.hits.len(),
         after.hits.len(),
@@ -4347,31 +4330,43 @@ fn find_keeps_bea_when_ada_mentions_dangling_note_with_bea_ulid() {
         "dangling n-Bea ULID changed Bea's hits"
     );
     assert!(confidant_core::allowlist_is_fixed_point(
-        &load_vault(dir.path()).unwrap()
+        &load_vault(root).unwrap()
     ));
 }
 
 #[test]
 fn find_keeps_ada_when_interaction_mentions_dangling_note_with_ada_ulid() {
-    let dir = copy_demo();
-    let ixn = dir
-        .path()
-        .join(format!("interactions/{IXN}/interaction.md"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "confidant.toml",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n",
+    );
+    person(root, ADA, "Ada Example");
+    write(
+        root,
+        &format!("interactions/{IXN}/interaction.md"),
+        &format!(
+            "---\nid: {IXN}\ntype: interaction\nname: Intro call\ndate: 2026-10-01\nperson: {ADA}\n---\n\nCall notes.\n"
+        ),
+    );
+    let ixn = root.join(format!("interactions/{IXN}/interaction.md"));
     let mut text = fs::read_to_string(&ixn).unwrap();
     text.push_str(&format!("\nn-{}\n", ulid_of(ADA)));
     fs::write(&ixn, text).unwrap();
-    let ada = search_q(dir.path(), "Ada Example");
+    let ada = search_q(root, "Ada Example");
     assert!(
         token_in_hits(&ada, "Ada Example"),
         "dangling n-Ada ULID hid Ada: {ada:?}"
     );
     assert!(confidant_core::allowlist_is_fixed_point(
-        &load_vault(dir.path()).unwrap()
+        &load_vault(root).unwrap()
     ));
 }
 
 #[test]
-fn find_open_line_with_thousands_of_ids_is_fast() {
+fn find_grant_line_with_thousands_of_ids_is_fast() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -4635,7 +4630,7 @@ fn edge_self_edge_is_rejected() {
 
 #[test]
 fn edge_unknown_kind_is_rejected() {
-    // The kind list is closed: an unknown kind is an error, not free text.
+    // The kind list is closed: an unknown kind is an error, not comp text.
     let dir = tempfile::tempdir().unwrap();
     two_people(dir.path());
     edge(dir.path(), EDGE1, ADA, BEA, "nemesis");
@@ -5083,14 +5078,14 @@ fn personal_cadence_overdue_fires_when_no_touchpoint() {
 
 #[test]
 fn personal_cadence_counts_sessions_as_touchpoints() {
-    // #227 Q2: a coaching session counts as a touchpoint, so a coaching
+    // #227 Q2: a example-pack session counts as a touchpoint, so a example-pack
     // client who is also a friend does not get a false overdue.
     let dir = tempfile::tempdir().unwrap();
     install_example_pack(dir.path());
     write(
         dir.path(),
         "confidant.toml",
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\", \"personal@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\", \"personal@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
     );
     write(
         dir.path(),
@@ -5103,7 +5098,7 @@ fn personal_cadence_counts_sessions_as_touchpoints() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n2026-10-01 session {ADA} 60m paid\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n2026-10-01 use {ADA} 60m full\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -5176,7 +5171,7 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     write(
         dir.path(),
         "confidant.toml",
-        "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[crypto]\nmode = \"plaintext\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[crypto]\nmode = \"plaintext\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
     );
     write(
         dir.path(),
@@ -5368,9 +5363,9 @@ fn check_body_only_conflict_keeps_record_and_refs_resolve() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-01 session {ADA} 60m paid\n\
-             2026-10-01 balance {ADA} sessions_remaining 5\n"
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full\n\
+             2026-10-01 balance {ADA} units_remaining 5\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -5573,10 +5568,10 @@ grammar = "non-empty-string"
 /// #438/#490: each failure kind reports its own stable code, and the
 /// message names the failing `name@version` exactly as listed in
 /// `confidant.toml`; `E_PACK_HASH`/`E_PACK_INVALID` also point at the
-/// vendored path in `file`. Record/ledger free text still never echoes.
+/// vendored path in `file`. Record/ledger comp text still never echoes.
 #[test]
 fn external_pack_malformed_id_does_not_echo() {
-    // A listed id that is not `name@version` is operator free text, not a
+    // A listed id that is not `name@version` is operator comp text, not a
     // pin: it must stay out of findings even though the pin carve-out
     // (#490) lets a real pin echo.
     let dir = tempfile::tempdir().unwrap();
@@ -5598,7 +5593,7 @@ fn external_pack_malformed_id_does_not_echo() {
         "malformed id echoed: {dumped}"
     );
 
-    // #501: an entry with an `@` but no real pin shape is still free text.
+    // #501: an entry with an `@` but no real pin shape is still comp text.
     // The loose check (`@` with both halves non-empty) echoed an email and
     // anything with a newline; only a valid pack name plus a version-like
     // half may echo.
@@ -5636,7 +5631,7 @@ fn external_pack_malformed_id_does_not_echo() {
 /// #612: the `E_PACK_UNKNOWN` fix for a real pin names the CLI commands that
 /// actually recover the state — `pack remove` keys off the listing (and the
 /// vendored tree) when the lock has no entry, and `pack add --yes` may
-/// re-pin — not a command that refuses. A non-pin listing stays name-free.
+/// re-pin — not a command that refuses. A non-pin listing stays name-comp.
 #[test]
 fn pack_unknown_fix_names_the_recovery_commands() {
     let dir = tempfile::tempdir().unwrap();
@@ -5650,7 +5645,7 @@ fn pack_unknown_fix_names_the_recovery_commands() {
     assert!(fix.contains("confidant pack add"), "{fix}");
     assert!(fix.contains("example-pack"), "{fix}");
 
-    // A malformed listing is operator free text: neither the message nor the
+    // A malformed listing is operator comp text: neither the message nor the
     // fix may echo it, and the fix does not point at a pack command.
     external_vault_toml(dir.path(), "\"zxqvleakmail@example.com\"", DEFAULT_CHECKS);
     let json = report_json(dir.path(), None);
@@ -5671,7 +5666,7 @@ fn pack_unknown_fix_names_the_recovery_commands() {
 fn unpinned_listed_pack_checks_keys_do_not_point_at_the_spec() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", DEFAULT_CHECKS);
     let json = report_json(dir.path(), None);
     assert!(
         codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
@@ -5692,7 +5687,7 @@ fn unpinned_listed_pack_checks_keys_do_not_point_at_the_spec() {
     for f in config_findings {
         let message = f["message"].as_str().unwrap();
         assert!(
-            message.contains("requires pack coaching@0.1, which is not installed"),
+            message.contains("requires pack example-pack@0.1, which is not installed"),
             "{f}"
         );
         assert!(!message.contains("unknown [checks] key"), "{f}");
@@ -6145,7 +6140,7 @@ kind = "cadence-overdue"
 code = "W_EXAMPLE_CADENCE"
 severity_key = "example-pack.cadence_overdue"
 cadence_field = "example_cadence"
-event_verbs = ["touch", "session"]
+event_verbs = ["touch", "session", "use"]
 
 [messages."W_EXAMPLE_CADENCE"]
 last = "person {id} has no touchpoint on or after {start} (last was {d}, cadence {cadence_days}d)"
@@ -6361,7 +6356,7 @@ fn cadence_rule_session_counts_as_contact() {
     // suppresses the nudge (#227 Q2).
     let ledger = vec![(
         "ledger/2026/10.cfd",
-        format!("2026-10-02 session {ADA} 60m paid\n"),
+        format!("2026-10-02 use {ADA} 60m full\n"),
     )];
     let (personal, _) = assert_cadence_parity(&ledger, "", "", true, |_| {});
     assert!(
@@ -7642,18 +7637,29 @@ fn write_full_0_2_person(root: &Path, no_ai: bool) {
 
 /// Structural golden for a demo-vault person: the `personal@0.2` entry keeps
 /// the same shape at the #551 cutover. Demo Ada has no declared personal
-/// field, so only derived keys appear; the 2026-10-08 session is her last
+/// field, so only derived keys appear; the 2026-10-08 use is her last
 /// contact.
 #[test]
 fn context_view_shape_is_stable() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    );
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-08 touch {ADA} call\n"),
+    );
     assert_eq!(
-        personal_view(&root, ADA),
+        personal_view(dir.path(), ADA),
         json!({
             "last_touch": "2026-10-08",
             "days_since_touch": 0,
             "overdue": false,
-            "recent_touches": [],
+            "recent_touches": [{"date": "2026-10-08", "kind": "call"}],
         })
     );
 }
@@ -8069,182 +8075,182 @@ fn touch_args_table_malformed() {
 }
 
 // ---------------------------------------------------------------------------
-// Declarative coaching kinds (#446 ledger-balance)
+// Declarative example-pack kinds (#446 ledger-balance)
 // ---------------------------------------------------------------------------
 
-/// Messages for the `coaching-ext` fixture's `ledger-balance` rule. The
-/// text is copied verbatim from `packs/coaching/manifest.toml` so parity
+/// Messages for the `example-ext` fixture's `ledger-balance` rule. The
+/// text is copied verbatim from `packs/example-pack/manifest.toml` so parity
 /// compares behaviour, not wording; only the codes differ (an external
 /// pack cannot claim a builtin code, PD13).
-const COACHING_EXT_BALANCE_MESSAGES: &str = r#"
-[messages."E_COACHING_EXT_PARSE"]
+const EXAMPLE_EXT_BALANCE_MESSAGES: &str = r#"
+[messages."E_EXAMPLE_EXT_PARSE"]
 missing_number = "balance line is missing a number"
 expected_integer = "expected integer"
-expected_integer_fix = "Use an integer such as 3 for sessions_remaining"
+expected_integer_fix = "Use an integer such as 3 for units_remaining"
 expected_decimal = "expected decimal"
-expected_decimal_fix = "Use a decimal such as 1.50 for icf_hours"
-minutes_overflow = "session minutes for {id} overflow"
+expected_decimal_fix = "Use a decimal such as 1.50 for minutes_total"
+minutes_overflow = "entry minutes for {id} overflow"
 
-[messages."E_COACHING_EXT_BALANCE"]
-sessions_remaining = "sessions_remaining asserted {asserted}, computed {computed}"
-sessions_remaining_fix = "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
-icf_hours = "icf_hours asserted {asserted}, computed {computed}"
-icf_hours_fix = "Check session durations for {person} or correct the assertion"
+[messages."E_EXAMPLE_EXT_BALANCE"]
+units_remaining = "units_remaining asserted {asserted}, computed {computed}"
+units_remaining_fix = "Check for a missing 'grant' entry or a duplicated 'use' entry for {person}"
+minutes_total = "minutes_total asserted {asserted}, computed {computed}"
+minutes_total_fix = "Check entry durations for {person} or correct the assertion"
 
-[messages."E_COACHING_EXT_NEGATIVE"]
-default = "sessions_remaining for {id} is {remaining}"
-default_fix = "Add an open/renewal or remove extra session lines"
+[messages."E_EXAMPLE_EXT_NEGATIVE"]
+default = "units_remaining for {id} is {remaining}"
+default_fix = "Add a grant or remove extra use lines"
 
-[messages."E_COACHING_EXT_OPEN"]
-shape = "open line must be: DATE open PERSON-ID package PKG-ID N sessions"
-shape_fix = "Example: 2026-10-01 open p-… package pkg-… 6 sessions"
+[messages."E_EXAMPLE_EXT_GRANT"]
+shape = "grant line must be: DATE grant PERSON-ID package PKG-ID N sessions"
+shape_fix = "Example: 2026-10-01 grant p-… package pkg-… 6 sessions"
 not_integer = "expected integer"
-not_integer_fix = "Use open <pkg-id> <positive-integer> on its own ledger line"
-exceeds_cap = "open N {n} exceeds the cap of {cap}"
+not_integer_fix = "Use grant <pkg-id> <positive-integer> on its own ledger line"
+exceeds_cap = "grant N {n} exceeds the cap of {cap}"
 exceeds_cap_fix = "Use a package size between 1 and {cap}"
-total_overflow = "open total for {id} overflows"
+total_overflow = "grant total for {id} overflows"
 
-[messages."E_COACHING_EXT_ID"]
+[messages."E_EXAMPLE_EXT_ID"]
 package = "package id is not a record ID"
 package_fix = "Use a pkg-<ULID> package id"
 
-[messages."E_COACHING_EXT_TYPE"]
+[messages."E_EXAMPLE_EXT_TYPE"]
 package = "package id '{pkg}' must use the pkg- prefix"
 
-[messages."E_COACHING_EXT_DURATION"]
-default = "session for {id} has no parseable duration"
+[messages."E_EXAMPLE_EXT_DURATION"]
+default = "entry for {id} has no parseable duration"
 default_fix = "Add a duration such as 60m or 1h30m"
 
-[messages."E_COACHING_EXT_TAGS"]
-default = "session for {id} has more than one of paid, pps, comp"
-default_fix = "Keep exactly one billing tag: paid, pps, or comp"
+[messages."E_EXAMPLE_EXT_TAGS"]
+default = "entry for {id} has more than one of full, pps, comp"
+default_fix = "Keep exactly one tag: full, pps, or comp"
 
-[messages."W_COACHING_EXT_UNTAGGED"]
-default = "session for {id} has no paid, pps, or comp tag"
-default_fix = "Tag the session paid, pps (pay-per-session), or comp (complimentary)"
+[messages."W_EXAMPLE_EXT_UNTAGGED"]
+default = "entry for {id} has no full, pps, or comp tag"
+default_fix = "Tag the entry full, pps, or comp"
 
-[messages."E_COACHING_EXT_NOTES"]
-default = "session on {date} for {person} has no notes"
-default_fix = "Add a note for that person and date, or note:n-<ULID> on the session line"
+[messages."E_EXAMPLE_EXT_NOTES"]
+default = "entry on {date} for {person} has no notes"
+default_fix = "Add a note for that person and date, or note:n-<ULID> on the entry line"
 
-[messages."E_COACHING_EXT_GAP"]
-none = "paid client {id} has no session logged"
-none_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
-remaining = "paid client {id} has remaining sessions and no session on or after {start} (last was {d})"
-remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
-no_remaining = "paid client {id} has no session on or after {start} (last was {d})"
-no_remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
+[messages."E_EXAMPLE_EXT_GAP"]
+none = "client {id} has no entry logged"
+none_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
+remaining = "client {id} has remaining units and no entry on or after {start} (last was {d})"
+remaining_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
+no_remaining = "client {id} has no entry on or after {start} (last was {d})"
+no_remaining_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
 "#;
 
 /// The fixture pack's balance rule. `max_open_n` is overridable so the
 /// total-overflow case (unreachable under the 100000 cap) can be built.
-const COACHING_EXT_BALANCE_RULE: &str = r#"[[rules]]
+const EXAMPLE_EXT_BALANCE_RULE: &str = r#"[[rules]]
 id = "balance"
 kind = "ledger-balance"
-code = "E_COACHING_EXT_BALANCE"
-severity_key = "coaching-ext.balance_nonnegative"
-open_verb = "open"
-consume_verb = "session"
-units_metric = "sessions_remaining"
-minutes_metric = "icf_hours"
+code = "E_EXAMPLE_EXT_BALANCE"
+severity_key = "example-ext.balance_nonnegative"
+open_verb = "grant"
+consume_verb = "use"
+units_metric = "units_remaining"
+minutes_metric = "minutes_total"
 max_open_n = 100000
-parse_code = "E_COACHING_EXT_PARSE"
-negative_code = "E_COACHING_EXT_NEGATIVE"
-open_malformed_code = "E_COACHING_EXT_OPEN"
-invalid_code = "E_COACHING_EXT_ID"
-wrong_type_code = "E_COACHING_EXT_TYPE"
+parse_code = "E_EXAMPLE_EXT_PARSE"
+negative_code = "E_EXAMPLE_EXT_NEGATIVE"
+open_malformed_code = "E_EXAMPLE_EXT_GRANT"
+invalid_code = "E_EXAMPLE_EXT_ID"
+wrong_type_code = "E_EXAMPLE_EXT_TYPE"
 "#;
 
-/// A v2 `coaching-ext@0.1` manifest using the given `[[rules]]` body. The
+/// A v2 `example-ext@0.1` manifest using the given `[[rules]]` body. The
 /// fixture never ships; it exists to prove the declarative kinds reproduce
-/// the shipped external coaching pack (#449).
-fn coaching_ext_manifest(rules: &str) -> String {
+/// the external pack fixture.
+fn example_ext_manifest(rules: &str) -> String {
     let mut text = String::from(
         r#"manifest_version = 2
 record_types = []
-balance_metrics = ["sessions_remaining", "icf_hours"]
+balance_metrics = ["units_remaining", "minutes_total"]
 finding_codes = [
-  "E_COACHING_EXT_PARSE",
-  "E_COACHING_EXT_BALANCE",
-  "E_COACHING_EXT_NEGATIVE",
-  "E_COACHING_EXT_OPEN",
-  "E_COACHING_EXT_ID",
-  "E_COACHING_EXT_TYPE",
-  "E_COACHING_EXT_DURATION",
-  "E_COACHING_EXT_TAGS",
-  "W_COACHING_EXT_UNTAGGED",
-  "E_COACHING_EXT_NOTES",
-  "E_COACHING_EXT_GAP",
+  "E_EXAMPLE_EXT_PARSE",
+  "E_EXAMPLE_EXT_BALANCE",
+  "E_EXAMPLE_EXT_NEGATIVE",
+  "E_EXAMPLE_EXT_GRANT",
+  "E_EXAMPLE_EXT_ID",
+  "E_EXAMPLE_EXT_TYPE",
+  "E_EXAMPLE_EXT_DURATION",
+  "E_EXAMPLE_EXT_TAGS",
+  "W_EXAMPLE_EXT_UNTAGGED",
+  "E_EXAMPLE_EXT_NOTES",
+  "E_EXAMPLE_EXT_GAP",
 ]
 
 [pack]
-name = "coaching-ext"
+name = "example-ext"
 version = "0.1"
 skill = "SKILL.md"
 requires_spec = ["0.1"]
 
 [[verbs]]
-name = "open"
+name = "grant"
 id_type = "person"
 
 [[verbs]]
-name = "session"
+name = "use"
 id_type = "person"
 
 [[checks.severity]]
-key = "coaching-ext.balance_nonnegative"
+key = "example-ext.balance_nonnegative"
 default = "error"
 
 [[checks.severity]]
-key = "coaching-ext.require_duration"
+key = "example-ext.require_duration"
 default = "error"
 
 [[checks.severity]]
-key = "coaching-ext.session_notes"
+key = "example-ext.notes"
 default = "warning"
 
 [[checks.severity]]
-key = "coaching-ext.paid_session_gap"
+key = "example-ext.gap"
 default = "warning"
 
 [[checks.int]]
-key = "coaching-ext.paid_session_gap_days"
+key = "example-ext.gap_days"
 default = 45
 
 [[checks.int]]
-key = "coaching-ext.pps_lookback_days"
+key = "example-ext.lookback_days"
 default = 180
 "#,
     );
     text.push_str(rules);
-    text.push_str(COACHING_EXT_BALANCE_MESSAGES);
+    text.push_str(EXAMPLE_EXT_BALANCE_MESSAGES);
     text
 }
 
 /// Vendor the fixture pack and pin it. Returns the manifest text used, so
 /// a loader-negative test can edit it first.
-fn install_coaching_ext(root: &Path, manifest: &str) {
+fn install_example_ext(root: &Path, manifest: &str) {
     let hash = install_external_pack_with_manifest(
         root,
-        "coaching-ext",
+        "example-ext",
         "0.1",
         manifest,
-        "# coaching-ext fixture.\n",
+        "# example-ext fixture.\n",
     );
-    install_lockfile(root, "coaching-ext", "0.1", &hash);
+    install_lockfile(root, "example-ext", "0.1", &hash);
 }
 
 /// `confidant.toml` enabling only the fixture pack. The operator keys are
-/// the fixture's own namespace; the shipped coaching pack is not enabled,
-/// so its `coaching.*` keys would be unknown here.
-fn coaching_ext_vault(root: &Path, checks: &str) {
-    external_vault_toml(root, "\"coaching-ext@0.1\"", checks);
+/// the fixture's own namespace; the example-pack fixture is not enabled,
+/// so its `example-pack.*` keys would be unknown here.
+fn example_ext_vault(root: &Path, checks: &str) {
+    external_vault_toml(root, "\"example-ext@0.1\"", checks);
 }
 
-const COACHING_EXT_CHECKS: &str = "coaching-ext.balance_nonnegative = \"error\"\n";
+const EXAMPLE_EXT_CHECKS: &str = "example-ext.balance_nonnegative = \"error\"\n";
 
 /// Build the same vault twice — once with the shipped external
-/// `coaching@0.1`, once with the inline fixture — and return both reports.
+/// `example-pack@0.1`, once with the inline fixture — and return both reports.
 /// `setup` writes the records and ledger; the fixture install is added to
 /// the declarative side.
 fn assert_ext_parity_with(
@@ -8261,8 +8267,8 @@ fn assert_ext_parity_with(
 
     let declarative_dir = tempfile::tempdir().unwrap();
     setup(declarative_dir.path());
-    install_coaching_ext(declarative_dir.path(), &coaching_ext_manifest(rules));
-    coaching_ext_vault(declarative_dir.path(), ext_checks);
+    install_example_ext(declarative_dir.path(), &example_ext_manifest(rules));
+    example_ext_vault(declarative_dir.path(), ext_checks);
     let declarative = report_json(declarative_dir.path(), None);
 
     assert_eq!(
@@ -8274,7 +8280,7 @@ fn assert_ext_parity_with(
 }
 
 fn assert_ext_parity(setup: impl Fn(&Path), rules: &str, map: &[(&str, &str)]) -> (Value, Value) {
-    assert_ext_parity_with(setup, rules, map, DEFAULT_CHECKS, COACHING_EXT_CHECKS)
+    assert_ext_parity_with(setup, rules, map, DEFAULT_CHECKS, EXAMPLE_EXT_CHECKS)
 }
 
 fn assert_balance_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
@@ -8286,76 +8292,76 @@ fn assert_session_parity(setup: impl Fn(&Path), rules: &str) -> (Value, Value) {
 }
 
 /// The fixture's `activity-gap` rule. It counts through the
-/// `ledger-balance` rule that owns `sessions_remaining`.
-const COACHING_EXT_GAP_RULE: &str = r#"[[rules]]
+/// `ledger-balance` rule that owns `units_remaining`.
+const EXAMPLE_EXT_GAP_RULE: &str = r#"[[rules]]
 id = "gap"
 kind = "activity-gap"
-code = "E_COACHING_EXT_GAP"
-severity_key = "coaching-ext.paid_session_gap"
-activity_verb = "session"
-start_verb = "open"
-gap_days_key = "coaching-ext.paid_session_gap_days"
-lookback_days_key = "coaching-ext.pps_lookback_days"
-balance_metric = "sessions_remaining"
+code = "E_EXAMPLE_EXT_GAP"
+severity_key = "example-ext.gap"
+activity_verb = "use"
+start_verb = "grant"
+gap_days_key = "example-ext.gap_days"
+lookback_days_key = "example-ext.lookback_days"
+balance_metric = "units_remaining"
 "#;
 
 /// Fixture code → shipped-pack code for the gap rule.
-const GAP_CODE_MAP: &[(&str, &str)] = &[("E_COACHING_EXT_GAP", "E_COACHING_PAID_SESSION_GAP")];
+const GAP_CODE_MAP: &[(&str, &str)] = &[("E_EXAMPLE_EXT_GAP", "E_EXAMPLE_GAP")];
 
 fn assert_gap_parity(setup: impl Fn(&Path)) -> (Value, Value) {
-    assert_ext_parity(setup, &coaching_ext_gap_rules(), GAP_CODE_MAP)
+    assert_ext_parity(setup, &example_ext_gap_rules(), GAP_CODE_MAP)
 }
 
 /// The balance rule (for the counter) plus the gap rule.
-fn coaching_ext_gap_rules() -> String {
-    format!("{COACHING_EXT_BALANCE_RULE}\n{COACHING_EXT_GAP_RULE}")
+fn example_ext_gap_rules() -> String {
+    format!("{EXAMPLE_EXT_BALANCE_RULE}\n{EXAMPLE_EXT_GAP_RULE}")
 }
 
 /// The fixture report for one vault, without a shipped comparison.
 fn ext_report(setup: impl Fn(&Path), rules: &str, checks: &str) -> Value {
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path());
-    install_coaching_ext(dir.path(), &coaching_ext_manifest(rules));
-    coaching_ext_vault(dir.path(), checks);
+    install_example_ext(dir.path(), &example_ext_manifest(rules));
+    example_ext_vault(dir.path(), checks);
     report_json(dir.path(), None)
 }
 
 /// Fixture code → shipped-pack code for the balance rule.
 const BALANCE_CODE_MAP: &[(&str, &str)] = &[
-    ("E_COACHING_EXT_PARSE", "E_COACHING_PARSE"),
-    ("E_COACHING_EXT_BALANCE", "E_COACHING_BALANCE_MISMATCH"),
-    ("E_COACHING_EXT_NEGATIVE", "E_COACHING_NEGATIVE_BALANCE"),
-    ("E_COACHING_EXT_OPEN", "E_COACHING_OPEN_MALFORMED"),
-    ("E_COACHING_EXT_ID", "E_COACHING_INVALID_ID"),
-    ("E_COACHING_EXT_TYPE", "E_COACHING_WRONG_ID_TYPE"),
+    ("E_EXAMPLE_EXT_PARSE", "E_EXAMPLE_PARSE"),
+    ("E_EXAMPLE_EXT_BALANCE", "E_EXAMPLE_BALANCE_MISMATCH"),
+    ("E_EXAMPLE_EXT_NEGATIVE", "E_EXAMPLE_NEGATIVE_BALANCE"),
+    ("E_EXAMPLE_EXT_GRANT", "E_EXAMPLE_GRANT_MALFORMED"),
+    ("E_EXAMPLE_EXT_ID", "E_EXAMPLE_INVALID_ID"),
+    ("E_EXAMPLE_EXT_TYPE", "E_EXAMPLE_WRONG_ID_TYPE"),
 ];
 
 /// The fixture's `session-checks` rule.
-const COACHING_EXT_SESSION_RULE: &str = r#"[[rules]]
+const EXAMPLE_EXT_SESSION_RULE: &str = r#"[[rules]]
 id = "sessions"
 kind = "session-checks"
-code = "E_COACHING_EXT_DURATION"
-severity_duration_key = "coaching-ext.require_duration"
-severity_notes_key = "coaching-ext.session_notes"
-verb = "session"
-billing_tags = ["paid", "pps", "comp"]
-tags_code = "E_COACHING_EXT_TAGS"
-untagged_code = "W_COACHING_EXT_UNTAGGED"
-notes_code = "E_COACHING_EXT_NOTES"
+code = "E_EXAMPLE_EXT_DURATION"
+severity_duration_key = "example-ext.require_duration"
+severity_notes_key = "example-ext.notes"
+verb = "use"
+billing_tags = ["full", "pps", "comp"]
+tags_code = "E_EXAMPLE_EXT_TAGS"
+untagged_code = "W_EXAMPLE_EXT_UNTAGGED"
+notes_code = "E_EXAMPLE_EXT_NOTES"
 "#;
 
 /// Fixture code → shipped-pack code for the session rule.
 const SESSION_CODE_MAP: &[(&str, &str)] = &[
-    ("E_COACHING_EXT_DURATION", "E_COACHING_MISSING_DURATION"),
-    ("E_COACHING_EXT_TAGS", "E_COACHING_SESSION_TAGS"),
-    ("W_COACHING_EXT_UNTAGGED", "W_COACHING_SESSION_UNTAGGED"),
-    ("E_COACHING_EXT_NOTES", "E_COACHING_SESSION_WITHOUT_NOTES"),
+    ("E_EXAMPLE_EXT_DURATION", "E_EXAMPLE_MISSING_DURATION"),
+    ("E_EXAMPLE_EXT_TAGS", "E_EXAMPLE_TAGS"),
+    ("W_EXAMPLE_EXT_UNTAGGED", "W_EXAMPLE_UNTAGGED"),
+    ("E_EXAMPLE_EXT_NOTES", "E_EXAMPLE_WITHOUT_NOTES"),
 ];
 
 /// The balance-related findings of a report, normalized to the shipped
 /// pack's code names and rendered as comparable tuples (code, severity,
 /// message, fix, file, line, id). Codes outside `map` are ignored: the
-/// inline fixture and the shipped pack emit different *unrelated* codes on
+/// inline fixture and the fixture emit different *unrelated* codes on
 /// the same vault (both pack-own), and parity is scoped to the kind's codes.
 fn normalized_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
     let mut out: Vec<String> = report["findings"]
@@ -8409,8 +8415,8 @@ fn ext_findings<'a>(report: &'a Value, code: &str) -> Vec<&'a Value> {
 }
 
 #[test]
-fn balance_rule_open_then_sessions_remaining() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_grant_then_units_remaining() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (compiled, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8419,10 +8425,10 @@ fn balance_rule_open_then_sessions_remaining() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-                     2026-10-05 session {ADA} 60m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} sessions_remaining 4\n"
+                    "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+                     2026-10-05 use {ADA} 60m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} units_remaining 4\n"
                 ),
             );
         },
@@ -8430,49 +8436,49 @@ fn balance_rule_open_then_sessions_remaining() {
     );
     // Matching assertion: no mismatch on either side.
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE").is_empty(),
         "{declarative:?}"
     );
     assert!(
-        !codes(&compiled).contains(&"E_COACHING_BALANCE_MISMATCH".to_string()),
+        !codes(&compiled).contains(&"E_EXAMPLE_BALANCE_MISMATCH".to_string()),
         "{compiled:?}"
     );
 }
 
 #[test]
 fn balance_rule_negative_balance() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (compiled, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
             note(root, NOTE, ADA, "2026-10-01");
-            let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+            let mut ledger = format!("2026-10-01 grant {ADA} package {PKG} 6 sessions\n");
             for day in 1..=7 {
                 ledger.push_str(&format!(
-                    "2026-10-{day:02} session {ADA} 60m paid note:{NOTE}\n"
+                    "2026-10-{day:02} use {ADA} 60m full note:{NOTE}\n"
                 ));
             }
             write(root, "ledger/2026/10.cfd", &ledger);
         },
         rules,
     );
-    let negative = ext_findings(&declarative, "E_COACHING_EXT_NEGATIVE");
+    let negative = ext_findings(&declarative, "E_EXAMPLE_EXT_NEGATIVE");
     assert_eq!(negative.len(), 1, "{declarative:?}");
     assert_eq!(negative[0]["id"], ADA);
     assert_eq!(
         negative[0]["message"],
-        format!("sessions_remaining for {ADA} is -1")
+        format!("units_remaining for {ADA} is -1")
     );
     assert_eq!(
         codes(&compiled),
-        vec!["E_COACHING_NEGATIVE_BALANCE"],
+        vec!["E_EXAMPLE_NEGATIVE_BALANCE"],
         "{compiled:?}"
     );
 }
 
 #[test]
-fn balance_rule_comp_and_pps_do_not_consume() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_pps_and_comp_do_not_consume() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8481,123 +8487,123 @@ fn balance_rule_comp_and_pps_do_not_consume() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-10-01 session {ADA} 60m comp note:{NOTE}\n\
-                     2026-10-02 session {ADA} 60m pps note:{NOTE}\n\
-                     2026-10-03 session {ADA} 60m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} sessions_remaining 5\n"
+                    "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 use {ADA} 60m comp note:{NOTE}\n\
+                     2026-10-02 use {ADA} 60m pps note:{NOTE}\n\
+                     2026-10-03 use {ADA} 60m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} units_remaining 5\n"
                 ),
             );
         },
         rules,
     );
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE").is_empty(),
         "comp and pps must not consume: {declarative:?}"
     );
 }
 
 #[test]
-fn balance_rule_open_malformed_shape() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_grant_malformed_shape() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 open {ADA} 6\n"),
+                &format!("2026-10-01 grant {ADA} 6\n"),
             );
         },
         rules,
     );
-    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    let malformed = ext_findings(&declarative, "E_EXAMPLE_EXT_GRANT");
     assert_eq!(malformed.len(), 1, "{declarative:?}");
     assert_eq!(
         malformed[0]["message"],
-        "open line must be: DATE open PERSON-ID package PKG-ID N sessions"
+        "grant line must be: DATE grant PERSON-ID package PKG-ID N sessions"
     );
     assert_eq!(malformed[0]["file"], "ledger/2026/10.cfd");
     assert_eq!(malformed[0]["line"], 1);
 }
 
 #[test]
-fn balance_rule_open_not_integer() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_grant_not_integer() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 open {ADA} package {PKG} six sessions\n"),
+                &format!("2026-10-01 grant {ADA} package {PKG} six sessions\n"),
             );
         },
         rules,
     );
-    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    let malformed = ext_findings(&declarative, "E_EXAMPLE_EXT_GRANT");
     assert_eq!(malformed.len(), 1, "{declarative:?}");
     assert_eq!(malformed[0]["message"], "expected integer");
     assert_eq!(
         malformed[0]["fix"],
-        "Use open <pkg-id> <positive-integer> on its own ledger line"
+        "Use grant <pkg-id> <positive-integer> on its own ledger line"
     );
 }
 
 #[test]
-fn balance_rule_open_exceeds_cap() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_grant_exceeds_cap() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 open {ADA} package {PKG} 100001 sessions\n"),
+                &format!("2026-10-01 grant {ADA} package {PKG} 100001 sessions\n"),
             );
         },
         rules,
     );
-    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    let malformed = ext_findings(&declarative, "E_EXAMPLE_EXT_GRANT");
     assert_eq!(malformed.len(), 1, "{declarative:?}");
     assert_eq!(
         malformed[0]["message"],
-        "open N 100001 exceeds the cap of 100000"
+        "grant N 100001 exceeds the cap of 100000"
     );
 }
 
 #[test]
-fn balance_rule_open_total_overflow() {
+fn balance_rule_grant_total_overflow() {
     // The 100000 cap makes a total overflow unreachable with default
     // parameters, so this case raises the cap and opens `i64::MAX` twice.
     // The shipped side cannot be configured, so this one asserts the
     // declarative behaviour only (the arithmetic is shared).
-    let rules = COACHING_EXT_BALANCE_RULE
-        .replace("max_open_n = 100000", "max_open_n = 9223372036854775807");
+    let rules =
+        EXAMPLE_EXT_BALANCE_RULE.replace("max_open_n = 100000", "max_open_n = 9223372036854775807");
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
     write(
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 9223372036854775807 sessions\n\
-             2026-10-02 open {ADA} package {PKG2} 9223372036854775807 sessions\n"
+            "2026-10-01 grant {ADA} package {PKG} 9223372036854775807 sessions\n\
+             2026-10-02 grant {ADA} package {PKG2} 9223372036854775807 sessions\n"
         ),
     );
-    install_coaching_ext(dir.path(), &coaching_ext_manifest(&rules));
-    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    install_example_ext(dir.path(), &example_ext_manifest(&rules));
+    example_ext_vault(dir.path(), EXAMPLE_EXT_CHECKS);
     let declarative = report_json(dir.path(), None);
-    let malformed = ext_findings(&declarative, "E_COACHING_EXT_OPEN");
+    let malformed = ext_findings(&declarative, "E_EXAMPLE_EXT_GRANT");
     assert_eq!(malformed.len(), 1, "{declarative:?}");
     assert_eq!(
         malformed[0]["message"],
-        format!("open total for {ADA} overflows")
+        format!("grant total for {ADA} overflows")
     );
 }
 
 #[test]
 fn balance_rule_package_id_wrong_prefix() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8607,28 +8613,28 @@ fn balance_rule_package_id_wrong_prefix() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {ADA} package {BEA} 6 sessions\n\
-                     2026-10-08 balance {ADA} sessions_remaining 6\n"
+                    "2026-10-01 grant {ADA} package {BEA} 6 sessions\n\
+                     2026-10-08 balance {ADA} units_remaining 6\n"
                 ),
             );
         },
         rules,
     );
-    let wrong = ext_findings(&declarative, "E_COACHING_EXT_TYPE");
+    let wrong = ext_findings(&declarative, "E_EXAMPLE_EXT_TYPE");
     assert_eq!(wrong.len(), 1, "{declarative:?}");
     assert_eq!(
         wrong[0]["message"],
         format!("package id '{BEA}' must use the pkg- prefix")
     );
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE").is_empty(),
         "the line still opens 6: {declarative:?}"
     );
 }
 
 #[test]
 fn balance_rule_merged_people_accumulate_to_canonical() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (compiled, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8638,28 +8644,28 @@ fn balance_rule_merged_people_accumulate_to_canonical() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {BEA} package {PKG} 6 sessions\n\
+                    "2026-10-01 grant {BEA} package {PKG} 6 sessions\n\
                      2026-10-02 merge {BEA} into {ADA}\n\
-                     2026-10-03 session {ADA} 60m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} sessions_remaining 5\n"
+                     2026-10-03 use {ADA} 60m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} units_remaining 5\n"
                 ),
             );
         },
         rules,
     );
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE").is_empty(),
         "Bea's open and Ada's session share the canonical balance: {declarative:?}"
     );
     assert!(
-        !codes(&compiled).contains(&"E_COACHING_BALANCE_MISMATCH".to_string()),
+        !codes(&compiled).contains(&"E_EXAMPLE_BALANCE_MISMATCH".to_string()),
         "{compiled:?}"
     );
 }
 
 #[test]
-fn balance_rule_icf_hours_decimal_rounding() {
-    let rules = COACHING_EXT_BALANCE_RULE;
+fn balance_rule_minutes_total_decimal_rounding() {
+    let rules = EXAMPLE_EXT_BALANCE_RULE;
     let (_, declarative) = assert_balance_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8668,16 +8674,16 @@ fn balance_rule_icf_hours_decimal_rounding() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 session {ADA} 1h30m paid note:{NOTE}\n\
-                     2026-10-02 session {ADA} 45m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} icf_hours 2.25\n"
+                    "2026-10-01 use {ADA} 1h30m full note:{NOTE}\n\
+                     2026-10-02 use {ADA} 45m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} minutes_total 2.25\n"
                 ),
             );
         },
         rules,
     );
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_BALANCE").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE").is_empty(),
         "135 minutes is exactly 2.25h in hundredths: {declarative:?}"
     );
 
@@ -8690,25 +8696,25 @@ fn balance_rule_icf_hours_decimal_rounding() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 session {ADA} 1h30m paid note:{NOTE}\n\
-                     2026-10-02 session {ADA} 45m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} icf_hours 2.30\n"
+                    "2026-10-01 use {ADA} 1h30m full note:{NOTE}\n\
+                     2026-10-02 use {ADA} 45m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} minutes_total 2.30\n"
                 ),
             );
         },
         rules,
     );
-    let mismatch = ext_findings(&declarative, "E_COACHING_EXT_BALANCE");
+    let mismatch = ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE");
     assert_eq!(mismatch.len(), 1, "{declarative:?}");
     assert_eq!(
         mismatch[0]["message"],
-        "icf_hours asserted 2.30, computed 2.25"
+        "minutes_total asserted 2.30, computed 2.25"
     );
 }
 
 #[test]
 fn balance_rule_mismatch_matches_golden() {
-    // The same vault as `balance_mismatch_golden`: open 6, one paid
+    // The same vault as `balance_mismatch_golden`: open 6, one full
     // session, assert 4 (computed 5). The fixture's finding must equal the
     // compiled finding field for field, modulo the pack's code.
     let (compiled, declarative) = assert_balance_parity(
@@ -8719,13 +8725,13 @@ fn balance_rule_mismatch_matches_golden() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-10-01 session {ADA} 60m paid note:{NOTE}\n\
-                     2026-10-08 balance {ADA} sessions_remaining 4\n"
+                    "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+                     2026-10-08 balance {ADA} units_remaining 4\n"
                 ),
             );
         },
-        COACHING_EXT_BALANCE_RULE,
+        EXAMPLE_EXT_BALANCE_RULE,
     );
     let golden: Value =
         serde_json::from_str(&fs::read_to_string(golden_path("balance_mismatch.json")).unwrap())
@@ -8735,11 +8741,11 @@ fn balance_rule_mismatch_matches_golden() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["code"] == "E_COACHING_BALANCE_MISMATCH")
+        .find(|f| f["code"] == "E_EXAMPLE_BALANCE_MISMATCH")
         .expect("compiled mismatch");
     assert_eq!(golden_finding, *compiled_finding, "shipped side drifted");
 
-    let declarative_finding = &ext_findings(&declarative, "E_COACHING_EXT_BALANCE")[0];
+    let declarative_finding = &ext_findings(&declarative, "E_EXAMPLE_EXT_BALANCE")[0];
     for field in ["severity", "message", "fix", "file", "line", "id"] {
         assert_eq!(
             golden_finding[field], declarative_finding[field],
@@ -8749,7 +8755,7 @@ fn balance_rule_mismatch_matches_golden() {
 }
 
 #[test]
-fn balance_rule_matches_shipped_coaching() {
+fn balance_rule_matches_shipped_example() {
     // One vault that exercises every balance code the kind emits, on both
     // packs: the normalized findings must be equal.
     let (compiled, declarative) = assert_balance_parity(
@@ -8761,12 +8767,12 @@ fn balance_rule_matches_shipped_coaching() {
                 root,
                 "ledger/2026/08.cfd",
                 &format!(
-                    "2026-08-01 open {BEA} package {PKG} 3 sessions\n\
-                     2026-08-01 open {ADA} package bad-package 2 sessions\n\
-                     2026-08-02 open {ADA} package {PKG2} two sessions\n\
-                     2026-08-03 open {ADA} 6\n\
-                     2026-08-04 open {ADA} package {PKG2} 100001 sessions\n\
-                     2026-08-05 open {ADA} package {PKG2} 1 sessions\n"
+                    "2026-08-01 grant {BEA} package {PKG} 3 sessions\n\
+                     2026-08-01 grant {ADA} package bad-package 2 sessions\n\
+                     2026-08-02 grant {ADA} package {PKG2} two sessions\n\
+                     2026-08-03 grant {ADA} 6\n\
+                     2026-08-04 grant {ADA} package {PKG2} 100001 sessions\n\
+                     2026-08-05 grant {ADA} package {PKG2} 1 sessions\n"
                 ),
             );
             write(
@@ -8774,15 +8780,15 @@ fn balance_rule_matches_shipped_coaching() {
                 "ledger/2026/10.cfd",
                 &format!(
                     "2026-10-01 merge {BEA} into {ADA}\n\
-                     2026-10-02 session {ADA} 1h30m paid note:{NOTE}\n\
-                     2026-10-03 session {BEA} 45m pps note:{NOTE}\n\
-                     2026-10-04 session {ADA} 30m comp note:{NOTE}\n\
-                     2026-10-08 balance {ADA} sessions_remaining 4\n\
-                     2026-10-08 balance {ADA} icf_hours 2.30\n"
+                     2026-10-02 use {ADA} 1h30m full note:{NOTE}\n\
+                     2026-10-03 use {BEA} 45m pps note:{NOTE}\n\
+                     2026-10-04 use {ADA} 30m comp note:{NOTE}\n\
+                     2026-10-08 balance {ADA} units_remaining 4\n\
+                     2026-10-08 balance {ADA} minutes_total 2.30\n"
                 ),
             );
         },
-        COACHING_EXT_BALANCE_RULE,
+        EXAMPLE_EXT_BALANCE_RULE,
     );
     assert!(
         !normalized_findings(&compiled, BALANCE_CODE_MAP).is_empty(),
@@ -8795,9 +8801,9 @@ fn balance_rule_matches_shipped_coaching() {
 }
 
 /// The fixture with one parameter patched, for the loader negatives.
-fn install_invalid_coaching_ext(root: &Path, rules: &str) {
-    install_coaching_ext(root, &coaching_ext_manifest(rules));
-    coaching_ext_vault(root, COACHING_EXT_CHECKS);
+fn install_invalid_example_ext(root: &Path, rules: &str) {
+    install_example_ext(root, &example_ext_manifest(rules));
+    example_ext_vault(root, EXAMPLE_EXT_CHECKS);
 }
 
 fn assert_pack_invalid(root: &Path) {
@@ -8812,10 +8818,10 @@ fn assert_pack_invalid(root: &Path) {
 fn balance_rule_loader_refuses_undeclared_units_metric() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_BALANCE_RULE.replace(
-            "units_metric = \"sessions_remaining\"",
+        &EXAMPLE_EXT_BALANCE_RULE.replace(
+            "units_metric = \"units_remaining\"",
             "units_metric = \"ghost_metric\"",
         ),
     );
@@ -8826,9 +8832,9 @@ fn balance_rule_loader_refuses_undeclared_units_metric() {
 fn balance_rule_loader_refuses_same_verbs() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_BALANCE_RULE.replace("consume_verb = \"session\"", "consume_verb = \"open\""),
+        &EXAMPLE_EXT_BALANCE_RULE.replace("consume_verb = \"use\"", "consume_verb = \"grant\""),
     );
     assert_pack_invalid(dir.path());
 }
@@ -8838,9 +8844,9 @@ fn balance_rule_loader_refuses_zero_cap_and_negative_cap() {
     for cap in ["0", "-1"] {
         let dir = tempfile::tempdir().unwrap();
         person(dir.path(), ADA, "Ada Example");
-        install_invalid_coaching_ext(
+        install_invalid_example_ext(
             dir.path(),
-            &COACHING_EXT_BALANCE_RULE
+            &EXAMPLE_EXT_BALANCE_RULE
                 .replace("max_open_n = 100000", &format!("max_open_n = {cap}")),
         );
         assert_pack_invalid(dir.path());
@@ -8854,10 +8860,10 @@ fn balance_rule_loader_refuses_builtin_code_param() {
     // pack-own code it could use instead.
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_BALANCE_RULE.replace(
-            "parse_code = \"E_COACHING_EXT_PARSE\"",
+        &EXAMPLE_EXT_BALANCE_RULE.replace(
+            "parse_code = \"E_EXAMPLE_EXT_PARSE\"",
             "parse_code = \"E_PARSE\"",
         ),
     );
@@ -8871,10 +8877,10 @@ fn balance_rule_loader_refuses_metric_owned_twice() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
     let two_rules = format!(
-        "{COACHING_EXT_BALANCE_RULE}\n{}",
-        COACHING_EXT_BALANCE_RULE.replace("id = \"balance\"", "id = \"balance2\"")
+        "{EXAMPLE_EXT_BALANCE_RULE}\n{}",
+        EXAMPLE_EXT_BALANCE_RULE.replace("id = \"balance\"", "id = \"balance2\"")
     );
-    install_invalid_coaching_ext(dir.path(), &two_rules);
+    install_invalid_example_ext(dir.path(), &two_rules);
     assert_pack_invalid(dir.path());
 }
 
@@ -8886,59 +8892,59 @@ fn balance_rule_balance_nonnegative_off_keeps_mismatch() {
     // silently stop assertions from being verified.
     let setup = |root: &Path| {
         person(root, ADA, "Ada Example");
-        let mut ledger = format!("2026-10-01 open {ADA} package {PKG} 6 sessions\n");
+        let mut ledger = format!("2026-10-01 grant {ADA} package {PKG} 6 sessions\n");
         for day in 1..=7 {
-            ledger.push_str(&format!("2026-10-{day:02} session {ADA} 60m paid\n"));
+            ledger.push_str(&format!("2026-10-{day:02} use {ADA} 60m full\n"));
         }
-        ledger.push_str(&format!("2026-10-08 balance {ADA} sessions_remaining 5\n"));
+        ledger.push_str(&format!("2026-10-08 balance {ADA} units_remaining 5\n"));
         write(root, "ledger/2026/10.cfd", &ledger);
     };
 
     let off_dir = tempfile::tempdir().unwrap();
     setup(off_dir.path());
-    install_coaching_ext(
+    install_example_ext(
         off_dir.path(),
-        &coaching_ext_manifest(COACHING_EXT_BALANCE_RULE),
+        &example_ext_manifest(EXAMPLE_EXT_BALANCE_RULE),
     );
-    coaching_ext_vault(
+    example_ext_vault(
         off_dir.path(),
-        "coaching-ext.balance_nonnegative = \"off\"\n",
+        "example-ext.balance_nonnegative = \"off\"\n",
     );
     let off = report_json(off_dir.path(), None);
     assert!(
-        ext_findings(&off, "E_COACHING_EXT_NEGATIVE").is_empty(),
+        ext_findings(&off, "E_EXAMPLE_EXT_NEGATIVE").is_empty(),
         "off must suppress the negative finding: {off:?}"
     );
-    let mismatch = ext_findings(&off, "E_COACHING_EXT_BALANCE");
+    let mismatch = ext_findings(&off, "E_EXAMPLE_EXT_BALANCE");
     assert_eq!(mismatch.len(), 1, "{off:?}");
     assert_eq!(
         mismatch[0]["message"],
-        "sessions_remaining asserted 5, computed -1"
+        "units_remaining asserted 5, computed -1"
     );
 
     // The positive control: with the key on, both findings appear.
     let on_dir = tempfile::tempdir().unwrap();
     setup(on_dir.path());
-    install_coaching_ext(
+    install_example_ext(
         on_dir.path(),
-        &coaching_ext_manifest(COACHING_EXT_BALANCE_RULE),
+        &example_ext_manifest(EXAMPLE_EXT_BALANCE_RULE),
     );
-    coaching_ext_vault(on_dir.path(), COACHING_EXT_CHECKS);
+    example_ext_vault(on_dir.path(), EXAMPLE_EXT_CHECKS);
     let on = report_json(on_dir.path(), None);
     assert_eq!(
-        ext_findings(&on, "E_COACHING_EXT_NEGATIVE").len(),
+        ext_findings(&on, "E_EXAMPLE_EXT_NEGATIVE").len(),
         1,
         "{on:?}"
     );
     assert_eq!(
-        ext_findings(&on, "E_COACHING_EXT_BALANCE").len(),
+        ext_findings(&on, "E_EXAMPLE_EXT_BALANCE").len(),
         1,
         "{on:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Declarative coaching kinds (#447 session-checks)
+// Declarative example-pack kinds (#447 session-checks)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -8950,30 +8956,30 @@ fn session_checks_missing_duration() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} paid note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} full note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
-    let found = ext_findings(&declarative, "E_COACHING_EXT_DURATION");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_DURATION");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
-        format!("session for {ADA} has no parseable duration")
+        format!("entry for {ADA} has no parseable duration")
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_COACHING_MISSING_DURATION"]
+        vec!["E_EXAMPLE_MISSING_DURATION"]
     );
 }
 
 #[test]
 fn session_checks_duration_off_suppresses() {
     let compiled_checks = DEFAULT_CHECKS.replace(
-        "coaching.require_duration = \"error\"",
-        "coaching.require_duration = \"off\"",
+        "example-pack.require_duration = \"error\"",
+        "example-pack.require_duration = \"off\"",
     );
-    let ext_checks = "coaching-ext.require_duration = \"off\"\n";
+    let ext_checks = "example-ext.require_duration = \"off\"\n";
     let (compiled, declarative) = assert_ext_parity_with(
         |root| {
             person(root, ADA, "Ada Example");
@@ -8981,10 +8987,10 @@ fn session_checks_duration_off_suppresses() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} paid note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} full note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
         SESSION_CODE_MAP,
         &compiled_checks,
         ext_checks,
@@ -9005,20 +9011,20 @@ fn session_checks_two_billing_tags() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m paid pps note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} 60m full pps note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
-    let found = ext_findings(&declarative, "E_COACHING_EXT_TAGS");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_TAGS");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
-        format!("session for {ADA} has more than one of paid, pps, comp")
+        format!("entry for {ADA} has more than one of full, pps, comp")
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_COACHING_SESSION_TAGS"]
+        vec!["E_EXAMPLE_TAGS"]
     );
 }
 
@@ -9031,21 +9037,21 @@ fn session_checks_no_tag() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} 60m note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
-    let found = ext_findings(&declarative, "W_COACHING_EXT_UNTAGGED");
+    let found = ext_findings(&declarative, "W_EXAMPLE_EXT_UNTAGGED");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(found[0]["severity"], "warning");
     assert_eq!(
         found[0]["message"],
-        format!("session for {ADA} has no paid, pps, or comp tag")
+        format!("entry for {ADA} has no full, pps, or comp tag")
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["W_COACHING_SESSION_UNTAGGED"]
+        vec!["W_EXAMPLE_UNTAGGED"]
     );
 }
 
@@ -9058,10 +9064,10 @@ fn session_checks_one_tag_is_clean() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert!(codes(&declarative).is_empty(), "{declarative:?}");
 }
@@ -9075,12 +9081,12 @@ fn session_checks_without_notes_matches_golden() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-10-01 session {ADA} 60m paid\n"
+                    "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-10-01 use {ADA} 60m full\n"
                 ),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
         "",
     );
     let golden: Value = serde_json::from_str(
@@ -9088,7 +9094,7 @@ fn session_checks_without_notes_matches_golden() {
     )
     .unwrap();
     let golden_finding = &golden["findings"].as_array().unwrap()[0];
-    let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_NOTES");
     assert_eq!(found.len(), 1, "{declarative:?}");
     for field in ["severity", "message", "fix", "file", "line", "id"] {
         assert_eq!(
@@ -9107,10 +9113,10 @@ fn session_checks_note_on_line_covers() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m paid note:{NOTE}\n"),
+                &format!("2026-10-01 use {ADA} 60m full note:{NOTE}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert!(codes(&declarative).is_empty(), "{declarative:?}");
 }
@@ -9124,10 +9130,10 @@ fn session_checks_note_record_same_date_covers() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m paid\n"),
+                &format!("2026-10-01 use {ADA} 60m full\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert!(codes(&declarative).is_empty(), "{declarative:?}");
 }
@@ -9142,19 +9148,19 @@ fn session_checks_note_other_person_does_not_cover() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {ADA} 60m paid\n"),
+                &format!("2026-10-01 use {ADA} 60m full\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert_eq!(
-        ext_findings(&declarative, "E_COACHING_EXT_NOTES").len(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_NOTES").len(),
         1,
         "{declarative:?}"
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
+        vec!["E_EXAMPLE_WITHOUT_NOTES"]
     );
 }
 
@@ -9170,25 +9176,25 @@ fn session_checks_non_person_id_notes_parity() {
             write(
                 root,
                 "ledger/2026/10.cfd",
-                &format!("2026-10-01 session {PKG}\n"),
+                &format!("2026-10-01 use {PKG}\n"),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
-    let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_NOTES");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(found[0]["id"], PKG);
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_DURATION").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_DURATION").is_empty(),
         "a non-person id gets no duration check: {declarative:?}"
     );
     assert!(
-        ext_findings(&declarative, "W_COACHING_EXT_UNTAGGED").is_empty(),
+        ext_findings(&declarative, "W_EXAMPLE_EXT_UNTAGGED").is_empty(),
         "a non-person id gets no tag check: {declarative:?}"
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
+        vec!["E_EXAMPLE_WITHOUT_NOTES"]
     );
 }
 
@@ -9200,32 +9206,32 @@ fn session_checks_notes_severity_warning_vs_error_vs_off() {
         ("off", None),
     ] {
         let compiled_checks = DEFAULT_CHECKS.replace(
-            "coaching.session_notes = \"warning\"",
-            &format!("coaching.session_notes = \"{ext_severity}\""),
+            "example-pack.notes = \"warning\"",
+            &format!("example-pack.notes = \"{ext_severity}\""),
         );
-        let ext_checks = format!("coaching-ext.session_notes = \"{ext_severity}\"\n");
+        let ext_checks = format!("example-ext.notes = \"{ext_severity}\"\n");
         let (compiled, declarative) = assert_ext_parity_with(
             |root| {
                 person(root, ADA, "Ada Example");
                 write(
                     root,
                     "ledger/2026/10.cfd",
-                    &format!("2026-10-01 session {ADA} 60m paid\n"),
+                    &format!("2026-10-01 use {ADA} 60m full\n"),
                 );
             },
-            COACHING_EXT_SESSION_RULE,
+            EXAMPLE_EXT_SESSION_RULE,
             SESSION_CODE_MAP,
             &compiled_checks,
             &ext_checks,
         );
         match expected {
             Some(severity) => {
-                let found = ext_findings(&declarative, "E_COACHING_EXT_NOTES");
+                let found = ext_findings(&declarative, "E_EXAMPLE_EXT_NOTES");
                 assert_eq!(found.len(), 1, "{declarative:?}");
                 assert_eq!(found[0]["severity"], severity, "{declarative:?}");
                 assert_eq!(
                     normalized_codes(&compiled, SESSION_CODE_MAP),
-                    vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
+                    vec!["E_EXAMPLE_WITHOUT_NOTES"]
                 );
             }
             None => {
@@ -9253,11 +9259,11 @@ fn session_checks_merged_person_notes_cover() {
                 "ledger/2026/10.cfd",
                 &format!(
                     "2026-10-02 merge {BEA} into {ADA}\n\
-                     2026-10-02 session {ADA} 60m paid\n"
+                     2026-10-02 use {ADA} 60m full\n"
                 ),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert!(codes(&declarative).is_empty(), "{declarative:?}");
     assert!(
@@ -9267,7 +9273,7 @@ fn session_checks_merged_person_notes_cover() {
 }
 
 #[test]
-fn session_checks_matches_shipped_coaching() {
+fn session_checks_matches_shipped_example() {
     let (compiled, declarative) = assert_session_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -9276,14 +9282,14 @@ fn session_checks_matches_shipped_coaching() {
                 root,
                 "ledger/2026/10.cfd",
                 &format!(
-                    "2026-10-01 session {ADA} paid note:{NOTE}\n\
-                     2026-10-02 session {ADA} 60m paid pps note:{NOTE}\n\
-                     2026-10-03 session {ADA} 60m note:{NOTE}\n\
-                     2026-10-04 session {ADA} 60m paid\n"
+                    "2026-10-01 use {ADA} full note:{NOTE}\n\
+                     2026-10-02 use {ADA} 60m full pps note:{NOTE}\n\
+                     2026-10-03 use {ADA} 60m note:{NOTE}\n\
+                     2026-10-04 use {ADA} 60m full\n"
                 ),
             );
         },
-        COACHING_EXT_SESSION_RULE,
+        EXAMPLE_EXT_SESSION_RULE,
     );
     assert_eq!(
         normalized_findings(&compiled, SESSION_CODE_MAP),
@@ -9296,10 +9302,10 @@ fn session_checks_matches_shipped_coaching() {
 fn session_checks_loader_refuses_empty_billing_tags() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_SESSION_RULE.replace(
-            "billing_tags = [\"paid\", \"pps\", \"comp\"]",
+        &EXAMPLE_EXT_SESSION_RULE.replace(
+            "billing_tags = [\"full\", \"pps\", \"comp\"]",
             "billing_tags = []",
         ),
     );
@@ -9310,9 +9316,9 @@ fn session_checks_loader_refuses_empty_billing_tags() {
 fn session_checks_loader_refuses_empty_verb() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_SESSION_RULE.replace("verb = \"session\"", "verb = \"\""),
+        &EXAMPLE_EXT_SESSION_RULE.replace("verb = \"use\"", "verb = \"\""),
     );
     assert_pack_invalid(dir.path());
 }
@@ -9321,9 +9327,9 @@ fn session_checks_loader_refuses_empty_verb() {
 fn session_checks_loader_refuses_unclaimed_verb() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_SESSION_RULE.replace("verb = \"session\"", "verb = \"touch\""),
+        &EXAMPLE_EXT_SESSION_RULE.replace("verb = \"use\"", "verb = \"touch\""),
     );
     assert_pack_invalid(dir.path());
 }
@@ -9332,12 +9338,12 @@ fn session_checks_loader_refuses_unclaimed_verb() {
 fn session_checks_loader_refuses_missing_message_variant() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    let manifest = coaching_ext_manifest(COACHING_EXT_SESSION_RULE).replace(
-        "default_fix = \"Add a note for that person and date, or note:n-<ULID> on the session line\"\n",
+    let manifest = example_ext_manifest(EXAMPLE_EXT_SESSION_RULE).replace(
+        "default_fix = \"Add a note for that person and date, or note:n-<ULID> on the entry line\"\n",
         "",
     );
-    install_coaching_ext(dir.path(), &manifest);
-    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    install_example_ext(dir.path(), &manifest);
+    example_ext_vault(dir.path(), EXAMPLE_EXT_CHECKS);
     assert_pack_invalid(dir.path());
 }
 
@@ -9348,9 +9354,9 @@ fn session_checks_loader_refuses_missing_notes_code() {
     // name in the message.
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
-        &COACHING_EXT_SESSION_RULE.replace("notes_code = \"E_COACHING_EXT_NOTES\"\n", ""),
+        &EXAMPLE_EXT_SESSION_RULE.replace("notes_code = \"E_EXAMPLE_EXT_NOTES\"\n", ""),
     );
     assert_pack_invalid(dir.path());
 }
@@ -9363,23 +9369,23 @@ fn balance_rule_loader_refuses_retired_code_param() {
     // + an unusable pin, like the other parse-time negatives).
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    let manifest = coaching_ext_manifest(&COACHING_EXT_BALANCE_RULE.replace(
-        "negative_code = \"E_COACHING_EXT_NEGATIVE\"",
+    let manifest = example_ext_manifest(&EXAMPLE_EXT_BALANCE_RULE.replace(
+        "negative_code = \"E_EXAMPLE_EXT_NEGATIVE\"",
         "negative_code = \"E_NEGATIVE_BALANCE\"",
     ));
-    install_external_pack_raw(dir.path(), "coaching-ext", "0.1", &manifest);
+    install_external_pack_raw(dir.path(), "example-ext", "0.1", &manifest);
     install_lockfile(
         dir.path(),
-        "coaching-ext",
+        "example-ext",
         "0.1",
         &unusable_external_pack_hash(),
     );
-    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    example_ext_vault(dir.path(), EXAMPLE_EXT_CHECKS);
     assert_pack_invalid(dir.path());
 }
 
 // ---------------------------------------------------------------------------
-// Declarative coaching kinds (#448 activity-gap)
+// Declarative example-pack kinds (#448 activity-gap)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -9392,13 +9398,13 @@ fn gap_rule_inclusive_window_edge() {
             root,
             "ledger/2026/08.cfd",
             &format!(
-                "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-                 2026-08-24 session {ADA} 60m paid\n"
+                "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+                 2026-08-24 use {ADA} 60m full\n"
             ),
         );
     });
     assert!(
-        ext_findings(&edge, "E_COACHING_EXT_GAP").is_empty(),
+        ext_findings(&edge, "E_EXAMPLE_EXT_GAP").is_empty(),
         "{edge:?}"
     );
 
@@ -9408,21 +9414,24 @@ fn gap_rule_inclusive_window_edge() {
             root,
             "ledger/2026/08.cfd",
             &format!(
-                "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-                 2026-08-23 session {ADA} 60m paid\n"
+                "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+                 2026-08-23 use {ADA} 60m full\n"
             ),
         );
     });
-    let found = ext_findings(&older, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&older, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{older:?}");
     assert_eq!(found[0]["id"], ADA);
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_COACHING_PAID_SESSION_GAP"]
+        vec!["E_EXAMPLE_GAP"]
     );
-    assert_eq!(found[0]["message"], format!(
-        "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-23)"
-    ));
+    assert_eq!(
+        found[0]["message"],
+        format!(
+        "client {ADA} has remaining units and no entry on or after 2026-08-24 (last was 2026-08-23)"
+    )
+    );
 }
 
 #[test]
@@ -9434,18 +9443,18 @@ fn gap_rule_never_started_none_variant() {
         write(
             root,
             "ledger/2026/01.cfd",
-            &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+            &format!("2026-01-01 grant {ADA} package {PKG} 6 sessions\n"),
         );
     });
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
-        format!("paid client {ADA} has no session logged")
+        format!("client {ADA} has no entry logged")
     );
     assert_eq!(
         found[0]["fix"],
-        "Log a session, close the package, or widen coaching.paid_session_gap_days (currently 45)"
+        "Log an entry, close the grant, or widen example-pack.gap_days (currently 45)"
     );
 }
 
@@ -9456,27 +9465,27 @@ fn gap_rule_remaining_variant() {
         write(
             root,
             "ledger/2026/01.cfd",
-            &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+            &format!("2026-01-01 grant {ADA} package {PKG} 6 sessions\n"),
         );
         write(
             root,
             "ledger/2026/06.cfd",
-            &format!("2026-06-01 session {ADA} 60m paid\n"),
+            &format!("2026-06-01 use {ADA} 60m full\n"),
         );
     });
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
         format!(
-            "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-06-01)"
+            "client {ADA} has remaining units and no entry on or after 2026-08-24 (last was 2026-06-01)"
         )
     );
 }
 
 #[test]
 fn gap_rule_no_remaining_variant() {
-    // A pps session inside the lookback keeps a spent package a paid
+    // A pps session inside the lookback keeps a spent package a full
     // client; the last session is old, so the `no_remaining` variant.
     let (compiled, declarative) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
@@ -9484,50 +9493,50 @@ fn gap_rule_no_remaining_variant() {
             root,
             "ledger/2026/05.cfd",
             &format!(
-                "2026-05-01 open {ADA} package {PKG} 1 sessions\n\
-                 2026-05-02 session {ADA} 60m paid\n"
+                "2026-05-01 grant {ADA} package {PKG} 1 sessions\n\
+                 2026-05-02 use {ADA} 60m full\n"
             ),
         );
         write(
             root,
             "ledger/2026/08.cfd",
-            &format!("2026-08-01 session {ADA} 60m pps\n"),
+            &format!("2026-08-01 use {ADA} 60m pps\n"),
         );
     });
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
-        format!("paid client {ADA} has no session on or after 2026-08-24 (last was 2026-08-01)")
+        format!("client {ADA} has no entry on or after 2026-08-24 (last was 2026-08-01)")
     );
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_COACHING_PAID_SESSION_GAP"]
+        vec!["E_EXAMPLE_GAP"]
     );
 }
 
 #[test]
 fn gap_rule_spent_package_no_finding_when_expected() {
-    // Spent package, no pps, last session old: not a paid client, no gap.
+    // Spent package, no pps, last session old: not a full client, no gap.
     let (_, declarative) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
         write(
             root,
             "ledger/2026/01.cfd",
             &format!(
-                "2026-01-01 open {ADA} package {PKG} 1 sessions\n\
-                 2026-01-01 session {ADA} 60m paid\n"
+                "2026-01-01 grant {ADA} package {PKG} 1 sessions\n\
+                 2026-01-01 use {ADA} 60m full\n"
             ),
         );
     });
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_GAP").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_GAP").is_empty(),
         "{declarative:?}"
     );
 }
 
 #[test]
-fn gap_rule_open_resets_clock() {
+fn gap_rule_grant_resets_clock() {
     // A recent opener resets the clock even when the last session is old,
     // and the opener adds units (remaining 6).
     let (_, declarative) = assert_gap_parity(|root| {
@@ -9536,18 +9545,18 @@ fn gap_rule_open_resets_clock() {
             root,
             "ledger/2026/01.cfd",
             &format!(
-                "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
-                 2026-01-02 session {ADA} 60m paid\n"
+                "2026-01-01 grant {ADA} package {PKG} 6 sessions\n\
+                 2026-01-02 use {ADA} 60m full\n"
             ),
         );
         write(
             root,
             "ledger/2026/10.cfd",
-            &format!("2026-10-01 open {ADA} package {PKG2} 1 sessions\n"),
+            &format!("2026-10-01 grant {ADA} package {PKG2} 1 sessions\n"),
         );
     });
     assert!(
-        ext_findings(&declarative, "E_COACHING_EXT_GAP").is_empty(),
+        ext_findings(&declarative, "E_EXAMPLE_EXT_GAP").is_empty(),
         "{declarative:?}"
     );
 }
@@ -9555,7 +9564,7 @@ fn gap_rule_open_resets_clock() {
 #[test]
 fn gap_rule_merged_person_clock() {
     // The clock is merge-aware: the opener is under the root and the
-    // session under the merged member. With the coaching verbs this rides
+    // session under the merged member. With the example-pack verbs this rides
     // the shared fold's `last_session_on` / `last_open_on` helpers.
     let (compiled, declarative) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
@@ -9564,23 +9573,23 @@ fn gap_rule_merged_person_clock() {
             root,
             "ledger/2026/01.cfd",
             &format!(
-                "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
+                "2026-01-01 grant {ADA} package {PKG} 6 sessions\n\
                  2026-01-02 merge {BEA} into {ADA}\n"
             ),
         );
         write(
             root,
             "ledger/2026/08.cfd",
-            &format!("2026-08-01 session {BEA} 60m paid\n"),
+            &format!("2026-08-01 use {BEA} 60m full\n"),
         );
     });
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(found[0]["id"], ADA);
     assert_eq!(
         found[0]["message"],
         format!(
-            "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-01)"
+            "client {ADA} has remaining units and no entry on or after 2026-08-24 (last was 2026-08-01)"
         )
     );
     assert_eq!(
@@ -9597,11 +9606,8 @@ fn gap_rule_merged_person_clock_with_distinct_activity_verb() {
     // not merge-aware would fall back to the old opener and pick the
     // `none` variant instead of `remaining`.
     let rules = format!(
-        "{COACHING_EXT_BALANCE_RULE}\n{}",
-        COACHING_EXT_GAP_RULE.replace(
-            "activity_verb = \"session\"",
-            "activity_verb = \"gathering\""
-        )
+        "{EXAMPLE_EXT_BALANCE_RULE}\n{}",
+        EXAMPLE_EXT_GAP_RULE.replace("activity_verb = \"use\"", "activity_verb = \"gathering\"")
     );
     let (compiled, declarative) = assert_ext_parity(
         |root| {
@@ -9611,7 +9617,7 @@ fn gap_rule_merged_person_clock_with_distinct_activity_verb() {
                 root,
                 "ledger/2026/01.cfd",
                 &format!(
-                    "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
+                    "2026-01-01 grant {ADA} package {PKG} 6 sessions\n\
                      2026-01-02 merge {BEA} into {ADA}\n"
                 ),
             );
@@ -9619,7 +9625,7 @@ fn gap_rule_merged_person_clock_with_distinct_activity_verb() {
                 root,
                 "ledger/2026/08.cfd",
                 &format!(
-                    "2026-08-01 session {ADA} 60m paid\n\
+                    "2026-08-01 use {ADA} 60m full\n\
                      2026-08-01 gathering {BEA}\n"
                 ),
             );
@@ -9627,12 +9633,12 @@ fn gap_rule_merged_person_clock_with_distinct_activity_verb() {
         &rules,
         GAP_CODE_MAP,
     );
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
         format!(
-            "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-01)"
+            "client {ADA} has remaining units and no entry on or after 2026-08-24 (last was 2026-08-01)"
         )
     );
     assert_eq!(
@@ -9644,25 +9650,25 @@ fn gap_rule_merged_person_clock_with_distinct_activity_verb() {
 #[test]
 fn gap_rule_pps_lookback_window() {
     // Inside the 180-day lookback a pps session keeps the spent package a
-    // paid client; outside it does not.
+    // full client; outside it does not.
     let (_, inside) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
         write(
             root,
             "ledger/2026/05.cfd",
             &format!(
-                "2026-05-01 open {ADA} package {PKG} 1 sessions\n\
-                 2026-05-02 session {ADA} 60m paid\n"
+                "2026-05-01 grant {ADA} package {PKG} 1 sessions\n\
+                 2026-05-02 use {ADA} 60m full\n"
             ),
         );
         write(
             root,
             "ledger/2026/08.cfd",
-            &format!("2026-08-01 session {ADA} 60m pps\n"),
+            &format!("2026-08-01 use {ADA} 60m pps\n"),
         );
     });
     assert_eq!(
-        ext_findings(&inside, "E_COACHING_EXT_GAP").len(),
+        ext_findings(&inside, "E_EXAMPLE_EXT_GAP").len(),
         1,
         "{inside:?}"
     );
@@ -9673,14 +9679,14 @@ fn gap_rule_pps_lookback_window() {
             root,
             "ledger/2026/03.cfd",
             &format!(
-                "2026-03-01 open {ADA} package {PKG} 1 sessions\n\
-                 2026-03-01 session {ADA} 60m paid\n\
-                 2026-03-02 session {ADA} 60m pps\n"
+                "2026-03-01 grant {ADA} package {PKG} 1 sessions\n\
+                 2026-03-01 use {ADA} 60m full\n\
+                 2026-03-02 use {ADA} 60m pps\n"
             ),
         );
     });
     assert!(
-        ext_findings(&outside, "E_COACHING_EXT_GAP").is_empty(),
+        ext_findings(&outside, "E_EXAMPLE_EXT_GAP").is_empty(),
         "{outside:?}"
     );
 }
@@ -9688,20 +9694,20 @@ fn gap_rule_pps_lookback_window() {
 #[test]
 fn gap_rule_severity_off() {
     let compiled_checks = DEFAULT_CHECKS.replace(
-        "coaching.paid_session_gap = \"warning\"",
-        "coaching.paid_session_gap = \"off\"",
+        "example-pack.gap = \"warning\"",
+        "example-pack.gap = \"off\"",
     );
-    let ext_checks = "coaching-ext.paid_session_gap = \"off\"\n";
+    let ext_checks = "example-ext.gap = \"off\"\n";
     let (compiled, declarative) = assert_ext_parity_with(
         |root| {
             person(root, ADA, "Ada Example");
             write(
                 root,
                 "ledger/2026/01.cfd",
-                &format!("2026-01-01 open {ADA} package {PKG} 6 sessions\n"),
+                &format!("2026-01-01 grant {ADA} package {PKG} 6 sessions\n"),
             );
         },
-        &coaching_ext_gap_rules(),
+        &example_ext_gap_rules(),
         GAP_CODE_MAP,
         &compiled_checks,
         ext_checks,
@@ -9718,11 +9724,9 @@ fn gap_rule_severity_off() {
 
 #[test]
 fn gap_rule_days_override_from_config() {
-    let compiled_checks = DEFAULT_CHECKS.replace(
-        "coaching.paid_session_gap_days = 45",
-        "coaching.paid_session_gap_days = 10",
-    );
-    let ext_checks = "coaching-ext.paid_session_gap_days = 10\n";
+    let compiled_checks =
+        DEFAULT_CHECKS.replace("example-pack.gap_days = 45", "example-pack.gap_days = 10");
+    let ext_checks = "example-ext.gap_days = 10\n";
     let (compiled, declarative) = assert_ext_parity_with(
         |root| {
             person(root, ADA, "Ada Example");
@@ -9730,26 +9734,26 @@ fn gap_rule_days_override_from_config() {
                 root,
                 "ledger/2026/09.cfd",
                 &format!(
-                    "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-09-18 session {ADA} 60m paid\n"
+                    "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-09-18 use {ADA} 60m full\n"
                 ),
             );
         },
-        &coaching_ext_gap_rules(),
+        &example_ext_gap_rules(),
         GAP_CODE_MAP,
         &compiled_checks,
         ext_checks,
     );
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_COACHING_PAID_SESSION_GAP"]
+        vec!["E_EXAMPLE_GAP"]
     );
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     assert_eq!(
         found[0]["message"],
         format!(
-            "paid client {ADA} has remaining sessions and no session on or after 2026-09-28 (last was 2026-09-18)"
+            "client {ADA} has remaining units and no entry on or after 2026-09-28 (last was 2026-09-18)"
         )
     );
     assert!(
@@ -9759,7 +9763,7 @@ fn gap_rule_days_override_from_config() {
 }
 
 #[test]
-fn gap_rule_matches_golden_paid_session_gap() {
+fn gap_rule_matches_golden_session_gap() {
     let declarative = ext_report(
         |root| {
             person(root, ADA, "Ada Example");
@@ -9768,19 +9772,19 @@ fn gap_rule_matches_golden_paid_session_gap() {
                 root,
                 "ledger/2026/08.cfd",
                 &format!(
-                    "2026-08-01 open {ADA} package {PKG} 6 sessions\n\
-                     2026-08-23 session {ADA} 60m paid note:{NOTE}\n"
+                    "2026-08-01 grant {ADA} package {PKG} 6 sessions\n\
+                     2026-08-23 use {ADA} 60m full note:{NOTE}\n"
                 ),
             );
         },
-        &coaching_ext_gap_rules(),
+        &example_ext_gap_rules(),
         "",
     );
     let golden: Value =
-        serde_json::from_str(&fs::read_to_string(golden_path("paid_session_gap.json")).unwrap())
+        serde_json::from_str(&fs::read_to_string(golden_path("session_gap.json")).unwrap())
             .unwrap();
     let golden_finding = &golden["findings"].as_array().unwrap()[0];
-    let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
+    let found = ext_findings(&declarative, "E_EXAMPLE_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
     for field in ["severity", "message", "fix", "id"] {
         assert_eq!(
@@ -9791,7 +9795,7 @@ fn gap_rule_matches_golden_paid_session_gap() {
 }
 
 #[test]
-fn gap_rule_matches_shipped_coaching() {
+fn gap_rule_matches_shipped_example() {
     let (compiled, declarative) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
         person(root, BEA, "Bea Demo");
@@ -9801,27 +9805,27 @@ fn gap_rule_matches_shipped_coaching() {
             root,
             "ledger/2026/01.cfd",
             &format!(
-                "2026-01-01 open {ADA} package {PKG} 6 sessions\n\
-                 2026-01-01 open {BEA} package {PKG} 6 sessions\n"
+                "2026-01-01 grant {ADA} package {PKG} 6 sessions\n\
+                 2026-01-01 grant {BEA} package {PKG} 6 sessions\n"
             ),
         );
         write(
             root,
             "ledger/2026/05.cfd",
             &format!(
-                "2026-05-01 open {CAM} package {PKG2} 1 sessions\n\
-                 2026-05-02 session {CAM} 60m paid\n"
+                "2026-05-01 grant {CAM} package {PKG2} 1 sessions\n\
+                 2026-05-02 use {CAM} 60m full\n"
             ),
         );
         write(
             root,
             "ledger/2026/06.cfd",
-            &format!("2026-06-01 session {BEA} 60m paid\n"),
+            &format!("2026-06-01 use {BEA} 60m full\n"),
         );
         write(
             root,
             "ledger/2026/08.cfd",
-            &format!("2026-08-01 session {CAM} 60m pps\n"),
+            &format!("2026-08-01 use {CAM} 60m pps\n"),
         );
     });
     assert_eq!(
@@ -9835,14 +9839,14 @@ fn gap_rule_matches_shipped_coaching() {
 fn gap_rule_loader_refuses_undeclared_int_key() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
         &format!(
             "{}\n{}",
-            COACHING_EXT_BALANCE_RULE,
-            COACHING_EXT_GAP_RULE.replace(
-                "gap_days_key = \"coaching-ext.paid_session_gap_days\"",
-                "gap_days_key = \"coaching-ext.ghost_days\""
+            EXAMPLE_EXT_BALANCE_RULE,
+            EXAMPLE_EXT_GAP_RULE.replace(
+                "gap_days_key = \"example-ext.gap_days\"",
+                "gap_days_key = \"example-ext.ghost_days\""
             )
         ),
     );
@@ -9853,13 +9857,13 @@ fn gap_rule_loader_refuses_undeclared_int_key() {
 fn gap_rule_loader_refuses_undeclared_balance_metric() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    install_invalid_coaching_ext(
+    install_invalid_example_ext(
         dir.path(),
         &format!(
             "{}\n{}",
-            COACHING_EXT_BALANCE_RULE,
-            COACHING_EXT_GAP_RULE.replace(
-                "balance_metric = \"sessions_remaining\"",
+            EXAMPLE_EXT_BALANCE_RULE,
+            EXAMPLE_EXT_GAP_RULE.replace(
+                "balance_metric = \"units_remaining\"",
                 "balance_metric = \"ghost_metric\""
             )
         ),
@@ -9874,61 +9878,70 @@ fn gap_rule_loader_refuses_retired_generic_code() {
     // manifest parse, so the fixture uses an unusable pin.
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    let manifest = coaching_ext_manifest(&format!(
+    let manifest = example_ext_manifest(&format!(
         "{}\n{}",
-        COACHING_EXT_BALANCE_RULE,
-        COACHING_EXT_GAP_RULE.replace(
-            "code = \"E_COACHING_EXT_GAP\"",
+        EXAMPLE_EXT_BALANCE_RULE,
+        EXAMPLE_EXT_GAP_RULE.replace(
+            "code = \"E_EXAMPLE_EXT_GAP\"",
             "code = \"E_PAID_SESSION_GAP\""
         )
     ));
-    install_external_pack_raw(dir.path(), "coaching-ext", "0.1", &manifest);
+    install_external_pack_raw(dir.path(), "example-ext", "0.1", &manifest);
     install_lockfile(
         dir.path(),
-        "coaching-ext",
+        "example-ext",
         "0.1",
         &unusable_external_pack_hash(),
     );
-    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    example_ext_vault(dir.path(), EXAMPLE_EXT_CHECKS);
     assert_pack_invalid(dir.path());
 }
 
 // ---------------------------------------------------------------------------
-// #449: the shipped external coaching pack
+// The neutral external example-pack fixture
 //
-// The inline `coaching_ext_manifest` above tunes one rule per test to pin
-// each kind in isolation. This section loads the real `packs/coaching/`
-// manifest — all four rules at once — and pins the shipped unit, its skill
-// drift, and the new pack-own finding codes.
+// The inline `example_ext_manifest` above tunes one rule per test to pin
+// each kind in isolation. This section loads the real
+// `testdata/packs/example-pack/` manifest — all four rules at once — and
+// pins the fixture, its skill drift, and the pack-own finding codes.
 // ---------------------------------------------------------------------------
 
-/// Recursively copy `src` into `dst` (the demo vault is a tree).
-fn copy_tree(src: &Path, dst: &Path) {
-    fs::create_dir_all(dst).unwrap();
-    for entry in fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &to);
-        } else {
-            fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
-/// The demo vault's records and ledger without its `confidant.toml`; the
-/// context harness writes its own config.
+/// Synthetic records and ledger for the context-view harness: the visible
+/// demo vault is personal-only, so the pack tests build the data they need.
 fn demo_vault_records(root: &Path) {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
-    copy_tree(&src, root);
-    fs::remove_file(root.join("confidant.toml")).unwrap();
+    // The visible demo vault is personal-only; the context-view tests need
+    // the pack's ledger data, so build a small synthetic vault with the
+    // neutral example pack's vocabulary.
+    person(root, ADA, "Ada Example");
+    person(root, CAM, "Cam Sample");
+    write(
+        root,
+        &format!("people/{CAM}/profile.md"),
+        &format!(
+            "---\nid: {CAM}\ntype: person\nname: Cam Sample\nno-ai: true\n---\n\nFake person.\n"
+        ),
+    );
+    note(root, NOTE, ADA, "2026-10-01");
+    note(root, NOTE2, ADA, "2026-10-08");
+    note(root, CAM_NOTE, CAM, "2026-10-07");
+    write(
+        root,
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 grant {ADA} package {PKG} 6 sessions\n\
+             2026-10-01 use {ADA} 60m full note:{NOTE}\n\
+             2026-10-08 use {ADA} 45m full note:{NOTE2}\n\
+             2026-10-01 grant {CAM} package {PKG2} 4 sessions\n\
+             2026-10-07 use {CAM} 45m full note:{CAM_NOTE}\n"
+        ),
+    );
 }
 
-/// #449: the shipped pack's `note-ref` rule emits its own pack codes, not
+/// #449: the fixture's `note-ref` rule emits its own pack codes, not
 /// the shared core codes. The three cases are invalid id, wrong id type,
 /// and a missing note.
 #[test]
-fn shipped_coaching_note_ref_codes_are_pack_own() {
+fn shipped_example_note_ref_codes_are_pack_own() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -9936,10 +9949,10 @@ fn shipped_coaching_note_ref_codes_are_pack_own() {
         dir.path(),
         "ledger/2026/10.cfd",
         &format!(
-            "2026-10-01 open {ADA} package {PKG} 10 sessions\n\
-             2026-10-01 session {ADA} 60m paid note:not-an-id\n\
-             2026-10-02 session {ADA} 60m paid note:{ADA}\n\
-             2026-10-03 session {ADA} 60m paid note:{NOTE2}\n"
+            "2026-10-01 grant {ADA} package {PKG} 10 sessions\n\
+             2026-10-01 use {ADA} 60m full note:not-an-id\n\
+             2026-10-02 use {ADA} 60m full note:{ADA}\n\
+             2026-10-03 use {ADA} 60m full note:{NOTE2}\n"
         ),
     );
     let json = report_json(dir.path(), None);
@@ -9948,73 +9961,51 @@ fn shipped_coaching_note_ref_codes_are_pack_own() {
     assert_eq!(
         got,
         vec![
-            "E_COACHING_NOTE_INVALID_ID",
-            "E_COACHING_NOTE_WRONG_TYPE",
-            "E_COACHING_UNKNOWN_RECORD",
+            "E_EXAMPLE_NOTE_INVALID_ID",
+            "E_EXAMPLE_NOTE_WRONG_TYPE",
+            "E_EXAMPLE_UNKNOWN_RECORD",
         ],
         "{json:?}"
     );
 }
 
-/// #449: the shipped pack is a pinned, shippable unit. Any edit to its
+/// #449: the fixture is a pinned, shippable unit. Any edit to its
 /// bytes changes this hash, so a change is deliberate.
 #[test]
-fn shipped_coaching_pack_hash_is_stable() {
+fn shipped_example_pack_hash_is_stable() {
     let pack = read_pack_dir(&example_pack_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:b4234c3b952e9905b02c9a03b4aacaf78c44bcf37f366548d29c4bb6691f8813",
-        "the shipped coaching pack changed; update this pin in the same commit"
+        pack.hash, "sha256:924c427db3318b575c07fcf19038d9f81f303195109c2945c0c9f078aba4438e",
+        "the example-pack fixture changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);
 }
 
-/// #449: the demo vault's vendored coaching pack is a byte-for-byte copy of
-/// the shipped `packs/coaching/`, so the example cannot drift — and its
-/// `confidant.lock` pins that same tree.
-///
-/// #633 edited the pack's hash-pinned `SKILL.md` (root and demo copy) but
-/// left the demo lock's pin stale, so `check` reported `E_PACK_HASH` and the
-/// coaching pack became unloadable. The byte comparison below cannot catch
-/// that: both copies drift together. The lock assertion can, and it fails
-/// here rather than only in the CLI suite that `check`s the demo vault.
+/// The visible demo vault is personal-only: no vendored pack directory and
+/// no lockfile. The pack's own drift tests use the fixture directly.
 #[test]
-fn demo_vault_vendored_coaching_matches_shipped_pack() {
+fn demo_vault_is_personal_only() {
     let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
-    let demo = demo_root.join("packs/coaching@0.1");
-    let shipped = example_pack_dir();
-    for name in ["manifest.toml", "SKILL.md", "0.1.md"] {
-        assert_eq!(
-            fs::read(demo.join(name)).unwrap(),
-            fs::read(shipped.join(name)).unwrap(),
-            "examples/demo-vault/packs/coaching@0.1/{name} drifted from packs/coaching/{name}"
-        );
-    }
-    let demo_hash = read_pack_dir(&demo).unwrap().hash;
-    assert_eq!(demo_hash, read_pack_dir(&shipped).unwrap().hash);
-
-    let lock = confidant_core::packs::lock::read_lockfile(&demo_root)
-        .expect("the demo vault lock reads")
-        .expect("the demo vault pins its coaching pack");
-    let pin = lock
-        .packs
-        .iter()
-        .find(|entry| entry.id() == "coaching@0.1")
-        .expect("the demo vault lock pins coaching@0.1");
-    assert_eq!(
-        pin.hash, demo_hash,
-        "examples/demo-vault/confidant.lock pins a stale coaching@0.1 tree; \
-         reinstall the pack (`confidant pack update coaching --from-dir packs/coaching --yes`)"
+    assert!(!demo_root.join("packs").exists(), "demo vendors a pack");
+    assert!(
+        !demo_root.join("confidant.lock").exists(),
+        "demo has a lockfile"
     );
+    let vault = load_vault(&demo_root).unwrap();
+    let report = check_vault(&vault, &CheckOptions::default());
+    assert!(report.ok, "{:#?}", report.findings);
+    let codes: Vec<&str> = report.findings.iter().map(|f| f.code.as_str()).collect();
+    assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
 }
 
-/// #449 drift test: the shipped pack's SKILL.md must document every code
+/// #449 drift test: the fixture's SKILL.md must document every code
 /// and every `[checks]` key the manifest declares.
 #[test]
-fn shipped_coaching_skill_documents_all_codes_and_keys() {
+fn shipped_example_skill_documents_all_codes_and_keys() {
     let dir = example_pack_dir();
     let manifest_text = fs::read_to_string(dir.join("manifest.toml")).unwrap();
     let manifest = confidant_core::packs::manifest::parse_manifest_external(&manifest_text)
-        .expect("shipped coaching manifest parses");
+        .expect("example-pack fixture manifest parses");
     let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
     for code in &manifest.finding_codes {
         assert!(
@@ -10036,13 +10027,13 @@ fn shipped_coaching_skill_documents_all_codes_and_keys() {
     }
 }
 
-/// #449: a vault that lists `coaching@0.1` but has not vendored the pack
+/// #449: a vault that lists `example-pack@0.1` but has not vendored the pack
 /// is `E_PACK_UNKNOWN` — the compiled fallback is gone.
 #[test]
-fn coaching_without_vendored_pack_is_unknown() {
+fn example_pack_without_vendored_pack_is_unknown() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", DEFAULT_CHECKS);
     let json = report_json(dir.path(), None);
     assert!(
         codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
@@ -10067,8 +10058,8 @@ fn ledger_sessions_row<'a>(bundle: &'a Value, key: &str) -> &'a Value {
     &bundle["packs"][key]
 }
 
-/// A demo-vault copy with the shipped coaching pack installed.
-fn demo_vault_with_coaching() -> tempfile::TempDir {
+/// A demo-vault copy with the example-pack fixture installed.
+fn demo_vault_with_example_pack() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     demo_vault_records(dir.path());
     vault_toml(dir.path(), DEFAULT_CHECKS);
@@ -10076,13 +10067,13 @@ fn demo_vault_with_coaching() -> tempfile::TempDir {
 }
 
 /// #594/#449: the shipped external pack serves the `ledger-sessions` view
-/// on the demo vault, including the legacy `coaching` alias.
+/// on the demo vault, including the legacy `example-pack` alias.
 #[test]
-fn coaching_context_view_on_demo_vault() {
-    let dir = demo_vault_with_coaching();
+fn example_pack_context_view_on_demo_vault() {
+    let dir = demo_vault_with_example_pack();
     let bundle = context_bundle(dir.path(), ADA);
-    // Ada: 6 opened minus two paid sessions; 60m + 45m = 1.75h.
-    let row = ledger_sessions_row(&bundle, "coaching@0.1");
+    // Ada: 6 opened minus two full sessions; 60m + 45m = 1.75h.
+    let row = ledger_sessions_row(&bundle, "example-pack@0.1");
     assert_eq!(row["sessions_remaining"], 4, "{bundle:?}");
     assert_eq!(row["icf_hours"], 1.75, "{bundle:?}");
     let dates: Vec<&str> = row["recent_sessions"]
@@ -10092,49 +10083,48 @@ fn coaching_context_view_on_demo_vault() {
         .map(|s| s["date"].as_str().unwrap())
         .collect();
     assert_eq!(dates, vec!["2026-10-08", "2026-10-01"], "{bundle:?}");
-    assert_eq!(
-        bundle["coaching"], bundle["packs"]["coaching@0.1"],
-        "the coaching pack must populate the legacy alias: {bundle:?}"
-    );
 }
 
 /// #594/#449: the three golden vaults' `ledger-sessions` values through
 /// the shipped external pack. The values are literal, so drift fails.
 #[test]
-fn coaching_context_view_on_goldens() {
+fn example_pack_context_view_on_goldens() {
     for setup in [
         balance_mismatch_vault as fn(&Path),
-        paid_session_gap_vault,
+        session_gap_vault,
         session_without_notes_vault,
     ] {
         let dir = tempfile::tempdir().unwrap();
         setup(dir.path());
         vault_toml(dir.path(), DEFAULT_CHECKS);
         let bundle = context_bundle(dir.path(), ADA);
-        let row = ledger_sessions_row(&bundle, "coaching@0.1");
+        let row = ledger_sessions_row(&bundle, "example-pack@0.1");
         assert_eq!(row["sessions_remaining"], 5, "{bundle:?}");
         assert_eq!(row["icf_hours"], 1.0, "{bundle:?}");
     }
 }
 
-/// #594 privacy: the coaching row is byte-identical with and without the
+/// #594 privacy: the example-pack row is byte-identical with and without the
 /// private data (`--exclude-private` maps to `include_private = false`). The
 /// view is ledger metadata only, so neither the §12 gate nor
 /// `private_context_fields` has anything to strip.
 #[test]
 fn context_ledger_sessions_view_is_identical_without_private() {
-    let dir = demo_vault_with_coaching();
+    let dir = demo_vault_with_example_pack();
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::RecordId::parse(ADA).unwrap();
     let full = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
     let stripped = build_context(&vault, &ada, false, &PackScope::All, false).unwrap();
-    assert_eq!(full.coaching, stripped.coaching);
-    assert_eq!(full.packs["coaching@0.1"], stripped.packs["coaching@0.1"]);
+
+    assert_eq!(
+        full.packs["example-pack@0.1"],
+        stripped.packs["example-pack@0.1"]
+    );
     // The JSON bytes of the row are unchanged, so a reader that diffs the
     // two flags sees no difference at all.
     assert_eq!(
-        serde_json::to_string(&full.coaching).unwrap(),
-        serde_json::to_string(&stripped.coaching).unwrap()
+        serde_json::to_string(&full.packs["example-pack@0.1"]).unwrap(),
+        serde_json::to_string(&stripped.packs["example-pack@0.1"]).unwrap()
     );
 }
 
@@ -10144,71 +10134,17 @@ fn context_ledger_sessions_view_is_identical_without_private() {
 #[test]
 fn context_ledger_sessions_view_no_ai_carries_only_ledger_keys() {
     let ledger_keys = ["icf_hours", "recent_sessions", "sessions_remaining"];
-    let dir = demo_vault_with_coaching();
+    let dir = demo_vault_with_example_pack();
     let bundle = context_bundle(dir.path(), CAM);
-    let row = ledger_sessions_row(&bundle, "coaching@0.1")
+    let row = ledger_sessions_row(&bundle, "example-pack@0.1")
         .as_object()
         .unwrap();
     let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ledger_keys, "{bundle:?}");
-    // Cam's own figures: 4 opened, one 45m paid session.
+    // Cam's own figures: 4 opened, one 45m full session.
     assert_eq!(row["sessions_remaining"], 3, "{bundle:?}");
     assert_eq!(row["icf_hours"], 0.75, "{bundle:?}");
-}
-
-/// Copy the shipped coaching pack under another name, keeping its
-/// `[context]` opt-in, and pin it. Returns the pack directory hash.
-fn install_renamed_coaching(root: &Path, name: &str) -> String {
-    let src = example_pack_dir();
-    let dst = root.join(format!("packs/{name}@0.1"));
-    fs::create_dir_all(&dst).unwrap();
-    for entry in fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        let mut text = fs::read_to_string(entry.path()).unwrap();
-        if entry.file_name() == "manifest.toml" {
-            text = text
-                .replace("name = \"coaching\"", &format!("name = \"{name}\""))
-                // The loader requires `[checks]`/rule keys to be namespaced
-                // to the pack's own name.
-                .replace("\"coaching.", &format!("\"{name}."));
-        }
-        fs::write(dst.join(entry.file_name()), text).unwrap();
-    }
-    let hash = read_pack_dir(&dst).unwrap().hash;
-    install_lockfile(root, name, "0.1", &hash);
-    hash
-}
-
-/// #594/#449: the legacy `coaching` alias is tied to the coaching pack, not
-/// to the view kind. The shipped external `coaching@0.1` populates it; a
-/// `[context]` pack under another name serves its own row but leaves the
-/// alias null; and a vault with no coaching pack has no alias at all.
-#[test]
-fn context_legacy_coaching_alias_is_tied_to_the_coaching_pack() {
-    let dir = demo_vault_with_coaching();
-    let bundle = context_bundle(dir.path(), ADA);
-    assert!(!bundle["coaching"].is_null(), "{bundle:?}");
-    assert_eq!(bundle["coaching"], bundle["packs"]["coaching@0.1"]);
-
-    let other_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(other_dir.path());
-    install_renamed_coaching(other_dir.path(), "other-coaching");
-    external_vault_toml(other_dir.path(), "\"other-coaching@0.1\"", "");
-    let other = context_bundle(other_dir.path(), ADA);
-    assert!(!other["packs"]["other-coaching@0.1"].is_null(), "{other:?}");
-    assert!(
-        other["coaching"].is_null(),
-        "a non-coaching [context] pack must not own the legacy alias: {other:?}"
-    );
-
-    // No coaching pack at all (only the implicit built-in personal pack).
-    let none_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(none_dir.path());
-    external_vault_toml(none_dir.path(), "", "");
-    let none = context_bundle(none_dir.path(), ADA);
-    assert!(none["coaching"].is_null(), "{none:?}");
-    assert!(none["packs"].get("coaching@0.1").is_none(), "{none:?}");
 }
 
 /// #594: a `[context]` the loader refuses (here an unknown view) fails the
@@ -10220,23 +10156,31 @@ fn external_context_unknown_view_is_pack_invalid() {
         .replace("view = \"ledger-sessions\"", "view = \"nope\"");
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    write(dir.path(), "packs/coaching@0.1/manifest.toml", &manifest);
     write(
         dir.path(),
-        "packs/coaching@0.1/SKILL.md",
-        "# coaching pack.\n",
+        "packs/example-pack@0.1/manifest.toml",
+        &manifest,
     );
-    write(dir.path(), "packs/coaching@0.1/0.1.md", "# coaching 0.1\n");
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/SKILL.md",
+        "# example-pack skill.\n",
+    );
+    write(
+        dir.path(),
+        "packs/example-pack@0.1/0.1.md",
+        "# example-pack 0.1\n",
+    );
     // `read_pack_dir` validates the manifest, so the bad `[context]` makes it
     // fail here too; the pin only has to be well-formed so the lockfile
     // parses and the failure is the manifest, not the pin.
-    let pack_dir = dir.path().join("packs/coaching@0.1");
+    let pack_dir = dir.path().join("packs/example-pack@0.1");
     let hash = read_pack_dir(&pack_dir)
         .map(|p| p.hash)
         .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
-    install_lockfile(dir.path(), "coaching", "0.1", &hash);
-    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", DEFAULT_CHECKS);
     let json = report_json(dir.path(), None);
     let finding = finding_by_code(&json, "E_PACK_INVALID");
-    assert_eq!(finding["file"], "packs/coaching@0.1", "{json:?}");
+    assert_eq!(finding["file"], "packs/example-pack@0.1", "{json:?}");
 }

@@ -7,7 +7,7 @@ The pack exercises every declarative rule kind with generic names:
 
 - `grant` adds units in the form `DATE grant PERSON-ID package PKG-ID N
   sessions`.
-- `use` consumes a unit: `DATE use PERSON-ID DURATION [full|metered|free]
+- `use` consumes a unit: `DATE use PERSON-ID DURATION [full|pps|comp]
   [note:NOTE-ID] [src:PROVENANCE]`.
 - `session` is a generic event verb with no rules attached.
 

@@ -129,7 +129,7 @@ code = "E_EXAMPLE_MISSING_DURATION"
 severity_duration_key = "example-pack.require_duration"
 severity_notes_key = "example-pack.notes"
 verb = "use"
-billing_tags = ["full", "metered", "free"]
+billing_tags = ["full", "pps", "comp"]
 tags_code = "E_EXAMPLE_TAGS"
 untagged_code = "W_EXAMPLE_UNTAGGED"
 notes_code = "E_EXAMPLE_WITHOUT_NOTES"
@@ -188,12 +188,12 @@ default = "entry for {id} has no parseable duration"
 default_fix = "Add a duration such as 60m or 1h30m"
 
 [messages."E_EXAMPLE_TAGS"]
-default = "entry for {id} has more than one of full, metered, free"
-default_fix = "Keep exactly one tag: full, metered, or free"
+default = "entry for {id} has more than one of full, pps, comp"
+default_fix = "Keep exactly one tag: full, pps, or comp"
 
 [messages."W_EXAMPLE_UNTAGGED"]
-default = "entry for {id} has no full, metered, or free tag"
-default_fix = "Tag the entry full, metered, or free"
+default = "entry for {id} has no full, pps, or comp tag"
+default_fix = "Tag the entry full, pps, or comp"
 
 [messages."E_EXAMPLE_WITHOUT_NOTES"]
 default = "entry on {date} for {person} has no notes"

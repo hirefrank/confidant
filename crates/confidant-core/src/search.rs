@@ -807,7 +807,10 @@ fn pkg_open_lines(allow: &Allowlist<'_>) -> Vec<OpenLine> {
         .iter()
         .zip(allow.ledger_tokens.iter())
     {
-        if ledger_line_verb(&line.text).as_deref() != Some("open") {
+        // Package clearing is driven by the line's shape (`... package
+        // <pkg-id> ...`), not by one pack's verb name: a declarative pack
+        // chooses its own opener verb (`open`, `grant`, ...).
+        if !line.text.split_whitespace().any(|word| word == "package") {
             continue;
         }
         let mut people = HashSet::new();

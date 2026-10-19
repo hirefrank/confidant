@@ -131,7 +131,7 @@ kind = "cadence-overdue"
 code = "W_CADENCE_OVERDUE"
 severity_key = "personal.cadence_overdue"
 cadence_field = "cadence"
-event_verbs = ["touch", "session"]
+event_verbs = ["touch", "session", "use"]
 snooze_field = "snooze_until"
 
 # Upcoming birthdays and other recurring dates.
