@@ -29,6 +29,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   for a built-in name is still `E_PACK_INVALID`, listed or not (#504 R8).
 
 ### Changed
+- `context --json`'s `packs["personal@0.2"]` entry gains `cadence_never:
+  true` when, and only when, the person's declared `cadence` is the literal
+  `never`. It tells a deliberate never-nudge apart from no cadence set (both
+  omit `cadence_days`), so an agent does not suggest configuring a cadence
+  the person turned off. Additive: absent for everyone else (#589).
 - The `touch` kind list is now `call|text|email|meet|meal|event|gift|other`
   (#509). `coffee` is removed, not aliased: `meal` replaces it. New `log touch`
   writes using `coffee` are a usage error, and an existing `coffee` ledger line
