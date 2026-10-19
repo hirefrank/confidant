@@ -553,6 +553,67 @@ fn context_scope_excludes_personal_unless_named() {
     assert_eq!(personal["scope"], serde_json::json!(["personal@0.2"]));
 }
 
+/// #589: `context --json` marks `cadence: never` with `cadence_never: true`
+/// (and omits it otherwise), so the CLI agent path can tell the deliberate
+/// never-nudge apart from "no cadence set" — both of which omit
+/// `cadence_days`.
+#[test]
+fn context_json_marks_cadence_never() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000C\"\n[checks]\nas_of = \"2026-10-08\"\n",
+    )
+    .unwrap();
+    const CAM: &str = "p-01M3TC5H00MPJG000000000002";
+    for (id, name, extra) in [
+        (ADA, "Ada Example", "cadence: never\n"),
+        (BEA, "Bea Demo", "cadence: 30d\n"),
+        (
+            CAM,
+            "Cam Sample",
+            "no-ai: true\ntitle: Hidden Title\ncadence: never\n",
+        ),
+    ] {
+        let d = dir.path().join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n{extra}---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+
+    let never = run_json(&["context", ADA], dir.path());
+    assert_eq!(
+        never["packs"]["personal@0.2"]["cadence_never"], true,
+        "{never}"
+    );
+    assert!(
+        never["packs"]["personal@0.2"].get("cadence_days").is_none(),
+        "{never}"
+    );
+
+    let numeric = run_json(&["context", BEA], dir.path());
+    assert_eq!(
+        numeric["packs"]["personal@0.2"]["cadence_days"], 30,
+        "{numeric}"
+    );
+    assert!(
+        numeric["packs"]["personal@0.2"]
+            .get("cadence_never")
+            .is_none(),
+        "{numeric}"
+    );
+
+    // §12: a `no-ai` person keeps the derived cadence state (`cadence_never`
+    // included, like `cadence_days`) but no declared field.
+    let no_ai = run_json(&["context", CAM], dir.path());
+    let view = &no_ai["packs"]["personal@0.2"];
+    assert!(view.get("title").is_none(), "{no_ai}");
+    assert_eq!(view["cadence_never"], true, "{no_ai}");
+}
+
 #[test]
 fn allowlist_scoped_annotates_owners() {
     let out = Command::new(bin())

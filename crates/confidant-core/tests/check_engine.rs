@@ -7816,6 +7816,89 @@ fn context_view_0_2_declared_fields_shape() {
     );
 }
 
+/// #589: `cadence: never` is marked explicitly, so an agent can tell the
+/// deliberate never-nudge apart from "no cadence set" (both omit
+/// `cadence_days`).
+#[test]
+fn context_view_cadence_never_is_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\ncadence: never\n---\n\nFake person.\n"
+        ),
+    );
+    let view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    assert_eq!(view["cadence_never"], true, "{view}");
+    assert!(view.get("cadence_days").is_none(), "{view}");
+    // `never` is never overdue, with or without contact.
+    assert_eq!(view["overdue"], false, "{view}");
+}
+
+/// A numeric cadence emits `cadence_days` and no `cadence_never` key, so the
+/// marker stays additive: the JSON for a person who is not `never` is
+/// unchanged.
+#[test]
+fn context_view_numeric_cadence_has_no_never_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\ncadence: 30d\n---\n\nFake person.\n"
+        ),
+    );
+    let view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    assert_eq!(view["cadence_days"], 30, "{view}");
+    assert!(view.get("cadence_never").is_none(), "{view}");
+}
+
+/// No cadence field: `cadence_days` and `cadence_never` are both absent, so
+/// the presence of `cadence_never` is the whole never signal.
+#[test]
+fn context_view_no_cadence_has_no_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!("---\nid: {ADA}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+    );
+    let view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    assert!(view.get("cadence_days").is_none(), "{view}");
+    assert!(view.get("cadence_never").is_none(), "{view}");
+}
+
+/// §12: `cadence_never` is derived cadence state, exactly like `cadence_days`,
+/// so a `no-ai` person keeps it while every declared field stays hidden.
+#[test]
+fn context_view_cadence_never_kept_for_no_ai_person() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: true\n\
+             title: Staff Engineer\nrelationship: friend\ncadence: never\n---\n\nFake person.\n"
+        ),
+    );
+    let view = personal_view_0_2(dir.path(), ADA, "2026-10-08");
+    // The whole view is the derived cadence/touch state: no declared field.
+    assert_eq!(
+        view,
+        json!({
+            "cadence_never": true,
+            "overdue": false,
+            "recent_touches": [],
+        }),
+        "{view}"
+    );
+}
+
 /// A field takes the canonical person's own value first, else the first
 /// merged member's in record order; a merged-away id's own view folds onto
 /// the canonical person.

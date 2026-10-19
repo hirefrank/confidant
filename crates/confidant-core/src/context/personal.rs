@@ -21,7 +21,7 @@
 //! | `list` | `[string, …]` |
 //! | `labeled-list` | `[{"label": …, "value": …}, …]` |
 //! | `date` | the raw `YYYY-MM-DD` string |
-//! | `cadence` | not emitted raw; drives `cadence_days` instead |
+//! | `cadence` | not emitted raw; drives `cadence_days` and `cadence_never` instead |
 //!
 //! A field is omitted when no merge-group member has a value that parses, and
 //! a `list` / `dates-list` / `labeled-list` field is omitted when it is empty.
@@ -30,6 +30,12 @@
 //!
 //! - `cadence_days`: the day count, omitted for `cadence: never` and when no
 //!   cadence is set. `never` means the person is never overdue.
+//! - `cadence_never`: `true` only when the declared `cadence` field is the
+//!   literal `never`, omitted otherwise (so the JSON for every other person
+//!   is unchanged). It tells the two `cadence_days`-absent cases apart: a
+//!   `never` person deliberately asked not to be nudged, while a person with
+//!   no `cadence_never` and no `cadence_days` simply has no cadence set, so an
+//!   agent must not suggest configuring one for a `never` person.
 //! - `snooze_until`: emitted by the declared `date` field of that name when
 //!   set (so an agent can see why no nudge fired).
 //! - `last_touch`, `days_since_touch`: the latest contact on or before
@@ -60,17 +66,23 @@
 //! keys [`PRIVATE_CONTEXT_FIELDS`] names, which is the pack's own PII:
 //! `birthday`, `dates`, `relationship` (`relationship_to_me` until #444),
 //! `location`, `emails`, `phones`, `links`, `tags`. Everything else is kept —
-//! `title`, `company`, `cadence_days`, `snooze_until` and the touch metadata.
+//! `title`, `company`, `cadence_days`, `cadence_never`, `snooze_until` and the
+//! touch metadata.
 //!
 //! **`no-ai`** (the §12 cleared set) is deny-by-default: a person outside it
 //! (`no-ai: true`, or uncleared through a merge-group peer) exposes **no
 //! declared field at all** except [`UNCLEARED_VISIBLE_FIELDS`], today only
 //! `snooze_until`, plus the derived cadence and touch metadata
-//! (`cadence_days`, `last_touch`, `days_since_touch`, `overdue`,
-//! `recent_touches`). A field a later manifest adds is hidden until it is
-//! listed in that allowlist, so a new 0.2+ field cannot leak to agents by
+//! (`cadence_days`, `cadence_never`, `last_touch`, `days_since_touch`,
+//! `overdue`, `recent_touches`). A field a later manifest adds is hidden until
+//! it is listed in that allowlist, so a new 0.2+ field cannot leak to agents by
 //! default. `title` and `company` are *not* allowlisted: `no-ai` hides a
 //! person's profile front matter today, and the view must not widen that.
+//!
+//! `cadence_never` is derived cadence state, not record content: like
+//! `cadence_days`, it stays for a `no-ai` person so an agent can still tell
+//! that the nudge was deliberately turned off, rather than suggesting a
+//! cadence the person asked never to have.
 //!
 //! Ledger-derived touch metadata (dates and kinds) is not record content and
 //! is kept, exactly as the `context` module documents; no decrypted content
@@ -140,6 +152,7 @@ pub const SNOOZE_FIELD: &str = "snooze_until";
 /// (duplicate JSON keys), so it is skipped and a debug build asserts.
 const DERIVED_VIEW_KEYS: &[&str] = &[
     "cadence_days",
+    "cadence_never",
     "last_touch",
     "days_since_touch",
     "overdue",
@@ -182,12 +195,24 @@ pub struct PersonalView {
     pub fields: BTreeMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cadence_days: Option<u32>,
+    /// `true` only when the declared `cadence` field is the literal `never`
+    /// (#589). Emitted only when true so the JSON for every other person is
+    /// unchanged; `cadence_days` stays absent for `never` and for "no cadence
+    /// set", so this is the only way an agent can tell them apart.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cadence_never: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_touch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub days_since_touch: Option<i64>,
     pub overdue: bool,
     pub recent_touches: Vec<RecentTouch>,
+}
+
+/// `serde(skip_serializing_if)` helper for `cadence_never`: skip the key when
+/// it is false, so only a `cadence: never` person grows a key (#589).
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Build the personal pack's `context` view for one person.
@@ -224,6 +249,7 @@ pub fn build_personal_view(
     let mut view = PersonalView {
         fields: BTreeMap::new(),
         cadence_days: None,
+        cadence_never: false,
         last_touch: None,
         days_since_touch: None,
         overdue: false,
@@ -307,6 +333,9 @@ pub fn build_personal_view(
         // `never` has no day count and is never overdue.
         Some(Cadence::Never) | None => None,
     };
+    // #589: make the deliberate `never` visible, so it is not confused with
+    // "no cadence set" (both leave `cadence_days` absent).
+    view.cadence_never = matches!(cadence, Some(Cadence::Never));
 
     let last_touch = last_contact_on(vault, canonical, &members, as_of);
     view.days_since_touch = last_touch.map(|d| as_of.signed_duration_since(d).num_days());
