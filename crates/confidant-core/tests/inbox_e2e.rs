@@ -8,7 +8,7 @@ use std::process::Command;
 
 mod common;
 
-use common::install_shipped_coaching;
+use common::install_example_pack;
 use confidant_core::{
     queue_items, read_inbox_item, run_inbox, verify_inbox_trust, DecryptExistingFn, DecryptFn,
     DomainError, InboxOptions, QueueItem,
@@ -61,10 +61,10 @@ impl Repo {
         git(root, &["init", "-b", "main", "-q"]);
         git(root, &["config", "user.name", "Test"]);
         git(root, &["config", "user.email", "test@example.com"]);
-        install_shipped_coaching(root);
+        install_example_pack(root);
         std::fs::write(
             root.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"inbox-e2e-vault\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"inbox-e2e-vault\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join(format!("people/{PID}"))).unwrap();
@@ -74,7 +74,7 @@ impl Repo {
         )
         .unwrap();
         std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
-        std::fs::write(root.join("ledger/2026/10.cfd"), "; ledger/2026/10.cfd\n2026-10-01 open p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 6 sessions\n").unwrap();
+        std::fs::write(root.join("ledger/2026/10.cfd"), "; ledger/2026/10.cfd\n2026-10-01 grant p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 6 sessions\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "init"]);
         Self { dir }

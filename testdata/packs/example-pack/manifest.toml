@@ -1,0 +1,222 @@
+# Pack manifest for example-pack@0.1 (spec/pack-manifest.md, §13).
+#
+# This is the neutral external-pack fixture used by CI, the QA smoke, the
+# benchmark generator, and the CLI/TUI test suites. It is deliberately not a
+# real workflow: it exercises every declarative rule kind with generic names
+# so tests do not depend on a shipped pack.
+#
+# Finding codes are pack-own (E_EXAMPLE_* / W_EXAMPLE_*) because PD13 refuses
+# a builtin code in an external pack. The `[checks]` keys use the
+# `example-pack.*` namespace.
+
+manifest_version = 2
+
+# Top-level keys come before the first [table] header.
+record_types = []
+
+balance_metrics = [
+  "units_remaining",
+  "minutes_total",
+]
+
+finding_codes = [
+  "E_FRONTMATTER",
+  "E_EXAMPLE_PARSE",
+  "E_EXAMPLE_BALANCE_MISMATCH",
+  "E_EXAMPLE_NEGATIVE_BALANCE",
+  "E_EXAMPLE_GRANT_MALFORMED",
+  "E_EXAMPLE_INVALID_ID",
+  "E_EXAMPLE_WRONG_ID_TYPE",
+  "E_EXAMPLE_MISSING_DURATION",
+  "E_EXAMPLE_TAGS",
+  "W_EXAMPLE_UNTAGGED",
+  "E_EXAMPLE_WITHOUT_NOTES",
+  "E_EXAMPLE_GAP",
+  "E_EXAMPLE_NOTE_INVALID_ID",
+  "E_EXAMPLE_NOTE_WRONG_TYPE",
+  "E_EXAMPLE_UNKNOWN_RECORD",
+]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[verbs]]
+name = "grant"
+id_type = "person"
+
+[[verbs]]
+name = "use"
+id_type = "person"
+
+# A generic event verb with no rules attached. It keeps the CLI's `log
+# session` write path covered without giving this fixture a workflow.
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[fields]]
+name = "tier"
+grammar = "non-empty-string"
+
+[[edge_kinds]]
+name = "ally"
+symmetric = true
+
+# Opt in to the core `ledger-sessions` context view. The view's verbs and
+# metrics come from the single `ledger-balance` rule below.
+[context]
+view = "ledger-sessions"
+
+[checks]
+[[checks.severity]]
+key = "example-pack.require_duration"
+default = "error"
+
+[[checks.severity]]
+key = "example-pack.balance_nonnegative"
+default = "error"
+
+[[checks.severity]]
+key = "example-pack.notes"
+default = "warning"
+
+[[checks.severity]]
+key = "example-pack.gap"
+default = "warning"
+
+[[checks.int]]
+key = "example-pack.gap_days"
+default = 45
+
+[[checks.int]]
+key = "example-pack.lookback_days"
+default = 180
+
+# One rule per kind: note integrity, the unit/minutes fold, per-entry checks,
+# and the activity gap.
+[[rules]]
+id = "note_ref"
+kind = "note-ref"
+code = "E_EXAMPLE_UNKNOWN_RECORD"
+verb = "use"
+pair = "note"
+invalid_code = "E_EXAMPLE_NOTE_INVALID_ID"
+wrong_type_code = "E_EXAMPLE_NOTE_WRONG_TYPE"
+
+[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_EXAMPLE_BALANCE_MISMATCH"
+severity_key = "example-pack.balance_nonnegative"
+open_verb = "grant"
+consume_verb = "use"
+units_metric = "units_remaining"
+minutes_metric = "minutes_total"
+max_open_n = 100000
+parse_code = "E_EXAMPLE_PARSE"
+negative_code = "E_EXAMPLE_NEGATIVE_BALANCE"
+open_malformed_code = "E_EXAMPLE_GRANT_MALFORMED"
+invalid_code = "E_EXAMPLE_INVALID_ID"
+wrong_type_code = "E_EXAMPLE_WRONG_ID_TYPE"
+
+[[rules]]
+id = "entries"
+kind = "session-checks"
+code = "E_EXAMPLE_MISSING_DURATION"
+severity_duration_key = "example-pack.require_duration"
+severity_notes_key = "example-pack.notes"
+verb = "use"
+billing_tags = ["full", "metered", "free"]
+tags_code = "E_EXAMPLE_TAGS"
+untagged_code = "W_EXAMPLE_UNTAGGED"
+notes_code = "E_EXAMPLE_WITHOUT_NOTES"
+
+[[rules]]
+id = "gap"
+kind = "activity-gap"
+code = "E_EXAMPLE_GAP"
+severity_key = "example-pack.gap"
+activity_verb = "use"
+start_verb = "grant"
+gap_days_key = "example-pack.gap_days"
+lookback_days_key = "example-pack.lookback_days"
+balance_metric = "units_remaining"
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[messages."E_EXAMPLE_PARSE"]
+missing_number = "balance line is missing a number"
+expected_integer = "expected integer"
+expected_integer_fix = "Use an integer such as 3 for units_remaining"
+expected_decimal = "expected decimal"
+expected_decimal_fix = "Use a decimal such as 1.50 for minutes_total"
+minutes_overflow = "entry minutes for {id} overflow"
+
+[messages."E_EXAMPLE_BALANCE_MISMATCH"]
+units_remaining = "units_remaining asserted {asserted}, computed {computed}"
+units_remaining_fix = "Check for a missing 'grant' entry or a duplicated 'use' entry for {person}"
+minutes_total = "minutes_total asserted {asserted}, computed {computed}"
+minutes_total_fix = "Check entry durations for {person} or correct the assertion"
+
+[messages."E_EXAMPLE_NEGATIVE_BALANCE"]
+default = "units_remaining for {id} is {remaining}"
+default_fix = "Add a grant or remove extra use lines"
+
+[messages."E_EXAMPLE_GRANT_MALFORMED"]
+shape = "grant line must be: DATE grant PERSON-ID package PKG-ID N sessions"
+shape_fix = "Example: 2026-10-01 grant p-… package pkg-… 6 sessions"
+not_integer = "expected integer"
+not_integer_fix = "Use grant <pkg-id> <positive-integer> on its own ledger line"
+exceeds_cap = "grant N {n} exceeds the cap of {cap}"
+exceeds_cap_fix = "Use a package size between 1 and {cap}"
+total_overflow = "grant total for {id} overflows"
+
+[messages."E_EXAMPLE_INVALID_ID"]
+package = "package id is not a record ID"
+package_fix = "Use a pkg-<ULID> package id"
+
+[messages."E_EXAMPLE_WRONG_ID_TYPE"]
+package = "package id '{pkg}' must use the pkg- prefix"
+
+[messages."E_EXAMPLE_MISSING_DURATION"]
+default = "entry for {id} has no parseable duration"
+default_fix = "Add a duration such as 60m or 1h30m"
+
+[messages."E_EXAMPLE_TAGS"]
+default = "entry for {id} has more than one of full, metered, free"
+default_fix = "Keep exactly one tag: full, metered, or free"
+
+[messages."W_EXAMPLE_UNTAGGED"]
+default = "entry for {id} has no full, metered, or free tag"
+default_fix = "Tag the entry full, metered, or free"
+
+[messages."E_EXAMPLE_WITHOUT_NOTES"]
+default = "entry on {date} for {person} has no notes"
+default_fix = "Add a note for that person and date, or note:n-<ULID> on the entry line"
+
+[messages."E_EXAMPLE_GAP"]
+none = "client {id} has no entry logged"
+none_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
+remaining = "client {id} has remaining units and no entry on or after {start} (last was {d})"
+remaining_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
+no_remaining = "client {id} has no entry on or after {start} (last was {d})"
+no_remaining_fix = "Log an entry, close the grant, or widen example-pack.gap_days (currently {days})"
+
+[messages."E_EXAMPLE_NOTE_INVALID_ID"]
+default = "note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_EXAMPLE_NOTE_WRONG_TYPE"]
+default = "note '{nid}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+
+[messages."E_EXAMPLE_UNKNOWN_RECORD"]
+missing = "note '{nid}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "note '{nid}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"

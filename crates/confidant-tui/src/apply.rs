@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::contract::{parse_raw_output, CheckReport, ContractOutcome};
 use crate::proposals::{
     is_planned_under_dir, is_under_dir, manifest_stem, open_secure_write, progress_file_corrupt,
-    progress_path, read_manifest, read_progress, write_progress, ProposalManifest, TuiProgress,
+    read_manifest, read_progress, write_progress, ProposalManifest, TuiProgress,
 };
 use crate::runner::{RawOutput, Runner};
 
@@ -553,10 +553,6 @@ pub enum FlowPhase {
     CheckFailed,
     /// All steps done and final check clean: prompt to delete the set.
     CleanupPrompt,
-    /// Lightfield cleanup: asking for the export file path.
-    CleanupExportInput { input: String },
-    /// Cleanup failed; nothing was deleted.
-    CleanupFailed { message: String },
     /// Proposal set deleted.
     Finished,
     /// The progress file was corrupt: ask before treating the proposal as
@@ -926,95 +922,14 @@ impl ApplyFlow {
         }
     }
 
-    /// Delete the proposal set. For `lightfield-import` the skill's own
-    /// `--cleanup` script handles the export, manifest, lines file and note
-    /// bodies (it needs the export path, which the TUI asks for); the TUI
-    /// then removes its own scratch dirs and the progress file. For other
-    /// skills the TUI removes exactly the manifest-listed paths, each
+    /// Delete the proposal set: exactly the manifest-listed paths, each
     /// validated to sit under `.confidant/proposals/`.
-    pub fn cleanup<R: Runner>(&mut self, runner: &R, export_path: Option<&str>) -> Result<()> {
-        if self.manifest.skill == "lightfield-import" {
-            let export = export_path
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("lightfield cleanup needs the export file path"))?;
-            let skills_dir = self.skills_dir(runner)?;
-            let script = skills_dir
-                .join("lightfield-import")
-                .join("bin")
-                .join("lightfield-import.py");
-            let manifest_str = self.manifest_path.display().to_string();
-            let script_str = script.display().to_string();
-            let out = runner.run_program(
-                "python3",
-                &[
-                    &script_str,
-                    "--cleanup",
-                    "--export",
-                    export,
-                    "--manifest",
-                    &manifest_str,
-                    "--i-verified-the-import",
-                ],
-            )?;
-            if out.status != 0 {
-                let tail = String::from_utf8_lossy(&out.stdout);
-                let tail: Vec<&str> = tail.lines().collect();
-                let shown = tail
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                self.phase = FlowPhase::CleanupFailed {
-                    message: format!("skill --cleanup failed (exit {}):\n{shown}", out.status),
-                };
-                return Ok(());
-            }
-            // The skill removed the export, manifest, lines file and notes;
-            // remove the TUI's own scratch and progress file.
-            let stem = manifest_stem(&self.manifest_path);
-            remove_paths(&[
-                progress_path(&self.manifest_path),
-                stem.join("records"),
-                stem,
-            ])?;
-        } else {
-            let paths = cleanup_paths(&self.manifest, &self.manifest_path, &self.vault_root)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            remove_paths(&paths)?;
-        }
+    pub fn cleanup<R: Runner>(&mut self, _runner: &R) -> Result<()> {
+        let paths = cleanup_paths(&self.manifest, &self.manifest_path, &self.vault_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        remove_paths(&paths)?;
         self.phase = FlowPhase::Finished;
         Ok(())
-    }
-
-    /// Resolve the installed skills directory via `confidant which`.
-    fn skills_dir<R: Runner>(&self, runner: &R) -> Result<PathBuf> {
-        #[derive(Deserialize, Default)]
-        struct WhichOutput {
-            #[serde(default)]
-            skills_dir: String,
-        }
-        let raw = runner.run(&["which", "--skills-dir"])?;
-        match parse_raw_output::<WhichOutput>(&raw) {
-            ContractOutcome::Ok { data, .. } if !data.skills_dir.is_empty() => {
-                Ok(PathBuf::from(data.skills_dir))
-            }
-            ContractOutcome::Ok { .. } => {
-                Err(anyhow::anyhow!("`which --skills-dir` returned no path"))
-            }
-            ContractOutcome::CliError { error, .. } => Err(anyhow::anyhow!(
-                "cannot locate skills dir: {}",
-                error.message
-            )),
-            ContractOutcome::InvalidJson { status } => Err(anyhow::anyhow!(
-                "cannot parse `which --skills-dir` output (exit {status})"
-            )),
-            ContractOutcome::VersionMismatch { reported_version } => Err(anyhow::anyhow!(
-                "contract version mismatch: {reported_version}"
-            )),
-        }
     }
 }
 
@@ -1042,8 +957,7 @@ pub fn remove_paths(paths: &[PathBuf]) -> Result<()> {
 
 /// Remove a staged reviewed-source file: best-effort overwrite-with-zeros,
 /// unlink, then prune the now-empty `staged/` dir. Never removes the manifest
-/// stem dir itself (it holds the record scratch and, for lightfield, the
-/// notes). This is not secure deletion — see [`crate::edit::remove_scratch`]
+/// stem dir itself (it holds the record scratch). This is not secure deletion — see [`crate::edit::remove_scratch`]
 /// for the same caveat. Missing paths are skipped; a symlink is unlinked
 /// without following it.
 fn remove_staged_source(path: &Path) {
@@ -1066,7 +980,7 @@ mod tests {
 
     fn manifest_fixture() -> ProposalManifest {
         ProposalManifest {
-            skill: "lightfield-import".to_owned(),
+            skill: "example-pack".to_owned(),
             request_id: "01AAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             vault: String::new(),
             lines_file: None,

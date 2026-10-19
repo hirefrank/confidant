@@ -1,19 +1,19 @@
  1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
-vault  unknown   scope  not resolved yet   doctor  not run
+vault  /fake/demo-vault   scope  not resolved yet   doctor  not run
 ╭ Check Summary ───────────────────────────────────────────────────────────────────────────────────╮
-│  FAILED   spec 0.1  •  records 1  •  ledger 2  •  errors 0  •  warnings 1  •  findings 1         │
+│  FAILED   spec 0.1  •  records 0  •  ledger 1  •  errors 1  •  warnings 0  •  findings 1         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ Findings ───────────────────────────────────────────╮╭ Detail ───────────────────────────────────╮
-│ › [warning] E_COACHING_SESSION_WITHOUT_NOTES p-01M3 ││ code                                      │
-│                                                     ││ E_COACHING_SESSION_WITHOUT_NOTES          │
-│                                                     ││ severity  [warning]                       │
+│ › [error] E_EXAMPLE_WITHOUT_NOTES p-01M3TC5H00MPJG0 ││ code      E_EXAMPLE_WITHOUT_NOTES         │
+│                                                     ││ severity  [error]                         │
 │                                                     ││ id        p-01M3TC5H00MPJG000000000000    │
-│                                                     ││ location  ledger/2026/10.cfd:2            │
-│                                                     ││ message   session on 2026-10-01 for       │
+│                                                     ││ location  -                               │
+│                                                     ││ message   entry on 2026-10-01 for         │
 │                                                     ││ p-01M3TC5H00MPJG000000000000 has no notes │
-│                                                     ││ fix       Add a note for that person and  │
-│                                                     ││ date, or note:n-<ULID> on the session     │
-│                                                     ││ line                                      │
+│                                                     ││ fix       Fix the fixture                 │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

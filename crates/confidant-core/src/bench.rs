@@ -14,7 +14,7 @@ const SESSIONS_PER_PERSON: usize = 24;
 const NOTE_BODY_KB: usize = 3;
 const TOUCHES_PER_PERSON: usize = 100;
 
-/// Write a vault of `people` clients, each with `notes_per_person` notes.
+/// Write a vault of `people` people, each with `notes_per_person` notes.
 /// All names and emails are synthetic. Returns the unique token planted in
 /// person 0's profile (for a one-hit search) and a common token planted in
 /// every profile. When `cjk` is true, note bodies use a no-space CJK
@@ -33,11 +33,11 @@ pub fn generate_realistic_vault(
 ) -> Result<(String, String)> {
     refuse_existing(root)?;
     std::fs::create_dir_all(root)?;
-    install_coaching(root)?;
-    let unique = "zxqvUniqueTokenAda0";
-    let common = "coaching-practice";
+    install_example_pack(root)?;
+    let unique = "zxqvUniqueTokenCase0";
+    let common = "benchmark-common";
     let vault_id = ulid_from_parts(TIME_MS, 1);
-    let packs = r#"packs = ["coaching@0.1"]"#;
+    let packs = r#"packs = ["example-pack@0.1"]"#;
     let cfg = format!(
         r#"spec = "0.1"
 {packs}
@@ -45,12 +45,12 @@ vault_id = "{vault_id}"
 
 [checks]
 as_of = "2026-10-08"
-coaching.require_duration = "error"
-coaching.balance_nonnegative = "error"
-coaching.session_notes = "off"
-coaching.paid_session_gap = "off"
-coaching.paid_session_gap_days = 45
-coaching.pps_lookback_days = 180
+example-pack.require_duration = "error"
+example-pack.balance_nonnegative = "error"
+example-pack.notes = "off"
+example-pack.gap = "off"
+example-pack.gap_days = 45
+example-pack.lookback_days = 180
 "#
     );
     paths::write_replace(root, Path::new("confidant.toml"), cfg.as_bytes())?;
@@ -61,7 +61,7 @@ coaching.pps_lookback_days = 180
     let filler = if cjk {
         "会话记录关于目标阻碍与下一步行动计划-主题讨论。".repeat(20)
     } else {
-        "transcript line about goals, blockers, and next actions. ".repeat(40)
+        "note line about goals, blockers, and next actions. ".repeat(40)
     };
 
     for i in 0..people {
@@ -90,7 +90,7 @@ coaching.pps_lookback_days = 180
                 NaiveDate::from_ymd_opt(2024 + (n / 12) as i32, (n % 12) as u32 + 1, 15)
                     .unwrap_or(NaiveDate::from_ymd_opt(2026, 10, 1).expect("valid"));
             let mut note_body =
-                format!("Session note {n} for generated person {i}. Themes: {common}.\n{filler}\n");
+                format!("Entry note {n} for generated person {i}. Themes: {common}.\n{filler}\n");
             while note_body.len() < NOTE_BODY_KB * 1024 {
                 note_body.push_str(&filler);
             }
@@ -101,15 +101,12 @@ coaching.pps_lookback_days = 180
             paths::write_replace(root, &path, note.as_bytes())?;
         }
 
-        let pps_client = i % 10 == 1;
-        if !pps_client {
-            push_ledger(
-                &mut ledgers,
-                2024,
-                1,
-                &format!("2024-01-01 open {pid} package {pkg} 36 sessions\n"),
-            );
-        }
+        push_ledger(
+            &mut ledgers,
+            2024,
+            1,
+            &format!("2024-01-01 grant {pid} package {pkg} 36 sessions\n"),
+        );
         for s in 0..SESSIONS_PER_PERSON {
             let month_offset = (s as u32) % 12;
             let year = 2024 + (s as i32 / 12);
@@ -119,25 +116,22 @@ coaching.pps_lookback_days = 180
                 Prefix::Note,
                 ulid_from_parts(TIME_MS, 50_000 + (i as u128) * 256),
             )?;
-            let tag = if pps_client { "pps" } else { "paid" };
             push_ledger(
                 &mut ledgers,
                 year,
                 month,
-                &format!("{year}-{month:02}-{day:02} session {pid} 60m {tag} note:{nid}\n"),
+                &format!("{year}-{month:02}-{day:02} use {pid} 60m full note:{nid}\n"),
             );
         }
-        if !pps_client {
-            push_ledger(
-                &mut ledgers,
-                2026,
-                10,
-                &format!(
-                    "2026-10-01 balance {pid} sessions_remaining {}\n",
-                    36 - SESSIONS_PER_PERSON
-                ),
-            );
-        }
+        push_ledger(
+            &mut ledgers,
+            2026,
+            10,
+            &format!(
+                "2026-10-01 balance {pid} units_remaining {}\n",
+                36 - SESSIONS_PER_PERSON
+            ),
+        );
         if touch {
             // #188: many small `touch` lines, spread across 2024–2026, so
             // the personal cadence fold and the search scanner see a
@@ -169,18 +163,18 @@ coaching.pps_lookback_days = 180
     Ok((unique.to_owned(), common.to_owned()))
 }
 
-/// Vendor the shipped external `coaching@0.1` pack into a generated bench
-/// vault and pin its hash (#449). `bench-gen` is a hidden developer tool
-/// and runs from the repo; a packaged binary without `../../packs` gets a
-/// clear error rather than a silently different vault.
-fn install_coaching(root: &Path) -> Result<()> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/coaching");
+/// Vendor the neutral `example-pack` fixture into a generated bench vault
+/// and pin its hash. `bench-gen` is a hidden developer tool and runs from
+/// the repo; a packaged binary without the fixture gets a clear error rather
+/// than a silently different vault.
+fn install_example_pack(root: &Path) -> Result<()> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/example-pack");
     if !src.is_dir() {
         return Err(anyhow::Error::new(DomainError::config(
-            "bench-gen needs the repo's packs/coaching/ directory to build its fixture vault",
+            "bench-gen needs the repo's testdata/packs/example-pack/ fixture to build its vault",
         )));
     }
-    let dst = root.join("packs/coaching@0.1");
+    let dst = root.join("packs/example-pack@0.1");
     std::fs::create_dir_all(&dst)?;
     for entry in std::fs::read_dir(&src)? {
         let entry = entry?;
@@ -190,7 +184,7 @@ fn install_coaching(root: &Path) -> Result<()> {
         .map_err(anyhow::Error::new)?
         .hash;
     let lock = format!(
-        "lock_version = 1\n\n[[pack]]\nname = \"coaching\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+        "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
     );
     paths::write_replace(root, Path::new("confidant.lock"), lock.as_bytes())?;
     Ok(())

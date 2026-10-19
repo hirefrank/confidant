@@ -1,111 +1,36 @@
 # Confidant integration skills
 
-Agent skills and small scripts that pull outside events into the vault (ADR-8).
-There is no plugin system in v0: the **agent** runs these, calling the CLI's
-agent contract (ADR-7).
+Agent-facing skill text that ships inside the `confidant` binary (ADR-8).
+There is no plugin system in v0: the agent runs a skill, and the skill calls
+the CLI's agent contract (ADR-7).
+
+Two skills ship today:
+
+| Skill | What it does |
+|---|---|
+| `qmd-search/` | Optional QMD-backed search over a local index; falls back to `confidant find` |
+| `pack-author/` | Scaffold and refine a local schema pack with `confidant pack init` |
 
 ## Installing (for operators and agents)
 
-Skills ship inside the `confidant` binary (embedded at compile time) and are
-installed by `confidant setup --agent auto`: each skill calls its own `bin/`
-scripts via paths under the installed skills dir, so copying a lone `SKILL.md`
-elsewhere breaks it — always link (or copy) the whole skill directory, which
-`setup` does for you. Run `confidant which --skills-dir` to locate the
-installed tree. The supported setup is `docs/agent-setup.md` in the GitHub
-repo: install the binary, run `setup`, set `CONFIDANT_VAULT`. That page also
-holds the single copy/paste install prompt and the update loop (`confidant
-update`, then `confidant setup --force` to re-link).
+Skills are embedded at compile time and installed by `confidant setup
+--agent auto`: each skill calls scripts via paths under the installed
+skills dir, so copying a lone `SKILL.md` elsewhere breaks it — always link
+(or copy) the whole skill directory, which `setup` does for you. Run
+`confidant which --skills-dir` to locate the installed tree. The supported
+setup is `docs/agent-setup.md` in the GitHub repo: install the binary, run
+`setup`, set `CONFIDANT_VAULT`. That page also holds the single copy/paste
+install prompt and the update loop (`confidant update`, then `confidant
+setup --force` to re-link).
 
-## The uniform workflow
-
-Every skill follows the same shape:
-
-1. **Propose.** The agent runs the skill's script. The script reads the
-   source data and the vault, computes the delta, and prints a
-   human-readable summary plus a machine-readable **proposal manifest**
-   (JSON) under `<vault>/.confidant/proposals/` (gitignored scratch —
-   the manifest is plaintext PII). The script refuses unless that dir is
-   git-ignored (same `check-ignore` refusal as the QMD skill), creates it
-   `0700`, and writes the manifest and lines file `0600`. Next to the manifest the script writes
-   a flat **lines file** (`.cfd`) with the proposed ledger lines, one per
-   line. Scripts never write to the vault. The manifest carries a
-   `request_id` — a fresh ULID generated once per proposal; retries reuse
-   the manifest's stored value, never regenerate it.
-2. **Confirm.** The agent shows the logical change (ledger lines, record
-   diffs) to the human and gets explicit approval. No approval, no write.
-   (Or review in `confidant-tui`: the proposals tab shows each proposal's
-   dry-run diff and applies it step by step with explicit `y` confirms.)
-3. **Apply.** The agent applies the approved change through the CLI:
-   - Ledger lines: `confidant import --file <lines_file> --request-id
-     <request_id from manifest> --dry-run --json --no-input` first, then
-     the real run. (`import --file` reads ledger lines and routes each
-     to its month file itself.) One commit per write; `check` runs
-     before every commit and a failing check blocks the write (ADR-7).
-   - Notes: one `confidant note add --person <id> --date <date>
-     --body-file <body> --request-id <note_request_id>` per note record.
-     Bodies are pre-staged by the proposer next to the manifest
-     (`body_file` in the manifest, mode 0600 — never `/tmp`), and each
-     note carries its own `request_id` ULID in the manifest so a retried
-     apply doesn't duplicate notes.
-   - Person/deal/interaction records: **pre-M2 only** — hand-create the
-     files from the manifest's `records[]`, then `confidant check
-     --json` before committing. **Post-M2** (the manifest's
-     `records_blocked` is true — the vault looks encrypted): do NOT
-     hand-write files into the vault tree; apply each record with
-     `confidant record add --file <scratch.md> --request-id
-      <record.request_id from the manifest>
-     --dry-run --json --no-input` first, then the real run (one commit
-     per record). Stage each manifest `records[]` entry to a `0600`
-     scratch file. The scripts set `records_blocked` when they detect
-     an `enc:` envelope in the vault.
-4. **Clean up.** Delete the whole proposal set (manifest, lines file,
-   staged note bodies) after a successful apply — all plaintext PII.
-   (Lightfield: `--cleanup` takes `--manifest` and deletes the export
-   and the whole proposal set together; also run `--record-applied
-   --manifest` so reruns skip what's applied.)
-
-## Skills
-
-| Skill | Source | Writes |
-|---|---|---|
-| `portal-sync/` | Coaching portal events (JSONL) | `open` (renewals), `stage` (checkouts sent, lost deals), all with `src:portal/<event-id>` |
-| `transcript-import/` | Transcript metadata (JSON) | Interaction record + `session` line with duration and `src:transcript/<id>` |
-| `lightfield-import/` | Lightfield export (JSON) | Person/deal/note/interaction records + ledger lines, `src:lightfield/<id>` |
-| `capture-gap-summary/` | `confidant check --json` | Nothing — operator-facing summary of `E_COACHING_SESSION_WITHOUT_NOTES` / `E_COACHING_PAID_SESSION_GAP` |
-
-## Shared helper
-
-`bin/common.py` holds the small shared pieces: ULID generation, `src:`
-provenance scanning, record-ID validation, and proposal-manifest writing.
-Scripts load it via a `sys.path` entry pointing at `skills/bin/`.
-
-## Provenance and idempotency
-
-Every imported ledger line carries `src:<namespace>/<id>` (`portal`,
-`transcript`, `lightfield`). The scripts skip events whose `src:`
-already appears in the vault, so re-running an import adds nothing;
-`E_DUPLICATE_SRC` is the backstop. Contacts and notes never get ledger
-lines, so lightfield-import keeps a second dedup record: a local map at
-`<vault>/.confidant/lightfield-import-map.json` holding opaque
-`lf-id → vault-id` pairs only (no PII), updated by `--record-applied`
-after the apply. Each proposal also carries a `request_id` — a fresh
-ULID stored in the manifest — for the CLI's HMAC idempotency (ADR-7);
-reuse the manifest's value on retry.
+`setup` and `update` also remove confidant-owned links for skills that no
+longer ship. Unowned user files are left alone.
 
 ## Privacy
 
-- Nothing private ever flows back out to a source system. Imports are
-  pull-only.
-- Proposal manifests are **plaintext PII** (names, emails, phones, notes,
-  transcripts). They live under `<vault>/.confidant/proposals/`
-  (gitignored, never committed) and are deleted after the apply. The
-  scripts refuse to write a proposal unless that dir is git-ignored in
-  the vault, create it `0700`, and write the manifest, lines file, and
-  staged note bodies `0600`.
-- The Lightfield export is **plaintext PII**: it is never committed, never
-  copied into the vault, and the import script deletes it after a verified
-  import.
-- The scripts never invent data: bad rows are warned and skipped, never
-  defaulted (no invented dates, stages, verbs, or IDs).
-- Commit messages and trailers carry only opaque IDs, verbs, and hashes —
-  never names or free text (ADR-7).
+- `qmd-search` reads the vault through the §12 allowlist: a `no-ai` record
+  never reaches the index or a query result.
+- Indexes and caches live in `<vault>/.confidant/` (gitignored), stay on
+  trusted devices, and never go in git (ADR-6).
+- Skills propose nothing and write nothing themselves: `pack-author` edits
+  a directory outside the vault; `qmd-search` only reads.

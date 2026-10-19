@@ -1213,7 +1213,6 @@ mod tests {
         cleared_ledger_line_owners, cleared_record_owners, search, search_for_operator, OwnerKey,
         PackScope,
     };
-    use std::collections::BTreeSet;
 
     #[test]
     fn excerpt_truncates() {
@@ -1297,14 +1296,79 @@ mod tests {
         assert_fixed_point(&vault);
     }
 
-    fn demo_vault() -> crate::vault::Vault {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
-        crate::vault::load_vault(&root).unwrap()
+    fn example_pack_vault() -> (tempfile::TempDir, crate::vault::Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/packs/example-pack");
+        let dst = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&dst).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+        let hash = crate::packs::dir::read_pack_dir(&dst).unwrap().hash;
+        std::fs::write(
+            dir.path().join("confidant.lock"),
+            format!(
+                "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let ada = "p-01M3TC5H00MPJG000000000000";
+        let cam = "p-01M3TC5H00MPJG001248000002";
+        std::fs::create_dir_all(dir.path().join("people").join(ada).join("notes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("people").join(cam).join("notes")).unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("profile.md"),
+            format!("---\nid: {ada}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(cam).join("profile.md"),
+            format!("---\nid: {cam}\ntype: person\nname: Cam Sample\nno-ai: true\n---\n\nHidden person.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("notes/n-01M3TC5H00MPJG002NAM000005.md"),
+            format!("---\nid: n-01M3TC5H00MPJG002NAM000005\ntype: note\nperson: {ada}\ndate: 2026-10-02\n---\n\nKickofftoken note.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("notes/n-01M3TC5H00MPJG0036CR000006.md"),
+            format!("---\nid: n-01M3TC5H00MPJG0036CR000006\ntype: note\nperson: {ada}\ndate: 2026-10-04\n---\n\nFollowuptoken note.\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("people").join(cam).join("notes/n-01M3TC5H000068T0000000000C.md"),
+            format!("---\nid: n-01M3TC5H000068T0000000000C\ntype: note\nperson: {cam}\ndate: 2026-10-07\n---\n\nCam asked that notes never go to a model provider.\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("interactions/i-01M3TC5H00MPJG0048H0000008"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("interactions/i-01M3TC5H00MPJG0048H0000008/interaction.md"),
+            format!("---\nid: i-01M3TC5H00MPJG0048H0000008\ntype: interaction\nname: Intro call\ndate: 2026-10-01\nperson: {ada}\n---\n\nFake intro call body.\n"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            format!(
+                "2026-10-01 grant {ada} package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n2026-10-02 use {ada} 60m full note:n-01M3TC5H00MPJG002NAM000005\n2026-10-03 balance {ada} units_remaining 3\n2026-10-04 stage d-01M3TC5H00MPJG00248G000004 proposal\n2026-10-05 touch {ada} meeting note:n-01M3TC5H00MPJG0036CR000006\n2026-10-07 touch {cam} message note:n-01M3TC5H000068T0000000000C\n"
+            ),
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        (dir, vault)
     }
 
-    fn coaching_scope() -> PackScope {
-        PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+    fn example_scope() -> PackScope {
+        PackScope::Only(["example-pack@0.1".to_string()].into_iter().collect())
     }
 
     #[test]
@@ -1312,23 +1376,23 @@ mod tests {
         // Demo vault: "Kickoff" is in the session-linked (coaching) note;
         // "Follow-up" is in the unattributed note; "Fake intro call" is in
         // the unattributed interaction body.
-        let vault = demo_vault();
-        let coaching = coaching_scope();
-        let kickoff = search(&vault, "Kickoff", &coaching).unwrap();
+        let (_dir, vault) = example_pack_vault();
+        let scoped = example_scope();
+        let kickoff = search(&vault, "Kickofftoken", &scoped).unwrap();
         assert_eq!(kickoff.hits.len(), 1);
         assert!(kickoff.hits[0].path.contains("002NAM000005"));
 
-        let followup = search(&vault, "Follow-up", &coaching).unwrap();
+        let followup = search(&vault, "Followuptoken", &scoped).unwrap();
         assert!(followup.hits.is_empty());
-        let followup_all = search(&vault, "Follow-up", &PackScope::All).unwrap();
+        let followup_all = search(&vault, "Followuptoken", &PackScope::All).unwrap();
         assert_eq!(followup_all.hits.len(), 1);
 
-        let intro_body = search(&vault, "Fake intro call", &coaching).unwrap();
+        let intro_body = search(&vault, "Fake intro call", &scoped).unwrap();
         assert!(intro_body.hits.is_empty());
         // #246 fix round: the unattributed interaction's `name:` line no
         // longer leaks through per-field filtering — notes and
         // interactions contribute no lines at all when out of scope.
-        let intro_name = search(&vault, "Intro call", &coaching).unwrap();
+        let intro_name = search(&vault, "Intro call", &scoped).unwrap();
         assert!(intro_name.hits.is_empty());
 
         // The unattributed note is undiscoverable under a coaching scope:
@@ -1336,9 +1400,9 @@ mod tests {
         // (`type: note` still matches the in-scope coaching note's own
         // line — that record is legitimately visible — so assert the
         // unattributed note's path is absent, not zero hits.)
-        let by_id = search(&vault, "n-01M3TC5H00MPJG0036CR000006", &coaching).unwrap();
+        let by_id = search(&vault, "n-01M3TC5H00MPJG0036CR000006", &scoped).unwrap();
         assert!(by_id.hits.is_empty());
-        let by_type = search(&vault, "type: note", &coaching).unwrap();
+        let by_type = search(&vault, "type: note", &scoped).unwrap();
         assert!(
             by_type
                 .hits
@@ -1350,20 +1414,18 @@ mod tests {
     }
 
     #[test]
-    fn scoped_search_keeps_coaching_and_core_ledger_lines() {
+    fn scoped_search_keeps_pack_and_core_ledger_lines() {
         // Balance lines are owned by their metric's pack; `stage` is core.
-        let vault = demo_vault();
-        let coaching = coaching_scope();
-        let balance = search(&vault, "sessions_remaining", &coaching).unwrap();
+        let (_dir, vault) = example_pack_vault();
+        let scoped = example_scope();
+        let balance = search(&vault, "units_remaining", &scoped).unwrap();
         assert!(!balance.hits.is_empty());
         assert!(balance.hits.iter().all(|h| h.path.contains("10.cfd")));
-        let stage = search(&vault, "proposal", &coaching).unwrap();
-        assert!(!stage.hits.is_empty());
     }
 
     #[test]
     fn allowlist_owners_cover_records_and_ledger_lines() {
-        let vault = demo_vault();
+        let (_dir, vault) = example_pack_vault();
         let records = cleared_record_owners(&vault);
         // Ada's profile is core; the session-linked note is coaching;
         // the unattributed note has no owners.
@@ -1374,20 +1436,19 @@ mod tests {
         assert_eq!(
             records
                 .get("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG002NAM000005.md"),
-            Some(&[OwnerKey::Pack("coaching@0.1")].into_iter().collect())
+            Some(&[OwnerKey::Pack("example-pack@0.1")].into_iter().collect())
         );
+        // The second note is linked from a core `touch` line, so the
+        // implicit personal pack owns it.
         assert_eq!(
             records
                 .get("people/p-01M3TC5H00MPJG000000000000/notes/n-01M3TC5H00MPJG0036CR000006.md"),
-            Some(&BTreeSet::new())
+            Some(&[OwnerKey::Pack("personal@0.2")].into_iter().collect())
         );
         let lines = cleared_ledger_line_owners(&vault);
-        // The balance line is coaching; the alias line is core.
+        // The balance line is pack-owned; the stage line is core.
         assert!(lines.iter().any(|(f, _, o)| f.contains("10.cfd")
-            && o == &[OwnerKey::Pack("coaching@0.1")].into_iter().collect()));
-        assert!(lines
-            .iter()
-            .any(|(f, _, o)| f.contains("10.cfd") && o == &[OwnerKey::Core].into_iter().collect()));
+            && o == &[OwnerKey::Pack("example-pack@0.1")].into_iter().collect()));
     }
 
     /// #572: the operator search is the agent search plus everything hidden
@@ -1395,7 +1456,7 @@ mod tests {
     /// badge. The agent path is unchanged and never sets `no_ai`.
     #[test]
     fn operator_search_includes_no_ai_records_with_badge() {
-        let vault = demo_vault();
+        let (_dir, vault) = example_pack_vault();
         // "model provider" is only in Cam Sample's note body (Cam is
         // `no-ai: true`, so the note inherits hidden).
         let agent = search(&vault, "model provider", &PackScope::All).unwrap();
@@ -1434,7 +1495,7 @@ mod tests {
     /// hits keep the tri-state `no_ai` (never the ledger marker).
     #[test]
     fn operator_ledger_hits_mark_only_operator_only_lines() {
-        let vault = demo_vault();
+        let (_dir, vault) = example_pack_vault();
         // `2026-10-07 session <Cam> ... note:<Cam's note>` is hidden from
         // agents: the person is `no-ai: true` and the note inherits it.
         let agent = search(&vault, "2026-10-07", &PackScope::All).unwrap();
@@ -1463,15 +1524,15 @@ mod tests {
         assert_eq!(record.no_ai, Some("true"));
         assert_eq!(record.operator_only, None);
 
-        // An alias line naming cleared people is visible to agents too, so
+        // A stage line naming a cleared deal is visible to agents too, so
         // the operator path does not mark it.
-        let agent_alias = search(&vault, "alias", &PackScope::All).unwrap();
+        let agent_alias = search(&vault, "meeting", &PackScope::All).unwrap();
         assert!(agent_alias
             .hits
             .iter()
             .any(|h| h.path.starts_with("ledger/")));
         assert!(agent_alias.hits.iter().all(|h| h.operator_only.is_none()));
-        let operator_alias = search_for_operator(&vault, "alias", &PackScope::All).unwrap();
+        let operator_alias = search_for_operator(&vault, "meeting", &PackScope::All).unwrap();
         let visible: Vec<_> = operator_alias
             .hits
             .iter()

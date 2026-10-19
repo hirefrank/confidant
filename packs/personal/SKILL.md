@@ -12,15 +12,16 @@ second record type. People stay core `person` records; the pack owns optional
 fields on them (identity, contact details, relationship, birthdays, dates,
 keep-in-touch cadence), the `touch` ledger verb, relationship edge kinds, and
 two warning-level rules (keep-in-touch cadence, upcoming dates). It works
-alongside `coaching@0.1` in one vault — a coaching client can also be a
-friend, and each pack's data scopes independently (#178).
+alongside any external pack in one vault — a contact can also be a member
+of another pack's workflow, and each pack's data scopes independently
+(#178).
 
 The pack is **implicit**: every vault has it, whether or not
-`confidant.toml` lists it. A vault that lists `coaching@0.1` explicitly
+`confidant.toml` lists it. A vault that lists an external pack explicitly
 looks like:
 
 ```toml
-packs = ["coaching@0.1"]
+packs = ["example-pack@0.1"]
 ```
 
 `packs = []` still enables the personal pack. A `personal@…` entry in
@@ -184,7 +185,7 @@ name the key when it is a known spec key, otherwise give the line number.
 
 A person with `cadence: <N>d` has no touchpoint on or after
 `as_of - N days` (and on or before `as_of`). Touchpoints are `touch` lines
-and coaching `session` lines, after merge canonicalization. Skipped entirely
+and any pack-declared event verb, after merge canonicalization. Skipped entirely
 when `cadence: never`, and while `snooze_until` is later than `as_of` (the
 person is eligible again on the snooze date; a past date has no effect).
 

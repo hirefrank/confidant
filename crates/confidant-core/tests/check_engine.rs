@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{install_shipped_coaching, shipped_coaching_dir};
+use common::{example_pack_dir, install_example_pack};
 use confidant_core::check::{CheckOptions, FindingCode, Severity};
 use confidant_core::{check_vault, load_vault};
 use serde_json::{json, Value};
@@ -55,7 +55,7 @@ fn note(root: &Path, id: &str, person: &str, date: &str) {
 /// that checks coaching behaviour vendors the pack: the compiled path is
 /// gone (#449), so a listed pack without bytes is `E_PACK_UNKNOWN`.
 fn vault_toml(root: &Path, checks: &str) {
-    install_shipped_coaching(root);
+    install_example_pack(root);
     write(
         root,
         "confidant.toml",
@@ -3275,7 +3275,7 @@ still-bare-ulid-token\n"
 #[test]
 fn check_messages_do_not_echo_vault_free_text() {
     let dir = tempfile::tempdir().unwrap();
-    install_shipped_coaching(dir.path());
+    install_example_pack(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -5086,7 +5086,7 @@ fn personal_cadence_counts_sessions_as_touchpoints() {
     // #227 Q2: a coaching session counts as a touchpoint, so a coaching
     // client who is also a friend does not get a false overdue.
     let dir = tempfile::tempdir().unwrap();
-    install_shipped_coaching(dir.path());
+    install_example_pack(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -5172,7 +5172,7 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     use confidant_core::search::{allowlist_is_fixed_point, search};
 
     let dir = tempfile::tempdir().unwrap();
-    install_shipped_coaching(dir.path());
+    install_example_pack(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -9960,7 +9960,7 @@ fn shipped_coaching_note_ref_codes_are_pack_own() {
 /// bytes changes this hash, so a change is deliberate.
 #[test]
 fn shipped_coaching_pack_hash_is_stable() {
-    let pack = read_pack_dir(&shipped_coaching_dir()).expect("shipped pack dir must read");
+    let pack = read_pack_dir(&example_pack_dir()).expect("shipped pack dir must read");
     assert_eq!(
         pack.hash, "sha256:b4234c3b952e9905b02c9a03b4aacaf78c44bcf37f366548d29c4bb6691f8813",
         "the shipped coaching pack changed; update this pin in the same commit"
@@ -9981,7 +9981,7 @@ fn shipped_coaching_pack_hash_is_stable() {
 fn demo_vault_vendored_coaching_matches_shipped_pack() {
     let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
     let demo = demo_root.join("packs/coaching@0.1");
-    let shipped = shipped_coaching_dir();
+    let shipped = example_pack_dir();
     for name in ["manifest.toml", "SKILL.md", "0.1.md"] {
         assert_eq!(
             fs::read(demo.join(name)).unwrap(),
@@ -10011,7 +10011,7 @@ fn demo_vault_vendored_coaching_matches_shipped_pack() {
 /// and every `[checks]` key the manifest declares.
 #[test]
 fn shipped_coaching_skill_documents_all_codes_and_keys() {
-    let dir = shipped_coaching_dir();
+    let dir = example_pack_dir();
     let manifest_text = fs::read_to_string(dir.join("manifest.toml")).unwrap();
     let manifest = confidant_core::packs::manifest::parse_manifest_external(&manifest_text)
         .expect("shipped coaching manifest parses");
@@ -10160,7 +10160,7 @@ fn context_ledger_sessions_view_no_ai_carries_only_ledger_keys() {
 /// Copy the shipped coaching pack under another name, keeping its
 /// `[context]` opt-in, and pin it. Returns the pack directory hash.
 fn install_renamed_coaching(root: &Path, name: &str) -> String {
-    let src = shipped_coaching_dir();
+    let src = example_pack_dir();
     let dst = root.join(format!("packs/{name}@0.1"));
     fs::create_dir_all(&dst).unwrap();
     for entry in fs::read_dir(&src).unwrap() {
@@ -10215,7 +10215,7 @@ fn context_legacy_coaching_alias_is_tied_to_the_coaching_pack() {
 /// external pack closed as `E_PACK_INVALID`, before anything folds.
 #[test]
 fn external_context_unknown_view_is_pack_invalid() {
-    let manifest = fs::read_to_string(shipped_coaching_dir().join("manifest.toml"))
+    let manifest = fs::read_to_string(example_pack_dir().join("manifest.toml"))
         .unwrap()
         .replace("view = \"ledger-sessions\"", "view = \"nope\"");
     let dir = tempfile::tempdir().unwrap();

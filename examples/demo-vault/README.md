@@ -2,12 +2,10 @@
 
 **FAKE data only.** No real names, emails, phone numbers, or notes.
 
-This is one operator's relationship memory, personal first. Most of the
-roster is everyday life — a friend, family, a partner, a mentor — with
-birthdays, keep-in-touch cadences, relationship edges, and `touch` ledger
-lines for calls, texts, meals, and meetings. A small coaching practice sits
-alongside it (Ada Example, Bea Demo, and a `no-ai: true` client) so the
-coaching pack and its balance/session rules stay exercised too.
+This is one operator's relationship memory, personal first. The roster is
+everyday life — a friend, family, a partner, a mentor — with birthdays,
+keep-in-touch cadences, relationship edges, and `touch` ledger lines for
+calls, texts, meals, and meetings.
 
 The built-in `personal@0.2` pack is implicit: it is enabled without being
 listed in `packs = [...]`. The `[checks]` block sets the personal nudge

@@ -2452,10 +2452,6 @@ impl<R: Runner> App<R> {
 
     /// Handle a key event while the proposals tab is active.
     fn handle_proposals_key(&mut self, key: KeyEvent) {
-        let in_export_input = matches!(
-            self.proposals.opened.as_ref().map(|f| &f.phase),
-            Some(FlowPhase::CleanupExportInput { .. })
-        );
         // Workspace shortcuts are only honoured while browsing (or with no
         // proposal open). In a phase modal they would escape to another
         // workspace and leave the flow armed: gate on `Browsing` so the
@@ -2468,46 +2464,10 @@ impl<R: Runner> App<R> {
         if browsing && self.handle_workspace_shortcut(key) {
             return;
         }
-        if in_export_input {
-            self.handle_export_input_key(key);
-        } else if self.proposals.opened.is_some() {
+        if self.proposals.opened.is_some() {
             self.handle_open_proposal_key(key);
         } else {
             self.handle_proposal_list_key(key);
-        }
-    }
-
-    /// Text input for the lightfield cleanup export path.
-    fn handle_export_input_key(&mut self, key: KeyEvent) {
-        let run_with: Option<String> = {
-            let Some(flow) = self.proposals.opened.as_mut() else {
-                return;
-            };
-            let FlowPhase::CleanupExportInput { input } = &mut flow.phase else {
-                return;
-            };
-            match key.code {
-                KeyCode::Esc => {
-                    flow.phase = FlowPhase::CleanupPrompt;
-                    None
-                }
-                KeyCode::Enter => Some(input.clone()),
-                KeyCode::Backspace => {
-                    input.pop();
-                    None
-                }
-                KeyCode::Char(c)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    input.push(c);
-                    None
-                }
-                _ => None,
-            }
-        };
-        if let Some(path) = run_with {
-            self.proposals_run_cleanup(Some(path.as_str()));
         }
     }
 
@@ -2718,36 +2678,12 @@ impl<R: Runner> App<R> {
                 _ => {}
             },
             FlowPhase::CleanupPrompt => match key.code {
-                KeyCode::Char('y') => {
-                    let is_lightfield = self
-                        .proposals
-                        .opened
-                        .as_ref()
-                        .is_some_and(|f| f.manifest.skill == "lightfield-import");
-                    if is_lightfield {
-                        if let Some(flow) = self.proposals.opened.as_mut() {
-                            flow.phase = FlowPhase::CleanupExportInput {
-                                input: String::new(),
-                            };
-                        }
-                    } else {
-                        self.proposals_run_cleanup(None);
-                    }
-                }
+                KeyCode::Char('y') => self.proposals_run_cleanup(),
                 _ => {
                     if let Some(flow) = self.proposals.opened.as_mut() {
                         flow.phase = FlowPhase::Browsing;
                     }
                 }
-            },
-            FlowPhase::CleanupFailed { .. } => match key.code {
-                KeyCode::Esc => {
-                    if let Some(flow) = self.proposals.opened.as_mut() {
-                        flow.phase = FlowPhase::CleanupPrompt;
-                    }
-                }
-                KeyCode::Char('q') => self.should_quit = true,
-                _ => {}
             },
             // The progress file was corrupt: `y` treats the proposal as fresh
             // (re-apply is safe — the CLI's idempotence checks skip done
@@ -2764,7 +2700,7 @@ impl<R: Runner> App<R> {
             },
             // Terminal phases are exited immediately by the action that
             // produced them; any stray key just closes the detail.
-            FlowPhase::Finished | FlowPhase::CheckFailed | FlowPhase::CleanupExportInput { .. } => {
+            FlowPhase::Finished | FlowPhase::CheckFailed => {
                 self.close_opened_proposal();
             }
         }
@@ -2824,12 +2760,12 @@ impl<R: Runner> App<R> {
     }
 
     /// Run cleanup (delete the proposal set) for the open proposal.
-    fn proposals_run_cleanup(&mut self, export: Option<&str>) {
+    fn proposals_run_cleanup(&mut self) {
         let result = {
             let Some(flow) = self.proposals.opened.as_mut() else {
                 return;
             };
-            flow.cleanup(&self.runner, export)
+            flow.cleanup(&self.runner)
         };
         match result {
             Ok(()) => {
@@ -3666,14 +3602,6 @@ impl<R: Runner> App<R> {
                 }
                 h.push_str(" | r: retry step | Esc: back");
                 h
-            }
-            FlowPhase::CleanupExportInput { input } => {
-                format!(
-                    "Lightfield cleanup deletes the plaintext export. Type the export file path.\nExport file: {input}_\nEnter: delete export and proposal set | Esc: cancel"
-                )
-            }
-            FlowPhase::CleanupFailed { message } => {
-                format!("cleanup failed: {message} | Esc: back to cleanup prompt")
             }
             _ => String::new(),
         };

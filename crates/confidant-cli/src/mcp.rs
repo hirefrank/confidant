@@ -7,7 +7,7 @@
 //! wrapping the CLI, never a second way in).
 //!
 //! Pack scope (#178, #232): the server instance may be configured with a
-//! ceiling (`confidant mcp --packs coaching@0.1`). Every `find` / `context`
+//! ceiling (`confidant mcp --packs example-pack@0.1`). Every `find` / `context`
 //! call runs under that ceiling; a per-call `packs` argument can only
 //! narrow it, never widen it. The ceiling is validated by the CLI
 //! sub-invocation (unknown / disabled pack = hard error); the widen check
@@ -238,7 +238,7 @@ fn tools() -> Vec<Value> {
             obj(
                 &[],
                 json!({
-                    "pack": {"type": "string", "description": "Pack name, e.g. coaching@0.1. Unset = combined skill generated from the effective scope."},
+                    "pack": {"type": "string", "description": "Pack name, e.g. example-pack@0.1. Unset = combined skill generated from the effective scope."},
                     "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
                 }),
             ),
@@ -756,21 +756,24 @@ mod tests {
     #[test]
     fn effective_packs_narrows_never_widens() {
         let ceiling: Option<BTreeSet<String>> =
-            Some(["coaching@0.1".to_string()].into_iter().collect());
+            Some(["example-pack@0.1".to_string()].into_iter().collect());
         // No per-call scope: the ceiling.
         assert_eq!(
             effective_packs(&ceiling, None).unwrap(),
-            Some(vec!["coaching@0.1".to_string()])
+            Some(vec!["example-pack@0.1".to_string()])
         );
         // Narrowing to a subset of the ceiling is fine.
         assert_eq!(
-            effective_packs(&ceiling, Some(vec!["coaching@0.1".to_string()])).unwrap(),
-            Some(vec!["coaching@0.1".to_string()])
+            effective_packs(&ceiling, Some(vec!["example-pack@0.1".to_string()])).unwrap(),
+            Some(vec!["example-pack@0.1".to_string()])
         );
         // Widening past the ceiling is an error (#232 acceptance).
         let err = effective_packs(
             &ceiling,
-            Some(vec!["coaching@0.1".to_string(), "testpack@0.1".to_string()]),
+            Some(vec![
+                "example-pack@0.1".to_string(),
+                "testpack@0.1".to_string(),
+            ]),
         )
         .unwrap_err();
         assert!(err.contains("outside"));
@@ -786,9 +789,9 @@ mod tests {
     fn per_call_widening_is_an_mcp_error() {
         // #232 acceptance: a scoped call never widens past the ceiling.
         let ceiling: Option<BTreeSet<String>> =
-            Some(["coaching@0.1".to_string()].into_iter().collect());
+            Some(["example-pack@0.1".to_string()].into_iter().collect());
         let resp = handle(
-            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find","arguments":{"query":"Ada","packs":["coaching@0.1","testpack@0.1"]}}}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"find","arguments":{"query":"Ada","packs":["example-pack@0.1","testpack@0.1"]}}}"#,
             Path::new("/tmp"),
             &ceiling,
         )

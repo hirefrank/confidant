@@ -83,7 +83,7 @@ pub fn combined_pack_skill(
 /// Skill ids: subdirectories of the embedded tree containing a `SKILL.md`.
 pub fn skill_ids() -> Vec<&'static str> {
     // NOTE: `Dir::get_file` matches on the entry path relative to the
-    // *include root* (e.g. `portal-sync/SKILL.md`), not relative to the
+    // *include root* (e.g. `pack-author/SKILL.md`), not relative to the
     // subdirectory, so the marker must be the full joined path.
     let mut ids: Vec<&'static str> = SKILLS
         .dirs()
@@ -97,7 +97,7 @@ pub fn skill_ids() -> Vec<&'static str> {
 
 /// Recursively materialize `dir` under `root`, overwriting files.
 /// `root` is the tree root; file paths from `include_dir` are already
-/// relative to it (e.g. `portal-sync/bin/portal-sync.py`).
+/// relative to it (e.g. `qmd-search/bin/qmd-query.py`).
 ///
 /// Build junk is skipped on the way out: `include_dir!` embeds whatever is
 /// in the working tree at compile time, so a local `__pycache__` (gitignored
@@ -144,18 +144,8 @@ mod tests {
     #[test]
     fn embedded_tree_has_expected_skills() {
         let ids = skill_ids();
-        assert_eq!(
-            ids,
-            vec![
-                "capture-gap-summary",
-                "lightfield-import",
-                "pack-author",
-                "portal-sync",
-                "qmd-search",
-                "transcript-import",
-            ]
-        );
-        assert!(SKILLS.get_dir("bin").is_some());
+        assert_eq!(ids, vec!["pack-author", "qmd-search"]);
+        assert!(SKILLS.get_dir("bin").is_none());
     }
 
     #[test]
@@ -269,9 +259,8 @@ mod tests {
         }
 
         let vendored_names = skill_pack_names(&vendored);
-        // Only compiled-in packs have a vendored copy. The shipped coaching
-        // pack is external since #449 and reads its `SKILL.md` from the
-        // vault, so it is not in this tree.
+        // Only compiled-in packs have a vendored copy. External packs read
+        // their `SKILL.md` from the vault, so they are not in this tree.
         for name in &vendored_names {
             let repo_text = std::fs::read_to_string(repo_packs.join(name).join("SKILL.md"))
                 .unwrap_or_else(|e| panic!("read packs/{name}/SKILL.md: {e}"));

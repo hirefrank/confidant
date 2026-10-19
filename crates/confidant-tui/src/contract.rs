@@ -258,8 +258,6 @@ pub struct Context {
     #[serde(default)]
     pub touchpoints: Vec<TouchpointView>,
     #[serde(default)]
-    pub coaching: Option<CoachingView>,
-    #[serde(default)]
     pub packs: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub aliases: Vec<String>,
@@ -334,28 +332,6 @@ pub struct TouchpointView {
     pub date: String,
     #[serde(default)]
     pub kind: Option<String>,
-}
-
-/// Coaching pack view inside [`Context`].
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct CoachingView {
-    #[serde(default)]
-    pub sessions_remaining: i64,
-    #[serde(default)]
-    pub icf_hours: f64,
-    #[serde(default)]
-    pub recent_sessions: Vec<RecentSession>,
-}
-
-/// One recent session inside [`CoachingView`].
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct RecentSession {
-    #[serde(default)]
-    pub date: String,
-    #[serde(default)]
-    pub duration_minutes: Option<u32>,
-    #[serde(default)]
-    pub tag: Option<String>,
 }
 
 /// Output of `confidant record list --json --no-input` (#558).

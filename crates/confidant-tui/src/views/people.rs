@@ -23,12 +23,7 @@ use crate::views::context::{self, ContextViewState};
 
 /// Finding codes that read as an operator nudge about a person. Order is
 /// the order findings are shown in; the CLI already emits deterministically.
-pub const ATTENTION_CODES: &[&str] = &[
-    "W_DATE_UPCOMING",
-    "W_CADENCE_OVERDUE",
-    "E_COACHING_SESSION_WITHOUT_NOTES",
-    "E_COACHING_PAID_SESSION_GAP",
-];
+pub const ATTENTION_CODES: &[&str] = &["W_DATE_UPCOMING", "W_CADENCE_OVERDUE"];
 
 /// One `Needs Attention` row.
 #[derive(Clone, Debug, PartialEq, Eq)]

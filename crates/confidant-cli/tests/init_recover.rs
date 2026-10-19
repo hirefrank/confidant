@@ -1249,7 +1249,7 @@ fn bootstrap_refuses_external_pack_with_pack_add_guidance() {
         "init",
         "--create",
         "--packs",
-        "coaching@0.1",
+        "example-pack@0.1",
         "--no-input",
         "--json",
     ]);
@@ -1258,7 +1258,7 @@ fn bootstrap_refuses_external_pack_with_pack_add_guidance() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["error"]["code"], "usage_error");
     let message = v["error"]["message"].as_str().unwrap_or("");
-    assert!(message.contains("coaching@0.1"), "{message}");
+    assert!(message.contains("example-pack@0.1"), "{message}");
     assert!(message.contains("external pack"), "{message}");
     assert!(message.contains("init cannot vendor"), "{message}");
     let fix = v["error"]["fix"].as_str().unwrap_or("");

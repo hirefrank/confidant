@@ -1,9 +1,0 @@
-lock_version = 1
-
-[[pack]]
-name = "coaching"
-version = "0.1"
-source = "dir"
-rev = ""
-subdir = ""
-hash = "sha256:b4234c3b952e9905b02c9a03b4aacaf78c44bcf37f366548d29c4bb6691f8813"
