@@ -3,26 +3,25 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/hirefrank/confidant/badge)](https://securityscorecards.dev/viewer/?uri=github.com/hirefrank/confidant)
 [![CII Best Practices](https://www.bestpractices.dev/projects/15504/badge)](https://www.bestpractices.dev/projects/15504)
 
-**Confidant is relationship memory you own.** Your agents share one memory
-of the people in your life — people, organizations, deals, interactions,
-notes — and every change is proposed by an agent, verified by deterministic
-rules (`confidant check`), and recorded by you. It's a private record of
-relationships. With the right schema pack it can run a coaching practice,
-track personal relationships, or model any other relationship domain —
-the core stays the same.
+**Confidant is relationship memory you own.** It remembers the people in
+your life — the friend you meant to call, a sibling's birthday, the mentor
+you last saw in March — in one private place your AI agents can read and
+update. Each person is a Markdown file with notes, dates, and a log of every
+touch; `confidant check` turns that into who is overdue and which dates are
+coming up.
 
-Records live in plain-text files in a git repo (the **vault**). The Rust CLI
-`confidant` reads, checks, and writes them. There is no server.
+The personal use case is the default: every vault has the built-in
+`personal@0.2` pack (birthdays, recurring dates, relationship, keep-in-touch
+cadence, and the `touch` verb). For a coaching practice, add the optional
+`coaching@0.1` pack to the same vault — a client can also be a friend.
 
-The same files serve both sides: open `people/p-<ULID>/profile.md` in any
-editor and it's just Markdown; ask an agent for context on a person and it
-pulls the whole bundle — notes, sessions, deals, balances — through one
-`confidant context` call, gated by the same rules. A memory your agents
-use, in files you can read. Underneath, a ledger of dated facts
-(`ledger/2026/10.cfd`) keeps the record append-only and auditable.
+Records are plain-text files in a git repo (the **vault**); the Rust CLI
+`confidant` reads, checks, and writes them. There is no server, and a ledger
+of dated facts (`ledger/2026/10.cfd`) keeps the record append-only and
+auditable.
 
-New here? Start with [Agent setup](#agent-setup) for the one-prompt
-install, or [Quickstart](#quickstart) to try the fake-data demo vault.
+Start with [Install](#install) or the [demo
+quickstart](#first-five-minutes-the-people-in-your-life).
 
 Starting over, or adopting Confidant in stages? See
 [Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
@@ -31,215 +30,266 @@ in the same vault.
 
 ## Install
 
-**The easiest path:** paste the one-prompt install from
-[`docs/agent-setup.md`](docs/agent-setup.md) into your agent. It handles
-everything — binary, skills, config.
+**The preferred path: let your agent install it.** Paste this into Claude
+Code, Cursor, Codex, or any agent that can run commands; it installs the
+CLI, links the embedded skills, and asks where your vault is. This README
+is the canonical home for the prompt; [`docs/agent-setup.md`](docs/agent-setup.md)
+covers headless hosts, environment variables, and updates.
 
-**Manual install** (requires a recent Rust toolchain; MSRV 1.88, see
-`rust-version` in `Cargo.toml`):
+```text
+Set up Confidant (relationship memory you own — a CLI plus embedded agent skills) on this machine:
 
-```sh
-cargo install confidant-cli
-confidant setup --agent auto
+1. Install the CLI: `cargo install confidant-cli` (needs a Rust
+   toolchain 1.88+; check with `rustc --version`). This provides the
+   `confidant` binary. Make sure `~/.cargo/bin` is on PATH first
+   (`export PATH="$HOME/.cargo/bin:$PATH"`) or the next step fails with
+   `confidant: command not found`. Verify with `confidant --help`.
+   (No Rust toolchain? Download the `confidant` binary + installer from
+   the latest GitHub Release at
+   https://github.com/hirefrank/confidant/releases instead — and verify
+   the downloaded `.tar.xz`/`.zip` first: check the published `.sha256`
+   checksum file (that's what it covers), or run
+   `gh attestation verify <archive> --repo hirefrank/confidant` for build
+   provenance.)
+2. Install the skills (they ship inside the binary — no repo checkout):
+   `confidant setup --agent auto`. This materializes the skills to a
+   versioned share dir and links each skill into the detected agent's
+   skills directory. (No vault configured yet? `confidant doctor` exits
+   with `E_VAULT_NOT_FOUND` before reporting skills-link health, so
+   confirm the links with `confidant agents` or
+   `confidant which --skills-dir` instead.) (`confidant doctor` checks GitHub for the latest
+   release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
+   shell rc too, this session and permanently, only if I want that
+   request disabled.)
+3. Ask me where my vault is and set `CONFIDANT_VAULT` to it (export it for
+   this session and tell me what to add to my shell rc to keep it). If I
+   have no vault yet, ask whether to create one at a path I choose or
+   stop — do not invent a path. To create one, run
+   `confidant init --create --no-input` against an absent or empty
+   directory: it scaffolds the directory, git repo, `.gitignore`, and
+   `confidant.toml`, then the keys.
+4. Ask me whether this vault is for **real relationship data** (encrypted
+   mode, the production default) or **demo / learning / fixtures only**
+   (plaintext opt-out), and explain the consequences before editing
+   `confidant.toml` or running `confidant init`:
+   - **Encrypted (real data):** `confidant init` creates vault keys and
+     shows a 24-word recovery phrase once (store offline); record bodies
+     are encrypted in git while ledger lines stay structural plaintext.
+     Ensure `confidant.toml` does **not** set `[crypto] mode = "plaintext"`
+     (never silently copy the demo vault's `mode = "plaintext"` into a
+     vault I described as real) and the working tree is clean
+     (`git status`), then guide `confidant init` and recovery-phrase
+     handling (never echo the phrase into chat logs).
+   - **Plaintext (demo / learning / fixtures only):** set or keep
+     `mode = "plaintext"` under `[crypto]` in `confidant.toml` (only valid
+     while the vault is structurally plaintext; never for real PII), do
+     **not** run `confidant init`, and warn that `git clone` exposes all
+     record content.
+5. Verify: run `confidant check --json --no-input` against the vault and
+   report the error/warning counts.
+6. Read the routing snippet (`confidant routing`) for the propose →
+   confirm → apply workflow every skill follows, and the Privacy rules
+   (trusted devices with encrypted disks only; `.confidant/` is never
+   committed; `no-ai` records stay out of agent output — see the README's
+   Encryption and privacy section and `docs/privacy.md` in the GitHub repo).
+
+Report back: CLI version (`confidant --version`), which skills you linked,
+vault crypto mode (encrypted vs. plaintext opt-out), the `check` result,
+and any `confidant doctor` warnings.
 ```
 
-This installs the `confidant` binary from [crates.io](https://crates.io/crates/confidant-cli).
-Prebuilt binaries and shell installers are on the
-[GitHub Releases](https://github.com/hirefrank/confidant/releases) page.
-Supported platforms: **macOS** (Apple Silicon and Intel) and **Linux**
-(x86_64). Windows users run Confidant under
-[WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) — native
-Windows builds are not provided.
-`confidant update` keeps the install current (re-run the installer or
-`cargo install confidant-cli`, then `confidant setup` to re-link).
+**No agent?** `cargo install confidant-cli && confidant setup --agent auto`
+(Rust 1.88+); prebuilt binaries are on
+[GitHub Releases](https://github.com/hirefrank/confidant/releases) for macOS
+and Linux (x86_64), Windows under
+[WSL2](https://learn.microsoft.com/en-us/windows/wsl/install). To update,
+re-run the installer or `cargo install`, then `confidant setup`.
+Contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-`setup` installs the integration skills shipped inside the binary into your
-agent's skills dir — no repo checkout needed.
+## First five minutes: the people in your life
 
-**Dev install** (contributors, see [`CONTRIBUTING.md`](CONTRIBUTING.md)):
+The demo vault is fake data: a friend, a sibling, a partner, a mentor, and
+a small coaching practice. Copy it out so writes commit to a scratch repo:
 
 ```sh
-git clone https://github.com/hirefrank/confidant.git
-cd confidant
-cargo run -p confidant-cli -- check --json --no-input --vault examples/demo-vault
+git clone --depth 1 https://github.com/hirefrank/confidant
+cp -r confidant/examples/demo-vault /tmp/confidant-demo
+cd /tmp/confidant-demo && git init -q && git add -A
+git commit -qm "demo vault" && export CONFIDANT_VAULT="$PWD"
 ```
 
-## Quickstart
+`confidant record list` prints six people (a seventh, `no-ai: true`, is
+absent). `confidant check` lists what needs attention:
 
-When creating or connecting a vault, choose **encrypted** (real data) or
-**plaintext** (demo/fixtures only) up front — see
-[`docs/agent-setup.md`](docs/agent-setup.md#encrypted-vault-vs-plaintext-demo):
+```text
+warning  W_CADENCE_OVERDUE  people/p-01M3TC5H00MPJG000000000101/profile.md  p-01M3TC5H00MPJG000000000101
+    person p-01M3TC5H00MPJG000000000101 has no touchpoint on or after 2026-09-17 (last was 2026-09-10, cadence 21d)
+    fix: Log a touchpoint with `confidant log touch p-01M3TC5H00MPJG000000000101 <kind>` or widen cadence
+warning  W_DATE_UPCOMING  people/p-01M3TC5H00MPJG000000000102/profile.md  p-01M3TC5H00MPJG000000000102
+    upcoming date for p-01M3TC5H00MPJG000000000102 on 2026-10-12 (in 4d)
+    fix: Reach out to p-01M3TC5H00MPJG000000000102 or set `[checks] personal.date_upcoming = "off"`
+0 error(s), 2 warning(s)
+```
 
-- **Real relationship data (encrypted, default):** scaffold a fresh vault
-  with `confidant init --create` (or prepare one by hand: a git repo with a
-  committed `confidant.toml` and a clean tree, then `confidant init`). Never
-  copy the demo vault's `[crypto] mode = "plaintext"` opt-out into a real
-  vault. Record bodies are encrypted in git; ledger lines stay structural
-  plaintext.
-- **Demo / learning / fixtures only (plaintext opt-out):** set
-  `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the
-  vault is structurally plaintext) and do **not** run `confidant init`. Never
-  use for real PII — `git clone` exposes all record content.
+Those warnings are the feature, not breakage: Dana's 21-day cadence says
+"reach out"; Eli's birthday is four days after the pinned `as_of`
+(`2026-10-08`). Warnings never block a write; `--fail-on warning` makes
+them fail on purpose.
 
-Create an encrypted vault in one command (or point `CONFIDANT_VAULT` at an
-existing one) and check it:
+### Add someone and log a touch
+
+A person is a record with an ID in front matter; personal fields are
+optional:
 
 ```sh
-export CONFIDANT_VAULT="$HOME/vault"
-# --create scaffolds an absent or empty directory: mkdir, `git init`,
-# `.gitignore` with `.confidant/`, a committed `confidant.toml`, then the
-# vault keys. Add `--packs coaching@0.1` to record packs in confidant.toml
-# (default: none).
-confidant init --create --no-input   # shows a 24-word recovery phrase once on stderr — store it offline
+cat > /tmp/robin.md <<'PERSON'
+---
+id: p-01M3TC5H00MPJG000000000105
+type: person
+name: Robin Example
+relationship: friend
+birthday: --11-04
+cadence: 30d
+---
+Fake neighbour; we climb on Thursdays.
+PERSON
+confidant record add --file /tmp/robin.md
 confidant check
-confidant check --json --no-input
 ```
 
-To try it with fake data, use the demo vault (`[crypto] mode = "plaintext"` — **fake data only**):
+Robin has no touchpoint, so `check` adds a `W_CADENCE_OVERDUE` with the
+"no touchpoint logged" wording. Log the contact and it clears:
 
 ```sh
-confidant find "Ada Example" --json --vault examples/demo-vault
+confidant log touch "Robin Example" text --date 2026-10-08
+confidant check
 ```
 
-`--json` is on every command. `--no-input` never prompts. Discovery order is
-`--vault`, then `CONFIDANT_VAULT`, then a walk up from the current directory
-looking for `confidant.toml`, then `default_vault` in `~/.config/confidant/config.toml`.
+`log touch` resolves the display name and writes one committed ledger line.
+The demo is plaintext fake data; for real people, `confidant init --create
+--no-input` on an empty directory makes an encrypted vault and prints a
+24-word recovery phrase once (store it offline).
 
-## What's in the box today
+## How your agents use it
 
-The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
-`CONFIDANT_VAULT` (or pass `--vault`) so they never write the wrong tree.
+`confidant setup --agent auto` links the embedded skills. Agents use the
+CLI — or `confidant mcp`, a thin stdio wrapper over the same commands — and
+follow one workflow: propose, confirm, apply. Every command takes `--json`
+and `--no-input`; usage errors exit 2; branch on `code`, never message text.
 
-| Area | Commands | Notes |
-|---|---|---|
-| Write | `record add`, `record edit`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
-| Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster; `--for-operator` on `find`, `context`, or `record list` is operator-only and adds `no-ai` records (a tri-state `no_ai`; a `find` ledger hit carries `operator_only: true` when the flag is why it shows); `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
-| Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
-| Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
-| Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |
-| Search | `reindex` + `qmd-search` skill | QMD index is local, gitignored, built from the cleared set only |
-| Health | `doctor` | Staleness checks, skills-link health |
-| Agents | `mcp`, `setup`, `update`, `agents`, `which`, `routing` | MCP is a thin stdio wrapper over the CLI — never a second code path |
+`confidant mcp` exposes ten fixed tools (`check`, `doctor`, `find`,
+`context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
+`pack_skill`); no tool can widen that list. A write runs `check` and commits once. `--packs` scopes
+reads (on `mcp` it is the instance ceiling) as a read-time policy filter,
+not cryptography ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
+[`docs/threat-model-agents.md`](docs/threat-model-agents.md)).
 
-Wherever a command takes a person (`--person` on `log session`, `log touch`,
-`note add`, and `context`), it accepts either a `p-<ULID>` or an **exact
-display name**: trimmed, case-insensitive, whole-string equality against the
-§12 cleared set (`find` stays the fuzzy path). A name belonging to a
-merged-away member resolves to the canonical person. Writes resolved by name
-echo the resolved `p-<ULID>` (and name) so a wrong pick is visible.
-`confidant resolve <query>` is the read-only lookup. A `no-ai: true` person
-is addressed by `p-<ULID>` only — never by name — and an ambiguous name fails
-closed with `E_AMBIGUOUS_PERSON` rather than guessing.
+`no-ai` keeps a record out of agent output; `--for-operator` on `find`,
+`context`, and `record list` is the operator-only escape hatch, and MCP
+never passes it. `--person` (on `log session`, `log touch`, `note add`,
+`context`) takes a `p-<ULID>` or an **exact display name**; `find` stays
+fuzzy and `no-ai: true` people are ID-only.
 
-**Aliases** turn a `kind:value` (`email`, `phone`, or `handle`) into a
-person. `confidant alias add <person> <kind>` appends the
-`DATE alias <p-ULID> KIND hmac:HEX` ledger line, and
-`confidant alias resolve <kind>` maps a value back to the canonical person.
-The raw value is PII: both read it from stdin or `--value-file`, **never** an
-argument, and never echo it — only the `hmac:` appears. `alias resolve`
-honors `no-ai` like other reads (an alias on a `no-ai: true` person is not
-surfaced), and two cleared people sharing one alias fails closed with
-`E_AMBIGUOUS_PERSON`. Alias HMACs are computed with the vault lookup key, so
-these commands need an enrolled device (see [`docs/crypto-design.md`](docs/crypto-design.md) §10).
+| Area | Commands |
+|---|---|
+| Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` |
+| Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
+| Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
+| Packs | `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
+| Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` |
+| Inbox | `inbox`, `inbox rotate` |
+| Search | `reindex` + `qmd-search` skill |
+| Health | `doctor` |
+| Agents | `mcp`, `setup`, `update`, `agents`, `which`, `routing`, `tui` |
+
+**Aliases** map a `kind:value` to a person. The raw value is PII: `alias
+add` and `alias resolve` read it from stdin or `--value-file`, never an
+argument, and emit only `hmac:`.
+
+## The TUI
+
+`confidant-tui` is a terminal UI for the roster, a person's context, vault
+health, quick capture, and review of queued work. It consumes only the
+ADR-7 CLI JSON contract and keeps plaintext on the alternate screen only.
+Install both with `cargo install confidant-cli confidant-tui`, then run
+`confidant tui --vault examples/demo-vault`.
+
+Operator mode (`!`) is off by default; `e` edits through the operator-only
+path, `s` / `t` / `n` capture a session, touch, or note, and `2` opens the
+review queue. Tabs and phase history: [`docs/tui.md`](docs/tui.md).
 
 ## Packs
 
-A **schema pack** declares extra verbs, record types, front-matter fields,
-balance metrics, and check rules. Packs are the extension mechanism: the
-core stays generic, and a pack turns Confidant into a tool for a specific
-domain.
+A **schema pack** declares extra verbs, types, fields, rules, and metrics;
+its manifest ([`spec/pack-manifest.md`](spec/pack-manifest.md)) is the
+machine-readable contract.
 
-- **`coaching@0.1`** ships as an external pack in this repo. A vault that
-  lists it must vendor it; otherwise `check` fails with `E_PACK_UNKNOWN` and
-  writes are blocked. Install it with:
+**`personal@0.2` — built in, always on.** Every vault has it whether or not
+`packs` lists it; a `personal@…` entry is a no-op. It adds `birthday`
+(`YYYY-MM-DD` or year-less `--MM-DD`), recurring `dates`, `relationship`,
+`cadence` (`21d`, or `never`) with `snooze_until`, identity and contact
+fields, relationship edges (`friend`, `family`, `sibling`, `partner`,
+`parent`, `mentor`, plus the core kinds), and the `touch` verb
+(`call|text|email|meet|meal|event|gift|other`). Two warning-level rules
+never block a write: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING`. Contract:
+[`packs/personal/0.2.md`](packs/personal/0.2.md).
 
-  ```sh
-  confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
-  ```
+**`coaching@0.1` — optional, for a practice.** A vault that lists it must
+vendor it, or `check` fails with `E_PACK_UNKNOWN` and writes are blocked:
 
-  It adds sessions, packages, ICF hours, balance assertions, and gap rules
-  (a session with no notes; a paid client with no session inside a
-  configurable window). If you run a coaching practice, this pack covers what
-  you'd otherwise need a coaching CRM for — without the sales-pipeline
-  baggage.
-- **`personal@0.2`** is the built-in personal pack. It is **implicit**:
-  every vault has it, whether or not `packs` lists it (`packs = []` still
-  enables it), and a `personal@…` entry is a no-op. It adds birthdays,
-  relationship edges (`friend`, `family`, `sibling`, `partner`, `parent`,
-  `mentor`), keep-in-touch cadence (`W_CADENCE_OVERDUE`), upcoming
-  important dates (`W_DATE_UPCOMING`), and the `touch` ledger verb
-  (`confidant log touch <person> call|text|email|meet|meal|event|gift|other`) for lightweight
-  touchpoints. Both cadence and date nudges are warning-level and never block
-  a write.
-- **Multi-pack vaults** ([issue #173](https://github.com/hirefrank/confidant/issues/173)):
-  a vault can list additional packs at once (`packs = [...]` in
-  `confidant.toml`), e.g. `packs = ["coaching@0.1"]`. Per-pack
-  access scoping — so one person can be a coaching
-  client and a friend, and a coaching agent never sees personal notes —
-  is still to come.
-- **External packs** ([issue #193](https://github.com/hirefrank/confidant/issues/193)):
-  installable, versioned packs are vendored into the vault under `packs/`
-  and pinned in `confidant.lock`, so third parties can publish packs without
-  opening a PR here. `coaching@0.1` ships this way.
+```sh
+confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
+```
 
-Pack specs live in [`packs/`](packs/). The coaching pack's human-readable
-contract is [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+It adds sessions, packages, ICF hours, balance assertions, and gap rules
+(a session with no notes; a paid client with no session in a configurable
+window). Contract: [`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+
+Packs share a vault; `--packs` scopes a read to the packs you name. They
+are vendored under `packs/` and pinned in `confidant.lock`, and `pack
+verify` checks them against the pin. Scoping is a read-time policy filter,
+not per-pack cryptography
+([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178)).
 
 ## Search
 
-There are two search paths, and the CLI is the source of truth for both.
-
-**`confidant find`** scans the vault directly. It is exact, deterministic,
-and fail-closed: it returns content only from the **cleared allowlist** — a
-record is searchable only when it parsed cleanly, has no `no-ai: true` flag
-(a `no-ai: notes` person stays searchable; their notes don't), and
-every ID it references is cleared. If a record is uncleared, it is omitted
-from results entirely (not redacted — omitted). This is enough for a few
-hundred clients; numbers are in
+**`confidant find`** scans the vault directly, exact and fail-closed: it
+returns content only from the **cleared allowlist** — parsed cleanly, no
+`no-ai: true` flag, every referenced ID cleared. An uncleared record is
+omitted, not redacted. Numbers:
 [`docs/search-benchmark.md`](docs/search-benchmark.md).
 
-**QMD search** is an optional, local-first semantic search layer
-([BM25 + vectors + reranking, all on-device](https://github.com/tobi/qmd)).
-It is not a dependency of the Rust CLI — it ships as an embedded skill you
-run through `confidant setup`. `confidant reindex` builds the QMD corpus
-through the CLI from the §12 cleared set only; the index lives under
-`<vault>/.confidant/` (gitignored, never committed, never synced). At query
-time the `qmd-search` skill asks the CLI to verify every hit against the
-allowlist before returning it, so a query-path bug degrades to missing
-results rather than risking a leak. `no-ai` records are never decrypted
-into the corpus.
-
-If QMD is not installed or the index is missing, `qmd-search` falls back to
-`confidant find` and says so — it never falls back silently.
+**QMD search** is an optional on-device semantic layer (BM25 + vectors +
+reranking), shipped as an embedded skill, not a CLI dependency.
+`confidant reindex` builds the corpus from the cleared set under
+`<vault>/.confidant/` (gitignored, never committed). `qmd-search` verifies
+every hit through the CLI, so a query-path bug degrades to missing results;
+without QMD it falls back to `confidant find` and says so.
 
 ## Encryption and privacy
 
 **Plaintext belongs only on trusted devices** (your laptop, or an agent
-computer acting for you). A git remote must not hold client notes in
-plaintext. On a keyed vault the write path encrypts record content:
-`record add`, `note add`, and `log session --note` write §14 envelopes
-(per-client data keys; `name:` lives only inside the ciphertext), and inbox
-`RecordWrite` items are encrypted at drain time with the vault's device
-key (without a record encryptor the drain fails closed rather than
-writing plaintext). Ledger entries,
-`import`, and `confidant.toml` stay plaintext by design. A vault with
-`[crypto] mode = "plaintext"` in `confidant.toml` opts out (only for vaults
-that hold no real data, such as the demo vault); the opt-out can never
-downgrade a vault that already has keys. Existing plaintext records are
-never encrypted in place.
+computer acting for you); a git remote must not hold notes in plaintext. On
+a keyed vault the write path encrypts record content: `record add`,
+`note add`, and `log session --note` write §14 envelopes (per-client data
+keys; `name:` lives only inside the ciphertext), and inbox items encrypt at
+drain time. Ledger entries, `import`, and `confidant.toml` stay plaintext by
+design — a `touch` line carries a date, an opaque ID, and a kind, never
+prose.
 
-Encrypted reads work too: `find`, `context`, and MCP decrypt cleared records
-through the CLI (never `no-ai` records, except the operator-only
-`--for-operator` flag), so search and context work on keyed vaults.
+A `[crypto] mode = "plaintext"` vault opts out; that is only for vaults with
+no real data and can never downgrade a keyed vault. Existing plaintext
+records are never encrypted in place. `find`, `context`, and
+MCP decrypt cleared records (never `no-ai`, except the operator-only
+`--for-operator` flag). Content an agent reads is sent to a hosted model
+provider; this is explicit and accepted, and Confidant makes no claim about
+what the provider stores.
 
-When an agent reads notes, that content is sent to a hosted model provider.
-This is explicit and accepted. Confidant does not claim the provider stores
-nothing; that depends on the provider's terms.
-
-The full allowlist rules (merge groups, ledger lines, package propagation,
-ID edge cases) are in [`docs/privacy.md`](docs/privacy.md). What an
-MCP-connected agent can and cannot do — and exactly what `no-ai`, the
-`check` gate, and the inbox guarantee — is in
+`no-ai` is an exposure control, not access control. Content stays out of
+`find`, `context`, the allowlist, and the search corpus, while `context`
+still serves derived ledger metadata and the flag itself is visible in the
+envelope header. A stolen unlocked device defeats every guarantee. See
+[`docs/privacy.md`](docs/privacy.md) and
 [`docs/threat-model-agents.md`](docs/threat-model-agents.md).
 
 `confidant doctor` checks GitHub for the latest release and reports skills
@@ -249,173 +299,40 @@ included, and only the `tag_name` is read — the response body is discarded.
 Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 `staleness check disabled`.
 
-## Agent setup
+## Where to go deeper
 
-Agents use the CLI plus its embedded integration skills (imports, search).
-One page covers it all — including a single copy/paste prompt that
-installs everything and a loop for staying current:
-[`docs/agent-setup.md`](docs/agent-setup.md).
-
-## Layout
-
-See [`spec/0.1.md`](spec/0.1.md). Short version:
-
-```
-vault/
-├── confidant.toml
-├── ledger/2026/10.cfd      # dated facts, one file per month
-├── people/p-<ULID>/profile.md
-├── people/p-<ULID>/notes/n-<ULID>.md
-├── orgs/o-<ULID>/org.md
-├── deals/d-<ULID>/deal.md
-└── .confidant/             # local cache, gitignored
-```
-
-Structured facts are ledger lines (`DATE VERB ID ARGS…`). Prose is Markdown.
-`balance` lines are assertions `check` verifies against computed values.
-
-## `confidant check`
-
-Read-only. Collects every finding; it does not repair. Stable finding codes
-are part of the spec ([`spec/findings.md`](spec/findings.md)). Callers branch
-on `code`, never on message text.
-
-Gap rules from the architecture (section 9b): a session with no notes, and a
-paid client (`sessions_remaining > 0` or a `pps` session in the lookback)
-with no session inside a configurable window. The gap clock runs from
-`max(last session, latest open)`. Session billing tags are `paid`
-(consumes a slot), `pps`, and `comp` (complimentary; never consume). A
-session with none of these still consumes and is `W_COACHING_SESSION_UNTAGGED`; more
-than one is `E_COACHING_SESSION_TAGS`. A merge between different record types is
-`E_WRONG_ID_TYPE`. `find` follows the section 12 allowlist.
-
-```sh
-confidant check --json --fail-on warning --as-of 2026-10-08
-```
-
-## TUI
-
-`confidant-tui` is a terminal UI for `check`, `find`, `context`, and
-`doctor`, plus confirm-before-apply review of skill proposals and QMD-backed
-search. It consumes
-only the ADR-7 CLI JSON contract
-(`confidant <subcommand> --json --no-input`), never opens vault files
-directly, and keeps plaintext on the alternate screen only.
-
-The proposals tab (Phase 2, #211) lists the manifests in
-`<vault>/.confidant/proposals/` and applies them exactly as the skill
-workflow does: ledger import, then notes, then records — each step shown as
-a dry-run diff first and applied only on an explicit `y` confirm. Records
-are never hand-written into the vault tree (pre-M2 records stay with the
-skill workflow); every write goes through the CLI, one commit per write,
-with progress tracked so a crashed apply resumes where it stopped.
-
-The inbox tab (Phase 3, #212) shows the `inbox --dry-run` plan — items with
-their merge actions, deferred items, and warnings — and applies it
-all-or-nothing through the existing `inbox` command on an explicit `y`
-confirm. There is no per-item selection in the TUI.
-
-It ships both as a GitHub Releases binary (next to `confidant`) and on
-crates.io. You need **both** binaries: the TUI shells out to a `confidant`
-on `PATH` that speaks the same agent contract (`schema_version == "1"`) —
-it never bundles its own copy. Install with:
-
-```sh
-cargo install confidant-cli confidant-tui
-```
-
-then launch it with `confidant tui` (extra arguments pass through to
-`confidant-tui`). From a checkout:
-
-```sh
-cargo run -p confidant-tui -- --vault examples/demo-vault
-```
-
-`--vault` falls back to the `CONFIDANT_VAULT` environment variable when it
-isn't passed, so the vault path doesn't have to be given on every command
-line — same as the `confidant` CLI itself.
-
-The Search tab (Phase 3a, #212) runs the `qmd-search` skill's `qmd-query.py`
-against the vault's QMD index and renders each match with its provenance
-(`qmd` or `find`) and score. Rendering is fail-closed: matches with any
-other provenance are dropped and counted. When QMD or the index is missing,
-the skill falls back to plain `confidant find` and the tab shows a
-`fallback: <reason>` banner. If `python3` or the skill itself is missing, the
-tab shows an alert instead of falling back silently.
-
-The People workspace shows the cleared roster and the selected person's live
-`context`. `!` toggles **operator mode**: the roster and context are then read
-with `--for-operator`, so `no-ai` people and notes appear with a tri-state
-`[no-ai]` / `[no-ai: notes]` badge, and the footer carries the same
-`OPERATOR MODE` banner the CLI prints, so a screen share cannot silently show
-hidden data. Operator mode is off by default — the TUI passes the flag only
-after that explicit key press. Turning it off drops the operator roster and
-context before reloading, so a failed reload cannot leave hidden content on
-screen without the banner.
-
-Editing is always operator-only, independent of operator mode: from the
-context pane, `[`/`]` select the person, a note, or an interaction and `e`
-edits it. `e` uses `record show --for-edit` / `note show --for-edit`, which
-decrypt `no-ai` records even while the roster view is un-badged (operator mode
-off); the badges and banner describe the roster/context view, not the edit
-path. The text is staged in 0600 scratch under
-`<vault>/.confidant/conflicts/<id>/`, opens in `$EDITOR`/`$VISUAL` (run as a
-single program, so `EDITOR="code -w"` does not work — the same limitation as
-the CLI's own `--edit` flows), and is written back through `record edit` /
-`note edit --file` only after an explicit `y` confirm. A no-op edit commits
-nothing.
-
-Quick capture is `s` (session), `t` (touch), and `n` (note). Each opens a
-form pre-filled with the selected person's id, so a ULID never has to be
-typed, and `Enter` runs the CLI's `--dry-run` preview; `y` writes it (one
-commit) and any other key cancels and writes nothing. A note body is staged
-in the same 0600 gitignored scratch as the editor flow and removed after the
-write. Search moved to `f` (it was `s`). The Review Queue workspace (`2`)
-carries a badge with its pending count — proposal manifests, inbox items, and
-unresolved conflicts — so a queued item is visible from every workspace.
+- [`spec/0.1.md`](spec/0.1.md) — vault format; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
+- [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
+- [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, shred; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
+- [`docs/crypto-design.md`](docs/crypto-design.md) — keys, envelopes, recovery; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
+- [`packs/`](packs/) — pack contracts; [`docs/search-benchmark.md`](docs/search-benchmark.md) — search numbers.
 
 ## Where we're going
 
-The roadmap is tracked as open issues on GitHub. The big themes:
+The roadmap is the open issues on GitHub. The current themes:
 
-- **Multi-pack vaults** — one vault, several packs, per-pack scoping.
-  [Issue #173](https://github.com/hirefrank/confidant/issues/173) is the
-  umbrella; the implicit built-in `personal@0.2` is the proving pack
-  ([#184](https://github.com/hirefrank/confidant/issues/184)).
-- **External packs** — installable, versioned, loaded at runtime so third
-  parties can publish packs without a PR here.
-  [Issue #193](https://github.com/hirefrank/confidant/issues/193).
-- **TUI** — a terminal UI on top of the agent contract, with write flows
-  and proposal review (Phase 2, #211).
-  [Issue #205](https://github.com/hirefrank/confidant/issues/205).
-- **Encrypted editing** — `record edit`, `record show --for-edit`, and the
-  operator-only `note show --for-edit` / `note edit` pair
-  (#216, #557). The TUI now puts these behind `e` in the context pane
-  (#556 phase 2).
-- **Ciphertext merge conflicts** — detection and resolution for encrypted
-  records. [Issue #219](https://github.com/hirefrank/confidant/issues/219).
-- **Ledger query performance** — a rebuildable local index.
-  [Issue #188](https://github.com/hirefrank/confidant/issues/188).
+- **Outside crypto audit** — [#138](https://github.com/hirefrank/confidant/issues/138), the gate on public launch.
+- **Crypto scope and shredding** — scoped recipients ([#160](https://github.com/hirefrank/confidant/issues/160)), pair keys for edges ([#257](https://github.com/hirefrank/confidant/issues/257)), a real shred path ([#155](https://github.com/hirefrank/confidant/issues/155)).
+- **Agent ergonomics** — cache decrypted reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
+- **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
+- **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), safe `init --force` ([#640](https://github.com/hirefrank/confidant/issues/640)), a reset path for local state ([#638](https://github.com/hirefrank/confidant/issues/638)).
 
 ## Status: not yet audited
 
 **The encryption has had no outside review.** The design was reviewed
-in-project and the implementation's tests pass, but no independent reviewer
-has audited it. Tracked in
-[#138](https://github.com/hirefrank/confidant/issues/138).
+in-project and the tests pass, but no independent reviewer has audited it.
+Tracked in [#138](https://github.com/hirefrank/confidant/issues/138).
 
-So, today: **keep vaults on trusted devices with encrypted disks, and do not
-put other people's client data in them.** `confidant check`, the privacy
-allowlist, and `no-ai` all work, but they are not a substitute for the
-outside audit. This section will say plainly when the audit lands; until
-then it is the disclosure.
+So, today: **keep vaults on trusted devices with encrypted disks, and do
+not put other people's sensitive data in them.** `check`, the privacy
+allowlist, and `no-ai` work, but they are not a substitute for the outside
+audit. This section will say plainly when the audit lands.
 
 ## License
 
-Copyright 2026 Frank Harris.
-
-Licensed under the Apache License, Version 2.0 (`license = "Apache-2.0"` in
-[`Cargo.toml`](Cargo.toml)). See [`LICENSE`](LICENSE) for the full text.
-Some files are adapted from [cr](https://github.com/AnandChowdhary/cr)
-(MIT); see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) and
+Copyright 2026 Frank Harris. Licensed under the Apache License, Version 2.0
+(`license = "Apache-2.0"` in [`Cargo.toml`](Cargo.toml)). See
+[`LICENSE`](LICENSE) for the full text. Some files are adapted from
+[cr](https://github.com/AnandChowdhary/cr) (MIT); see
+[`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES) and
 [`docs/borrowing.md`](docs/borrowing.md).

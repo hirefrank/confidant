@@ -3,7 +3,8 @@
 Confidant's search is **fail-closed**: a record is searchable only when it
 parses cleanly, carries no `no-ai` flag, and every ID it references is
 cleared. This document describes the allowlist mechanics in detail. For the
-short version, see the README's [Privacy](../README.md#read-this) section.
+short version, see the README's
+[Encryption and privacy](../README.md#encryption-and-privacy) section.
 
 ## What `confidant find` returns
 
