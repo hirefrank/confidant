@@ -539,12 +539,19 @@ fn live_shape_against_demo_vault_check_find_context_doctor() {
     let runner =
         ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
 
-    // 1. check: demo vault is clean ("0 findings").
+    // 1. check: demo vault is healthy, with the two personal warning nudges.
     let raw_check = runner.run(&["check"]).expect("run check");
     match parse_raw_output::<CheckReport>(&raw_check) {
         ContractOutcome::Ok { ok, data, .. } => {
             assert!(ok);
-            assert!(data.findings.is_empty());
+            assert_eq!(data.summary.errors, 0);
+            assert_eq!(data.summary.warnings, 2);
+            let codes: Vec<&str> = data
+                .findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect();
+            assert_eq!(codes, vec!["W_CADENCE_OVERDUE", "W_DATE_UPCOMING"]);
         }
         other => panic!("unexpected check outcome: {other:?}"),
     }
@@ -589,15 +596,23 @@ fn live_shape_against_demo_vault_check_find_context_doctor() {
     }
 
     // Also verify end-to-end through App against the demo vault:
-    // Check view on demo vault renders "0 findings".
+    // Check view on demo vault renders the two personal nudges.
     let mut app = App::new(runner);
     app.load_check();
     // Phase 1 defaults to People; switch to the Check workspace.
     app.handle_key(key(KeyCode::Char('3')));
     let check_screen = render_to_string(&app);
     assert!(
-        check_screen.contains("0 findings"),
-        "expected '0 findings' on demo vault check screen:\n{check_screen}"
+        check_screen.contains("findings 2"),
+        "expected two findings on demo vault check screen:\n{check_screen}"
+    );
+    assert!(
+        check_screen.contains("W_CADENCE_OVERDUE"),
+        "expected the overdue-cadence nudge:\n{check_screen}"
+    );
+    assert!(
+        check_screen.contains("W_DATE_UPCOMING"),
+        "expected the upcoming-date nudge:\n{check_screen}"
     );
 }
 
@@ -2385,7 +2400,17 @@ fn live_roster_against_demo_vault_omits_no_ai_people() {
         .iter()
         .map(|entry| entry.name.as_str())
         .collect();
-    assert_eq!(names, vec!["Ada Example", "Bea Demo"]);
+    assert_eq!(
+        names,
+        vec![
+            "Ada Example",
+            "Bea Demo",
+            "Dana Example",
+            "Eli Sample",
+            "Fay Demo",
+            "Gus Example",
+        ]
+    );
     assert!(!names.contains(&"Cam Sample"), "no-ai person must stay out");
     assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
     let rendered = render_to_string(&app);

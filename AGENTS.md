@@ -104,6 +104,17 @@ dependency, commit the updated `Cargo.lock`, and make sure its license is on
 the `deny.toml` allow list and it comes from crates.io (unknown registries
 and git sources are denied).
 
+Content under `packs/`, `examples/`, `testdata/`,
+`crates/confidant-core/pack-manifests/`, `crates/confidant-cli/pack-skills/`
+and `crates/confidant-cli/skills/` is **not** documentation, whatever its
+extension: it is hash-pinned or embedded content that drives behaviour
+(#636). Editing it means re-pinning or re-vendoring it in the same PR: run
+`python3 .github/scripts/sync-packs.py`, and for a vault that pins the pack
+(the demo vault) refresh the pin with the CLI
+(`confidant pack update <name> --from-dir <pack> --yes`), then confirm
+`check --json` on that vault is `ok:true`. Such a change cannot ride the
+docs-only fast path; expect the full suite.
+
 ## Hard rules
 
 These are blocking. Do not open a PR for review that breaks one.

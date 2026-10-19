@@ -116,6 +116,32 @@ jobs:
             done <<< "$files"
           fi
           echo "qa_relevant=$qa_relevant" >> "$GITHUB_OUTPUT"
+      - name: report what this run covers
+        # Reporting only (#636): a docs-only run reports green for the whole
+        # matrix while the heavy steps execute nothing, so a reviewer cannot
+        # tell "passed" from "skipped". This step reads the classifier's
+        # outputs and changes no gate conditions.
+        env:
+          DOCS_ONLY: ${{ steps.detect.outputs.docs_only }}
+          QA_RELEVANT: ${{ steps.detect.outputs.qa_relevant }}
+        run: |
+          {
+            echo "### Change classification"
+            echo ""
+            echo "| output | value |"
+            echo "| --- | --- |"
+            echo "| docs_only | $DOCS_ONLY |"
+            echo "| qa_relevant | $QA_RELEVANT |"
+            if [ "$DOCS_ONLY" = "true" ]; then
+              echo ""
+              echo "**Skipped gates:** this is a docs-only change, so the fmt, clippy, test, skills smoke and qa smoke steps were skipped and therefore verified nothing in this run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DOCS_ONLY" = "true" ]; then
+            echo "::notice title=Skipped gates::docs_only=true — test, skills smoke and qa smoke ran no steps on this run"
+          else
+            echo "::notice title=Change classification::docs_only=false qa_relevant=$QA_RELEVANT"
+          fi
 
   msrv:
     name: msrv (1.88)
@@ -132,6 +158,11 @@ jobs:
       - name: check
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo +1.88 check --workspace --locked
+      # Visibility only (#636): say so here too, so a green docs-only check
+      # does not read as "verified".
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
 
   test:
     name: test (${{ matrix.os }})
@@ -166,6 +197,9 @@ jobs:
       - name: confidant check demo vault
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo run -p confidant-cli --locked -- check --json --no-input --vault examples/demo-vault
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
 
   skills-smoke:
     name: skills smoke
@@ -191,6 +225,9 @@ jobs:
         # so the §12 verification and the one-allowlist-call contract stay
         # covered (#538).
         run: python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
 
   qa-smoke:
     name: qa smoke
@@ -230,6 +267,9 @@ jobs:
         run: |
           set -o pipefail
           python3 .github/scripts/qa-smoke.py --cli target/debug/confidant 2>&1 | tee qa-smoke.log
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
       # A red night must land on the queue a human already watches, without
       # filing a new issue every time. The alert updates one `qa-found` issue
       # in place, and only for `main`: a manual dispatch on a branch cannot
@@ -260,6 +300,9 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
         with:
           command: check
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
 
   audit:
     name: cargo audit
@@ -280,6 +323,9 @@ jobs:
       - name: cargo audit
         if: needs.changes.outputs.docs_only != 'true'
         run: cargo audit
+      - name: docs-only skip notice
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "::notice title=Skipped gates::job '${{ github.job }}' ran no steps because this change is docs-only"
 
   package-paths:
     name: crate path check
