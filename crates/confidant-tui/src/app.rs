@@ -2037,6 +2037,21 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// The tone of the cached doctor status pill: neutral until doctor has
+    /// run, then red/amber/green by the worst cached check.
+    fn doctor_tone(&self) -> theme::Tone {
+        let Some(report) = &self.doctor.report else {
+            return theme::Tone::Neutral;
+        };
+        if report.checks.iter().any(|check| check.status == "error") {
+            theme::Tone::Error
+        } else if report.checks.iter().any(|check| check.status == "warning") {
+            theme::Tone::Warn
+        } else {
+            theme::Tone::Ok
+        }
+    }
+
     fn open_scope_modal(&mut self) {
         self.info_modal = Some(InfoState::new(
             "Scope",
@@ -2963,7 +2978,7 @@ impl<R: Runner> App<R> {
             theme::pill(&self.scope_label()),
             Span::raw("  "),
             theme::label("doctor "),
-            theme::pill(&self.doctor_label()),
+            theme::tone_pill(&self.doctor_label(), self.doctor_tone()),
         ]);
         frame.render_widget(Paragraph::new(status), rows[1]);
     }
@@ -3311,5 +3326,31 @@ mod tests {
         // No PATH / no vault -> not available.
         assert!(!qmd_available_on(None, Some(&vault)));
         assert!(!qmd_available_on(Some(&path_var), None));
+    }
+
+    /// The header's doctor status pill carries the cached report's worst
+    /// tone, and stays neutral until doctor has run.
+    #[test]
+    fn doctor_tone_follows_the_cached_report() {
+        use crate::contract::DoctorCheck;
+        use crate::runner::FakeRunner;
+
+        let mut app = App::new(FakeRunner::new());
+        assert_eq!(app.doctor_tone(), theme::Tone::Neutral);
+
+        app.doctor.report = Some(DoctorReport {
+            checks: vec![DoctorCheck {
+                id: "spec".to_owned(),
+                status: "ok".to_owned(),
+                message: String::new(),
+            }],
+        });
+        assert_eq!(app.doctor_tone(), theme::Tone::Ok);
+
+        app.doctor.report.as_mut().unwrap().checks[0].status = "warning".to_owned();
+        assert_eq!(app.doctor_tone(), theme::Tone::Warn);
+
+        app.doctor.report.as_mut().unwrap().checks[0].status = "error".to_owned();
+        assert_eq!(app.doctor_tone(), theme::Tone::Error);
     }
 }

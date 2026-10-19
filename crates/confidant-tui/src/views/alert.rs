@@ -2,7 +2,7 @@
 //! contract version mismatches.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -156,12 +156,12 @@ pub fn render(state: &AlertState, frame: &mut Frame<'_>, area: Rect) {
     if let Some(code) = &state.code {
         lines.push(Line::from(vec![
             theme::label("code    "),
-            Span::styled(code.clone(), Style::default().fg(palette::MUTED)),
+            Span::styled(code.clone(), theme::muted()),
         ]));
     }
     lines.push(Line::from(vec![
         theme::label("message "),
-        Span::styled(state.message.clone(), Color::White),
+        Span::styled(state.message.clone(), palette::TEXT),
     ]));
     if let Some(fix) = &state.fix {
         lines.push(Line::from(vec![
@@ -181,10 +181,7 @@ pub fn render(state: &AlertState, frame: &mut Frame<'_>, area: Rect) {
         } else {
             "Press Esc to dismiss, r to retry, or q to quit."
         };
-        lines.push(Line::from(Span::styled(
-            hint,
-            Style::default().fg(palette::MUTED),
-        )));
+        lines.push(Line::from(Span::styled(hint, theme::muted())));
     }
 
     let block = theme::block("").title(Span::styled(format!(" {} ", state.title), title_style));

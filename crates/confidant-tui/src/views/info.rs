@@ -4,7 +4,7 @@
 //! writes or applies.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -44,12 +44,12 @@ pub fn render(state: &InfoState, frame: &mut Frame<'_>, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(ratatui::text::Span::styled(
         "Press any key to close.",
-        Style::default().fg(palette::MUTED),
+        theme::muted(),
     )));
 
     let block = theme::block("").title(ratatui::text::Span::styled(
         format!(" {} ", state.title),
-        Style::default().fg(Color::White).bold(),
+        Style::default().fg(palette::TEXT).bold(),
     ));
     frame.render_widget(
         Paragraph::new(lines)

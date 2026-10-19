@@ -8,7 +8,7 @@
 //! screen only, never logged.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -36,7 +36,7 @@ pub fn render_form(capture: &Capture, frame: &mut Frame<'_>, area: Rect) {
         theme::label("person "),
         theme::pill(&capture.person_id),
         Span::raw(" "),
-        Span::styled(name, Style::default().fg(palette::MUTED)),
+        Span::styled(name, theme::muted()),
     ]));
     lines.push(Line::from(""));
 
@@ -47,17 +47,14 @@ pub fn render_form(capture: &Capture, frame: &mut Frame<'_>, area: Rect) {
         } else {
             Span::raw("  ")
         };
-        let label = Span::styled(
-            format!("{:<9}", field.label),
-            Style::default().fg(palette::MUTED),
-        );
+        let label = Span::styled(format!("{:<9}", field.label), theme::muted());
         let value = match field.kind {
             FieldKind::Text => {
                 let mut text = field.value.clone();
                 if focused {
                     text.push('_');
                 }
-                Span::styled(text, Style::default().fg(Color::White))
+                Span::styled(text, Style::default().fg(palette::TEXT))
             }
             FieldKind::Toggle => Span::styled(
                 if field.enabled { "[x]" } else { "[ ]" },
@@ -72,10 +69,7 @@ pub fn render_form(capture: &Capture, frame: &mut Frame<'_>, area: Rect) {
         if focused {
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(
-                    format!("({})", field.hint),
-                    Style::default().fg(palette::MUTED),
-                ),
+                Span::styled(format!("({})", field.hint), theme::muted()),
             ]));
         }
     }

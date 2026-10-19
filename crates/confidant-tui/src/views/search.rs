@@ -5,7 +5,7 @@
 //! skill fell back to `confidant find`, and drop counts are always visible.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -38,20 +38,17 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
     let query_line = if state.editing {
         Line::from(vec![
             theme::label("query "),
-            Span::styled(format!("{}_", state.input), Color::White),
+            Span::styled(format!("{}_", state.input), palette::TEXT),
         ])
     } else if state.query.is_empty() {
         Line::from(vec![
             theme::label("query "),
-            Span::styled(
-                "(empty — press / to search)",
-                Style::default().fg(palette::MUTED),
-            ),
+            Span::styled("(empty — press / to search)", theme::muted()),
         ])
     } else {
         Line::from(vec![
             theme::label("query "),
-            Span::styled(state.query.clone(), Color::White),
+            Span::styled(state.query.clone(), palette::TEXT),
         ])
     };
     frame.render_widget(
@@ -70,7 +67,7 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
     let Some(res) = result else {
         frame.render_widget(
             Paragraph::new(Line::from(
-                "No search run yet. Press / to enter a query.".dark_gray(),
+                "No search run yet. Press / to enter a query.".fg(palette::MUTED),
             ))
             .block(block),
             area,
@@ -88,14 +85,14 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
     } else if !res.result.mode.is_empty() {
         lines.push(Line::from(vec![
             theme::label("mode: "),
-            Span::styled(res.result.mode.clone(), Color::White),
+            Span::styled(res.result.mode.clone(), palette::TEXT),
         ]));
     }
     let mut count_spans: Vec<Span<'static>> = vec![
         theme::label("matches shown: "),
         Span::styled(
             res.kept.len().to_string(),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         ),
     ];
     if res.result.dropped_uncleared > 0 {
@@ -122,14 +119,14 @@ fn render_matches(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
     let block = theme::block(" Matches ");
     let Some(res) = state.result.as_ref() else {
         frame.render_widget(
-            Paragraph::new(Line::from("No search run yet.".dark_gray())).block(block),
+            Paragraph::new(Line::from("No search run yet.".fg(palette::MUTED))).block(block),
             area,
         );
         return;
     };
     if res.kept.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::from("0 matches".dark_gray())).block(block),
+            Paragraph::new(Line::from("0 matches".fg(palette::MUTED))).block(block),
             area,
         );
         return;
@@ -142,15 +139,9 @@ fn render_matches(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(id, Style::default().fg(palette::ACCENT)),
                 Span::raw(" "),
-                Span::styled(
-                    format!("{}:{}", hit.path, hit.line),
-                    Style::default().fg(palette::MUTED),
-                ),
+                Span::styled(format!("{}:{}", hit.path, hit.line), theme::muted()),
                 Span::raw(" "),
-                Span::styled(
-                    format!("[{} {:.2}]", hit.via, hit.score),
-                    Style::default().fg(palette::MUTED),
-                ),
+                Span::styled(format!("[{} {:.2}]", hit.via, hit.score), theme::muted()),
                 Span::raw("  "),
                 Span::raw(hit.excerpt.clone()),
             ]))
@@ -175,7 +166,7 @@ fn render_detail(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
         .as_ref()
         .and_then(|r| r.kept.get(state.selected))
     {
-        None => vec![Line::from("No match selected.".dark_gray())],
+        None => vec![Line::from("No match selected.".fg(palette::MUTED))],
         Some(hit) => vec![
             Line::from(vec![
                 theme::label("id        "),
@@ -191,7 +182,7 @@ fn render_detail(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
                         "{}:{}  via {}  score {:.4}",
                         hit.path, hit.line, hit.via, hit.score
                     ),
-                    Style::default().fg(palette::MUTED),
+                    theme::muted(),
                 ),
             ]),
             Line::from(vec![

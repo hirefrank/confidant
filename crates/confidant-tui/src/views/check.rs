@@ -1,7 +1,7 @@
 //! Read-only Check view (`confidant check --json --no-input`).
 
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -32,14 +32,14 @@ fn summary_line(r: &CheckReport) -> Line<'static> {
     let mut spans = vec![theme::status_badge(r.ok), Span::raw("  ")];
     spans.extend(theme::labeled(
         "spec ",
-        Span::styled(r.spec.clone(), Color::White),
+        Span::styled(r.spec.clone(), palette::TEXT),
     ));
     spans.push(theme::label("  •  "));
     spans.extend(theme::labeled(
         "records ",
         Span::styled(
             r.summary.records.to_string(),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         ),
     ));
     spans.push(theme::label("  •  "));
@@ -47,7 +47,7 @@ fn summary_line(r: &CheckReport) -> Line<'static> {
         "ledger ",
         Span::styled(
             r.summary.ledger_entries.to_string(),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         ),
     ));
     spans.push(theme::label("  •  "));
@@ -77,9 +77,9 @@ fn finding_row(f: &crate::contract::Finding) -> ListItem<'_> {
     ListItem::new(Line::from(vec![
         theme::severity_tag(&f.severity),
         Span::raw(" "),
-        Span::styled(f.code.clone(), Style::default().fg(Color::White)),
+        Span::styled(f.code.clone(), Style::default().fg(palette::TEXT)),
         Span::raw(" "),
-        Span::styled(id, Style::default().fg(palette::MUTED)),
+        Span::styled(id, theme::muted()),
         Span::raw(" "),
         Span::raw(f.message.clone()),
     ]))
@@ -88,10 +88,7 @@ fn finding_row(f: &crate::contract::Finding) -> ListItem<'_> {
 /// Label/value detail row for the finding detail pane.
 fn detail_row<'a>(label_text: &'a str, value: Span<'a>) -> Line<'a> {
     Line::from(vec![
-        Span::styled(
-            format!("{label_text:<10}"),
-            Style::default().fg(palette::MUTED),
-        ),
+        Span::styled(format!("{label_text:<10}"), theme::muted()),
         value,
     ])
 }
@@ -108,7 +105,7 @@ pub fn render(state: &CheckViewState, frame: &mut Frame<'_>, area: Rect) {
             chunks[0],
         );
         frame.render_widget(
-            Paragraph::new(Line::from("Press r to run check.".dark_gray()))
+            Paragraph::new(Line::from("Press r to run check.".fg(palette::MUTED)))
                 .block(theme::block(" Findings ")),
             chunks[1],
         );
@@ -153,10 +150,7 @@ pub fn render(state: &CheckViewState, frame: &mut Frame<'_>, area: Rect) {
 fn summary_line_placeholder() -> Line<'static> {
     Line::from(vec![
         Span::raw("No check report loaded "),
-        Span::styled(
-            "(press r to run check)",
-            Style::default().fg(palette::MUTED),
-        ),
+        Span::styled("(press r to run check)", theme::muted()),
     ])
 }
 
@@ -173,13 +167,13 @@ fn render_empty_state(r: &CheckReport, frame: &mut Frame<'_>, area: Rect) {
         .split(inner);
 
     let lines = vec![
-        Line::from("✓ Vault is coherent".green().bold()),
+        Line::from("✓ Vault is coherent".fg(palette::SUCCESS).bold()),
         Line::from(
             format!(
                 "0 findings across {} records and {} ledger entries",
                 r.summary.records, r.summary.ledger_entries
             )
-            .dark_gray(),
+            .fg(palette::MUTED),
         ),
     ];
     frame.render_widget(
@@ -192,7 +186,7 @@ fn render_empty_state(r: &CheckReport, frame: &mut Frame<'_>, area: Rect) {
 fn render_detail(r: &CheckReport, selected: usize, frame: &mut Frame<'_>, area: Rect) {
     let block = theme::block(" Detail ");
     let lines: Vec<Line<'_>> = match r.findings.get(selected) {
-        None => vec![Line::from("No finding selected.".dark_gray())],
+        None => vec![Line::from("No finding selected.".fg(palette::MUTED))],
         Some(f) => {
             let loc = match (&f.file, f.line) {
                 (Some(file), Some(line)) => format!("{file}:{line}"),
@@ -201,16 +195,16 @@ fn render_detail(r: &CheckReport, selected: usize, frame: &mut Frame<'_>, area: 
             };
             let id = f.id.clone().unwrap_or_else(|| "-".to_owned());
             vec![
-                detail_row("code", Span::styled(f.code.clone(), Color::White)),
+                detail_row("code", Span::styled(f.code.clone(), palette::TEXT)),
                 detail_row("severity", theme::severity_tag(&f.severity)),
-                detail_row("id", Span::styled(id, Style::default().fg(palette::MUTED))),
+                detail_row("id", Span::styled(id, theme::muted())),
                 detail_row("location", Span::raw(loc)),
                 detail_row("message", Span::raw(f.message.clone())),
                 detail_row(
                     "fix",
                     Span::styled(
                         f.fix.clone().unwrap_or_else(|| "-".to_owned()),
-                        Style::default().fg(palette::MUTED),
+                        theme::muted(),
                     ),
                 ),
             ]
