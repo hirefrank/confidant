@@ -1702,6 +1702,18 @@ fn pack_add(pack: &Path, vault: &Path, yes: bool) -> std::process::Output {
     cmd.arg("--no-input").output().unwrap()
 }
 
+/// Drop `id` from the vault's `packs = [...]` listing. The PD12 pre-check
+/// keys on the listing, so a removal/update test can unlist the pack to
+/// isolate the path under test (#529 item 1).
+#[cfg(unix)]
+fn unlist_pack(vault: &std::path::Path, id: &str) {
+    let path = vault.join("confidant.toml");
+    let cfg = std::fs::read_to_string(&path).unwrap();
+    let updated = cfg.replace(&format!("packs = [\"{id}\"]"), "packs = []");
+    assert_ne!(updated, cfg, "pack {id} was not listed; config:\n{cfg}");
+    std::fs::write(&path, updated).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_add_without_yes_changes_nothing() {
@@ -2055,15 +2067,95 @@ fn pack_add_refuses_a_second_version_of_the_same_name() {
     assert!(!vault.path().join("packs/example-pack@0.2").exists());
 }
 
+/// #529 item 2: `pack update` must not hand a symlinked vendored tree to
+/// `git diff --no-index`, which follows symlinks and would read content from
+/// outside the vault into the review. The no-follow check makes it "cannot
+/// diff".
+#[cfg(unix)]
+#[test]
+fn pack_update_refuses_to_diff_a_symlinked_vendored_dir() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    // Replace the vendored tree with a symlink to a *valid* pack outside the
+    // vault: `git diff --no-index` would read it and show its text.
+    let outside = versioned_pack("example-pack", "0.1", "# OUTSIDE-SECRET\n", None);
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    std::fs::remove_dir_all(&vendored).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &vendored).unwrap();
+
+    let updated = versioned_pack("example-pack", "0.2", "# two\n", None);
+    let out = Command::new(bin())
+        .args(["pack", "update", "example-pack", "--from-dir"])
+        .arg(updated.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("OUTSIDE-SECRET"),
+        "the diff read content from outside the vault: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot diff"), "{stderr}");
+}
+
+/// #529 item 3: `pack list`/`pack verify` classify with the no-follow
+/// helpers, so a symlinked vendored tree is `invalid` (not read and not
+/// silently `missing`).
+#[cfg(unix)]
+#[test]
+fn pack_list_reports_a_symlinked_tree_invalid() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+
+    let outside = versioned_pack("example-pack", "0.1", "# otherwise valid\n", None);
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    std::fs::remove_dir_all(&vendored).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &vendored).unwrap();
+
+    let list = Command::new(bin())
+        .args(["pack", "list", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["packs"][0]["status"], "invalid", "{v}");
+
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert_eq!(verify.status.code(), Some(1), "{verify:?}");
+
+    // An absent tree is still `missing`, not `invalid`.
+    std::fs::remove_file(&vendored).unwrap();
+    let list = Command::new(bin())
+        .args(["pack", "list", "--json", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(v["packs"][0]["status"], "missing", "{v}");
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_remove_refuses_a_symlinked_pack_dir() {
     // A synced vault can plant `packs/<id>` as a symlink out of the vault.
     // Removal must refuse to follow it and must never delete the files it
-    // points at (#440).
+    // points at (#440). The pack is unlisted first so the PD12 pre-check
+    // cannot mask the delete path (#529 item 1).
     let vault = git_vault();
     let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
     assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    unlist_pack(vault.path(), "example-pack@0.1");
 
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("victim.txt"), "keep me\n").unwrap();
@@ -2092,6 +2184,81 @@ fn pack_remove_refuses_a_symlinked_pack_dir() {
         "a file outside the vault was deleted"
     );
     // Nothing was committed and the lockfile still pins the pack.
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
+    assert!(lock.contains("[[pack]]"), "{lock}");
+}
+
+/// #529 item 1: a symlinked file *inside* the vendored tree is refused
+/// before any delete is queued, so the refusal never leaves a half-deleted
+/// pack: the pack's other files survive and the working tree stays clean.
+/// The test fails if that refusal is bypassed (the delete path would remove
+/// `SKILL.md`/`manifest.toml` and change `git status`).
+#[cfg(unix)]
+#[test]
+fn pack_remove_refuses_a_symlinked_file_in_a_pack_dir() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    assert!(pack_add(pack.path(), vault.path(), true).status.success());
+    unlist_pack(vault.path(), "example-pack@0.1");
+
+    // The tree itself is a real directory, so listing succeeds. Commit the
+    // planted symlink (a synced vault is the threat model) so `git status`
+    // can prove the refusal changed nothing at all.
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    let vendored = vault.path().join("packs/example-pack@0.1");
+    std::os::unix::fs::symlink(&victim, vendored.join("evil.txt")).unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "plant symlink",
+        ],
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the symlinked entry must be refused, stdout {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "keep me\n",
+        "a file outside the vault was deleted"
+    );
+    // The refusal happens before any delete is queued: the pack's own files
+    // survive and the working tree is untouched.
+    assert!(
+        vendored.join("SKILL.md").is_file(),
+        "SKILL.md was deleted by a partial apply"
+    );
+    assert!(
+        vendored.join("manifest.toml").is_file(),
+        "manifest.toml was deleted by a partial apply"
+    );
+    assert_eq!(
+        git(vault.path(), &["status", "--porcelain"]),
+        "",
+        "the refusal left the vault dirty"
+    );
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
     let lock = std::fs::read_to_string(vault.path().join("confidant.lock")).unwrap();
     assert!(lock.contains("[[pack]]"), "{lock}");

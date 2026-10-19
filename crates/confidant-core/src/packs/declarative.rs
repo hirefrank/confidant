@@ -211,6 +211,11 @@ pub(crate) fn resolve_declared_severity(
 
 /// Validate one rule's params against its registered kind (PD1: the
 /// logic lives in Rust; the loader refuses what a kind does not accept).
+///
+/// The manifest is the only input: validation never reads the compiled
+/// registry or the vault. The external-pack interning fast path (#497) relies
+/// on that — a cached pack skips re-validation — so if a kind's validation
+/// ever needs anything but the manifest, the fast path must re-run it.
 pub(crate) fn validate_rule(rule: &RuleDecl, manifest: &PackManifest) -> Result<(), DomainError> {
     let kind = rule_kind(&rule.kind).ok_or_else(|| {
         DomainError::config(format!(
@@ -516,6 +521,9 @@ impl RuleKind for CadenceOverdueKind {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
+        // Resolved once, not per person (a param lookup in the loop was a
+        // needless re-read; the loader already validated it).
+        let snooze_field = rule.params.get("snooze_field").and_then(|v| v.as_str());
         let Some(code) = resolve_finding_code(&rule.code) else {
             return; // the loader validated the code; unreachable
         };
@@ -576,7 +584,7 @@ impl RuleKind for CadenceOverdueKind {
             // `as_of < snooze_until`; the person is eligible again on the
             // date itself, and a past date has no effect. Only the
             // canonical person's own record is read.
-            if let Some(snooze_field) = rule.params.get("snooze_field").and_then(|v| v.as_str()) {
+            if let Some(snooze_field) = snooze_field {
                 if let Some(raw) = rec.field(snooze_field) {
                     if let Some(FieldValue::Date(until)) =
                         parse_field_grammar(GRAMMAR_DATE, snooze_field, raw)
@@ -1045,7 +1053,7 @@ impl RuleKind for NoteRefKind {
                         rule.id, code
                     ))
                     .with_fix(
-                        "Declare a pack-own code (e.g. W_<PACK>_<RULE>) in finding_codes and use it",
+                        "Declare a pack-own code (e.g. E_<PACK>_<RULE>) in finding_codes and use it",
                     ));
                 }
             }
@@ -2432,6 +2440,56 @@ default_fix = "Use note:n-<ULID>"
             &problems,
             "emits builtin code 'E_FRONTMATTER'; a rule's wrong_type_code must be a pack-own code",
         );
+    }
+
+    /// #529 item 4: for this always-`error` kind the builtin-code fix hint
+    /// names the error prefix (`E_<PACK>_<RULE>`), matching the spec's
+    /// note-ref example, not the warning prefix.
+    #[test]
+    fn note_ref_builtin_code_hint_names_an_error_code() {
+        let text = format!(
+            r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_FRONTMATTER", "E_NOTE_UNKNOWN", "E_NOTE_BAD_ID", "E_NOTE_BAD_TYPE"]
+
+[pack]
+name = "example-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+{}
+
+[messages."E_FRONTMATTER"]
+default = "front matter key '{{key}}' {{problem}}"
+default_fix = "{{fix}}"
+
+[messages."E_NOTE_UNKNOWN"]
+missing = "note '{{nid}}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "note '{{nid}}' does not belong to {{person}}"
+wrong_owner_fix = "Point note: at a note for this person"
+
+[messages."E_NOTE_BAD_ID"]
+default = "note is not a record ID"
+default_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_NOTE_BAD_TYPE"]
+default = "note '{{nid}}' is not a note id"
+default_fix = "Use note:n-<ULID>"
+"#,
+            note_rule(
+                "verb = \"touch\"\npair = \"note\"\ninvalid_code = \"E_FRONTMATTER\"\nwrong_type_code = \"E_NOTE_BAD_TYPE\"\n",
+            )
+        );
+        let manifest =
+            parse_manifest_external(&text).expect("the fixture manifest parses as external");
+        let err = validate_rule(&manifest.rules[0], &manifest)
+            .expect_err("a builtin invalid_code is refused");
+        let fix = err.fix().unwrap_or_default();
+        assert!(fix.contains("E_<PACK>_<RULE>"), "fix: {fix:?}");
+        assert!(!fix.contains("W_<PACK>_<RULE>"), "fix: {fix:?}");
     }
 
     /// A present-but-non-string code parameter is refused (like
