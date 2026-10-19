@@ -5320,7 +5320,7 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
 
     // context: person name and profile are shown; only the explicit-false note is included.
     let ada_id = confidant_core::id::RecordId::parse(ADA).unwrap();
-    let ctx = build_context(&vault, &ada_id, true, &PackScope::All).unwrap();
+    let ctx = build_context(&vault, &ada_id, true, &PackScope::All, false).unwrap();
     assert_eq!(ctx.person.name.as_deref(), Some("Ada Example"));
     assert!(!ctx.person.no_ai);
     assert!(ctx
@@ -7700,7 +7700,7 @@ default_fix = "{{fix}}"
 fn personal_view(root: &Path, person: &str) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(person).unwrap();
-    let bundle = build_context(&vault, &id, true, &PackScope::All).unwrap();
+    let bundle = build_context(&vault, &id, true, &PackScope::All, false).unwrap();
     bundle
         .packs
         .get("personal@0.2")
@@ -7974,7 +7974,7 @@ fn context_view_cleared_person_hides_touch_content() {
 
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
-    let bundle = build_context(&vault, &ada, true, &PackScope::All).unwrap();
+    let bundle = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
     assert!(bundle.person.name.is_none());
     assert!(bundle.person.profile.is_none());
     assert!(bundle.interactions.is_empty(), "{:?}", bundle.interactions);

@@ -284,18 +284,20 @@ fn opt_packs(args: &Value) -> Option<Vec<String>> {
     })
 }
 
-/// Build the CLI argv for a tool call and run it via `current_exe`.
-fn call_tool(
-    params: &Value,
+/// Build the CLI argv for one tool call.
+///
+/// Split out of [`call_tool`] so tests can assert the argv directly: no
+/// agent-reachable tool may ever pass an operator-only flag
+/// (`--for-edit`, `--for-operator`) even when the caller smuggles it into
+/// `arguments` (#559, #572). The match below is the only place a tool name
+/// becomes argv, so an operator flag that is not written here can never be
+/// passed over MCP.
+fn build_argv(
+    name: &str,
+    args: &Value,
     vault: &Path,
     ceiling: &Option<BTreeSet<String>>,
-) -> Result<String, String> {
-    let name = params
-        .get("name")
-        .and_then(|n| n.as_str())
-        .ok_or_else(|| "missing tool name".to_owned())?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
+) -> Result<Vec<String>, String> {
     // Globals first: every tool call is machine-readable, vault-pinned,
     // and non-interactive.
     let mut cli: Vec<String> = vec![
@@ -304,10 +306,10 @@ fn call_tool(
         "--vault".to_owned(),
         vault.display().to_string(),
     ];
-    if get_bool(&args, "dry_run") {
+    if get_bool(args, "dry_run") {
         cli.push("--dry-run".to_owned());
     }
-    if let Some(r) = opt_str(&args, "request_id") {
+    if let Some(r) = opt_str(args, "request_id") {
         cli.push("--request-id".to_owned());
         cli.push(r);
     }
@@ -319,35 +321,35 @@ fn call_tool(
             // Flags first, then `--` before the agent-supplied positional:
             // a query of `--packs=…` must be a needle, never a flag
             // (today it only fails closed via clap's duplicate-flag error).
-            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+            if let Some(packs) = effective_packs(ceiling, opt_packs(args))? {
                 cli.push("--packs".to_owned());
                 cli.push(packs.join(","));
             }
             cli.push("--".to_owned());
-            cli.push(get_str(&args, "query")?);
+            cli.push(get_str(args, "query")?);
         }
         "context" => {
             cli.push("context".to_owned());
-            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+            if let Some(packs) = effective_packs(ceiling, opt_packs(args))? {
                 cli.push("--packs".to_owned());
                 cli.push(packs.join(","));
             }
-            if context_strips_private(&args) {
+            if context_strips_private(args) {
                 cli.push("--exclude-private".to_owned());
             }
             cli.push("--".to_owned());
-            cli.push(get_str(&args, "person")?);
+            cli.push(get_str(args, "person")?);
         }
         "log_session" => {
             cli.push("log".to_owned());
             cli.push("session".to_owned());
-            cli.push(get_str(&args, "person")?);
-            cli.push(get_str(&args, "duration")?);
-            if let Some(t) = opt_str(&args, "tag") {
+            cli.push(get_str(args, "person")?);
+            cli.push(get_str(args, "duration")?);
+            if let Some(t) = opt_str(args, "tag") {
                 cli.push(t);
             }
             for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
-                if let Some(v) = opt_str(&args, key) {
+                if let Some(v) = opt_str(args, key) {
                     cli.push(flag.to_owned());
                     cli.push(v);
                 }
@@ -356,10 +358,10 @@ fn call_tool(
         "log_touch" => {
             cli.push("log".to_owned());
             cli.push("touch".to_owned());
-            cli.push(get_str(&args, "person")?);
-            cli.push(get_str(&args, "kind")?);
+            cli.push(get_str(args, "person")?);
+            cli.push(get_str(args, "kind")?);
             for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
-                if let Some(v) = opt_str(&args, key) {
+                if let Some(v) = opt_str(args, key) {
                     cli.push(flag.to_owned());
                     cli.push(v);
                 }
@@ -368,20 +370,20 @@ fn call_tool(
         "import_ledger" => {
             cli.push("import".to_owned());
             cli.push("--file".to_owned());
-            cli.push(get_str(&args, "file")?);
+            cli.push(get_str(args, "file")?);
         }
         "note_add" => {
             cli.push("note".to_owned());
             cli.push("add".to_owned());
             cli.push("--person".to_owned());
-            cli.push(get_str(&args, "person")?);
+            cli.push(get_str(args, "person")?);
             cli.push("--body-file".to_owned());
-            cli.push(get_str(&args, "body_file")?);
-            if let Some(d) = opt_str(&args, "date") {
+            cli.push(get_str(args, "body_file")?);
+            if let Some(d) = opt_str(args, "date") {
                 cli.push("--date".to_owned());
                 cli.push(d);
             }
-            if get_bool(&args, "no_ai") {
+            if get_bool(args, "no_ai") {
                 cli.push("--no-ai".to_owned());
             }
         }
@@ -389,17 +391,32 @@ fn call_tool(
         "doctor" => cli.push("doctor".to_owned()),
         "pack_skill" => {
             cli.push("help".to_owned());
-            match opt_str(&args, "pack") {
+            match opt_str(args, "pack") {
                 Some(p) => cli.push(format!("pack:{p}")),
                 None => cli.push("pack".to_owned()),
             }
-            if let Some(packs) = effective_packs(ceiling, opt_packs(&args))? {
+            if let Some(packs) = effective_packs(ceiling, opt_packs(args))? {
                 cli.push("--packs".to_owned());
                 cli.push(packs.join(","));
             }
         }
         _ => return Err(format!("unknown tool: {name}")),
     }
+    Ok(cli)
+}
+
+/// Build the CLI argv for a tool call and run it via `current_exe`.
+fn call_tool(
+    params: &Value,
+    vault: &Path,
+    ceiling: &Option<BTreeSet<String>>,
+) -> Result<String, String> {
+    let name = params
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "missing tool name".to_owned())?;
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let cli = build_argv(name, &args, vault, ceiling)?;
 
     let exe = std::env::current_exe().map_err(|e| format!("cannot find CLI binary: {e}"))?;
     let out = std::process::Command::new(exe)
@@ -632,6 +649,32 @@ mod tests {
                 !schema.contains("for_operator"),
                 "tool {} exposes for_operator: {schema}",
                 t["name"]
+            );
+        }
+    }
+
+    /// #559 / #572: no agent tool may pass an operator-only flag through,
+    /// even when the caller smuggles it into `arguments`. `build_argv` is
+    /// the only place a tool name becomes argv, so this pins the property
+    /// for the shared read commands (`context`, `find`) that now also carry
+    /// an operator flag: the flag is simply not written, and an unknown
+    /// argument key is ignored.
+    #[test]
+    fn mcp_never_passes_for_operator_to_context_or_find() {
+        let vault = Path::new("/tmp/vault");
+        for (name, args) in [
+            (
+                "context",
+                json!({"person": "p-01ABC", "for_operator": true, "--for-operator": true}),
+            ),
+            ("find", json!({"query": "needle", "for_operator": true})),
+        ] {
+            let argv = build_argv(name, &args, vault, &None).unwrap();
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a.contains("for-operator") || a.contains("for_edit")),
+                "{name} passed an operator flag: {argv:?}"
             );
         }
     }

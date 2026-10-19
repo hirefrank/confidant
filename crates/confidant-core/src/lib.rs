@@ -57,6 +57,7 @@ pub use scope::{
 };
 pub use search::{
     allowlist_is_fixed_point, cleared_ledger_line_owners, cleared_ledger_lines, cleared_record_ids,
-    cleared_record_owners, cleared_record_paths, search, SearchHit, SearchResult,
+    cleared_record_ids_for_operator, cleared_record_owners, cleared_record_paths,
+    operator_no_ai_badge, search, search_for_operator, SearchHit, SearchResult,
 };
 pub use vault::{load_vault, load_vault_with_hook, ContentHook, ContentOutcome, Vault};

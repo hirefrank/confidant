@@ -108,7 +108,7 @@ The CLI is `confidant`. Vault config is `confidant.toml`. Agents should set
 | Area | Commands | Notes |
 |---|---|---|
 | Write | `record add`, `record edit`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` | One commit per write; `check` runs before every commit; an edit that changes nothing reports `unchanged` and commits nothing |
-| Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster and `--for-operator` adds `no-ai` records; `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
+| Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `allowlist`, `schema`, `help` | `context` returns the whole bundle for one person in a single call; `record list` is the roster; `--for-operator` on `find`, `context`, or `record list` is operator-only and adds `no-ai` records (a tri-state `no_ai`); `record show <id> --for-edit` and `note show <id> --for-edit` are operator-only and decrypt `no-ai` records |
 | Check | `check` | Read-only; collects every finding; stable codes in [`spec/findings.md`](spec/findings.md) |
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred`, `keys device-add` | Per-client data keys; shred-coupled inbox rotation |
 | Inbox | `inbox`, `inbox rotate` | Signed, pull-only intake from outside systems |
@@ -216,8 +216,8 @@ downgrade a vault that already has keys. Existing plaintext records are
 never encrypted in place.
 
 Encrypted reads work too: `find`, `context`, and MCP decrypt cleared records
-through the CLI (never `no-ai` records), so search and context work on
-keyed vaults.
+through the CLI (never `no-ai` records, except the operator-only
+`--for-operator` flag), so search and context work on keyed vaults.
 
 When an agent reads notes, that content is sent to a hosted model provider.
 This is explicit and accepted. Confidant does not claim the provider stores

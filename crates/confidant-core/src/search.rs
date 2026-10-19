@@ -25,6 +25,13 @@ pub struct SearchHit {
     pub path: String,
     pub line: u32,
     pub excerpt: String,
+    /// Operator-only tri-state `no-ai` mode (`"true"`, `"notes"`, `"false"`)
+    /// of the hit's record, present only on [`search_for_operator`] (#572).
+    /// `None` for every agent-path hit and for ledger-line hits, so the
+    /// field never changes an agent's byte-for-byte output. A ledger line
+    /// has no record of its own to badge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_ai: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -66,6 +73,15 @@ struct Allowlist<'a> {
     /// Pack scope this search applies (#178). [`PackScope::All`] for the
     /// unscoped §12 allowlist.
     scope: PackScope,
+    /// Operator mode (#572): compute the cleared set as if `no-ai` did not
+    /// exist, so an operator-only read can surface `no-ai` records. This is
+    /// the same decrypt path as `record show --for-edit` (spec §12). Never
+    /// set on an agent path; `false` is the §12 allowlist.
+    operator: bool,
+    /// Operator mode only (#572): ids the agent allowlist hides but the
+    /// operator allowlist does not — hidden solely by `no-ai` (their own or
+    /// inherited). Used to badge a hit. Empty on the agent path.
+    no_ai_hidden: HashSet<RecordId>,
     /// Enabled packs for this vault (for attribution).
     enabled: Vec<&'a dyn crate::packs::Pack>,
     /// Note id → packs owning a ledger line that references it.
@@ -79,11 +95,33 @@ struct Allowlist<'a> {
 /// and no hits. `scope` further filters hits to the packs in scope (#178):
 /// core-owned items stay visible, unattributed items are hidden.
 pub fn search(vault: &Vault, query: &str, scope: &PackScope) -> Result<SearchResult, DomainError> {
+    search_with(vault, query, scope, false)
+}
+
+/// Operator-only variant of [`search`] (#572): the same scan, but the
+/// cleared set is computed as if `no-ai` did not exist, so `no-ai` records
+/// (and ledger lines that only reference them) come back as hits. Each
+/// record hit carries the tri-state `no_ai` string. Reached only through
+/// `confidant find --for-operator`, never through MCP (spec §12).
+pub fn search_for_operator(
+    vault: &Vault,
+    query: &str,
+    scope: &PackScope,
+) -> Result<SearchResult, DomainError> {
+    search_with(vault, query, scope, true)
+}
+
+fn search_with(
+    vault: &Vault,
+    query: &str,
+    scope: &PackScope,
+    operator: bool,
+) -> Result<SearchResult, DomainError> {
     if vault.ledger_unread_count > 0 {
         return Err(DomainError::ledger_unreadable(vault.ledger_unread_count));
     }
     let needle = case_fold(query);
-    let allow = Allowlist::build(vault, scope);
+    let allow = Allowlist::build_with(vault, scope, operator);
     let findings = findings_for_find(&allow);
     if needle.is_empty() {
         return Ok(SearchResult {
@@ -117,6 +155,9 @@ pub fn search(vault: &Vault, query: &str, scope: &PackScope) -> Result<SearchRes
                 path: line.file.clone(),
                 line: line.line,
                 excerpt: excerpt(line.text.trim(), 200),
+                // A ledger line is not a record; it has no `no-ai` of its
+                // own to badge, even in operator mode.
+                no_ai: None,
             });
         }
     }
@@ -133,6 +174,14 @@ pub fn search(vault: &Vault, query: &str, scope: &PackScope) -> Result<SearchRes
 /// Unscoped: the §12 allowlist is scope-independent; scoping applies on top.
 pub fn cleared_record_ids(vault: &Vault) -> HashSet<RecordId> {
     Allowlist::build(vault, &PackScope::All).cleared
+}
+
+/// Operator-only cleared set (#572): like [`cleared_record_ids`], but
+/// `no-ai` is ignored in the fixpoint, so records hidden only by their own
+/// or an inherited `no-ai` mode are included. Used by `context
+/// --for-operator`; never an agent path (spec §12).
+pub fn cleared_record_ids_for_operator(vault: &Vault) -> HashSet<RecordId> {
+    Allowlist::build_with(vault, &PackScope::All, true).cleared
 }
 
 /// Vault-relative paths of the records in the section 12 cleared set.
@@ -224,7 +273,14 @@ pub fn allowlist_is_fixed_point(vault: &Vault) -> bool {
 }
 
 impl<'a> Allowlist<'a> {
+    /// The §12 agent allowlist: `no-ai` records are excluded.
     fn build(vault: &'a Vault, scope: &PackScope) -> Self {
+        Self::build_with(vault, scope, false)
+    }
+
+    /// `operator` ignores `no-ai` in the cleared-set fixpoint (#572). Only
+    /// ever `true` for `find --for-operator` / `context --for-operator`.
+    fn build_with(vault: &'a Vault, scope: &PackScope, operator: bool) -> Self {
         let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
         let linkage = note_linkage_owners(vault, &enabled);
         let mut by_path = BTreeMap::new();
@@ -323,10 +379,22 @@ impl<'a> Allowlist<'a> {
             named_ledger_lines,
             ledger_ok: Vec::new(),
             scope: scope.clone(),
+            operator,
+            no_ai_hidden: HashSet::new(),
             enabled,
             linkage,
         };
         allow.cleared = compute_cleared(&allow);
+        if operator {
+            // The badge set: everything the operator allowlist adds over
+            // the agent allowlist is hidden solely by `no-ai`. The operator
+            // rules are a strict relaxation of the agent rules, so the
+            // agent set is a subset.
+            let agent = Allowlist::build_with(vault, scope, false);
+            let hidden: HashSet<RecordId> =
+                allow.cleared.difference(&agent.cleared).cloned().collect();
+            allow.no_ai_hidden = hidden;
+        }
         allow.ledger_ok = allow
             .vault
             .ledger_lines
@@ -345,12 +413,15 @@ fn compute_cleared(allow: &Allowlist<'_>) -> HashSet<RecordId> {
     let open_lines = pkg_open_lines(allow);
     let dependents = reverse_deps(allow, &components);
 
+    // Operator mode (#572) ignores `no-ai` here (and in `still_cleared`),
+    // so the fixpoint yields the cleared set a human sees: the same
+    // integrity rules, without the agent-visibility rule.
     let mut cleared: HashSet<RecordId> = vault
         .records
         .values()
-        .filter(|rec| !rec.no_ai() && !tainted.contains(&rec.id))
+        .filter(|rec| (allow.operator || !rec.no_ai()) && !tainted.contains(&rec.id))
         .filter(|rec| rec.person().is_none_or(|person| !tainted.contains(&person)))
-        .filter(|rec| !inherits_notes_no_ai(rec, allow, &components))
+        .filter(|rec| allow.operator || !inherits_notes_no_ai(rec, allow, &components))
         .map(|rec| rec.id.clone())
         .collect();
 
@@ -418,7 +489,7 @@ fn still_cleared(
         return false;
     }
     if let Some(rec) = allow.vault.records.get(id) {
-        if inherits_notes_no_ai(rec, allow, components) {
+        if !allow.operator && inherits_notes_no_ai(rec, allow, components) {
             return false;
         }
     }
@@ -957,6 +1028,22 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
     false
 }
 
+/// Operator-path tri-state `no-ai` badge (#572) for one record.
+///
+/// The record's own mode wins (`"true"` / `"notes"` / `"false"`). With no
+/// explicit flag, `"true"` when the agent allowlist hides it while the
+/// operator allowlist does not (an inherited `no-ai`), else `"false"`.
+pub fn operator_no_ai_badge(
+    rec: &crate::record::Record,
+    hidden_by_no_ai: &HashSet<RecordId>,
+) -> &'static str {
+    match rec.no_ai_mode() {
+        Some(mode) => mode.as_str(),
+        None if hidden_by_no_ai.contains(&rec.id) => "true",
+        None => "false",
+    }
+}
+
 fn scan_record(
     rec: &crate::record::Record,
     needle: &str,
@@ -1013,6 +1100,13 @@ fn scan_record(
                 path: rec.path.clone(),
                 line: *line_no,
                 excerpt: excerpt(line.trim(), 200),
+                // Operator mode (#572) badges every record hit: a cleared
+                // record is `"false"`, a `no-ai: notes` person is
+                // `"notes"`, a hidden record is `"true"`. Agent mode never
+                // sets this, so its JSON is unchanged.
+                no_ai: allow
+                    .operator
+                    .then(|| operator_no_ai_badge(rec, &allow.no_ai_hidden)),
             });
         }
     }
@@ -1064,7 +1158,10 @@ fn excerpt(line: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{case_fold, excerpt, still_cleared, Allowlist};
-    use crate::{cleared_ledger_line_owners, cleared_record_owners, search, OwnerKey, PackScope};
+    use crate::{
+        cleared_ledger_line_owners, cleared_record_owners, search, search_for_operator, OwnerKey,
+        PackScope,
+    };
     use std::collections::BTreeSet;
 
     #[test]
@@ -1240,5 +1337,44 @@ mod tests {
         assert!(lines
             .iter()
             .any(|(f, _, o)| f.contains("10.cfd") && o == &[OwnerKey::Core].into_iter().collect()));
+    }
+
+    /// #572: the operator search is the agent search plus everything hidden
+    /// only by `no-ai`, and every operator record hit carries the tri-state
+    /// badge. The agent path is unchanged and never sets `no_ai`.
+    #[test]
+    fn operator_search_includes_no_ai_records_with_badge() {
+        let vault = demo_vault();
+        // "model provider" is only in Cam Sample's note body (Cam is
+        // `no-ai: true`, so the note inherits hidden).
+        let agent = search(&vault, "model provider", &PackScope::All).unwrap();
+        assert!(agent.hits.is_empty(), "{:?}", agent.hits);
+        assert!(agent.hits.iter().all(|h| h.no_ai.is_none()));
+
+        let op = search_for_operator(&vault, "model provider", &PackScope::All).unwrap();
+        let hit = op
+            .hits
+            .iter()
+            .find(|h| h.id.as_deref() == Some("n-01M3TC5H000068T0000000000C"))
+            .unwrap_or_else(|| panic!("no-ai note must be an operator hit: {:?}", op.hits));
+        // The note has no explicit flag; it is hidden by inheritance, and
+        // the badge says so.
+        assert_eq!(hit.no_ai, Some("true"));
+
+        // A cleared record hit is badged `"false"` in operator mode, and
+        // the agent path never gains the key.
+        let op_ada = search_for_operator(&vault, "Ada Example", &PackScope::All).unwrap();
+        assert!(op_ada.hits.iter().any(|h| h.no_ai == Some("false")));
+        let agent_ada = search(&vault, "Ada Example", &PackScope::All).unwrap();
+        assert!(!agent_ada.hits.is_empty());
+        assert!(agent_ada.hits.iter().all(|h| h.no_ai.is_none()));
+
+        // A ledger line that only references the no-ai person also becomes
+        // searchable under the operator allowlist (no record badge).
+        let op_ledger = search_for_operator(&vault, "2026-10-07", &PackScope::All).unwrap();
+        assert!(op_ledger
+            .hits
+            .iter()
+            .any(|h| h.path.starts_with("ledger/") && h.no_ai.is_none()));
     }
 }
