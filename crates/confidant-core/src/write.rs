@@ -497,6 +497,24 @@ fn apply_write_inner(
         snapshots.push((rel.to_path_buf(), existing));
     }
 
+    // 4b. Directories this write may have to create, recorded before the apply
+    // (shallow to deep) so a rolled-back write can remove only what it created
+    // (#604). Scoped to ancestors that do not exist *now*: a directory that is
+    // already there is never a candidate, and removal below is empty-only, so
+    // a directory that ends up holding another file survives untouched.
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    for change in &pending.changes {
+        if let Some(parent) = change.path().parent() {
+            if !parent.as_os_str().is_empty() {
+                for dir in crate::paths::missing_ancestors(root, parent) {
+                    if !created_dirs.contains(&dir) {
+                        created_dirs.push(dir);
+                    }
+                }
+            }
+        }
+    }
+
     // 5. Apply atomically.
     for change in &pending.changes {
         match change {
@@ -552,6 +570,13 @@ fn apply_write_inner(
                     let _ = crate::paths::remove_file(root, &rel);
                 }
             }
+        }
+        // Then remove the directories this write created, innermost first,
+        // only when they are now empty (#604). A directory that existed before
+        // the write was never recorded; one that now holds another file makes
+        // `remove_dir` fail and is left in place. Best effort, like the files.
+        for dir in created_dirs.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
         }
         return Ok(WriteOutcome::CheckBlocked { report: post });
     }

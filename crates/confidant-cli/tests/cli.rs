@@ -1993,6 +1993,9 @@ fn pack_add_check_failure_rolls_back() {
         ],
     );
     let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    // A directory that already exists (even empty, so git never tracks it) must
+    // survive the rollback: the write did not create it (#604).
+    std::fs::create_dir_all(vault.path().join("packs/pre-existing-empty")).unwrap();
     let pack = versioned_pack("example-pack", "0.1", "# conflict\n", Some("session"));
     let out = pack_add(pack.path(), vault.path(), true);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -2005,6 +2008,27 @@ fn pack_add_check_failure_rolls_back() {
     assert!(!vault.path().join("confidant.lock").exists());
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    // #604: the empty directory the refused write created is gone, but the one
+    // that was already there is untouched.
+    assert!(
+        !vault.path().join("packs/example-pack@0.1").exists(),
+        "refused pack add left its vendored directory behind"
+    );
+    assert!(
+        vault.path().join("packs/pre-existing-empty").is_dir(),
+        "rollback removed a directory it did not create"
+    );
+
+    // The refusal leaves the vault healthy: a following write still succeeds.
+    let good = versioned_pack("second-pack", "0.1", "# ok\n", None);
+    let out = pack_add(good.path(), vault.path(), true);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[cfg(unix)]

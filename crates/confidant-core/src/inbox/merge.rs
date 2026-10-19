@@ -24,21 +24,6 @@ pub(crate) enum AppliedChange {
     },
 }
 
-/// Ancestor directories under `vault_root` that do not exist yet, shallow
-/// to deep. Recorded before `ensure_directory` so revert only removes what
-/// this write created.
-fn missing_ancestors(vault_root: &Path, parent: &Path) -> Vec<PathBuf> {
-    let mut missing = Vec::new();
-    let mut cur = PathBuf::new();
-    for comp in parent.components() {
-        cur.push(comp);
-        let abs = vault_root.join(&cur);
-        if !abs.is_dir() {
-            missing.push(abs);
-        }
-    }
-    missing
-}
 /// Apply planned writes to the working tree, recording previous bytes for
 /// revert. Uses atomic replace (`paths::write_replace`).
 ///
@@ -81,7 +66,7 @@ pub(crate) fn apply_writes(
                 let mut created_dirs = Vec::new();
                 if let Some(parent) = file.parent() {
                     if !parent.as_os_str().is_empty() {
-                        created_dirs = missing_ancestors(vault_root, parent);
+                        created_dirs = paths::missing_ancestors(vault_root, parent);
                         paths::ensure_directory(vault_root, parent).map_err(|e| {
                             anyhow::anyhow!("could not create {}: {e:#}", parent.display())
                         })?;
@@ -126,7 +111,7 @@ pub(crate) fn apply_writes(
                 let mut created_dirs = Vec::new();
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
-                        created_dirs = missing_ancestors(vault_root, parent);
+                        created_dirs = paths::missing_ancestors(vault_root, parent);
                         paths::ensure_directory(vault_root, parent).map_err(|e| {
                             anyhow::anyhow!("could not create {}: {e:#}", parent.display())
                         })?;

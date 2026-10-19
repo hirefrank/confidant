@@ -881,6 +881,98 @@ fn record_add_deal_and_dry_run() {
     assert_eq!(commits(root), 1);
 }
 
+/// #604: a `record add` whose post-check refuses must not leave the record
+/// directory it created. The payload shares a ULID with an existing
+/// interaction under a different prefix, so the write creates `people/p-…/`
+/// and the post-check then reports `E_DUPLICATE_ULID`. Left behind, the empty
+/// directory makes the next `check` fail `E_FRONTMATTER` ("record directory is
+/// missing the main file") and blocks later writes — invisible to git.
+#[test]
+fn record_add_check_blocked_removes_created_directory() {
+    let dir = make_vault();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    // The ULID body shared by the existing interaction and the refused person.
+    const SHARED: &str = "01J9Z3K4QK0000000000000000";
+    let iid = format!("i-{SHARED}");
+    let i_dir = root.join(format!("interactions/{iid}"));
+    std::fs::create_dir_all(&i_dir).unwrap();
+    std::fs::write(
+        i_dir.join("interaction.md"),
+        format!(
+            "---\nid: {iid}\ntype: interaction\nname: Call\nperson: {PERSON}\ndate: 2026-10-06\n---\n\nFake call.\n"
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "interaction fixture"]);
+    let before = commits(root);
+
+    let new_person = format!("p-{SHARED}");
+    let file = scratch.path().join("person.md");
+    std::fs::write(
+        &file,
+        format!("---\nid: {new_person}\ntype: person\nname: \"Dana Example\"\n---\n\nBio.\n"),
+    )
+    .unwrap();
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .expect("check report")
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"E_DUPLICATE_ULID"), "{codes:?}");
+    assert_eq!(commits(root), before, "nothing committed");
+
+    // The file AND the directory this write created are gone (#604).
+    assert!(
+        !root.join(format!("people/{new_person}")).exists(),
+        "refused record add left its record directory behind"
+    );
+
+    // The vault is healthy after the refusal, and a later write still works.
+    let (ok, v) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(!codes.contains(&"E_FRONTMATTER"), "{codes:?}");
+
+    let file2 = scratch.path().join("person2.md");
+    std::fs::write(
+        &file2,
+        "---\nid: p-01J9Z3K4QM0000000000000000\ntype: person\nname: \"Eve Example\"\n---\n\nBio.\n",
+    )
+    .unwrap();
+    let (ok, v) = run_json(&[
+        "record",
+        "add",
+        "--file",
+        &file2.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+}
+
 /// `record add` a plaintext person profile, so a `with:` reference exists
 /// (`check` verifies `with:` entries at write time).
 fn add_person_record(vroot: &str, id: &str, name: &str) {
