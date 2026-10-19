@@ -355,6 +355,9 @@ pub fn load_external_packs(
         // validation already passed for these exact bytes and this exact
         // listing; only the vault spec can differ between loads, so the
         // fast path re-checks that one condition.
+        // Inside the parse, `validate_rule` reads only the manifest, so a
+        // cached pack stays valid without re-running it; if that ever gains a
+        // registry or vault input, re-run it on the fast path (#529).
         let intern_key = (listed.clone(), packed.hash.clone());
         if let Some(pack) = interned_pack(&intern_key) {
             if let Some(problem) = spec_requires_problem(pack.pack_manifest(), listed, spec) {
@@ -486,6 +489,12 @@ grammar = "non-empty-string"
     /// lockfile pin matches its canonical tree hash, and return the vault
     /// root. The `TempDir` must stay alive for the load to find the
     /// files.
+    ///
+    /// The intern cache is process-wide (#497), so tests that vendor these
+    /// same `example-pack@0.1` bytes share an entry: whichever runs second
+    /// may serve its "first" load from the cache. The pointer-equality
+    /// assertions below still hold; "fails without the interning" is true
+    /// for the pair, not for each test in isolation (#529 item 8).
     fn vendored_pack() -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         let pack_dir = dir.path().join("packs/example-pack@0.1");

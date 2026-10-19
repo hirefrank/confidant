@@ -1711,11 +1711,14 @@ fn install_changes(
 /// `DeleteFile` changes for every regular file in a vendored pack dir.
 ///
 /// Lists with [`confidant_core::paths::read_dir`], which refuses to follow a
-/// symbolic link at any depth, and skips anything that is not a regular file,
-/// so a planted `packs/<id>` (or `packs/`) symlink can never steer a delete
-/// into files outside the vault (#440). A missing vendored tree is not an
-/// error — removal must still clean up the lockfile and listing — but an
-/// unlistable one is.
+/// symbolic link at any depth, so a planted `packs/<id>` (or `packs/`)
+/// symlink can never steer a delete into files outside the vault (#440). A
+/// non-regular entry (a symlink, a directory, a special file) is refused
+/// before any change is built: `apply_write` applies its change list in order
+/// without rolling back a mid-list failure, so queuing one would delete the
+/// earlier files and then fail, leaving a half-deleted pack (#529 review). A
+/// missing vendored tree is not an error — removal must still clean up the
+/// lockfile and listing — but an unlistable one is.
 fn delete_vendored_changes(
     root: &Path,
     name: &str,
@@ -1747,13 +1750,70 @@ fn delete_vendored_changes(
     }
     let mut out = Vec::new();
     for entry in listing.entries {
-        if entry.kind.is_file() {
-            out.push(FileChange::DeleteFile {
-                path: PathBuf::from(&rel).join(&entry.name),
-            });
+        // Refuse before any delete is queued: a mid-list refusal inside
+        // `apply_write` would have already unlinked the earlier files.
+        if !entry.kind.is_file() {
+            return Err(anyhow::Error::new(
+                DomainError::pack_invalid(format!(
+                    "cannot remove {}: {} is {}",
+                    pack_fetch::escape_line(&rel),
+                    pack_fetch::escape_line(&entry.name),
+                    describe_non_regular(entry.kind)
+                ))
+                .with_fix(
+                    "Restore the vendored tree (git checkout -- packs) or remove the entry, then retry",
+                ),
+            ));
         }
+        out.push(FileChange::DeleteFile {
+            path: PathBuf::from(&rel).join(&entry.name),
+        });
     }
     Ok(out)
+}
+
+/// Describe a directory entry that is not a regular file, for a refusal
+/// message. `File` is unreachable (callers check `is_file` first) but keeps
+/// the match exhaustive.
+fn describe_non_regular(kind: confidant_core::paths::EntryKind) -> &'static str {
+    use confidant_core::paths::EntryKind;
+    match kind {
+        EntryKind::Symlink => "a symbolic link",
+        EntryKind::Directory => "a directory",
+        EntryKind::Other => "a special file",
+        EntryKind::File => "a regular file",
+    }
+}
+
+/// `pack update` reviews the change with `git diff --no-index`, which follows
+/// symlinks. The vendored tree is checked with the vault's no-follow helpers
+/// first, so a planted `packs/<id>` symlink (or a symlinked file inside) cannot
+/// feed content from outside the vault into the review (PD12). A tree that is
+/// not a real directory of regular files is "cannot diff".
+fn ensure_vendored_tree_diffable(root: &Path, name: &str, version: &str) -> anyhow::Result<()> {
+    let rel = vendored_rel(name, version);
+    let cannot_diff = |detail: String| {
+        anyhow::Error::new(
+            DomainError::pack_invalid(format!("cannot diff {rel}: {detail}")).with_fix(
+                "Restore the vendored tree (git checkout -- packs) or remove the pack, then retry",
+            ),
+        )
+    };
+    let listing = confidant_core::paths::read_dir(root, Path::new(&rel))
+        .map_err(|error| cannot_diff(pack_fetch::escape_line(&format!("{error:#}"))))?;
+    if let Some((entry, cause)) = listing.errors.first() {
+        return Err(cannot_diff(format!(
+            "cannot list {}: {}",
+            pack_fetch::escape_line(entry),
+            pack_fetch::escape_line(cause)
+        )));
+    }
+    if listing.entries.iter().any(|entry| !entry.kind.is_file()) {
+        return Err(cannot_diff(
+            "the vendored tree holds a non-regular entry (a symlink or directory)".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verification status of one installed pack (PD12: fail closed).
@@ -1768,12 +1828,37 @@ struct PackStatus {
 
 impl PackStatus {
     fn verify(root: &Path, entry: &confidant_core::packs::lock::LockEntry) -> Self {
-        let dir = root.join(vendored_rel(&entry.name, &entry.version));
-        let status = match read_pack_dir(&dir) {
-            Ok(packed) if packed.hash == entry.hash => "ok",
-            Ok(_) => "tampered",
-            Err(_) if !dir.exists() => "missing",
+        let rel = vendored_rel(&entry.name, &entry.version);
+        let rel_path = Path::new(&rel);
+        let dir = root.join(&rel);
+        // `read_pack_dir` takes a path and follows a symlink at the tree root,
+        // so classify with the vault's no-follow helpers first: a planted
+        // `packs/<id>` symlink (or a symlinked file inside) is `invalid`,
+        // never read (#529).
+        let status = match confidant_core::paths::exists(root, rel_path) {
+            // Only a definite absence is `missing`; a helper error fails
+            // closed as `invalid` rather than masquerading as absent.
+            Ok(false) => "missing",
             Err(_) => "invalid",
+            Ok(true) => match confidant_core::paths::read_dir(root, rel_path) {
+                Ok(listing)
+                    if listing.errors.is_empty()
+                        && listing.entries.iter().all(|e| e.kind.is_file()) =>
+                {
+                    // The no-follow check above and this `read_pack_dir` are
+                    // separate syscalls: a tree swapped for a symlink in
+                    // between would still be followed. That window is local
+                    // only (an attacker with vault write access), and
+                    // `read_pack_dir` refuses symlinked entries inside the
+                    // tree, so the tree is not re-read to close it.
+                    match read_pack_dir(&dir) {
+                        Ok(packed) if packed.hash == entry.hash => "ok",
+                        Ok(_) => "tampered",
+                        Err(_) => "invalid",
+                    }
+                }
+                _ => "invalid",
+            },
         };
         Self {
             name: entry.name.clone(),
@@ -2054,6 +2139,7 @@ fn cmd_pack_update(
     }
 
     let old_dir = root.join(vendored_rel(&entry.name, &entry.version));
+    ensure_vendored_tree_diffable(root, &entry.name, &entry.version)?;
     let diff = pack_fetch::diff_dirs(&old_dir, &fetched.pack_dir)?;
     let new_files = read_pack_dir(&fetched.pack_dir).map_err(anyhow::Error::new)?;
     if new_files.hash != report.hash {
