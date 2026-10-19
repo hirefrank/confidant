@@ -135,6 +135,35 @@ jobs:
         # covered (#538).
         run: python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
 
+  qa-smoke:
+    name: qa smoke
+    runs-on: ubuntu-latest
+    needs: [changes]
+    # Nightly, manual, and push-to-main only. A sweep is not a gate on every
+    # PR: it is slower than the unit suite and its value is finding what the
+    # suite missed, so keep it off the PR critical path (see
+    # `.agents/skills/qa-sweep/SKILL.md`).
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        if: needs.changes.outputs.docs_only != 'true'
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.changes.outputs.docs_only != 'true'
+      - name: build CLI
+        if: needs.changes.outputs.docs_only != 'true'
+        # --all-features enables `test-overrides`, so the smoke can use
+        # throwaway keys via env instead of a real keychain (ADR-14).
+        run: cargo build -p confidant-cli --locked --all-features
+      - name: end-to-end smoke
+        if: needs.changes.outputs.docs_only != 'true'
+        # Drives the built binary through the deterministic subset of the
+        # sweep protocol: writes, refusal invariants, read-path privacy,
+        # pack lifecycle.
+        run: python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
