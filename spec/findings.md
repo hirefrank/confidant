@@ -59,10 +59,13 @@ present, for CI users who want the stricter gate.
 | `E_KEY_COMMITMENT` | error | | A reader refused to use a key epoch because the verified key manifest carries no commitment for it. Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
 | `E_ENVELOPE` | error | | An encrypted record envelope is structurally invalid keylessly: duplicate header keys, unknown header keys, a missing required header, an `enc` other than `xchacha20poly1305`, a nonce that is not 24 bytes, bad base64, or a `key_id` that is not `<client_id>/e<epoch>` (shape only). Fires only in encrypted vaults (spec §14). Reserved for milestone 2 readers; `check` does not emit it. |
 
-**Retired, not emitted, never reused.** Codes are never reused for a new
-meaning. Names that shipped in earlier published versions stay reserved by
-the loader, even after the pack that emitted them is removed (§13.7 of the
-manifest spec).
+**Retired, not emitted, never reused.** These old built-in names stay
+reserved and must never be reused for a new meaning; nothing emits them in
+0.1:
+
+`E_BALANCE_MISMATCH`, `E_NEGATIVE_BALANCE`, `E_OPEN_MALFORMED`,
+`E_MISSING_DURATION`, `E_SESSION_TAGS`, `W_SESSION_UNTAGGED`,
+`E_SESSION_WITHOUT_NOTES`, `E_PAID_SESSION_GAP`.
 
 `confidant find` uses the same codes and the section 12 allowlist: only
 cleared records and ledger lines are searchable. A note, interaction, or

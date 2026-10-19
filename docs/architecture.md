@@ -97,6 +97,7 @@ Structured facts are one-line ledger entries. Prose is Markdown.
 2026-10-01 touch    p-01J9Z3K4QF  call
 2026-10-03 alias    p-01J9Z3K4QF  email hmac:3f9c…  ; keyed HMAC; real value in encrypted profile
 2026-10-08 touch    p-01J9Z3K4QF  meet note:n-01JA02
+2026-10-08 balance  p-01J9Z3K4QF  unknown_metric 4
 2026-10-09 stage    d-01J9ZB7W1M  proposal
 2026-10-12 merge    p-01J9ZQ00XY  into p-01J9Z3K4QF  reason "duplicate account"
 ```
@@ -430,8 +431,11 @@ decrypts, runs `check`, merges into the vault and clears the inbox. GitHub
 webhooks are not used for intake. They only notify a server you would have to
 run, and a GitHub Action must never hold decryption keys.
 
-**Decided (see section 9).** The inbox is a separate `inbox` branch, with
-main protected so only trusted signers can write to it.
+**Intended pattern.** The operator deletes answers from the outside tool
+after a verified import; browser-side encryption is the stronger option.
+The inbox is a separate `inbox` branch, with main protected so only trusted
+signers can write to it. This is the intended pattern, not a v0 enforcement
+claim (see section 9).
 
 ## 9. Open questions (resolved)
 
@@ -448,9 +452,9 @@ main protected so only trusted signers can write to it.
 2. **The model provider sees plaintext.** Agents send what they read to a hosted model provider. The README and privacy model say so plainly and don't claim the provider stores nothing. A per-client `no-ai` flag keeps that client's notes and PII out of `confidant context` and `--json` output used by agents, so the operator can keep sensitive people away from models entirely.
 3. **Capture going stale.** Confidant only knows what agents write into it. A `confidant check` rule flags gaps, such as a record with no follow-up note, or a contact with no touchpoint within a set window. The agent sends the operator a weekly summary of these gaps.
 4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred people (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks, and its index stays out of git and is never synced anywhere.
-5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with personal data.
+5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with client data.
 
-   Changed 2026-10-12 by Frank: the crates.io release is **not** treated as the invitation. Publishing (needed for `cargo install confidant-cli` to resolve its dependencies) goes ahead with an explicit disclosure that the crypto is unaudited and the CLI write path still produces plaintext; a disclosure that withholds the invitation satisfies this item as written. The outside review and code audit are still required before any surface invites trust with personal data, and remain tracked in issue #138. If the audit finds a defect, the fix ships as a new version; published versions are yanked, not deleted.
+   Changed 2026-10-12 by Frank: the crates.io release is **not** treated as the invitation. Publishing (needed for `cargo install confidant-cli` to resolve its dependencies) goes ahead with an explicit disclosure that the crypto is unaudited and the CLI write path still produces plaintext; a disclosure that withholds the invitation satisfies this item as written. The outside review and code audit are still required before any surface invites trust with client data, and remain tracked in issue #138. If the audit finds a defect, the fix ships as a new version; published versions are yanked, not deleted.
 
 ## Appendix: Prior art (sweep 2026-10-07)
 

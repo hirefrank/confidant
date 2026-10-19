@@ -673,13 +673,13 @@ copy):
 
 ```toml
 [[rules]]
-id = "touch_note"
+id = "note_ref"
 kind = "note-ref"
-code = "E_EXAMPLE_NOTE_UNKNOWN"
-verb = "touch"
+code = "E_EXAMPLE_UNKNOWN_RECORD"
+verb = "use"
 pair = "note"
-invalid_code = "E_EXAMPLE_NOTE_BAD_ID"
-wrong_type_code = "E_EXAMPLE_NOTE_BAD_TYPE"
+invalid_code = "E_EXAMPLE_NOTE_INVALID_ID"
+wrong_type_code = "E_EXAMPLE_NOTE_WRONG_TYPE"
 ```
 
 #### Kind `ledger-balance` (#446)
@@ -701,7 +701,7 @@ checking. Every other finding is a fixed `error`.
 | `open_verb` | string, non-empty | The ledger verb that adds units: `DATE <open_verb> <person-id> package <pkg-id> <N> sessions`. |
 | `consume_verb` | string, non-empty, different from `open_verb` | The ledger verb that consumes a unit. An entry consumes unless it is tagged `pps` or `comp`; an untagged entry consumes too, so a balance cannot silently drop a session. |
 | `units_metric` | string | The declared `balance_metrics` entry holding the integer unit count (for example `units_remaining`). |
-| `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (for example `hours_logged`). |
+| `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (for example `minutes_total`). |
 | `max_open_n` | integer > 0 | Cap for one `open` line (today `100000`). A larger `N` is refused and not counted. |
 | `parse_code` | string | Code for `balance`-line parse problems and the minutes-overflow problem. Required; must be a code the pack declares. |
 | `negative_code` | string | Code for a negative unit balance. Required; must be a code the pack declares. |
@@ -719,7 +719,7 @@ origin.
 
 Message variants the pack's tables must declare (`<units>` and `<minutes>`
 are the two metric names, so a session-tracking pack declares
-`units_remaining` / `hours_logged` variants):
+`units_remaining` / `minutes_total` variants):
 
 | Code | Variants | Placeholders |
 |---|---|---|
@@ -772,24 +772,24 @@ id = "balance"
 kind = "ledger-balance"
 code = "E_EXAMPLE_BALANCE_MISMATCH"
 severity_key = "example-pack.balance_nonnegative"
-open_verb = "open"
-consume_verb = "session"
+open_verb = "grant"
+consume_verb = "use"
 units_metric = "units_remaining"
-minutes_metric = "hours_logged"
+minutes_metric = "minutes_total"
 max_open_n = 100000
-parse_code = "E_EXAMPLE_BALANCE_PARSE"
-negative_code = "E_EXAMPLE_BALANCE_NEGATIVE"
-open_malformed_code = "E_EXAMPLE_OPEN_MALFORMED"
+parse_code = "E_EXAMPLE_PARSE"
+negative_code = "E_EXAMPLE_NEGATIVE_BALANCE"
+open_malformed_code = "E_EXAMPLE_GRANT_MALFORMED"
 invalid_code = "E_EXAMPLE_INVALID_ID"
 wrong_type_code = "E_EXAMPLE_WRONG_ID_TYPE"
 ```
 
-With `2026-10-01 open p-… package pkg-… 6 sessions`, a paid session on
+With `2026-10-01 grant p-… package pkg-… 6 sessions`, a tagged use on
 `2026-10-01`, and `2026-10-08 balance p-… units_remaining 4`, the
 computed value is 5, so the finding message is
 `units_remaining asserted 4, computed 5` and its fix names the person.
-A `comp` or `pps` session consumes nothing; an untagged session consumes
-one. This kind does not warn about an untagged session: that finding
+A `comp` or `pps` use consumes nothing; an untagged use consumes
+one. This kind does not warn about an untagged use: that finding
 belongs to the `session-checks` kind (#447), so a pack that declares only
 `ledger-balance` gets no untagged warning.
 
@@ -867,23 +867,23 @@ Worked example:
 
 ```toml
 [[rules]]
-id = "sessions"
+id = "entries"
 kind = "session-checks"
 code = "E_EXAMPLE_MISSING_DURATION"
 severity_duration_key = "example-pack.require_duration"
-severity_notes_key = "example-pack.session_notes"
-verb = "session"
-billing_tags = ["paid", "pps", "comp"]
-tags_code = "E_EXAMPLE_SESSION_TAGS"
-untagged_code = "W_EXAMPLE_SESSION_UNTAGGED"
-notes_code = "E_EXAMPLE_SESSION_WITHOUT_NOTES"
+severity_notes_key = "example-pack.notes"
+verb = "use"
+billing_tags = ["full", "pps", "comp"]
+tags_code = "E_EXAMPLE_TAGS"
+untagged_code = "W_EXAMPLE_UNTAGGED"
+notes_code = "E_EXAMPLE_WITHOUT_NOTES"
 ```
 
-A `2026-10-01 session p-… 60m paid` line with no `note:` and no note
-record for that day emits `E_EXAMPLE_SESSION_WITHOUT_NOTES` at the
-`example-pack.session_notes` severity. Adding `note:n-…` to the line, or a
-note for the person dated `2026-10-01`, silences it. A second session
-that day tagged both `paid` and `pps` emits `E_EXAMPLE_SESSION_TAGS` as
+A `2026-10-01 use p-… 60m full` line with no `note:` and no note
+record for that day emits `E_EXAMPLE_WITHOUT_NOTES` at the
+`example-pack.notes` severity. Adding `note:n-…` to the line, or a
+note for the person dated `2026-10-01`, silences it. A second entry
+that day tagged both `full` and `pps` emits `E_EXAMPLE_TAGS` as
 well.
 
 #### Kind `activity-gap` (#448)
@@ -945,20 +945,20 @@ Worked example:
 [[rules]]
 id = "gap"
 kind = "activity-gap"
-code = "E_EXAMPLE_ACTIVITY_GAP"
-severity_key = "example-pack.activity_gap"
-activity_verb = "session"
-start_verb = "open"
-gap_days_key = "example-pack.activity_gap_days"
+code = "E_EXAMPLE_GAP"
+severity_key = "example-pack.gap"
+activity_verb = "use"
+start_verb = "grant"
+gap_days_key = "example-pack.gap_days"
 lookback_days_key = "example-pack.lookback_days"
 balance_metric = "units_remaining"
 ```
 
 With `as_of = 2026-10-08` and `gap_days = 45`, a client with
-`2026-08-01 open p-… package pkg-… 6 sessions` and a last session on
-`2026-08-24` is exactly on the edge and emits nothing; a last session on
+`2026-08-01 grant p-… package pkg-… 6 sessions` and a last use on
+`2026-08-24` is exactly on the edge and emits nothing; a last use on
 `2026-08-23` emits `remaining` with `start = 2026-08-24`. A client whose
-only event is an open on `2026-01-01` emits `none`.
+only event is a grant on `2026-01-01` emits `none`.
 
 ### 13.3. Names
 
@@ -1089,6 +1089,11 @@ skill text, is vendored under `packs/<name>@<version>/`, and is pinned in
 finding codes stay pack-owned, and a vault that lists the pack resolves it
 like any other external pack. The built-in `personal@0.2` is the only
 compiled pack.
+
+The legacy top-level `coaching` field in `context` survives (ADR-7): it is
+the entry of the pack named `coaching` that serves the `ledger-sessions`
+view, and the `packs["coaching@<version>"]` key is unchanged. The alias
+stays for contract stability even when no in-tree pack uses it.
 
 ### 13.9. Context views (`[context]`, v2, opt-in)
 
