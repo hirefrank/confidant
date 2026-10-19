@@ -20,8 +20,10 @@ but narrower than it sounds.
 - An MCP agent can only call 8 fixed tools, and cannot grant itself more.
 - An agent can read private data through `context` only by passing
   `exclude_private: false` — which it can do by itself.
-- A `no-ai` record never appears in `find`, `context`, the allowlist, or the
-  search corpus — in either the CLI or MCP.
+- A `no-ai` record's content never appears in `find`, `context`, the
+  allowlist, or the search corpus — in either the CLI or MCP (though
+  `context` still serves the person's derived ledger metadata; see
+  `docs/privacy.md`).
 - `no-ai` does not hide a record from the vault's owner.
 - `check` blocks a commit on errors, never on warnings, and verifies
   coherence, not truthfulness.
@@ -86,7 +88,7 @@ for processing. This is explicit and accepted (`docs/architecture.md` §4).
 | Can | Cannot | Notes |
 |---|---|---|
 | See whatever the agent sends it (note bodies, context bundles, search hits) | Be constrained by Confidant — Confidant makes no claim about what the provider stores, retains, or trains on | Depends on the provider's terms |
-| Receive `no-ai` content | — | `no-ai` records never reach agent surfaces, so they never reach the provider through Confidant |
+| Receive `no-ai` content | — | A `no-ai` record's content never reaches agent surfaces, so it never reaches the provider through Confidant |
 
 Mitigations the operator controls: mark sensitive records `no-ai` so they
 never enter agent flows; keep the `context` private-data default (stripped)
@@ -117,9 +119,11 @@ envelope (`no-ai: bool`, `crates/confidant-crypt/src/envelope.rs`). A
 record's effective flag is its own flag **or** its person's flag — "any
 `true` wins" (`person_no_ai()` in `crates/confidant-cli/src/record_crypto.rs`).
 
-What it does: a `no-ai` record never appears in `find` (filter in
-`crates/confidant-core/src/search.rs`), in `context` (which only shows §12
-cleared records), in the `allowlist` response ("no-ai records never appear",
+What it does: a `no-ai` record's content never appears in `find` (filter in
+`crates/confidant-core/src/search.rs`), in `context` (which shows a `no-ai`
+person only through their derived ledger metadata — cadence, touch and
+session state, opaque alias hashes; see `docs/privacy.md` — never their
+content), in the `allowlist` response ("no-ai records never appear",
 `crates/confidant-core/src/schema.rs`), or in the reindex corpus (built
 from the cleared set, `crates/confidant-cli/src/main.rs`
 `build_reindex_corpus`) — unless the operator passes the operator-only
