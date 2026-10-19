@@ -180,9 +180,21 @@ git -C ~/vault log --oneline -5
 - A former **plaintext** vault (`[crypto] mode = "plaintext"`) may contain
   real record bodies in that history. Deleting the local directory does not
   remove them from the remote.
-- `confidant init --create` runs `git init` and does **not** add a remote.
-  `git remote -v` on the new vault should be empty until you add the one you
-  intend.
+- `confidant init --create` runs `git init` with branch `main` and does
+  **not** add a remote. `git remote -v` on the new vault should be empty
+  until you add the one you intend. Local-only is a valid choice, but there
+  is no backup and `recover` cannot help if the disk dies. For backup and
+  second-device recovery:
+
+  ```sh
+  git remote add origin <url>
+  git push -u origin main
+  ```
+
+  The URL is provider-neutral. No Confidant command adds a remote or pushes
+  for you. `doctor`'s `git-remote` check accepts local-only and an encrypted
+  vault with a remote, and warns for a remote on a plaintext vault (which
+  must never be pushed).
 
 ### 2.3 Clear or overwrite the machine state
 
@@ -256,29 +268,34 @@ is refused so a stray `--create` cannot turn a project checkout into a vault.
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"
-confidant init --create --no-input
+confidant init --create --no-input --phrase-out "$HOME/confidant-recovery.txt"
 ```
 
 Before this, make sure git has an identity (`git config --global user.name`
 and `user.email`); the skeleton commit needs one. The command:
 
-1. creates the directory and runs `git init` when needed;
+1. creates the directory and runs `git init` with branch `main` (no manual
+   `master` → `main` rename), then reports the branch it created;
 2. writes `.gitignore` with `.confidant/` and a minimal `confidant.toml`
-   with a fresh `vault_id`, and commits the skeleton;
-3. generates the operator key, a 24-word recovery phrase (shown once on
-   stderr), and this device's key;
+   with a fresh `vault_id` and `packs = []`, and commits the skeleton;
+3. generates the operator key, a 24-word recovery phrase, and this device's
+   key. With `--phrase-out` the phrase goes to a new file (mode `0600`,
+   refuses to overwrite) and only the path is printed; without it the
+   phrase is shown once on stderr;
 4. creates the vault lookup key, the `vault:shared` client, and the signed
    operator certificate under `keys/`, then commits the `keys/` tree;
 5. writes `~/.config/confidant/trust.toml` only after every key step
    succeeds.
 
-It does **not** create an inbox key or install any pack. With `--no-input`
-the phrase is printed without the "have you written it down?" confirmation —
-store it offline (paper and a password manager, not a synced file in the
-vault) before continuing.
+It does **not** create an inbox key, add a git remote, or install any pack.
+Keep the recovery phrase offline: confirm the `--phrase-out` file with the
+human-only, read-only check `confidant keys verify-recovery --phrase-file
+<path>`, then move it offline and delete the local copy. Agents must not
+read or pipe the phrase.
 
 A new vault starts with `packs = []`. That is fine: `personal@0.2` is
-implicit and already enabled (§3.1).
+implicit and already enabled (§3.1), and `check` is clean without packs.
+Install an external pack later with `confidant pack add <https-url> --yes`.
 
 ### 2.5 The `init --force` case
 
@@ -311,7 +328,13 @@ Tracked defect from verification:
 - If `doctor` says `not enrolled`, either run `init` (new vault) or
   `recover` (existing vault), or, on a headless host with no Secret Service,
   provide `CONFIDANT_DEVICE_KEY` (and `CONFIDANT_INBOX_KEY` if you run
-  `inbox`) from the host's secret store.
+  `inbox`) from the host's secret store. For the full pre-init flow
+  (`age-keygen`, `CONFIDANT_DEVICE_KEY`, and `CONFIDANT_OPERATOR_KEY`), see
+  [Headless hosts and agents](agent-setup.md#headless-hosts-and-agents).
+- After `recover` or a `keys shred` rotation, run
+  `confidant keys verify-recovery --phrase-file <path>` (human-only,
+  read-only) to confirm the offline phrase still matches the vault. The
+  phrase itself never goes through an agent.
 - Re-enrollment is not `init`: running `init` again creates a new vault's
   keys rather than recovering the old ones.
 
@@ -406,10 +429,21 @@ confidant doctor
 confidant check --json --no-input
 ```
 
-Expected: `doctor` exits 0 with `vault resolved to .../vault` and a `device-key`
-check that is `ok`; `check` returns `"ok": true`. On a brand-new vault the
-summary is zero records and zero ledger entries. To make the check
-meaningful, add one fake person and one touch first, then re-run.
+Expected: `doctor` exits 0 with `vault resolved to .../vault` and a
+`device-key` check that is `ok`; `check` returns `"ok": true`; and
+`git -C "$NEW_VAULT" branch --show-current` prints `main` (init reports the
+branch it created). On a brand-new vault the summary is zero records and
+zero ledger entries. To make the check meaningful, add one fake person and
+one touch first, then re-run.
+
+While the recovery-phrase file is still available, confirm it matches the
+vault (human-only; never hand the phrase to an agent):
+
+```sh
+confidant keys verify-recovery --phrase-file <path>
+```
+
+Then move the file offline and delete the local copy.
 
 Confirm the new vault is self-contained and does not point at the old one:
 
