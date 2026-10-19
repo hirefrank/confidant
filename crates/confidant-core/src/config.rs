@@ -229,6 +229,29 @@ impl VaultConfig {
         self.packs.iter().any(|p| p == name)
     }
 
+    /// #656: the `name@version` pin when the vault lists `name` but the
+    /// pack's manifest is absent from `manifests`, i.e. the pack did not
+    /// resolve. When it did resolve, or `name` is not listed at all,
+    /// `None`: the key is then judged normally (a typo under a resolved
+    /// pack still points at the spec).
+    ///
+    /// Only a valid pin may be echoed: any other `packs` entry is operator
+    /// free text (#490, #501).
+    fn unresolved_pack_pin<'a>(
+        &'a self,
+        manifests: &[&crate::packs::manifest::PackManifest],
+        name: &str,
+    ) -> Option<&'a str> {
+        if manifests.iter().any(|m| m.pack.name == name) {
+            return None;
+        }
+        self.packs.iter().find_map(|listed| {
+            let (listed_name, _) = listed.split_once('@')?;
+            (listed_name == name && crate::packs::lock::is_valid_pack_pin(listed))
+                .then_some(listed.as_str())
+        })
+    }
+
     /// Semantic `[checks]` problems as `E_CONFIG` findings. Never panics.
     pub fn config_findings(&mut self) -> Vec<Finding> {
         let manifests = crate::packs::pack_manifests_for_config();
@@ -354,6 +377,14 @@ impl VaultConfig {
             if manifests.iter().any(|m| m.pack.name == key.as_str()) {
                 continue;
             }
+            // #656: a key under a listed pack that did not resolve (no
+            // lockfile pin, bad hash, unreadable manifest) is unknown only
+            // because the pack is missing. Point at the pack, not the spec,
+            // which does not define the pack's keys.
+            if let Some(pin) = self.unresolved_pack_pin(manifests, first_segment(key)) {
+                findings.push(unresolved_pack_key_finding(key, pin));
+                continue;
+            }
             findings.push(
                 Finding::new(
                     FindingCode::Config,
@@ -377,15 +408,19 @@ impl VaultConfig {
                 let prefix = format!("{top_key}.");
                 let has_leaf = seen.iter().any(|k| k.starts_with(&prefix));
                 if !has_leaf {
-                    findings.push(
-                        Finding::new(
-                            FindingCode::Config,
-                            Severity::Error,
-                            format!("unknown [checks] key '{top_key}'"),
-                        )
-                        .at_file("confidant.toml")
-                        .with_fix("See spec/0.1.md for the keys defined in 0.1"),
-                    );
+                    // #656: same pack-not-resolved carve-out as above.
+                    match self.unresolved_pack_pin(manifests, top_key) {
+                        Some(pin) => findings.push(unresolved_pack_key_finding(top_key, pin)),
+                        None => findings.push(
+                            Finding::new(
+                                FindingCode::Config,
+                                Severity::Error,
+                                format!("unknown [checks] key '{top_key}'"),
+                            )
+                            .at_file("confidant.toml")
+                            .with_fix("See spec/0.1.md for the keys defined in 0.1"),
+                        ),
+                    }
                 }
             }
         }
@@ -419,6 +454,27 @@ where
             }
         }
     }
+}
+
+/// The pack name a `[checks]` key belongs to: its first dotted segment.
+fn first_segment(key: &str) -> &str {
+    key.split('.').next().unwrap_or(key)
+}
+
+/// #656: an unknown `[checks]` key under a listed pack that did not resolve
+/// is not a typo, so the generic spec pointer would be wrong. The validated
+/// pin is safe to echo (#490), and the `E_PACK_UNKNOWN` (or other pack
+/// problem) finding already names it.
+fn unresolved_pack_key_finding(key: &str, pin: &str) -> Finding {
+    Finding::new(
+        FindingCode::Config,
+        Severity::Error,
+        format!("[checks] key '{key}' requires pack {pin}, which is not installed"),
+    )
+    .at_file("confidant.toml")
+    .with_fix(format!(
+        "Run `confidant pack add <https-url> --yes` to install/pin {pin}, or remove the [checks] key"
+    ))
 }
 
 /// `~/.config/confidant/config.toml`
@@ -748,6 +804,183 @@ vault_id = "abc"
         assert!(findings
             .iter()
             .any(|f| f.message.contains("unknown [checks] key")));
+    }
+
+    #[test]
+    fn config_unresolved_listed_pack_keys_point_at_the_pack() {
+        // #656: a listed pack with no lockfile pin resolves to no manifest,
+        // so its own keys are "unknown" only because the pack is missing.
+        // They must point at `pack add`, not at a spec page that does not
+        // define them: one finding per key, none with the spec pointer.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "abc"
+[checks]
+coaching.require_duration = "error"
+coaching.paid_session_gap_days = 45
+coaching.bogus = "warning"
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert_eq!(findings.len(), 3, "one finding per key: {findings:?}");
+        for f in &findings {
+            assert_eq!(f.code.as_str(), "E_CONFIG");
+            assert!(
+                f.message
+                    .contains("requires pack coaching@0.1, which is not installed"),
+                "{f:?}"
+            );
+        }
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("'coaching.require_duration'")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("'coaching.paid_session_gap_days'")),
+            "{findings:?}"
+        );
+        for f in &findings {
+            let fix = f.fix.as_deref().expect("a fix");
+            assert!(fix.contains("confidant pack add"), "{f:?}");
+            assert!(!fix.contains("spec/0.1.md"), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn config_unresolved_listed_pack_bare_and_empty_table_keys() {
+        // #656: the legacy bare pack key and an empty `[checks.<pack>]`
+        // table reach the same carve-out.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "abc"
+[checks]
+coaching = "error"
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("'coaching' requires pack coaching@0.1"),
+            "{findings:?}"
+        );
+        assert!(!findings[0]
+            .fix
+            .as_deref()
+            .unwrap_or("")
+            .contains("spec/0.1.md"));
+
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "abc"
+[checks.coaching]
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("'coaching' requires pack coaching@0.1"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn config_resolved_pack_typo_still_points_at_spec() {
+        // #656: with the pack resolved (manifest present), declared keys are
+        // accepted and a bogus leaf is the normal E_CONFIG typo, spec
+        // pointer included.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "abc"
+[checks]
+coaching.require_duration = "error"
+coaching.balance_nonnegative = "error"
+coaching.bogus = "warning"
+"#,
+        )
+        .unwrap();
+        let findings = config_findings_with_coaching(&mut cfg);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("unknown [checks] key 'coaching.bogus'"),
+            "{findings:?}"
+        );
+        assert!(findings[0]
+            .fix
+            .as_deref()
+            .unwrap_or("")
+            .contains("spec/0.1.md"));
+    }
+
+    #[test]
+    fn config_non_pack_key_unchanged_by_pack_listing() {
+        // #656: keys under no listed pack keep today's generic finding, even
+        // when the vault lists a pack whose keys are separately carved out.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@0.1"]
+vault_id = "abc"
+[checks]
+bogus.key = 1
+otherpack.thing = "error"
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        for f in &findings {
+            assert!(f.message.starts_with("unknown [checks] key"), "{f:?}");
+            assert!(
+                f.fix.as_deref().unwrap_or("").contains("spec/0.1.md"),
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_unresolved_pack_requires_a_valid_pin() {
+        // #656: a listing that is not a valid `name@version` pin is operator
+        // free text (#490, #501). It gets no carve-out and is never echoed.
+        let mut cfg = VaultConfig::parse(
+            r#"
+spec = "0.1"
+packs = ["coaching@nightly"]
+vault_id = "abc"
+[checks]
+coaching.require_duration = "error"
+"#,
+        )
+        .unwrap();
+        let findings = cfg.config_findings();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("unknown [checks] key 'coaching.require_duration'"),
+            "{findings:?}"
+        );
+        assert!(!findings[0].message.contains("nightly"), "{findings:?}");
     }
 
     #[test]

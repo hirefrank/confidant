@@ -5663,6 +5663,45 @@ fn pack_unknown_fix_names_the_recovery_commands() {
     );
 }
 
+/// #656: a listed external pack with no lockfile pin still reports
+/// `E_PACK_UNKNOWN` (the real cause), but its own `[checks]` keys must not
+/// add a stack of `E_CONFIG` findings pointing at a spec page that does not
+/// define them. One pack-specific finding per key instead.
+#[test]
+fn unpinned_listed_pack_checks_keys_do_not_point_at_the_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
+        "the real cause must stay: {json}"
+    );
+
+    let config_findings: Vec<&Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "E_CONFIG")
+        .collect();
+    assert_eq!(
+        config_findings.len(),
+        6,
+        "one finding per [checks] key: {json}"
+    );
+    for f in config_findings {
+        let message = f["message"].as_str().unwrap();
+        assert!(
+            message.contains("requires pack coaching@0.1, which is not installed"),
+            "{f}"
+        );
+        assert!(!message.contains("unknown [checks] key"), "{f}");
+        let fix = f["fix"].as_str().unwrap();
+        assert!(fix.contains("confidant pack add"), "{f}");
+        assert!(!fix.contains("spec/0.1.md"), "{f}");
+    }
+}
+
 #[test]
 fn external_pack_problems_report_their_codes() {
     let dir = tempfile::tempdir().unwrap();
