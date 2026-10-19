@@ -312,6 +312,107 @@ pub fn apply_write_with_encryptor(
     apply_write_inner(root, pending, opts, Some(encrypt), false)
 }
 
+/// Apply the step-5 change list in order. A failure here is an unexpected I/O
+/// error (disk full, a permission change, a path replaced by a directory since
+/// the pre-check): the caller restores the step-4 snapshots and returns this
+/// error unchanged (#614).
+fn apply_changes(root: &Path, changes: &[FileChange]) -> anyhow::Result<()> {
+    for (index, change) in changes.iter().enumerate() {
+        // Test-only injection point (#614): fail on a chosen change, after
+        // earlier changes have already landed, so the mid-apply rollback can
+        // be exercised without provoking a real I/O fault.
+        #[cfg(test)]
+        if apply_failure_due(index) {
+            return Err(anyhow::anyhow!(
+                "injected mid-apply failure at change {index} (test-only, #614)"
+            ));
+        }
+        #[cfg(not(test))]
+        let _ = index;
+        match change {
+            FileChange::AppendLines { path, lines } => {
+                let mut text = crate::paths::read_to_string(root, path).unwrap_or_default();
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                for line in lines {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                crate::paths::write_replace(root, path, text.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
+            }
+            FileChange::WriteFile { path, contents } => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        crate::paths::ensure_directory(root, parent)
+                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
+                    }
+                }
+                crate::paths::write_replace(root, path, contents.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
+            }
+            FileChange::WriteBytes { path, contents } => {
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        crate::paths::ensure_directory(root, parent)
+                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
+                    }
+                }
+                crate::paths::write_replace(root, path, contents)
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
+            }
+            FileChange::DeleteFile { path } => {
+                crate::paths::remove_file(root, path)
+                    .map_err(|e| anyhow::anyhow!("cannot delete {}: {e:#}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restore the step-4 snapshots and remove the directories this write created
+/// (innermost first, only when now empty), for a write that must not stand: a
+/// mid-apply failure (#614) or a failing post-check (#604). Best effort — the
+/// caller already has an error or a check report to surface.
+fn rollback(root: &Path, snapshots: &[(PathBuf, Option<Vec<u8>>)], created_dirs: &[PathBuf]) {
+    for (rel, orig) in snapshots {
+        match orig {
+            Some(bytes) => {
+                let _ = crate::paths::write_replace(root, rel, bytes);
+            }
+            None => {
+                let _ = crate::paths::remove_file(root, rel);
+            }
+        }
+    }
+    // A directory that existed before the write was never recorded; one that
+    // now holds another file makes `remove_dir` fail and is left in place.
+    for dir in created_dirs.iter().rev() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+// Test-only injection point for a mid-apply failure (#614). Armed with
+// `Some(i)`, `apply_changes` fails on change `i`. Absent from every non-test
+// build, so the production write path carries no hook.
+#[cfg(test)]
+thread_local! {
+    static FAIL_APPLY_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arm (or with `None`, disarm) the test-only mid-apply failure injection.
+#[cfg(test)]
+fn set_apply_failure(index: Option<usize>) {
+    FAIL_APPLY_AT.with(|cell| cell.set(index));
+}
+
+/// Whether the test-only injection is armed for this change index.
+#[cfg(test)]
+fn apply_failure_due(index: usize) -> bool {
+    FAIL_APPLY_AT.with(|cell| cell.get()) == Some(index)
+}
+
 fn apply_write_inner(
     root: &Path,
     mut pending: PendingWrite,
@@ -515,69 +616,22 @@ fn apply_write_inner(
         }
     }
 
-    // 5. Apply atomically.
-    for change in &pending.changes {
-        match change {
-            FileChange::AppendLines { path, lines } => {
-                let mut text = crate::paths::read_to_string(root, path).unwrap_or_default();
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                for line in lines {
-                    text.push_str(line);
-                    text.push('\n');
-                }
-                crate::paths::write_replace(root, path, text.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
-            }
-            FileChange::WriteFile { path, contents } => {
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        crate::paths::ensure_directory(root, parent)
-                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
-                    }
-                }
-                crate::paths::write_replace(root, path, contents.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
-            }
-            FileChange::WriteBytes { path, contents } => {
-                if let Some(parent) = path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        crate::paths::ensure_directory(root, parent)
-                            .map_err(|e| anyhow::anyhow!("cannot create directory: {e:#}"))?;
-                    }
-                }
-                crate::paths::write_replace(root, path, contents)
-                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e:#}", path.display()))?;
-            }
-            FileChange::DeleteFile { path } => {
-                crate::paths::remove_file(root, path)
-                    .map_err(|e| anyhow::anyhow!("cannot delete {}: {e:#}", path.display()))?;
-            }
-        }
+    // 5. Apply atomically. An unexpected I/O error partway (disk full, a
+    // permission change, a path replaced by a directory since the pre-check)
+    // must not leave a partially applied tree: restore the step-4 snapshots
+    // and drop the directories this write created, then return the error
+    // unchanged (#614). Modelled refusals are pre-validated above (#587,
+    // #604); this is the backstop for the ones that are not.
+    if let Err(err) = apply_changes(root, &pending.changes) {
+        rollback(root, &snapshots, &created_dirs);
+        return Err(err);
     }
 
     // 6. Post-check: roll the files back if the write broke the vault.
     let vault2 = load_vault(root).map_err(anyhow::Error::new)?;
     let post = check_vault(&vault2, &CheckOptions::default());
     if !post.ok {
-        for (rel, orig) in snapshots {
-            match orig {
-                Some(bytes) => {
-                    let _ = crate::paths::write_replace(root, &rel, &bytes);
-                }
-                None => {
-                    let _ = crate::paths::remove_file(root, &rel);
-                }
-            }
-        }
-        // Then remove the directories this write created, innermost first,
-        // only when they are now empty (#604). A directory that existed before
-        // the write was never recorded; one that now holds another file makes
-        // `remove_dir` fail and is left in place. Best effort, like the files.
-        for dir in created_dirs.iter().rev() {
-            let _ = std::fs::remove_dir(dir);
-        }
+        rollback(root, &snapshots, &created_dirs);
         return Ok(WriteOutcome::CheckBlocked { report: post });
     }
 
@@ -764,6 +818,102 @@ mod tests {
         assert!(
             message.contains("nothing to commit") || message.contains("no changes"),
             "message lost git's own detail: {message:?}"
+        );
+    }
+
+    /// #614: an unexpected I/O error partway through the apply loop must not
+    /// leave a partially applied tree. The failure is injected at the second
+    /// change (so the first has already landed): the first change is rolled
+    /// back, the directory this write created is removed, nothing is staged or
+    /// committed, and the original error is surfaced unchanged.
+    #[test]
+    fn mid_apply_failure_rolls_back_and_returns_the_original_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // A minimal check-clean vault (same shape as the inbox e2e fixture).
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",
+        )
+        .expect("write config");
+        let person = root.join("people/p-01M3TC5H00MPJG000000000000");
+        std::fs::create_dir_all(&person).expect("person dir");
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nname: \"Test Person\"\n---\n\nFake.\n",
+        )
+        .expect("profile");
+        std::fs::create_dir_all(root.join("ledger/2026")).expect("ledger dir");
+        std::fs::write(
+            root.join("ledger/2026/10.cfd"),
+            "2026-10-01 open p-01M3TC5H00MPJG000000000000 package pkg-01M3TC5H00MPJG004SK4000009 4 sessions\n",
+        )
+        .expect("ledger");
+        git(root, &["init", "-q", "-b", "main"], false).expect("init");
+        git(root, &["config", "user.name", "Test"], false).expect("name");
+        git(
+            root,
+            &["config", "user.email", "test@example.invalid"],
+            false,
+        )
+        .expect("email");
+        git(root, &["add", "-A"], false).expect("add");
+        git(root, &["commit", "-qm", "init"], false).expect("commit");
+
+        // Two new records: the first creates `people/p-…/` (and its dir), the
+        // second is made to fail before it does anything.
+        let first = "people/p-01M3TC5H00MPJG000000000001/profile.md";
+        let second = "people/p-01M3TC5H00MPJG000000000002/profile.md";
+        let pending = PendingWrite {
+            changes: vec![
+                FileChange::WriteFile {
+                    path: PathBuf::from(first),
+                    contents: "---\nid: p-01M3TC5H00MPJG000000000001\ntype: person\nname: \"Ada Example\"\n---\n\nFake.\n".to_owned(),
+                },
+                FileChange::WriteFile {
+                    path: PathBuf::from(second),
+                    contents: "---\nid: p-01M3TC5H00MPJG000000000002\ntype: person\nname: \"Bea Example\"\n---\n\nFake.\n".to_owned(),
+                },
+            ],
+            summary: "test: injected mid-apply failure".to_owned(),
+            canonical_request: "test: injected mid-apply failure".to_owned(),
+        };
+
+        set_apply_failure(Some(1));
+        let err = apply_write(root, pending, &WriteOptions::default())
+            .expect_err("the injected failure must surface");
+        set_apply_failure(None);
+
+        // The original error is returned as-is, never rewrapped into an E_*.
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("injected mid-apply failure at change 1"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            DomainError::of(&err).is_none(),
+            "the mid-apply error must not be rewrapped as a domain error: {message}"
+        );
+
+        // The first change is rolled back and the directory this write created
+        // for it is gone; the second change never touched the tree.
+        assert!(
+            !root.join(first).exists(),
+            "the first change was left applied"
+        );
+        assert!(
+            !root.join("people/p-01M3TC5H00MPJG000000000001").exists(),
+            "the directory this write created was left behind"
+        );
+        assert!(!root.join(second).exists());
+
+        // Nothing staged, nothing committed.
+        assert_eq!(git(root, &["status", "--porcelain"], false).unwrap(), "");
+        assert_eq!(
+            git(root, &["rev-list", "--count", "HEAD"], false)
+                .unwrap()
+                .trim(),
+            "1"
         );
     }
 }
