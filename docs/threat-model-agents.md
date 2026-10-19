@@ -124,9 +124,9 @@ cleared records), in the `allowlist` response ("no-ai records never appear",
 from the cleared set, `crates/confidant-cli/src/main.rs`
 `build_reindex_corpus`). The agent read path never decrypts a `no-ai`
 envelope: its decrypt hook returns a shell with the id and type, never the
-content (`crates/confidant-cli/src/record_decrypt.rs`). The one read that
-does decrypt is the operator's own `confidant record show <id> --for-edit`,
-covered below.
+content (`crates/confidant-cli/src/record_decrypt.rs`). The reads that do
+decrypt are the operator's own `confidant record show <id> --for-edit` and
+`confidant note show <id> --for-edit`, covered below.
 
 What it does not do:
 
@@ -140,7 +140,8 @@ What it does not do:
 - **It does not stop an agent that already has a shell on this device.**
   MCP dispatches from a fixed tool whitelist
   (`crates/confidant-cli/src/mcp.rs`) that omits `record show --for-edit`,
-  so a tool call cannot reach it. An agent that can run commands on this
+  `note show --for-edit`, and `note edit`, so a tool call cannot reach
+  them. An agent that can run commands on this
   machine, with this device's key material in reach, can invoke it directly
   — exactly as it could decrypt the file itself, or shell out to the CLI at
   all. `--for-edit` is a boundary in the CLI's surface, not access control

@@ -2923,6 +2923,404 @@ fn record_show_for_edit_decrypts_no_ai_that_reads_still_hide() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #557: `note show --for-edit` / `note edit` on an encrypted vault
+// ---------------------------------------------------------------------------
+
+/// Add a note for `PERSON` to the keyed vault and return (id, absolute path).
+fn add_note(h: &Harness, body: &str, no_ai: bool) -> (String, PathBuf) {
+    let body_file = write_file(h._tmp.path(), "note-body.md", body);
+    let mut cmd = h.cmd(&[
+        "note",
+        "add",
+        "--person",
+        PERSON,
+        "--body-file",
+        body_file.to_str().unwrap(),
+        "--json",
+        "--no-input",
+    ]);
+    if no_ai {
+        cmd.arg("--no-ai");
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "note add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let id = v["id"].as_str().unwrap().to_owned();
+    let path = h.vault.join(v["path"].as_str().unwrap());
+    (id, path)
+}
+
+/// `note show --for-edit` (human output) for `id`.
+fn show_note(h: &Harness, id: &str) -> String {
+    let out = h
+        .cmd(&["note", "show", id, "--for-edit", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note show failed: {}", stderr(&out));
+    stdout(&out)
+}
+
+/// Write the edited note text to a file for `note edit --file`.
+fn edit_note_file(h: &Harness, text: &str) -> PathBuf {
+    write_file(h._tmp.path(), "note-edit.md", text)
+}
+
+#[test]
+fn note_edit_reencrypts_and_for_edit_reads_it_back() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, path) = add_note(&h, "First note body.", false);
+    let before = std::fs::read(&path).unwrap();
+    let commits = commit_count(&h);
+
+    let text = show_note(&h, &id).replace("First note body.", "Second note body.");
+    let edited = edit_note_file(&h, &text);
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note edit failed: {}", stderr(&out));
+    assert_eq!(commit_count(&h), commits + 1, "expected exactly one commit");
+
+    let after = std::fs::read(&path).unwrap();
+    assert_ne!(before, after, "the edit did not rewrite the file");
+    let envelope = String::from_utf8_lossy(&after);
+    assert!(
+        envelope.contains("\nenc: xchacha20poly1305\n"),
+        "the edited note is not an envelope:\n{envelope}"
+    );
+    assert!(!envelope.contains("Second note body."), "plaintext leaked");
+
+    let shown = show_note(&h, &id);
+    assert!(
+        shown.contains("Second note body."),
+        "for-edit did not return the new body: {shown}"
+    );
+    assert!(
+        !shown.contains("First note body."),
+        "for-edit returned stale content: {shown}"
+    );
+}
+
+#[test]
+fn note_edit_refuses_an_envelope_as_input() {
+    // Passing the on-disk file back (an envelope) would bury a second
+    // encryption layer; point the operator at `note show --for-edit`.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, path) = add_note(&h, "Body.", false);
+    let before = std::fs::read(&path).unwrap();
+    let commits = commit_count(&h);
+
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a refusal: {}",
+        stdout(&out)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("encrypted note envelope"),
+        "{v}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before, "ciphertext changed");
+    assert_eq!(commit_count(&h), commits, "nothing committed");
+}
+
+#[test]
+fn note_edit_unchanged_reuses_ciphertext_and_commits_nothing() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, path) = add_note(&h, "First note body.", false);
+
+    // Apply a real edit first, so the stored plaintext is canonical.
+    let text = show_note(&h, &id).replace("First note body.", "Second note body.");
+    let edited = edit_note_file(&h, &text);
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note edit failed: {}", stderr(&out));
+
+    let bytes = std::fs::read(&path).unwrap();
+    let commits = commit_count(&h);
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            edited.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "no-op edit failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["unchanged"], serde_json::json!(true), "{v}");
+    assert!(
+        v.get("commit").is_none(),
+        "no-op edit reported a commit: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "the ciphertext changed on a no-op edit"
+    );
+    assert_eq!(commit_count(&h), commits, "a no-op edit committed");
+}
+
+#[test]
+fn note_show_for_edit_decrypts_no_ai_that_reads_still_hide() {
+    // #557: notes are where no-ai prose lives, so the operator can read them
+    // while agents stay blind.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Hidden", "Bio."));
+    let secret = "Hidden note prose agents must never see.";
+    let (id, path) = add_note(&h, secret, true);
+
+    let shown = show_note(&h, &id);
+    assert!(
+        shown.contains(secret),
+        "for-edit did not decrypt the no-ai note: {shown}"
+    );
+
+    let out = h
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let ctx: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        !ctx.to_string().contains(secret),
+        "the no-ai note leaked into context: {ctx}"
+    );
+
+    let out = h
+        .cmd(&["find", secret, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let found: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        found["matches"].as_array().unwrap().len(),
+        0,
+        "find returned a no-ai note: {found}"
+    );
+
+    // The outer header carries no-ai, so an unkeyed read fails closed.
+    let envelope = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        envelope.contains("\nno-ai: true\n"),
+        "the note envelope is not no-ai:\n{envelope}"
+    );
+}
+
+#[test]
+fn note_edit_restamps_the_no_ai_header() {
+    // #410 in spirit: changing a note's `no-ai` moves its outer header in
+    // the same commit, in both directions; agents stop seeing it and the
+    // operator still can.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let body = "Visible note body.";
+    let (id, path) = add_note(&h, body, false);
+    let envelope = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        envelope.contains("\nno-ai: false\n"),
+        "the note should start visible:\n{envelope}"
+    );
+
+    let text = show_note(&h, &id).replace("type: note\n", "type: note\nno-ai: true\n");
+    let edited = edit_note_file(&h, &text);
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            edited.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note edit failed: {}", stderr(&out));
+
+    let envelope = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        envelope.contains("\nno-ai: true\n"),
+        "the no-ai header was not restamped:\n{envelope}"
+    );
+    let out = h
+        .cmd(&["find", body, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    let found: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        found["matches"].as_array().unwrap().len(),
+        0,
+        "find returned the now-no-ai note: {found}"
+    );
+    assert!(show_note(&h, &id).contains(body));
+}
+
+/// #557: `note edit --edit` reuses the #455 scratch convention: 0600 file
+/// in a 0700 dir, removed on success. A fake $EDITOR records the modes and
+/// rewrites the body.
+#[test]
+#[cfg(unix)]
+fn note_edit_edit_uses_0600_scratch_and_cleans_up() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, _path) = add_note(&h, "Editor note body.", false);
+    // `.confidant/` must be git-ignored for --edit to run.
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+
+    let modes_out = h._tmp.path().join("modes.txt");
+    let script = write_file(
+        h._tmp.path(),
+        "editor.sh",
+        &format!(
+            "#!/bin/sh\n\
+             d=$(dirname \"$1\")\n\
+             ls -ld \"$d\" | cut -c1-10 > \"{}\"\n\
+             ls -l \"$1\" | cut -c1-10 >> \"{}\"\n\
+             sed -i 's/Editor note body./Editor changed body./' \"$1\"\n",
+            modes_out.display(),
+            modes_out.display(),
+        ),
+    );
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = h
+        .cmd(&["note", "edit", &id, "--edit", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", script.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "note edit --edit failed: {} {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    let modes = std::fs::read_to_string(&modes_out).unwrap();
+    let lines: Vec<&str> = modes.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 mode lines: {modes}");
+    assert_eq!(
+        lines[0], "drwx------",
+        "scratch dir should be 0700: {modes}"
+    );
+    assert_eq!(
+        lines[1], "-rw-------",
+        "scratch file should be 0600: {modes}"
+    );
+    assert!(
+        !h.vault.join(format!(".confidant/notes/{id}")).exists(),
+        "scratch should be removed"
+    );
+    assert!(show_note(&h, &id).contains("Editor changed body."));
+}
+
+/// #557: `--edit` with no editor configured is a usage error and leaves no
+/// scratch or commit behind.
+#[test]
+#[cfg(unix)]
+fn note_edit_without_editor_env_is_usage_error() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, _path) = add_note(&h, "Body.", false);
+    std::fs::write(h.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    let commits = commit_count(&h);
+
+    let out = h
+        .cmd(&["note", "edit", &id, "--edit", "--json", "--no-input"])
+        .env("VISUAL", "")
+        .env("EDITOR", "")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "expected a usage error: {}",
+        stdout(&out)
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(v["error"]["code"], "usage_error", "{v}");
+    assert!(!h.vault.join(".confidant/notes").exists(), "no scratch");
+    assert_eq!(commit_count(&h), commits, "nothing committed");
+}
+
+/// #557: a crashed `--edit` run leaves scratch behind; the next
+/// `note edit` (even `--file`) sweeps it before doing anything else.
+#[test]
+#[cfg(unix)]
+fn note_edit_sweeps_stale_scratch() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    add_person(&h, &person_md(PERSON, "Ada Example", "Bio."));
+    let (id, _path) = add_note(&h, "Body.", false);
+
+    let stale_dir = h.vault.join(format!(".confidant/notes/{id}"));
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let stale = stale_dir.join("note.md");
+    std::fs::write(&stale, "SENTINEL-STALE-PLAINTEXT").unwrap();
+
+    // A `--file` edit with the canonical plaintext is a no-op write, but it
+    // must still sweep the stale plaintext.
+    let same = edit_note_file(&h, &show_note(&h, &id));
+    let out = h
+        .cmd(&[
+            "note",
+            "edit",
+            &id,
+            "--file",
+            same.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "note edit failed: {}", stderr(&out));
+    assert!(!stale.exists(), "stale scratch was not swept");
+    assert!(!stale_dir.exists(), "stale scratch dir was not swept");
+}
+
 /// `key_id` epoch from a record file, for the epoch assertions below.
 fn envelope_epoch(bytes: &str) -> u64 {
     let key_id = bytes

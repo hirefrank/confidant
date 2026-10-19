@@ -43,8 +43,8 @@ only). There are no field-level flags — the record is the unit.
   `reindex` while the person stays visible. Use this for one-off sensitive
   detail (a medical note); use `notes` mode when most notes should be
   hidden. A note's explicit `no-ai: false` overrides the `notes` default
-  (set it in front matter; `note add` has no flag for it), but can never
-  un-hide a `no-ai: true` person.
+  (set it in front matter, e.g. via `note edit`; `note add` has no flag for
+  it), but can never un-hide a `no-ai: true` person.
 
 On encrypted vaults the mode rides the envelope's plaintext outer header
 (`no-ai: notes`), so `find`/`context` fail closed without keys; readers

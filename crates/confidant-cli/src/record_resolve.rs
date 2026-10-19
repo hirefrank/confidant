@@ -11,6 +11,10 @@
 //! Fail-closed per side (CD7): a side this device cannot decrypt names the
 //! side (`ours`/`theirs`) in the error and never leaks the other side's
 //! plaintext. Error messages carry no file content.
+//!
+//! The 0600 scratch plumbing (`ScratchGuard`, the stale-scratch sweep, the
+//! editor helpers) is shared with `note edit --edit` (#557), which lives at
+//! `.confidant/notes/<id>/note.md` under the same privacy rules.
 
 use std::path::{Path, PathBuf};
 
@@ -593,12 +597,24 @@ pub(crate) fn refuse_vault_path(root: &Path, path: &Path) -> anyhow::Result<Path
 /// `resolve --edit` (#455, CD5). Best-effort: files are zero-overwritten
 /// before the tree is removed, and every file is attempted.
 pub(crate) fn sweep_stale_scratch(root: &Path) {
+    sweep_stale_scratch_under(&root.join(".confidant").join("conflicts"));
+}
+
+/// Remove a stale `.confidant/notes/` dir left by a crashed
+/// `note edit --edit` (#557). Same 0600 scratch convention as #455.
+pub(crate) fn sweep_stale_note_scratch(root: &Path) {
+    sweep_stale_scratch_under(&root.join(".confidant").join("notes"));
+}
+
+/// Zero-overwrite every file under `dir`, then remove the tree. Best-effort:
+/// every file is attempted and errors are swallowed so cleanup never masks
+/// the original result.
+fn sweep_stale_scratch_under(dir: &Path) {
     use std::io::Write;
-    let dir = root.join(".confidant").join("conflicts");
     if !dir.exists() {
         return;
     }
-    let mut stack = vec![dir.clone()];
+    let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
@@ -616,7 +632,7 @@ pub(crate) fn sweep_stale_scratch(root: &Path) {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Apply a merged record (#455).
@@ -843,6 +859,90 @@ pub(crate) fn run_editor(path: &Path) -> anyhow::Result<()> {
         return Err(anyhow::Error::new(
             DomainError::invalid("editor exited with an error; the merge was not applied")
                 .with_fix("Fix the merge and retry, or use --merged-file"),
+        ));
+    }
+    Ok(())
+}
+
+/// #557: set up `note edit --edit` scratch (unix only).
+///
+/// Creates `.confidant/notes/<id>/` (0700) with `note.md` (0600) holding the
+/// note's current plaintext, for the operator's editor. Same 0600 scratch
+/// convention as #455 (and the same `.confidant/` gitignore pre-flight):
+/// [`ScratchGuard`] zero-overwrites and removes everything on drop.
+#[cfg(unix)]
+pub(crate) fn setup_note_edit_scratch(
+    root: &Path,
+    id: &RecordId,
+    text: &str,
+) -> anyhow::Result<(ScratchGuard, PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    crate::ensure_corpus_gitignored(root).map_err(anyhow::Error::new)?;
+
+    let dir = root.join(".confidant").join("notes").join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot create scratch dir {}: {e}",
+            dir.display()
+        )))
+    })?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot set permissions on {}: {e}",
+            dir.display()
+        )))
+    })?;
+
+    let note_path = dir.join("note.md");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&note_path)
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot write scratch file {}: {e}",
+                note_path.display()
+            )))
+        })?;
+    f.write_all(text.as_bytes()).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot write scratch file {}: {e}",
+            note_path.display()
+        )))
+    })?;
+    f.sync_all().map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot sync scratch file {}: {e}",
+            note_path.display()
+        )))
+    })?;
+
+    let guard = ScratchGuard::new(dir, vec![note_path.clone()]);
+    Ok((guard, note_path))
+}
+
+/// Run the operator's editor on a note's scratch file (#557).
+///
+/// A non-zero editor exit is an error; the caller must not apply anything.
+#[cfg(unix)]
+pub(crate) fn run_note_editor(path: &Path) -> anyhow::Result<()> {
+    let editor = resolve_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(path)
+        .status()
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not run editor '{editor}': {e}"
+            )))
+        })?;
+    if !status.success() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("editor exited with an error; the note was not changed")
+                .with_fix("Fix the note and retry, or use --file"),
         ));
     }
     Ok(())
