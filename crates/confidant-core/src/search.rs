@@ -1038,7 +1038,7 @@ fn front_matter_key(line: &str) -> Option<String> {
 }
 
 /// Practical Unicode caseless matching: lowercasing plus ß/ẞ → ss and İ → i.
-fn case_fold(s: &str) -> String {
+pub(crate) fn case_fold(s: &str) -> String {
     if s.is_ascii() {
         return s.to_ascii_lowercase();
     }

@@ -21,6 +21,7 @@ pub mod inbox;
 pub mod ledger;
 pub mod paths;
 pub mod record;
+pub mod resolve;
 pub mod schema;
 pub mod search;
 pub mod touch;
