@@ -2260,3 +2260,118 @@ fn verify_recovery_empty_stdin_is_usage_error() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["error"]["code"], "usage_error");
 }
+
+// ---------------------------------------------------------------------------
+// #671 review: a failure after the keys commit must rewind the commit before
+// removing keys/, so a prepared vault is clean and the retry works. The
+// failpoint is test-only (`test-overrides`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn failed_init_after_keys_commit_rewinds_and_retry_succeeds() {
+    let h = Harness::new();
+    let head_before = git_out(&h.vault, &["rev-parse", "HEAD"]);
+    let phrase_path = h._tmp.path().join("phrase.txt");
+
+    let out = h
+        .cmd(&[
+            "init",
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .env("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the failpoint must fail init: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The keys commit was rewound, keys/ and the phrase file are gone, and
+    // the prepared vault is exactly as clean as before the run.
+    assert_eq!(
+        git_out(&h.vault, &["rev-parse", "HEAD"]),
+        head_before,
+        "the keys commit was not rewound"
+    );
+    let porcelain = git_out(&h.vault, &["status", "--porcelain"]);
+    assert!(
+        porcelain.trim().is_empty(),
+        "rollback left a dirty tree:\n{porcelain}"
+    );
+    assert!(!h.vault.join("keys").exists(), "keys/ must be removed");
+    assert!(!phrase_path.exists(), "the phrase file must be removed");
+    assert!(!h.trust_toml().exists(), "the anchor must not be written");
+
+    // Retry without the failpoint: the same prepared vault now initializes.
+    let retry = h.init(&["--phrase-out", phrase_path.to_str().unwrap()]);
+    assert!(
+        retry.status.success(),
+        "retry failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(phrase_path.is_file(), "retry must write the phrase file");
+    assert!(h.trust_toml().is_file(), "retry must write the anchor");
+    let check = h.cmd(&["check", "--no-input", "--json"]).output().unwrap();
+    assert!(
+        check.status.success(),
+        "check failed after the retry: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}
+
+#[test]
+fn failed_create_init_after_keys_commit_rolls_back_the_scaffold() {
+    let b = Boot::new();
+    let phrase_path = b._tmp.path().join("phrase.txt");
+
+    let out = b
+        .cmd(&[
+            "init",
+            "--create",
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the failpoint must fail init: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !b.vault.exists(),
+        "failed --create must leave the target absent"
+    );
+    assert!(!phrase_path.exists(), "the phrase file must be removed");
+
+    // Retry without the failpoint from the same absent target.
+    let retry = b.at_vault(&["init", "--create", "--no-input", "--json"]);
+    assert!(
+        retry.status.success(),
+        "retry failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let check = b.at_vault(&["check", "--no-input", "--json"]);
+    assert!(
+        check.status.success(),
+        "check failed after the retry: {}",
+        String::from_utf8_lossy(&check.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+}

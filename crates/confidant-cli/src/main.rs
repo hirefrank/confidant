@@ -9137,13 +9137,19 @@ enum BootstrapPlan {
 }
 
 /// Rollback for the key steps of `init` (#651): removes a `keys/` tree this
-/// run created (never a pre-existing one) and a `--phrase-out` file this run
-/// created, then lets an armed [`Scaffold`] roll the skeleton back on drop.
+/// run created (never a pre-existing one), a `--phrase-out` file this run
+/// created, and the `init: trust anchor and vault keys` commit when the run
+/// fails after committing but before the anchor save. Then it lets an armed
+/// [`Scaffold`] roll the skeleton back on drop.
 struct InitRollback {
     root: PathBuf,
     scaffold: Option<Scaffold>,
     keys_dir_preexisting: bool,
     keys_started: bool,
+    /// HEAD immediately before the keys commit; `None` on an unborn branch.
+    head_before_keys: Option<String>,
+    /// True once `init: trust anchor and vault keys` succeeded.
+    keys_committed: bool,
     phrase_out: Option<PathBuf>,
     phrase_out_created: bool,
     armed: bool,
@@ -9156,6 +9162,8 @@ impl InitRollback {
             scaffold,
             keys_dir_preexisting: root.join("keys").exists(),
             keys_started: false,
+            head_before_keys: None,
+            keys_committed: false,
             phrase_out: phrase_out.map(Path::to_path_buf),
             phrase_out_created: false,
             armed: true,
@@ -9169,11 +9177,48 @@ impl InitRollback {
             scaffold.armed = false;
         }
     }
+
+    /// Rewind the `init: trust anchor and vault keys` commit so the working
+    /// tree can be cleaned up. Returns false when git refuses.
+    fn rewind_keys_commit(&self) -> bool {
+        match &self.head_before_keys {
+            Some(prev) => {
+                confidant_core::write::git(&self.root, &["reset", "--mixed", prev], true).is_ok()
+            }
+            None => {
+                confidant_core::write::git(&self.root, &["update-ref", "-d", "HEAD"], true).is_ok()
+            }
+        }
+    }
 }
 
 impl Drop for InitRollback {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+        if self.keys_committed && !self.rewind_keys_commit() {
+            // Keep the keys tree, the phrase file, and the scaffold: the
+            // commit still references keys/, and deleting either side would
+            // lose data silently. Say exactly what is left and why.
+            if let Some(scaffold) = self.scaffold.as_mut() {
+                scaffold.armed = false;
+            }
+            let keys_path = self.root.join("keys");
+            eprintln!(
+                "warning: init failed after committing keys/ but could not rewind the commit; \
+                 keeping {} so the phrase still matches the committed keys",
+                keys_path.display()
+            );
+            if self.phrase_out_created {
+                if let Some(path) = &self.phrase_out {
+                    eprintln!(
+                        "warning: keeping the recovery phrase file at {}; write it down before \
+                         retrying",
+                        path.display()
+                    );
+                }
+            }
             return;
         }
         if self.keys_started && !self.keys_dir_preexisting {
@@ -9682,15 +9727,33 @@ fn cmd_init(
         display_phrase_once(no_input, &phrase)?;
     }
 
+    // #651 review: record the pre-keys HEAD so a failure after the keys
+    // commit (e.g. the anchor save) can rewind it before removing keys/.
+    rollback.head_before_keys = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+
     stage_keys(root, no_input)?;
     confidant_core::write::git(
         root,
         &["commit", "-m", "init: trust anchor and vault keys"],
         no_input,
     )?;
+    rollback.keys_committed = true;
     let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
         .trim()
         .to_owned();
+
+    // Test-only failpoint (never in release builds): a failure after the
+    // irreversible keys/ commit and before the anchor save exercises the
+    // rewind path. Not part of the agent contract.
+    #[cfg(feature = "test-overrides")]
+    if std::env::var("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT").as_deref() == Ok("1") {
+        return Err(anyhow::Error::new(DomainError::internal(
+            "test-only failpoint: failing after the keys/ commit",
+        )));
+    }
 
     // Persist the anchor now that everything succeeded. Atomic
     // temp-and-rename: a crash never leaves a half-written trust.toml.
