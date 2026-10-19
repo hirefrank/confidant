@@ -30,7 +30,7 @@ use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
 use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
-use confidant_core::error::DomainError;
+use confidant_core::error::{DomainError, ErrorKind};
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::packs::dir::read_pack_dir;
@@ -442,6 +442,18 @@ enum KeysAction {
     Shred {
         /// Client id to shred.
         client_id: String,
+    },
+    /// Verify a saved recovery phrase against this vault (read-only).
+    ///
+    /// The phrase arrives via stdin or `--phrase-file` only (never as an
+    /// argument). Works on an enrolled device and on a fresh device: it
+    /// needs no device key and writes nothing (no config dir, no `keys/`,
+    /// no git, no keychain). Exits 0 only when the phrase matches the
+    /// pinned public halves and opens every current client's wrapping.
+    VerifyRecovery {
+        /// File containing the 24-word recovery phrase (alternative to stdin).
+        #[arg(long)]
+        phrase_file: Option<PathBuf>,
     },
     /// Add a new device: two-step ceremony.
     ///
@@ -1388,6 +1400,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                             cmd_keys_revoke(&cli, &root, client_id, key_ids)
                         }
                         KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
+                        KeysAction::VerifyRecovery { phrase_file } => {
+                            cmd_keys_verify_recovery(&cli, &root, phrase_file.as_deref())
+                        }
                         KeysAction::DeviceAdd { .. } => {
                             unreachable!("handled by the outer match arm")
                         }
@@ -9338,6 +9353,84 @@ fn cmd_init(cli: &Cli, root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Read a recovery phrase from stdin or `--phrase-file` (B7: never argv).
+///
+/// Both channels read straight into a [`Zeroizing<String>`]; the trimmed
+/// copy is zeroizing too, so neither the raw nor the trimmed buffer is ever
+/// dropped as a plain `String`. Empty input is a usage error.
+fn read_phrase(phrase_file: Option<&Path>) -> anyhow::Result<Zeroizing<String>> {
+    use std::io::Read;
+
+    let mut buf: Zeroizing<String> = Zeroizing::new(String::new());
+    if let Some(path) = phrase_file {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "--phrase-file {} unreadable: {e}",
+                path.display()
+            )))
+        })?;
+        *buf = text;
+    } else {
+        io::stdin().read_to_string(&mut buf).map_err(|e| {
+            anyhow::Error::new(DomainError::usage(format!(
+                "cannot read phrase from stdin: {e}"
+            )))
+        })?;
+    }
+
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "recovery phrase is required via stdin or --phrase-file",
+        )));
+    }
+    if trimmed.len() == buf.len() {
+        return Ok(buf);
+    }
+    // A separate zeroizing buffer, so dropping the untrimmed original does
+    // not leave the phrase bytes in a plain `String` (#663).
+    Ok(Zeroizing::new(trimmed.to_owned()))
+}
+
+/// Compare a phrase-derived recovery identity with a trust anchor: **both**
+/// halves must match (Ed25519 pubkey and X25519 age recipient). The two
+/// comparisons live here so `recover` and `keys verify-recovery` cannot
+/// drift apart (#663).
+fn recovery_matches_anchor(
+    anchor: &confidant_crypt::anchor::Anchor,
+    recovery: &confidant_crypt::recovery::Recovery,
+) -> (bool, bool) {
+    (
+        anchor.recovery == recovery.verifying_key(),
+        anchor.recovery_age == recovery.age_identity().to_recipient_string(),
+    )
+}
+
+/// Fail closed unless the phrase-derived recovery identity matches the
+/// anchor's Ed25519 pubkey and X25519 age recipient. Shared by `recover`
+/// and `keys verify-recovery`.
+fn check_recovery(
+    anchor: &confidant_crypt::anchor::Anchor,
+    recovery: &confidant_crypt::recovery::Recovery,
+) -> anyhow::Result<()> {
+    let (pubkey_matches, recipient_matches) = recovery_matches_anchor(anchor, recovery);
+    if !pubkey_matches {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "recovery phrase does not match this vault's trust anchor",
+        )));
+    }
+    // The X25519 recovery recipient is a separate HKDF branch of the
+    // phrase; it must match too, or a tampered anchor file could get a
+    // forged recipient recorded in the denylist and the real retired
+    // recipient missed (#154 must-fix 1).
+    if !recipient_matches {
+        return Err(anyhow::Error::new(DomainError::invalid(
+            "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+        )));
+    }
+    Ok(())
+}
+
 fn cmd_recover(
     cli: &Cli,
     root: &Path,
@@ -9354,35 +9447,9 @@ fn cmd_recover(
     let json = cli.json;
     let no_input = cli.no_input;
 
-    // B7: phrase via stdin or --phrase-file only — never argv.
-    // Wrapped in Zeroizing: the plaintext phrase is wiped on drop.
-    let phrase: zeroize::Zeroizing<String> = if let Some(path) = phrase_file {
-        zeroize::Zeroizing::new(
-            std::fs::read_to_string(path)
-                .map_err(|e| {
-                    anyhow::Error::new(DomainError::usage(format!(
-                        "--phrase-file {} unreadable: {e}",
-                        path.display()
-                    )))
-                })?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        let mut buf = String::new();
-        use std::io::Read;
-        io::stdin().read_to_string(&mut buf).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "cannot read phrase from stdin: {e}"
-            )))
-        })?;
-        zeroize::Zeroizing::new(buf.trim().to_string())
-    };
-    if phrase.is_empty() {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "recovery phrase is required via stdin or --phrase-file",
-        )));
-    }
+    // B7: phrase via stdin or --phrase-file only — never argv. Both
+    // channels read into zeroizing buffers (shared `read_phrase`).
+    let phrase = read_phrase(phrase_file)?;
 
     // B8: validate (typo-in-word-N errors; never echoes the word).
     let old_recovery = Recovery::from_phrase(&phrase).map_err(anyhow::Error::new)?;
@@ -9434,23 +9501,6 @@ fn cmd_recover(
     //    phrase alone re-establishes trust.
     //
     // Nothing is written to the config dir until this succeeds.
-    let check_recovery = |a: &anchor::Anchor| -> anyhow::Result<()> {
-        if a.recovery != old_recovery.verifying_key() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "recovery phrase does not match this vault's trust anchor",
-            )));
-        }
-        // The X25519 recovery recipient is a separate HKDF branch of the
-        // phrase; it must match too, or a tampered anchor file could get a
-        // forged recipient recorded in the denylist and the real retired
-        // recipient missed (#154 must-fix 1).
-        if a.recovery_age != old_recovery.age_identity().to_recipient_string() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "recovery phrase does not match this vault's trust anchor (recovery recipient)",
-            )));
-        }
-        Ok(())
-    };
     let anchor = if let Some(path) = anchor_file {
         let a = anchor::load_from(path, root).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
@@ -9458,7 +9508,7 @@ fn cmd_recover(
                 path.display()
             )))
         })?;
-        check_recovery(&a)?;
+        check_recovery(&a, &old_recovery)?;
         // #154 must-fix 3: the supplied operator key may only be accepted
         // when the vault has no operator certificate (the pre-cert case the
         // backup exists for). When a cert is present it must verify against
@@ -9490,7 +9540,7 @@ fn cmd_recover(
             Ok((a, _warnings)) => {
                 // The phrase must be for THIS vault: the recovery public key
                 // in the anchor must match the phrase-derived one.
-                check_recovery(&a)?;
+                check_recovery(&a, &old_recovery)?;
                 a
             }
             Err(_) => {
@@ -9680,6 +9730,9 @@ fn cmd_recover(
         println!("recovered {} client(s); anchor re-pinned", clients.len());
         println!("committed ({})", &commit[..8.min(commit.len())]);
         println!("note: only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery). Enroll more devices with `keys device-add`.");
+        println!(
+            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -12913,6 +12966,326 @@ fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<Exi
                 "inbox rotation pending: this device does not hold the inbox key; reminder written"
             );
         }
+        println!(
+            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print the structured failure for `keys verify-recovery`.
+///
+/// The error envelope is the ordinary ADR-7 shape (`ok:false`, stable
+/// `code`); `outcome` and `checks` are additive so `--json` still reports
+/// which checks passed. Never include words, positions, derived keys, or
+/// recipient fingerprints.
+fn verify_recovery_failure(
+    cli: &Cli,
+    root: &Path,
+    outcome: &str,
+    checks: Option<Value>,
+    err: DomainError,
+) -> anyhow::Result<ExitCode> {
+    let code = err.exit_code() as u8;
+    if cli.json {
+        let mut body = serde_json::json!({
+            "ok": false,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": vault_json(Some(root)),
+            "outcome": outcome,
+            "error": err.to_json(),
+        });
+        if let Some(checks) = checks {
+            body["checks"] = checks;
+        }
+        print_json(&body)?;
+    } else {
+        print_error(false, None, &err)?;
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// `confidant keys verify-recovery` (#663): check a saved phrase without
+/// changing anything.
+///
+/// Match requires all of:
+/// 1. when `~/.config/confidant/trust.toml` exists, both its Ed25519
+///    `recovery_pubkey` and X25519 `recovery_age_recipient` match the
+///    phrase (and a disagreement never falls back to `keys/`);
+/// 2. when `keys/operator.toml` exists, its certificate verifies against
+///    the phrase-derived recovery pubkey;
+/// 3. the phrase identity trial-unwraps the current-epoch
+///    `wrapped/recovery.age` for every initialized client except the
+///    device-only `vault:lookup` key.
+fn cmd_keys_verify_recovery(
+    cli: &Cli,
+    root: &Path,
+    phrase_file: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{
+        anchor,
+        lifecycle::KeyStore,
+        manifest::{RECOVERY_KEY_ID, VAULT_CLIENT_ID},
+        recovery::Recovery,
+    };
+
+    // B7: stdin or --phrase-file only, never argv; zeroizing buffers.
+    let phrase = read_phrase(phrase_file)?;
+    let recovery = match Recovery::from_phrase(&phrase) {
+        Ok(recovery) => recovery,
+        Err(e) => {
+            drop(phrase);
+            // The position hint is stderr-only. The JSON error message is
+            // deliberately generic so no word position reaches --json.
+            eprintln!("hint: {e}");
+            return verify_recovery_failure(
+                cli,
+                root,
+                "malformed",
+                None,
+                DomainError::new(
+                    ErrorKind::RecoveryMalformed,
+                    "recovery phrase is malformed (expected 24 BIP39 words)",
+                )
+                .with_fix("Check the saved copy and re-enter the 24 words from it"),
+            );
+        }
+    };
+    drop(phrase);
+
+    let vault = load_vault(root)?;
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+    let keys_dir = root.join("keys");
+    let trust_path = config_dir.join(anchor::TRUST_FILE);
+    let trust_exists = trust_path.is_file();
+
+    let derived_pubkey = recovery.verifying_key();
+    let derived_recipient = recovery.age_identity().to_recipient_string();
+
+    let mut anchor_pin: Option<anchor::Anchor> = None;
+    let mut anchor_state = "absent";
+    let mut recipient_state = "absent";
+    if trust_exists {
+        match anchor::load(&config_dir, root) {
+            Ok((loaded, _warnings)) => {
+                let (pubkey_matches, recipient_matches) =
+                    recovery_matches_anchor(&loaded, &recovery);
+                anchor_state = if pubkey_matches { "pass" } else { "fail" };
+                recipient_state = if recipient_matches { "pass" } else { "fail" };
+                anchor_pin = Some(loaded);
+            }
+            Err(e) => {
+                // The anchor exists but cannot be used: fail closed. Never
+                // fall back to the keys/ tree in this case.
+                let checks = serde_json::json!({
+                    "anchor": "fail",
+                    "recipient": "fail",
+                    "cert": "absent",
+                    "unwrap": {},
+                });
+                let err = DomainError::new(
+                    ErrorKind::RecoveryMismatch,
+                    format!(
+                        "trust anchor exists at {} but cannot be used: {e}",
+                        trust_path.display()
+                    ),
+                )
+                .with_fix(
+                    "Restore a valid trust.toml from backup; verify-recovery never falls back \
+                     to the vault's keys/ tree when an anchor exists",
+                );
+                return verify_recovery_failure(cli, root, "mismatch", Some(checks), err);
+            }
+        }
+    }
+
+    let store = KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
+        .map_err(anyhow::Error::new)?;
+
+    // A retired phrase is only knowable against a current anchor: the
+    // append-only history also records the current recipient, so membership
+    // alone would flag a healthy phrase after any rotation.
+    let retired = trust_exists
+        && recipient_state == "fail"
+        && store.recovery_history().contains(&derived_recipient);
+
+    // The operator certificate is what a fresh-device `recover` relies on.
+    let mut cert_state = "absent";
+    let mut cert_error: Option<String> = None;
+    if keys_dir.join(anchor::OPERATOR_CERT_FILE).is_file() {
+        match anchor::verify_operator_cert(&keys_dir, &vault.config.vault_id, &derived_pubkey) {
+            Ok(operator) => {
+                cert_state = "pass";
+                if anchor_pin.is_none() {
+                    // Fresh device: rebuild the anchor from the verified
+                    // certificate, exactly as `recover` does.
+                    anchor_pin = Some(anchor::Anchor {
+                        operator,
+                        recovery: derived_pubkey,
+                        recovery_age: derived_recipient.clone(),
+                        source: trust_path.clone(),
+                    });
+                }
+            }
+            Err(e) => {
+                cert_state = "fail";
+                cert_error = Some(e.to_string());
+            }
+        }
+    }
+
+    let identity = recovery.age_identity().to_age_identity().map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!("bad recovery identity: {e}")))
+    })?;
+
+    let mut clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != VAULT_CLIENT_ID)
+        .collect();
+    clients.sort();
+
+    let mut unwrap = serde_json::Map::new();
+    let mut unwrap_failed = false;
+    let mut unwrap_error: Option<(String, String)> = None;
+    if let Some(anchor) = &anchor_pin {
+        for client_id in &clients {
+            let result = (|| -> Result<(), String> {
+                let epoch = store.current_epoch(client_id).map_err(|e| e.to_string())?;
+                // The trial key is a DataKey (zeroizing). Drop it right
+                // here: it is never returned, logged, or cached.
+                let key = store
+                    .trial_unwrap_data_key(client_id, RECOVERY_KEY_ID, epoch, &identity, anchor)
+                    .map_err(|e| e.to_string())?;
+                drop(key);
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    unwrap.insert(client_id.clone(), Value::String("pass".to_owned()));
+                }
+                Err(e) => {
+                    unwrap_failed = true;
+                    unwrap_error.get_or_insert_with(|| (client_id.clone(), e));
+                    unwrap.insert(client_id.clone(), Value::String("fail".to_owned()));
+                }
+            }
+        }
+    }
+
+    let checks = serde_json::json!({
+        "anchor": anchor_state,
+        "recipient": recipient_state,
+        "cert": cert_state,
+        "unwrap": Value::Object(unwrap),
+    });
+
+    let outcome = if retired {
+        "retired"
+    } else if anchor_state == "fail" || recipient_state == "fail" || cert_state == "fail" {
+        "mismatch"
+    } else if unwrap_failed {
+        "unwrap_failed"
+    } else if anchor_pin.is_none() {
+        // Nothing to verify against: no anchor, no operator certificate.
+        "mismatch"
+    } else {
+        "match"
+    };
+
+    if outcome != "match" {
+        let err = match outcome {
+            "retired" => DomainError::new(
+                ErrorKind::RecoveryRetired,
+                "this is a retired recovery phrase (a later `recover` or `keys shred` replaced it)",
+            )
+            .with_fix(
+                "Destroy that copy: it still opens the vault's history, but it cannot recover \
+                 the current device. Use the current phrase.",
+            ),
+            "unwrap_failed" => {
+                let (client_id, detail) = unwrap_error
+                    .unwrap_or_else(|| ("unknown".to_owned(), "unwrap failed".to_owned()));
+                DomainError::new(
+                    ErrorKind::RecoveryUnwrap,
+                    format!(
+                        "the phrase matches the pinned keys but cannot unwrap the current data \
+                         key for {client_id}: {detail}"
+                    ),
+                )
+                .with_fix(
+                    "Re-check the saved copy; if trust.toml was restored from an old backup, \
+                     restore the current one",
+                )
+            }
+            _ => {
+                if anchor_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "recovery phrase does not match this vault's trust anchor",
+                    )
+                    .with_fix("Use the current phrase; do not run `recover` with this copy")
+                } else if recipient_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "recovery phrase does not match this vault's trust anchor (recovery recipient)",
+                    )
+                    .with_fix("Use the current phrase; do not run `recover` with this copy")
+                } else if cert_state == "fail" {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        format!(
+                            "operator certificate does not verify against this recovery phrase: {}",
+                            cert_error.as_deref().unwrap_or("signature check failed")
+                        ),
+                    )
+                    .with_fix(
+                        "Use the current phrase; a fresh-device `recover` with this copy would \
+                         fail the same way",
+                    )
+                } else {
+                    DomainError::new(
+                        ErrorKind::RecoveryMismatch,
+                        "cannot verify this phrase: the vault has neither a trust anchor nor an \
+                         operator certificate",
+                    )
+                    .with_fix(
+                        "Restore ~/.config/confidant/trust.toml from a backup; pre-certificate \
+                         vaults cannot verify a phrase without one",
+                    )
+                }
+            }
+        };
+        return verify_recovery_failure(cli, root, outcome, Some(checks), err);
+    }
+
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "outcome": "match",
+                "checks": checks,
+                "clients_checked": clients.len(),
+            }),
+        ))?;
+    } else {
+        println!("recovery phrase matches this vault");
+        match anchor_state {
+            "pass" => println!("  trust anchor  both recovery halves match"),
+            _ => println!("  trust anchor  not on this device (verified from keys/)"),
+        }
+        match cert_state {
+            "pass" => println!("  certificate   verified against the phrase"),
+            _ => println!("  certificate   not present in keys/"),
+        }
+        println!(
+            "  data keys     {} client(s) opened with the phrase",
+            clients.len()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
