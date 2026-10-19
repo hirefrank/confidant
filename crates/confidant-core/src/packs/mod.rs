@@ -22,7 +22,6 @@ use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::vault::{SourcedEntry, Vault};
 
-pub mod coaching;
 pub mod declarative;
 pub mod dir;
 pub mod embedded;
@@ -213,17 +212,17 @@ pub trait Pack: Send + Sync {
     }
 }
 
-/// Every pack compiled into this binary, in registry order. The built-in
-/// declarative packs are not here: they are implicit and live in
-/// [`embedded`] (#551), enabled in every vault.
-pub static ALL_PACKS: &[&'static dyn Pack] = &[&coaching::CoachingPack];
+/// Every pack compiled into this binary, in registry order. There are
+/// none today (#449): the only built-in is the embedded personal pack,
+/// which is implicit and lives in [`embedded`] (#551), enabled in every
+/// vault.
+pub static ALL_PACKS: &[&'static dyn Pack] = &[];
 
-/// The parsed manifests of every compiled pack, in registry order.
-/// `config` reads the `[checks]` key declarations from these so the
-/// allowlists and defaults live in the manifests, not in hardcoded
-/// slices (#345).
+/// The parsed manifests of every compiled pack, in registry order. There
+/// are none today (#449); `config` reads the built-in manifests from
+/// [`embedded`] through [`pack_manifests_for_config`].
 pub(crate) fn pack_manifests() -> Vec<&'static manifest::PackManifest> {
-    vec![&coaching::manifest_claims().manifest]
+    Vec::new()
 }
 
 /// The pack manifests consulted for `[checks]` key handling (#433).
@@ -342,9 +341,9 @@ pub fn find_conflict(packs: &[&dyn Pack]) -> Option<PackConflict> {
         }
         // #434: finding codes claimed by two enabled *external* packs
         // conflict. Codes that are already builtin enum codes are skipped:
-        // compiled packs legitimately share them (coaching@0.1 and
-        // the built-in personal pack both list E_INVALID_ID, E_WRONG_ID_TYPE,
-        // E_UNKNOWN_RECORD).
+        // the built-in personal pack lists shared core codes
+        // (E_INVALID_ID, E_WRONG_ID_TYPE, E_UNKNOWN_RECORD) and must not
+        // conflict with core.
         for code in pack.finding_codes() {
             if crate::check::FindingCode::is_builtin_code(code) {
                 continue;
@@ -480,10 +479,9 @@ mod tests {
     }
 
     static TEST_PACK: TestPack = TestPack;
-    static COACHING: coaching::CoachingPack = coaching::CoachingPack;
 
     fn registry() -> Vec<&'static dyn Pack> {
-        vec![&COACHING, &TEST_PACK]
+        vec![&TEST_PACK]
     }
 
     #[test]
@@ -493,24 +491,18 @@ mod tests {
             .iter()
             .map(|p| p.name())
             .collect();
-        assert_eq!(names, vec!["coaching@0.1", "personal@0.2"]);
-        let all_names: Vec<&str> = ALL_PACKS.iter().map(|p| p.name()).collect();
-        assert_eq!(all_names, vec!["coaching@0.1"]);
+        assert_eq!(names, vec!["personal@0.2"]);
+        assert!(ALL_PACKS.is_empty());
     }
 
     #[test]
     fn registry_resolve_enabled_dedups_and_reports_unknown() {
         let registry = PackRegistry::compiled();
-        let names = vec![
-            "coaching@0.1".to_string(),
-            "coaching@0.1".to_string(),
-            "nope@9.9".to_string(),
-        ];
+        let names = vec!["nope@9.9".to_string()];
         let (found, unknown) = registry.resolve_enabled(&names);
-        // The implicit built-in is appended after the listed packs.
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].name(), "coaching@0.1");
-        assert_eq!(found[1].name(), "personal@0.2");
+        // The implicit built-in is always appended.
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name(), "personal@0.2");
         assert_eq!(unknown, vec!["nope@9.9".to_string()]);
     }
 
@@ -546,9 +538,8 @@ mod tests {
         let enabled: Vec<&dyn Pack> = vec![*personal];
         let via_method = registry.orphan_owners(&enabled);
         let via_free = orphan_owners(registry.all(), &enabled);
-        // Coaching verbs are orphans when only personal is enabled.
-        assert_eq!(via_method.verbs.get("open"), Some(&"coaching@0.1"));
-        assert_eq!(via_method.verbs.get("session"), Some(&"coaching@0.1"));
+        // The compiled registry holds no optional packs, so there are no
+        // compiled-owned orphans once personal is enabled.
         assert_eq!(via_method.verbs, via_free.verbs);
         assert_eq!(via_method.record_types, via_free.record_types);
         assert_eq!(via_method.fields, via_free.fields);
@@ -565,13 +556,13 @@ mod tests {
     #[test]
     fn resolve_dedupes_and_reports_unknown() {
         let names = vec![
-            "coaching@0.1".to_string(),
-            "coaching@0.1".to_string(),
+            "testpack@0.1".to_string(),
+            "testpack@0.1".to_string(),
             "nope@1".to_string(),
         ];
         let (found, unknown) = resolve_enabled(&names, &registry(), &[]);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].name(), "coaching@0.1");
+        assert_eq!(found[0].name(), "testpack@0.1");
         assert_eq!(unknown, vec!["nope@1".to_string()]);
     }
 
@@ -583,7 +574,7 @@ mod tests {
                 "clash@0.1"
             }
             fn verbs(&self) -> &'static [&'static str] {
-                &["session"]
+                &["touch"]
             }
             fn record_types(&self) -> &'static [&'static str] {
                 &[]
@@ -624,13 +615,13 @@ mod tests {
             }
         }
         static CLASH: Clashing = Clashing;
-        let packs: Vec<&dyn Pack> = vec![&COACHING, &CLASH];
+        let packs: Vec<&dyn Pack> = vec![&TEST_PACK, &CLASH];
         let conflict = find_conflict(&packs).unwrap();
         assert_eq!(conflict.kind, "verb");
-        assert_eq!(conflict.name, "session");
-        assert_eq!(conflict.first, "coaching@0.1");
+        assert_eq!(conflict.name, "touch");
+        assert_eq!(conflict.first, "testpack@0.1");
         assert_eq!(conflict.second, "clash@0.1");
-        assert!(find_conflict(&[&COACHING, &TEST_PACK]).is_none());
+        assert!(find_conflict(&[&TEST_PACK]).is_none());
     }
 
     #[test]
@@ -750,13 +741,21 @@ mod tests {
 
     #[test]
     fn find_conflict_ignores_shared_core_codes() {
-        // coaching@0.1 and the built-in personal pack both list E_INVALID_ID,
-        // E_WRONG_ID_TYPE, E_UNKNOWN_RECORD — shared builtin codes must not
-        // conflict (#434).
+        // Two packs may both list a builtin code: the built-in personal
+        // pack declares E_INVALID_ID, E_WRONG_ID_TYPE and E_UNKNOWN_RECORD,
+        // and an external pack may not claim them, but the skip in
+        // find_conflict is what keeps the built-in side conflict-free
+        // (#434).
+        code_pack!(
+            CoreCodePack,
+            "corecodes@0.1",
+            &["E_INVALID_ID", "E_UNKNOWN_RECORD"]
+        );
+        static CORE_CODES: CoreCodePack = CoreCodePack;
         let personal = crate::packs::embedded::find(crate::packs::embedded::PERSONAL_0_2)
             .expect("personal@0.2 is embedded")
             .pack();
-        let packs: Vec<&dyn Pack> = vec![&COACHING, personal];
+        let packs: Vec<&dyn Pack> = vec![&CORE_CODES, personal];
         assert!(find_conflict(&packs).is_none());
     }
 
@@ -781,7 +780,7 @@ mod tests {
 
     #[test]
     fn orphan_owners_cover_disabled_packs_only() {
-        let owners = orphan_owners(&registry(), &[&COACHING]);
+        let owners = orphan_owners(&registry(), &[]);
         assert_eq!(owners.verbs.get("touch"), Some(&"testpack@0.1"));
         assert_eq!(owners.fields.get("birthday"), Some(&"testpack@0.1"));
         assert_eq!(owners.record_types.get("testtype"), Some(&"testpack@0.1"));
@@ -790,8 +789,7 @@ mod tests {
             Some(&"testpack@0.1")
         );
         assert_eq!(owners.edge_kinds.get("mentor"), Some(&"testpack@0.1"));
-        assert!(!owners.verbs.contains_key("session"));
-        let none = orphan_owners(&registry(), &[&COACHING, &TEST_PACK]);
+        let none = orphan_owners(&registry(), &[&TEST_PACK]);
         assert!(none.verbs.is_empty());
         assert!(none.fields.is_empty());
         assert!(none.edge_kinds.is_empty());

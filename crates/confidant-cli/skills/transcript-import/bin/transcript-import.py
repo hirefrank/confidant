@@ -139,7 +139,7 @@ def main(argv=None) -> int:
         notes = ""
         warnings.append("no notes text provided; interaction body will be empty "
                         "(add prose before applying, or the session may trip "
-                        "E_SESSION_WITHOUT_NOTES coverage)")
+                        "E_COACHING_SESSION_WITHOUT_NOTES coverage)")
 
     iid = "i-" + common.new_ulid()
     title = d.get("title", f"Session {date}")
@@ -161,7 +161,7 @@ def main(argv=None) -> int:
     # NOTE: no `note:` arg here. Per the spec, session `note:` must name a
     # *note* (n-) record; the transcript prose lives in the interaction
     # record above (architecture §6 example). The session may trip
-    # E_SESSION_WITHOUT_NOTES coverage until the operator adds notes —
+    # E_COACHING_SESSION_WITHOUT_NOTES coverage until the operator adds notes —
     # that warning is working as intended.
     line = (f"{date} session {person} {duration} {billing} "
             f"src:transcript/{tid}")

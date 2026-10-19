@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::{install_shipped_coaching, shipped_coaching_dir};
 use confidant_core::check::{CheckOptions, FindingCode, Severity};
 use confidant_core::{check_vault, load_vault};
 use serde_json::{json, Value};
@@ -48,7 +51,11 @@ fn note(root: &Path, id: &str, person: &str, date: &str) {
     );
 }
 
+/// A vault enabling the shipped `coaching@0.1` external pack. Every test
+/// that checks coaching behaviour vendors the pack: the compiled path is
+/// gone (#449), so a listed pack without bytes is `E_PACK_UNKNOWN`.
 fn vault_toml(root: &Path, checks: &str) {
+    install_shipped_coaching(root);
     write(
         root,
         "confidant.toml",
@@ -161,7 +168,7 @@ fn balance_mismatch_golden() {
     vault_toml(dir.path(), DEFAULT_CHECKS);
     balance_mismatch_vault(dir.path());
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["E_BALANCE_MISMATCH"]);
+    assert_eq!(codes(&json), vec!["E_COACHING_BALANCE_MISMATCH"]);
     assert_golden("balance_mismatch.json", &json);
 }
 
@@ -185,7 +192,7 @@ fn session_without_notes_golden() {
     vault_toml(dir.path(), DEFAULT_CHECKS);
     session_without_notes_vault(dir.path());
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["E_SESSION_WITHOUT_NOTES"]);
+    assert_eq!(codes(&json), vec!["E_COACHING_SESSION_WITHOUT_NOTES"]);
     assert_golden("session_without_notes.json", &json);
 }
 
@@ -225,7 +232,7 @@ fn paid_gap_boundary() {
     // 2026-10-08 minus 45 days = 2026-08-24 (inclusive → clean)
     let json = report_json(dir.path(), Some("2026-10-08"));
     assert!(
-        !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
         "{json}"
     );
 
@@ -234,7 +241,7 @@ fn paid_gap_boundary() {
     vault_toml(dir2.path(), DEFAULT_CHECKS);
     paid_session_gap_vault(dir2.path());
     let json = report_json(dir2.path(), Some("2026-10-08"));
-    assert_eq!(codes(&json), vec!["E_PAID_SESSION_GAP"]);
+    assert_eq!(codes(&json), vec!["E_COACHING_PAID_SESSION_GAP"]);
     assert_golden("paid_session_gap.json", &json);
 }
 
@@ -266,7 +273,7 @@ fn paid_gap_never_started_and_spent() {
     let json = report_json(dir.path(), Some("2026-10-08"));
     // Gap clock starts at the most recent open; 7 days is inside the 45-day window.
     assert!(
-        !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
         "{json}"
     );
 
@@ -285,7 +292,7 @@ fn paid_gap_never_started_and_spent() {
     );
     let json = report_json(dir2.path(), Some("2026-10-08"));
     assert!(
-        !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
         "{json}"
     );
 }
@@ -395,7 +402,7 @@ fn balance_as_of_date_ignores_later_sessions() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
@@ -413,7 +420,7 @@ fn paid_without_package_is_negative_balance() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"E_NEGATIVE_BALANCE".into()),
+        codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
         "{json}"
     );
 }
@@ -431,7 +438,7 @@ fn pps_does_not_consume_package() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_NEGATIVE_BALANCE".into()),
+        !codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
         "{json}"
     );
 }
@@ -448,10 +455,10 @@ fn pps_client_can_be_flagged_for_gap() {
         &format!("2026-05-01 session {ADA} 60m pps note:{NOTE}\n"),
     );
     // lookback 180: 2026-05-01 is within 180 days of 2026-10-08;
-    // gap 45: last session is outside the 45-day window → E_PAID_SESSION_GAP.
+    // gap 45: last session is outside the 45-day window → E_COACHING_PAID_SESSION_GAP.
     let json = report_json(dir.path(), Some("2026-10-08"));
     assert!(
-        codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
         "{json}"
     );
 }
@@ -482,7 +489,7 @@ fn later_merge_does_not_change_earlier_assertions() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
@@ -505,7 +512,10 @@ coaching.paid_session_gap = "off"
         &format!("2026-10-01 session {ADA} 60m paid note:not-an-id\n"),
     );
     let json = report_json(dir.path(), None);
-    assert!(codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(
+        codes(&json).contains(&"E_COACHING_NOTE_INVALID_ID".into()),
+        "{json}"
+    );
 }
 
 #[test]
@@ -533,7 +543,7 @@ fn alias_unknown_kind_does_not_echo_raw_token() {
 }
 
 #[test]
-fn invalid_open_pkg_id_is_e_invalid_id() {
+fn invalid_open_pkg_id_is_a_pack_code() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
     person(dir.path(), ADA, "Ada Example");
@@ -543,7 +553,10 @@ fn invalid_open_pkg_id_is_e_invalid_id() {
         &format!("2026-10-01 open {ADA} package not-a-pkg 6 sessions\n"),
     );
     let json = report_json(dir.path(), None);
-    assert!(codes(&json).contains(&"E_INVALID_ID".into()), "{json}");
+    assert!(
+        codes(&json).contains(&"E_COACHING_INVALID_ID".into()),
+        "{json}"
+    );
 }
 
 #[test]
@@ -721,7 +734,7 @@ fn wrong_id_type_and_invalid_note_id() {
     let json = report_json(dir.path(), None);
     let c = codes(&json);
     assert!(c.contains(&"E_WRONG_ID_TYPE".into()), "{c:?}");
-    assert!(c.contains(&"E_INVALID_ID".into()), "{c:?}");
+    assert!(c.contains(&"E_COACHING_NOTE_INVALID_ID".into()), "{c:?}");
 }
 
 #[test]
@@ -1065,14 +1078,17 @@ fn comp_session_does_not_consume_package() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        !codes(&json).contains(&"E_NEGATIVE_BALANCE".into()),
+        !codes(&json).contains(&"E_COACHING_NEGATIVE_BALANCE".into()),
         "{json}"
     );
     assert!(
-        !codes(&json).contains(&"E_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
         "{json}"
     );
-    assert!(!codes(&json).contains(&"E_SESSION_TAGS".into()), "{json}");
+    assert!(
+        !codes(&json).contains(&"E_COACHING_SESSION_TAGS".into()),
+        "{json}"
+    );
 }
 
 #[test]
@@ -1091,7 +1107,7 @@ fn untagged_session_consumes_and_warns() {
         ),
     );
     let json = report_json(dir.path(), None);
-    assert_eq!(codes(&json), vec!["W_SESSION_UNTAGGED"], "{json}");
+    assert_eq!(codes(&json), vec!["W_COACHING_SESSION_UNTAGGED"], "{json}");
 }
 
 // Issue #181 Q3: agent-facing findings must never surface a no-ai person's
@@ -1118,7 +1134,7 @@ fn findings_never_name_no_ai_person() {
     );
     let json = report_json(dir.path(), None);
     assert!(
-        codes(&json).contains(&"W_SESSION_UNTAGGED".to_string()),
+        codes(&json).contains(&"W_COACHING_SESSION_UNTAGGED".to_string()),
         "{json}"
     );
     let text = serde_json::to_string(&json).unwrap();
@@ -1143,7 +1159,10 @@ fn double_tagged_session_is_e_session_tags() {
         ),
     );
     let json = report_json(dir.path(), None);
-    assert!(codes(&json).contains(&"E_SESSION_TAGS".into()), "{json}");
+    assert!(
+        codes(&json).contains(&"E_COACHING_SESSION_TAGS".into()),
+        "{json}"
+    );
 }
 
 #[test]
@@ -1157,7 +1176,7 @@ fn never_started_package_measured_from_open_date() {
         &format!("2026-08-01 open {ADA} package {PKG} 6 sessions\n"),
     );
     let json = report_json(dir.path(), Some("2026-10-08"));
-    assert_eq!(codes(&json), vec!["E_PAID_SESSION_GAP"], "{json}");
+    assert_eq!(codes(&json), vec!["E_COACHING_PAID_SESSION_GAP"], "{json}");
 }
 
 #[test]
@@ -1206,7 +1225,7 @@ fn later_merge_includes_from_history_on_or_after_merge_date() {
     );
     let json = report_json(dir.path(), Some("2026-10-12"));
     assert!(
-        !codes(&json).contains(&"E_BALANCE_MISMATCH".into()),
+        !codes(&json).contains(&"E_COACHING_BALANCE_MISMATCH".into()),
         "{json}"
     );
 }
@@ -1594,7 +1613,7 @@ fn returning_client_new_package_resets_gap_clock() {
     );
     let json = report_json(dir.path(), Some("2026-10-08"));
     assert!(
-        !codes(&json).contains(&"E_PAID_SESSION_GAP".into()),
+        !codes(&json).contains(&"E_COACHING_PAID_SESSION_GAP".into()),
         "{json}"
     );
 }
@@ -2690,7 +2709,10 @@ fn wikilink_and_comment_person_count_for_ownership_and_coverage() {
     let json = report_json(dir.path(), None);
     let c = codes(&json);
     assert!(!c.contains(&"E_UNKNOWN_RECORD".into()), "{json}");
-    assert!(!c.contains(&"E_SESSION_WITHOUT_NOTES".into()), "{json}");
+    assert!(
+        !c.contains(&"E_COACHING_SESSION_WITHOUT_NOTES".into()),
+        "{json}"
+    );
     assert!(!c.contains(&"E_ID_PATH_MISMATCH".into()), "{json}");
 }
 
@@ -3250,6 +3272,7 @@ still-bare-ulid-token\n"
 #[test]
 fn check_messages_do_not_echo_vault_free_text() {
     let dir = tempfile::tempdir().unwrap();
+    install_shipped_coaching(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -3310,7 +3333,7 @@ coaching.paid_session_gap = "off"
     assert!(c.contains(&"E_DUPLICATE_SRC".into()), "{c:?}");
     assert!(c.contains(&"E_UNKNOWN_METRIC".into()), "{c:?}");
     assert!(c.contains(&"E_PARSE".into()), "{c:?}");
-    assert!(c.contains(&"E_OPEN_MALFORMED".into()), "{c:?}");
+    assert!(c.contains(&"E_COACHING_OPEN_MALFORMED".into()), "{c:?}");
 }
 
 fn ada_coaching_client(root: &Path) {
@@ -4448,119 +4471,6 @@ fn find_keeps_ada_when_only_her_own_filenames_contain_her_id() {
     ));
 }
 
-#[test]
-fn orphan_coaching_verbs_warn_instead_of_unknown_verb() {
-    // #177 Q2: data owned by a disabled pack warns, never errors.
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "confidant.toml",
-        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
-    );
-    person(dir.path(), ADA, "Ada Example");
-    write(
-        dir.path(),
-        "orgs/x/profile.md",
-        &format!("---\nid: {ORG}\ntype: org\nname: Org\n---\n\nFake org.\n"),
-    );
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-02 session {ADA} 60m paid\n\
-             2026-10-03 session {ORG} 60m paid\n\
-             2026-10-04 frobnicate {ADA}\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    let c = codes(&json);
-    // Coaching verbs warn as orphans, not E_UNKNOWN_VERB ...
-    assert_eq!(
-        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
-        3,
-        "{c:?}"
-    );
-    // ... but the verb's ID-type rule still fires for the org session.
-    assert!(c.contains(&"E_WRONG_ID_TYPE".to_string()), "{c:?}");
-    // A verb no pack owns is still an unknown-verb error.
-    assert!(
-        json["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f["code"] == "E_UNKNOWN_VERB" && f["severity"] == "error"),
-        "{c:?}"
-    );
-}
-
-#[test]
-fn orphan_warnings_alone_do_not_fail_check() {
-    // #177 Q2 + #183: warnings never block writes (fail_on error gate).
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "confidant.toml",
-        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
-    );
-    person(dir.path(), ADA, "Ada Example");
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!(
-            "2026-10-01 open {ADA} package {PKG} 6 sessions\n\
-             2026-10-02 session {ADA} 60m paid\n\
-             2026-10-03 balance {ADA} sessions_remaining 0\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    let c = codes(&json);
-    assert_eq!(
-        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
-        3,
-        "{c:?}"
-    );
-    assert!(!c.iter().any(|code| code.starts_with("E_")), "{c:?}");
-    let vault = load_vault(dir.path()).unwrap();
-    let report = check_vault(
-        &vault,
-        &CheckOptions {
-            as_of: None,
-            fail_on: Some(Severity::Error),
-            pinned_inbox_pubkey: None,
-        },
-    );
-    assert!(report.ok, "{:?}", report.findings);
-}
-
-#[test]
-fn orphan_coaching_metrics_warn_instead_of_unknown_metric() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "confidant.toml",
-        "spec = \"0.1\"\npacks = []\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
-    );
-    person(dir.path(), ADA, "Ada Example");
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!(
-            "2026-10-01 balance {ADA} sessions_remaining 0\n\
-             2026-10-02 balance {ADA} frobnicate_metric 1\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    let c = codes(&json);
-    assert!(c.contains(&"W_PACK_ORPHAN".to_string()), "{c:?}");
-    assert_eq!(
-        c.iter().filter(|code| *code == "W_PACK_ORPHAN").count(),
-        1,
-        "{c:?}"
-    );
-    assert!(c.contains(&"E_UNKNOWN_METRIC".to_string()), "{c:?}");
-}
-
 // ---------------------------------------------------------------------------
 // #179: relationship edges, `with:` lists, touchpoints.
 // ---------------------------------------------------------------------------
@@ -5173,6 +5083,7 @@ fn personal_cadence_counts_sessions_as_touchpoints() {
     // #227 Q2: a coaching session counts as a touchpoint, so a coaching
     // client who is also a friend does not get a false overdue.
     let dir = tempfile::tempdir().unwrap();
+    install_shipped_coaching(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -5258,6 +5169,7 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     use confidant_core::search::{allowlist_is_fixed_point, search};
 
     let dir = tempfile::tempdir().unwrap();
+    install_shipped_coaching(dir.path());
     write(
         dir.path(),
         "confidant.toml",
@@ -5350,83 +5262,6 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     let ctx_note_ids: Vec<&str> = ctx.notes.iter().map(|n| n.id.as_str()).collect();
     assert_eq!(ctx_note_ids, vec![note_explicit_false]);
     assert!(ctx.interactions.is_empty(), "{:?}", ctx.interactions);
-}
-
-/// Drift test (#189, behavioral half): every finding code the coaching
-/// pack's rules actually emit over a violations fixture must be declared
-/// in `CoachingPack::finding_codes()`. Together with the SKILL.md
-/// documentation test (cli `embedded` tests) this gives:
-/// emitted ⊆ declared ⊆ documented, so the skill text stays honest.
-#[test]
-fn pack_emitted_codes_are_all_declared() {
-    use confidant_core::packs::{coaching::CoachingPack, Pack, ALL_PACKS};
-    use std::collections::HashSet;
-
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    person(dir.path(), ADA, "Ada Example");
-    person(dir.path(), BEA, "Bea Example");
-    // BEA: paid client (package opened 68 days before as-of, balance > 0)
-    // with no sessions in the gap window -> E_PAID_SESSION_GAP only.
-    write(
-        dir.path(),
-        "ledger/2026/08.cfd",
-        &format!("2026-08-01 open {BEA} package {PKG2} 6 sessions\n"),
-    );
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!(
-            "2026-10-01 open {ADA} package {PKG} 1 sessions\n\
-             2026-10-01 open {ADA} package {PKG} 100001 sessions\n\
-             2026-10-01 open {ADA} package bad-pkg-id 6 sessions\n\
-             2026-10-02 session {ADA} paid\n\
-             2026-10-02 session {ADA} 60m paid pps\n\
-             2026-10-02 session {ADA} 60m\n\
-             2026-10-02 session {ADA} 60m paid note:not-an-id\n\
-             2026-10-02 session {ADA} 60m paid note:{ADA}\n\
-             2026-10-02 session {ADA} 60m paid note:{NOTE2}\n\
-             2026-10-03 session {ADA} 60m paid\n\
-             2026-10-04 session {ADA} 60m paid\n\
-             2026-10-05 session {ADA} 60m paid\n\
-             2026-10-06 session {ADA} 60m paid\n\
-             2026-10-08 balance {ADA} sessions_remaining 999\n\
-             2026-10-08 balance {ADA} sessions_remaining abc\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    let emitted = codes(&json);
-    // Sanity: the fixture really does exercise every declared code.
-    for want in [
-        "E_PARSE",
-        "E_BALANCE_MISMATCH",
-        "E_NEGATIVE_BALANCE",
-        "E_OPEN_MALFORMED",
-        "E_INVALID_ID",
-        "E_WRONG_ID_TYPE",
-        "E_MISSING_DURATION",
-        "E_SESSION_TAGS",
-        "W_SESSION_UNTAGGED",
-        "E_UNKNOWN_RECORD",
-        "E_SESSION_WITHOUT_NOTES",
-        "E_PAID_SESSION_GAP",
-    ] {
-        assert!(
-            emitted.contains(&want.to_string()),
-            "fixture did not emit {want}: {emitted:?}"
-        );
-    }
-    let declared: HashSet<&str> = CoachingPack.finding_codes().iter().copied().collect();
-    for code in &emitted {
-        assert!(
-            declared.contains(code.as_str()),
-            "pack emitted {code} but finding_codes() does not declare it: {emitted:?}"
-        );
-    }
-    // Sanity: the compiled registry holds exactly the pack this fixture
-    // covers; the built-in personal pack is implicit and separate (#551).
-    assert_eq!(ALL_PACKS.len(), 1);
-    assert_eq!(ALL_PACKS[0].name(), "coaching@0.1");
 }
 
 /// #396 (part of #219): a note referencing a conflicted person record
@@ -5665,11 +5500,7 @@ fn external_pack_installed_checks_clean() {
     );
     let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
     let json = report_json(dir.path(), None);
     assert!(json["ok"].as_bool().unwrap(), "expected clean: {json}");
@@ -5677,16 +5508,16 @@ fn external_pack_installed_checks_clean() {
     assert_eq!(json["summary"]["records"].as_u64().unwrap(), 1);
 }
 
-/// #438: a `[[pack]]` claim that collides with an enabled pack is
-/// `E_PACK_CONFLICT` — conflict detection spans compiled and external
-/// packs exactly as PD8 says (claims may not collide with an enabled
-/// pack; core verbs are refused at load by the manifest loader, see
-/// `external_rejects_core_verb`).
+/// #438/#449: a `[[pack]]` claim that collides with an enabled pack is
+/// `E_PACK_CONFLICT` — conflict detection spans built-in and external
+/// packs exactly as PD8 says. The built-in personal pack is implicit, so
+/// its `title` field is always claimed (core verbs are refused at load by
+/// the manifest loader, see `external_rejects_core_verb`).
 #[test]
-fn external_pack_claiming_enabled_pack_verb_is_a_conflict() {
+fn external_pack_claiming_enabled_field_is_a_conflict() {
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    // Vendor a pack whose verb collides with coaching's (`session`).
+    // Vendor a pack whose field collides with personal's `title`.
     let pack_dir = dir.path().join("packs/example-pack@0.1");
     fs::create_dir_all(&pack_dir).unwrap();
     write(
@@ -5695,7 +5526,7 @@ fn external_pack_claiming_enabled_pack_verb_is_a_conflict() {
         r#"manifest_version = 2
 record_types = []
 balance_metrics = []
-finding_codes = ["W_EXAMPLE_CODE"]
+finding_codes = ["W_EXAMPLE_CODE", "E_FRONTMATTER"]
 
 [pack]
 name = "example-pack"
@@ -5706,8 +5537,13 @@ requires_spec = ["0.1"]
 [messages."W_EXAMPLE_CODE"]
 default = "stale"
 
-[[verbs]]
-name = "session"
+[messages."E_FRONTMATTER"]
+default = "front matter key '{key}' {problem}"
+default_fix = "{fix}"
+
+[[fields]]
+name = "title"
+grammar = "non-empty-string"
 "#,
     );
     write(
@@ -5719,19 +5555,15 @@ name = "session"
         .expect("fixture pack dir must read")
         .hash;
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
     let json = report_json(dir.path(), None);
     let found = codes(&json);
-    // The claim collides with coaching's `session`: E_PACK_CONFLICT, and
+    // The claim collides with personal's `title`: E_PACK_CONFLICT, and
     // the pack set is incoherent (nothing folds).
     assert!(
         found.contains(&"E_PACK_CONFLICT".to_string()),
-        "an enabled-pack verb collision must be E_PACK_CONFLICT: {json}"
+        "an enabled-pack field collision must be E_PACK_CONFLICT: {json}"
     );
 }
 
@@ -5746,11 +5578,7 @@ fn external_pack_malformed_id_does_not_echo() {
     // (#490) lets a real pin echo.
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"justaname\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"justaname\"", "");
     let json = report_json(dir.path(), None);
     let unknown = finding_by_code(&json, "E_PACK_UNKNOWN");
     assert!(
@@ -5773,8 +5601,8 @@ fn external_pack_malformed_id_does_not_echo() {
     // half may echo.
     external_vault_toml(
         dir.path(),
-        r#""coaching@0.1", "zxqvleakmail@example.com", "zxqvleak-nl\nname@0.1", "zxqvleak-nl2@0.1\nleak""#,
-        DEFAULT_CHECKS,
+        r#""zxqvleakmail@example.com", "zxqvleak-nl\nname@0.1", "zxqvleak-nl2@0.1\nleak""#,
+        "",
     );
     let json = report_json(dir.path(), None);
     let dumped = serde_json::to_string(&json).unwrap();
@@ -5846,11 +5674,7 @@ fn external_pack_problems_report_their_codes() {
     );
     let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
     // Hash mismatch: vendored file edited after install.
     write(
@@ -5984,11 +5808,7 @@ fn packs_dir_contents_are_not_records() {
     person(dir.path(), ADA, "Ada Example");
     let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
     // A person-shaped file inside the vendored pack.
     write(
         dir.path(),
@@ -6073,11 +5893,7 @@ default = "stale greeting"
         .map(|p| p.hash)
         .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
     let json = report_json(dir.path(), None);
     let found = codes(&json);
@@ -6152,11 +5968,7 @@ fn external_pack_cannot_claim_core_verb_edge_or_code() {
             "0.1",
             &unusable_external_pack_hash(),
         );
-        external_vault_toml(
-            dir.path(),
-            "\"coaching@0.1\", \"example-pack@0.1\"",
-            DEFAULT_CHECKS,
-        );
+        external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
         let json = report_json(dir.path(), None);
         assert!(
@@ -6224,11 +6036,7 @@ default_fix = "{fix}"
         "# example pack.\n\nCadence rule (fake).\n",
     );
     install_lockfile(dir.path(), "example-pack", "0.1", &hash);
-    external_vault_toml(
-        dir.path(),
-        "\"coaching@0.1\", \"example-pack@0.1\"",
-        DEFAULT_CHECKS,
-    );
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
 
     let json = report_json(dir.path(), None);
     assert!(
@@ -6387,7 +6195,7 @@ fn assert_cadence_parity(
     // Parity covers code-agnostic content: severity, message, fix,
     // file, id. The code itself is pack-own on the declarative side by
     // design (the #494 review refuses a builtin as a rule's code);
-    // whether the declarative copies may emit the compiled codes
+    // whether the declarative copies may emit the shipped codes
     // verbatim is Frank's call (#490), and #444 depends on it.
     let cadence_findings = |v: &Value| -> Vec<String> {
         v["findings"]
@@ -6461,7 +6269,7 @@ fn cadence_rule_overdue_with_last_contact() {
     assert_eq!(overdue[0]["severity"], "warning");
     assert_eq!(
         overdue[0]["code"], "W_CADENCE_OVERDUE",
-        "compiled side keeps the builtin code"
+        "shipped side keeps the builtin code"
     );
     let message = overdue[0]["message"].as_str().unwrap();
     assert!(
@@ -6592,7 +6400,7 @@ fn cadence_rule_merged_person_recent_contact_not_overdue() {
 fn cadence_rule_severity_off_and_error_from_config() {
     // `off` skips the rule; `error` escalates it — the same override
     // keys work for the declarative pack as for the compiled one, and
-    // the parity helper proves the compiled analogue behaves the same.
+    // the parity helper proves the shipped analogue behaves the same.
     let ledger = vec![(
         "ledger/2026/08.cfd",
         format!("2026-08-29 touch {ADA} call\n"),
@@ -8307,7 +8115,7 @@ wrong_type_code = "E_COACHING_EXT_TYPE"
 
 /// A v2 `coaching-ext@0.1` manifest using the given `[[rules]]` body. The
 /// fixture never ships; it exists to prove the declarative kinds reproduce
-/// compiled coaching until #449 switches the real pack.
+/// the shipped external coaching pack (#449).
 fn coaching_ext_manifest(rules: &str) -> String {
     let mut text = String::from(
         r#"manifest_version = 2
@@ -8385,28 +8193,29 @@ fn install_coaching_ext(root: &Path, manifest: &str) {
 }
 
 /// `confidant.toml` enabling only the fixture pack. The operator keys are
-/// the fixture's own namespace; compiled coaching is not enabled, so its
-/// `coaching.*` keys would be unknown here.
+/// the fixture's own namespace; the shipped coaching pack is not enabled,
+/// so its `coaching.*` keys would be unknown here.
 fn coaching_ext_vault(root: &Path, checks: &str) {
     external_vault_toml(root, "\"coaching-ext@0.1\"", checks);
 }
 
 const COACHING_EXT_CHECKS: &str = "coaching-ext.balance_nonnegative = \"error\"\n";
 
-/// Build the same vault twice — once with compiled `coaching@0.1`, once
-/// with the fixture — and return both reports. `setup` writes the records
-/// and ledger; the fixture install is added to the declarative side.
+/// Build the same vault twice — once with the shipped external
+/// `coaching@0.1`, once with the inline fixture — and return both reports.
+/// `setup` writes the records and ledger; the fixture install is added to
+/// the declarative side.
 fn assert_ext_parity_with(
     setup: impl Fn(&Path),
     rules: &str,
     map: &[(&str, &str)],
-    compiled_checks: &str,
+    shipped_checks: &str,
     ext_checks: &str,
 ) -> (Value, Value) {
-    let compiled_dir = tempfile::tempdir().unwrap();
-    setup(compiled_dir.path());
-    vault_toml(compiled_dir.path(), compiled_checks);
-    let compiled = report_json(compiled_dir.path(), None);
+    let shipped_dir = tempfile::tempdir().unwrap();
+    setup(shipped_dir.path());
+    vault_toml(shipped_dir.path(), shipped_checks);
+    let compiled = report_json(shipped_dir.path(), None);
 
     let declarative_dir = tempfile::tempdir().unwrap();
     setup(declarative_dir.path());
@@ -8448,8 +8257,8 @@ lookback_days_key = "coaching-ext.pps_lookback_days"
 balance_metric = "sessions_remaining"
 "#;
 
-/// Fixture code → compiled code for the gap rule.
-const GAP_CODE_MAP: &[(&str, &str)] = &[("E_COACHING_EXT_GAP", "E_PAID_SESSION_GAP")];
+/// Fixture code → shipped-pack code for the gap rule.
+const GAP_CODE_MAP: &[(&str, &str)] = &[("E_COACHING_EXT_GAP", "E_COACHING_PAID_SESSION_GAP")];
 
 fn assert_gap_parity(setup: impl Fn(&Path)) -> (Value, Value) {
     assert_ext_parity(setup, &coaching_ext_gap_rules(), GAP_CODE_MAP)
@@ -8460,7 +8269,7 @@ fn coaching_ext_gap_rules() -> String {
     format!("{COACHING_EXT_BALANCE_RULE}\n{COACHING_EXT_GAP_RULE}")
 }
 
-/// The fixture report for one vault, without a compiled comparison.
+/// The fixture report for one vault, without a shipped comparison.
 fn ext_report(setup: impl Fn(&Path), rules: &str, checks: &str) -> Value {
     let dir = tempfile::tempdir().unwrap();
     setup(dir.path());
@@ -8469,14 +8278,14 @@ fn ext_report(setup: impl Fn(&Path), rules: &str, checks: &str) -> Value {
     report_json(dir.path(), None)
 }
 
-/// Fixture code → compiled code for the balance rule.
+/// Fixture code → shipped-pack code for the balance rule.
 const BALANCE_CODE_MAP: &[(&str, &str)] = &[
-    ("E_COACHING_EXT_PARSE", "E_PARSE"),
-    ("E_COACHING_EXT_BALANCE", "E_BALANCE_MISMATCH"),
-    ("E_COACHING_EXT_NEGATIVE", "E_NEGATIVE_BALANCE"),
-    ("E_COACHING_EXT_OPEN", "E_OPEN_MALFORMED"),
-    ("E_COACHING_EXT_ID", "E_INVALID_ID"),
-    ("E_COACHING_EXT_TYPE", "E_WRONG_ID_TYPE"),
+    ("E_COACHING_EXT_PARSE", "E_COACHING_PARSE"),
+    ("E_COACHING_EXT_BALANCE", "E_COACHING_BALANCE_MISMATCH"),
+    ("E_COACHING_EXT_NEGATIVE", "E_COACHING_NEGATIVE_BALANCE"),
+    ("E_COACHING_EXT_OPEN", "E_COACHING_OPEN_MALFORMED"),
+    ("E_COACHING_EXT_ID", "E_COACHING_INVALID_ID"),
+    ("E_COACHING_EXT_TYPE", "E_COACHING_WRONG_ID_TYPE"),
 ];
 
 /// The fixture's `session-checks` rule.
@@ -8493,19 +8302,19 @@ untagged_code = "W_COACHING_EXT_UNTAGGED"
 notes_code = "E_COACHING_EXT_NOTES"
 "#;
 
-/// Fixture code → compiled code for the session rule.
+/// Fixture code → shipped-pack code for the session rule.
 const SESSION_CODE_MAP: &[(&str, &str)] = &[
-    ("E_COACHING_EXT_DURATION", "E_MISSING_DURATION"),
-    ("E_COACHING_EXT_TAGS", "E_SESSION_TAGS"),
-    ("W_COACHING_EXT_UNTAGGED", "W_SESSION_UNTAGGED"),
-    ("E_COACHING_EXT_NOTES", "E_SESSION_WITHOUT_NOTES"),
+    ("E_COACHING_EXT_DURATION", "E_COACHING_MISSING_DURATION"),
+    ("E_COACHING_EXT_TAGS", "E_COACHING_SESSION_TAGS"),
+    ("W_COACHING_EXT_UNTAGGED", "W_COACHING_SESSION_UNTAGGED"),
+    ("E_COACHING_EXT_NOTES", "E_COACHING_SESSION_WITHOUT_NOTES"),
 ];
 
-/// The balance-related findings of a report, normalized to the compiled
-/// code names and rendered as comparable tuples (code, severity, message,
-/// fix, file, line, id). Codes outside `map` are ignored: the fixture and
-/// compiled packs emit different *unrelated* codes on the same vault
-/// (pack-own vs. core), and parity is scoped to the kind's codes.
+/// The balance-related findings of a report, normalized to the shipped
+/// pack's code names and rendered as comparable tuples (code, severity,
+/// message, fix, file, line, id). Codes outside `map` are ignored: the
+/// inline fixture and the shipped pack emit different *unrelated* codes on
+/// the same vault (both pack-own), and parity is scoped to the kind's codes.
 fn normalized_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
     let mut out: Vec<String> = report["findings"]
         .as_array()
@@ -8537,7 +8346,7 @@ fn normalized_findings(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
 }
 
 /// The normalized codes of a report (the code column only), for the
-/// assertions that name a compiled counterpart. The compiled side can
+/// assertions that name a shipped-pack counterpart. The shipped side can
 /// carry unrelated findings on the same vault (a session without an open
 /// is a negative balance), so filter through the map.
 fn normalized_codes(report: &Value, map: &[(&str, &str)]) -> Vec<String> {
@@ -8583,7 +8392,7 @@ fn balance_rule_open_then_sessions_remaining() {
         "{declarative:?}"
     );
     assert!(
-        !codes(&compiled).contains(&"E_BALANCE_MISMATCH".to_string()),
+        !codes(&compiled).contains(&"E_COACHING_BALANCE_MISMATCH".to_string()),
         "{compiled:?}"
     );
 }
@@ -8612,7 +8421,11 @@ fn balance_rule_negative_balance() {
         negative[0]["message"],
         format!("sessions_remaining for {ADA} is -1")
     );
-    assert_eq!(codes(&compiled), vec!["E_NEGATIVE_BALANCE"], "{compiled:?}");
+    assert_eq!(
+        codes(&compiled),
+        vec!["E_COACHING_NEGATIVE_BALANCE"],
+        "{compiled:?}"
+    );
 }
 
 #[test]
@@ -8715,7 +8528,7 @@ fn balance_rule_open_exceeds_cap() {
 fn balance_rule_open_total_overflow() {
     // The 100000 cap makes a total overflow unreachable with default
     // parameters, so this case raises the cap and opens `i64::MAX` twice.
-    // The compiled side cannot be configured, so this one asserts the
+    // The shipped side cannot be configured, so this one asserts the
     // declarative behaviour only (the arithmetic is shared).
     let rules = COACHING_EXT_BALANCE_RULE
         .replace("max_open_n = 100000", "max_open_n = 9223372036854775807");
@@ -8797,7 +8610,7 @@ fn balance_rule_merged_people_accumulate_to_canonical() {
         "Bea's open and Ada's session share the canonical balance: {declarative:?}"
     );
     assert!(
-        !codes(&compiled).contains(&"E_BALANCE_MISMATCH".to_string()),
+        !codes(&compiled).contains(&"E_COACHING_BALANCE_MISMATCH".to_string()),
         "{compiled:?}"
     );
 }
@@ -8880,9 +8693,9 @@ fn balance_rule_mismatch_matches_golden() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["code"] == "E_BALANCE_MISMATCH")
+        .find(|f| f["code"] == "E_COACHING_BALANCE_MISMATCH")
         .expect("compiled mismatch");
-    assert_eq!(golden_finding, *compiled_finding, "compiled side drifted");
+    assert_eq!(golden_finding, *compiled_finding, "shipped side drifted");
 
     let declarative_finding = &ext_findings(&declarative, "E_COACHING_EXT_BALANCE")[0];
     for field in ["severity", "message", "fix", "file", "line", "id"] {
@@ -8894,7 +8707,7 @@ fn balance_rule_mismatch_matches_golden() {
 }
 
 #[test]
-fn balance_rule_matches_compiled_coaching() {
+fn balance_rule_matches_shipped_coaching() {
     // One vault that exercises every balance code the kind emits, on both
     // packs: the normalized findings must be equal.
     let (compiled, declarative) = assert_balance_parity(
@@ -9108,7 +8921,7 @@ fn session_checks_missing_duration() {
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_MISSING_DURATION"]
+        vec!["E_COACHING_MISSING_DURATION"]
     );
 }
 
@@ -9163,7 +8976,7 @@ fn session_checks_two_billing_tags() {
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_SESSION_TAGS"]
+        vec!["E_COACHING_SESSION_TAGS"]
     );
 }
 
@@ -9190,7 +9003,7 @@ fn session_checks_no_tag() {
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["W_SESSION_UNTAGGED"]
+        vec!["W_COACHING_SESSION_UNTAGGED"]
     );
 }
 
@@ -9299,7 +9112,7 @@ fn session_checks_note_other_person_does_not_cover() {
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_SESSION_WITHOUT_NOTES"]
+        vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
     );
 }
 
@@ -9333,7 +9146,7 @@ fn session_checks_non_person_id_notes_parity() {
     );
     assert_eq!(
         normalized_codes(&compiled, SESSION_CODE_MAP),
-        vec!["E_SESSION_WITHOUT_NOTES"]
+        vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
     );
 }
 
@@ -9370,7 +9183,7 @@ fn session_checks_notes_severity_warning_vs_error_vs_off() {
                 assert_eq!(found[0]["severity"], severity, "{declarative:?}");
                 assert_eq!(
                     normalized_codes(&compiled, SESSION_CODE_MAP),
-                    vec!["E_SESSION_WITHOUT_NOTES"]
+                    vec!["E_COACHING_SESSION_WITHOUT_NOTES"]
                 );
             }
             None => {
@@ -9412,7 +9225,7 @@ fn session_checks_merged_person_notes_cover() {
 }
 
 #[test]
-fn session_checks_matches_compiled_coaching() {
+fn session_checks_matches_shipped_coaching() {
     let (compiled, declarative) = assert_session_parity(
         |root| {
             person(root, ADA, "Ada Example");
@@ -9526,7 +9339,7 @@ fn gap_rule_inclusive_window_edge() {
     assert_eq!(found[0]["id"], ADA);
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_PAID_SESSION_GAP"]
+        vec!["E_COACHING_PAID_SESSION_GAP"]
     );
     assert_eq!(found[0]["message"], format!(
         "paid client {ADA} has remaining sessions and no session on or after 2026-08-24 (last was 2026-08-23)"
@@ -9610,7 +9423,7 @@ fn gap_rule_no_remaining_variant() {
     );
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_PAID_SESSION_GAP"]
+        vec!["E_COACHING_PAID_SESSION_GAP"]
     );
 }
 
@@ -9850,7 +9663,7 @@ fn gap_rule_days_override_from_config() {
     );
     assert_eq!(
         normalized_codes(&compiled, GAP_CODE_MAP),
-        vec!["E_PAID_SESSION_GAP"]
+        vec!["E_COACHING_PAID_SESSION_GAP"]
     );
     let found = ext_findings(&declarative, "E_COACHING_EXT_GAP");
     assert_eq!(found.len(), 1, "{declarative:?}");
@@ -9899,7 +9712,7 @@ fn gap_rule_matches_golden_paid_session_gap() {
 }
 
 #[test]
-fn gap_rule_matches_compiled_coaching() {
+fn gap_rule_matches_shipped_coaching() {
     let (compiled, declarative) = assert_gap_parity(|root| {
         person(root, ADA, "Ada Example");
         person(root, BEA, "Bea Demo");
@@ -9976,139 +9789,13 @@ fn gap_rule_loader_refuses_undeclared_balance_metric() {
 }
 
 // ---------------------------------------------------------------------------
-// #449: the on-disk `coaching-ext` fixture, loaded verbatim
+// #449: the shipped external coaching pack
 //
 // The inline `coaching_ext_manifest` above tunes one rule per test to pin
-// each kind in isolation. This section loads `testdata/packs/coaching-ext/`
-// — the shippable-unit fixture, all four rules at once — and compares it
-// with compiled `coaching@0.1` on the three golden vaults and the demo
-// vault. It is the parity gate for replacing compiled coaching.
+// each kind in isolation. This section loads the real `packs/coaching/`
+// manifest — all four rules at once — and pins the shipped unit, its skill
+// drift, and the new pack-own finding codes.
 // ---------------------------------------------------------------------------
-
-/// The on-disk parity fixture (#449).
-fn coaching_ext_fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/coaching-ext")
-}
-
-/// Copy the fixture into `root/packs/coaching-ext@0.1`, exactly as
-/// `pack add` vendors it, and pin the canonical hash. Returns the hash.
-fn install_coaching_ext_fixture(root: &Path) -> String {
-    let src = coaching_ext_fixture_dir();
-    let dst = root.join("packs/coaching-ext@0.1");
-    fs::create_dir_all(&dst).unwrap();
-    for entry in fs::read_dir(&src).unwrap() {
-        let entry = entry.unwrap();
-        assert!(
-            entry.file_type().unwrap().is_file(),
-            "fixture pack dir must be flat: {}",
-            entry.path().display()
-        );
-        fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
-    }
-    let hash = read_pack_dir(&dst)
-        .expect("fixture pack dir must read")
-        .hash;
-    install_lockfile(root, "coaching-ext", "0.1", &hash);
-    hash
-}
-
-/// Fixture code → compiled code for every rule the fixture can emit. The
-/// two `E_INVALID_ID` / `E_WRONG_ID_TYPE` rows are intentional: the balance
-/// rule's package ids and the `note-ref` rule's note ids normalise onto the
-/// same compiled codes, and the message text keeps them apart.
-const FIXTURE_CODE_MAP: &[(&str, &str)] = &[
-    ("E_COACHING_EXT_PARSE", "E_PARSE"),
-    ("E_COACHING_EXT_BALANCE", "E_BALANCE_MISMATCH"),
-    ("E_COACHING_EXT_NEGATIVE", "E_NEGATIVE_BALANCE"),
-    ("E_COACHING_EXT_OPEN", "E_OPEN_MALFORMED"),
-    ("E_COACHING_EXT_ID", "E_INVALID_ID"),
-    ("E_COACHING_EXT_TYPE", "E_WRONG_ID_TYPE"),
-    ("E_COACHING_EXT_DURATION", "E_MISSING_DURATION"),
-    ("E_COACHING_EXT_TAGS", "E_SESSION_TAGS"),
-    ("W_COACHING_EXT_UNTAGGED", "W_SESSION_UNTAGGED"),
-    ("E_COACHING_EXT_NOTES", "E_SESSION_WITHOUT_NOTES"),
-    ("E_COACHING_EXT_GAP", "E_PAID_SESSION_GAP"),
-    ("E_COACHING_EXT_NOTE_ID", "E_INVALID_ID"),
-    ("E_COACHING_EXT_NOTE_TYPE", "E_WRONG_ID_TYPE"),
-    ("E_COACHING_EXT_UNKNOWN", "E_UNKNOWN_RECORD"),
-];
-
-/// The fixture's operator keys: the compiled `coaching.*` keys with the
-/// pack namespace swapped, same values. That is the #449 `[checks]`-key
-/// normalisation: each side is configured through its own namespace, then
-/// the findings are compared after the code map above.
-const FIXTURE_CHECKS: &str = "coaching-ext.require_duration = \"error\"\n\
-coaching-ext.balance_nonnegative = \"error\"\n\
-coaching-ext.session_notes = \"warning\"\n\
-coaching-ext.paid_session_gap = \"warning\"\n\
-coaching-ext.paid_session_gap_days = 45\n\
-coaching-ext.pps_lookback_days = 180\n";
-
-/// The raw finding codes of a report, in order — for failure messages.
-fn raw_codes(report: &Value) -> Vec<String> {
-    report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["code"].as_str().unwrap_or("").to_owned())
-        .collect()
-}
-
-/// Normalise `report`'s findings through `map`, failing if any finding's
-/// code is not covered. The map must cover every code the vault can emit,
-/// so a code that fails to map is a parity gap and must fail the test
-/// rather than be dropped silently by [`normalized_findings`].
-fn mapped_findings(report: &Value, map: &[(&str, &str)], side: &str) -> Vec<String> {
-    let normalized = normalized_findings(report, map);
-    let raw = raw_codes(report);
-    assert_eq!(
-        raw.len(),
-        normalized.len(),
-        "{side} emitted a finding code the parity map does not cover \
-         (raw: {raw:?}); add it to FIXTURE_CODE_MAP"
-    );
-    normalized
-}
-
-/// Build the same vault twice — compiled `coaching@0.1` and the on-disk
-/// fixture — and assert the mapped findings match. `setup` writes the
-/// records and ledger; each side then gets its own `confidant.toml`.
-///
-/// The comparison is strict in both directions: every finding on each side
-/// must map (no silent drops), the raw counts must agree before
-/// normalisation, and the normalised findings must agree after it.
-fn assert_fixture_parity(setup: impl Fn(&Path)) -> (Value, Value) {
-    let compiled_dir = tempfile::tempdir().unwrap();
-    setup(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
-    let compiled = report_json(compiled_dir.path(), None);
-
-    let declarative_dir = tempfile::tempdir().unwrap();
-    setup(declarative_dir.path());
-    install_coaching_ext_fixture(declarative_dir.path());
-    external_vault_toml(
-        declarative_dir.path(),
-        "\"coaching-ext@0.1\"",
-        FIXTURE_CHECKS,
-    );
-    let declarative = report_json(declarative_dir.path(), None);
-
-    let compiled_findings = mapped_findings(&compiled, FIXTURE_CODE_MAP, "compiled");
-    let declarative_findings = mapped_findings(&declarative, FIXTURE_CODE_MAP, "fixture");
-    assert_eq!(
-        raw_codes(&compiled).len(),
-        raw_codes(&declarative).len(),
-        "raw finding counts differ before normalisation:\n\
-         compiled: {:?}\nfixture: {:?}",
-        raw_codes(&compiled),
-        raw_codes(&declarative)
-    );
-    assert_eq!(
-        compiled_findings, declarative_findings,
-        "fixture parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
-    );
-    (compiled, declarative)
-}
 
 /// Recursively copy `src` into `dst` (the demo vault is a tree).
 fn copy_tree(src: &Path, dst: &Path) {
@@ -10125,142 +9812,90 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 /// The demo vault's records and ledger without its `confidant.toml`; the
-/// parity harness writes the compiled/fixture config itself.
+/// context harness writes its own config.
 fn demo_vault_records(root: &Path) {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/demo-vault");
     copy_tree(&src, root);
     fs::remove_file(root.join("confidant.toml")).unwrap();
 }
 
-/// #449 parity: the `balance_mismatch` golden vault, compiled vs. fixture.
+/// #449: the shipped pack's `note-ref` rule emits its own pack codes, not
+/// the shared core codes. The three cases are invalid id, wrong id type,
+/// and a missing note.
 #[test]
-fn declarative_coaching_matches_compiled_coaching_balance() {
-    let (compiled, declarative) = assert_fixture_parity(balance_mismatch_vault);
-    assert_eq!(
-        normalized_codes(&compiled, FIXTURE_CODE_MAP),
-        vec!["E_BALANCE_MISMATCH"]
+fn shipped_coaching_note_ref_codes_are_pack_own() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 open {ADA} package {PKG} 10 sessions\n\
+             2026-10-01 session {ADA} 60m paid note:not-an-id\n\
+             2026-10-02 session {ADA} 60m paid note:{ADA}\n\
+             2026-10-03 session {ADA} 60m paid note:{NOTE2}\n"
+        ),
     );
+    let json = report_json(dir.path(), None);
+    let mut got = codes(&json);
+    got.sort();
     assert_eq!(
-        normalized_codes(&declarative, FIXTURE_CODE_MAP),
-        vec!["E_BALANCE_MISMATCH"]
-    );
-    assert_eq!(
-        codes(&declarative),
-        vec!["E_COACHING_EXT_BALANCE"],
-        "{declarative:?}"
+        got,
+        vec![
+            "E_COACHING_NOTE_INVALID_ID",
+            "E_COACHING_NOTE_WRONG_TYPE",
+            "E_COACHING_UNKNOWN_RECORD",
+        ],
+        "{json:?}"
     );
 }
 
-/// #449 parity: the `paid_session_gap` golden vault, compiled vs. fixture.
+/// #449: the shipped pack is a pinned, shippable unit. Any edit to its
+/// bytes changes this hash, so a change is deliberate.
 #[test]
-fn declarative_coaching_matches_compiled_coaching_gap() {
-    let (compiled, declarative) = assert_fixture_parity(paid_session_gap_vault);
+fn shipped_coaching_pack_hash_is_stable() {
+    let pack = read_pack_dir(&shipped_coaching_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        normalized_codes(&compiled, FIXTURE_CODE_MAP),
-        vec!["E_PAID_SESSION_GAP"]
-    );
-    assert_eq!(
-        normalized_codes(&declarative, FIXTURE_CODE_MAP),
-        vec!["E_PAID_SESSION_GAP"]
-    );
-    assert_eq!(
-        codes(&declarative),
-        vec!["E_COACHING_EXT_GAP"],
-        "{declarative:?}"
-    );
-}
-
-/// #449 parity: the `session_without_notes` golden vault, compiled vs.
-/// fixture.
-#[test]
-fn declarative_coaching_matches_compiled_coaching_session_notes() {
-    let (compiled, declarative) = assert_fixture_parity(session_without_notes_vault);
-    assert_eq!(
-        normalized_codes(&compiled, FIXTURE_CODE_MAP),
-        vec!["E_SESSION_WITHOUT_NOTES"]
-    );
-    assert_eq!(
-        normalized_codes(&declarative, FIXTURE_CODE_MAP),
-        vec!["E_SESSION_WITHOUT_NOTES"]
-    );
-    assert_eq!(
-        codes(&declarative),
-        vec!["E_COACHING_EXT_NOTES"],
-        "{declarative:?}"
-    );
-}
-
-/// #449 parity: the demo vault, compiled vs. fixture. Both sides are clean,
-/// so a fixture that over-fires fails here.
-#[test]
-fn declarative_coaching_matches_compiled_coaching_demo_vault_clean() {
-    let (compiled, declarative) = assert_fixture_parity(demo_vault_records);
-    assert!(
-        normalized_findings(&compiled, FIXTURE_CODE_MAP).is_empty(),
-        "{compiled:?}"
-    );
-    assert!(
-        normalized_findings(&declarative, FIXTURE_CODE_MAP).is_empty(),
-        "{declarative:?}"
-    );
-}
-
-/// #449 parity extra: the `note-ref` fourth rule, invalid / wrong-type /
-/// missing note ids on `session` lines, compiled vs. fixture.
-#[test]
-fn declarative_coaching_matches_compiled_coaching_note_ref() {
-    let (compiled, declarative) = assert_fixture_parity(|root| {
-        person(root, ADA, "Ada Example");
-        write(
-            root,
-            "ledger/2026/10.cfd",
-            &format!(
-                "2026-10-01 open {ADA} package {PKG} 10 sessions\n\
-                 2026-10-01 session {ADA} 60m paid note:not-an-id\n\
-                 2026-10-02 session {ADA} 60m paid note:{ADA}\n\
-                 2026-10-03 session {ADA} 60m paid note:{NOTE2}\n"
-            ),
-        );
-    });
-    // `normalized_codes` sorts, so the order is the sorted code names.
-    assert_eq!(
-        normalized_codes(&compiled, FIXTURE_CODE_MAP),
-        vec!["E_INVALID_ID", "E_UNKNOWN_RECORD", "E_WRONG_ID_TYPE"]
-    );
-    assert_eq!(
-        normalized_codes(&declarative, FIXTURE_CODE_MAP),
-        vec!["E_INVALID_ID", "E_UNKNOWN_RECORD", "E_WRONG_ID_TYPE"]
-    );
-}
-
-/// #449: the fixture is a pinned, shippable unit. Any edit to its bytes
-/// changes this hash, so the parity tests above must be re-run and this pin
-/// updated deliberately.
-#[test]
-fn declarative_coaching_fixture_hash_is_stable() {
-    let pack = read_pack_dir(&coaching_ext_fixture_dir()).expect("fixture pack dir must read");
-    assert_eq!(
-        pack.hash, "sha256:1cb2a1f197a555e7c833ddf629f7bbc3224bc041e6f2934225a58d1d74904711",
-        "the #449 fixture changed; re-run the fixture parity tests and update \
-         this pin in the same commit"
+        pack.hash, "sha256:d5dbb563979e7b16f2a35f0a59412720149a43ef207fa6a6d799da669d3ab604",
+        "the shipped coaching pack changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);
 }
 
-/// #449 drift test: the fixture's SKILL.md must document every code and
-/// every `[checks]` key the manifest declares, exactly like the compiled
-/// packs' skill drift test (`crates/confidant-cli/src/embedded.rs`).
+/// #449: the demo vault's vendored coaching pack is a byte-for-byte copy of
+/// the shipped `packs/coaching/`, so the example cannot drift.
 #[test]
-fn declarative_coaching_skill_documents_all_codes_and_keys() {
-    let dir = coaching_ext_fixture_dir();
+fn demo_vault_vendored_coaching_matches_shipped_pack() {
+    let demo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/demo-vault/packs/coaching@0.1");
+    let shipped = shipped_coaching_dir();
+    for name in ["manifest.toml", "SKILL.md", "0.1.md"] {
+        assert_eq!(
+            fs::read(demo.join(name)).unwrap(),
+            fs::read(shipped.join(name)).unwrap(),
+            "examples/demo-vault/packs/coaching@0.1/{name} drifted from packs/coaching/{name}"
+        );
+    }
+    assert_eq!(
+        read_pack_dir(&demo).unwrap().hash,
+        read_pack_dir(&shipped).unwrap().hash
+    );
+}
+
+/// #449 drift test: the shipped pack's SKILL.md must document every code
+/// and every `[checks]` key the manifest declares.
+#[test]
+fn shipped_coaching_skill_documents_all_codes_and_keys() {
+    let dir = shipped_coaching_dir();
     let manifest_text = fs::read_to_string(dir.join("manifest.toml")).unwrap();
     let manifest = confidant_core::packs::manifest::parse_manifest_external(&manifest_text)
-        .expect("fixture manifest parses");
+        .expect("shipped coaching manifest parses");
     let skill = fs::read_to_string(dir.join("SKILL.md")).unwrap();
     for code in &manifest.finding_codes {
         assert!(
             skill.contains(code.as_str()),
-            "fixture can emit {code} but its SKILL.md does not document it"
+            "pack can emit {code} but its SKILL.md does not document it"
         );
     }
     for key in manifest
@@ -10272,9 +9907,23 @@ fn declarative_coaching_skill_documents_all_codes_and_keys() {
     {
         assert!(
             skill.contains(&format!("`{key}`")),
-            "fixture declares [checks] key {key} but its SKILL.md does not document it"
+            "pack declares [checks] key {key} but its SKILL.md does not document it"
         );
     }
+}
+
+/// #449: a vault that lists `coaching@0.1` but has not vendored the pack
+/// is `E_PACK_UNKNOWN` — the compiled fallback is gone.
+#[test]
+fn coaching_without_vendored_pack_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_UNKNOWN".to_string()),
+        "{json:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -10294,203 +9943,142 @@ fn ledger_sessions_row<'a>(bundle: &'a Value, key: &str) -> &'a Value {
     &bundle["packs"][key]
 }
 
-/// Build the same vault twice — compiled `coaching@0.1` and the `[context]`
-/// fixture — and assert the per-pack view is structurally equal (keys, array
-/// ordering and values). The legacy `coaching` alias belongs to the coaching
-/// pack, so the compiled side populates it and the `coaching-ext` fixture must
-/// not. `setup` writes the records and ledger.
-fn assert_context_view_parity(setup: impl Fn(&Path), person: &str) -> (Value, Value) {
-    let compiled_dir = tempfile::tempdir().unwrap();
-    setup(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
-    let compiled = context_bundle(compiled_dir.path(), person);
-
-    let declarative_dir = tempfile::tempdir().unwrap();
-    setup(declarative_dir.path());
-    install_coaching_ext_fixture(declarative_dir.path());
-    external_vault_toml(
-        declarative_dir.path(),
-        "\"coaching-ext@0.1\"",
-        FIXTURE_CHECKS,
-    );
-    let declarative = context_bundle(declarative_dir.path(), person);
-
-    assert_eq!(
-        compiled["packs"]["coaching@0.1"], declarative["packs"]["coaching-ext@0.1"],
-        "context view parity failed:\ncompiled: {compiled:?}\ndeclarative: {declarative:?}"
-    );
-    // The alias is tied to the coaching pack: the compiled side serves it, the
-    // fixture (a `[context]` pack under another name) must not.
-    assert_eq!(
-        compiled["coaching"], compiled["packs"]["coaching@0.1"],
-        "the coaching pack must populate the legacy alias: {compiled:?}"
-    );
-    assert!(
-        declarative["coaching"].is_null(),
-        "a non-coaching [context] pack must not populate the legacy alias: {declarative:?}"
-    );
-    (compiled, declarative)
+/// A demo-vault copy with the shipped coaching pack installed.
+fn demo_vault_with_coaching() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    demo_vault_records(dir.path());
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    dir
 }
 
-/// #594: the demo vault, compiled coaching vs. the `[context]` fixture.
+/// #594/#449: the shipped external pack serves the `ledger-sessions` view
+/// on the demo vault, including the legacy `coaching` alias.
 #[test]
-fn declarative_coaching_context_view_matches_compiled_demo_vault() {
-    let (compiled, declarative) = assert_context_view_parity(demo_vault_records, ADA);
+fn coaching_context_view_on_demo_vault() {
+    let dir = demo_vault_with_coaching();
+    let bundle = context_bundle(dir.path(), ADA);
     // Ada: 6 opened minus two paid sessions; 60m + 45m = 1.75h.
-    let row = ledger_sessions_row(&compiled, "coaching@0.1");
-    assert_eq!(row["sessions_remaining"], 4, "{compiled:?}");
-    assert_eq!(row["icf_hours"], 1.75, "{compiled:?}");
+    let row = ledger_sessions_row(&bundle, "coaching@0.1");
+    assert_eq!(row["sessions_remaining"], 4, "{bundle:?}");
+    assert_eq!(row["icf_hours"], 1.75, "{bundle:?}");
     let dates: Vec<&str> = row["recent_sessions"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["date"].as_str().unwrap())
         .collect();
-    // Newest first, and the declarative side preserves the same order.
-    assert_eq!(dates, vec!["2026-10-08", "2026-10-01"], "{compiled:?}");
+    assert_eq!(dates, vec!["2026-10-08", "2026-10-01"], "{bundle:?}");
     assert_eq!(
-        declarative["packs"]["coaching-ext@0.1"]["recent_sessions"],
-        compiled["packs"]["coaching@0.1"]["recent_sessions"]
+        bundle["coaching"], bundle["packs"]["coaching@0.1"],
+        "the coaching pack must populate the legacy alias: {bundle:?}"
     );
 }
 
-/// #594: the three golden vaults, compiled coaching vs. the `[context]`
-/// fixture. Each compares the full view, so a mismatch in the balance
-/// arithmetic or the recent-session shape fails.
+/// #594/#449: the three golden vaults' `ledger-sessions` values through
+/// the shipped external pack. The values are literal, so drift fails.
 #[test]
-fn declarative_coaching_context_view_matches_compiled_goldens() {
+fn coaching_context_view_on_goldens() {
     for setup in [
         balance_mismatch_vault as fn(&Path),
         paid_session_gap_vault,
         session_without_notes_vault,
     ] {
-        let (compiled, _) = assert_context_view_parity(setup, ADA);
-        assert_eq!(
-            ledger_sessions_row(&compiled, "coaching@0.1")["sessions_remaining"],
-            5,
-            "{compiled:?}"
-        );
-        assert_eq!(
-            ledger_sessions_row(&compiled, "coaching@0.1")["icf_hours"],
-            1.0,
-            "{compiled:?}"
-        );
+        let dir = tempfile::tempdir().unwrap();
+        setup(dir.path());
+        vault_toml(dir.path(), DEFAULT_CHECKS);
+        let bundle = context_bundle(dir.path(), ADA);
+        let row = ledger_sessions_row(&bundle, "coaching@0.1");
+        assert_eq!(row["sessions_remaining"], 5, "{bundle:?}");
+        assert_eq!(row["icf_hours"], 1.0, "{bundle:?}");
     }
 }
 
 /// #594 privacy: the coaching row is byte-identical with and without the
 /// private data (`--exclude-private` maps to `include_private = false`). The
 /// view is ledger metadata only, so neither the §12 gate nor
-/// `private_context_fields` has anything to strip. Checked on the compiled
-/// pack and the `[context]` fixture.
+/// `private_context_fields` has anything to strip.
 #[test]
 fn context_ledger_sessions_view_is_identical_without_private() {
-    let compiled_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
-
-    let declarative_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(declarative_dir.path());
-    install_coaching_ext_fixture(declarative_dir.path());
-    external_vault_toml(
-        declarative_dir.path(),
-        "\"coaching-ext@0.1\"",
-        FIXTURE_CHECKS,
+    let dir = demo_vault_with_coaching();
+    let vault = load_vault(dir.path()).unwrap();
+    let ada = confidant_core::RecordId::parse(ADA).unwrap();
+    let full = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
+    let stripped = build_context(&vault, &ada, false, &PackScope::All, false).unwrap();
+    assert_eq!(full.coaching, stripped.coaching);
+    assert_eq!(full.packs["coaching@0.1"], stripped.packs["coaching@0.1"]);
+    // The JSON bytes of the row are unchanged, so a reader that diffs the
+    // two flags sees no difference at all.
+    assert_eq!(
+        serde_json::to_string(&full.coaching).unwrap(),
+        serde_json::to_string(&stripped.coaching).unwrap()
     );
-
-    for (root, key) in [
-        (compiled_dir.path(), "coaching@0.1"),
-        (declarative_dir.path(), "coaching-ext@0.1"),
-    ] {
-        let vault = load_vault(root).unwrap();
-        let ada = confidant_core::RecordId::parse(ADA).unwrap();
-        let full = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
-        let stripped = build_context(&vault, &ada, false, &PackScope::All, false).unwrap();
-        assert_eq!(full.coaching, stripped.coaching, "{root:?}");
-        assert_eq!(full.packs[key], stripped.packs[key], "{root:?}");
-        // The JSON bytes of the row are unchanged, so a reader that diffs the
-        // two flags sees no difference at all.
-        assert_eq!(
-            serde_json::to_string(&full.coaching).unwrap(),
-            serde_json::to_string(&stripped.coaching).unwrap()
-        );
-    }
 }
 
 /// #594 privacy: a `no-ai` person's row carries only the ledger keys — the
 /// view reads no record content, so the §12 cleared set does not gate it and
-/// nothing beyond the three metadata keys can appear. Checked on both the
-/// compiled and the declarative side.
+/// nothing beyond the three metadata keys can appear.
 #[test]
 fn context_ledger_sessions_view_no_ai_carries_only_ledger_keys() {
     let ledger_keys = ["icf_hours", "recent_sessions", "sessions_remaining"];
-
-    let compiled_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
-    let compiled = context_bundle(compiled_dir.path(), CAM);
-
-    let declarative_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(declarative_dir.path());
-    install_coaching_ext_fixture(declarative_dir.path());
-    external_vault_toml(
-        declarative_dir.path(),
-        "\"coaching-ext@0.1\"",
-        FIXTURE_CHECKS,
-    );
-    let declarative = context_bundle(declarative_dir.path(), CAM);
-
-    for (bundle, key) in [
-        (&compiled, "coaching@0.1"),
-        (&declarative, "coaching-ext@0.1"),
-    ] {
-        let row = ledger_sessions_row(bundle, key).as_object().unwrap();
-        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ledger_keys, "{bundle:?}");
-        // Cam's own figures: 4 opened, one 45m paid session.
-        assert_eq!(row["sessions_remaining"], 3, "{bundle:?}");
-        assert_eq!(row["icf_hours"], 0.75, "{bundle:?}");
-    }
-    assert_eq!(
-        compiled["packs"]["coaching@0.1"],
-        declarative["packs"]["coaching-ext@0.1"]
-    );
+    let dir = demo_vault_with_coaching();
+    let bundle = context_bundle(dir.path(), CAM);
+    let row = ledger_sessions_row(&bundle, "coaching@0.1")
+        .as_object()
+        .unwrap();
+    let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ledger_keys, "{bundle:?}");
+    // Cam's own figures: 4 opened, one 45m paid session.
+    assert_eq!(row["sessions_remaining"], 3, "{bundle:?}");
+    assert_eq!(row["icf_hours"], 0.75, "{bundle:?}");
 }
 
-/// #594: the legacy `coaching` alias is tied to the coaching pack, not to the
-/// view kind. The compiled `coaching@0.1` populates it; a `[context]` pack
-/// under another name (the fixture) serves its own row but leaves the alias
-/// null; and a vault with no coaching pack has no alias at all. Fails if the
-/// alias is served by the wrong pack or by any pack at all.
+/// Copy the shipped coaching pack under another name, keeping its
+/// `[context]` opt-in, and pin it. Returns the pack directory hash.
+fn install_renamed_coaching(root: &Path, name: &str) -> String {
+    let src = shipped_coaching_dir();
+    let dst = root.join(format!("packs/{name}@0.1"));
+    fs::create_dir_all(&dst).unwrap();
+    for entry in fs::read_dir(&src).unwrap() {
+        let entry = entry.unwrap();
+        let mut text = fs::read_to_string(entry.path()).unwrap();
+        if entry.file_name() == "manifest.toml" {
+            text = text
+                .replace("name = \"coaching\"", &format!("name = \"{name}\""))
+                // The loader requires `[checks]`/rule keys to be namespaced
+                // to the pack's own name.
+                .replace("\"coaching.", &format!("\"{name}."));
+        }
+        fs::write(dst.join(entry.file_name()), text).unwrap();
+    }
+    let hash = read_pack_dir(&dst).unwrap().hash;
+    install_lockfile(root, name, "0.1", &hash);
+    hash
+}
+
+/// #594/#449: the legacy `coaching` alias is tied to the coaching pack, not
+/// to the view kind. The shipped external `coaching@0.1` populates it; a
+/// `[context]` pack under another name serves its own row but leaves the
+/// alias null; and a vault with no coaching pack has no alias at all.
 #[test]
 fn context_legacy_coaching_alias_is_tied_to_the_coaching_pack() {
-    // Compiled coaching: the alias is present and equals its `packs` entry.
-    let compiled_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(compiled_dir.path());
-    vault_toml(compiled_dir.path(), DEFAULT_CHECKS);
-    let compiled = context_bundle(compiled_dir.path(), ADA);
-    assert!(!compiled["coaching"].is_null(), "{compiled:?}");
-    assert_eq!(compiled["coaching"], compiled["packs"]["coaching@0.1"]);
+    let dir = demo_vault_with_coaching();
+    let bundle = context_bundle(dir.path(), ADA);
+    assert!(!bundle["coaching"].is_null(), "{bundle:?}");
+    assert_eq!(bundle["coaching"], bundle["packs"]["coaching@0.1"]);
 
-    // The `coaching-ext` fixture serves the ledger-sessions kind under a
-    // different name: its own row is present, the alias must be null.
-    let fixture_dir = tempfile::tempdir().unwrap();
-    demo_vault_records(fixture_dir.path());
-    install_coaching_ext_fixture(fixture_dir.path());
-    external_vault_toml(fixture_dir.path(), "\"coaching-ext@0.1\"", FIXTURE_CHECKS);
-    let fixture = context_bundle(fixture_dir.path(), ADA);
+    let other_dir = tempfile::tempdir().unwrap();
+    demo_vault_records(other_dir.path());
+    install_renamed_coaching(other_dir.path(), "other-coaching");
+    external_vault_toml(other_dir.path(), "\"other-coaching@0.1\"", "");
+    let other = context_bundle(other_dir.path(), ADA);
+    assert!(!other["packs"]["other-coaching@0.1"].is_null(), "{other:?}");
     assert!(
-        !fixture["packs"]["coaching-ext@0.1"].is_null(),
-        "{fixture:?}"
-    );
-    assert!(
-        fixture["coaching"].is_null(),
-        "a non-coaching [context] pack must not own the legacy alias: {fixture:?}"
+        other["coaching"].is_null(),
+        "a non-coaching [context] pack must not own the legacy alias: {other:?}"
     );
 
-    // No coaching pack at all (only the implicit built-in personal pack): the
-    // alias is null and there is no coaching `packs` entry.
+    // No coaching pack at all (only the implicit built-in personal pack).
     let none_dir = tempfile::tempdir().unwrap();
     demo_vault_records(none_dir.path());
     external_vault_toml(none_dir.path(), "", "");
@@ -10503,31 +10091,28 @@ fn context_legacy_coaching_alias_is_tied_to_the_coaching_pack() {
 /// external pack closed as `E_PACK_INVALID`, before anything folds.
 #[test]
 fn external_context_unknown_view_is_pack_invalid() {
-    let manifest = fs::read_to_string(coaching_ext_fixture_dir().join("manifest.toml"))
+    let manifest = fs::read_to_string(shipped_coaching_dir().join("manifest.toml"))
         .unwrap()
         .replace("view = \"ledger-sessions\"", "view = \"nope\"");
     let dir = tempfile::tempdir().unwrap();
     person(dir.path(), ADA, "Ada Example");
+    write(dir.path(), "packs/coaching@0.1/manifest.toml", &manifest);
     write(
         dir.path(),
-        "packs/coaching-ext@0.1/manifest.toml",
-        &manifest,
+        "packs/coaching@0.1/SKILL.md",
+        "# coaching pack.\n",
     );
-    write(
-        dir.path(),
-        "packs/coaching-ext@0.1/SKILL.md",
-        "# coaching-ext fixture.\n",
-    );
+    write(dir.path(), "packs/coaching@0.1/0.1.md", "# coaching 0.1\n");
     // `read_pack_dir` validates the manifest, so the bad `[context]` makes it
     // fail here too; the pin only has to be well-formed so the lockfile
     // parses and the failure is the manifest, not the pin.
-    let pack_dir = dir.path().join("packs/coaching-ext@0.1");
+    let pack_dir = dir.path().join("packs/coaching@0.1");
     let hash = read_pack_dir(&pack_dir)
         .map(|p| p.hash)
         .unwrap_or_else(|_| format!("sha256:{}", "0".repeat(64)));
-    install_lockfile(dir.path(), "coaching-ext", "0.1", &hash);
-    coaching_ext_vault(dir.path(), COACHING_EXT_CHECKS);
+    install_lockfile(dir.path(), "coaching", "0.1", &hash);
+    external_vault_toml(dir.path(), "\"coaching@0.1\"", DEFAULT_CHECKS);
     let json = report_json(dir.path(), None);
     let finding = finding_by_code(&json, "E_PACK_INVALID");
-    assert_eq!(finding["file"], "packs/coaching-ext@0.1", "{json:?}");
+    assert_eq!(finding["file"], "packs/coaching@0.1", "{json:?}");
 }

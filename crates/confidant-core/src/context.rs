@@ -18,7 +18,7 @@
 //! fields) lives in [`personal`]; `context` only strips the fields the pack
 //! declares as private. The ledger-derived `ledger-sessions` entry lives in
 //! [`ledger_sessions`] and is served by whichever enabled pack reports it —
-//! the compiled coaching pack or a `[context]` declarative pack (#594).
+//! the shipped external coaching pack (a `[context]` pack, #449/#594).
 
 pub mod ledger_sessions;
 pub mod personal;
@@ -111,8 +111,8 @@ pub struct InteractionView {
 // the agent contract (ADR-7): `context` output keeps the `coaching` field
 // with exactly this shape. Pack state is grouped by pack in
 // PersonContext::packs; `coaching` is the `ledger-sessions` provider's entry
-// in that map (the compiled coaching pack or a `[context]` declarative
-// pack), deserialized back into this struct.
+// in that map (the shipped external `coaching` pack), deserialized back
+// into this struct.
 
 /// The full bundle returned by `context`.
 #[derive(Clone, Debug, Serialize)]
@@ -231,8 +231,8 @@ pub fn build_context(
     // Legacy contract field: the coaching pack's entry, deserialized back.
     // The alias is tied to the coaching pack (ADR-7), not to the view kind:
     // any `[context]` pack can serve the `ledger-sessions` kind, but only the
-    // pack named `coaching` (the compiled `coaching@0.1` today, the external
-    // `coaching` pack after the #449 cutover) owns the legacy alias. Another
+    // pack named `coaching` (the shipped external `coaching@0.1`) owns the
+    // legacy alias. Another
     // pack serving the same kind must leave `coaching` null. The key is never
     // hardcoded: the version comes from the enabled pack, matched by base
     // name. `to_value` in the builder produced it from this struct, so this

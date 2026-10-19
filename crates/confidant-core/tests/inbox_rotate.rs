@@ -46,7 +46,7 @@ impl Repo {
         git(root, &["config", "user.email", "test@example.com"]);
         std::fs::write(
             root.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"inbox-rotate-vault\"\n",
+            "spec = \"0.1\"\npacks = []\nvault_id = \"inbox-rotate-vault\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join(format!("people/{PID}"))).unwrap();

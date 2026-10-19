@@ -385,7 +385,7 @@ mod tests {
             "testpack@0.1"
         }
         fn verbs(&self) -> &'static [&'static str] {
-            &["touch"]
+            &["touch", "session"]
         }
         fn record_types(&self) -> &'static [&'static str] {
             // "edge" is a core record type (#179) and is never claimed.
@@ -441,10 +441,9 @@ mod tests {
     }
 
     static TEST_PACK: TestPack = TestPack;
-    static COACHING: crate::packs::coaching::CoachingPack = crate::packs::coaching::CoachingPack;
 
     fn registry() -> Vec<&'static dyn Pack> {
-        vec![&COACHING, &TEST_PACK]
+        vec![&TEST_PACK]
     }
 
     #[test]
@@ -469,8 +468,8 @@ mod tests {
 
     #[test]
     fn resolve_disabled_pack_is_error() {
-        // testpack is in the registry but not in this enabled set.
-        let enabled: Vec<&dyn Pack> = vec![&COACHING];
+        // testpack is registered but not enabled in this set.
+        let enabled: Vec<&dyn Pack> = Vec::new();
         let err = resolve_scope(Some(&["testpack@0.1".to_string()]), &enabled, &[]).unwrap_err();
         assert!(err.message().contains("testpack@0.1"));
     }
@@ -491,13 +490,13 @@ mod tests {
     #[test]
     fn resolve_scope_includes_implicit_builtin_only_when_named() {
         let implicit = implicit_personal();
-        let enabled: Vec<&dyn Pack> = vec![&COACHING, implicit[0]];
+        let enabled: Vec<&dyn Pack> = vec![&TEST_PACK, implicit[0]];
         // A ceiling naming only an optional pack excludes the built-in.
         let scoped =
-            resolve_scope(Some(&["coaching@0.1".to_string()]), &enabled, &implicit).unwrap();
+            resolve_scope(Some(&["testpack@0.1".to_string()]), &enabled, &implicit).unwrap();
         assert_eq!(
             scoped,
-            PackScope::Only(["coaching@0.1".to_string()].into_iter().collect())
+            PackScope::Only(["testpack@0.1".to_string()].into_iter().collect())
         );
         // A built-in listing at any version resolves to the built-in.
         for listed in ["personal@0.1", "personal@0.2", "personal@9.9"] {
@@ -516,15 +515,15 @@ mod tests {
     }
 
     /// #551: the ceiling check has no implicit bypass. Naming the built-in
-    /// cannot widen a coaching-only ceiling, but the any-version alias still
-    /// matches a ceiling that already names it.
+    /// cannot widen an optional-pack-only ceiling, but the any-version alias
+    /// still matches a ceiling that already names it.
     #[test]
     fn intersect_scope_never_widens_past_ceiling_with_implicit() {
         let implicit = implicit_personal();
-        let enabled: Vec<&dyn Pack> = vec![&COACHING, implicit[0]];
-        let coaching_ceiling = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
+        let enabled: Vec<&dyn Pack> = vec![&TEST_PACK, implicit[0]];
+        let optional_ceiling = PackScope::Only(["testpack@0.1".to_string()].into_iter().collect());
         let err = intersect_scope(
-            &coaching_ceiling,
+            &optional_ceiling,
             Some(&["personal@0.1".to_string()]),
             &enabled,
             &implicit,
@@ -547,12 +546,12 @@ mod tests {
 
     #[test]
     fn intersect_narrows_but_never_widens() {
-        let ceiling = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
+        let ceiling = PackScope::Only(["testpack@0.1".to_string()].into_iter().collect());
         // Narrowing to the ceiling itself is fine.
         assert_eq!(
             intersect_scope(
                 &ceiling,
-                Some(&["coaching@0.1".to_string()]),
+                Some(&["testpack@0.1".to_string()]),
                 &registry(),
                 &[]
             )
@@ -560,13 +559,8 @@ mod tests {
             ceiling
         );
         // A pack outside the ceiling is an error, even though it exists.
-        let err = intersect_scope(
-            &ceiling,
-            Some(&["testpack@0.1".to_string()]),
-            &registry(),
-            &[],
-        )
-        .unwrap_err();
+        let err = intersect_scope(&ceiling, Some(&["other@0.1".to_string()]), &registry(), &[])
+            .unwrap_err();
         assert!(err.message().contains("outside"));
         // No per-call scope means the ceiling.
         assert_eq!(
@@ -606,7 +600,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             owners_of_ledger_entry(&session, &enabled),
-            [OwnerKey::Pack("coaching@0.1")].into_iter().collect()
+            [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
         );
         let balance = parse_line("2026-10-08 balance p-01M3TC5H00MPJG000000000000 test_metric 3")
             .unwrap()
@@ -633,12 +627,12 @@ mod tests {
 
     #[test]
     fn allows_is_core_visible_unattributed_hidden() {
-        let coaching = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
+        let other = PackScope::Only(["other@0.1".to_string()].into_iter().collect());
         let core: BTreeSet<OwnerKey> = [OwnerKey::Core].into_iter().collect();
         let pack: BTreeSet<OwnerKey> = [OwnerKey::Pack("testpack@0.1")].into_iter().collect();
-        assert!(coaching.allows(&core));
-        assert!(!coaching.allows(&pack));
-        assert!(!coaching.allows(&BTreeSet::new()));
+        assert!(other.allows(&core));
+        assert!(!other.allows(&pack));
+        assert!(!other.allows(&BTreeSet::new()));
         assert!(PackScope::All.allows(&BTreeSet::new()));
     }
 
@@ -658,8 +652,8 @@ mod tests {
             owners,
             [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
         );
-        let coaching = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
-        assert!(!coaching.allows(&owners));
+        let other = PackScope::Only(["other@0.1".to_string()].into_iter().collect());
+        assert!(!other.allows(&owners));
         let testpack = PackScope::Only(["testpack@0.1".to_string()].into_iter().collect());
         assert!(testpack.allows(&owners));
         // A person record is the core anchor: always visible.
@@ -670,7 +664,7 @@ mod tests {
         .unwrap();
         let person_owners = record_owners(&person, &HashMap::new(), &enabled);
         assert_eq!(person_owners, [OwnerKey::Core].into_iter().collect());
-        assert!(coaching.allows(&person_owners));
+        assert!(other.allows(&person_owners));
     }
 
     #[test]
@@ -697,8 +691,8 @@ mod tests {
             mentor_owners,
             [OwnerKey::Pack("testpack@0.1")].into_iter().collect()
         );
-        let coaching = PackScope::Only(["coaching@0.1".to_string()].into_iter().collect());
-        assert!(!coaching.allows(&mentor_owners));
+        let other = PackScope::Only(["other@0.1".to_string()].into_iter().collect());
+        assert!(!other.allows(&mentor_owners));
         let testpack = PackScope::Only(["testpack@0.1".to_string()].into_iter().collect());
         assert!(testpack.allows(&mentor_owners));
         // An unknown kind is unattributed: visible only unscoped.
@@ -709,7 +703,7 @@ mod tests {
         .unwrap();
         let mystery_owners = record_owners(&mystery, &HashMap::new(), &enabled);
         assert!(mystery_owners.is_empty());
-        assert!(!coaching.allows(&mystery_owners));
+        assert!(!other.allows(&mystery_owners));
         assert!(PackScope::All.allows(&mystery_owners));
         // `owner_of_edge_kind` directly: core kind, pack kind, unknown.
         assert_eq!(
@@ -725,11 +719,11 @@ mod tests {
 
     #[test]
     fn note_linkage_attributes_session_notes() {
-        // A vault whose only entry is a coaching session referencing a note.
+        // A vault whose only entry is a pack-owned session referencing a note.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\npacks = [\"coaching@0.1\"]\n",
+            "spec = \"0.1\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
         )
         .unwrap();
         let note_id = "n-01M3TC5H00MPJG002NAM000005";
@@ -744,7 +738,7 @@ mod tests {
         let id = RecordId::parse(note_id).unwrap();
         assert_eq!(
             linkage.get(&id),
-            Some(&[OwnerKey::Pack("coaching@0.1")].into_iter().collect())
+            Some(&[OwnerKey::Pack("testpack@0.1")].into_iter().collect())
         );
     }
 }

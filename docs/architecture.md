@@ -241,7 +241,7 @@ confidant check --json
   "ok": false,
   "vault": "/home/frank/vault",
   "error": {
-    "code": "E_BALANCE_MISMATCH",
+    "code": "E_COACHING_BALANCE_MISMATCH",
     "file": "ledger/2026/10.cfd",
     "line": 5,
     "message": "sessions_remaining asserted 4, computed 3",
@@ -285,7 +285,7 @@ confidant import --file portal-events.jsonl --request-id portal-2026-10-07 --jso
 
 **Alternatives considered.** Git-style subprocess plugins: `confidant-<name>` on PATH, a JSON stdin/stdout protocol, and a capability manifest declaring whether the plugin needs the private (decrypted) tier. Clean, and a likely later addition, but in v0 it is a framework to design, version and secure before there is a second user who needs it. Agents plus the CLI contract cover the same integrations today.
 
-**Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; v0 can compile the coaching pack into the binary behind the pack interface.
+**Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; the coaching pack ships as an external declarative pack, while the built-in personal pack stays compiled behind the same pack interface.
 
 *External packs (#193, approved 2026-10-16).* Schema packs can now also
 ship outside the binary: a v2 manifest (`spec/pack-manifest.md` §13)

@@ -147,14 +147,6 @@ impl ChecksConfig {
         }
     }
 
-    pub fn paid_session_gap_days(&self) -> u64 {
-        self.ints["coaching.paid_session_gap_days"]
-    }
-
-    pub fn pps_lookback_days(&self) -> u64 {
-        self.ints["coaching.pps_lookback_days"]
-    }
-
     pub fn date_upcoming_days(&self) -> u64 {
         self.ints["personal.date_upcoming_days"]
     }
@@ -504,7 +496,22 @@ pub fn parse_iso_date(s: &str) -> Result<chrono::NaiveDate, DomainError> {
 #[cfg(test)]
 mod tests {
     use super::{VaultConfig, MAX_GAP_DAYS};
-    use crate::check::Severity;
+    use crate::check::{Finding, Severity};
+
+    /// Run config validation with the shipped external coaching manifest
+    /// appended, the way a vault load does after #449 (#438).
+    fn config_findings_with_coaching(cfg: &mut VaultConfig) -> Vec<Finding> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packs/coaching/manifest.toml"
+        );
+        let text = std::fs::read_to_string(path).expect("shipped coaching manifest");
+        let manifest =
+            crate::packs::manifest::parse_manifest_external(&text).expect("coaching manifest");
+        let mut manifests = crate::packs::pack_manifests_for_config();
+        manifests.push(&manifest);
+        cfg.config_findings_with(&manifests)
+    }
 
     #[test]
     fn parses_architecture_example() {
@@ -521,7 +528,7 @@ coaching.paid_session_gap_days = 45
 "#,
         )
         .unwrap();
-        assert!(cfg.config_findings().is_empty());
+        assert!(config_findings_with_coaching(&mut cfg).is_empty());
         assert_eq!(cfg.spec, "0.1");
         assert!(cfg.has_pack("coaching@0.1"));
         assert_eq!(
@@ -529,9 +536,7 @@ coaching.paid_session_gap_days = 45
                 .severity("coaching.require_duration", Severity::Warning),
             Some(Severity::Error)
         );
-        assert_eq!(cfg.checks.paid_session_gap_days(), 45);
-        // Default comes from the coaching manifest's [checks] table (#345).
-        assert_eq!(cfg.checks.pps_lookback_days(), 180);
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(45));
         assert_eq!(
             cfg.checks
                 .severity("coaching.session_notes", Severity::Warning),
@@ -571,9 +576,12 @@ unknown_key = true
 "#,
         )
         .unwrap();
-        let findings = cfg.config_findings();
+        let findings = config_findings_with_coaching(&mut cfg);
         assert!(findings.iter().any(|f| f.code.as_str() == "E_CONFIG"));
-        assert_eq!(cfg.checks.paid_session_gap_days(), MAX_GAP_DAYS);
+        assert_eq!(
+            cfg.checks.int("coaching.paid_session_gap_days"),
+            Some(MAX_GAP_DAYS)
+        );
         assert!(findings.iter().any(|f| f.message.contains("warn")));
         assert!(findings.iter().any(|f| f.message.contains("unknown")));
     }
@@ -589,11 +597,11 @@ vault_id = "abc"
         )
         .unwrap();
         assert!(cfg.config_findings().is_empty());
-        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(45));
         assert_eq!(cfg.checks.int("personal.date_upcoming_days"), Some(7));
-        // The accessors read from the same map.
-        assert_eq!(cfg.checks.paid_session_gap_days(), 45);
         assert_eq!(cfg.checks.date_upcoming_days(), 7);
+        // Coaching is external now, so its defaults arrive only with its
+        // manifest (the vault load appends it, #449).
+        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), None);
     }
 
     #[test]
@@ -603,7 +611,7 @@ vault_id = "abc"
 spec = "0.1"
 vault_id = "abc"
 [checks]
-coaching.paid_session_gap_days = 3651
+personal.date_upcoming_days = 3651
 "#,
         )
         .unwrap();
@@ -611,8 +619,8 @@ coaching.paid_session_gap_days = 3651
         assert!(findings
             .iter()
             .any(|f| f.message.contains("exceeds the cap of 3650")));
-        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(3650));
-        assert_eq!(cfg.checks.paid_session_gap_days(), 3650);
+        assert_eq!(cfg.checks.int("personal.date_upcoming_days"), Some(3650));
+        assert_eq!(cfg.checks.date_upcoming_days(), 3650);
     }
 
     #[test]
@@ -662,7 +670,7 @@ bogus.key = 1
 spec = "0.1"
 vault_id = "abc"
 [checks]
-coaching.bogus = 1
+personal.bogus = 1
 "#,
         )
         .unwrap();
@@ -670,7 +678,7 @@ coaching.bogus = 1
         assert!(
             findings
                 .iter()
-                .any(|f| f.message.contains("unknown [checks] key 'coaching.bogus'")),
+                .any(|f| f.message.contains("unknown [checks] key 'personal.bogus'")),
             "expected an unknown-key finding, got {findings:?}"
         );
 
@@ -680,7 +688,7 @@ coaching.bogus = 1
 spec = "0.1"
 vault_id = "abc"
 [checks]
-coaching.paid_session_gap_dayz = 5
+personal.date_upcoming_dayz = 5
 "#,
         )
         .unwrap();
@@ -688,7 +696,7 @@ coaching.paid_session_gap_dayz = 5
         assert!(
             findings.iter().any(|f| f
                 .message
-                .contains("unknown [checks] key 'coaching.paid_session_gap_dayz'")),
+                .contains("unknown [checks] key 'personal.date_upcoming_dayz'")),
             "expected an unknown-key finding, got {findings:?}"
         );
     }
@@ -701,8 +709,8 @@ coaching.paid_session_gap_dayz = 5
             r#"
 spec = "0.1"
 vault_id = "abc"
-[checks.coaching]
-paid_session_gap_days = 10
+[checks.personal]
+date_upcoming_days = 10
 "#,
         )
         .unwrap();
@@ -710,8 +718,8 @@ paid_session_gap_days = 10
             cfg.config_findings().is_empty(),
             "legacy nested table should be accepted"
         );
-        assert_eq!(cfg.checks.int("coaching.paid_session_gap_days"), Some(10));
-        assert_eq!(cfg.checks.paid_session_gap_days(), 10);
+        assert_eq!(cfg.checks.int("personal.date_upcoming_days"), Some(10));
+        assert_eq!(cfg.checks.date_upcoming_days(), 10);
     }
 
     #[test]
@@ -721,7 +729,7 @@ paid_session_gap_days = 10
             r#"
 spec = "0.1"
 vault_id = "abc"
-[checks.coaching]
+[checks.personal]
 "#,
         )
         .unwrap();

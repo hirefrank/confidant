@@ -5,6 +5,10 @@
 //! is fake.
 
 use std::path::{Path, PathBuf};
+
+mod common;
+
+use common::install_shipped_coaching;
 use std::process::{Command, Output};
 
 /// Generate a throwaway age identity, returning the Bech32 secret.
@@ -73,6 +77,7 @@ impl Harness {
             "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n",
         )
         .unwrap();
+        install_shipped_coaching(&vault);
         // Pin the initial branch to `master`: the conflict tests check it
         // out by name, and `git init` alone would follow the machine's
         // `init.defaultBranch` (`main` on most machines) and fail there.

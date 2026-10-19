@@ -21,8 +21,8 @@ pub static SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 /// copy remains the fallback for compiled-in packs.
 pub static PACK_SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/pack-skills");
 
-/// Agent-facing skill text for a compiled pack (`coaching@0.1` reads
-/// `coaching/SKILL.md`). `None` when the pack ships no skill text.
+/// Agent-facing skill text for a compiled-in pack (`personal@0.2` reads
+/// `personal/SKILL.md`). `None` when the pack ships no skill text.
 pub fn pack_skill_text(pack_name: &str) -> Option<&'static str> {
     let dir = pack_name.split('@').next()?;
     PACK_SKILLS
@@ -267,13 +267,11 @@ mod tests {
             names
         }
 
-        let repo_names = skill_pack_names(&repo_packs);
         let vendored_names = skill_pack_names(&vendored);
-        assert_eq!(
-            repo_names, vendored_names,
-            "pack dirs with SKILL.md differ between packs/ and pack-skills/"
-        );
-        for name in &repo_names {
+        // Only compiled-in packs have a vendored copy. The shipped coaching
+        // pack is external since #449 and reads its `SKILL.md` from the
+        // vault, so it is not in this tree.
+        for name in &vendored_names {
             let repo_text = std::fs::read_to_string(repo_packs.join(name).join("SKILL.md"))
                 .unwrap_or_else(|e| panic!("read packs/{name}/SKILL.md: {e}"));
             let vendored_text = std::fs::read_to_string(vendored.join(name).join("SKILL.md"))
@@ -289,11 +287,11 @@ mod tests {
     #[test]
     fn combined_pack_skill_lists_packs_in_scope() {
         let registry = confidant_core::packs::PackRegistry::compiled();
-        let combined = combined_pack_skill(&registry, &["coaching@0.1"], |_| None).unwrap();
-        assert!(combined.contains("Packs in scope: coaching@0.1"));
-        assert!(combined.contains("## coaching@0.1"));
+        let combined = combined_pack_skill(&registry, &["personal@0.2"], |_| None).unwrap();
+        assert!(combined.contains("Packs in scope: personal@0.2"));
+        assert!(combined.contains("## personal@0.2"));
         // The embedded copy is the served copy: spot-check content.
-        assert!(combined.contains("E_OPEN_MALFORMED"));
+        assert!(combined.contains("W_CADENCE_OVERDUE"));
         assert!(combined_pack_skill(&registry, &["nope@9.9"], |_| None).is_none());
         let empty = combined_pack_skill(&registry, &[], |_| None).unwrap();
         assert!(empty.contains("Packs in scope: (none)"));
@@ -304,17 +302,13 @@ mod tests {
     #[test]
     fn combined_pack_skill_labels_labelled_packs_only() {
         let registry = confidant_core::packs::PackRegistry::compiled();
-        let combined = combined_pack_skill(&registry, &["coaching@0.1", "personal@0.2"], |name| {
+        let combined = combined_pack_skill(&registry, &["personal@0.2"], |name| {
             (name == "personal@0.2").then(|| "[external pack: test]".to_owned())
         })
         .unwrap();
         assert!(
             combined.contains("## personal@0.2\n\n[external pack: test]\n"),
             "{combined}"
-        );
-        assert!(
-            !combined.contains("## coaching@0.1\n\n[external pack:"),
-            "a compiled pack must not gain a label: {combined}"
         );
     }
 }

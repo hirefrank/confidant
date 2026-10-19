@@ -1,15 +1,18 @@
-# Pack manifest for coaching@0.1 (spec/pack-manifest.md).
+# Pack manifest for coaching@0.1 (spec/pack-manifest.md, §13.9).
 #
-# Claims only: name, verbs, record types, front-matter fields and their
-# grammars, edge kinds and symmetry, finding codes, verb-to-ID type,
-# [checks] keys and defaults, and skill and finding text.
-# The reducers and date math (fold, findings, check_balance) stay compiled
-# in Rust behind the Pack trait.
+# The coaching pack ships as an external, vendorable pack. Its claims
+# (verbs, metrics, finding codes, [checks] keys, messages) and its rules
+# live here; core owns the rule kinds, the ledger arithmetic and the
+# `ledger-sessions` context view it opts into.
+#
+# Finding codes are pack-own (`E_COACHING_*` / `W_COACHING_*`): PD13
+# refuses a builtin code in an external pack, and omission of an optional
+# `*_code` parameter would fall back to a builtin the loader also refuses.
+# The `[checks]` keys keep the `coaching.*` namespace.
 
-manifest_version = 1
+manifest_version = 2
 
-# Top-level keys come before the first [table] header: in TOML anything
-# after a table header belongs to that table.
+# Top-level keys come before the first [table] header.
 record_types = []
 
 balance_metrics = [
@@ -18,24 +21,27 @@ balance_metrics = [
 ]
 
 finding_codes = [
-  "E_PARSE",
-  "E_BALANCE_MISMATCH",
-  "E_NEGATIVE_BALANCE",
-  "E_OPEN_MALFORMED",
-  "E_INVALID_ID",
-  "E_WRONG_ID_TYPE",
-  "E_MISSING_DURATION",
-  "E_SESSION_TAGS",
-  "W_SESSION_UNTAGGED",
-  "E_UNKNOWN_RECORD",
-  "E_SESSION_WITHOUT_NOTES",
-  "E_PAID_SESSION_GAP",
+  "E_COACHING_PARSE",
+  "E_COACHING_BALANCE_MISMATCH",
+  "E_COACHING_NEGATIVE_BALANCE",
+  "E_COACHING_OPEN_MALFORMED",
+  "E_COACHING_INVALID_ID",
+  "E_COACHING_WRONG_ID_TYPE",
+  "E_COACHING_MISSING_DURATION",
+  "E_COACHING_SESSION_TAGS",
+  "W_COACHING_SESSION_UNTAGGED",
+  "E_COACHING_SESSION_WITHOUT_NOTES",
+  "E_COACHING_PAID_SESSION_GAP",
+  "E_COACHING_NOTE_INVALID_ID",
+  "E_COACHING_NOTE_WRONG_TYPE",
+  "E_COACHING_UNKNOWN_RECORD",
 ]
 
 [pack]
 name = "coaching"
 version = "0.1"
 skill = "SKILL.md"
+requires_spec = ["0.1"]
 
 [[verbs]]
 name = "open"
@@ -45,6 +51,13 @@ id_type = "person"
 name = "session"
 id_type = "person"
 
+# #594/#449: opt in to the core `ledger-sessions` context view. The view's
+# verbs and metrics come from the single `ledger-balance` rule below; the
+# manifest only names the view, core implements it.
+[context]
+view = "ledger-sessions"
+
+[checks]
 [[checks.severity]]
 key = "coaching.require_duration"
 default = "error"
@@ -69,7 +82,60 @@ default = 45
 key = "coaching.pps_lookback_days"
 default = 180
 
-[messages."E_PARSE"]
+# One rule per coaching check: the `note:` integrity check, the balance
+# fold, the per-session checks, and the paid-session gap. `note_ref` is
+# first so its evaluation order matches the old compiled `findings` order
+# (note integrity before the gap rules).
+[[rules]]
+id = "note_ref"
+kind = "note-ref"
+code = "E_COACHING_UNKNOWN_RECORD"
+verb = "session"
+pair = "note"
+variants = "session"
+invalid_code = "E_COACHING_NOTE_INVALID_ID"
+wrong_type_code = "E_COACHING_NOTE_WRONG_TYPE"
+
+[[rules]]
+id = "balance"
+kind = "ledger-balance"
+code = "E_COACHING_BALANCE_MISMATCH"
+severity_key = "coaching.balance_nonnegative"
+open_verb = "open"
+consume_verb = "session"
+units_metric = "sessions_remaining"
+minutes_metric = "icf_hours"
+max_open_n = 100000
+parse_code = "E_COACHING_PARSE"
+negative_code = "E_COACHING_NEGATIVE_BALANCE"
+open_malformed_code = "E_COACHING_OPEN_MALFORMED"
+invalid_code = "E_COACHING_INVALID_ID"
+wrong_type_code = "E_COACHING_WRONG_ID_TYPE"
+
+[[rules]]
+id = "sessions"
+kind = "session-checks"
+code = "E_COACHING_MISSING_DURATION"
+severity_duration_key = "coaching.require_duration"
+severity_notes_key = "coaching.session_notes"
+verb = "session"
+billing_tags = ["paid", "pps", "comp"]
+tags_code = "E_COACHING_SESSION_TAGS"
+untagged_code = "W_COACHING_SESSION_UNTAGGED"
+notes_code = "E_COACHING_SESSION_WITHOUT_NOTES"
+
+[[rules]]
+id = "gap"
+kind = "activity-gap"
+code = "E_COACHING_PAID_SESSION_GAP"
+severity_key = "coaching.paid_session_gap"
+activity_verb = "session"
+start_verb = "open"
+gap_days_key = "coaching.paid_session_gap_days"
+lookback_days_key = "coaching.pps_lookback_days"
+balance_metric = "sessions_remaining"
+
+[messages."E_COACHING_PARSE"]
 missing_number = "balance line is missing a number"
 expected_integer = "expected integer"
 expected_integer_fix = "Use an integer such as 3 for sessions_remaining"
@@ -77,17 +143,17 @@ expected_decimal = "expected decimal"
 expected_decimal_fix = "Use a decimal such as 1.50 for icf_hours"
 minutes_overflow = "session minutes for {id} overflow"
 
-[messages."E_BALANCE_MISMATCH"]
+[messages."E_COACHING_BALANCE_MISMATCH"]
 sessions_remaining = "sessions_remaining asserted {asserted}, computed {computed}"
 sessions_remaining_fix = "Check for a missing 'open' entry or a duplicated 'session' entry for {person}"
 icf_hours = "icf_hours asserted {asserted}, computed {computed}"
 icf_hours_fix = "Check session durations for {person} or correct the assertion"
 
-[messages."E_NEGATIVE_BALANCE"]
+[messages."E_COACHING_NEGATIVE_BALANCE"]
 default = "sessions_remaining for {id} is {remaining}"
 default_fix = "Add an open/renewal or remove extra session lines"
 
-[messages."E_OPEN_MALFORMED"]
+[messages."E_COACHING_OPEN_MALFORMED"]
 shape = "open line must be: DATE open PERSON-ID package PKG-ID N sessions"
 shape_fix = "Example: 2026-10-01 open p-… package pkg-… 6 sessions"
 not_integer = "expected integer"
@@ -96,43 +162,47 @@ exceeds_cap = "open N {n} exceeds the cap of {cap}"
 exceeds_cap_fix = "Use a package size between 1 and {cap}"
 total_overflow = "open total for {id} overflows"
 
-[messages."E_INVALID_ID"]
+[messages."E_COACHING_INVALID_ID"]
 package = "package id is not a record ID"
 package_fix = "Use a pkg-<ULID> package id"
-session_note = "session note is not a record ID"
-session_note_fix = "Point note: at an existing n-<ULID> note"
 
-[messages."E_WRONG_ID_TYPE"]
+[messages."E_COACHING_WRONG_ID_TYPE"]
 package = "package id '{pkg}' must use the pkg- prefix"
-session_note = "session note '{nid}' is not a note id"
-session_note_fix = "Use note:n-<ULID>"
 
-[messages."E_MISSING_DURATION"]
+[messages."E_COACHING_MISSING_DURATION"]
 default = "session for {id} has no parseable duration"
 default_fix = "Add a duration such as 60m or 1h30m"
 
-[messages."E_SESSION_TAGS"]
+[messages."E_COACHING_SESSION_TAGS"]
 default = "session for {id} has more than one of paid, pps, comp"
 default_fix = "Keep exactly one billing tag: paid, pps, or comp"
 
-[messages."W_SESSION_UNTAGGED"]
+[messages."W_COACHING_SESSION_UNTAGGED"]
 default = "session for {id} has no paid, pps, or comp tag"
 default_fix = "Tag the session paid, pps (pay-per-session), or comp (complimentary)"
 
-[messages."E_UNKNOWN_RECORD"]
-missing = "session note '{nid}' does not exist"
-missing_fix = "Point note: at an existing n-<ULID> note"
-wrong_owner = "session note '{nid}' does not belong to {person}"
-wrong_owner_fix = "Point note: at a note for this person"
-
-[messages."E_SESSION_WITHOUT_NOTES"]
+[messages."E_COACHING_SESSION_WITHOUT_NOTES"]
 default = "session on {date} for {person} has no notes"
 default_fix = "Add a note for that person and date, or note:n-<ULID> on the session line"
 
-[messages."E_PAID_SESSION_GAP"]
+[messages."E_COACHING_PAID_SESSION_GAP"]
 none = "paid client {id} has no session logged"
 none_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
 remaining = "paid client {id} has remaining sessions and no session on or after {start} (last was {d})"
 remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
 no_remaining = "paid client {id} has no session on or after {start} (last was {d})"
 no_remaining_fix = "Log a session, close the package, or widen coaching.paid_session_gap_days (currently {days})"
+
+[messages."E_COACHING_NOTE_INVALID_ID"]
+session_note = "session note is not a record ID"
+session_note_fix = "Point note: at an existing n-<ULID> note"
+
+[messages."E_COACHING_NOTE_WRONG_TYPE"]
+session_note = "session note '{nid}' is not a note id"
+session_note_fix = "Use note:n-<ULID>"
+
+[messages."E_COACHING_UNKNOWN_RECORD"]
+missing = "session note '{nid}' does not exist"
+missing_fix = "Point note: at an existing n-<ULID> note"
+wrong_owner = "session note '{nid}' does not belong to {person}"
+wrong_owner_fix = "Point note: at a note for this person"
