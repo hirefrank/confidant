@@ -72,7 +72,7 @@ export `CONFIDANT_VAULT` in that process or pass `--vault`; do not rely on
 The TUI is a layer on top of the Confidant project: it inherits the
 project's trust story rather than having a separate one. The milestone 2
 encryption has had no outside review — see the
-[Status section](https://github.com/hirefrank/confidant#status-not-yet-audited)
+[Status section](https://github.com/hirefrank/confidant#security-status-no-independent-audit-yet)
 of the main repository README (tracked in
 [#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
 other people's client data in a vault until the audit lands.

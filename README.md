@@ -388,8 +388,11 @@ what the provider stores.
 `find`, `context`, the allowlist, and the search corpus, while `context`
 still serves derived ledger metadata and the flag itself is visible in the
 envelope header. A stolen unlocked device defeats every guarantee. See
-[`docs/privacy.md`](docs/privacy.md) and
-[`docs/threat-model-agents.md`](docs/threat-model-agents.md).
+[`docs/privacy.md`](docs/privacy.md),
+[`docs/threat-model-agents.md`](docs/threat-model-agents.md), and
+[`docs/crypto-design.md`](docs/crypto-design.md). The encryption has not
+been independently audited; see
+[Security status](#security-status-no-independent-audit-yet).
 
 `confidant doctor` checks GitHub for the latest release and reports skills
 link health. The release check is one unauthenticated `GET` to
@@ -416,16 +419,34 @@ The roadmap is the open issues on GitHub. The current themes:
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
 - **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), safe `init --force` ([#640](https://github.com/hirefrank/confidant/issues/640)), a reset path for local state ([#638](https://github.com/hirefrank/confidant/issues/638)).
 
-## Status: not yet audited
+## Security status: no independent audit yet
 
-**The encryption has had no outside review.** The design was reviewed
-in-project and the tests pass, but no independent reviewer has audited it.
-Tracked in [#138](https://github.com/hirefrank/confidant/issues/138).
+Confidant's encryption hasn't been reviewed by an independent auditor. No
+audit is scheduled. One will happen if someone sponsors it. If you'd like to
+sponsor or arrange one, comment on
+[#138](https://github.com/hirefrank/confidant/issues/138).
 
-So, today: **keep vaults on trusted devices with encrypted disks, and do
-not put other people's sensitive data in them.** `check`, the privacy
-allowlist, and `no-ai` work, but they are not a substitute for the outside
-audit. This section will say plainly when the audit lands.
+What is in place: the project follows the
+[OSTIF / LeastAuthority security best-practices guide](https://github.com/ostif-org/best-practices-guide).
+That means a private reporting channel ([SECURITY.md](SECURITY.md)), and CI
+that runs `cargo deny`, `cargo audit` and CodeQL on every change. It also
+means no `unsafe` code in the crypto crate, fuzz targets for the parsers,
+and attested release builds. The design is written down so you can judge it
+yourself:
+
+- [`docs/crypto-design.md`](docs/crypto-design.md): key hierarchy,
+  envelopes, recovery and shredding, plus the in-project review history
+- [`docs/threat-model-agents.md`](docs/threat-model-agents.md): what
+  Confidant does and doesn't protect against when agents read your vault
+- [`docs/privacy.md`](docs/privacy.md): what stays plaintext, what `no-ai`
+  does, and what reaches a model provider
+- [`spec/0.1.md`](spec/0.1.md) §14: the normative envelope format
+
+Until an independent review happens, keep vaults on trusted devices with
+encrypted disks, and use your own judgment before storing other people's
+sensitive data. `check`, the privacy allowlist and `no-ai` are working
+controls, but they don't replace an independent review. This section will
+be updated if an audit takes place.
 
 ## License
 
