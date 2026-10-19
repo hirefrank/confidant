@@ -7,7 +7,7 @@
 //! resolves to a `record`/`note` edit on `e`.
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
@@ -114,7 +114,7 @@ fn body_lines(body: Option<&str>, indent: &'static str) -> Vec<Line<'static>> {
     if paragraphs.len() > MAX_BODY_LINES {
         lines.push(Line::from(vec![
             Span::raw(indent),
-            Span::styled("…", Style::default().fg(palette::MUTED)),
+            Span::styled("…", theme::muted()),
         ]));
     }
     lines
@@ -133,10 +133,7 @@ fn note_block(note: &NoteView, marker: bool) -> Vec<Line<'static>> {
         lead.push(badge);
         lead.push(Span::raw(" "));
     }
-    lead.push(Span::styled(
-        note.id.clone(),
-        Style::default().fg(palette::MUTED),
-    ));
+    lead.push(Span::styled(note.id.clone(), theme::muted()));
     let mut lines = vec![Line::from(lead)];
     lines.extend(body_lines(note.body.as_deref(), "    "));
     lines
@@ -172,11 +169,11 @@ fn render_with_title(state: &ContextViewState, title: &str, frame: &mut Frame<'_
         let line = match id {
             Some(id) => Line::from(vec![
                 Span::raw(format!("No context loaded for {id} ")),
-                Span::styled("(press r to reload)", Style::default().fg(palette::MUTED)),
+                Span::styled("(press r to reload)", theme::muted()),
             ]),
             None => Line::from(Span::styled(
                 "No person selected. Choose someone in People or press Enter on a p-… item.",
-                Style::default().fg(palette::MUTED),
+                theme::muted(),
             )),
         };
         frame.render_widget(Paragraph::new(line).block(block), area);
@@ -255,7 +252,7 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
 
     lines.push(Line::from(Span::styled(
         format!("notes ({})", ctx.notes.len()),
-        Style::default().fg(palette::MUTED).bold(),
+        theme::muted().bold(),
     )));
     for (index, n) in ctx.notes.iter().enumerate() {
         // Target 0 is the person; notes start at 1.
@@ -264,7 +261,7 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
 
     lines.push(Line::from(Span::styled(
         format!("interactions ({})", ctx.interactions.len()),
-        Style::default().fg(palette::MUTED).bold(),
+        theme::muted().bold(),
     )));
     let interactions_start = 1 + ctx.notes.len();
     for (index, ixn) in ctx.interactions.iter().enumerate() {
@@ -279,24 +276,21 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
         }
         title.push(Span::styled(
             ixn.title.clone().unwrap_or_else(|| "-".to_owned()),
-            Style::default().fg(Color::White).bold(),
+            Style::default().fg(palette::TEXT).bold(),
         ));
         if let Some(badge) = no_ai_badge(ixn.no_ai) {
             title.push(Span::raw(" "));
             title.push(badge);
         }
         title.push(Span::raw(" "));
-        title.push(Span::styled(
-            ixn.id.clone(),
-            Style::default().fg(palette::MUTED),
-        ));
+        title.push(Span::styled(ixn.id.clone(), theme::muted()));
         lines.push(Line::from(title));
         lines.extend(body_lines(ixn.body.as_deref(), "    "));
     }
 
     lines.push(Line::from(Span::styled(
         format!("touchpoints ({})", ctx.touchpoints.len()),
-        Style::default().fg(palette::MUTED).bold(),
+        theme::muted().bold(),
     )));
     for tp in &ctx.touchpoints {
         lines.push(Line::from(vec![
@@ -307,17 +301,14 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("aliases ({}) ", ctx.aliases.len()),
-            Style::default().fg(palette::MUTED),
-        ),
+        Span::styled(format!("aliases ({}) ", ctx.aliases.len()), theme::muted()),
         Span::styled(
             if ctx.aliases.is_empty() {
                 "-".to_owned()
             } else {
                 ctx.aliases.join(", ")
             },
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ),
     ]));
 

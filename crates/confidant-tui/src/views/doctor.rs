@@ -1,7 +1,7 @@
 //! Read-only Doctor view (`confidant doctor --json --no-input`).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -43,10 +43,7 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
     let summary_line = match &state.report {
         None => Line::from(vec![
             Span::raw("No doctor report loaded "),
-            Span::styled(
-                "(press r to run doctor)",
-                Style::default().fg(palette::MUTED),
-            ),
+            Span::styled("(press r to run doctor)", theme::muted()),
         ]),
         Some(r) => {
             let overall = state
@@ -56,7 +53,7 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
             spans.extend(theme::count(
                 "checks ",
                 r.checks.len(),
-                Style::default().fg(Color::White).bold(),
+                Style::default().fg(palette::TEXT).bold(),
             ));
             Line::from(spans)
         }
@@ -69,14 +66,15 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
     match &state.report {
         None => {
             frame.render_widget(
-                Paragraph::new(Line::from("Press r to run doctor.".dark_gray()))
+                Paragraph::new(Line::from("Press r to run doctor.".fg(palette::MUTED)))
                     .block(theme::block(" Checks ")),
                 chunks[1],
             );
         }
         Some(r) if r.checks.is_empty() => {
             frame.render_widget(
-                Paragraph::new(Line::from("0 checks".dark_gray())).block(theme::block(" Checks ")),
+                Paragraph::new(Line::from("0 checks".fg(palette::MUTED)))
+                    .block(theme::block(" Checks ")),
                 chunks[1],
             );
         }
@@ -88,7 +86,7 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
                     ListItem::new(Line::from(vec![
                         status_tag(&c.status),
                         Span::raw(" "),
-                        Span::styled(c.id.clone(), Color::White),
+                        Span::styled(c.id.clone(), palette::TEXT),
                         Span::raw(" "),
                         Span::raw(c.message.clone()),
                     ]))
@@ -113,11 +111,11 @@ pub fn render(state: &DoctorViewState, frame: &mut Frame<'_>, area: Rect) {
         .as_ref()
         .and_then(|r| r.checks.get(state.selected))
     {
-        None => vec![Line::from("No check selected.".dark_gray())],
+        None => vec![Line::from("No check selected.".fg(palette::MUTED))],
         Some(c) => vec![
             Line::from(vec![
                 theme::label("id      "),
-                Span::styled(c.id.clone(), Color::White),
+                Span::styled(c.id.clone(), palette::TEXT),
             ]),
             Line::from(vec![theme::label("status  "), status_tag(&c.status)]),
             Line::from(vec![theme::label("message "), Span::raw(c.message.clone())]),

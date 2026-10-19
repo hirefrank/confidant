@@ -7,7 +7,7 @@
 //! to disk, never logs it, and its `Debug` impl redacts it.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -106,7 +106,7 @@ pub fn render(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
     let header = match (state.loaded, state.entries.len()) {
         (false, _) => Line::from(Span::styled(
             "Press r to load conflicted records",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         )),
         (true, 0) => Line::from(vec![
             theme::label("Conflicts "),
@@ -129,14 +129,14 @@ pub fn render(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
     if state.loaded {
         if state.entries.is_empty() {
             list_items.push(ListItem::new(Line::from(
-                "No conflicted records — the vault is clean.".dark_gray(),
+                "No conflicted records — the vault is clean.".fg(palette::MUTED),
             )));
         } else {
             for e in &state.entries {
                 list_items.push(ListItem::new(Line::from(vec![
                     Span::styled(e.id.clone(), Style::default().fg(palette::ACCENT)),
                     Span::raw(" "),
-                    Span::styled(e.message.clone(), Color::White),
+                    Span::styled(e.message.clone(), palette::TEXT),
                 ])));
             }
         }
@@ -154,7 +154,7 @@ pub fn render(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
         list_items.push(ListItem::new(Line::from("")));
         list_items.push(ListItem::new(Line::from(Span::styled(
             "Enter: show both sides   r: refresh",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ))));
     }
 
@@ -178,7 +178,8 @@ pub fn render(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
 pub fn render_detail(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
     let Some(detail) = &state.detail else {
         frame.render_widget(
-            Paragraph::new(Line::from("Loading…".dark_gray())).block(theme::block(" Conflicts ")),
+            Paragraph::new(Line::from("Loading…".fg(palette::MUTED)))
+                .block(theme::block(" Conflicts ")),
             area,
         );
         return;

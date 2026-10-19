@@ -6,7 +6,7 @@
 //! selection here (deferred to #217).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -31,9 +31,9 @@ fn item_line<'a>(name: &'a str, kind: &'a str, target: &'a str, action: Span<'a>
     Line::from(vec![
         Span::styled(name, Style::default().fg(palette::ACCENT)),
         Span::raw(" "),
-        Span::styled(format!("[{kind}]"), Style::default().fg(palette::MUTED)),
+        Span::styled(format!("[{kind}]"), theme::muted()),
         Span::raw(" "),
-        Span::styled(target, Color::White),
+        Span::styled(target, palette::TEXT),
         Span::raw(" "),
         action,
     ])
@@ -42,9 +42,9 @@ fn item_line<'a>(name: &'a str, kind: &'a str, target: &'a str, action: Span<'a>
 fn action_span(action: &str) -> Span<'static> {
     let style = match action {
         "merge" => Style::default().fg(palette::SUCCESS).bold(),
-        "skip" => Style::default().fg(palette::MUTED),
+        "skip" => theme::muted(),
         "deferred" => Style::default().fg(palette::WARNING),
-        _ => Style::default().fg(palette::MUTED),
+        _ => theme::muted(),
     };
     Span::styled(format!("({action})"), style)
 }
@@ -53,7 +53,7 @@ fn action_span(action: &str) -> Span<'static> {
 fn section_header(title: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!("── {title} ──"),
-        Style::default().fg(palette::MUTED),
+        theme::muted(),
     )))
 }
 
@@ -67,11 +67,11 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
     let header = match &state.report {
         Some(r) if r.empty => Line::from(Span::styled(
             "Inbox: nothing to do (no inbox branch)",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         )),
         Some(r) => Line::from(vec![
             theme::label("dry run "),
-            Span::styled(r.branch.clone(), Color::White),
+            Span::styled(r.branch.clone(), palette::TEXT),
             theme::label("  •  to merge "),
             Span::styled(
                 r.merged.to_string(),
@@ -83,10 +83,7 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
                 Style::default().fg(palette::WARNING).bold(),
             ),
         ]),
-        None => Line::from(Span::styled(
-            "Press r to load the dry run",
-            Style::default().fg(palette::MUTED),
-        )),
+        None => Line::from(Span::styled("Press r to load the dry run", theme::muted())),
     };
     frame.render_widget(
         Paragraph::new(header).block(theme::block(" Inbox ")),
@@ -95,8 +92,10 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
 
     let Some(report) = &state.report else {
         frame.render_widget(
-            Paragraph::new(Line::from("No dry-run report loaded yet.".dark_gray()))
-                .block(theme::block("")),
+            Paragraph::new(Line::from(
+                "No dry-run report loaded yet.".fg(palette::MUTED),
+            ))
+            .block(theme::block("")),
             chunks[1],
         );
         return;
@@ -105,7 +104,7 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
     if report.empty {
         frame.render_widget(
             Paragraph::new(Line::from(
-                "No inbox branch in this vault — nothing to merge.".dark_gray(),
+                "No inbox branch in this vault — nothing to merge.".fg(palette::MUTED),
             ))
             .block(theme::block("")),
             chunks[1],
@@ -117,7 +116,7 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
 
     list_items.push(section_header(&format!("Items ({})", report.items.len())));
     if report.items.is_empty() {
-        list_items.push(ListItem::new(Line::from("(none)".dark_gray())));
+        list_items.push(ListItem::new(Line::from("(none)".fg(palette::MUTED))));
     } else {
         for i in &report.items {
             list_items.push(ListItem::new(item_line(
@@ -176,7 +175,7 @@ pub fn render(state: &InboxViewState, frame: &mut Frame<'_>, area: Rect) {
         list_items.push(ListItem::new(Line::from("")));
         list_items.push(ListItem::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ))));
     }
 

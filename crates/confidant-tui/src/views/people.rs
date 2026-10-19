@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -164,18 +164,18 @@ fn render_left(
     let filter_line = if state.editing_filter {
         Line::from(vec![
             theme::label("filter "),
-            Span::styled(format!("{}_", state.filter), Color::White),
+            Span::styled(format!("{}_", state.filter), palette::TEXT),
         ])
     } else if state.filter.trim().is_empty() {
         Line::from(Span::styled(
             "press / to filter by name or id",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ))
     } else {
         Line::from(vec![
             theme::label("filter "),
-            Span::styled(state.filter.clone(), Color::White),
-            Span::styled("  (Esc clears)", Style::default().fg(palette::MUTED)),
+            Span::styled(state.filter.clone(), palette::TEXT),
+            Span::styled("  (Esc clears)", theme::muted()),
         ])
     };
     frame.render_widget(
@@ -202,7 +202,7 @@ fn render_left(
     };
     items.push(ListItem::new(Line::from(Span::styled(
         attention_header,
-        Style::default().fg(palette::MUTED).bold(),
+        theme::muted().bold(),
     ))));
     if report.is_none() {
         // No cached check report: never render the empty-state all-clear.
@@ -214,7 +214,7 @@ fn render_left(
     } else if nudges.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "Nothing needs attention.",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ))));
     } else {
         for (index, nudge) in nudges.iter().enumerate() {
@@ -227,7 +227,7 @@ fn render_left(
 
     items.push(ListItem::new(Line::from(Span::styled(
         format!("People ({})", people.len()),
-        Style::default().fg(palette::MUTED).bold(),
+        theme::muted().bold(),
     ))));
     if state.roster.is_none() {
         let text = state
@@ -241,7 +241,7 @@ fn render_left(
     } else if people.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
             "No people match the filter.",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         ))));
     } else {
         for (index, entry) in people.iter().enumerate() {
@@ -270,23 +270,20 @@ fn nudge_row<'a>(nudge: &'a Nudge, roster: Option<&Roster>) -> ListItem<'a> {
     let style = match nudge.severity.as_str() {
         "error" => Style::default().fg(palette::ERROR).bold(),
         "warning" => Style::default().fg(palette::WARNING).bold(),
-        _ => Style::default().fg(palette::MUTED),
+        _ => theme::muted(),
     };
     ListItem::new(vec![
         Line::from(vec![
             Span::styled(nudge.code.clone(), style),
             Span::raw(" "),
-            Span::styled(name.to_owned(), Color::White),
+            Span::styled(name.to_owned(), palette::TEXT),
         ]),
-        Line::from(Span::styled(
-            format!("  {}", nudge.message),
-            Style::default().fg(palette::MUTED),
-        )),
+        Line::from(Span::styled(format!("  {}", nudge.message), theme::muted())),
     ])
 }
 
 fn person_row(entry: &RosterEntry) -> ListItem<'_> {
-    let mut spans = vec![Span::styled(entry.name.clone(), Color::White)];
+    let mut spans = vec![Span::styled(entry.name.clone(), palette::TEXT)];
     if let Some(badge) = entry.no_ai.badge() {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -296,10 +293,7 @@ fn person_row(entry: &RosterEntry) -> ListItem<'_> {
     }
     if entry.name != entry.id {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            entry.id.clone(),
-            Style::default().fg(palette::MUTED),
-        ));
+        spans.push(Span::styled(entry.id.clone(), theme::muted()));
     }
     ListItem::new(Line::from(spans))
 }
@@ -309,7 +303,7 @@ pub fn render_empty(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "No person selected. Load a roster or choose someone on the left.",
-            Style::default().fg(palette::MUTED),
+            theme::muted(),
         )))
         .block(theme::block(" Context "))
         .wrap(Wrap { trim: false }),
