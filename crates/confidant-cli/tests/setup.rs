@@ -1399,3 +1399,104 @@ fn setup_auto_with_detected_agent_does_not_warn() {
     );
     assert!(cursor.join("portal-sync").is_symlink());
 }
+
+// ---------------------------------------------------------------------------
+// #668: `update --dry-run` writes nothing and does not run the upgrade.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_dry_run_writes_nothing() {
+    let env = fresh_env();
+    let r = run_no_override(
+        &["update", "--agent", "all", "--dry-run", "--json"],
+        &env,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    let v: Value = serde_json::from_str(&r.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["update"]["status"], "disabled", "{v}");
+
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude: {v}"
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".agents").exists(),
+        "dry run created ~/.agents: {v}"
+    );
+    assert!(
+        !std::path::Path::new(&env.share).join("skills").exists(),
+        "dry run materialized the skills tree: {v}"
+    );
+}
+
+#[test]
+fn update_dry_run_human_reports_planned_relink() {
+    let env = fresh_env();
+    let r = run_no_override(
+        &["update", "--agent", "all", "--dry-run"],
+        &env,
+        &[("CONFIDANT_OFFLINE", "1")],
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("would re-link 40 skills"),
+        "planned relink not reported:\n{}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("re-linked"),
+        "past-tense wording under --dry-run:\n{}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&env.home).join(".claude").exists(),
+        "dry run created ~/.claude:\n{}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&env.share).join("skills").exists(),
+        "dry run materialized the skills tree:\n{}",
+        r.stdout
+    );
+}
+
+#[cfg(all(feature = "test-overrides", not(windows)))]
+#[test]
+fn update_behind_dry_run_prints_command_without_offering() {
+    // #668: behind + `--dry-run` prints the command it would run, never
+    // prompts for it, and never records/executes it.
+    let port = stub_release_server("v999.0.0");
+    let env = fresh_env();
+    let recorder = recorder_path(&env);
+    let url = format!("http://127.0.0.1:{port}/");
+    let r = run_raw(
+        &["update", "--agent", "all", "--dry-run"],
+        &env,
+        &[
+            ("CONFIDANT_TEST_RELEASES_URL", url.as_str()),
+            (
+                "CONFIDANT_TEST_EXE_PATH",
+                "/home/tester/.cargo/bin/confidant",
+            ),
+            ("CONFIDANT_TEST_FORCE_INTERACTIVE", "1"),
+            ("CONFIDANT_TEST_PROMPT_ANSWERS", "y"),
+            (
+                "CONFIDANT_TEST_COMMAND_RECORDER",
+                recorder.to_str().unwrap(),
+            ),
+        ],
+        &[],
+        false,
+    );
+    assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("would run `cargo install confidant-cli`"),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stderr.contains("[y/N]"), "{}", r.stderr);
+    assert!(!recorder.exists(), "dry run executed the upgrade command");
+}

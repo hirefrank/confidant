@@ -9561,7 +9561,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             print_json(&ok_envelope(None, value))?;
             return Ok(ExitCode::SUCCESS);
         }
-        let result = setup::run_setup(agent, force, false, false)?;
+        let result = setup::run_setup(agent, force, false, cli.dry_run)?;
         let mut value = setup_result_json(&result);
         if let Value::Object(ref mut obj) = value {
             obj.insert("update".to_owned(), update_info);
@@ -9579,26 +9579,36 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     // Never re-link from a behind binary: the installed
                     // skills would be stale on arrival. Print the single
                     // command that fits this install; in an interactive
-                    // terminal, offer to run it (default No).
+                    // terminal, offer to run it (default No). `--dry-run`
+                    // prints the command and never offers or runs it (#668).
                     if let (Some(cmd), Some((program, args))) =
                         (method.update_command(), method.run_spec())
                     {
-                        println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
-                        if offerable_update(method, true)
-                            && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
-                        {
-                            match run_offered_command(cmd, program, args) {
-                                Ok(()) => {
-                                    println!("updated via `{cmd}`.");
-                                    if confirm_yn(
-                                        "run `confidant setup` now?",
-                                        cli.no_input,
-                                        cli.json,
-                                    )? {
-                                        return relink_after_update(agent, force, verbose);
+                        if cli.dry_run {
+                            println!("confidant {local} is behind the latest release {tag}; would run `{cmd}`, then re-run `confidant setup`.");
+                        } else {
+                            println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
+                            if offerable_update(method, true)
+                                && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
+                            {
+                                match run_offered_command(cmd, program, args) {
+                                    Ok(()) => {
+                                        println!("updated via `{cmd}`.");
+                                        if confirm_yn(
+                                            "run `confidant setup` now?",
+                                            cli.no_input,
+                                            cli.json,
+                                        )? {
+                                            return relink_after_update(
+                                                agent,
+                                                force,
+                                                verbose,
+                                                cli.dry_run,
+                                            );
+                                        }
                                     }
+                                    Err(err) => eprintln!("update failed: {err:#}"),
                                 }
-                                Err(err) => eprintln!("update failed: {err:#}"),
                             }
                         }
                     } else {
@@ -9608,18 +9618,28 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                if cli.dry_run {
+                    println!("confidant {local} is current (latest: {tag}). Would re-link skills…");
+                } else {
+                    println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                }
             }
         }
     }
-    relink_after_update(agent, force, verbose)
+    relink_after_update(agent, force, verbose, cli.dry_run)
 }
 
 /// Shared tail of `update`: re-link skills from this binary and report.
 /// `force` is the operator's own flag: owned entries are re-pointed
-/// regardless, unowned entries need it.
-fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
-    let result = setup::run_setup(agent, force, false, false)?;
+/// regardless, unowned entries need it. `dry_run` (#668) plans the relink
+/// and writes nothing.
+fn relink_after_update(
+    agent: &str,
+    force: bool,
+    verbose: bool,
+    dry_run: bool,
+) -> anyhow::Result<ExitCode> {
+    let result = setup::run_setup(agent, force, false, dry_run)?;
     if verbose {
         for line in &result.verbose_lines {
             println!("{line}");
@@ -9628,11 +9648,19 @@ fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Resul
     for unknown in &result.unknown_agents {
         eprintln!("warning: unknown agent '{unknown}' — skipped");
     }
-    println!(
-        "re-linked {} skills → {}",
-        result.linked_count(),
-        result.agent_labels().join(", ")
-    );
+    if dry_run {
+        println!(
+            "would re-link {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    } else {
+        println!(
+            "re-linked {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
