@@ -19,13 +19,13 @@ tmp=$(mktemp -d)
 ./target/release/confidant bench-gen "$tmp" --people 400 --notes 5
 hyperfine --warmup 3 --runs 10 \
   "./target/release/confidant find zxqvUniqueTokenAda0 --vault $tmp --json --no-input" \
-  "./target/release/confidant find coaching-practice --vault $tmp --json --no-input" \
+  "./target/release/confidant find benchmark-common --vault $tmp --json --no-input" \
   "./target/release/confidant check --vault $tmp --json --no-input"
 cjk=$(mktemp -d)
 ./target/release/confidant bench-gen "$cjk" --people 400 --notes 5 --cjk
 hyperfine --warmup 3 --runs 10 \
   "./target/release/confidant find zxqvUniqueTokenAda0 --vault $cjk --json --no-input" \
-  "./target/release/confidant find coaching-practice --vault $cjk --json --no-input"
+  "./target/release/confidant find benchmark-common --vault $cjk --json --no-input"
 ```
 
 `--cjk` fills note bodies with no-space CJK prose (an embedded dash, no
@@ -61,13 +61,15 @@ both the English and `--cjk` vaults.
 Hardware: Intel Xeon (4 logical CPUs), Linux 6.12, `confidant` release
 build (`rustc 1.99.0`). Hyperfine 2.0.0, **3 warmup runs, 10 timed runs**.
 Spread is mean ± one standard deviation; min and max are the observed range.
+These runs used an earlier generated corpus whose common token differed;
+that token only selects every record, so its label does not change counts.
 
 English filler:
 
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
 | `find zxqvUniqueTokenAda0` (one profile) | 1 | **160.3 ms** | 2.4 ms | 156.4 ms | 163.3 ms |
-| `find coaching-practice` (every record) | 2,400 | **161.1 ms** | 1.9 ms | 158.9 ms | 163.8 ms |
+| `find benchmark-common` (every record) | 2,400 | **161.1 ms** | 1.9 ms | 158.9 ms | 163.8 ms |
 | `check` | 0 findings | **98.3 ms** | 14.1 ms | 91.7 ms | 137.7 ms |
 
 `--cjk` (no-space CJK note bodies):
@@ -75,7 +77,7 @@ English filler:
 | Command | Hits / findings | Mean | σ | Min | Max |
 |---|---:|---:|---:|---:|---:|
 | `find zxqvUniqueTokenAda0` | 1 | **243.6 ms** | 3.2 ms | 239.6 ms | 250.6 ms |
-| `find coaching-practice` | 2,400 | **257.1 ms** | 22.3 ms | 244.0 ms | 319.4 ms |
+| `find benchmark-common` | 2,400 | **257.1 ms** | 22.3 ms | 244.0 ms | 319.4 ms |
 | `check` | 0 findings | **99.6 ms** | 2.5 ms | 97.0 ms | 104.5 ms |
 
 Peak RSS was about 33–46 MiB (check ~33–35 MiB, find ~44–46 MiB).
@@ -97,7 +99,7 @@ each cell is min / median / max over 10–15 `date`-timed runs after
 | Command | Hits | Min | Median | Max |
 |---|---:|---:|---:|---:|
 | `find zxqvUniqueTokenAda0` (English) | 1 | 107 ms | 110 ms | 115 ms |
-| `find coaching-practice --limit 2500` (English) | 2,400 | 111 ms | 113 ms | 117 ms |
+| `find benchmark-common --limit 2500` (English) | 2,400 | 111 ms | 113 ms | 117 ms |
 | `check` (English vault) | 0 findings | 58 ms | 60 ms | 62 ms |
 | `find zxqvUniqueTokenAda0` (`--cjk` vault) | 1 | 173 ms | 177 ms | 181 ms |
 
@@ -152,7 +154,7 @@ tmp=$(mktemp -d)
 ./target/release/confidant bench-gen "$tmp" --people 400 --notes 5 --encrypted --touch
 export HOME=$(cat "$tmp/.bench-home-path")
 export CONFIDANT_DEVICE_KEY=$(cat "$tmp/.bench-device-key")
-./target/release/confidant find coaching-practice --vault "$tmp" --json --no-input
+./target/release/confidant find benchmark-common --vault "$tmp" --json --no-input
 ./target/release/confidant check --vault "$tmp" --json --no-input
 ```
 
@@ -162,7 +164,7 @@ hyperfine on this machine: each cell is mean ± stdev over 5 timed runs
 after warmups. `find` uses the default `--limit 50` (truncates
 printing, not scanning — scan work is identical).
 
-| Vault | Ledger entries | `find coaching-practice` | `check` |
+| Vault | Ledger entries | `find benchmark-common` | `check` |
 |---|---|---:|---:|
 | plaintext | 10,320 | 180.0 ± 14.0 ms | 62.0 ± 3.4 ms |
 | plaintext + touch | 50,320 | 338.2 ± 13.4 ms | 124.5 ± 7.9 ms |

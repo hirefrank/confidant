@@ -162,11 +162,11 @@ the loader rejects a negative one.
 
 `balance_metrics` is an array of metric-name strings — the metrics the
 pack's compiled fold computes and `check_balance` verifies (today's
-`Pack::balance_metrics`; e.g. coaching's `sessions_remaining` and
-`icf_hours`, personal's empty list). Each name must be a non-empty,
-unique string; the loader rejects duplicates. There is no separate
-drift check: the fold stays compiled, so step 4's parity test pins the
-manifest's list against the old slices, and the drift test only
+`Pack::balance_metrics`): a session-tracking pack's remaining units and
+hours, or the built-in personal pack's empty list. Each name must be a
+non-empty, unique string; the loader rejects duplicates. There is no
+separate drift check: the fold stays compiled, so step 4's parity test pins
+the manifest's list against the old slices, and the drift test only
 asserts well-formedness.
 
 ## 5. Versioning
@@ -476,8 +476,7 @@ an error.
 Every kind-specific `*_code` parameter is **required** and names a code
 the pack declares in `finding_codes` (a compiled-in pack may also name a
 live core code, §13.7). There are no fallback defaults: a missing
-parameter, or a value on the retired list in `spec/findings.md`, is
-`E_PACK_INVALID` at load.
+parameter, or a retired name, is `E_PACK_INVALID` at load.
 
 **The fixed kind list.** This spec starts the list empty. Each kind's
 own issue appends its section with the parameter table:
@@ -486,10 +485,10 @@ own issue appends its section with the parameter table:
 |---|---|---|
 | `cadence-overdue` | #442 | the built-in personal pack's keep-in-touch rule |
 | `date-upcoming` | #443 | the built-in personal pack's upcoming-dates rule |
-| `note-ref` | #458 | the built-in personal pack's `touch` note check and `coaching@0.1`'s `session` note check |
-| `ledger-balance` | #446 | `coaching@0.1`'s `sessions_remaining` / `icf_hours` fold and `balance` checks |
-| `session-checks` | #447 | `coaching@0.1`'s per-session duration, billing-tag and notes checks |
-| `activity-gap` | #448 | `coaching@0.1`'s paid-session gap rule |
+| `note-ref` | #458 | the built-in personal pack's `touch` note check and a pack's session-note check |
+| `ledger-balance` | #446 | a pack's balance fold and `balance` checks |
+| `session-checks` | #447 | a pack's per-entry duration, tag and notes checks |
+| `activity-gap` | #448 | a pack's inactivity-gap rule |
 
 #### Kind `cadence-overdue` (#442)
 
@@ -616,7 +615,8 @@ outside the window and emits nothing.
 Check the integrity of a `note:<id>` pair on a pack's ledger verb: the id
 must parse as a record id, must be a note id, must exist, and must belong
 to the entry's canonical person. Reproduces the built-in personal pack's
-`touch_note_integrity` and `coaching@0.1`'s `session_note_integrity`.
+`touch_note_integrity` and a session-tracking pack's equivalent session-note
+check.
 Only ids and path ownership are read — never note bodies, never `no-ai`
 content (PD8).
 
@@ -628,7 +628,7 @@ one is refused at load.
 |---|---|---|
 | `verb` | string, non-empty | The ledger verb whose entries are checked. |
 | `pair` | string, non-empty | The key of the pair holding the note id (today `"note"`). |
-| `variants` | string, optional | `"touch"` (default) or `"session"`: which variant names the invalid-id and wrong-type messages use (`default`/`default_fix` for personal, `session_note`/`session_note_fix` for coaching). The `missing`/`wrong_owner` variants are the same in both. |
+| `variants` | string, optional | `"touch"` (default) or `"session"`: which variant names the invalid-id and wrong-type messages use (`default`/`default_fix` for a touch verb, `session_note`/`session_note_fix` for a session verb). The `missing`/`wrong_owner` variants are the same in both. |
 | `invalid_code` | string | The code for an id that does not parse. Required; must be a code the pack declares. |
 | `wrong_type_code` | string | The code for a parsed id that is not a note id. Required; must be a code the pack declares. |
 
@@ -639,7 +639,7 @@ message tables in the manifest; a pack-own code must also be declared in
 codes use the `E_` prefix. An external pack cannot claim a builtin code
 (PD13), so it sets `invalid_code` and `wrong_type_code` to codes it
 declares. A compiled-in pack may name a live core code, but it must still
-set both explicitly. A retired name (`spec/findings.md`) is refused for
+set both explicitly. A retired name is refused for
 every origin.
 
 Message variants the pack's tables must declare:
@@ -686,9 +686,9 @@ wrong_type_code = "E_EXAMPLE_NOTE_BAD_TYPE"
 
 Keep a running count of units a person opened, less the units their
 consuming ledger entries used, and verify `balance` assertions against it.
-Reproduces `coaching@0.1`'s fold for `sessions_remaining` and `icf_hours`,
-including its merge semantics: opens and sessions from every merged member
-accumulate into the canonical person's balance.
+Reproduces the fold shape a session-tracking pack needs (remaining units
+and hours), including its merge semantics: opens and consuming entries from
+every merged member accumulate into the canonical person's balance.
 
 The kind **manages its own severity**: it always runs (a `balance` line
 must not silently stop being verified), and `severity_key` is the severity
@@ -700,8 +700,8 @@ checking. Every other finding is a fixed `error`.
 |---|---|---|
 | `open_verb` | string, non-empty | The ledger verb that adds units: `DATE <open_verb> <person-id> package <pkg-id> <N> sessions`. |
 | `consume_verb` | string, non-empty, different from `open_verb` | The ledger verb that consumes a unit. An entry consumes unless it is tagged `pps` or `comp`; an untagged entry consumes too, so a balance cannot silently drop a session. |
-| `units_metric` | string | The declared `balance_metrics` entry holding the integer unit count (today `sessions_remaining`). |
-| `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (today `icf_hours`). |
+| `units_metric` | string | The declared `balance_metrics` entry holding the integer unit count (for example `units_remaining`). |
+| `minutes_metric` | string, different from `units_metric` | The declared `balance_metrics` entry holding decimal hours computed from session durations (for example `hours_logged`). |
 | `max_open_n` | integer > 0 | Cap for one `open` line (today `100000`). A larger `N` is refused and not counted. |
 | `parse_code` | string | Code for `balance`-line parse problems and the minutes-overflow problem. Required; must be a code the pack declares. |
 | `negative_code` | string | Code for a negative unit balance. Required; must be a code the pack declares. |
@@ -714,12 +714,12 @@ required and must have a message table; a pack-own code must also be
 declared in `finding_codes`. An external pack cannot name a builtin code
 (PD13): it sets every code parameter to a code it declares. A compiled-in
 pack may name a live core code, but it must still set every parameter
-explicitly. A retired name (`spec/findings.md`) is refused for every
+explicitly. A retired name is refused for every
 origin.
 
 Message variants the pack's tables must declare (`<units>` and `<minutes>`
-are the two metric names, so a coaching copy declares
-`sessions_remaining` / `icf_hours` variants):
+are the two metric names, so a session-tracking pack declares
+`units_remaining` / `hours_logged` variants):
 
 | Code | Variants | Placeholders |
 |---|---|---|
@@ -770,24 +770,24 @@ Worked example:
 [[rules]]
 id = "balance"
 kind = "ledger-balance"
-code = "E_COACHING_BALANCE_MISMATCH"
-severity_key = "coaching.balance_nonnegative"
+code = "E_EXAMPLE_BALANCE_MISMATCH"
+severity_key = "example-pack.balance_nonnegative"
 open_verb = "open"
 consume_verb = "session"
-units_metric = "sessions_remaining"
-minutes_metric = "icf_hours"
+units_metric = "units_remaining"
+minutes_metric = "hours_logged"
 max_open_n = 100000
-parse_code = "E_COACHING_PARSE"
-negative_code = "E_COACHING_NEGATIVE_BALANCE"
-open_malformed_code = "E_COACHING_OPEN_MALFORMED"
-invalid_code = "E_COACHING_INVALID_ID"
-wrong_type_code = "E_COACHING_WRONG_ID_TYPE"
+parse_code = "E_EXAMPLE_BALANCE_PARSE"
+negative_code = "E_EXAMPLE_BALANCE_NEGATIVE"
+open_malformed_code = "E_EXAMPLE_OPEN_MALFORMED"
+invalid_code = "E_EXAMPLE_INVALID_ID"
+wrong_type_code = "E_EXAMPLE_WRONG_ID_TYPE"
 ```
 
 With `2026-10-01 open p-… package pkg-… 6 sessions`, a paid session on
-`2026-10-01`, and `2026-10-08 balance p-… sessions_remaining 4`, the
+`2026-10-01`, and `2026-10-08 balance p-… units_remaining 4`, the
 computed value is 5, so the finding message is
-`sessions_remaining asserted 4, computed 5` and its fix names the person.
+`units_remaining asserted 4, computed 5` and its fix names the person.
 A `comp` or `pps` session consumes nothing; an untagged session consumes
 one. This kind does not warn about an untagged session: that finding
 belongs to the `session-checks` kind (#447), so a pack that declares only
@@ -797,7 +797,7 @@ belongs to the `session-checks` kind (#447), so a pack that declares only
 
 Check a pack's consuming ledger verb per entry: a parseable duration is
 present, exactly one billing tag is set, and a session has notes.
-Reproduces `coaching@0.1`'s `apply_session` checks, its
+Reproduces a pack's per-entry session checks, its
 `session_without_notes` rule and its `note_coverage` map, including
 merge-aware grouping: a note for any merged member covers the canonical
 person's session. Only ledger metadata and note ids, paths and dates are
@@ -826,7 +826,7 @@ required and must have a message table; a pack-own code must also be
 declared in `finding_codes`. An external pack cannot name a builtin code
 (PD13): it sets every code to a code it declares. A compiled-in pack may
 name a live core code, but it must still set every parameter explicitly.
-A retired name (`spec/findings.md`) is refused for every origin.
+A retired name is refused for every origin.
 
 Message variants the pack's tables must declare:
 
@@ -869,27 +869,27 @@ Worked example:
 [[rules]]
 id = "sessions"
 kind = "session-checks"
-code = "E_COACHING_MISSING_DURATION"
-severity_duration_key = "coaching.require_duration"
-severity_notes_key = "coaching.session_notes"
+code = "E_EXAMPLE_MISSING_DURATION"
+severity_duration_key = "example-pack.require_duration"
+severity_notes_key = "example-pack.session_notes"
 verb = "session"
 billing_tags = ["paid", "pps", "comp"]
-tags_code = "E_COACHING_SESSION_TAGS"
-untagged_code = "W_COACHING_SESSION_UNTAGGED"
-notes_code = "E_COACHING_SESSION_WITHOUT_NOTES"
+tags_code = "E_EXAMPLE_SESSION_TAGS"
+untagged_code = "W_EXAMPLE_SESSION_UNTAGGED"
+notes_code = "E_EXAMPLE_SESSION_WITHOUT_NOTES"
 ```
 
 A `2026-10-01 session p-… 60m paid` line with no `note:` and no note
-record for that day emits `E_COACHING_SESSION_WITHOUT_NOTES` at the
-`coaching.session_notes` severity. Adding `note:n-…` to the line, or a
+record for that day emits `E_EXAMPLE_SESSION_WITHOUT_NOTES` at the
+`example-pack.session_notes` severity. Adding `note:n-…` to the line, or a
 note for the person dated `2026-10-01`, silences it. A second session
-that day tagged both `paid` and `pps` emits `E_COACHING_SESSION_TAGS` as
+that day tagged both `paid` and `pps` emits `E_EXAMPLE_SESSION_TAGS` as
 well.
 
 #### Kind `activity-gap` (#448)
 
-Warn when a paid client has no session lately. Reproduces
-`coaching@0.1`'s `paid_session_gap`: who counts as a paid client, the gap
+Warn when a paid client has no session lately. Reproduces a pack's
+paid-session gap rule: who counts as a paid client, the gap
 clock, the inclusive window edge, and the never-started / spent-package
 cases.
 
@@ -899,11 +899,11 @@ cases.
 | `start_verb` | string, non-empty | A later opener also resets the clock (today `open`); the gap clock is `max(last activity_verb, last start_verb)`. |
 | `gap_days_key` | string | A declared `[[checks.int]]` key holding the window in days. Resolved as the operator's `[checks]` value when set, else the manifest default. |
 | `lookback_days_key` | string | A declared `[[checks.int]]` key holding the pay-per-session lookback in days. |
-| `balance_metric` | string | A declared `balance_metrics` entry that a `ledger-balance` rule owns as its `units_metric` (today `sessions_remaining`); the kind uses that rule's fold for the remaining count and the `pps` history. |
+| `balance_metric` | string | A declared `balance_metrics` entry that a `ledger-balance` rule owns as its `units_metric` (for example `units_remaining`); the kind uses that rule's fold for the remaining count and the `pps` history. |
 
 The generic `code` is the gap code and is required. It must be a code the
 pack declares (PD13: an external pack cannot name a builtin); a retired
-name (`spec/findings.md`) is refused for every origin. The kind has no
+name is refused for every origin. The kind has no
 other code parameter. Severity comes from `severity_key`; `off` skips the
 rule.
 
@@ -945,13 +945,13 @@ Worked example:
 [[rules]]
 id = "gap"
 kind = "activity-gap"
-code = "E_COACHING_PAID_SESSION_GAP"
-severity_key = "coaching.paid_session_gap"
+code = "E_EXAMPLE_ACTIVITY_GAP"
+severity_key = "example-pack.activity_gap"
 activity_verb = "session"
 start_verb = "open"
-gap_days_key = "coaching.paid_session_gap_days"
-lookback_days_key = "coaching.pps_lookback_days"
-balance_metric = "sessions_remaining"
+gap_days_key = "example-pack.activity_gap_days"
+lookback_days_key = "example-pack.lookback_days"
+balance_metric = "units_remaining"
 ```
 
 With `as_of = 2026-10-08` and `gap_days = 45`, a client with
@@ -966,9 +966,7 @@ only event is an open on `2026-01-01` emits `none`.
 - `personal` is reserved: no external pack may use it. `personal@…` names
   the implicit built-in personal pack: the listing is a no-op at any
   version, and any vendored directory or lockfile pin for it is
-  `E_PACK_INVALID` (§13.7). `coaching` is an ordinary external pack since
-  #449: a vault listing `coaching@0.1` resolves through `confidant.lock`
-  and its vendored `packs/coaching@0.1/` bytes.
+  `E_PACK_INVALID` (§13.7).
 - Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
 - Finding codes declared by an external pack must match
   `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
@@ -1000,8 +998,8 @@ violation is `E_PACK_INVALID`:
 
 Ledger verbs named in rule parameters (e.g. `event_verbs`) are
 read-only access to plaintext ledger metadata (date, verb, opaque id)
-and may be any verb: the built-in personal pack counts coaching's
-`session` as a touchpoint. A kind may still require its verb to be one of
+and may be any verb: the built-in personal pack counts another pack's
+`session` verb as a touchpoint. A kind may still require its verb to be one of
 the pack's own claims: `session-checks`' `verb` is the pack's own
 consuming verb and must be declared in `[[verbs]]`.
 
@@ -1072,8 +1070,8 @@ it (a manifest file cannot claim it):
   trusted as core. The reserved-name rule and PD8 rules 1–3 do not
   apply (a built-in may claim `touch`), and a rule's `code`,
   `invalid_code` or `wrong_type_code` may name any **live** core code.
-  Every `*_code` parameter is still required, and the retired names in
-  `spec/findings.md` are refused for every origin (#629).
+  Every `*_code` parameter is still required, and a retired name is
+  refused for every origin (#629).
 
 The allowance is keyed on the origin, **never on the pack name**. A
 vault directory `packs/personal@<version>/` still resolves through the
@@ -1082,34 +1080,15 @@ from the vault: any lockfile pin or vendored directory for its name
 fails closed). The v2 schema itself — rule ids, kinds, declared codes,
 message tables — applies in full.
 
-### 13.8. Removing the compiled coaching path (#449)
+### 13.8. Moving a compiled pack to an external pack
 
-*Landed in #449. This note is the switch record; it changes no format.*
-
-The compiled `coaching@0.1` path is gone. The shipped pack is
-`packs/coaching/`, a v2 external pack using `note-ref` (#458),
-`ledger-balance` (#446), `session-checks` (#447) and `activity-gap`
-(#448), and it opts into the core `ledger-sessions` context view with
-`[context] view = "ledger-sessions"` (#594).
-
-- `coaching` is no longer in `RESERVED_PACK_NAMES`; `personal` is the only
-  reserved name. A vault vendors `packs/coaching@0.1/` and pins it in
-  `confidant.lock` like any other external pack.
-- `packs/coaching.rs`, the `ALL_PACKS` entry, `pack_manifests()` and the
-  in-crate vendored copies are deleted. `ALL_PACKS` is empty; the only
-  built-in is the embedded `personal@0.2`.
-- The parity and CLI tests now run the shipped external pack against the
-  three golden vaults and `examples/demo-vault`, which vendors the pack and
-  its lockfile.
-- The finding codes are the pack-own `E_COACHING_*` / `W_COACHING_*`
-  family (PD13 forbids an external pack from naming a builtin code; every
-  `*_code` parameter is required, so a pack cannot inherit a core default
-  — a missing one is `E_PACK_INVALID`, #629). `spec/findings.md` lists the
-  mapping and the retired names.
-- The legacy top-level `coaching` field in `context` survives (ADR-7): it
-  is the entry of the pack named `coaching` that serves the
-  `ledger-sessions` view, and the `packs["coaching@0.1"]` key is
-  unchanged.
+A pack that once shipped compiled into the binary can move to an external
+pack without a format change. The external pack carries its manifest and
+skill text, is vendored under `packs/<name>@<version>/`, and is pinned in
+`confidant.lock`; the binary stops registering the compiled path. Its
+finding codes stay pack-owned, and a vault that lists the pack resolves it
+like any other external pack. The built-in `personal@0.2` is the only
+compiled pack.
 
 ### 13.9. Context views (`[context]`, v2, opt-in)
 
@@ -1138,7 +1117,7 @@ recent_limit = 10          # optional; default 10
 
 | View | Spec issue | Reproduces |
 |---|---|---|
-| `ledger-sessions` | #594 | the shipped external `coaching@0.1` pack's per-person `sessions_remaining` / `icf_hours` / `recent_sessions` view |
+| `ledger-sessions` | #594 | a session-tracking pack's per-person remaining units, hours and recent entries |
 
 `ledger-sessions` resolves its parameters from the pack's
 `ledger-balance` rule (§13.2): `open_verb` and `consume_verb` select the
@@ -1175,15 +1154,14 @@ this section.
 affect `check` only. Under this section a pack that declares `[context]`
 also affects `context`, **strictly scoped to the derived ledger metadata
 above** — no content, no private fields, no decrypted content, and no
-widening of the §12 allowlist. The rationale is ADR-7: the compiled
-coaching view is live agent contract that `context`, MCP, the CLI and the
+widening of the §12 allowlist. The rationale is ADR-7: the core view is
+live agent contract that `context`, MCP, the CLI and the
 TUI read today, and it is ledger metadata, not content. Naming a
 core-owned builder keeps PD16's purpose — an external pack cannot reach
-record content — while letting the shipped external `coaching@0.1` pack
-serve that same narrow read surface. A pack without `[context]` is
-check-only, as before.
+record content — while letting a pack serve that same narrow read
+surface. A pack without `[context]` is check-only, as before.
 
-**Parity.** A core test builds this view from the shipped external pack
-over `examples/demo-vault` and the three golden vaults and asserts the
-literal values and ordering, so arithmetic or shape drift fails. The
-golden `check` JSON files record findings and are **not** edited.
+**Parity.** A core test builds this view from a fixture pack
+over a vault and asserts the literal values and ordering, so arithmetic or
+shape drift fails. The golden `check` JSON files record findings and are
+**not** edited.

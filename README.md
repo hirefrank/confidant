@@ -12,8 +12,8 @@ coming up.
 
 The personal use case is the default: every vault has the built-in
 `personal@0.2` pack (birthdays, recurring dates, relationship, keep-in-touch
-cadence, and the `touch` verb). For a coaching practice, add the optional
-`coaching@0.1` pack to the same vault — a client can also be a friend.
+cadence, and the `touch` verb). Other domains come from schema packs you
+author locally or install into the same vault.
 
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
@@ -25,8 +25,8 @@ quickstart](#first-five-minutes-the-people-in-your-life).
 
 Starting over, or adopting Confidant in stages? See
 [Starting fresh, and adopting in stages](docs/starting-fresh.md) — personal
-relationships first (`personal@0.2` is built in), coaching clients later,
-in the same vault.
+relationships first (`personal@0.2` is built in), extra packs later, in the
+same vault.
 
 ## Install
 
@@ -155,8 +155,8 @@ demo, learning, and fixtures. Details:
 
 ## First five minutes: the people in your life
 
-The demo vault is fake data: a friend, a sibling, a partner, a mentor, and
-a small coaching practice. Copy it out so writes commit to a scratch repo:
+The demo vault is fake data: a friend, a sibling, a partner, and a mentor.
+Copy it out so writes commit to a scratch repo:
 
 ```sh
 git clone --depth 1 https://github.com/hirefrank/confidant
@@ -170,8 +170,8 @@ explicitly instead of relying on an exported variable — and never
 `source ~/.bashrc` to set it: an interactive guard skips the export, and a
 stale `CONFIDANT_VAULT` can make `check` inspect the wrong vault.
 
-`confidant record list` prints six people (a seventh, `no-ai: true`, is
-absent). `confidant check` lists what needs attention:
+`confidant record list` prints the visible people; the one marked
+`no-ai: true` is absent. `confidant check` lists what needs attention:
 
 ```text
 warning  W_CADENCE_OVERDUE  people/p-01M3TC5H00MPJG000000000101/profile.md  p-01M3TC5H00MPJG000000000101
@@ -292,26 +292,23 @@ fields, relationship edges (`friend`, `family`, `sibling`, `partner`,
 never block a write: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING`. Contract:
 [`packs/personal/0.2.md`](packs/personal/0.2.md).
 
-**`coaching@0.1` — optional, for a practice.** Packs are optional:
-`init --create` seeds `packs = []`, and `check` is clean without any pack
-because `personal@0.2` is built in. Install an external pack after init
-with `confidant pack add <https-url> --yes`; for coaching:
+**External packs — optional.** Packs are optional: `init --create` seeds
+`packs = []`, and `check` is clean without any pack because `personal@0.2`
+is built in. Install an external pack after init with
+`confidant pack add <https-url> --yes`, or author one locally (below). A
+pack can add verbs, record types, fields, balance metrics, edge kinds, and
+check rules.
 
-```sh
-confidant pack add https://github.com/hirefrank/confidant.git --subdir packs/coaching --yes
-```
-
-A vault that lists it must vendor it, or `check` fails with `E_PACK_UNKNOWN`
-and writes are blocked. It adds sessions, packages, ICF hours, balance
-assertions, and gap rules (a session with no notes; a paid client with no
-session in a configurable window). Contract:
-[`packs/coaching/0.1.md`](packs/coaching/0.1.md).
+A vault that lists an external pack must vendor it, or `check` fails with
+`E_PACK_UNKNOWN` and writes are blocked. `pack verify` checks the vendored
+copy against the pinned hash in `confidant.lock`.
 
 ### Local packs
 
 An agent can write a pack for a local need without a git host or a core
 change. Keep the source outside the vault (for example
-`~/confidant-packs/weekly-checkin/`):
+`~/confidant-packs/weekly-checkin/`). The embedded `pack-author` skill walks
+an agent through the same steps; review its output as code:
 
 ```sh
 confidant pack init ~/confidant-packs/weekly-checkin

@@ -59,9 +59,10 @@ never symlinks (`cargo publish` tarballs and `include_dir!` break).
 | Path | What |
 |---|---|
 | `spec/` | Format spec 0.1 and stable finding codes |
+| `packs/personal/` | Built-in personal pack contract |
 | `crates/confidant-core` | Parser, model, derived values, check engine |
 | `crates/confidant-cli` | `confidant` binary |
-| `crates/confidant-crypt` | Stub until the milestone 2 crypto review |
+| `crates/confidant-crypt` | Encryption (milestone 2) |
 | `examples/demo-vault/` | Fake data only |
 | `docs/borrowing.md` | What we took from cr, and what we did not |
 
