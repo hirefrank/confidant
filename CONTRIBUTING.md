@@ -42,6 +42,18 @@ Regenerate golden check JSON after an intentional finding-message change:
 UPDATE_GOLDEN=1 cargo test -p confidant-core --test check_engine
 ```
 
+Regenerate the in-crate vendored pack copies after editing a repo-root pack
+skill or manifest (the binary embeds the vendored copies; crates.io tarballs
+omit `packs/`):
+
+```sh
+python3 .github/scripts/sync-packs.py          # copy packs/ -> in-crate copies
+python3 .github/scripts/sync-packs.py --check  # verify only, no writes
+```
+
+The drift tests stay in CI and fail on any mismatch. Generated copies only,
+never symlinks (`cargo publish` tarballs and `include_dir!` break).
+
 ## Layout
 
 | Path | What |

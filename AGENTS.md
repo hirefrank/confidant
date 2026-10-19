@@ -50,6 +50,7 @@ Read before changing behaviour:
 | `fuzz/` | cargo-fuzz harnesses for the ledger parser and §14 envelope decoder (own workspace, excluded from the main one; not run in CI) |
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (coaching and personal) |
+| `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, crypto design, benchmarks, research |
@@ -86,6 +87,7 @@ Narrower loops while iterating:
 cargo test -p confidant-core --test check_engine   # check engine + golden JSON
 cargo test -p confidant-cli --test cli             # CLI contract tests
 UPDATE_GOLDEN=1 cargo test -p confidant-core --test check_engine   # only after an intentional message change
+python3 .github/scripts/sync-packs.py               # re-vendor pack skills/manifests after editing packs/
 python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
                                                     # skill allowlist/verification tests (needs a built CLI; the "skills smoke" job)
 ```
