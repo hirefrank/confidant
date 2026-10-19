@@ -89,6 +89,7 @@ Command-level error codes (not check findings):
 | `usage_error` | 2 | Bad flags or missing arguments. |
 | `E_VAULT_NOT_FOUND` | 1 | Discovery (ADR-11) found no vault. |
 | `E_NOT_FOUND` | 1 | The caller named something that does not exist. |
+| `E_AMBIGUOUS_PERSON` | 1 | A person argument was an exact display name (not a `p-<ULID>`) that matched more than one person in the §12 cleared set. The message lists the candidate `p-<ULID>`s — never names; only cleared people are searched — and the caller must pass the intended id. |
 | `E_ALREADY_EXISTS` | 1 | The caller asked to create something that already exists. |
 | `E_INVALID` | 1 | The request is well formed but not valid for this vault. |
 | `E_CONFLICT` | 1 | The request conflicts with stored vault state (including a refused symlink on a write path). |
