@@ -8,6 +8,18 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
+**Disclosure:** the milestone 2 encryption has had no outside review
+([#138](https://github.com/hirefrank/confidant/issues/138)). Do not put
+other people's client data in a vault until the audit lands.
+
+**Breaking:** `coaching@0.1` is an external pack now, so a vault that lists
+it must install the pack before upgrading, and a vault with `open`/`session`
+ledger lines but no coaching pack fails `check` with `E_UNKNOWN_VERB`
+instead of the old non-blocking warning. The coaching finding codes also
+moved to the `E_COACHING_*` / `W_COACHING_*` names; see Changed.
+
 ### Added
 - `confidant reset --machine-state`, the CLI path for starting fresh: it
   clears the trust anchor, manifest high-water marks, the pending inbox
@@ -16,7 +28,76 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   comments), and the device, operator and inbox keys from the OS keychain.
   It never writes inside a vault, refuses while a resolvable vault still has
   a `keys/` tree unless `--force`, supports `--dry-run`, requires `--yes`
-  with `--no-input`/`--json`, and is idempotent (#638).
+  with `--no-input`/`--json`, and is idempotent (#638, #647).
+- The demo vault is **personal-first**: four people with relationship edges,
+  birthdays, anniversaries, keep-in-touch cadences and `touch` lines, with
+  the coaching client and its checks kept alongside. It intentionally
+  reports `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING` as teaching content
+  (#642).
+- `docs/starting-fresh.md` documents starting over — vault-local *and*
+  machine state — and adopting Confidant in stages (personal first, then a
+  coaching practice), including the pack-scope-is-not-a-boundary caveat
+  (#644).
+- `confidant init --create` bootstraps a vault in one non-interactive
+  command: target resolution, `mkdir`, `git init`, a committed
+  `confidant.toml`, `.gitignore`, then the existing key ceremony, with the
+  trust-anchor refusal before anything is written (#552).
+- Exact display-name person resolution: `--person` on `log session`,
+  `log touch`, `note add`, and `context` accepts a trimmed,
+  case-insensitive, whole-string display name as well as a `p-<ULID>`, and
+  a new read-only `confidant resolve <query>` resolves either form to the
+  canonical person. A name matching more than one cleared person fails
+  closed with `E_AMBIGUOUS_PERSON`; a `no-ai: true` person stays
+  addressable by id only (#554, #563).
+- `confidant note show <id> --for-edit` and `confidant note edit <id>
+  --file|--edit`: the operator-only decrypted read and replace pair for
+  notes, through the same write pipeline as records (re-encrypt,
+  `check`-gated, one commit, `unchanged` when nothing changes) (#562).
+- `confidant record list [--for-operator] [--kind person|org|deal]`: a
+  roster of the cleared set, or with the flag the full roster through the
+  operator decrypt path, with a tri-state `no_ai` and a `--packs`-validated
+  `scope` (#565).
+- `--for-operator` on `find` and `context`: the same operator boundary as
+  the roster, loading through the for-edit decrypt path, marking records
+  with the tri-state `no_ai` and operator-only ledger hits with
+  `operator_only: true`. Without the flag the agent output is byte-for-byte
+  unchanged, and MCP never passes the flag (#586, #598).
+- `confidant alias add <person> <kind>` and `confidant alias resolve
+  <kind>`: append and resolve the spec §6 `alias` HMAC line. The raw value
+  arrives on stdin or `--value-file` only and is never echoed; resolution
+  honours `no-ai` and fails closed with `E_AMBIGUOUS_PERSON` (#585).
+- Pack apply: `pack add --yes` now vendors the reviewed files, pins them
+  in `confidant.lock`, adds the `packs` entry, runs `check`, and commits
+  once. New `pack list`, `pack verify`, `pack remove --yes`, and
+  `pack update` (with a reviewed diff) round out the lifecycle (#516).
+- Declarative rule kinds for external packs: `date-upcoming`,
+  `ledger-balance`, `session-checks`, `activity-gap`, and `note-ref`,
+  reproducing the personal and coaching checks from manifest parameters
+  (#519, #524, #571, #573, #582).
+- External packs can opt into the core-built `ledger-sessions` context view
+  with a manifest `[context]` table (spec §13.9), serving the coaching
+  `sessions_remaining`, `icf_hours`, and `recent_sessions` keys from
+  derived ledger metadata without widening the §12 allowlist (#620, #622).
+- TUI v2 (phases 1–5): a three-workspace layout with people master–detail,
+  an operator-mode toggle (`!`) with `no-ai` badges and an `OPERATOR MODE`
+  footer, inline record/note editing (`e`), quick capture for session,
+  touch, and note (`s`/`t`/`n`) with dry-run previews, a review-queue
+  badge, a contrast-safe theme, a vim/lazygit keymap, a grouped help modal,
+  and a command palette (#556, #576, #595, #603, #608, #610).
+- The TUI's `a` form creates a new person: it mints the `p-ULID` locally,
+  stages the record, previews through `record add --dry-run`, and writes
+  only on an explicit `y` (#643).
+- `confidant doctor` gains a `device-key` check reporting whether the
+  device key comes from the keychain, `CONFIDANT_DEVICE_KEY`, or no
+  enrollment, with an actionable `fix` for headless hosts (#575).
+- The qmd index skill persists the encrypted-disk confirmation through
+  `CONFIDANT_ASSUME_ENCRYPTED_DISK=1` or the `[qmd] assume_encrypted_disk`
+  config key, preferring real disk detection over either (#567).
+- A repo QA sweep skill and a nightly `qa smoke` job: 22 deterministic
+  end-to-end steps against throwaway vaults, run on the schedule and on
+  pushes to `main`, on a pull request when fixtures, packs, the smoke
+  script, or the workflow change, and with a failure alert that opens one
+  `qa-found` issue and closes it on the next green run (#623, #631, #632).
 - `personal@0.2` schema: three new field grammars — `list`,
   `labeled-list`, `date` — and an extended `cadence` grammar that also
   accepts the literal `never`. The `cadence-overdue` rule now skips a
@@ -79,7 +160,7 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   true` when, and only when, the person's declared `cadence` is the literal
   `never`. It tells a deliberate never-nudge apart from no cadence set (both
   omit `cadence_days`), so an agent does not suggest configuring a cadence
-  the person turned off. Additive: absent for everyone else (#589).
+  the person turned off. Additive: absent for everyone else (#589, #596).
 - The `touch` kind list is now `call|text|email|meet|meal|event|gift|other`
   (#509). `coffee` is removed, not aliased: `meal` replaces it. New `log touch`
   writes using `coffee` are a usage error, and an existing `coffee` ledger line
@@ -98,6 +179,45 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   logged interaction counts as contact for everyone on it (#505). The rules
   stay ledger-only: a hand-written interaction with no mirrored line still
   does not count.
+- Rule kinds require their kind-specific `*_code` parameters, and retired
+  finding-code names are refused for every pack origin, so a pack can no
+  longer fall back silently to a retired coaching code or a builtin (#634).
+- Documentation: the derived-view carve-out for `no-ai` people is recorded
+  where agents read it — content stays hidden from `find`, while `context`
+  still serves derived ledger metadata — and the pack skill shorthand
+  matches `docs/privacy.md` (#599, #633).
+
+### Fixed
+- Pack-loader hardening: an external pack on an unsupported spec no longer
+  reports `E_PACK_UNKNOWN`, duplicate `date` fields and negative int
+  defaults are refused, and external-pack label text is sanitized and
+  attributed by origin rather than the base name (#520, #531, #533, #584).
+- `init --force` on an already-initialized vault refuses before generating
+  or writing any key material, so a refused re-init leaves the tree, HEAD
+  and keychain untouched; and `init --create --packs` now accepts only the
+  packs the binary implements and points external packs at `pack add`
+  instead of promising a pack it cannot vendor (#639, #640, #646).
+- `pack update` on byte-identical bytes reports `unchanged` instead of
+  failing `internal_error` on an empty commit, and repairs a stale
+  `confidant.lock` hash over an otherwise matching tree (#605, #607).
+- A pack listed in `confidant.toml` with no lock entry is repairable from
+  the CLI: `pack remove` keys off every source of install state, `pack add
+  --yes` reinstalls, and the `E_PACK_UNKNOWN` hint names both (#617).
+- `pack remove` and `pack update` refuse a symlinked or otherwise
+  non-regular vendored tree before any delete or diff, so a refusal cannot
+  leave a half-deleted pack or read a file outside the vault (#587).
+- A refused or failed write rolls back the directories it created as well
+  as the files it touched, and a mid-apply I/O failure restores the
+  snapshot instead of leaving a partially applied tree (#613, #616).
+- The qmd-search skill verifies hits against the §12 cleared set with one
+  `confidant allowlist` call, so cleared CJK and short notes are returned
+  and stale or out-of-scope hits are dropped fail-closed (#548).
+- The package-id refusal hint points at `confidant context <person>`, a
+  command that exists (#577).
+- TUI: an older CLI on `PATH` is reported as `CLI Version Skew` instead of
+  a wall of usage text, with the raw output behind `x`; a proposal confirm
+  is bound to the reviewed dry-run and applies staged bytes, so a source
+  rewrite cannot land un-reviewed (#601, #615, #627).
 
 ### Removed
 - `crates/confidant-core/src/packs/coaching.rs`, its registry entries and
@@ -358,7 +478,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/hirefrank/confidant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hirefrank/confidant/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hirefrank/confidant/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hirefrank/confidant/compare/v0.3.0...v0.3.1
