@@ -9365,6 +9365,7 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
         "unknown_agents": result.unknown_agents,
         "linked": result.linked_count(),
         "skipped": result.skipped_count(),
+        "dry_run": result.dry_run,
     })
 }
 
@@ -9375,8 +9376,13 @@ fn cmd_setup(
     copy: bool,
     verbose: bool,
 ) -> anyhow::Result<ExitCode> {
-    match setup::run_setup(agent, force, copy) {
+    match setup::run_setup(agent, force, copy, cli.dry_run) {
         Ok(result) => {
+            // #653c: `--agent auto` falls back to claude-code when nothing is
+            // detected; say so instead of creating ~/.claude silently.
+            if let Some(note) = &result.fallback_note {
+                eprintln!("warning: {note}");
+            }
             if cli.json {
                 let mut value = setup_result_json(&result);
                 if let Value::Object(ref mut obj) = value {
@@ -9393,19 +9399,32 @@ fn cmd_setup(
                     eprintln!("warning: unknown agent '{unknown}' — skipped");
                 }
                 let labels = result.agent_labels().join(", ");
-                println!("Confidant skills installed");
+                if result.dry_run {
+                    println!("Confidant skills (dry run; nothing written)");
+                } else {
+                    println!("Confidant skills installed");
+                }
                 println!("  skills   {} → {labels}", result.skills_dir.display());
                 println!("  version  {}", result.version);
                 println!(
-                    "  linked   {} ({} skipped)",
+                    "  {:<9} {} ({} skipped)",
+                    if result.dry_run {
+                        "would link"
+                    } else {
+                        "linked"
+                    },
                     result.linked_count(),
                     result.skipped_count()
                 );
                 if result.skipped_count() > 0 {
                     println!("  replace existing dirs with: confidant setup --force");
                 }
-                println!();
-                setup_next_steps(cli)?;
+                if result.dry_run {
+                    println!("  re-run without --dry-run to apply");
+                } else {
+                    println!();
+                    setup_next_steps(cli, verbose)?;
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -9459,7 +9478,10 @@ fn setup_next_steps_json(cli: &Cli) -> Value {
 /// check command. When unset, the exact export line replaces the old
 /// generic wording. The vault is never read or probed here — the check
 /// runs only after an explicit `y`, inheriting the environment.
-fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
+///
+/// #653e: the optional qmd npm note is only printed with `-v/--verbose`;
+/// JSON keeps `qmd_available`/`qmd_note` for agents either way.
+fn setup_next_steps(cli: &Cli, verbose: bool) -> anyhow::Result<()> {
     println!("Next:");
     if vault_env_set() {
         println!("  Run `confidant check` against your vault.");
@@ -9476,8 +9498,10 @@ fn setup_next_steps(cli: &Cli) -> anyhow::Result<()> {
     }
     // #386: informational qmd note. Optional, never prompts, never fails,
     // never changes exit status.
-    if let Some(note) = qmd_setup_note() {
-        println!("  {note}");
+    if verbose {
+        if let Some(note) = qmd_setup_note() {
+            println!("  {note}");
+        }
     }
     Ok(())
 }
@@ -9537,7 +9561,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             print_json(&ok_envelope(None, value))?;
             return Ok(ExitCode::SUCCESS);
         }
-        let result = setup::run_setup(agent, force, false)?;
+        let result = setup::run_setup(agent, force, false, cli.dry_run)?;
         let mut value = setup_result_json(&result);
         if let Value::Object(ref mut obj) = value {
             obj.insert("update".to_owned(), update_info);
@@ -9555,26 +9579,36 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     // Never re-link from a behind binary: the installed
                     // skills would be stale on arrival. Print the single
                     // command that fits this install; in an interactive
-                    // terminal, offer to run it (default No).
+                    // terminal, offer to run it (default No). `--dry-run`
+                    // prints the command and never offers or runs it (#668).
                     if let (Some(cmd), Some((program, args))) =
                         (method.update_command(), method.run_spec())
                     {
-                        println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
-                        if offerable_update(method, true)
-                            && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
-                        {
-                            match run_offered_command(cmd, program, args) {
-                                Ok(()) => {
-                                    println!("updated via `{cmd}`.");
-                                    if confirm_yn(
-                                        "run `confidant setup` now?",
-                                        cli.no_input,
-                                        cli.json,
-                                    )? {
-                                        return relink_after_update(agent, force, verbose);
+                        if cli.dry_run {
+                            println!("confidant {local} is behind the latest release {tag}; would run `{cmd}`, then re-run `confidant setup`.");
+                        } else {
+                            println!("confidant {local} is behind the latest release {tag}; run `{cmd}`, then re-run `confidant setup`.");
+                            if offerable_update(method, true)
+                                && confirm_yn(&format!("run `{cmd}` now?"), cli.no_input, cli.json)?
+                            {
+                                match run_offered_command(cmd, program, args) {
+                                    Ok(()) => {
+                                        println!("updated via `{cmd}`.");
+                                        if confirm_yn(
+                                            "run `confidant setup` now?",
+                                            cli.no_input,
+                                            cli.json,
+                                        )? {
+                                            return relink_after_update(
+                                                agent,
+                                                force,
+                                                verbose,
+                                                cli.dry_run,
+                                            );
+                                        }
                                     }
+                                    Err(err) => eprintln!("update failed: {err:#}"),
                                 }
-                                Err(err) => eprintln!("update failed: {err:#}"),
                             }
                         }
                     } else {
@@ -9584,18 +9618,28 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
                     }
                     return Ok(ExitCode::SUCCESS);
                 }
-                println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                if cli.dry_run {
+                    println!("confidant {local} is current (latest: {tag}). Would re-link skills…");
+                } else {
+                    println!("confidant {local} is current (latest: {tag}). Re-linking skills…");
+                }
             }
         }
     }
-    relink_after_update(agent, force, verbose)
+    relink_after_update(agent, force, verbose, cli.dry_run)
 }
 
 /// Shared tail of `update`: re-link skills from this binary and report.
 /// `force` is the operator's own flag: owned entries are re-pointed
-/// regardless, unowned entries need it.
-fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
-    let result = setup::run_setup(agent, force, false)?;
+/// regardless, unowned entries need it. `dry_run` (#668) plans the relink
+/// and writes nothing.
+fn relink_after_update(
+    agent: &str,
+    force: bool,
+    verbose: bool,
+    dry_run: bool,
+) -> anyhow::Result<ExitCode> {
+    let result = setup::run_setup(agent, force, false, dry_run)?;
     if verbose {
         for line in &result.verbose_lines {
             println!("{line}");
@@ -9604,15 +9648,23 @@ fn relink_after_update(agent: &str, force: bool, verbose: bool) -> anyhow::Resul
     for unknown in &result.unknown_agents {
         eprintln!("warning: unknown agent '{unknown}' — skipped");
     }
-    println!(
-        "re-linked {} skills → {}",
-        result.linked_count(),
-        result.agent_labels().join(", ")
-    );
+    if dry_run {
+        println!(
+            "would re-link {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    } else {
+        println!(
+            "re-linked {} skills → {}",
+            result.linked_count(),
+            result.agent_labels().join(", ")
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_agents(cli: &Cli, verbose: bool) -> anyhow::Result<ExitCode> {
+fn cmd_agents(cli: &Cli, _verbose: bool) -> anyhow::Result<ExitCode> {
     let home = setup::home_dir()?;
     let health = setup::agents_health(&home);
     if cli.json {
@@ -9630,11 +9682,24 @@ fn cmd_agents(cli: &Cli, verbose: bool) -> anyhow::Result<ExitCode> {
             .collect();
         print_json(&ok_envelope(None, serde_json::json!({"agents": agents})))?;
     } else {
+        // #652: always show the full table, including before `setup` has run.
+        println!("{:<14} {:<9} {:<7} PATH", "AGENT", "DETECTED", "LINKED");
+        let mut any_linked = false;
         for h in &health {
-            let status = if h.detected { "detected" } else { "" };
-            if verbose || h.detected {
-                println!("{}\t{}\t{status}", h.name, h.dir.display());
-            }
+            any_linked |= h.linked > 0;
+            println!(
+                "{:<14} {:<9} {:<7} {}",
+                h.name,
+                if h.detected { "yes" } else { "no" },
+                format!("{}/{}", h.linked, h.total),
+                h.dir.display()
+            );
+        }
+        if !any_linked {
+            println!();
+            println!(
+                "No skills linked yet. Run `confidant setup --agent <name>` or `confidant setup --agent auto`."
+            );
         }
     }
     Ok(ExitCode::SUCCESS)
