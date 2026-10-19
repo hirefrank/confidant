@@ -111,6 +111,9 @@ fn doctor_reports_not_enrolled_without_a_keychain() {
     assert!(msg.contains("not enrolled"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field names the way out");
     assert!(fix.contains("CONFIDANT_DEVICE_KEY"), "{fix}");
+    assert!(fix.contains("CONFIDANT_OPERATOR_KEY"), "{fix}");
+    assert!(fix.contains("64-character hex"), "{fix}");
+    assert!(fix.contains("before running `confidant init`"), "{fix}");
     assert!(fix.contains("CONFIDANT_INBOX_KEY"), "{fix}");
     assert!(fix.contains("Keys never live in files"), "{fix}");
     // Warning-only: an unenrolled host still gets a usable doctor report.

@@ -7151,10 +7151,11 @@ fn device_key_check() -> DoctorCheck {
 
     const ID: &str = "device-key";
     let headless_fix = format!(
-        "On headless hosts (no D-Bus Secret Service) set {DEVICE_KEY_ENV} to the device key \
-         and {INBOX_KEY_ENV} to the inbox key before running confidant, e.g. \
-         `export {DEVICE_KEY_ENV}=AGE-SECRET-KEY-1…`. On a new device run `confidant recover` \
-         instead. Keys never live in files."
+        "On a host with no D-Bus Secret Service, set {DEVICE_KEY_ENV} to the device key \
+         (AGE-SECRET-KEY-1…), {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed, and \
+         {INBOX_KEY_ENV} to the inbox key before running `confidant init`, e.g. \
+         `export {OPERATOR_KEY_ENV}=<64 hex characters>`. On a device that already has \
+         vault keys, run `confidant recover` instead. Keys never live in files."
     );
     let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
         id: ID,
@@ -9233,6 +9234,58 @@ impl Drop for InitRollback {
     }
 }
 
+/// Env-var override for the operator Ed25519 signing seed at `init`
+/// (64 hex characters = a 32-byte seed). The load path
+/// (`confidant_crypt::keychain::operator_key`) already honors this variable;
+/// `init` accepts it so a host with no OS Secret Service can create an
+/// encrypted vault (#650).
+const OPERATOR_KEY_ENV: &str = "CONFIDANT_OPERATOR_KEY";
+
+/// Read and validate [`OPERATOR_KEY_ENV`] for `init` (#650). Returns `None`
+/// when unset. Never echoes the value: errors name the variable and the
+/// expected shape only.
+fn operator_key_from_env() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
+    let raw = match std::env::var(OPERATOR_KEY_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(invalid_operator_key("it is not valid UTF-8"));
+        }
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_operator_key("it is empty"));
+    }
+    if trimmed.len() != 64 {
+        return Err(invalid_operator_key(&format!(
+            "it is {} characters, not 64",
+            trimmed.len()
+        )));
+    }
+    if !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid_operator_key("it contains non-hex characters"));
+    }
+    let decoded = Zeroizing::new(
+        hex::decode(trimmed).map_err(|_| invalid_operator_key("it is not valid hex"))?,
+    );
+    let seed: [u8; 32] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid_operator_key("it is not a 32-byte seed"))?;
+    Ok(Some(ed25519_dalek::SigningKey::from_bytes(&seed)))
+}
+
+fn invalid_operator_key(reason: &str) -> anyhow::Error {
+    anyhow::Error::new(DomainError::usage(format!(
+        "{OPERATOR_KEY_ENV} is invalid: {reason}; expected 64 hex characters \
+         (a 32-byte Ed25519 seed)"
+    )))
+    .with_fix(&format!(
+        "Set {OPERATOR_KEY_ENV} to 64 hex characters, or unset it to generate a key \
+         (the OS keychain must then be reachable)"
+    ))
+}
+
 /// True when git can resolve a commit identity for the repo at `root`.
 /// Runs `git var` before `init --create` writes anything (#651), and avoids
 /// reading the *current* directory's repo config: a fresh target has no local
@@ -9304,7 +9357,12 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
         println!("  branch   main");
         println!("  would    create the vault directory (when absent)");
         println!("  would    run git init and commit .gitignore + confidant.toml");
-        println!("  would    generate the operator key, recovery phrase, and device key");
+        if std::env::var_os(OPERATOR_KEY_ENV).is_some() {
+            println!("  would    use {OPERATOR_KEY_ENV} as the operator key");
+        } else {
+            println!("  would    generate the operator key");
+        }
+        println!("  would    generate the recovery phrase and device key");
         println!("  would    commit keys/ and write the trust anchor");
         if packs_empty {
             println!("optional: install a pack with `confidant pack add <https-url> --yes`");
@@ -9377,6 +9435,10 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         .unwrap_or_default();
     validate_init_packs(&packs)?;
 
+    // #650: validate the operator-key override before the dry-run branch and
+    // before any write, so `--create --dry-run` reports a bad value too.
+    let _ = operator_key_from_env()?;
+
     // #651: require a commit identity before creating the directory or
     // running `git init`. `git var` works outside a repo, so a refused run
     // leaves an absent target absent instead of an empty `.git` that blocks
@@ -9422,6 +9484,17 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         confidant_core::write::git(&root, &["init"], no_input)?;
         // #661: create `main` explicitly, independent of init.defaultBranch.
         // `symbolic-ref` is portable and works before the first commit.
+        confidant_core::write::git(
+            &root,
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+            no_input,
+        )?;
+    } else if existing_repo
+        && confidant_core::write::git(&root, &["rev-parse", "--verify", "HEAD"], no_input).is_err()
+    {
+        // #661 edge: a pre-existing repo with an unborn HEAD has no commits
+        // to rename, so create `main` explicitly here too. A repo with
+        // commits is never renamed (the `rev-parse --verify HEAD` above).
         confidant_core::write::git(
             &root,
             &["symbolic-ref", "HEAD", "refs/heads/main"],
@@ -9570,6 +9643,11 @@ fn cmd_init(
     // any key material (works inside an existing repo).
     require_git_identity(root, no_input)?;
 
+    // #650: validate the operator-key override in the preflight so a bad
+    // value fails (including under --dry-run) before anything is generated
+    // or written. The same env var is already honored by the load path.
+    let env_operator_sk = operator_key_from_env()?;
+
     let vault = load_vault(root)?;
     // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
     // `init` on a vault declaring `[crypto] mode = "plaintext"` is a hard
@@ -9609,7 +9687,12 @@ fn cmd_init(
             if let Some(branch) = &branch {
                 println!("  branch   {branch}");
             }
-            println!("  would    generate the operator key, recovery phrase, and device key");
+            if env_operator_sk.is_some() {
+                println!("  would    use {OPERATOR_KEY_ENV} as the operator key");
+            } else {
+                println!("  would    generate the operator key");
+            }
+            println!("  would    generate the recovery phrase and device key");
             println!(
                 "  would    commit keys/ and write the trust anchor at {}",
                 trust_path.display()
@@ -9629,11 +9712,17 @@ fn cmd_init(
     // B2: generate operator key, recovery phrase, and device keypair.
     // None of this material is ever written into the vault.
     // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
-    // provides the hex seed.
+    // provides the hex seed and keeps precedence. Otherwise #650's
+    // CONFIDANT_OPERATOR_KEY (validated above) supplies the seed for
+    // headless hosts; with neither, generate a fresh key.
     #[cfg(feature = "test-overrides")]
-    let operator_sk = test_operator_key().unwrap_or_else(|| SigningKey::generate(&mut OsRng));
+    let test_operator_sk = test_operator_key();
     #[cfg(not(feature = "test-overrides"))]
-    let operator_sk = SigningKey::generate(&mut OsRng);
+    let test_operator_sk: Option<SigningKey> = None;
+    let operator_from_env = env_operator_sk.is_some();
+    let operator_sk = test_operator_sk
+        .or(env_operator_sk)
+        .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
     let recovery = Recovery::generate();
     let phrase = recovery.phrase();
 
@@ -9649,20 +9738,23 @@ fn cmd_init(
     let (_device_bech32, device_recipient) = provision_device_key()?;
 
     // Persist the operator signing key to the OS keychain (needed for
-    // `keys` commands to sign manifests). This is never skipped when
-    // CONFIDANT_DEVICE_KEY is set — the key must be persisted even in
-    // headless/test environments. In tests (CONFIDANT_KEYCHAIN=off),
-    // the keychain write is refused; the test harness provides the key
-    // via CONFIDANT_TEST_OPERATOR_KEY instead.
-    if let Err(e) =
-        confidant_crypt::keychain::store_operator_key(&hex::encode(operator_sk.to_bytes()))
-    {
-        if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
-            != confidant_crypt::keychain::KeychainSwitch::Off
+    // `keys` commands to sign manifests). #650: when CONFIDANT_OPERATOR_KEY
+    // is set, the operator key is externally managed for this run — do not
+    // write it to the keychain, which would fail on a headless host or
+    // duplicate the secret. The test-override path is otherwise unchanged:
+    // in tests (CONFIDANT_KEYCHAIN=off) the keychain write is refused and
+    // the harness provides the key via CONFIDANT_TEST_OPERATOR_KEY instead.
+    if !operator_from_env {
+        if let Err(e) =
+            confidant_crypt::keychain::store_operator_key(&hex::encode(operator_sk.to_bytes()))
         {
-            return Err(anyhow::Error::new(e));
+            if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
+                != confidant_crypt::keychain::KeychainSwitch::Off
+            {
+                return Err(anyhow::Error::new(e));
+            }
+            // Kill switch set: test mode; the harness provides the key via env.
         }
-        // Kill switch set: test mode; the harness provides the key via env.
     }
 
     // B3: build the anchor in memory. It is persisted atomically only
