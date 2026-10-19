@@ -2,7 +2,6 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -12,7 +11,7 @@ use crate::theme;
 use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, FindResult, InboxReport,
-    ResolveApplied, ResolveShow, SearchResult,
+    ResolveApplied, ResolveShow, Roster, SearchResult,
 };
 use crate::proposals::{discover_proposals, resolve_vault_root, DiscoveredProposal};
 use crate::runner::{RawOutput, Runner};
@@ -25,16 +24,57 @@ use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
 use crate::views::inbox::{self, InboxViewState};
+use crate::views::info::{self, InfoState};
+use crate::views::people::{self, PeopleViewState};
 use crate::views::proposals::{
     self, ProposalDetailState, ProposalListEntry, ProposalsListState, StepRow,
 };
 use crate::views::search;
 
-/// The seven views: Check, Context, Doctor, Proposals, unified
-/// Search (qmd-ranked with an exact `find` toggle), Inbox, Conflicts.
+/// The three workspaces of the operator layout (#556 phase 1).
+///
+/// The underlying [`ActiveView`] still exists per view; a workspace is the
+/// coarse job the operator is doing. `Search` and `Context` live under
+/// People; Proposals/Inbox/Conflicts live under Review until phase 3 merges
+/// them; Check and Doctor are the third workspace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Workspace {
+    #[default]
+    People,
+    Review,
+    Check,
+}
+
+impl Workspace {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::People => "1 People & Search",
+            Self::Review => "2 Review Queue",
+            Self::Check => "3 Check",
+        }
+    }
+
+    /// Views in tab order inside this workspace.
+    fn views(self) -> &'static [ActiveView] {
+        match self {
+            Self::People => &[ActiveView::People, ActiveView::Search],
+            Self::Review => &[
+                ActiveView::Proposals,
+                ActiveView::Inbox,
+                ActiveView::Conflicts,
+            ],
+            Self::Check => &[ActiveView::Check, ActiveView::Doctor],
+        }
+    }
+}
+
+/// The underlying views: People & Search (master–detail), Check, full-screen
+/// Context, Doctor, Proposals, unified Search (qmd-ranked with an exact
+/// `find` toggle), Inbox, and Conflicts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
+    People,
     Check,
     Context,
     Doctor,
@@ -45,39 +85,12 @@ pub enum ActiveView {
 }
 
 impl ActiveView {
-    pub fn next(self) -> Self {
+    /// The workspace this view belongs to.
+    pub fn workspace(self) -> Workspace {
         match self {
-            Self::Check => Self::Context,
-            Self::Context => Self::Doctor,
-            Self::Doctor => Self::Proposals,
-            Self::Proposals => Self::Search,
-            Self::Search => Self::Inbox,
-            Self::Inbox => Self::Conflicts,
-            Self::Conflicts => Self::Check,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Check => Self::Conflicts,
-            Self::Context => Self::Check,
-            Self::Doctor => Self::Context,
-            Self::Proposals => Self::Doctor,
-            Self::Inbox => Self::Search,
-            Self::Search => Self::Proposals,
-            Self::Conflicts => Self::Inbox,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Check => "1:Check",
-            Self::Context => "2:Context",
-            Self::Doctor => "3:Doctor",
-            Self::Proposals => "4:Proposals",
-            Self::Search => "5:Search",
-            Self::Inbox => "6:Inbox",
-            Self::Conflicts => "7:Conflicts",
+            Self::People | Self::Search | Self::Context => Workspace::People,
+            Self::Proposals | Self::Inbox | Self::Conflicts => Workspace::Review,
+            Self::Check | Self::Doctor => Workspace::Check,
         }
     }
 }
@@ -99,6 +112,7 @@ pub enum InputMode {
     #[default]
     Normal,
     EditingSearch,
+    EditingFilter,
 }
 
 /// An interactive `confidant` invocation the TUI must run outside its
@@ -117,10 +131,15 @@ pub struct App<R: Runner> {
     pub vault: Option<String>,
     pub check: CheckViewState,
     pub context: ContextViewState,
+    pub people: PeopleViewState,
     pub doctor: DoctorViewState,
     pub search: SearchViewState,
     pub alert: Option<AlertState>,
     pub blocking_alert: Option<AlertState>,
+    /// Scope names resolved by the last scoped read (`record list`).
+    pub scope: Option<Vec<String>>,
+    /// `p` Scope / `?` Help modal; any key dismisses it.
+    pub info_modal: Option<InfoState>,
     pub should_quit: bool,
     pub proposals: ProposalsTab,
     pub inbox: InboxViewState,
@@ -136,15 +155,18 @@ impl<R: Runner> App<R> {
     pub fn new(runner: R) -> Self {
         Self {
             runner,
-            active_view: ActiveView::Check,
+            active_view: ActiveView::People,
             input_mode: InputMode::Normal,
             vault: None,
             check: CheckViewState::default(),
             context: ContextViewState::default(),
+            people: PeopleViewState::default(),
             doctor: DoctorViewState::default(),
             search: SearchViewState::default(),
             alert: None,
             blocking_alert: None,
+            scope: None,
+            info_modal: None,
             should_quit: false,
             proposals: ProposalsTab::default(),
             inbox: InboxViewState::default(),
@@ -159,18 +181,79 @@ impl<R: Runner> App<R> {
         self.vault_root_override = Some(root);
     }
 
-    /// Run `confidant check --json --no-input` and update the Check view state.
+    /// Run `confidant check --json --no-input` and update the Check view
+    /// state. The People workspace reuses the same cached report for its
+    /// `Needs Attention` list; it never runs check per keystroke.
+    ///
+    /// A failed refresh clears the cached report: a stale report would keep
+    /// rendering old nudges (or a false "Nothing needs attention") after
+    /// check stopped answering.
     pub fn load_check(&mut self) {
         let raw = match self.runner.run(&["check"]) {
             Ok(r) => r,
             Err(e) => {
+                self.check.report = None;
+                self.check.selected = 0;
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                self.people.clamp(self.check.report.as_ref());
+                return;
+            }
+        };
+        match self.apply_outcome::<CheckReport>(&raw) {
+            Some((_ok, report)) => self.check.report = Some(report),
+            None => self.check.report = None,
+        }
+        self.check.selected = 0;
+        self.people.clamp(self.check.report.as_ref());
+    }
+
+    /// Run `confidant record list --json --no-input --kind person` and
+    /// update the People roster (#558). This is the cleared set: `no-ai:
+    /// true` people are absent. On first load it selects the first person
+    /// and loads their live context; refreshing preserves the current
+    /// selection when that person is still in the roster.
+    pub fn load_roster(&mut self) {
+        let raw = match self.runner.run(&["record", "list", "--kind", "person"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.people.loaded = true;
+                self.people.load_error = Some(format!("{e:#}"));
                 self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
                 return;
             }
         };
-        if let Some((_ok, report)) = self.apply_outcome::<CheckReport>(&raw) {
-            self.check.report = Some(report);
-            self.check.selected = 0;
+        match parse_raw_output::<Roster>(&raw) {
+            ContractOutcome::Ok { vault, data, .. } => {
+                if vault.is_some() {
+                    self.vault = vault;
+                }
+                self.alert = None;
+                self.scope = Some(data.scope.clone());
+                self.people.roster = Some(data);
+                self.people.load_error = None;
+                self.people.loaded = true;
+                let prefer_first = self.people.selected_person.is_none();
+                self.sync_people_selection(prefer_first);
+            }
+            ContractOutcome::VersionMismatch { reported_version } => {
+                self.people.loaded = true;
+                self.people.load_error = Some("unsupported agent contract version".to_owned());
+                self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
+            }
+            ContractOutcome::CliError {
+                status,
+                usage_error,
+                error,
+            } => {
+                self.people.loaded = true;
+                self.people.load_error = Some(error.message.clone());
+                self.alert = Some(AlertState::from_cli_error(status, usage_error, &error));
+            }
+            ContractOutcome::InvalidJson { status } => {
+                self.people.loaded = true;
+                self.people.load_error = Some("invalid roster JSON".to_owned());
+                self.alert = Some(AlertState::invalid_json(status));
+            }
         }
     }
 
@@ -337,9 +420,16 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Run `confidant context --json --no-input -- <person_id>` and update the Context view state.
+    /// Run `confidant context --json --no-input -- <person_id>` and update
+    /// the Context view state. The People workspace's right pane and the
+    /// full-screen Context view share this state.
     pub fn load_context(&mut self, person_id: &str) {
         let pid = person_id.to_owned();
+        let changed = self.context.person_id.as_deref() != Some(pid.as_str());
+        if changed {
+            self.context.context = None;
+            self.context.scroll = 0;
+        }
         self.context.person_id = Some(pid.clone());
         let raw = match self.runner.run(&["context", "--", &pid]) {
             Ok(r) => r,
@@ -349,9 +439,147 @@ impl<R: Runner> App<R> {
             }
         };
         if let Some((_ok, ctx)) = self.apply_outcome::<Context>(&raw) {
+            if self.scope.is_none() && !ctx.scope.is_empty() {
+                self.scope = Some(ctx.scope.clone());
+            }
             self.context.context = Some(ctx);
             self.context.scroll = 0;
         }
+    }
+
+    /// Reconcile the left-pane selection with the current roster, filter,
+    /// and nudge list. `prefer_first` forces the first person to be
+    /// selected (used when the roster is first loaded); otherwise the
+    /// current person is kept when still visible.
+    fn sync_people_selection(&mut self, prefer_first: bool) {
+        let nudge_count =
+            people::attention(self.check.report.as_ref(), self.people.roster.as_ref()).len();
+        let ids: Vec<String> =
+            people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+        let total = nudge_count + ids.len();
+        if total == 0 {
+            self.people.selected = 0;
+            self.people.selected_person = None;
+            self.context.person_id = None;
+            self.context.context = None;
+            return;
+        }
+
+        if prefer_first {
+            self.people.selected_person = None;
+            self.people.selected = nudge_count;
+        } else if let Some(id) = self.people.selected_person.as_deref() {
+            if let Some(index) = ids.iter().position(|candidate| candidate == id) {
+                self.people.selected = nudge_count + index;
+            } else {
+                // The selected person left the roster (or the filter hid
+                // them): fall through to the first visible row.
+                self.people.selected_person = None;
+            }
+        }
+        self.people.selected = self.people.selected.min(total - 1);
+
+        if self.people.selected >= nudge_count && !ids.is_empty() {
+            let index = self.people.selected - nudge_count;
+            let id = ids[index].clone();
+            if self.people.selected_person.as_deref() != Some(id.as_str()) {
+                self.people.selected_person = Some(id.clone());
+                self.load_context(&id);
+            }
+        } else if self.people.selected_person.is_none() && !ids.is_empty() {
+            self.people.selected = nudge_count;
+            let id = ids[0].clone();
+            self.people.selected_person = Some(id.clone());
+            self.load_context(&id);
+        }
+    }
+
+    /// Move the People selection by one row. Landing on a person loads
+    /// their live context; nudges leave the right pane on the last person.
+    fn move_people_selection(&mut self, delta: i32) {
+        let nudge_count =
+            people::attention(self.check.report.as_ref(), self.people.roster.as_ref()).len();
+        let ids: Vec<String> =
+            people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+        let total = nudge_count + ids.len();
+        if total == 0 {
+            return;
+        }
+        let next = (self.people.selected as i32 + delta).clamp(0, total as i32 - 1) as usize;
+        self.people.selected = next;
+        if next >= nudge_count {
+            let id = ids[next - nudge_count].clone();
+            if self.people.selected_person.as_deref() != Some(id.as_str()) {
+                self.people.selected_person = Some(id.clone());
+                self.load_context(&id);
+            }
+        }
+    }
+
+    /// `Enter`: on a nudge, focus the person it names (clearing a filter
+    /// that hides them); on a person row, load that row's context.
+    fn activate_people_selection(&mut self) {
+        let nudge_count =
+            people::attention(self.check.report.as_ref(), self.people.roster.as_ref()).len();
+        if self.people.selected < nudge_count {
+            let nudge = people::attention(self.check.report.as_ref(), self.people.roster.as_ref())
+                .into_iter()
+                .nth(self.people.selected);
+            if let Some(nudge) = nudge {
+                self.focus_person(&nudge.person_id);
+            }
+            return;
+        }
+        let ids: Vec<String> =
+            people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+        if let Some(id) = ids.get(self.people.selected - nudge_count).cloned() {
+            self.people.selected_person = Some(id.clone());
+            self.load_context(&id);
+        }
+    }
+
+    /// Select a person by id, clearing the local filter if needed, and load
+    /// their live context.
+    fn focus_person(&mut self, id: &str) {
+        let visible = people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+            .iter()
+            .any(|entry| entry.id == id);
+        if !visible {
+            self.people.filter.clear();
+            self.people.editing_filter = false;
+            self.input_mode = InputMode::Normal;
+        }
+        let nudge_count =
+            people::attention(self.check.report.as_ref(), self.people.roster.as_ref()).len();
+        let ids: Vec<String> =
+            people::filtered_entries(self.people.roster.as_ref(), &self.people.filter)
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+        if let Some(index) = ids.iter().position(|candidate| candidate == id) {
+            self.people.selected = nudge_count + index;
+            self.people.selected_person = Some(id.to_owned());
+            self.load_context(id);
+        }
+    }
+
+    /// `/` in People: edit the local roster filter. No CLI call is made
+    /// while typing.
+    fn enter_filter(&mut self) {
+        self.active_view = ActiveView::People;
+        self.input_mode = InputMode::EditingFilter;
+        self.people.editing_filter = true;
+        self.search.editing = false;
+        self.alert = None;
     }
 
     /// Run `confidant doctor --json --no-input` and update the Doctor view state.
@@ -634,10 +862,16 @@ impl<R: Runner> App<R> {
         }
     }
 
-    /// Refresh the currently active view.
+    /// Refresh the currently active view. Read-only views reload their
+    /// cached CLI result; People reloads check + roster (which preserves
+    /// the selected person).
     pub fn refresh_current(&mut self) {
         self.alert = None;
         match self.active_view {
+            ActiveView::People => {
+                self.load_check();
+                self.load_roster();
+            }
             ActiveView::Check => self.load_check(),
             ActiveView::Context => {
                 if let Some(pid) = self.context.person_id.clone() {
@@ -864,8 +1098,18 @@ impl<R: Runner> App<R> {
         self.active_view = view;
         self.input_mode = InputMode::Normal;
         self.search.editing = false;
+        self.people.editing_filter = false;
         self.alert = None;
         match view {
+            ActiveView::People => {
+                if !self.people.loaded {
+                    self.load_roster();
+                } else if self.context.context.is_none() {
+                    if let Some(id) = self.people.selected_person.clone() {
+                        self.load_context(&id);
+                    }
+                }
+            }
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
             ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
@@ -875,58 +1119,211 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Switch to a workspace, landing on its first view.
+    fn switch_workspace(&mut self, workspace: Workspace) {
+        match workspace {
+            Workspace::People => {
+                if self.active_view != ActiveView::People {
+                    self.switch_to(ActiveView::People);
+                }
+            }
+            Workspace::Review => {
+                if !matches!(
+                    self.active_view,
+                    ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts
+                ) {
+                    self.switch_to(ActiveView::Proposals);
+                }
+            }
+            Workspace::Check => {
+                if !matches!(self.active_view, ActiveView::Check | ActiveView::Doctor) {
+                    self.switch_to(ActiveView::Check);
+                }
+            }
+        }
+    }
+
+    /// `Tab`/`BackTab`: cycle the views inside the current workspace.
+    fn cycle_view(&mut self, forward: bool) {
+        let views = self.active_view.workspace().views();
+        let current = views
+            .iter()
+            .position(|view| *view == self.active_view)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % views.len()
+        } else {
+            (current + views.len() - 1) % views.len()
+        };
+        self.switch_to(views[next]);
+    }
+
+    /// `d`: Doctor is a pill, not a workspace. Toggling it returns to Check.
+    fn toggle_doctor(&mut self) {
+        if self.active_view == ActiveView::Doctor {
+            self.switch_to(ActiveView::Check);
+        } else {
+            self.switch_to(ActiveView::Doctor);
+        }
+    }
+
+    /// The vault path the status pill shows: the envelope value when a
+    /// call has answered, else the explicit `--vault` root.
+    fn vault_label(&self) -> String {
+        self.vault
+            .clone()
+            .or_else(|| {
+                self.vault_root_override
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    /// The resolved scope, from the last scoped read (`record list`).
+    fn scope_label(&self) -> String {
+        match self.scope.as_deref() {
+            Some([]) => "all enabled packs".to_owned(),
+            Some(names) => names.join(", "),
+            None => "not resolved yet".to_owned(),
+        }
+    }
+
+    /// Doctor state from the cached report; never runs doctor itself.
+    fn doctor_label(&self) -> String {
+        let Some(report) = &self.doctor.report else {
+            return "not run".to_owned();
+        };
+        let errors = report
+            .checks
+            .iter()
+            .filter(|check| check.status == "error")
+            .count();
+        let warnings = report
+            .checks
+            .iter()
+            .filter(|check| check.status == "warning")
+            .count();
+        if errors > 0 {
+            format!("{errors} error(s)")
+        } else if warnings > 0 {
+            format!("{warnings} warning(s)")
+        } else {
+            "ok".to_owned()
+        }
+    }
+
+    fn open_scope_modal(&mut self) {
+        self.info_modal = Some(InfoState::new(
+            "Scope",
+            vec![
+                format!("vault: {}", self.vault_label()),
+                format!("scope: {}", self.scope_label()),
+                "source: `confidant record list --json` (cleared set)".to_owned(),
+                String::new(),
+                "Scope is resolved by the CLI. The TUI passes no --packs, so this".to_owned(),
+                "is every enabled pack. Run the CLI with --packs to scope agent reads.".to_owned(),
+            ],
+        ));
+    }
+
+    fn open_help_modal(&mut self) {
+        self.info_modal = Some(InfoState::new(
+            "Help",
+            vec![
+                "1 People & Search    2 Review Queue    3 Check".to_owned(),
+                "/ filter people   s unified search   j/k move   Enter open".to_owned(),
+                "Tab / Shift-Tab cycle the views inside a workspace".to_owned(),
+                "o Proposals   i Inbox   c Conflicts".to_owned(),
+                "d Doctor   p Scope   ? Help   r refresh   q quit".to_owned(),
+                String::new(),
+                "People shows the cleared roster and a live context pane; nudges".to_owned(),
+                "come from the cached check report. Note editing and quick capture".to_owned(),
+                "arrive in later phases.".to_owned(),
+            ],
+        ));
+    }
+
+    /// Workspace bar, pills, and per-workspace shortcuts. Returns true when
+    /// the key was consumed. Text input modes call this only after their
+    /// own handlers, so typing `p`, `1`, or `?` stays literal.
+    fn handle_workspace_shortcut(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('1') => {
+                self.switch_workspace(Workspace::People);
+                true
+            }
+            KeyCode::Char('2') => {
+                self.switch_workspace(Workspace::Review);
+                true
+            }
+            KeyCode::Char('3') => {
+                self.switch_workspace(Workspace::Check);
+                true
+            }
+            KeyCode::Char('s') => {
+                self.switch_to(ActiveView::Search);
+                true
+            }
+            KeyCode::Char('d') => {
+                self.toggle_doctor();
+                true
+            }
+            KeyCode::Char('p') => {
+                self.open_scope_modal();
+                true
+            }
+            KeyCode::Char('?') => {
+                self.open_help_modal();
+                true
+            }
+            KeyCode::Char('o') => {
+                self.switch_to(ActiveView::Proposals);
+                true
+            }
+            KeyCode::Char('i') => {
+                self.switch_to(ActiveView::Inbox);
+                true
+            }
+            KeyCode::Char('c') => {
+                self.switch_to(ActiveView::Conflicts);
+                true
+            }
+            KeyCode::Tab => {
+                self.cycle_view(true);
+                true
+            }
+            KeyCode::BackTab => {
+                self.cycle_view(false);
+                true
+            }
+            KeyCode::Char('/')
+                if !matches!(self.active_view, ActiveView::People | ActiveView::Search) =>
+            {
+                self.enter_search();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a key event while the proposals tab is active.
     fn handle_proposals_key(&mut self, key: KeyEvent) {
         let in_export_input = matches!(
             self.proposals.opened.as_ref().map(|f| &f.phase),
             Some(FlowPhase::CleanupExportInput { .. })
         );
-        if !in_export_input {
-            match key.code {
-                KeyCode::Tab => {
-                    let next = self.active_view.next();
-                    self.switch_to(next);
-                    return;
-                }
-                KeyCode::BackTab => {
-                    let prev = self.active_view.prev();
-                    self.switch_to(prev);
-                    return;
-                }
-                KeyCode::Char('1') => {
-                    self.switch_to(ActiveView::Check);
-                    return;
-                }
-                KeyCode::Char('2') => {
-                    self.switch_to(ActiveView::Context);
-                    return;
-                }
-                KeyCode::Char('3') => {
-                    self.switch_to(ActiveView::Doctor);
-                    return;
-                }
-                KeyCode::Char('4') => {
-                    self.switch_to(ActiveView::Proposals);
-                    return;
-                }
-                KeyCode::Char('5') => {
-                    self.switch_to(ActiveView::Search);
-                    return;
-                }
-                KeyCode::Char('6') => {
-                    self.switch_to(ActiveView::Inbox);
-                    return;
-                }
-                KeyCode::Char('7') => {
-                    self.switch_to(ActiveView::Conflicts);
-                    return;
-                }
-                KeyCode::Char('/') => {
-                    self.enter_search();
-                    return;
-                }
-                _ => {}
-            }
+        // Workspace shortcuts are only honoured while browsing (or with no
+        // proposal open). In a phase modal they would escape to another
+        // workspace and leave the flow armed: gate on `Browsing` so the
+        // phase handler disarms/ignores the key instead.
+        let browsing = self
+            .proposals
+            .opened
+            .as_ref()
+            .is_none_or(|flow| matches!(flow.phase, FlowPhase::Browsing));
+        if browsing && self.handle_workspace_shortcut(key) {
+            return;
         }
         if in_export_input {
             self.handle_export_input_key(key);
@@ -1306,16 +1703,16 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        // Scope/Help modals are informational: any key closes them.
+        if self.info_modal.is_some() {
+            self.info_modal = None;
+            return;
+        }
+
+        // Proposals owns its open-flow keys and calls the workspace
+        // shortcuts itself (so its phase modals keep swallowing input).
         if self.active_view == ActiveView::Proposals {
             self.handle_proposals_key(key);
-            return;
-        }
-
-        if self.active_view == ActiveView::Inbox && self.handle_inbox_key(key) {
-            return;
-        }
-
-        if self.active_view == ActiveView::Conflicts && self.handle_conflict_key(key) {
             return;
         }
 
@@ -1344,34 +1741,54 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        if self.input_mode == InputMode::EditingFilter {
+            self.handle_filter_input(key);
+            return;
+        }
+
+        if self.active_view == ActiveView::Inbox && self.handle_inbox_key(key) {
+            return;
+        }
+
+        if self.active_view == ActiveView::Conflicts && self.handle_conflict_key(key) {
+            return;
+        }
+
+        if self.handle_workspace_shortcut(key) {
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
             }
-            KeyCode::Esc => {
-                if self.alert.is_some() {
-                    self.alert = None;
-                } else {
-                    self.should_quit = true;
+            KeyCode::Esc => match self.active_view {
+                ActiveView::People if !self.people.filter.trim().is_empty() => {
+                    self.people.filter.clear();
+                    self.people.clamp(self.check.report.as_ref());
                 }
-            }
-            KeyCode::Tab => {
-                let next = self.active_view.next();
-                self.switch_to(next);
-            }
-            KeyCode::BackTab => {
-                let prev = self.active_view.prev();
-                self.switch_to(prev);
-            }
-            KeyCode::Char('1') => self.switch_to(ActiveView::Check),
-            KeyCode::Char('2') => self.switch_to(ActiveView::Context),
-            KeyCode::Char('3') => self.switch_to(ActiveView::Doctor),
-            KeyCode::Char('4') => self.switch_to(ActiveView::Proposals),
-            KeyCode::Char('5') => self.switch_to(ActiveView::Search),
-            KeyCode::Char('6') => self.switch_to(ActiveView::Inbox),
-            KeyCode::Char('7') => self.switch_to(ActiveView::Conflicts),
+                ActiveView::People => {
+                    if self.alert.is_some() {
+                        self.alert = None;
+                    } else {
+                        self.should_quit = true;
+                    }
+                }
+                ActiveView::Search | ActiveView::Context => self.switch_to(ActiveView::People),
+                _ => {
+                    if self.alert.is_some() {
+                        self.alert = None;
+                    } else {
+                        self.should_quit = true;
+                    }
+                }
+            },
             KeyCode::Char('/') => {
-                self.enter_search();
+                if self.active_view == ActiveView::People {
+                    self.enter_filter();
+                } else {
+                    self.enter_search();
+                }
             }
             // #387: exact literal scan toggle for the unified Search tab.
             KeyCode::Char('e') if self.active_view == ActiveView::Search => {
@@ -1393,8 +1810,41 @@ impl<R: Runner> App<R> {
         }
     }
 
+    /// Text input for the local People filter. Filtering is pure; no CLI
+    /// call runs per keystroke. Enter applies the filter and activates the
+    /// row under the cursor (loading that person's context).
+    fn handle_filter_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.people.editing_filter = false;
+                self.people.filter.clear();
+                self.people.clamp(self.check.report.as_ref());
+            }
+            KeyCode::Enter => {
+                self.input_mode = InputMode::Normal;
+                self.people.editing_filter = false;
+                self.people.clamp(self.check.report.as_ref());
+                self.activate_people_selection();
+            }
+            KeyCode::Backspace => {
+                self.people.filter.pop();
+                self.people.clamp(self.check.report.as_ref());
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.people.filter.push(c);
+                self.people.clamp(self.check.report.as_ref());
+            }
+            _ => {}
+        }
+    }
+
     fn select_next(&mut self) {
         match self.active_view {
+            ActiveView::People => self.move_people_selection(1),
             ActiveView::Check => {
                 if let Some(r) = &self.check.report {
                     if !r.findings.is_empty() && self.check.selected + 1 < r.findings.len() {
@@ -1426,6 +1876,7 @@ impl<R: Runner> App<R> {
 
     fn select_prev(&mut self) {
         match self.active_view {
+            ActiveView::People => self.move_people_selection(-1),
             ActiveView::Check => {
                 self.check.selected = self.check.selected.saturating_sub(1);
             }
@@ -1444,6 +1895,10 @@ impl<R: Runner> App<R> {
     }
 
     fn activate_selected(&mut self) {
+        if self.active_view == ActiveView::People {
+            self.activate_people_selection();
+            return;
+        }
         let person_id = match self.active_view {
             ActiveView::Search => self
                 .search
@@ -1461,7 +1916,8 @@ impl<R: Runner> App<R> {
                 .and_then(|f| f.id.as_deref())
                 .filter(|id| id.starts_with("p-"))
                 .map(str::to_owned),
-            ActiveView::Context
+            ActiveView::People
+            | ActiveView::Context
             | ActiveView::Doctor
             | ActiveView::Proposals
             | ActiveView::Inbox
@@ -1485,7 +1941,7 @@ impl<R: Runner> App<R> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Min(10),
                 Constraint::Length(1),
             ])
@@ -1497,6 +1953,13 @@ impl<R: Runner> App<R> {
             alert::render(active_alert, frame, chunks[1]);
         } else {
             match self.active_view {
+                ActiveView::People => people::render(
+                    &self.people,
+                    self.check.report.as_ref(),
+                    &self.context,
+                    frame,
+                    chunks[1],
+                ),
                 ActiveView::Check => check::render(&self.check, frame, chunks[1]),
                 ActiveView::Context => context::render(&self.context, frame, chunks[1]),
                 ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
@@ -1508,51 +1971,71 @@ impl<R: Runner> App<R> {
         }
 
         Self::render_footer(frame, chunks[2]);
+        if let Some(modal) = &self.info_modal {
+            info::render(modal, frame, area);
+        }
     }
 
-    /// Borderless header: tab pills on the left, app title right-aligned.
+    /// Two-line borderless header: workspace pills + action pills, then the
+    /// cached status pills (vault, resolved scope, doctor state). Nothing
+    /// here runs the CLI.
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(18)])
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(area);
 
+        let nav = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(34)])
+            .split(rows[0]);
+
+        let active = self.active_view.workspace();
         let mut spans = Vec::new();
-        for v in [
-            ActiveView::Check,
-            ActiveView::Context,
-            ActiveView::Doctor,
-            ActiveView::Proposals,
-            ActiveView::Search,
-            ActiveView::Inbox,
-            ActiveView::Conflicts,
-        ] {
+        for workspace in [Workspace::People, Workspace::Review, Workspace::Check] {
             if !spans.is_empty() {
                 spans.push(Span::raw(" "));
             }
-            spans.push(theme::tab_pill(v.label(), v == self.active_view));
+            spans.push(theme::tab_pill(workspace.label(), workspace == active));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), nav[0]);
 
-        let title = Paragraph::new(Line::from(Span::styled(
-            "confidant-tui v1",
-            Style::default().fg(theme::palette::MUTED),
-        )))
-        .alignment(Alignment::Right);
-        frame.render_widget(title, chunks[1]);
+        let modal_title = self.info_modal.as_ref().map(|modal| modal.title.as_str());
+        let actions = Line::from(vec![
+            theme::tab_pill("[d] Doctor", self.active_view == ActiveView::Doctor),
+            Span::raw(" "),
+            theme::tab_pill("[p] Scope", modal_title == Some("Scope")),
+            Span::raw(" "),
+            theme::tab_pill("[?] Help", modal_title == Some("Help")),
+        ]);
+        frame.render_widget(Paragraph::new(actions).alignment(Alignment::Right), nav[1]);
+
+        let status = Line::from(vec![
+            theme::label("vault "),
+            theme::pill(&compact_path(&self.vault_label(), 36)),
+            Span::raw("  "),
+            theme::label("scope "),
+            theme::pill(&self.scope_label()),
+            Span::raw("  "),
+            theme::label("doctor "),
+            theme::pill(&self.doctor_label()),
+        ]);
+        frame.render_widget(Paragraph::new(status), rows[1]);
     }
 
     /// Borderless one-line footer with key badges and action labels.
     fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         let mut spans = Vec::new();
         for (key, label) in [
-            ("Tab/1-7", "view"),
-            ("/", "search"),
-            ("e", "exact"),
+            ("1-3", "ws"),
+            ("Tab", "view"),
+            ("/", "filter"),
+            ("s", "search"),
             ("j/k", "move"),
-            ("Enter", "context"),
+            ("Enter", "open"),
             ("r", "refresh"),
-            ("q/Esc", "quit"),
+            ("?", "help"),
+            ("q", "quit"),
         ] {
             spans.push(theme::key_badge(key));
             spans.push(theme::key_hint(label));
@@ -1764,6 +2247,17 @@ impl<R: Runner> App<R> {
     }
 }
 
+/// Shorten a status-pill path from the left, keeping the most specific
+/// trailing components. The full path stays in the Scope modal.
+fn compact_path(path: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max_chars {
+        return path.to_owned();
+    }
+    let tail: String = chars[chars.len() - (max_chars - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
 /// Pure check behind [`App::qmd_available`], taking its inputs explicitly
 /// so tests can control them without touching the process environment.
 fn qmd_available_on(
@@ -1784,6 +2278,16 @@ fn qmd_available_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_path_keeps_short_paths_and_tail_of_long_ones() {
+        assert_eq!(compact_path("/fake/demo-vault", 36), "/fake/demo-vault");
+        let long = "/home/operator/some/deeply/nested/worktree/examples/demo-vault";
+        let compact = compact_path(long, 20);
+        assert_eq!(compact.chars().count(), 20);
+        assert!(compact.starts_with('…'));
+        assert!(compact.ends_with("demo-vault"));
+    }
 
     #[test]
     fn qmd_available_needs_qmd_on_path_and_corpus() {

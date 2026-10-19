@@ -55,6 +55,15 @@ pub fn key_badge(key: &str) -> Span<'_> {
     )
 }
 
+/// A compact value pill, e.g. a front-matter value (`p-…`, a scope name)
+/// or a status value. Gray background, black text.
+pub fn pill(text: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {text} "),
+        Style::default().fg(Color::Black).bg(Color::Gray),
+    )
+}
+
 /// The action label next to a [`key_badge`]: dim text.
 pub fn key_hint(label: &str) -> Span<'_> {
     Span::styled(format!(" {label} "), muted())

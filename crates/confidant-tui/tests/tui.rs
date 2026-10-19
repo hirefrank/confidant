@@ -152,6 +152,8 @@ fn contract_goldens_deserialize_and_render_in_check_view() {
         let fake = FakeRunner::from_json(1, &raw_json);
         let mut app = App::new(fake);
         app.load_check();
+        // The Check workspace is `3`; phase 1 defaults to People.
+        app.handle_key(key(KeyCode::Char('3')));
         assert!(app.alert.is_none());
         assert!(app.blocking_alert.is_none());
 
@@ -275,9 +277,9 @@ fn search_context_and_doctor_views_snapshot() {
     let mut app = App::new(fake);
     app.set_vault_root(vault_root.path().to_path_buf());
 
-    // Unified Search tab (#387): switch with `5`, toggle exact literal
+    // Unified Search tab (#387): switch with `s`, toggle exact literal
     // scan with `e`, then press `/`, type, Enter.
-    app.handle_key(key(KeyCode::Char('5')));
+    app.handle_key(key(KeyCode::Char('s')));
     assert_eq!(app.active_view, ActiveView::Search);
     app.handle_key(key(KeyCode::Char('e')));
     assert!(app.search.exact);
@@ -300,11 +302,11 @@ fn search_context_and_doctor_views_snapshot() {
     assert_eq!(app.active_view, ActiveView::Context);
     let context_rendered = render_to_string(&app);
     assert!(context_rendered.contains("Ada Example"));
-    assert!(context_rendered.contains("sessions_remaining: 5"));
+    assert!(context_rendered.contains("sessions_remaining 5"));
     assert_snapshot("context_view.snap", &context_rendered);
 
-    // Switch to Doctor view with `3` (tabs renumbered 7 -> 6).
-    app.handle_key(key(KeyCode::Char('3')));
+    // Switch to Doctor view with `d` (a pill, not a workspace).
+    app.handle_key(key(KeyCode::Char('d')));
     assert_eq!(app.active_view, ActiveView::Doctor);
     let doctor_rendered = render_to_string(&app);
     assert!(doctor_rendered.contains("vault-discovery"));
@@ -485,6 +487,8 @@ fn live_shape_against_demo_vault_check_find_context_doctor() {
     // Check view on demo vault renders "0 findings".
     let mut app = App::new(runner);
     app.load_check();
+    // Phase 1 defaults to People; switch to the Check workspace.
+    app.handle_key(key(KeyCode::Char('3')));
     let check_screen = render_to_string(&app);
     assert!(
         check_screen.contains("0 findings"),
@@ -517,7 +521,7 @@ fn live_find_omits_no_ai_people_in_tui() {
 // Proposal review (Phase 2, #211)
 // ---------------------------------------------------------------------------
 
-use confidant_tui::apply::{ApplyFlow, StepApplyOutcome, StepStatus};
+use confidant_tui::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use confidant_tui::proposals::read_progress;
 
 fn proposals_temp_dir(name: &str) -> PathBuf {
@@ -581,7 +585,7 @@ fn check_blocked_json() -> &'static str {
 fn open_proposals_app(dir: &Path, runner: FakeRunner) -> App<FakeRunner> {
     let mut app = App::new(runner);
     app.set_vault_root(dir.to_path_buf());
-    app.handle_key(key(KeyCode::Char('4')));
+    app.handle_key(key(KeyCode::Char('o')));
     assert_eq!(app.active_view, ActiveView::Proposals);
     app
 }
@@ -802,7 +806,7 @@ fn proposals_list_shows_counts_from_lightfield_proposer() {
 
     let mut app = App::new(FakeRunner::new());
     app.set_vault_root(dir.clone());
-    app.handle_key(key(KeyCode::Char('4')));
+    app.handle_key(key(KeyCode::Char('o')));
     assert_eq!(app.proposals.entries.len(), 1);
     let entry = &app.proposals.entries[0];
     assert_eq!(entry.skill, "lightfield-import");
@@ -1008,7 +1012,7 @@ fn inbox_empty_json() -> &'static str {
 fn inbox_dry_run_renders_items_warnings_and_skipped() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     let rendered = render_to_string(&app);
     assert!(rendered.contains("01JAAA"), "item name shown:\n{rendered}");
@@ -1029,7 +1033,7 @@ fn inbox_dry_run_renders_items_warnings_and_skipped() {
 fn inbox_empty_renders_nothing_to_do() {
     let fake = FakeRunner::from_json(0, inbox_empty_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     let rendered = render_to_string(&app);
     assert!(
         rendered.contains("nothing to do"),
@@ -1050,7 +1054,7 @@ fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
     fake.push_response(0, inbox_empty_json().as_bytes().to_vec());
 
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     // Begin apply: confirm modal opens.
     app.handle_key(key(KeyCode::Char('a')));
     assert!(app.inbox.confirming, "confirm modal open");
@@ -1088,7 +1092,7 @@ fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
 fn inbox_apply_cancel_does_not_run_real_inbox() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     app.handle_key(key(KeyCode::Char('a')));
     assert!(app.inbox.confirming);
     // Any key other than y cancels.
@@ -1105,43 +1109,43 @@ fn inbox_apply_cancel_does_not_run_real_inbox() {
 fn inbox_apply_with_no_items_does_not_open_confirm() {
     let fake = FakeRunner::from_json(0, inbox_empty_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     app.handle_key(key(KeyCode::Char('a')));
     assert!(!app.inbox.confirming, "no confirm when nothing to apply");
 }
 
 #[test]
 fn inbox_tab_falls_through_to_shared_navigation() {
-    // Tab from Inbox advances to Conflicts.
+    // Tab from Inbox advances within the Review workspace.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.active_view, ActiveView::Conflicts);
 
-    // Tab from Conflicts wraps around to Check.
+    // Tab from Conflicts wraps around to Proposals.
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.active_view, ActiveView::Check);
-
-    // `4` from Inbox switches to Proposals.
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
-    app.handle_key(key(KeyCode::Char('4')));
     assert_eq!(app.active_view, ActiveView::Proposals);
 
-    // Shift-Tab from Inbox steps back to Search.
+    // `o` from Inbox switches to Proposals.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
+    app.handle_key(key(KeyCode::Char('o')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+
+    // Shift-Tab from Inbox steps back to Proposals in the Review cycle.
+    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
+    let mut app = App::new(fake);
+    app.handle_key(key(KeyCode::Char('i')));
     app.handle_key(key(KeyCode::BackTab));
-    assert_eq!(app.active_view, ActiveView::Search);
+    assert_eq!(app.active_view, ActiveView::Proposals);
 
     // Esc with no alert quits.
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     app.handle_key(key(KeyCode::Esc));
     assert!(app.should_quit, "Esc quits from the inbox tab");
 }
@@ -1150,7 +1154,7 @@ fn inbox_tab_falls_through_to_shared_navigation() {
 fn inbox_q_quits() {
     let fake = FakeRunner::from_json(0, inbox_dry_run_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     assert_eq!(app.active_view, ActiveView::Inbox);
     app.handle_key(key(KeyCode::Char('q')));
     assert!(app.should_quit, "q quits from the inbox tab");
@@ -1191,7 +1195,7 @@ fn inbox_live_dry_run_empty_vault() {
         .with_env("CONFIDANT_KEYCHAIN", "off")
         .with_env("HOME", home.path().to_string_lossy().to_string());
     let mut app = App::new(runner);
-    app.handle_key(key(KeyCode::Char('6')));
+    app.handle_key(key(KeyCode::Char('i')));
     let report = app.inbox.report.as_ref().expect("report loaded");
     assert!(report.empty, "no inbox branch -> empty");
     assert!(report.dry_run);
@@ -1525,7 +1529,7 @@ fn conflict_take_runner() -> FakeRunner {
 }
 
 fn open_conflict_detail(app: &mut App<FakeRunner>) {
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('c')));
     assert_eq!(app.active_view, ActiveView::Conflicts);
     app.handle_key(key(KeyCode::Enter));
     assert!(app.conflict.detail.is_some(), "detail loaded after Enter");
@@ -1535,7 +1539,7 @@ fn open_conflict_detail(app: &mut App<FakeRunner>) {
 fn conflict_list_snapshot() {
     let fake = FakeRunner::from_json(0, conflict_check_json());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('c')));
     assert_eq!(app.active_view, ActiveView::Conflicts);
     // Two E_MERGE_CONFLICT findings with ids; the ledger one (no id) is filtered out.
     assert_eq!(app.conflict.entries.len(), 2);
@@ -1671,7 +1675,7 @@ fn conflict_cli_error_shows_alert() {
     fake.push_response(0, conflict_check_json().as_bytes().to_vec());
     fake.push_response(1, conflict_cli_error_json().as_bytes().to_vec());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('c')));
     app.handle_key(key(KeyCode::Enter));
     assert!(app.alert.is_some(), "alert shown on CLI error");
     assert!(app.conflict.detail.is_none(), "no detail on CLI error");
@@ -1689,7 +1693,7 @@ fn conflict_old_cli_shows_upgrade_alert() {
     // Exit 2 with no JSON: unknown subcommand on an older CLI.
     fake.push_response(2, b"".to_vec());
     let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('c')));
     app.handle_key(key(KeyCode::Enter));
     let rendered = render_to_string(&app);
     assert!(
@@ -1798,17 +1802,19 @@ fn conflict_view_never_renders_labels_as_record_names() {
 fn conflict_tab_navigation() {
     let fake = FakeRunner::from_json(0, conflict_check_json());
     let mut app = App::new(fake);
-    // `7` switches to Conflicts.
-    app.handle_key(key(KeyCode::Char('7')));
+    // `c` switches to Conflicts.
+    app.handle_key(key(KeyCode::Char('c')));
     assert_eq!(app.active_view, ActiveView::Conflicts);
-    // Tab wraps around to Check; Shift-Tab steps back to Inbox.
+    // Tab wraps within Review: Conflicts -> Proposals; Shift-Tab steps
+    // back to Inbox.
     app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.active_view, ActiveView::Check);
-    app.handle_key(key(KeyCode::Char('7')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
     app.handle_key(key(KeyCode::BackTab));
     assert_eq!(app.active_view, ActiveView::Inbox);
     // `q` quits from the conflicts tab.
-    app.handle_key(key(KeyCode::Char('7')));
+    app.handle_key(key(KeyCode::Char('c')));
     app.handle_key(key(KeyCode::Char('q')));
     assert!(app.should_quit, "q quits from the conflicts tab");
 }
@@ -1823,4 +1829,480 @@ fn conflict_esc_from_detail_returns_to_list() {
     app.handle_key(key(KeyCode::Esc));
     assert!(app.conflict.detail.is_none(), "Esc closes the detail view");
     assert_eq!(app.active_view, ActiveView::Conflicts);
+}
+
+// ---------------------------------------------------------------------------
+// People & Search workspace (TUI-v2 phase 1, #556)
+// ---------------------------------------------------------------------------
+
+const ADA: &str = "p-01M3TC5H00MPJG000000000000";
+const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
+
+fn people_roster_json() -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "kind": "person",
+        "for_operator": false,
+        "records": [
+            {"id": ADA, "name": "Ada Example", "no_ai": "false", "kind": "person"},
+            {"id": BEA, "name": "Bea Demo", "no_ai": "false", "kind": "person"}
+        ],
+        "scope": ["coaching@0.1"],
+        "skipped_encrypted": 0,
+        "refused_envelopes": 0
+    })
+    .to_string()
+}
+
+fn people_context_json(id: &str, name: &str, profile: &str) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "person": {"id": id, "name": name, "no_ai": false, "profile": profile},
+        "notes": [
+            {"id": "n-01M3TC5H00MPJG002NAM000005", "date": "2026-10-01",
+             "body": format!("Fake note about {name}.")}
+        ],
+        "interactions": [
+            {"id": "i-01M3TC5H00MPJG0048H0000008", "date": "2026-09-25",
+             "title": "Intro call", "body": "Fake intro call transcript."}
+        ],
+        "touchpoints": [{"date": "2026-10-05", "kind": "call"}],
+        "coaching": {
+            "sessions_remaining": 5,
+            "icf_hours": 1.0,
+            "recent_sessions": [
+                {"date": "2026-10-01", "duration_minutes": 60, "tag": "paid"}
+            ]
+        },
+        "packs": {},
+        "aliases": ["hmac:0123456789abcdef0123456789abcdef"],
+        "skipped_encrypted": 0,
+        "refused_envelopes": 0,
+        "scope": ["coaching@0.1"]
+    })
+    .to_string()
+}
+
+fn people_check_json() -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "ok": false,
+        "vault": "/fake/demo-vault",
+        "spec": "0.1",
+        "summary": {"errors": 0, "warnings": 1, "records": 2, "ledger_entries": 0},
+        "findings": [
+            {"code": "W_DATE_UPCOMING", "severity": "warning", "id": ADA,
+             "message": "birthday in 3 days"}
+        ]
+    })
+    .to_string()
+}
+
+fn doctor_ok_json() -> &'static str {
+    r#"{
+        "schema_version": "1", "ok": true, "vault": "/fake/demo-vault",
+        "checks": [
+            {"id": "vault-discovery", "status": "ok", "message": "vault resolved"},
+            {"id": "spec", "status": "ok", "message": "vault spec 0.1 supported"}
+        ]
+    }"#
+}
+
+fn people_runner() -> FakeRunner {
+    FakeRunner::new()
+        .with_response("check", 0, people_check_json())
+        .with_response("record", 0, people_roster_json())
+        .with_response(
+            "context",
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        )
+}
+
+#[test]
+fn people_workspace_is_default_with_roster_nudges_and_live_context() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+
+    assert_eq!(app.active_view, ActiveView::People);
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    // One nudge, then the first person row.
+    assert_eq!(app.people.selected, 1);
+
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("1 People & Search"), "{rendered}");
+    assert!(rendered.contains("2 Review Queue"), "{rendered}");
+    assert!(rendered.contains("3 Check"), "{rendered}");
+    assert!(rendered.contains("Needs Attention (1)"), "{rendered}");
+    assert!(rendered.contains("W_DATE_UPCOMING"), "{rendered}");
+    assert!(rendered.contains("Ada Example"), "{rendered}");
+    assert!(rendered.contains("Bea Demo"), "{rendered}");
+    assert!(rendered.contains("Context — Ada Example"), "{rendered}");
+    assert!(rendered.contains("sessions_remaining 5"), "{rendered}");
+    assert!(
+        rendered.contains("Fake note about Ada Example."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("vault  /fake/demo-vault"), "{rendered}");
+    assert!(rendered.contains("scope  coaching@0.1"), "{rendered}");
+    assert!(rendered.contains("doctor  not run"), "{rendered}");
+    assert_snapshot("people_master_detail.snap", &rendered);
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls.iter().any(|call| {
+            call == &vec![
+                "record".to_owned(),
+                "list".to_owned(),
+                "--kind".to_owned(),
+                "person".to_owned(),
+            ]
+        }),
+        "roster call issued: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| { call == &vec!["context".to_owned(), "--".to_owned(), ADA.to_owned()] }),
+        "first person's context loaded: {calls:?}"
+    );
+}
+
+#[test]
+fn people_filter_is_local_and_enter_loads_the_selected_person() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    // Queue Bea's context; it is consumed by the Enter below, not by typing.
+    app.runner.push_response(
+        0,
+        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
+    );
+    let before = app.runner.recorded_calls().len();
+
+    app.handle_key(key(KeyCode::Char('/')));
+    assert_eq!(app.input_mode, InputMode::EditingFilter);
+    for ch in "Bea".chars() {
+        app.handle_key(key(KeyCode::Char(ch)));
+    }
+    assert_eq!(app.people.filter, "Bea");
+    // Typing is pure: no CLI call at all.
+    assert_eq!(app.runner.recorded_calls().len(), before);
+    let filtered = render_to_string(&app);
+    assert!(filtered.contains("People (1)"), "{filtered}");
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert_eq!(app.people.selected_person.as_deref(), Some(BEA));
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("Context — Bea Demo"), "{rendered}");
+    assert!(
+        rendered.contains("Fake pay-per-session client."),
+        "{rendered}"
+    );
+    assert!(app
+        .runner
+        .recorded_calls()
+        .iter()
+        .any(|call| { call == &vec!["context".to_owned(), "--".to_owned(), BEA.to_owned()] }));
+}
+
+#[test]
+fn nudge_enter_focuses_the_person_the_finding_names() {
+    let check = serde_json::json!({
+        "schema_version": "1", "ok": false, "vault": "/fake/demo-vault", "spec": "0.1",
+        "summary": {"errors": 0, "warnings": 1, "records": 2, "ledger_entries": 0},
+        "findings": [
+            {"code": "W_CADENCE_OVERDUE", "severity": "warning", "id": BEA,
+             "message": "no touchpoint in 45 days"}
+        ]
+    })
+    .to_string();
+    let fake = FakeRunner::new()
+        .with_response("check", 0, check)
+        .with_response("record", 0, people_roster_json())
+        .with_response(
+            "context",
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        );
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.runner.push_response(
+        0,
+        people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
+    );
+
+    // Initial selection is the first person, below the nudge.
+    assert_eq!(app.people.selected, 1);
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.people.selected, 0);
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.people.selected, 2, "nudge + Ada row, then Bea row");
+    assert_eq!(app.people.selected_person.as_deref(), Some(BEA));
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("Context — Bea Demo"), "{rendered}");
+}
+
+#[test]
+fn status_pills_use_cached_results_and_do_not_call_the_cli_per_key() {
+    let fake = people_runner().with_response("doctor", 0, doctor_ok_json());
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    let before = app.runner.recorded_calls().len();
+
+    app.handle_key(key(KeyCode::Char('d')));
+    assert_eq!(app.active_view, ActiveView::Doctor);
+    assert!(app.doctor.report.is_some(), "doctor loaded once by `d`");
+    let doctor_calls = app
+        .runner
+        .recorded_calls()
+        .iter()
+        .filter(|call| call.first().map(String::as_str) == Some("doctor"))
+        .count();
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("doctor  ok"), "{rendered}");
+
+    // Moving the People cursor loads context for the newly selected person,
+    // but never re-runs record list or doctor.
+    app.handle_key(key(KeyCode::Char('1')));
+    app.handle_key(key(KeyCode::Char('j')));
+    let calls = app.runner.recorded_calls();
+    let record_calls = calls
+        .iter()
+        .filter(|call| call.first().map(String::as_str) == Some("record"))
+        .count();
+    assert_eq!(record_calls, 1, "no roster reload per key: {calls:?}");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.first().map(String::as_str) == Some("doctor"))
+            .count(),
+        doctor_calls,
+        "no doctor rerun per key: {calls:?}"
+    );
+    assert!(
+        calls.len() > before,
+        "the person move did load context: {calls:?}"
+    );
+}
+
+#[test]
+fn workspace_shortcuts_keep_proposals_inbox_conflicts_and_check_reachable() {
+    let vault = tempfile::tempdir().expect("temp vault");
+    let fake = people_runner().with_response("inbox", 0, inbox_empty_json());
+    let mut app = App::new(fake);
+    app.set_vault_root(vault.path().to_path_buf());
+
+    app.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+    assert_eq!(
+        app.active_view.workspace(),
+        confidant_tui::app::Workspace::Review
+    );
+
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Inbox);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.active_view, ActiveView::Conflicts);
+
+    app.handle_key(key(KeyCode::Char('3')));
+    assert_eq!(app.active_view, ActiveView::Check);
+    app.handle_key(key(KeyCode::Char('1')));
+    assert_eq!(app.active_view, ActiveView::People);
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+}
+
+#[test]
+fn scope_and_help_pills_open_cached_modals_without_cli_calls() {
+    let mut app = App::new(people_runner());
+    app.load_check();
+    app.load_roster();
+    let before = app.runner.recorded_calls().len();
+
+    app.handle_key(key(KeyCode::Char('p')));
+    assert!(app.info_modal.is_some(), "scope modal open");
+    let scope = render_to_string(&app);
+    assert!(scope.contains("Scope"), "{scope}");
+    assert!(scope.contains("coaching@0.1"), "{scope}");
+    assert!(scope.contains("source:"), "{scope}");
+    assert_eq!(app.runner.recorded_calls().len(), before, "no CLI call");
+
+    // Any key dismisses the informational modal.
+    app.handle_key(key(KeyCode::Char('x')));
+    assert!(app.info_modal.is_none());
+
+    app.handle_key(key(KeyCode::Char('?')));
+    assert!(app.info_modal.is_some(), "help modal open");
+    let help = render_to_string(&app);
+    assert!(help.contains("Help"), "{help}");
+    assert!(help.contains("1 People & Search"), "{help}");
+    assert_eq!(app.runner.recorded_calls().len(), before, "no CLI call");
+}
+
+#[test]
+fn live_roster_against_demo_vault_omits_no_ai_people() {
+    let runner =
+        ProcessRunner::new(confidant_bin(), Some(demo_vault())).with_env("CONFIDANT_OFFLINE", "1");
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+
+    let roster = app.people.roster.as_ref().expect("roster loaded");
+    let names: Vec<&str> = roster
+        .records
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Ada Example", "Bea Demo"]);
+    assert!(!names.contains(&"Cam Sample"), "no-ai person must stay out");
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("Context — Ada Example"), "{rendered}");
+    assert!(rendered.contains("scope  coaching@0.1"), "{rendered}");
+}
+
+fn check_cli_error_json() -> &'static str {
+    r#"{
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "error": {
+            "code": "E_LEDGER_UNREADABLE",
+            "message": "1 items",
+            "fix": "Fix permissions, then run `confidant check` again"
+        }
+    }"#
+}
+
+#[test]
+fn people_needs_attention_reports_check_not_loaded() {
+    // A failed startup check followed by a successful roster load must not
+    // read as "Nothing needs attention": the report is unknown, not clean.
+    let fake = FakeRunner::new()
+        .with_response("check", 1, check_cli_error_json())
+        .with_response("record", 0, people_roster_json())
+        .with_response(
+            "context",
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        );
+    let mut app = App::new(fake);
+    app.load_check();
+    assert!(app.check.report.is_none(), "failed check leaves no report");
+    app.load_roster();
+
+    let rendered = render_to_string(&app);
+    assert!(
+        rendered.contains("check not loaded (press r)"),
+        "unknown check state must say so:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Nothing needs attention."),
+        "must not claim all-clear without a report:\n{rendered}"
+    );
+    assert!(rendered.contains("Ada Example"), "roster still renders");
+}
+
+#[test]
+fn failed_check_refresh_clears_a_stale_report() {
+    let fake = FakeRunner::new();
+    // Interleaved order: check, roster, context, failing check, roster, context.
+    fake.push_response(0, people_check_json());
+    fake.push_response(0, people_roster_json());
+    fake.push_response(
+        0,
+        people_context_json(ADA, "Ada Example", "Fake coaching client."),
+    );
+    fake.push_response(1, check_cli_error_json());
+    fake.push_response(0, people_roster_json());
+    fake.push_response(
+        0,
+        people_context_json(ADA, "Ada Example", "Fake coaching client."),
+    );
+
+    let mut app = App::new(fake);
+    app.load_check();
+    assert!(app.check.report.is_some(), "first check succeeded");
+    app.load_roster();
+    let with_nudge = render_to_string(&app);
+    assert!(with_nudge.contains("W_DATE_UPCOMING"), "{with_nudge}");
+
+    app.load_check();
+    assert!(
+        app.check.report.is_none(),
+        "a failed refresh must clear the stale report"
+    );
+    // The roster reload clears the check-error alert so the pane renders.
+    app.load_roster();
+    let stale = render_to_string(&app);
+    assert!(stale.contains("check not loaded (press r)"), "{stale}");
+    assert!(
+        !stale.contains("W_DATE_UPCOMING"),
+        "stale nudge must not survive a failed refresh:\n{stale}"
+    );
+    assert!(
+        !stale.contains("Nothing needs attention."),
+        "must not claim all-clear after a failed refresh:\n{stale}"
+    );
+}
+
+#[test]
+fn pending_apply_confirm_is_not_escaped_by_workspace_shortcuts() {
+    let dir = proposals_temp_dir("tui-test-proposals-confirm-gate");
+    write_test_manifest(&dir, "portal-20261015T000000Z", "");
+    let fake = FakeRunner::new()
+        .with_response("import", 0, dry_run_import_json())
+        .with_response("record", 0, people_roster_json())
+        .with_response(
+            "context",
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        );
+    let mut app = App::new(fake);
+    app.set_vault_root(dir.clone());
+    app.handle_key(key(KeyCode::Char('o')));
+    assert_eq!(app.active_view, ActiveView::Proposals);
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('a')));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(
+        matches!(
+            app.proposals.opened.as_ref().map(|flow| &flow.phase),
+            Some(FlowPhase::Confirm { .. })
+        ),
+        "confirm modal is armed"
+    );
+
+    // `1` must not escape to People while the confirm is armed; the phase
+    // handler cancels back to the diff instead.
+    app.handle_key(key(KeyCode::Char('1')));
+    assert_eq!(
+        app.active_view,
+        ActiveView::Proposals,
+        "workspace shortcut escaped an armed confirm"
+    );
+    assert!(
+        matches!(
+            app.proposals.opened.as_ref().map(|flow| &flow.phase),
+            Some(FlowPhase::Diff { .. })
+        ),
+        "confirm was disarmed, not left pending"
+    );
+
+    // Esc back to browsing, then the workspace shortcut works.
+    app.handle_key(key(KeyCode::Esc));
+    app.handle_key(key(KeyCode::Char('1')));
+    assert_eq!(app.active_view, ActiveView::People);
+    fs::remove_dir_all(&dir).unwrap();
 }

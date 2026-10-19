@@ -1,24 +1,24 @@
- 1:Check   2:Context   3:Doctor   4:Proposals   5:Search   6:Inbox   7:Conflicts    confidant-tui v1
+ 1 People & Search   2 Review Queue   3 Check                      [d] Doctor   [p] Scope   [?] Help
+vault  /fake/demo-vault   scope  coaching@0.1   doctor  not run
 ╭ Person Context ──────────────────────────────────────────────────────────────────────────────────╮
-│ person p-01M3TC5H00MPJG000000000000  name Ada Example                                            │
-│ scope coaching@0.1                                                                               │
+│ id  p-01M3TC5H00MPJG000000000000  name  Ada Example                                              │
+│ scope  coaching@0.1                                                                              │
 │ profile Fake executive coaching client at Acme Corp.                                             │
-│ coaching: sessions_remaining: 5 | icf_hours: 1.00                                                │
-│   2026-10-01 (60m, paid)                                                                         │
+│ coaching  sessions_remaining 5   icf_hours 1.00                                                  │
+│    2026-10-01  60m, paid                                                                         │
 │ notes (1)                                                                                        │
-│   n-01M3TC5H00MPJG002NAM000005 [2026-10-01]: Kickoff session notes for Ada Example.              │
+│    2026-10-01  n-01M3TC5H00MPJG002NAM000005                                                      │
+│     Kickoff session notes for Ada Example.                                                       │
 │ interactions (1)                                                                                 │
-│   i-01M3TC5H00MPJG0048H0000008 [2026-09-25] Intro call: Fake intro call transcript.              │
+│    2026-09-25  Intro call i-01M3TC5H00MPJG0048H0000008                                           │
+│     Fake intro call transcript.                                                                  │
 │ touchpoints (1)                                                                                  │
-│   2026-10-05 (kind: call)                                                                        │
+│    2026-10-05  call                                                                              │
 │ aliases (1) hmac:0123456789abcdef0123456789abcdef                                                │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tab/1-7  view  /  search  e  exact  j/k  move  Enter  context  r  refresh  q/Esc  quit
+ 1-3  ws  Tab  view  /  filter  s  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit
