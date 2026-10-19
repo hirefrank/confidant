@@ -525,7 +525,19 @@ use confidant_tui::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus};
 use confidant_tui::proposals::read_progress;
 
 fn proposals_temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(name);
+    proposals_temp_dir_at(&std::env::temp_dir(), name)
+}
+
+/// [`proposals_temp_dir`] under an explicit root.
+///
+/// #581: the dry-run snapshot prints the vault path in the header, which is
+/// truncated from the left when it is too wide. `std::env::temp_dir()` is
+/// `/var/folders/...` on macOS, so the snapshot test pins its vault to the
+/// short `/tmp/...` form that renders identically on Linux and macOS, the same
+/// way the conflict and inbox snapshots already use literal `/tmp/` paths.
+/// Every other proposals test keeps the platform temp dir.
+fn proposals_temp_dir_at(root: &Path, name: &str) -> PathBuf {
+    let dir = root.join(name);
     if dir.exists() {
         fs::remove_dir_all(&dir).expect("remove old temp dir");
     }
@@ -592,7 +604,9 @@ fn open_proposals_app(dir: &Path, runner: FakeRunner) -> App<FakeRunner> {
 
 #[test]
 fn proposals_dry_run_renders_path_action_and_content() {
-    let dir = proposals_temp_dir("tui-test-proposals-dryrun");
+    // #581: pinned root so the header's vault pill is identical on Linux and
+    // macOS; see `proposals_temp_dir_at`.
+    let dir = proposals_temp_dir_at(Path::new("/tmp"), "tui-test-proposals-dryrun");
     write_test_manifest(&dir, "portal-20261015T000000Z", "");
 
     let fake = FakeRunner::new().with_response("import", 0, dry_run_import_json());
