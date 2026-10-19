@@ -60,6 +60,7 @@ fn skill_ids() -> Vec<&'static str> {
     vec![
         "capture-gap-summary",
         "lightfield-import",
+        "pack-author",
         "portal-sync",
         "qmd-search",
         "transcript-import",
@@ -71,7 +72,7 @@ fn setup_links_all_skills_as_symlinks() {
     let env = fresh_env();
     let (ok, v, _) = run(&["setup", "--agent", "all", "--json"], &env, &[]);
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 5, "{v}");
+    assert_eq!(v["linked"], 6, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     for id in skill_ids() {
@@ -284,7 +285,12 @@ fn setup_marks_all_bin_dirs_executable() {
         let version_dir = PathBuf::from(v["skills_dir"].as_str().unwrap());
         for skill in skill_ids() {
             let bin = version_dir.join(skill).join("bin");
-            for entry in std::fs::read_dir(&bin).unwrap().flatten() {
+            // `pack-author` is text-only, so only skills with a bin/ dir
+            // have executables to check.
+            let Ok(entries) = std::fs::read_dir(&bin) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let mode = entry.metadata().unwrap().permissions().mode();
                 assert!(mode & 0o111 != 0, "{:?} should be +x: {v}", entry.path());
             }
@@ -517,6 +523,7 @@ fn routing_prints_snippet() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("portal-sync"), "{stdout:?}");
+    assert!(stdout.contains("pack-author"), "{stdout:?}");
 }
 
 #[test]
@@ -529,7 +536,7 @@ fn update_offline_relinks_without_network() {
         &[("CONFIDANT_OFFLINE", "1")],
     );
     assert!(ok, "{v}");
-    assert_eq!(v["linked"], 5, "{v}");
+    assert_eq!(v["linked"], 6, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 }
 
@@ -1092,7 +1099,7 @@ fn setup_json_next_steps_are_additive() {
     assert_eq!(v["next_steps"]["vault_set"], true, "{v}");
     assert!(v["next_steps"]["vault_export"].is_null(), "{v}");
     // Existing contract intact.
-    assert_eq!(v["linked"], 5, "{v}");
+    assert_eq!(v["linked"], 6, "{v}");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"), "{v}");
 }
 
@@ -1166,7 +1173,7 @@ fn setup_json_reports_qmd_availability_additively() {
     assert_eq!(v["next_steps"]["qmd_available"], false, "{v}");
     let note = v["next_steps"]["qmd_note"].as_str().expect("qmd_note");
     assert!(note.contains("confidant find"), "{v}");
-    assert_eq!(v["linked"], 5, "{v}");
+    assert_eq!(v["linked"], 6, "{v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,7 +1275,7 @@ fn setup_dry_run_json_reports_planned_counts() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["linked"], 48, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     // Nothing materialized or linked.
     assert!(
@@ -1292,8 +1299,8 @@ fn setup_counts_shared_agent_dir_once() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
 
-    // 9 agent entries, 8 distinct dirs, 5 skills each.
-    assert_eq!(v["linked"], 40, "{v}");
+    // 9 agent entries, 8 distinct dirs, 6 skills each.
+    assert_eq!(v["linked"], 48, "{v}");
     assert_eq!(v["skipped"], 0, "{v}");
     assert!(
         v["agents"]
@@ -1307,7 +1314,7 @@ fn setup_counts_shared_agent_dir_once() {
     // The shared dir got one link per skill, not two.
     let shared = std::path::Path::new(&env.home).join(".agents/skills");
     let entries: Vec<_> = std::fs::read_dir(&shared).unwrap().flatten().collect();
-    assert_eq!(entries.len(), 5, "shared dir linked twice: {v}");
+    assert_eq!(entries.len(), 6, "shared dir linked twice: {v}");
     for entry in entries {
         assert!(entry.path().is_symlink(), "{:?}", entry.path());
     }
@@ -1356,7 +1363,7 @@ fn agents_human_lists_all_nine_before_setup() {
             r.stdout
         );
     }
-    assert!(r.stdout.contains("0/5"), "{}", r.stdout);
+    assert!(r.stdout.contains("0/6"), "{}", r.stdout);
     assert!(
         r.stdout
             .contains("`confidant setup --agent <name>` or `confidant setup --agent auto`"),
@@ -1415,7 +1422,7 @@ fn update_dry_run_writes_nothing() {
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     let v: Value = serde_json::from_str(&r.stdout).unwrap();
     assert_eq!(v["dry_run"], true, "{v}");
-    assert_eq!(v["linked"], 40, "{v}");
+    assert_eq!(v["linked"], 48, "{v}");
     assert_eq!(v["update"]["status"], "disabled", "{v}");
 
     assert!(
@@ -1442,7 +1449,7 @@ fn update_dry_run_human_reports_planned_relink() {
     );
     assert!(r.ok, "stdout={}\nstderr={}", r.stdout, r.stderr);
     assert!(
-        r.stdout.contains("would re-link 40 skills"),
+        r.stdout.contains("would re-link 48 skills"),
         "planned relink not reported:\n{}",
         r.stdout
     );

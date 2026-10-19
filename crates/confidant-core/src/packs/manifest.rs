@@ -77,9 +77,9 @@ pub fn is_reserved_pack_name(name: &str) -> bool {
 
 /// Check a pack name against the v2 grammar `^[a-z][a-z0-9-]{1,31}$`.
 /// PD14: an external pack name matches `^[a-z][a-z0-9-]{1,31}$` (2..32
-/// chars, lowercase start). Used by the manifest loader and by the
-/// lockfile (#437).
-pub(crate) fn is_valid_pack_name(name: &str) -> bool {
+/// chars, lowercase start). Used by the manifest loader, the lockfile
+/// (#437), and `pack init` (#674).
+pub fn is_valid_pack_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     // 2..32 chars total: first is [a-z], rest are [a-z0-9-].
     if bytes.len() < 2 || bytes.len() > 32 {

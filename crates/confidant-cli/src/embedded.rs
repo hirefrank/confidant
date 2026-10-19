@@ -149,6 +149,7 @@ mod tests {
             vec![
                 "capture-gap-summary",
                 "lightfield-import",
+                "pack-author",
                 "portal-sync",
                 "qmd-search",
                 "transcript-import",

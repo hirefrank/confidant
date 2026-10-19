@@ -1499,6 +1499,84 @@ fn pack_add_from_dir_prints_report_and_writes_nothing() {
 }
 
 #[test]
+fn pack_init_json_reports_files_and_next_steps() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("weekly-checkin");
+    let out = Command::new(bin())
+        .args(["pack", "init"])
+        .arg(&dir)
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "pack-init", "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["vault"].is_null(), "{v}");
+    assert_eq!(v["dir"], dir.display().to_string(), "{v}");
+    assert_eq!(v["name"], "weekly-checkin", "{v}");
+    assert_eq!(v["version"], "0.1", "{v}");
+    assert_eq!(v["dry_run"], false, "{v}");
+    assert_eq!(
+        v["files"],
+        serde_json::json!(["manifest.toml", "SKILL.md", "0.1.md", "README.md"]),
+        "{v}"
+    );
+    let review = format!("confidant pack add --from-dir {}", dir.display());
+    assert_eq!(v["next_steps"]["review"], review, "{v}");
+    assert_eq!(v["next_steps"]["install"], format!("{review} --yes"), "{v}");
+    for file in ["manifest.toml", "SKILL.md", "0.1.md", "README.md"] {
+        assert!(dir.join(file).is_file(), "missing {file}: {v}");
+    }
+}
+
+#[test]
+fn pack_init_dry_run_writes_nothing() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("planned");
+    let out = Command::new(bin())
+        .args(["pack", "init"])
+        .arg(&dir)
+        .args(["--dry-run", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["name"], "planned", "{v}");
+    assert!(!dir.exists(), "dry run created the directory: {v}");
+}
+
+#[test]
+fn pack_init_refuses_a_non_empty_directory() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("occupied");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("keep.txt"), "user data").unwrap();
+    let out = Command::new(bin())
+        .args(["pack", "init"])
+        .arg(&dir)
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("non-empty"), "{v}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("keep.txt")).unwrap(),
+        "user data"
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+}
+
+#[test]
 fn pack_add_json_has_claims_rules_files_and_skill_text() {
     let pack = fake_pack_dir(&[]);
     let out = Command::new(bin())
@@ -1906,6 +1984,178 @@ fn pack_add_yes_vendors_locks_and_commits() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("already installed"));
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_add_yes_dry_run_writes_nothing() {
+    let vault = git_vault();
+    let pack = versioned_pack("example-pack", "0.1", "# Skill\n", None);
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(pack.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--dry-run", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert!(v["commit"].is_null(), "{v}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+    assert!(!vault.path().join("packs").exists());
+    assert!(!vault.path().join("confidant.lock").exists());
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #674: scaffold, review, install, verify, then edit the source and update.
+#[cfg(unix)]
+#[test]
+fn pack_init_round_trip_review_install_and_update() {
+    let vault = git_vault();
+    let parent = tempfile::tempdir().unwrap();
+    let source = parent.path().join("example-local");
+
+    let init = Command::new(bin())
+        .args(["pack", "init"])
+        .arg(&source)
+        .args(["--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // The review gate writes nothing.
+    let review = pack_add(&source, vault.path(), false);
+    let stdout = String::from_utf8_lossy(&review.stdout);
+    assert!(review.status.success(), "{stdout}");
+    assert!(stdout.contains("nothing was written"), "{stdout}");
+    assert!(stdout.contains("example-local@0.1"), "{stdout}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), "1\n");
+    assert!(!vault.path().join("packs").exists());
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+
+    // --yes installs and pins the reviewed bytes.
+    let install = pack_add(&source, vault.path(), true);
+    assert!(
+        install.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{verify:?}");
+
+    // Edit the source and bump the version (the contract file must move with
+    // it). A `--dry-run --yes` update must still write nothing.
+    let manifest_path = source.join("manifest.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let bumped = manifest.replace("version = \"0.1\"", "version = \"0.2\"");
+    assert_ne!(bumped, manifest, "the scaffold version was not found");
+    std::fs::write(&manifest_path, bumped).unwrap();
+    std::fs::rename(source.join("0.1.md"), source.join("0.2.md")).unwrap();
+    std::fs::write(source.join("0.2.md"), "# example-local 0.2\n").unwrap();
+    std::fs::write(
+        source.join("SKILL.md"),
+        format!(
+            "{}\nUpdated skill text for 0.2.\n",
+            std::fs::read_to_string(source.join("SKILL.md")).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let dry = Command::new(bin())
+        .args(["pack", "update", "example-local", "--from-dir"])
+        .arg(&source)
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--dry-run", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        dry.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert!(vault.path().join("packs/example-local@0.1").exists());
+    assert!(!vault.path().join("packs/example-local@0.2").exists());
+
+    // Without --yes, update prints the diff and stops.
+    let review_update = Command::new(bin())
+        .args(["pack", "update", "example-local", "--from-dir"])
+        .arg(&source)
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&review_update.stdout);
+    assert!(review_update.status.success(), "{stdout}");
+    assert!(stdout.contains("pass --yes to apply"), "{stdout}");
+    assert!(stdout.contains("Updated skill text for 0.2."), "{stdout}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+
+    // --yes applies the reviewed update.
+    let update = Command::new(bin())
+        .args(["pack", "update", "example-local", "--from-dir"])
+        .arg(&source)
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&update.stdout),
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert!(vault.path().join("packs/example-local@0.2").exists());
+    assert!(!vault.path().join("packs/example-local@0.1").exists());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("example-local@0.2"), "{cfg}");
+    assert!(!cfg.contains("example-local@0.1"), "{cfg}");
+
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    let verify = Command::new(bin())
+        .args(["pack", "verify", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    assert!(verify.status.success(), "{verify:?}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
 #[cfg(unix)]
