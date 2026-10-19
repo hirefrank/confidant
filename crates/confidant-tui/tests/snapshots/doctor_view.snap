@@ -21,4 +21,4 @@ vault  /fake/demo-vault   scope  coaching@0.1   doctor  ok
 │ status  [ok]                                                                                     │
 │ message vault resolved to /fake/demo-vault                                                       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- 1-3  ws  Tab  view  /  filter  s  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit
+ 1-3  ws  Tab  view  /  filter  f  search  j/k  move  Enter  open  r  refresh  ?  help  q  quit

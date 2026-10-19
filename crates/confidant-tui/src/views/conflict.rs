@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::contract::ResolveShow;
+use crate::contract::{CheckReport, ResolveShow};
 use crate::theme;
 use crate::theme::palette;
 
@@ -22,6 +22,26 @@ use crate::theme::palette;
 pub struct ConflictListEntry {
     pub id: String,
     pub message: String,
+}
+
+/// The `E_MERGE_CONFLICT` findings that carry a record id, in check order.
+///
+/// Pure, so both [`crate::app::App::load_conflicts`] and the Review Queue
+/// badge derive the same conflict set from a cached `check` report without a
+/// second CLI call.
+pub fn entries_from_report(report: Option<&CheckReport>) -> Vec<ConflictListEntry> {
+    let Some(report) = report else {
+        return Vec::new();
+    };
+    report
+        .findings
+        .iter()
+        .filter(|finding| finding.code == "E_MERGE_CONFLICT" && finding.id.is_some())
+        .map(|finding| ConflictListEntry {
+            id: finding.id.clone().unwrap_or_default(),
+            message: finding.message.clone(),
+        })
+        .collect()
 }
 
 /// The action awaiting explicit `y`/`n` confirmation.

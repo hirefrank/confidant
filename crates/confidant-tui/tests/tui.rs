@@ -283,9 +283,10 @@ fn search_context_and_doctor_views_snapshot() {
     let mut app = App::new(fake);
     app.set_vault_root(vault_root.path().to_path_buf());
 
-    // Unified Search tab (#387): switch with `s`, toggle exact literal
-    // scan with `e`, then press `/`, type, Enter.
-    app.handle_key(key(KeyCode::Char('s')));
+    // Unified Search tab (#387): switch with `f` (phase 3 moved `s` to
+    // session capture), toggle exact literal scan with `e`, then press `/`,
+    // type, Enter.
+    app.handle_key(key(KeyCode::Char('f')));
     assert_eq!(app.active_view, ActiveView::Search);
     app.handle_key(key(KeyCode::Char('e')));
     assert!(app.search.exact);
@@ -3251,5 +3252,675 @@ fn live_edit_commits_once_through_the_real_cli_and_editor() {
             .is_empty(),
         "working tree must be clean: {}",
         String::from_utf8_lossy(&status_out.stdout)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Quick capture and the merged Review Queue (TUI-v2 phase 3, #556)
+// ---------------------------------------------------------------------------
+
+use confidant_tui::capture::{
+    scratch_path as capture_scratch_path, CaptureKind, CapturePhase, FieldId,
+};
+use confidant_tui::views::proposals::ProposalListEntry;
+
+fn s(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| (*a).to_owned()).collect()
+}
+
+fn type_text<R: Runner>(app: &mut App<R>, text: &str) {
+    for ch in text.chars() {
+        app.handle_key(key(KeyCode::Char(ch)));
+    }
+}
+
+fn capture_dry_json(command: &str, path: &str, action: &str, content: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "command": command,
+        "dry_run": true,
+        "commit": null,
+        "changes": [{"path": path, "action": action, "content": content}]
+    })
+    .to_string()
+}
+
+fn capture_applied_json(command: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "command": command,
+        "commit": "abcdef1234567890",
+        "files": ["ledger/2026/10.cfd"]
+    })
+    .to_string()
+}
+
+/// The read responses every capture test needs: check, roster, and the
+/// selected person's context (loaded on boot and reloaded after a write).
+fn capture_base_runner() -> FakeRunner {
+    FakeRunner::new()
+        .with_argv_response(&["check"], 0, people_check_json())
+        .with_argv_response(&["record", "list"], 0, people_roster_json())
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        )
+}
+
+#[test]
+fn capture_session_prefills_person_previews_then_writes() {
+    let runner = capture_base_runner()
+        .with_argv_response(
+            &["log", "session", ADA, "60m", "--dry-run"],
+            0,
+            capture_dry_json(
+                "log-session",
+                "ledger/2026/10.cfd",
+                "append",
+                "2026-10-13 session ADA 60m\n",
+            ),
+        )
+        .with_argv_response(
+            &["log", "session", ADA, "60m"],
+            0,
+            capture_applied_json("log-session"),
+        );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.handle_key(key(KeyCode::Char('s')));
+    let capture = app.capture.as_ref().expect("capture open");
+    assert_eq!(capture.kind, CaptureKind::Session);
+    assert_eq!(capture.person_id, ADA, "person pre-filled, no ULID typing");
+    assert_eq!(capture.phase, CapturePhase::Editing);
+    let form = render_to_string(&app);
+    assert!(form.contains("Capture: Log session"), "{form}");
+    assert!(form.contains(ADA), "{form}");
+
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+        "the dry run is issued: {calls:?}"
+    );
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview),
+        "the preview is on screen"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+        "nothing is written before the confirm: {calls:?}"
+    );
+    let preview = render_to_string(&app);
+    assert!(preview.contains("Confirm: Log session"), "{preview}");
+    assert!(preview.contains("ledger/2026/10.cfd"), "{preview}");
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.capture.is_none(), "capture closed after the write");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+        "the real write is issued: {calls:?}"
+    );
+    let alert = app.alert.as_ref().expect("result alert");
+    assert_eq!(alert.title, "Capture Committed");
+    assert!(alert.message.contains("abcdef12"), "{}", alert.message);
+}
+
+#[test]
+fn capture_session_cancel_writes_nothing() {
+    let runner = capture_base_runner()
+        .with_argv_response(
+            &["log", "session", ADA, "60m", "--dry-run"],
+            0,
+            capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+        )
+        .with_argv_response(
+            &["log", "session", ADA, "60m"],
+            0,
+            capture_applied_json("log-session"),
+        );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('s')));
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview)
+    );
+
+    // Any key other than `y` cancels the capture.
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.capture.is_none(), "capture cancelled");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m"])),
+        "a cancelled capture writes nothing: {calls:?}"
+    );
+}
+
+#[test]
+fn capture_pending_preview_is_not_escaped_by_workspace_shortcuts() {
+    let runner = capture_base_runner().with_argv_response(
+        &["log", "session", ADA, "60m", "--dry-run"],
+        0,
+        capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+    );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    app.handle_key(key(KeyCode::Char('s')));
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.capture.is_some(), "preview armed");
+
+    app.handle_key(key(KeyCode::Char('2')));
+    assert!(app.capture.is_none(), "preview cancelled, not left pending");
+    assert_eq!(app.active_view, ActiveView::People, "no workspace escape");
+}
+
+#[test]
+fn capture_touch_uses_touch_argv() {
+    let runner = capture_base_runner()
+        .with_argv_response(
+            &["log", "touch", ADA, "meal", "--dry-run"],
+            0,
+            capture_dry_json("log-touch", "ledger/2026/10.cfd", "append", "x"),
+        )
+        .with_argv_response(
+            &["log", "touch", ADA, "meal"],
+            0,
+            capture_applied_json("log-touch"),
+        );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('t')));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.kind),
+        Some(CaptureKind::Touch)
+    );
+    type_text(&mut app, "meal");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &s(&["log", "touch", ADA, "meal"])),
+        "touch write issued: {calls:?}"
+    );
+}
+
+#[test]
+fn capture_without_a_person_shows_an_alert() {
+    let mut app = App::new(capture_base_runner());
+    // No roster loaded: nothing is selected.
+    app.handle_key(key(KeyCode::Char('s')));
+    assert!(app.capture.is_none(), "no capture without a person");
+    let alert = app.alert.as_ref().expect("alert");
+    assert_eq!(alert.code.as_deref(), Some("no_person"));
+}
+
+#[test]
+fn capture_dry_run_error_keeps_the_form_open() {
+    let error = serde_json::json!({
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "error": {"code": "usage_error", "message": "bad duration 'xx'", "fix": "use like 60m"}
+    })
+    .to_string();
+    let runner = capture_base_runner().with_argv_response(&["log", "session", ADA, "xx"], 0, error);
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('s')));
+    type_text(&mut app, "xx");
+    app.handle_key(key(KeyCode::Enter));
+
+    let capture = app.capture.as_ref().expect("form stays open");
+    assert_eq!(capture.phase, CapturePhase::Editing);
+    let message = capture.error.as_deref().unwrap_or("");
+    assert!(message.contains("bad duration"), "{message}");
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("bad duration"), "{rendered}");
+}
+
+#[test]
+fn capture_note_stages_scratch_then_writes_and_removes_it() {
+    let dir = tempfile::tempdir().expect("temp vault");
+    let runner = capture_base_runner();
+    runner.push_response(
+        0,
+        capture_dry_json("note-add", "people/ADA/notes/x.md", "add", "body"),
+    );
+    runner.push_response(0, capture_applied_json("note-add"));
+    // `git check-ignore` gate: a repo that ignores `.confidant/`.
+    runner.push_program_response("git", 0, "");
+    runner.push_program_response("git", 0, "");
+    let mut app = App::new(runner);
+    app.set_vault_root(dir.path().to_path_buf());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('n')));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.kind),
+        Some(CaptureKind::Note)
+    );
+    type_text(&mut app, "one-line body");
+    app.handle_key(key(KeyCode::Enter));
+
+    let scratch = capture_scratch_path(dir.path(), ADA).expect("scratch path");
+    assert_eq!(
+        fs::read_to_string(&scratch).unwrap(),
+        "one-line body",
+        "the body is staged for --body-file"
+    );
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls.iter().any(|call| {
+            call.first().map(String::as_str) == Some("note")
+                && call.contains(&"--dry-run".to_owned())
+        }),
+        "the note dry run is issued: {calls:?}"
+    );
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(!scratch.exists(), "the scratch is removed after the write");
+    let calls = app.runner.recorded_calls();
+    let write = calls
+        .iter()
+        .find(|call| {
+            call.first().map(String::as_str) == Some("note")
+                && !call.contains(&"--dry-run".to_owned())
+        })
+        .expect("note write issued");
+    assert!(write.contains(&"--body-file".to_owned()), "{write:?}");
+    assert!(
+        write.contains(&scratch.display().to_string()),
+        "the write points at the staged scratch: {write:?}"
+    );
+}
+
+#[test]
+fn capture_note_cancel_removes_the_scratch() {
+    let dir = tempfile::tempdir().expect("temp vault");
+    let runner = capture_base_runner();
+    runner.push_response(
+        0,
+        capture_dry_json("note-add", "people/ADA/notes/x.md", "add", "body"),
+    );
+    runner.push_response(0, capture_applied_json("note-add"));
+    runner.push_program_response("git", 0, "");
+    runner.push_program_response("git", 0, "");
+    let mut app = App::new(runner);
+    app.set_vault_root(dir.path().to_path_buf());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('n')));
+    type_text(&mut app, "cancel me");
+    app.handle_key(key(KeyCode::Enter));
+    let scratch = capture_scratch_path(dir.path(), ADA).expect("scratch path");
+    assert!(scratch.exists(), "scratch staged for the preview");
+
+    // Esc cancels from the preview: nothing is written, scratch removed.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.capture.is_none());
+    assert!(!scratch.exists(), "scratch removed on cancel");
+    let calls = app.runner.recorded_calls();
+    assert!(
+        !calls.iter().any(|call| {
+            call.first().map(String::as_str) == Some("note")
+                && !call.contains(&"--dry-run".to_owned())
+        }),
+        "a cancelled note writes nothing: {calls:?}"
+    );
+}
+
+#[test]
+fn capture_note_no_ai_toggle_is_passed() {
+    let dir = tempfile::tempdir().expect("temp vault");
+    let runner = capture_base_runner();
+    runner.push_response(
+        0,
+        capture_dry_json("note-add", "people/ADA/notes/x.md", "add", "body"),
+    );
+    runner.push_response(0, capture_applied_json("note-add"));
+    runner.push_program_response("git", 0, "");
+    runner.push_program_response("git", 0, "");
+    let mut app = App::new(runner);
+    app.set_vault_root(dir.path().to_path_buf());
+    app.load_check();
+    app.load_roster();
+
+    app.handle_key(key(KeyCode::Char('n')));
+    type_text(&mut app, "private body");
+    // Move to the no-ai toggle (body -> date -> no-ai) and flip it with space.
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Tab));
+    assert!(app
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.value(FieldId::Body) == "private body"));
+    app.handle_key(key(KeyCode::Char(' ')));
+    assert!(app
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.enabled(FieldId::NoAi)));
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('y')));
+
+    let calls = app.runner.recorded_calls();
+    let write = calls
+        .iter()
+        .find(|call| {
+            call.first().map(String::as_str) == Some("note")
+                && !call.contains(&"--dry-run".to_owned())
+        })
+        .expect("note write issued");
+    assert!(write.contains(&"--no-ai".to_owned()), "{write:?}");
+}
+
+#[test]
+fn review_queue_badge_counts_sources_and_is_visible_from_people() {
+    // Conflict check report: two E_MERGE_CONFLICT findings with ids.
+    let runner = FakeRunner::new()
+        .with_argv_response(&["check"], 0, conflict_check_json())
+        .with_argv_response(&["record", "list"], 0, people_roster_json())
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        )
+        .with_argv_response(&["inbox", "--dry-run"], 0, inbox_dry_run_json());
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    app.load_inbox();
+    app.proposals.entries.push(ProposalListEntry {
+        name: "portal-1".to_owned(),
+        ..ProposalListEntry::default()
+    });
+
+    assert_eq!(
+        app.review_pending(),
+        1 + 2 + 2,
+        "proposals + inbox + conflicts"
+    );
+    // Workspace 1 (People) still shows the Review Queue badge.
+    assert_eq!(app.active_view, ActiveView::People);
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("2 Review Queue (5)"), "{rendered}");
+
+    // With nothing pending the badge is absent (unchanged header).
+    let clean = FakeRunner::new()
+        .with_argv_response(&["check"], 0, people_check_json())
+        .with_argv_response(&["record", "list"], 0, people_roster_json())
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        );
+    let mut clean_app = App::new(clean);
+    clean_app.load_check();
+    clean_app.load_roster();
+    assert_eq!(clean_app.review_pending(), 0);
+    let clean_rendered = render_to_string(&clean_app);
+    assert!(
+        clean_rendered.contains("2 Review Queue"),
+        "{clean_rendered}"
+    );
+    assert!(
+        !clean_rendered.contains("2 Review Queue ("),
+        "{clean_rendered}"
+    );
+}
+
+/// End-to-end: the real CLI creates a note from a captured body in a
+/// throwaway git vault, committing exactly once.
+#[test]
+#[cfg(unix)]
+fn live_capture_note_commits_once_through_the_real_cli() {
+    // A fresh git copy of the demo vault (same shape as the live edit test).
+    let dir = tempfile::tempdir().expect("temp vault");
+    let root = dir.path();
+    for entry in fs::read_dir(demo_vault()).expect("read demo vault") {
+        let entry = entry.unwrap();
+        let dest = root.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&dest).unwrap();
+            for f in walk_files(&entry.path()) {
+                let rel = f.strip_prefix(entry.path()).unwrap();
+                let d = dest.join(rel);
+                fs::create_dir_all(d.parent().unwrap()).unwrap();
+                fs::copy(&f, &d).unwrap();
+            }
+        } else {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+    }
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    };
+    git(&["init", "-b", "main", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(root.join(".gitignore"), ".confidant/\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let runner = ProcessRunner::new(confidant_bin(), Some(root.to_path_buf()))
+        .with_env("CONFIDANT_OFFLINE", "1");
+    let mut app = App::new(runner);
+    app.set_vault_root(root.to_path_buf());
+    app.load_check();
+    app.load_roster();
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.handle_key(key(KeyCode::Char('n')));
+    type_text(&mut app, "live captured note body");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.capture.as_ref().map(|capture| capture.phase),
+        Some(CapturePhase::Preview),
+        "the real dry run produced a preview"
+    );
+    let scratch = capture_scratch_path(root, ADA).expect("scratch path");
+    assert!(scratch.exists(), "the note body is staged");
+
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.capture.is_none(), "capture finished");
+    assert!(!scratch.exists(), "the scratch is removed after the write");
+    assert_eq!(
+        app.alert.as_ref().map(|alert| alert.title.as_str()),
+        Some("Capture Committed")
+    );
+
+    // Exactly one new commit (init + the note).
+    let log = std::process::Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(root)
+        .output()
+        .expect("git log");
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert_eq!(log.lines().count(), 2, "one capture commit:\n{log}");
+
+    // The note landed under the person, with the captured body.
+    let notes_dir = root.join("people").join(ADA).join("notes");
+    let notes: Vec<_> = fs::read_dir(&notes_dir)
+        .expect("notes dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    let captured: Vec<_> = notes
+        .iter()
+        .filter(|path| {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .contains("live captured note body")
+        })
+        .collect();
+    assert_eq!(captured.len(), 1, "exactly one captured note: {notes:?}");
+}
+
+#[test]
+fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
+    // Ada stays highlighted in People; Bea is opened from a search hit into
+    // the full-screen Context view. `s` must target Bea (what is on screen),
+    // not the stale People cursor.
+    let find = serde_json::json!({
+        "schema_version": "1",
+        "ok": true,
+        "vault": "/fake/demo-vault",
+        "query": "bea",
+        "matches": [{
+            "id": BEA,
+            "path": "people/BEA/profile.md",
+            "line": 4,
+            "excerpt": "name: Bea Demo"
+        }],
+        "findings": [],
+        "skipped_encrypted": 0,
+        "refused_envelopes": 0,
+        "scope": ["coaching@0.1"]
+    })
+    .to_string();
+    let runner = FakeRunner::new()
+        .with_argv_response(&["check"], 0, people_check_json())
+        .with_argv_response(&["record", "list"], 0, people_roster_json())
+        .with_argv_response(
+            &["context", "--", ADA],
+            0,
+            people_context_json(ADA, "Ada Example", "Fake coaching client."),
+        )
+        .with_argv_response(
+            &["context", "--", BEA],
+            0,
+            people_context_json(BEA, "Bea Demo", "Fake pay-per-session client."),
+        )
+        .with_argv_response(&["find", "--", "bea"], 0, find)
+        .with_argv_response(
+            &["log", "session", BEA, "60m", "--dry-run"],
+            0,
+            capture_dry_json("log-session", "ledger/2026/10.cfd", "append", "x"),
+        );
+    let mut app = App::new(runner);
+    app.load_check();
+    app.load_roster();
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.active_view = ActiveView::Search;
+    app.search.exact = true;
+    app.run_search("bea");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.active_view, ActiveView::Context);
+    assert_eq!(app.context.person_id.as_deref(), Some(BEA));
+    // `activate_selected` opens Context without moving the People cursor.
+    assert_eq!(app.people.selected_person.as_deref(), Some(ADA));
+
+    app.handle_key(key(KeyCode::Char('s')));
+    assert_eq!(
+        app.capture
+            .as_ref()
+            .map(|capture| capture.person_id.as_str()),
+        Some(BEA),
+        "capture pre-fills the person whose context is on screen"
+    );
+    type_text(&mut app, "60m");
+    app.handle_key(key(KeyCode::Enter));
+
+    let calls = app.runner.recorded_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", BEA, "60m", "--dry-run"])),
+        "the write targets Bea: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &s(&["log", "session", ADA, "60m", "--dry-run"])),
+        "the write must not target Ada: {calls:?}"
+    );
+}
+
+#[test]
+fn load_conflicts_resets_the_check_cursor() {
+    let mut app = App::new(FakeRunner::from_json(0, conflict_check_json()));
+    app.check.selected = 7;
+    app.load_conflicts();
+    assert_eq!(
+        app.check.selected, 0,
+        "the Check list must not open on a stale row"
+    );
+}
+
+#[test]
+fn prime_review_queue_keeps_the_first_startup_alert() {
+    // check and roster fail first; the inbox dry run fails with a different
+    // error. The first failure is the one the operator should see.
+    let inbox_error = serde_json::json!({
+        "ok": false,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "error": {
+            "code": "E_INBOX_CRYPTO",
+            "message": "inbox dry run failed",
+            "fix": "queue the item again"
+        }
+    })
+    .to_string();
+    let fake = FakeRunner::new()
+        .with_argv_response(&["check"], 1, check_cli_error_json())
+        .with_argv_response(&["record", "list"], 1, check_cli_error_json())
+        .with_argv_response(&["inbox", "--dry-run"], 1, inbox_error);
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    let first = app
+        .alert
+        .as_ref()
+        .map(|alert| alert.message.clone())
+        .expect("startup alert");
+
+    app.prime_review_queue();
+
+    assert_eq!(
+        app.alert.as_ref().map(|alert| alert.message.clone()),
+        Some(first),
+        "the inbox failure must not replace the earlier startup alert"
     );
 }
