@@ -114,12 +114,13 @@ fn counting_stub_release_server(tag: &str) -> (String, Arc<AtomicUsize>) {
 }
 
 /// Extra environment for a doctor child: optional `HOME` (agent detection),
-/// `CONFIDANT_HOME` (share dir), and `CONFIDANT_OFFLINE`.
+/// `CONFIDANT_HOME` (share dir), `CONFIDANT_OFFLINE`, and process cwd.
 #[derive(Default)]
 struct DoctorEnv<'a> {
     home: Option<&'a str>,
     confidant_home: Option<&'a str>,
     offline: Option<&'a str>,
+    cwd: Option<&'a std::path::Path>,
 }
 
 /// Run `doctor --json` against the demo vault with a clean test environment
@@ -151,9 +152,16 @@ fn run_doctor_env(releases_url: Option<&str>, env: &DoctorEnv<'_>) -> Value {
     }
     if let Some(home) = env.confidant_home {
         cmd.env("CONFIDANT_HOME", home);
+    } else {
+        // Reporter #681 used the default share dir (`$HOME/.local/share/confidant`).
+        // Do not inherit a parent CONFIDANT_HOME.
+        cmd.env_remove("CONFIDANT_HOME");
     }
     if let Some(offline) = env.offline {
         cmd.env("CONFIDANT_OFFLINE", offline);
+    }
+    if let Some(cwd) = env.cwd {
+        cmd.current_dir(cwd);
     }
     let out = cmd.output().unwrap();
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
@@ -197,6 +205,24 @@ fn run_setup(home: &str, confidant_home: &str, agent: &str) {
         .env("HOME", home)
         .env("CONFIDANT_HOME", confidant_home)
         .env_remove("CONFIDANT_SKILLS_DIR");
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "setup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `setup --agent auto` with an absolute HOME and **default** CONFIDANT_HOME
+/// (unset), matching the #681 install-test host.
+fn run_setup_default_share(home: &str, cwd: &std::path::Path, agent: &str) {
+    let mut cmd = Command::new(bin());
+    cmd.args(["setup", "--agent", agent, "--no-input"])
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env_remove("CONFIDANT_HOME")
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        .env_remove("CONFIDANT_VAULT");
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
@@ -405,4 +431,184 @@ fn doctor_skills_links_missing_warns() {
     );
     // Warning-only: missing links never flip doctor's overall ok.
     assert_eq!(v["ok"], true, "{v}");
+}
+
+#[test]
+fn doctor_skills_links_from_vault_cwd_agrees_with_agents() {
+    // #681: setup and agents report 2/2, then doctor run from inside the
+    // vault must not flip to 0/2. Skill dirs live under $HOME, not the vault.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    let share = home.path().join("share");
+    let share_str = share.to_str().unwrap().to_owned();
+    run_setup(&home_str, &share_str, "claude-code");
+
+    let mut agents = Command::new(bin());
+    give_child_git_identity(&mut agents);
+    let agents_out = agents
+        .args(["agents", "--json", "--no-input"])
+        .env("HOME", &home_str)
+        .env("CONFIDANT_HOME", &share_str)
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        agents_out.status.success(),
+        "agents failed: {}",
+        String::from_utf8_lossy(&agents_out.stderr)
+    );
+    let agents_v: Value = serde_json::from_slice(&agents_out.stdout).unwrap();
+    let claude = agents_v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "claude-code")
+        .expect("claude-code row");
+    assert_eq!(claude["linked"], 2, "{agents_v}");
+    assert_eq!(claude["total"], 2, "{agents_v}");
+
+    let vault = demo();
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(&home_str),
+            confidant_home: Some(&share_str),
+            cwd: Some(vault.as_path()),
+            ..Default::default()
+        },
+    );
+    let c = check(&v, "skills-links").expect("skills-links check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("2/2"), "doctor disagreed with agents: {msg}");
+    assert!(msg.contains("claude-code"), "{msg}");
+}
+
+#[test]
+fn doctor_skills_links_relative_symlinks_from_other_cwd() {
+    // #681: even if the link target is relative (some tools rewrite
+    // absolute symlinks), doctor from the vault cwd must still count it.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap().to_owned();
+    let share = home.path().join("share");
+    let share_str = share.to_str().unwrap().to_owned();
+    run_setup(&home_str, &share_str, "claude-code");
+
+    let version = env!("CARGO_PKG_VERSION");
+    let skills_parent = home.path().join(".claude/skills");
+    for skill in ["pack-author", "qmd-search"] {
+        let dest = skills_parent.join(skill);
+        std::fs::remove_file(&dest).unwrap();
+        let target = PathBuf::from("../../share/skills")
+            .join(version)
+            .join(skill);
+        std::os::unix::fs::symlink(&target, &dest).unwrap();
+    }
+
+    let vault = demo();
+    let v = run_doctor_env(
+        Some(&unreachable_url()),
+        &DoctorEnv {
+            home: Some(&home_str),
+            confidant_home: Some(&share_str),
+            cwd: Some(vault.as_path()),
+            ..Default::default()
+        },
+    );
+    let c = check(&v, "skills-links").expect("skills-links check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(
+        msg.contains("2/2"),
+        "relative skill links missed from vault cwd: {msg}"
+    );
+}
+
+/// #681 reporter sequence: absolute `HOME=/…/box`, default (unset)
+/// `CONFIDANT_HOME`, `setup --agent auto` → `agents` → `cd vault && doctor`
+/// with no `--vault`. Skill dirs live under `$HOME`, share dir is
+/// `$HOME/.local/share/confidant`.
+#[test]
+fn doctor_skills_links_reporter_sequence_absolute_home_default_share() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home").join("box");
+    std::fs::create_dir_all(&home).unwrap();
+    let home_str = home.to_str().unwrap().to_owned();
+    assert!(
+        std::path::Path::new(&home_str).is_absolute(),
+        "HOME must be absolute to match the reporter: {home_str}"
+    );
+    std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+
+    let vault = home.join("confidant-vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        vault.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
+    )
+    .unwrap();
+    let git_st = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&vault)
+        .status()
+        .unwrap();
+    assert!(git_st.success(), "git init of throwaway vault failed");
+
+    run_setup_default_share(&home_str, &home, "auto");
+
+    let mut agents = Command::new(bin());
+    give_child_git_identity(&mut agents);
+    let agents_out = agents
+        .args(["agents", "--json", "--no-input"])
+        .current_dir(&home)
+        .env("HOME", &home_str)
+        .env_remove("CONFIDANT_HOME")
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        .env_remove("CONFIDANT_VAULT")
+        .output()
+        .unwrap();
+    assert!(
+        agents_out.status.success(),
+        "agents failed: {}",
+        String::from_utf8_lossy(&agents_out.stderr)
+    );
+    let agents_v: Value = serde_json::from_slice(&agents_out.stdout).unwrap();
+    let claude = agents_v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "claude-code")
+        .expect("claude-code row");
+    assert_eq!(claude["linked"], 2, "{agents_v}");
+    assert_eq!(claude["total"], 2, "{agents_v}");
+
+    let mut doctor = Command::new(bin());
+    give_child_git_identity(&mut doctor);
+    doctor
+        .args(["doctor", "--json", "--no-input"])
+        .current_dir(&vault)
+        .env("HOME", &home_str)
+        .env_remove("CONFIDANT_HOME")
+        .env_remove("CONFIDANT_SKILLS_DIR")
+        .env_remove("CONFIDANT_VAULT")
+        .env_remove("CONFIDANT_TEST_RELEASES_URL")
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env("CONFIDANT_KEYCHAIN", "off")
+        .env("CONFIDANT_TEST_RELEASES_URL", unreachable_url());
+    let out = doctor.output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not JSON ({e}); status={}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let c = check(&v, "skills-links").expect("skills-links check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(
+        msg.contains("2/2"),
+        "doctor disagreed with agents on the reporter sequence: {msg}"
+    );
+    assert!(msg.contains("claude-code"), "{msg}");
 }

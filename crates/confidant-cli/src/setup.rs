@@ -27,8 +27,22 @@ pub const AGENTS: &[(&str, &str)] = &[
 /// replaced or re-pointed without `--force`.
 pub const MANAGED_MARKER: &str = ".confidant-managed";
 
+/// Make `p` absolute against this process's cwd. Relative `HOME` /
+/// `CONFIDANT_HOME` / `CONFIDANT_SKILLS_DIR` otherwise resolve against
+/// whatever directory the next command happens to run from, so `setup`
+/// from `$HOME` and `doctor` from the vault can disagree (#681).
+fn make_absolute(p: PathBuf) -> PathBuf {
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
+    }
+}
+
 pub fn home_dir() -> anyhow::Result<PathBuf> {
-    std::env::var_os("HOME")
+    let p = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .filter(|p| !p.as_os_str().is_empty())
@@ -36,7 +50,11 @@ pub fn home_dir() -> anyhow::Result<PathBuf> {
             anyhow::anyhow!(
                 "cannot determine a home directory: set HOME (or USERPROFILE on Windows)"
             )
-        })
+        })?;
+    // Absolutize only: do not canonicalize. macOS `canonicalize("/var/…")`
+    // becomes `/private/var/…`, which then disagrees with un-canonicalized
+    // dests built from the raw HOME string.
+    Ok(make_absolute(p))
 }
 
 pub fn agent_subpath(name: &str) -> Option<&'static str> {
@@ -129,7 +147,7 @@ pub fn confidant_home() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CONFIDANT_HOME") {
         let p = PathBuf::from(dir);
         if !p.as_os_str().is_empty() {
-            return Ok(p);
+            return Ok(make_absolute(p));
         }
     }
     Ok(home_dir()?.join(".local/share/confidant"))
@@ -145,6 +163,7 @@ pub fn skills_dir_override() -> Option<PathBuf> {
     std::env::var_os("CONFIDANT_SKILLS_DIR")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
+        .map(make_absolute)
 }
 
 /// Materialize the embedded tree to the versioned share dir.
@@ -285,7 +304,11 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 fn create_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(src, dest)
+    // Store an absolute target so later `doctor` / `agents` runs from a
+    // different cwd still resolve the same link (#681).
+    let abs = make_absolute(src.to_path_buf());
+    let abs = abs.canonicalize().unwrap_or(abs);
+    std::os::unix::fs::symlink(abs, dest)
 }
 
 /// Remove a symlink without following it. Callers only pass paths already
@@ -407,12 +430,7 @@ fn path_under(path: &Path, root: &Path) -> bool {
 /// `--force` is the only path that touches unowned entries.
 fn is_owned(dest: &Path, skills_root: &Path) -> bool {
     if let Ok(target) = std::fs::read_link(dest) {
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            dest.parent().unwrap_or(Path::new(".")).join(target)
-        };
-        return path_under(&resolved, skills_root);
+        return path_under(&resolve_link_target(dest, target), skills_root);
     }
     dest.join(MANAGED_MARKER).is_file()
 }
@@ -872,23 +890,54 @@ pub struct AgentHealth {
     pub targeted: bool,
 }
 
+/// Lexical `..` / `.` normalization. Used when canonicalize fails (a
+/// relative symlink whose target is missing from this cwd) so `setup`
+/// and `doctor` still agree on the same link (#681).
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut norm = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => norm.push(c.as_os_str()),
+        }
+    }
+    norm
+}
+
+/// Resolve a symlink target against `dest`'s parent, matching [`is_owned`].
+fn resolve_link_target(dest: &Path, target: PathBuf) -> PathBuf {
+    if target.is_absolute() {
+        target
+    } else {
+        dest.parent().unwrap_or(Path::new(".")).join(target)
+    }
+}
+
 /// True when `dest` is linked to the current version's materialized skill:
 /// a symlink resolving to `<version_dir>/<skill>`, or a managed copy whose
 /// marker names the current version.
 fn is_linked_to_current(dest: &Path, skill: &str) -> bool {
     let version = env!("CARGO_PKG_VERSION");
-    if std::fs::read_link(dest).is_ok() {
+    if let Ok(target) = std::fs::read_link(dest) {
         let Ok(version_dir) = skills_version_dir() else {
             return false;
         };
         let expected = version_dir.join(skill);
-        let Ok(dest_c) = dest.canonicalize() else {
-            return false;
-        };
-        let Ok(expected_c) = expected.canonicalize() else {
-            return false;
-        };
-        return dest_c == expected_c;
+        let resolved = resolve_link_target(dest, target);
+        // Prefer real paths so two spellings of the same dir match.
+        if let (Ok(a), Ok(b)) = (resolved.canonicalize(), expected.canonicalize()) {
+            return a == b;
+        }
+        // dest.canonicalize follows the link. Require the real path to sit
+        // under this version dir so a same-named skill outside the share
+        // tree does not count (a suffix-only match was too broad).
+        if let (Ok(dest_c), Ok(version_c)) = (dest.canonicalize(), version_dir.canonicalize()) {
+            return dest_c == version_c.join(skill);
+        }
+        return normalize_lexical(&resolved) == normalize_lexical(&expected);
     }
     if dest.is_dir() {
         if let Ok(marker) = std::fs::read_to_string(dest.join(MANAGED_MARKER)) {
@@ -976,5 +1025,36 @@ mod tests {
         assert_eq!(resolved.agents, vec!["claude-code".to_owned()]);
         assert_eq!(resolved.unknown, vec!["bogus".to_owned()]);
         assert!(resolved.fallback_note.is_none());
+    }
+
+    #[test]
+    fn make_absolute_leaves_absolute_paths() {
+        let p = PathBuf::from("/tmp/confidant-home");
+        assert_eq!(make_absolute(p.clone()), p);
+    }
+
+    #[test]
+    fn make_absolute_joins_relative_paths_to_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(make_absolute(PathBuf::from("share")), cwd.join("share"));
+    }
+
+    #[test]
+    fn normalize_lexical_collapses_parent_dirs() {
+        let p = PathBuf::from("/home/box/.claude/skills/../../share/skills/0.6.1/qmd-search");
+        assert_eq!(
+            normalize_lexical(&p),
+            PathBuf::from("/home/box/share/skills/0.6.1/qmd-search")
+        );
+    }
+
+    #[test]
+    fn resolve_link_target_joins_relative_against_dest_parent() {
+        let dest = PathBuf::from("/home/box/.claude/skills/qmd-search");
+        let target = PathBuf::from("../../share/skills/0.6.1/qmd-search");
+        assert_eq!(
+            normalize_lexical(&resolve_link_target(&dest, target)),
+            PathBuf::from("/home/box/share/skills/0.6.1/qmd-search")
+        );
     }
 }
