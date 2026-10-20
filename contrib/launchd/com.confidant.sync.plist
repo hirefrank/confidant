@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.confidant.sync</string>
+
+	<!-- Edit both values for this machine. launchd does not expand "~". -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/confidant</string>
+		<string>sync</string>
+		<string>--push</string>
+		<string>--yes</string>
+		<string>--no-input</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CONFIDANT_VAULT</key>
+		<string>/Users/you/confidant</string>
+	</dict>
+
+	<!-- Every 15 minutes, and once when the agent loads. -->
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Output is optional; it never contains vault content. -->
+	<key>StandardOutPath</key>
+	<string>/tmp/confidant-sync.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/confidant-sync.log</string>
+</dict>
+</plist>
