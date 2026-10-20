@@ -9448,6 +9448,15 @@ fn require_init_key_sources() -> anyhow::Result<()> {
         self, DeviceKeyState, KeychainBackend, DEVICE_ACCOUNT, DEVICE_KEY_ENV, DEVICE_SERVICE,
     };
 
+    // Same stand-in #688 uses in `device_key_store_available`: a test
+    // keychain dir is the file-backed store `provision_device_key` writes
+    // to under `--all-features`. Dir presence is enough; do not wait for
+    // `device.key` (shred-rotation fixtures set the dir and then init).
+    #[cfg(feature = "test-overrides")]
+    if test_keychain_dir().is_some() {
+        return Ok(());
+    }
+
     let operator_from_env = operator_key_from_env()?.is_some();
     let device_from_env = device_key_supplied_from_env()?;
     if device_from_env && operator_from_env {
@@ -9470,6 +9479,13 @@ fn require_init_key_sources() -> anyhow::Result<()> {
             if operator_from_env {
                 return Ok(());
             }
+            // `DeviceKeyState::Env` means CONFIDANT_DEVICE_KEY is set, so
+            // `device_key_state` never opened the OS keychain. Probe it so
+            // a headless host still needs CONFIDANT_OPERATOR_KEY unless
+            // the keychain can persist one. `Error::Keychain` is
+            // "unreachable" (no Secret Service / no entry); any other
+            // error is a real backend failure and must not be treated as
+            // "no store".
             match keychain::OsKeychain.get_password(DEVICE_SERVICE, DEVICE_ACCOUNT) {
                 Ok(_) => true,
                 Err(confidant_crypt::error::Error::Keychain(_)) => false,

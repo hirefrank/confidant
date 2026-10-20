@@ -2519,6 +2519,38 @@ fn init_create_dry_run_refuses_without_key_sources() {
     assert!(!b.vault.exists(), "refused dry run wrote the target");
 }
 
+/// #682: the same keyless host as `init_create_dry_run_refuses_without_key_sources`,
+/// but a real `init --create` (not `--dry-run`). Preflight must fail with
+/// the same message and leave the target unwritten.
+#[test]
+fn init_create_refuses_without_key_sources() {
+    let b = Boot::new();
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env_remove("CONFIDANT_OPERATOR_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "real init must refuse a keyless host: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("keychain") || msg.contains("CONFIDANT_DEVICE_KEY"),
+        "expected a keychain/env-key refusal, got: {msg}"
+    );
+    assert!(fix.contains("CONFIDANT_DEVICE_KEY"), "{fix}");
+    assert!(fix.contains("CONFIDANT_OPERATOR_KEY"), "{fix}");
+    assert!(!b.vault.exists(), "refused init wrote the target");
+}
+
 /// #682: `CONFIDANT_TEST_KEYCHAIN_DIR` is the same device-key source
 /// `provision_device_key` uses under `--all-features`. The preflight must
 /// accept it (shred-rotation fixtures set the dir and unset
