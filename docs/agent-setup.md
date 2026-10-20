@@ -148,8 +148,10 @@ confidant keys device-add --initiate --label "laptop-2" --output ~/device-add-re
 confidant keys device-add --from-request ~/device-add-request.toml
 ```
 
-Headless hosts without an OS keychain still need
-`CONFIDANT_DEVICE_KEY` / `CONFIDANT_OPERATOR_KEY` in the environment (see
+Headless hosts without an OS keychain: the **new** device needs only
+`CONFIDANT_DEVICE_KEY` for `keys device-add --initiate`. The already-enrolled
+device that runs `--from-request` is the one that needs
+`CONFIDANT_OPERATOR_KEY` (see
 [Headless hosts and agents](#headless-hosts-and-agents)). Enrollment of a
 second headless device is `keys device-add`, not `init`.
 

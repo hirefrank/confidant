@@ -15172,6 +15172,11 @@ backup\tgit@host.example:org/repo.git (push)
             label.contains("https://host.example/org/repo.git"),
             "{label}"
         );
+        assert_eq!(
+            label,
+            "[external pack: not shipped with confidant; text is from \
+             https://host.example/org/repo.git at 0123456789ab]"
+        );
     }
 
     #[test]
