@@ -7357,7 +7357,13 @@ fn skills_links_check() -> DoctorCheck {
     } else {
         let mut parts = Vec::new();
         for h in targeted {
-            parts.push(format!("{} {}/{}", h.name, h.linked, h.total));
+            parts.push(format!(
+                "{} {}/{} ({})",
+                h.name,
+                h.linked,
+                h.total,
+                h.dir.display()
+            ));
         }
         DoctorCheck {
             id: "skills-links",
