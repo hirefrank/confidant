@@ -8,6 +8,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Changed
+- The `pack-author` skill spells out message-variant names (including
+  `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
+  ordering, where to read message templates during review, and that
+  `pack update` prints its diff without `--yes` and replaces same-version
+  content. It reflects the coaching-pack rebuild dogfood (#675).
+
 ## [0.6.2] - 2026-10-20
 
 **Disclosure:** the milestone 2 encryption has had no independent review,
@@ -35,11 +42,6 @@ vault; keep it on trusted devices with encrypted disks.
 - Docs and `init`/`recover` help treat `keys device-add` as the second-device
   path and `recover` as the lost-all-devices path (it rotates the phrase)
   (#685, #686).
-- The `pack-author` skill spells out message-variant names (including
-  `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
-  ordering, where to read message templates during review, and that
-  `pack update` prints its diff without `--yes` and replaces same-version
-  content. It reflects the coaching-pack rebuild dogfood (#675).
 
 ### Fixed
 - `init --create --remote` passes `--` to `git remote add` and refuses a
