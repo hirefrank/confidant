@@ -36,7 +36,7 @@ Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2
 
 | Mode | Use for | Consequences | Agent behavior |
 |---|---|---|---|
-| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and writes a 24-word recovery phrase once (`--phrase-out <path>` is the agent-safe form; see [Recovery phrase](#recovery-phrase-save-it-then-verify-it)). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | For a fresh vault, run `confidant init --create --phrase-out <path>`; for an existing one, ensure `mode` is not `"plaintext"` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then run `confidant init`. Store the recovery phrase offline. |
+| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and writes a 24-word recovery phrase once (`--phrase-out <path>` is the agent-safe form; see [Recovery phrase](#recovery-phrase-save-it-then-verify-it)). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | For a **new** vault, run `confidant init --create --phrase-out <path>` (optional `--remote <url>`). For an existing directory that is not yet initialized, ensure `mode` is not `"plaintext"` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then run `confidant init`. To put an already-initialized vault on another device, clone it and run `keys device-add` — not `init`. Store the recovery phrase offline. |
 | **Plaintext opt-out** | Demo, learning, fixtures only (`examples/demo-vault`) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Never use for real PII: `git clone` exposes all record content, so never push it to a remote. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, and warn that `git clone` exposes all record content. |
 
 ## Create a vault
@@ -51,11 +51,14 @@ git config --global user.name "Your Name"
 git config --global user.email "you@example.com"
 ```
 
-Then create the vault:
+Then create the vault. `--remote <url>` is optional and only sets `origin`
+(it does not push):
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"     # this process only
 confidant init --create --no-input --phrase-out "$HOME/confidant-recovery.txt"
+# or, if you already have a remote URL:
+# confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-recovery.txt"
 ```
 
 For an interactive shell you can add the export to your shell rc, but in a
@@ -68,7 +71,8 @@ The command creates the directory and runs `git init` with branch `main`
 `.gitignore` (`.confidant/`) and a minimal `confidant.toml` with a fresh
 `vault_id` and `packs = []`, commits the skeleton, then creates the vault
 lookup key, the `vault:shared` client, the signed operator certificate, and
-the trust anchor. It does **not** create an inbox key or add a git remote.
+the trust anchor. It does **not** create an inbox key. Without `--remote` it
+adds no git remote. It never pushes.
 
 Packs are optional. `packs = []` is clean: `personal@0.2` is built in and
 implicit, so `check` starts with birthdays, cadence, and the `touch` verb.
@@ -86,31 +90,70 @@ init with no packs, then `pack add`.
 
 ## Connect a git remote (optional)
 
-`confidant init --create` adds no remote, and local-only is a valid setup.
-The difference matters at recovery time:
+Local-only is a valid setup. A remote is what makes backup and putting the
+vault on another device possible:
 
 - **Local-only:** the vault lives on one disk. Back it up some other way —
-  `confidant recover` cannot help if the repository was never pushed.
-- **Remote:** backups and second-device recovery. The remote holds
-  ciphertext only for an encrypted vault; on a second device, clone it and
-  run `confidant recover`.
+  a second device cannot clone what was never pushed, and `confidant recover`
+  cannot help if the repository is gone.
+- **Remote:** backups and second-device enrollment. The remote holds
+  ciphertext only for an encrypted vault. On another device, clone it and
+  run `confidant keys device-add` (not `init`, and not `recover` unless
+  every enrolled device is lost). See [New device, existing vault](#new-device-existing-vault).
 
-To connect one, run git yourself:
+To set origin at init time (still no push):
+
+```sh
+confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-recovery.txt"
+git push -u origin main    # you run this; credentials and host keys stay yours
+```
+
+If the vault already exists, run git yourself:
 
 ```sh
 git remote add origin <url>
 git push -u origin main
 ```
 
-The URL is provider-neutral — whatever your git host gives you. No
-Confidant command adds a remote or pushes for you, because credentials and
-host keys are yours to supply. `confidant doctor` reports a `git-remote`
+The URL is provider-neutral — whatever your git host gives you.
+`confidant init --create --remote <url>` is the one Confidant command that
+adds `origin`; it never pushes. `confidant doctor` reports a `git-remote`
 check: local-only is fine, an encrypted vault with a remote is fine, and a
 remote on a `[crypto] mode = "plaintext"` vault is a **warning**.
 
 **A plaintext-mode vault must not be pushed anywhere.** Every record body is
 readable by anyone with access to the repository, including its history.
 Plaintext is only for demo, learning, and fixtures.
+
+## New device, existing vault
+
+`confidant init` always creates a **new** vault (new `vault_id`, new keys,
+new recovery phrase). Running it on a second machine does not attach that
+machine to the vault you already have.
+
+| Situation | What to run |
+|---|---|
+| New vault on this machine | `confidant init --create` (optional `--remote <url>`) |
+| This vault on another device, and an enrolled device still works | Clone the repo, then `confidant keys device-add` (`--initiate` on the new device, `--from-request` on an enrolled one) |
+| Every enrolled device is lost | Clone the repo, then `confidant recover` (this rotates and revokes the current recovery phrase) |
+
+Typical second-device flow:
+
+```sh
+git clone <url> ~/vault
+export CONFIDANT_VAULT="$HOME/vault"
+# on the new device:
+confidant keys device-add --initiate --label "laptop-2" --output ~/device-add-request.toml
+# copy the request to an enrolled device, confirm the fingerprint out of band, then:
+confidant keys device-add --from-request ~/device-add-request.toml
+```
+
+Headless hosts without an OS keychain: the **new** device needs only
+`CONFIDANT_DEVICE_KEY` for `keys device-add --initiate`. The already-enrolled
+device that runs `--from-request` is the one that needs
+`CONFIDANT_OPERATOR_KEY` (see
+[Headless hosts and agents](#headless-hosts-and-agents)). Enrollment of a
+second headless device is `keys device-add`, not `init`.
 
 ## Recovery phrase: save it, then verify it
 
@@ -300,7 +343,7 @@ same data in human and `--json` output:
 |---|---|
 | `device key comes from CONFIDANT_DEVICE_KEY` | Env-provided; the normal headless state (ok) |
 | `device key is in the OS keychain` | Keychain reachable and enrolled (ok) |
-| `not enrolled (the OS keychain holds no device key)` | Reachable but empty: run `confidant init` / `confidant recover`, or inject `CONFIDANT_DEVICE_KEY` (warning) |
+| `not enrolled (the OS keychain holds no device key)` | Reachable but empty: run `confidant init` (new vault), clone and `confidant keys device-add` (existing vault), or `confidant recover` only if every enrolled device is lost; on a headless host inject `CONFIDANT_DEVICE_KEY` (warning) |
 | `the OS keychain is unreachable (...)` | Headless host or locked keychain; the `fix` field names `CONFIDANT_DEVICE_KEY` and `CONFIDANT_OPERATOR_KEY` (warning) |
 
 Before init on a headless host, doctor's hint names both variables to set —

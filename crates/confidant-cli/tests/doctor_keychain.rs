@@ -114,7 +114,17 @@ fn doctor_reports_not_enrolled_without_a_keychain() {
     assert!(fix.contains("CONFIDANT_OPERATOR_KEY"), "{fix}");
     assert!(fix.contains("64-character hex"), "{fix}");
     assert!(fix.contains("before running `confidant init`"), "{fix}");
-    assert!(fix.contains("CONFIDANT_INBOX_KEY"), "{fix}");
+    // #683: the inbox key is created after init; the pre-init hint must
+    // not tell the operator to set it first.
+    assert!(
+        fix.contains("CONFIDANT_INBOX_KEY") && fix.contains("after the vault exists"),
+        "{fix}"
+    );
+    assert!(
+        !fix.contains("CONFIDANT_INBOX_KEY to the inbox key before running"),
+        "pre-init hint must not require the inbox key: {fix}"
+    );
+    assert!(fix.contains("keys device-add"), "{fix}");
     assert!(fix.contains("Keys never live in files"), "{fix}");
     // Warning-only: an unenrolled host still gets a usable doctor report.
     assert_eq!(v["ok"], true, "{v}");

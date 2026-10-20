@@ -180,21 +180,27 @@ git -C ~/vault log --oneline -5
 - A former **plaintext** vault (`[crypto] mode = "plaintext"`) may contain
   real record bodies in that history. Deleting the local directory does not
   remove them from the remote.
-- `confidant init --create` runs `git init` with branch `main` and does
-  **not** add a remote. `git remote -v` on the new vault should be empty
-  until you add the one you intend. Local-only is a valid choice, but there
-  is no backup and `recover` cannot help if the disk dies. For backup and
-  second-device recovery:
+- `confidant init --create` runs `git init` with branch `main`. Without
+  `--remote` it adds no remote; with `--remote <url>` it sets `origin` and
+  still does not push. `git remote -v` on the new vault should show only
+  the origin you intended. Local-only is a valid choice, but there is no
+  backup and a second device cannot clone what was never pushed. For backup
+  and second-device enrollment:
 
   ```sh
+  confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-recovery.txt"
+  git push -u origin main
+  # or, after init without --remote:
   git remote add origin <url>
   git push -u origin main
   ```
 
-  The URL is provider-neutral. No Confidant command adds a remote or pushes
-  for you. `doctor`'s `git-remote` check accepts local-only and an encrypted
-  vault with a remote, and warns for a remote on a plaintext vault (which
-  must never be pushed).
+  The URL is provider-neutral. `init --create --remote` is the one
+  Confidant command that adds `origin`; nothing pushes for you.
+  `doctor`'s `git-remote` check accepts local-only and an encrypted vault
+  with a remote, and warns for a remote on a plaintext vault (which must
+  never be pushed). Clone on another device, then `confidant keys
+  device-add`; `recover` only if every enrolled device is lost.
 
 ### 2.3 Clear or overwrite the machine state
 
@@ -287,7 +293,9 @@ and `user.email`); the skeleton commit needs one. The command:
 5. writes `~/.config/confidant/trust.toml` only after every key step
    succeeds.
 
-It does **not** create an inbox key, add a git remote, or install any pack.
+It does **not** create an inbox key or install any pack. Without `--remote`
+it adds no git remote; with `--remote <url>` it sets `origin` and does not
+push.
 Keep the recovery phrase offline: confirm the `--phrase-out` file with the
 human-only, read-only check `confidant keys verify-recovery --phrase-file
 <path>`, then move it offline and delete the local copy. Agents must not
@@ -321,16 +329,22 @@ Tracked defect from verification:
 
 - After `init`, this device is enrolled: `doctor` reports `device key is in
   the OS keychain`.
-- On a **new device** for an existing vault, the command is
-  `confidant recover`, not `init`. `recover` requires a fresh device (no
-  device key enrolled) and does not restore the inbox key or the lookup key
-  (see [`docs/crypto-design.md`](crypto-design.md) §9 and §8a).
-- If `doctor` says `not enrolled`, either run `init` (new vault) or
-  `recover` (existing vault), or, on a headless host with no Secret Service,
-  provide `CONFIDANT_DEVICE_KEY` (and `CONFIDANT_INBOX_KEY` if you run
-  `inbox`) from the host's secret store. For the full pre-init flow
-  (`age-keygen`, `CONFIDANT_DEVICE_KEY`, and `CONFIDANT_OPERATOR_KEY`), see
-  [Headless hosts and agents](agent-setup.md#headless-hosts-and-agents).
+- On a **new device** for an existing vault, do **not** run `init` (`init`
+  creates a separate vault). Clone the repo, then:
+  - if an enrolled device still works: `confidant keys device-add`
+    (`--initiate` on the new device, `--from-request` on an enrolled one);
+  - if every enrolled device is lost: `confidant recover` (this rotates and
+    revokes the current recovery phrase). `recover` requires a fresh device
+    (no device key enrolled) and does not restore the inbox key or the
+    lookup key (see [`docs/crypto-design.md`](crypto-design.md) §9 and §8a).
+- If `doctor` says `not enrolled`, run `init` (new vault), clone and
+  `keys device-add` (existing vault, an enrolled device still works), or
+  `recover` (every enrolled device is lost). On a headless host with no
+  Secret Service, provide `CONFIDANT_DEVICE_KEY` and
+  `CONFIDANT_OPERATOR_KEY` before `init`. `CONFIDANT_INBOX_KEY` is only
+  needed after the vault exists, if you run `inbox`. For the full pre-init
+  flow (`age-keygen`, `CONFIDANT_DEVICE_KEY`, and `CONFIDANT_OPERATOR_KEY`),
+  see [Headless hosts and agents](agent-setup.md#headless-hosts-and-agents).
 - After `recover` or a `keys shred` rotation, run
   `confidant keys verify-recovery --phrase-file <path>` (human-only,
   read-only) to confirm the offline phrase still matches the vault. The

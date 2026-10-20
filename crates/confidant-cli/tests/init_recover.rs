@@ -1651,8 +1651,8 @@ fn bootstrap_empty_packs_prints_pack_add_hint() {
     );
 }
 
-/// #658: JSON gets the hint additively in `next_steps`; an explicit pack
-/// list (and `--packs`) keeps it empty.
+/// #658/#686: JSON `next_steps` always names clone + `keys device-add`;
+/// `pack add` is present only when the scaffolded list is empty.
 #[test]
 fn bootstrap_json_next_steps_points_at_pack_add_only_when_empty() {
     let b = Boot::new();
@@ -1671,6 +1671,22 @@ fn bootstrap_json_next_steps_points_at_pack_add_only_when_empty() {
             .any(|s| s.as_str().unwrap_or("").contains("confidant pack add")),
         "missing pack hint in next_steps: {steps:?}"
     );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("keys device-add")),
+        "missing second-device hint in next_steps: {steps:?}"
+    );
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("git push")),
+        "push hint must not appear without --remote: {steps:?}"
+    );
+    assert!(
+        v["remote"].is_null(),
+        "remote must be null without --remote: {v}"
+    );
 
     let b2 = Boot::new();
     let out = b2.at_vault(&[
@@ -1688,7 +1704,304 @@ fn bootstrap_json_next_steps_points_at_pack_add_only_when_empty() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["next_steps"], serde_json::json!([]));
+    let steps = v["next_steps"].as_array().expect("next_steps array");
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("confidant pack add")),
+        "pack hint must not appear when packs are explicit: {steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("keys device-add")),
+        "missing second-device hint when packs are explicit: {steps:?}"
+    );
+}
+
+const EXAMPLE_REMOTE: &str = "https://example.invalid/vault.git";
+
+/// #686: `--create --remote` sets `origin` and does not push.
+#[test]
+fn bootstrap_create_with_remote_adds_origin_and_does_not_push() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote",
+        EXAMPLE_REMOTE,
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let remotes = git_out(&b.vault, &["remote", "-v"]);
+    assert!(
+        remotes.contains("origin") && remotes.contains(EXAMPLE_REMOTE),
+        "origin was not added:\n{remotes}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["remote"], EXAMPLE_REMOTE);
+    let steps = v["next_steps"].as_array().expect("next_steps array");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("git push -u origin")),
+        "missing push hint: {steps:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("keys device-add")),
+        "missing second-device hint: {steps:?}"
+    );
+}
+
+/// #686: `--create --dry-run --remote` reports the plan and writes nothing.
+#[test]
+fn bootstrap_create_dry_run_with_remote_writes_nothing() {
+    let b = Boot::new();
+    let home_before = path_snapshot(&b.home);
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote",
+        EXAMPLE_REMOTE,
+        "--no-input",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!b.vault.exists(), "dry run created the vault directory");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["remote"], EXAMPLE_REMOTE);
+    let steps = v["next_steps"].as_array().expect("next_steps array");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("git push -u origin")),
+        "missing push hint: {steps:?}"
+    );
+    assert_eq!(path_snapshot(&b.home), home_before, "dry run changed HOME");
+}
+
+/// #686: `--remote` without `--create` is a clap usage error (exit 2).
+#[test]
+fn bootstrap_remote_without_create_is_usage_error() {
+    let b = Boot::new();
+    let out = b.at_vault(&["init", "--remote", EXAMPLE_REMOTE, "--no-input"]);
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    assert!(!b.vault.exists(), "refused --remote must not scaffold");
+}
+
+/// #686: `--remote` refuses when `origin` already exists (including dry-run).
+#[test]
+fn bootstrap_remote_refuses_existing_origin() {
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    git(&b.vault, &["init", "-q"]);
+    git(
+        &b.vault,
+        &["remote", "add", "origin", "https://example.invalid/old.git"],
+    );
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args = vec![
+            "init",
+            "--create",
+            "--remote",
+            EXAMPLE_REMOTE,
+            "--no-input",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = b.at_vault(&args);
+        assert!(
+            !out.status.success(),
+            "must refuse existing origin ({extra:?}): stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false, "{v}");
+        let msg = v["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("origin already exists"),
+            "expected origin-exists refusal ({extra:?}): {v}"
+        );
+    }
+    let remotes = git_out(&b.vault, &["remote", "-v"]);
+    assert!(
+        remotes.contains("https://example.invalid/old.git"),
+        "existing origin must be untouched:\n{remotes}"
+    );
+    assert!(
+        !remotes.contains(EXAMPLE_REMOTE),
+        "refused --remote must not replace origin:\n{remotes}"
+    );
+}
+
+/// #686: `--remote` on a directory that already has a vault is refused.
+#[test]
+fn bootstrap_remote_on_existing_vault_is_refused() {
+    let h = Harness::new();
+    let out = h.init(&["--create", "--remote", EXAMPLE_REMOTE]);
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("already has a vault"),
+        "expected existing-vault refusal: {v}"
+    );
+    let remotes = Command::new("git")
+        .arg("-C")
+        .arg(&h.vault)
+        .args(["remote"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&remotes.stdout).trim().is_empty(),
+        "refused --remote must not add origin"
+    );
+}
+
+/// #686: a failed `--create --remote` on a pre-existing repo removes origin.
+#[test]
+fn bootstrap_remote_rollback_on_failed_init() {
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    git(&b.vault, &["init", "-q"]);
+    let phrase_path = b._tmp.path().join("phrase.txt");
+
+    let out = b
+        .cmd(&[
+            "init",
+            "--create",
+            "--remote",
+            EXAMPLE_REMOTE,
+            "--no-input",
+            "--json",
+            "--phrase-out",
+            phrase_path.to_str().unwrap(),
+        ])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the failpoint must fail init: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let remotes = git_out(&b.vault, &["remote"]);
+    assert!(
+        remotes.trim().is_empty(),
+        "rollback must remove origin this run added:\n{remotes}"
+    );
+    assert!(!b.vault.join("confidant.toml").exists());
+    assert!(!phrase_path.exists());
+}
+
+/// `--remote` URLs that start with `-` would be parsed as git options.
+#[test]
+fn bootstrap_remote_rejects_leading_dash() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote=-uorigin",
+        "--no-input",
+        "--json",
+    ]);
+    assert!(!out.status.success(), "leading-dash URL must be refused");
+    assert_eq!(out.status.code(), Some(2), "usage error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("must not start with '-'"), "{msg}");
+    assert!(!b.vault.exists(), "refused --remote must not scaffold");
+}
+
+/// `--remote` with userinfo must not print the credential; git still gets
+/// the real URL.
+#[test]
+fn bootstrap_remote_redacts_userinfo_in_output() {
+    let b = Boot::new();
+    let secret = "https://user:s3cret-token@example.invalid/vault.git";
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote",
+        secret,
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("s3cret-token") && !stderr.contains("s3cret-token"),
+        "credential leaked: stdout={stdout} stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["remote"], "https://example.invalid/vault.git");
+    let remotes = git_out(&b.vault, &["remote", "-v"]);
+    assert!(
+        remotes.contains(secret),
+        "git must still store the real URL:\n{remotes}"
+    );
+}
+
+/// Human `--create` output names clone + `keys device-add`, not `recover`
+/// as the second-device path. The pack-add line still appears once.
+#[test]
+fn bootstrap_human_output_names_device_add_not_recover() {
+    let b = Boot::new();
+    let out = b.at_vault(&["init", "--create", "--no-input"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("keys device-add"),
+        "missing second-device hint:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not `init`"),
+        "hint must say not to run init:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("recover") && stdout.contains("every enrolled device is lost"),
+        "recover must be the lost-all-devices path:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("confidant pack add <https-url> --yes")
+            .count(),
+        1,
+        "the optional pack hint must appear exactly once:\n{stdout}"
+    );
 }
 
 /// #662: the phrase goes to a new 0600 file, never to stdout/stderr/JSON.
