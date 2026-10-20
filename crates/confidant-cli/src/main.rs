@@ -686,6 +686,10 @@ enum PackAction {
         /// Apply the install (vendor, lock, add to `packs`, commit).
         #[arg(long)]
         yes: bool,
+        /// Skip the pre-check for data/checks this pack will resolve; the
+        /// post-check still gates. Applies with --yes.
+        #[arg(long)]
+        allow_unresolved: bool,
     },
     /// List installed external packs and their verification status.
     List,
@@ -1330,6 +1334,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 from_dir,
                 subdir,
                 yes,
+                allow_unresolved,
             } => cmd_pack_add(
                 &cli,
                 vault_root.as_deref(),
@@ -1337,6 +1342,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 from_dir.as_deref(),
                 subdir.as_deref(),
                 *yes,
+                *allow_unresolved,
             ),
             PackAction::List => {
                 cmd_pack_list(&cli, vault_root.as_deref()).map_err(pack_fetch::escape_domain_error)
@@ -1694,12 +1700,21 @@ fn cmd_pack_add(
     from_dir: Option<&Path>,
     subdir: Option<&str>,
     yes: bool,
+    allow_unresolved: bool,
 ) -> anyhow::Result<ExitCode> {
     // The pack reader, manifest parser and git all quote untrusted
     // repository text; escape it before any error reaches the terminal or
     // the JSON error envelope (#499).
-    cmd_pack_add_inner(cli, vault_root, url, from_dir, subdir, yes)
-        .map_err(pack_fetch::escape_domain_error)
+    cmd_pack_add_inner(
+        cli,
+        vault_root,
+        url,
+        from_dir,
+        subdir,
+        yes,
+        allow_unresolved,
+    )
+    .map_err(pack_fetch::escape_domain_error)
 }
 
 /// #694: refuse `pack add --yes` before the generic pre-check when the
@@ -1874,12 +1889,17 @@ fn installed_pack_tokens(root: &Path, name: &str) -> Vec<String> {
 /// #694: a stderr hint after `pack add --yes` is blocked, tailored to the
 /// findings that name this pack's data. Returns `None` when the block is
 /// unrelated (for example a pack conflict), so the hint never misdiagnoses.
+///
+/// #696: with `--allow-unresolved` the pre-check was already skipped, so the
+/// hint must not suggest listing the pack again or claim the flag fixes
+/// unrelated findings; it only says the post-check is what rolled back.
 fn pack_add_blocked_hint(
     root: &Path,
     report: &confidant_core::check::CheckReport,
     name: &str,
     version: &str,
     manifest: &confidant_core::packs::manifest::PackManifest,
+    allow_unresolved: bool,
 ) -> Option<String> {
     let owned = manifest_tokens(manifest);
     let scoped: Vec<&confidant_core::check::Finding> = report
@@ -1899,6 +1919,14 @@ fn pack_add_blocked_hint(
     let uses_ledger = scoped
         .iter()
         .any(|finding| finding.code.as_str() != "E_CONFIG");
+    if allow_unresolved {
+        if scoped.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "hint: --allow-unresolved skipped the pre-check, but the post-check still failed, so nothing was committed. The findings above name data {listed} resolves or `[checks]` keys the vault already sets; fix them, then re-run `confidant pack add`."
+        ));
+    }
     let mut lines = Vec::new();
     if sets_checks {
         lines.push(format!(
@@ -1911,6 +1939,20 @@ fn pack_add_blocked_hint(
         ));
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// #696: additive JSON field for `pack add`, present only when the flag was
+/// passed so existing envelopes keep their shape.
+fn with_allow_unresolved(
+    mut payload: serde_json::Value,
+    allow_unresolved: bool,
+) -> serde_json::Value {
+    if allow_unresolved {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("allow_unresolved".to_owned(), serde_json::Value::Bool(true));
+        }
+    }
+    payload
 }
 
 /// #694: a stderr hint after `pack remove --yes` is blocked. The report
@@ -1933,7 +1975,7 @@ fn pack_remove_blocked_hint(
     }
     let name = pack_fetch::escape_line(name);
     Some(format!(
-        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Remove or migrate those entries (and drop the [checks] keys) first, or keep the pack installed. An explicit orphan flag is tracked in #696 and is not available yet."
+        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Remove or migrate those entries (and drop the [checks] keys) first, or keep the pack installed. An explicit remove-side flag is tracked in #699 and is not available yet."
     ))
 }
 
@@ -1944,6 +1986,7 @@ fn cmd_pack_add_inner(
     from_dir: Option<&Path>,
     subdir: Option<&str>,
     yes: bool,
+    allow_unresolved: bool,
 ) -> anyhow::Result<ExitCode> {
     let source = pack_fetch::parse_add_source(url, from_dir)?;
     let fetched = pack_fetch::fetch(&source, subdir.unwrap_or(""))?;
@@ -1970,7 +2013,12 @@ fn cmd_pack_add_inner(
                     .is_some_and(|(name, _)| name == report.name)
         });
         if !listed_name {
-            preflight_unlisted_pack(root, &cfg, &report)?;
+            // #696: the explicit install-over-existing-data path skips this
+            // preflight. The post-check still gates the commit, so an
+            // unrelated error rolls the whole write back.
+            if !allow_unresolved {
+                preflight_unlisted_pack(root, &cfg, &report)?;
+            }
         }
         let lock = read_lockfile_or_empty(root)?;
         if let Some(entry) = lock.find(&report.name, &report.version) {
@@ -1979,11 +2027,14 @@ fn cmd_pack_add_inner(
                 if cli.json {
                     print_json(&ok_envelope(
                         Some(root),
-                        serde_json::json!({
-                            "command": "pack-add",
-                            "unchanged": true,
-                            "pack": {"name": report.name, "version": report.version, "hash": report.hash},
-                        }),
+                        with_allow_unresolved(
+                            serde_json::json!({
+                                "command": "pack-add",
+                                "unchanged": true,
+                                "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+                            }),
+                            allow_unresolved,
+                        ),
                     ))?;
                 } else {
                     println!(
@@ -2028,6 +2079,12 @@ fn cmd_pack_add_inner(
         // repairs by writing the pin, so route it through the repairing path;
         // the post-check still gates the commit. With no such listing the
         // pre-check runs as usual.
+        //
+        // #696: `--allow-unresolved` opts into the same repairing path for a
+        // vault that already carries this pack's checks/verbs/metrics/edge
+        // kinds but does not list it. The pre-check is skipped; the
+        // post-check still refuses to commit an unclean vault, so unrelated
+        // errors roll back.
         let unpinned_listing = cfg.packs.iter().any(|listed| listed == &listed_id);
         let changes = install_changes(root, &report, &files, &fetched, None)?;
         let summary = format!(
@@ -2041,7 +2098,7 @@ fn cmd_pack_add_inner(
             canonical_request: summary.clone(),
             summary,
         };
-        let outcome = if unpinned_listing {
+        let outcome = if unpinned_listing || allow_unresolved {
             apply_write_repairing(root, pending, &write_options(cli))?
         } else {
             apply_write(root, pending, &write_options(cli))?
@@ -2057,6 +2114,7 @@ fn cmd_pack_add_inner(
                 &report.name,
                 &report.version,
                 &report.manifest,
+                allow_unresolved,
             ),
             _ => None,
         };
@@ -2065,9 +2123,12 @@ fn cmd_pack_add_inner(
             root,
             "pack-add",
             outcome,
-            serde_json::json!({
-                "pack": {"name": report.name, "version": report.version, "hash": report.hash},
-            }),
+            with_allow_unresolved(
+                serde_json::json!({
+                    "pack": {"name": report.name, "version": report.version, "hash": report.hash},
+                }),
+                allow_unresolved,
+            ),
         )?;
         if let Some(hint) = hint {
             writeln!(io::stderr(), "{hint}")?;
@@ -2076,7 +2137,10 @@ fn cmd_pack_add_inner(
     }
     if cli.json {
         let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
-        print_json(&ok_envelope(vault_root, payload))?;
+        print_json(&ok_envelope(
+            vault_root,
+            with_allow_unresolved(payload, allow_unresolved),
+        ))?;
     } else {
         // Everything here except `rev` (40 hex) and `hash` (ours) comes from
         // an untrusted repository, so control characters are escaped before

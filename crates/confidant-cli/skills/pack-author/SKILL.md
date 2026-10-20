@@ -129,11 +129,16 @@ vault that still carries the pack's data:
 - **Adding** when the vault already has the pack's `[checks]` keys (or a
   vendored copy) but no `packs` listing fails before the generic check. Add
   `"<name>@<version>"` to `packs` in `confidant.toml` first, or remove the
-  dependent `[checks]` keys, then re-run.
+  dependent `[checks]` keys, then re-run. If the vault already has the
+  pack's data/checks, `confidant pack add --from-dir <dir>
+  --allow-unresolved --yes` installs over it: only the pre-check is
+  skipped, the post-check and `confidant check` still gate, and unrelated
+  errors roll back. The flag needs `--yes`; without it the command stays the
+  read-only review.
 - **Removing** while ledger lines, metrics, edge kinds, or `[checks]` keys
   still use the pack fails the post-check and rolls back. Remove or migrate
-  those entries first, or keep the pack installed; an explicit orphan flag
-  is tracked in #696 and is not available yet.
+  those entries first, or keep the pack installed; a remove-side flag is
+  not available yet (#699).
 
 The error text names the blocking data. Bring it to the operator; do not
 edit the vault around it.
