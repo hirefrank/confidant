@@ -24,9 +24,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   a keyless headless host (no OS keychain, no `CONFIDANT_DEVICE_KEY` /
   `CONFIDANT_OPERATOR_KEY`) is refused, and dry-run reports whether an
   existing repo on `master` will be left alone (#682, #661).
-- `doctor` skills-links now resolves `$HOME` / `CONFIDANT_HOME` / skill
-  symlink targets to absolute paths, so a run from inside the vault agrees
-  with `setup` and `agents` instead of reporting `linked 0/2` (#681).
+- `doctor` skills-links treats `$HOME` / `CONFIDANT_HOME` / skill symlink
+  targets as absolute (without rewriting macOS `/var` to `/private/var`),
+  and `setup` stores canonical absolute link targets. A regression test
+  pins the #681 install sequence: absolute `HOME`, default `CONFIDANT_HOME`,
+  `setup --agent auto` then `agents` then `doctor` from the vault cwd.
 
 ## [0.6.1] - 2026-10-19
 

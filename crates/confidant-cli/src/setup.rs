@@ -41,12 +41,6 @@ fn make_absolute(p: PathBuf) -> PathBuf {
     }
 }
 
-/// Absolute form of `p`, canonical when the path exists.
-fn make_absolute_canonical(p: PathBuf) -> PathBuf {
-    let abs = make_absolute(p);
-    abs.canonicalize().unwrap_or(abs)
-}
-
 pub fn home_dir() -> anyhow::Result<PathBuf> {
     let p = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -57,7 +51,10 @@ pub fn home_dir() -> anyhow::Result<PathBuf> {
                 "cannot determine a home directory: set HOME (or USERPROFILE on Windows)"
             )
         })?;
-    Ok(make_absolute_canonical(p))
+    // Absolutize only: do not canonicalize. macOS `canonicalize("/var/…")`
+    // becomes `/private/var/…`, which then disagrees with un-canonicalized
+    // dests built from the raw HOME string.
+    Ok(make_absolute(p))
 }
 
 pub fn agent_subpath(name: &str) -> Option<&'static str> {
@@ -150,7 +147,7 @@ pub fn confidant_home() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CONFIDANT_HOME") {
         let p = PathBuf::from(dir);
         if !p.as_os_str().is_empty() {
-            return Ok(make_absolute_canonical(p));
+            return Ok(make_absolute(p));
         }
     }
     Ok(home_dir()?.join(".local/share/confidant"))
@@ -166,7 +163,7 @@ pub fn skills_dir_override() -> Option<PathBuf> {
     std::env::var_os("CONFIDANT_SKILLS_DIR")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .map(make_absolute_canonical)
+        .map(make_absolute)
 }
 
 /// Materialize the embedded tree to the versioned share dir.
@@ -934,15 +931,11 @@ fn is_linked_to_current(dest: &Path, skill: &str) -> bool {
         if let (Ok(a), Ok(b)) = (resolved.canonicalize(), expected.canonicalize()) {
             return a == b;
         }
-        // The link target exists (follows dest) even when `expected` cannot
-        // be canonicalized — e.g. a relative CONFIDANT_HOME from a different
-        // cwd than setup used. Count it if the real path is the current
-        // version of this skill.
-        if let Ok(dest_c) = dest.canonicalize() {
-            let marker = Path::new("skills").join(version).join(skill);
-            if dest_c.ends_with(&marker) {
-                return true;
-            }
+        // dest.canonicalize follows the link. Require the real path to sit
+        // under this version dir so a same-named skill outside the share
+        // tree does not count (a suffix-only match was too broad).
+        if let (Ok(dest_c), Ok(version_c)) = (dest.canonicalize(), version_dir.canonicalize()) {
+            return dest_c == version_c.join(skill);
         }
         return normalize_lexical(&resolved) == normalize_lexical(&expected);
     }
@@ -1038,6 +1031,12 @@ mod tests {
     fn make_absolute_leaves_absolute_paths() {
         let p = PathBuf::from("/tmp/confidant-home");
         assert_eq!(make_absolute(p.clone()), p);
+    }
+
+    #[test]
+    fn make_absolute_joins_relative_paths_to_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(make_absolute(PathBuf::from("share")), cwd.join("share"));
     }
 
     #[test]
