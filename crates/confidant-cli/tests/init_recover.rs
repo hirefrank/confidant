@@ -2519,6 +2519,33 @@ fn init_create_dry_run_refuses_without_key_sources() {
     assert!(!b.vault.exists(), "refused dry run wrote the target");
 }
 
+/// #682: `CONFIDANT_TEST_KEYCHAIN_DIR` is the same device-key source
+/// `provision_device_key` uses under `--all-features`. The preflight must
+/// accept it (shred-rotation fixtures set the dir and unset
+/// `CONFIDANT_DEVICE_KEY`).
+#[test]
+fn init_accepts_test_keychain_dir_without_device_key_env() {
+    let b = Boot::new();
+    let keychain = b._tmp.path().join("keychain");
+    std::fs::create_dir_all(&keychain).unwrap();
+    std::fs::write(keychain.join("device.key"), &b.device_bech32).unwrap();
+
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env("CONFIDANT_TEST_KEYCHAIN_DIR", &keychain)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init with TEST_KEYCHAIN_DIR must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn init_create_dry_run_reports_existing_master_branch() {
     // #682: a 0.6.0 skeleton on master with commits is not renamed (#661

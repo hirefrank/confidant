@@ -9384,11 +9384,28 @@ fn invalid_operator_key(reason: &str) -> anyhow::Error {
     ))
 }
 
-/// True when `CONFIDANT_DEVICE_KEY` is set to a valid age identity. An
-/// invalid value fails the same way a real `init` would in
-/// [`provision_device_key`].
+/// True when this process already has a device identity that
+/// [`provision_device_key`] will use without writing the OS keychain:
+/// `CONFIDANT_DEVICE_KEY`, or (test-overrides only) a
+/// `CONFIDANT_TEST_KEYCHAIN_DIR` file / `CONFIDANT_TEST_DEVICE_KEY`.
 fn device_key_supplied_from_env() -> anyhow::Result<bool> {
     use std::str::FromStr;
+    #[cfg(feature = "test-overrides")]
+    if test_keychain_dir().is_some_and(|dir| dir.join("device.key").is_file()) {
+        return Ok(true);
+    }
+    #[cfg(feature = "test-overrides")]
+    if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
+        let trimmed = test_key.trim();
+        if !trimmed.is_empty() {
+            age::x25519::Identity::from_str(trimmed).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "CONFIDANT_TEST_DEVICE_KEY is not a valid age identity: {e}"
+                )))
+            })?;
+            return Ok(true);
+        }
+    }
     match std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
         Err(_) => Ok(false),
         Ok(value) if value.trim().is_empty() => Ok(false),
@@ -9421,7 +9438,9 @@ fn init_key_sources_error(detail: &str) -> anyhow::Error {
 ///
 /// A reachable OS keychain is enough to generate both. A headless host
 /// (keychain unreachable, or the test-only `CONFIDANT_KEYCHAIN=off`
-/// switch) needs `CONFIDANT_DEVICE_KEY`; it also needs
+/// switch) needs `CONFIDANT_DEVICE_KEY` (or, in test builds, a
+/// `CONFIDANT_TEST_KEYCHAIN_DIR` / `CONFIDANT_TEST_DEVICE_KEY` that
+/// [`provision_device_key`] would honor); it also needs
 /// `CONFIDANT_OPERATOR_KEY` unless the kill switch is on, matching the
 /// real init path that skips the operator keychain write in tests.
 fn require_init_key_sources() -> anyhow::Result<()> {
