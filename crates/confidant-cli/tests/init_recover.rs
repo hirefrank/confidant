@@ -2489,6 +2489,73 @@ fn init_dry_run_rejects_invalid_operator_env_key() {
 }
 
 #[test]
+fn init_create_dry_run_refuses_without_key_sources() {
+    // #682: on a keyless host (CONFIDANT_KEYCHAIN=off, no env keys) a real
+    // init fails at store_device_key. --dry-run must fail the same way.
+    let b = Boot::new();
+    let out = b
+        .cmd(&["init", "--create", "--no-input", "--dry-run", "--json"])
+        .arg("--vault")
+        .arg(&b.vault)
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .env_remove("CONFIDANT_OPERATOR_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "dry run must refuse a keyless host: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("keychain") || msg.contains("CONFIDANT_DEVICE_KEY"),
+        "expected a keychain/env-key refusal, got: {msg}"
+    );
+    assert!(fix.contains("CONFIDANT_DEVICE_KEY"), "{fix}");
+    assert!(fix.contains("CONFIDANT_OPERATOR_KEY"), "{fix}");
+    assert!(!b.vault.exists(), "refused dry run wrote the target");
+}
+
+#[test]
+fn init_create_dry_run_reports_existing_master_branch() {
+    // #682: a 0.6.0 skeleton on master with commits is not renamed (#661
+    // only moves an unborn HEAD). Dry-run must say so instead of always
+    // printing "branch main".
+    let b = Boot::new();
+    std::fs::create_dir_all(&b.vault).unwrap();
+    git(&b.vault, &["init", "-q"]);
+    git(&b.vault, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    git(&b.vault, &["config", "user.name", "Test Operator"]);
+    git(&b.vault, &["config", "user.email", "test@example.com"]);
+    std::fs::write(b.vault.join(".gitignore"), ".confidant/\n").unwrap();
+    git(&b.vault, &["add", "--", ".gitignore"]);
+    git(&b.vault, &["commit", "-q", "-m", "skeleton"]);
+    assert_eq!(
+        git_out(&b.vault, &["branch", "--show-current"]).trim(),
+        "master"
+    );
+
+    let out = b.at_vault(&["init", "--create", "--no-input", "--dry-run", "--json"]);
+    assert!(
+        out.status.success(),
+        "dry run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["dry_run"], true, "{v}");
+    assert_eq!(v["branch"], "master", "{v}");
+    let note = v["branch_note"].as_str().unwrap_or("");
+    assert!(note.contains("master"), "{v}");
+    assert!(note.contains("unborn"), "{v}");
+    assert!(!b.vault.join("confidant.toml").exists());
+}
+
+#[test]
 fn init_dry_run_with_env_keys_reports_plan() {
     let b = Boot::new();
     let seed_hex = "22".repeat(32);

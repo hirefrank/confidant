@@ -19,6 +19,12 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   nit 4). `--from-request` still refuses a previously-seen pubkey. `keys
   shred` still refuses the env override.
 
+### Fixed
+- `init --dry-run` now runs the same key-source preflight as a real init:
+  a keyless headless host (no OS keychain, no `CONFIDANT_DEVICE_KEY` /
+  `CONFIDANT_OPERATOR_KEY`) is refused, and dry-run reports whether an
+  existing repo on `master` will be left alone (#682, #661).
+
 ## [0.6.1] - 2026-10-19
 
 **Disclosure:** the milestone 2 encryption has had no independent review and
