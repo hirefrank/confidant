@@ -9384,6 +9384,159 @@ fn invalid_operator_key(reason: &str) -> anyhow::Error {
     ))
 }
 
+/// True when this process already has a device identity that
+/// [`provision_device_key`] will use without writing the OS keychain:
+/// `CONFIDANT_DEVICE_KEY`, or (test-overrides only) a
+/// `CONFIDANT_TEST_KEYCHAIN_DIR` file / `CONFIDANT_TEST_DEVICE_KEY`.
+fn device_key_supplied_from_env() -> anyhow::Result<bool> {
+    use std::str::FromStr;
+    #[cfg(feature = "test-overrides")]
+    if test_keychain_dir().is_some_and(|dir| dir.join("device.key").is_file()) {
+        return Ok(true);
+    }
+    #[cfg(feature = "test-overrides")]
+    if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
+        let trimmed = test_key.trim();
+        if !trimmed.is_empty() {
+            age::x25519::Identity::from_str(trimmed).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "CONFIDANT_TEST_DEVICE_KEY is not a valid age identity: {e}"
+                )))
+            })?;
+            return Ok(true);
+        }
+    }
+    match std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
+        Err(_) => Ok(false),
+        Ok(value) if value.trim().is_empty() => Ok(false),
+        Ok(value) => {
+            age::x25519::Identity::from_str(value.trim()).map_err(|e| {
+                anyhow::Error::new(DomainError::invalid(format!(
+                    "{} is not a valid age identity: {e}",
+                    confidant_crypt::keychain::DEVICE_KEY_ENV
+                )))
+            })?;
+            Ok(true)
+        }
+    }
+}
+
+fn init_key_sources_error(detail: &str) -> anyhow::Error {
+    use confidant_crypt::keychain::DEVICE_KEY_ENV;
+    anyhow::Error::new(DomainError::invalid(format!(
+        "cannot init on this host: {detail}"
+    )))
+    .with_fix(&format!(
+        "On a host with no OS keychain, set {DEVICE_KEY_ENV} to an AGE-SECRET-KEY-1… identity \
+         and {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed before `confidant init` \
+         (see docs/agent-setup.md, Headless hosts and agents)"
+    ))
+}
+
+/// Refuse `init` — including `--dry-run` — when this host cannot persist
+/// the device or operator key the same way a real run would (#682).
+///
+/// A reachable OS keychain is enough to generate both. A headless host
+/// (keychain unreachable, or the test-only `CONFIDANT_KEYCHAIN=off`
+/// switch) needs `CONFIDANT_DEVICE_KEY` (or, in test builds, a
+/// `CONFIDANT_TEST_KEYCHAIN_DIR` / `CONFIDANT_TEST_DEVICE_KEY` that
+/// [`provision_device_key`] would honor); it also needs
+/// `CONFIDANT_OPERATOR_KEY` unless the kill switch is on, matching the
+/// real init path that skips the operator keychain write in tests.
+fn require_init_key_sources() -> anyhow::Result<()> {
+    use confidant_crypt::keychain::{
+        self, DeviceKeyState, KeychainBackend, DEVICE_ACCOUNT, DEVICE_KEY_ENV, DEVICE_SERVICE,
+    };
+
+    // Same stand-in #688 uses in `device_key_store_available`: a test
+    // keychain dir is the file-backed store `provision_device_key` writes
+    // to under `--all-features`. Dir presence is enough; do not wait for
+    // `device.key` (shred-rotation fixtures set the dir and then init).
+    #[cfg(feature = "test-overrides")]
+    if test_keychain_dir().is_some() {
+        return Ok(());
+    }
+
+    let operator_from_env = operator_key_from_env()?.is_some();
+    let device_from_env = device_key_supplied_from_env()?;
+    if device_from_env && operator_from_env {
+        return Ok(());
+    }
+
+    if keychain::keychain_switch().map_err(anyhow::Error::new)? == keychain::KeychainSwitch::Off {
+        if !device_from_env {
+            return Err(init_key_sources_error(
+                "the OS keychain is not available to store a generated device key",
+            ));
+        }
+        // Real init skips the operator keychain write under the kill switch.
+        return Ok(());
+    }
+
+    let keychain_reachable = match keychain::device_key_state() {
+        Ok(DeviceKeyState::Keychain | DeviceKeyState::NotEnrolled) => true,
+        Ok(DeviceKeyState::Env) => {
+            if operator_from_env {
+                return Ok(());
+            }
+            // `DeviceKeyState::Env` means CONFIDANT_DEVICE_KEY is set, so
+            // `device_key_state` never opened the OS keychain. Probe it so
+            // a headless host still needs CONFIDANT_OPERATOR_KEY unless
+            // the keychain can persist one. `Error::Keychain` is
+            // "unreachable" (no Secret Service / no entry); any other
+            // error is a real backend failure and must not be treated as
+            // "no store".
+            match keychain::OsKeychain.get_password(DEVICE_SERVICE, DEVICE_ACCOUNT) {
+                Ok(_) => true,
+                Err(confidant_crypt::error::Error::Keychain(_)) => false,
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+        }
+        Ok(DeviceKeyState::KeychainUnreachable(_)) => false,
+        Err(e) => return Err(anyhow::Error::new(e)),
+    };
+    if keychain_reachable {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if !device_from_env {
+        missing.push(DEVICE_KEY_ENV);
+    }
+    if !operator_from_env {
+        missing.push(OPERATOR_KEY_ENV);
+    }
+    Err(init_key_sources_error(&format!(
+        "the OS keychain is unreachable and {} is unset",
+        missing.join(" and ")
+    )))
+}
+
+/// Branch `--create` will use, plus a note when an existing repo is left
+/// on a name other than `main` (#682, #661).
+fn planned_create_branch(root: &Path, no_input: bool) -> (String, Option<String>) {
+    if !root.is_dir() || !is_git_repo_root(root, no_input) {
+        return ("main".to_owned(), None);
+    }
+    if confidant_core::write::git(root, &["rev-parse", "--verify", "HEAD"], no_input).is_err() {
+        return (
+            "main".to_owned(),
+            Some("would move unborn HEAD to main".to_owned()),
+        );
+    }
+    let current = current_branch(root, no_input).unwrap_or_else(|| "main".to_owned());
+    if current == "main" {
+        (current, None)
+    } else {
+        (
+            current.clone(),
+            Some(format!(
+                "would leave existing branch {current} (init only moves an unborn HEAD to main)"
+            )),
+        )
+    }
+}
+
 /// True when git can resolve a commit identity for the repo at `root`.
 /// Runs `git var` before `init --create` writes anything (#651), and avoids
 /// reading the *current* directory's repo config: a fresh target has no local
@@ -9437,22 +9590,27 @@ fn init_next_steps(packs_empty: bool) -> Value {
 /// #649: report the `init --create` plan without writing anything.
 fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyhow::Result<()> {
     let packs_empty = packs.is_empty();
+    let (branch, branch_note) = planned_create_branch(root, cli.no_input);
     if cli.json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "command": "init",
-                "dry_run": true,
-                "branch": "main",
-                "scaffold": true,
-                "packs": packs,
-                "next_steps": init_next_steps(packs_empty),
-            }),
-        ))?;
+        let mut extra = serde_json::json!({
+            "command": "init",
+            "dry_run": true,
+            "branch": branch,
+            "scaffold": true,
+            "packs": packs,
+            "next_steps": init_next_steps(packs_empty),
+        });
+        if let Some(note) = &branch_note {
+            extra["branch_note"] = Value::String(note.clone());
+        }
+        print_json(&ok_envelope(Some(root), extra))?;
     } else {
         println!("dry run — no changes:");
         println!("  vault    {}", root.display());
-        println!("  branch   main");
+        println!("  branch   {branch}");
+        if let Some(note) = &branch_note {
+            println!("  note     {note}");
+        }
         println!("  would    create the vault directory (when absent)");
         println!("  would    run git init and commit .gitignore + confidant.toml");
         if std::env::var_os(OPERATOR_KEY_ENV).is_some() {
@@ -9542,6 +9700,11 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
     // leaves an absent target absent instead of an empty `.git` that blocks
     // the retry. This also covers the dry run so it reports the same refusal.
     require_git_identity(&root, no_input)?;
+
+    // #682: `--dry-run` "runs every preflight check" — including whether
+    // this host can persist keys. A keyless headless box must fail here
+    // the same way a real init would at `store_device_key`.
+    require_init_key_sources()?;
 
     // #649: dry run stops before the first write.
     if cli.dry_run {
@@ -9745,6 +9908,10 @@ fn cmd_init(
     // value fails (including under --dry-run) before anything is generated
     // or written. The same env var is already honored by the load path.
     let env_operator_sk = operator_key_from_env()?;
+
+    // #682: same key-source preflight as `--create`, so `--dry-run` on a
+    // prepared vault also refuses a keyless headless host.
+    require_init_key_sources()?;
 
     let vault = load_vault(root)?;
     // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
