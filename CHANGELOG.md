@@ -8,20 +8,6 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
-### Changed
-- The `pack-author` skill spells out message-variant names (including
-  `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
-  ordering, where to read message templates during review, and that
-  `pack update` prints its diff without `--yes` and replaces same-version
-  content. It reflects the coaching-pack rebuild dogfood (#675).
-
-## [0.6.2] - 2026-10-20
-
-**Disclosure:** the milestone 2 encryption has had no independent review,
-and none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138)).
-Use your own judgment before storing other people's sensitive data in a
-vault; keep it on trusted devices with encrypted disks.
-
 ### Added
 - `confidant sync`: the explicit git boundary (#665). Read-only by
   default (fetch, report ahead/behind); `--pull` fast-forwards and
@@ -37,6 +23,27 @@ vault; keep it on trusted devices with encrypted disks.
 - `contrib/` systemd user units and a launchd agent for an opt-in sync
   timer, plus [`docs/sync.md`](docs/sync.md) covering the manual rhythm,
   refusal codes, and timer setup (#665).
+
+### Changed
+- The `pack-author` skill spells out message-variant names (including
+  `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
+  ordering, where to read message templates during review, and that
+  `pack update` prints its diff without `--yes` and replaces same-version
+  content. It reflects the coaching-pack rebuild dogfood (#675).
+- Writes still commit locally only; `confidant sync` is now the one
+  command that fetches or pushes. It refuses a structurally plaintext
+  vault with `E_PLAINTEXT_REMOTE`, a missing remote/upstream with
+  `E_NO_REMOTE`, and a diverged branch with `E_NOT_FAST_FORWARD`; it
+  never force-pushes and never auto-merges (#665).
+
+## [0.6.2] - 2026-10-20
+
+**Disclosure:** the milestone 2 encryption has had no independent review,
+and none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138)).
+Use your own judgment before storing other people's sensitive data in a
+vault; keep it on trusted devices with encrypted disks.
+
+### Added
 - Headless `keys device-add --initiate`: `CONFIDANT_DEVICE_KEY` is this
   device's identity, the same as `init`. The command emits that pubkey and
   does not write a keychain; without an env identity and a reachable
@@ -47,11 +54,6 @@ vault; keep it on trusted devices with encrypted disks.
   clone-then-`keys device-add` next step (#686).
 
 ### Changed
-- Writes still commit locally only; `confidant sync` is now the one
-  command that fetches or pushes. It refuses a structurally plaintext
-  vault with `E_PLAINTEXT_REMOTE`, a missing remote/upstream with
-  `E_NO_REMOTE`, and a diverged branch with `E_NOT_FAST_FORWARD`; it
-  never force-pushes and never auto-merges (#665).
 - `--initiate` no longer refuses when `CONFIDANT_DEVICE_KEY` is set (#153
   nit 4). `--from-request` still refuses a previously-seen pubkey. `keys
   shred` still refuses the env override.
