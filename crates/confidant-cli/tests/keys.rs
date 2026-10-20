@@ -1587,8 +1587,9 @@ fn device_add_setup() -> (Harness, Harness, PathBuf, String, String) {
     assert!(out.status.success(), "rotate failed");
 
     // New device: --initiate (needs no vault). Uses the test keychain dir
-    // (a device key is "enrolled" there, so --force is required) because
-    // --initiate refuses to re-emit an env-var key (#153 nit 4).
+    // (a device key is "enrolled" there, so --force is required). The
+    // env-var path (#684) is covered separately; this setup still needs a
+    // distinct keychain identity for the second device.
     let mut h2 = Harness::new();
     h2.with_test_keychain();
     let req_path = h2.home.join("device-add-request.toml");
@@ -1823,26 +1824,276 @@ fn device_add_initiate_refuses_when_device_key_enrolled() {
 }
 
 #[test]
-fn device_add_initiate_refuses_device_key_env() {
-    // #153 nit 4: with CONFIDANT_DEVICE_KEY set, --initiate cannot generate
-    // a fresh keypair (it would re-emit the env key) — it must fail closed
-    // up front (as shred does), not let the enrolled device reject the
-    // request later. The harness sets CONFIDANT_DEVICE_KEY.
+fn device_add_initiate_uses_env_device_key() {
+    // #684: on a headless host, CONFIDANT_DEVICE_KEY IS this device's
+    // identity (same as init). --initiate must use it without --force,
+    // without writing a keychain, and without treating the env var as
+    // "already enrolled". --from-request still refuses a previously-seen
+    // pubkey. The harness sets CONFIDANT_DEVICE_KEY and KEYCHAIN=off.
+    use std::str::FromStr;
     let h = Harness::new();
+    let want_pubkey = age::x25519::Identity::from_str(&h.device_bech32)
+        .unwrap()
+        .to_public()
+        .to_string();
     for extra in [&[][..], &["--force"][..]] {
-        let mut args = vec!["keys", "device-add", "--initiate", "--no-input"];
+        let mut args = vec![
+            "keys",
+            "device-add",
+            "--initiate",
+            "--no-input",
+            "--json",
+            "--label",
+            "headless-box",
+        ];
         args.extend_from_slice(extra);
         let out = h.cmd_no_vault(&args).output().unwrap();
         assert!(
-            !out.status.success(),
-            "--initiate with CONFIDANT_DEVICE_KEY must fail closed ({extra:?})"
+            out.status.success(),
+            "--initiate with CONFIDANT_DEVICE_KEY must succeed ({extra:?}): stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["pubkey"], want_pubkey, "{v}");
+        assert_eq!(v["key_source"], "env", "{v}");
+        assert_eq!(v["label"], "headless-box", "{v}");
+        let request = v["request"].as_str().unwrap_or("");
+        assert!(request.contains(&want_pubkey), "{request}");
+        assert!(
+            !request.contains("AGE-SECRET-KEY"),
+            "private key leaked into the request"
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("CONFIDANT_DEVICE_KEY"),
-            "expected a CONFIDANT_DEVICE_KEY refusal ({extra:?}), got: {stderr}"
+            "stderr should name the env identity: {stderr}"
+        );
+        assert!(
+            !stderr.contains("AGE-SECRET-KEY"),
+            "private key leaked to stderr"
         );
     }
+}
+
+#[test]
+fn device_add_initiate_rejects_malformed_device_key() {
+    // #684: a headless CONFIDANT_DEVICE_KEY that is not an age identity
+    // must fail closed, not generate a different key.
+    let h = Harness::new();
+    let req_path = h.home.join("req.toml");
+    let out = h
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--no-input",
+            "--json",
+            "--label",
+            "headless-box",
+            "--output",
+            req_path.to_str().unwrap(),
+        ])
+        .env("CONFIDANT_DEVICE_KEY", "not-an-age-identity")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "malformed CONFIDANT_DEVICE_KEY must be refused: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("not-an-age-identity") && !stderr.contains("not-an-age-identity"),
+        "malformed key leaked: stdout={stdout} stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("CONFIDANT_DEVICE_KEY") && msg.contains("not a valid age identity"),
+        "expected an age-identity refusal, got: {v}"
+    );
+    assert!(
+        !req_path.exists(),
+        "malformed CONFIDANT_DEVICE_KEY must not write a request"
+    );
+}
+
+#[test]
+fn device_add_env_key_then_decrypts_a_record() {
+    // #684: --initiate with CONFIDANT_DEVICE_KEY, --from-request on the
+    // enrolled device, then the new device decrypts a record it was
+    // wrapped to.
+    const PERSON: &str = "p-01J9Z3K4QF0000000000000000";
+    const BIO: &str = "Bio with FAKEBIO-DEVICE-ADD.";
+    let h1 = Harness::new();
+    assert!(h1.init(&[]).status.success(), "init failed");
+    let out = h1
+        .cmd(&["keys", "init-client", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init-client failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let person_file = h1._tmp.path().join("person.md");
+    std::fs::write(
+        &person_file,
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Ada Example\"\n---\n\n{BIO}\n"),
+    )
+    .unwrap();
+    let out = h1
+        .cmd(&[
+            "record",
+            "add",
+            "--file",
+            person_file.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "record add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut h2 = Harness::new();
+    let req_path = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--label",
+            "headless-box",
+            "--output",
+            req_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "from-request failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Same vault, operator, and trust pin as the enrolled device; h2's
+    // identity is still CONFIDANT_DEVICE_KEY (no keychain).
+    h2.vault = h1.vault.clone();
+    h2.operator_hex = h1.operator_hex.clone();
+    let anchor_src = h1.home.join(".config/confidant/trust.toml");
+    let anchor_dir = h2.home.join(".config/confidant");
+    std::fs::create_dir_all(&anchor_dir).unwrap();
+    std::fs::copy(&anchor_src, anchor_dir.join("trust.toml")).unwrap();
+
+    let out = h2
+        .cmd(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "new device could not read the record: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("FAKEBIO-DEVICE-ADD"),
+        "decrypted bio missing: {text}"
+    );
+}
+
+#[test]
+fn device_add_from_request_refuses_already_enrolled_pubkey() {
+    // #684: --from-request must refuse a pubkey that is already a
+    // recipient, not only one that appears in shred history.
+    let (h1, _h2, req_path, _key_id, _stderr) = device_add_setup();
+    let before = snapshot_keys(&h1.vault);
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "second --from-request of an enrolled pubkey must be refused: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already enrolled"),
+        "expected already-enrolled refusal, got: {stderr}"
+    );
+    assert_eq!(
+        snapshot_keys(&h1.vault),
+        before,
+        "refused --from-request must leave keys/ byte-identical"
+    );
+}
+
+#[test]
+fn device_add_initiate_without_key_source_fails_closed() {
+    // Headless, no env identity, keychain writes disabled: --initiate must
+    // name CONFIDANT_DEVICE_KEY / age-keygen rather than trying to store.
+    let h = Harness::new();
+    let out = h
+        .cmd_no_vault(&["keys", "device-add", "--initiate", "--no-input", "--json"])
+        .env_remove("CONFIDANT_DEVICE_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--initiate without a key source must fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    let fix = v["error"]["fix"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("CONFIDANT_DEVICE_KEY"),
+        "expected env-var hint in message: {v}"
+    );
+    assert!(
+        fix.contains("age-keygen") && fix.contains("CONFIDANT_DEVICE_KEY"),
+        "expected age-keygen fix: {v}"
+    );
+    assert!(
+        fix.contains("Keys never live in files"),
+        "must not suggest a key file: {v}"
+    );
 }
 
 #[test]

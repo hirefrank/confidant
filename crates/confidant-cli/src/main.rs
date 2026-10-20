@@ -470,12 +470,15 @@ enum KeysAction {
     },
     /// Add a new device: two-step ceremony.
     ///
-    /// On the new device, `keys device-add --initiate` generates the keypair
-    /// locally and emits a request carrying only the public key + a label —
-    /// the private key never leaves the device. On an already-enrolled
-    /// device, `keys device-add --from-request <file>` verifies the
-    /// fingerprint out of band, re-wraps every client's every retained
-    /// epoch plus the vault lookup key to the new device, and commits.
+    /// On the new device, `keys device-add --initiate` emits a request
+    /// carrying only the public key + a label — the private key never
+    /// leaves the device. With an OS keychain it generates and stores the
+    /// keypair. On a headless host, set `CONFIDANT_DEVICE_KEY` to this
+    /// device's age identity first; `--initiate` uses that value and does
+    /// not write a keychain. On an already-enrolled device,
+    /// `keys device-add --from-request <file>` verifies the fingerprint
+    /// out of band, re-wraps every client's every retained epoch plus the
+    /// vault lookup key to the new device, and commits.
     DeviceAdd {
         /// Generate a device-add request on this (new) device. The request
         /// carries only the public key + label. Needs no vault.
@@ -11303,6 +11306,41 @@ fn test_keychain_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// True when `CONFIDANT_DEVICE_KEY` is set to a non-empty value. Headless
+/// `--initiate` uses this as the new device's identity (#684) and does not
+/// treat it as "already enrolled" in a keychain.
+fn device_key_env_set() -> bool {
+    std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Whether `--initiate` can persist a newly generated device key. The env
+/// identity path does not need this: it never writes the keychain.
+/// `CONFIDANT_KEYCHAIN=off` (tests) and an unreachable OS keychain both
+/// mean "no": generate-and-store would fail, so fail closed with the
+/// headless hint instead.
+fn device_key_store_available() -> anyhow::Result<bool> {
+    #[cfg(feature = "test-overrides")]
+    if test_keychain_dir().is_some() {
+        return Ok(true);
+    }
+    use confidant_crypt::keychain::{self, DeviceKeyState, KeychainSwitch};
+    match keychain::keychain_switch() {
+        Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
+            "cannot check device key: {e}"
+        )))),
+        Ok(KeychainSwitch::Off) => Ok(false),
+        Ok(KeychainSwitch::On) => match keychain::device_key_state() {
+            Ok(DeviceKeyState::KeychainUnreachable(_)) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot check device key: {e}"
+            )))),
+        },
+    }
+}
+
 /// Whether a device key is enrolled on this device: the test keychain dir
 /// (test builds only, the stand-in for the OS keychain), the OS keychain,
 /// or — handled separately by the caller — `CONFIDANT_DEVICE_KEY`.
@@ -11722,72 +11760,72 @@ fn cmd_keys_device_add_initiate(
     output: Option<&Path>,
     force: bool,
 ) -> anyhow::Result<ExitCode> {
-    // Refuse to overwrite an already-enrolled device key (same check as
-    // recover's B13): running --initiate on an enrolled device would
-    // replace its keychain entry and lock it out. --force overrides the
-    // refusal, but not the confirmation below.
-    use confidant_crypt::keychain;
-    // Check via the keychain directly (not the env override): if a
-    // device key is enrolled, refuse.
-    let enrolled = device_key_enrolled()?;
-    // Also check the env var (headless/test): if set, a key is enrolled.
-    let env_enrolled = std::env::var(keychain::DEVICE_KEY_ENV)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    let already_enrolled = enrolled || env_enrolled;
-    // #153 nit 4: with CONFIDANT_DEVICE_KEY set, `--initiate` cannot
-    // generate a fresh keypair — `provision_device_key()` would re-emit the
-    // env key, and the enrolled device later refuses that pubkey as
-    // already-seen. Fail closed up front, like shred does.
-    if env_enrolled {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(
-                "cannot --initiate a fresh device key while CONFIDANT_DEVICE_KEY is set \
-                 (the request would re-emit the enrolled key)",
-            )
-            .with_fix(
-                "Unset CONFIDANT_DEVICE_KEY and enroll this device's key in the OS keychain \
-                 (run `confidant recover` on a new device), then retry `keys device-add --initiate`",
-            ),
-        ));
-    }
-    if already_enrolled && !force {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
-        )));
-    }
-    // Item 5: --force on --initiate replaces the enrolled device key.
-    // Confirm interactively unless --no-input, and say plainly that the
-    // old key's access from this device is lost — worded for the
-    // re-enroll-after-shred case, the main reason to reach for --force.
-    if already_enrolled && force && !cli.no_input {
-        eprintln!("WARNING: a device key is already enrolled on this device.");
-        eprintln!("--force will replace it: the old key will no longer work from here.");
-        eprintln!(
-            "After a `keys shred` dropped this device, re-enrolling with a fresh key is \
-             how it rejoins; the shredded client's history stays unopenable by the old key."
-        );
-        eprint!("Replace the enrolled device key? [y/N] ");
-        use std::io::Write;
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
+    use confidant_crypt::keychain::DEVICE_KEY_ENV;
+
+    // Item 6: validate the label BEFORE any key-source probe or
+    // provisioning. A bad label must not store a key and then error —
+    // the retry would need --force to clean up the mess. (Shared
+    // validator with --from-request: a hand-edited request can inject
+    // controls into the commit message/manifest/stderr.)
+    let label = validate_device_label(label.unwrap_or("device"))?;
+
+    // #684: `CONFIDANT_DEVICE_KEY` is this new device's identity, the same
+    // way `init` uses it (#650). Do not generate a different key, do not
+    // write a keychain, and do not require --force: the env value is not
+    // "already enrolled in a keychain". `--from-request` still refuses a
+    // previously-seen pubkey, so re-using an already-enrolled identity
+    // fails on the approve side.
+    let using_env = device_key_env_set();
+    if !using_env {
+        // Probe persistence before enrollment: an unreachable keychain
+        // makes `device_key()` error, and generate-and-store would fail
+        // the same way. Fail closed with the headless hint instead.
+        if !device_key_store_available()? {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "cannot generate a device key: the OS keychain is unavailable and \
+                     {DEVICE_KEY_ENV} is not set"
+                ))
+                .with_fix(format!(
+                    "Generate this device's identity with `age-keygen`, export only the \
+                     AGE-SECRET-KEY-1… line as {DEVICE_KEY_ENV}, then retry \
+                     `confidant keys device-add --initiate`. Keys never live in files."
+                )),
+            ));
+        }
+        // Refuse to overwrite an already-enrolled keychain entry (same
+        // check as recover's B13). --force overrides the refusal, but not
+        // the confirmation below.
+        let already_enrolled = device_key_enrolled()?;
+        if already_enrolled && !force {
             return Err(anyhow::Error::new(DomainError::invalid(
-                "device key replacement not confirmed; refusing",
+                "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
             )));
+        }
+        if already_enrolled && force && !cli.no_input {
+            eprintln!("WARNING: a device key is already enrolled on this device.");
+            eprintln!("--force will replace it: the old key will no longer work from here.");
+            eprintln!(
+                "After a `keys shred` dropped this device, re-enrolling with a fresh key is \
+                 how it rejoins; the shredded client's history stays unopenable by the old key."
+            );
+            eprint!("Replace the enrolled device key? [y/N] ");
+            use std::io::Write;
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                return Err(anyhow::Error::new(DomainError::invalid(
+                    "device key replacement not confirmed; refusing",
+                )));
+            }
         }
     }
 
-    // Item 6: validate the label BEFORE provisioning the key. A bad label
-    // must not store a key and then error — the retry would need --force
-    // to clean up the mess.
-    // (Shared validator with --from-request: a hand-edited request can
-    // inject controls into the commit message/manifest/stderr.)
-    let label = validate_device_label(label.unwrap_or("device"))?;
     let (_bech32, recipient) = provision_device_key()?;
     let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&recipient);
     let key_id = device_key_id(&recipient);
+    let key_source = if using_env { "env" } else { "keychain" };
 
     let request = DeviceAddRequest {
         version: DEVICE_ADD_REQUEST_VERSION,
@@ -11808,6 +11846,9 @@ fn cmd_keys_device_add_initiate(
     eprintln!(
         "show this fingerprint on the enrolled device and confirm it matches before approving"
     );
+    if using_env {
+        eprintln!("using {DEVICE_KEY_ENV} as this device's identity (not stored in a keychain)");
+    }
 
     if cli.json {
         print_json(&serde_json::json!({
@@ -11817,6 +11858,7 @@ fn cmd_keys_device_add_initiate(
             "fingerprint": fingerprint,
             "label": label,
             "key_id": key_id,
+            "key_source": key_source,
             "pubkey": recipient,
             "request": document,
         }))?;

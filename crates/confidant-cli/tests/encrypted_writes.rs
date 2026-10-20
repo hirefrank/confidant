@@ -103,8 +103,8 @@ impl Harness {
 
     /// Switch this harness to the test keychain dir: the device key is
     /// read from / written to `$DIR/device.key` instead of
-    /// `CONFIDANT_DEVICE_KEY` / the OS keychain. Needed for
-    /// `keys device-add --initiate`, which refuses an env-var key.
+    /// `CONFIDANT_DEVICE_KEY` / the OS keychain. Needed when a command must
+    /// persist a keychain slot (for example inbox rotation).
     fn with_test_keychain(&mut self) {
         let dir = self._tmp.path().join("keychain");
         std::fs::create_dir_all(&dir).unwrap();
