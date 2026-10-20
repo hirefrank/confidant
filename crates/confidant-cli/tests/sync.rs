@@ -178,7 +178,14 @@ fn dry_run_reports_ahead_and_never_contacts_the_remote() {
         &["commit", "-q", "--allow-empty", "-m", "local"],
     );
     let local = git(&fixture.vault, &["rev-parse", "HEAD"]);
-    let own = format!("{}", fixture.vault.display());
+    // macOS resolves the temp dir's `/var` to `/private/var`; compare the
+    // canonical paths so the assertion is platform-independent.
+    let own = fixture
+        .vault
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
 
     let (status, v) = fixture.run_json(&["sync", "--dry-run", "--json", "--no-input"]);
     assert_ok(status, &v);
