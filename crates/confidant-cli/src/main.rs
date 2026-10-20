@@ -9641,7 +9641,7 @@ fn print_init_followup(packs_empty: bool, remote: Option<&str>, branch: &str) {
         println!("optional: install a pack with `confidant pack add <https-url> --yes`");
     }
     if let Some(url) = remote {
-        println!("git remote origin {url} (not pushed)");
+        println!("git remote origin {} (not pushed)", display_remote_url(url));
         println!("push when ready: git push -u origin {branch}");
     } else {
         println!(
@@ -9659,11 +9659,19 @@ fn refuse_init_remote(
     existing_repo: bool,
     no_input: bool,
 ) -> anyhow::Result<()> {
-    if url.trim().is_empty() {
+    let url = url.trim();
+    if url.is_empty() {
         return Err(anyhow::Error::new(
             DomainError::usage("--remote needs a git URL").with_fix(
                 "Pass `--remote <url>` with a real remote, or omit it and add origin later",
             ),
+        ));
+    }
+    // `git remote add` would otherwise parse a leading `-` as an option.
+    if url.starts_with('-') {
+        return Err(anyhow::Error::new(
+            DomainError::usage("refusing --remote: URL must not start with '-'")
+                .with_fix("Pass a git URL (https://… or git@…), not a flag"),
         ));
     }
     if !existing_repo {
@@ -9691,7 +9699,11 @@ fn add_init_remote(
     no_input: bool,
     scaffold: &mut Scaffold,
 ) -> anyhow::Result<()> {
-    confidant_core::write::git(root, &["remote", "add", "origin", url.trim()], no_input)?;
+    confidant_core::write::git(
+        root,
+        &["remote", "add", "--", "origin", url.trim()],
+        no_input,
+    )?;
     scaffold.added_remote = true;
     Ok(())
 }
@@ -9708,7 +9720,7 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             "branch": branch,
             "scaffold": true,
             "packs": packs,
-            "remote": remote,
+            "remote": remote.map(display_remote_url),
             "next_steps": init_next_steps(packs_empty, remote, &branch),
         });
         if let Some(note) = &branch_note {
@@ -9725,7 +9737,10 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
         println!("  would    create the vault directory (when absent)");
         println!("  would    run git init and commit .gitignore + confidant.toml");
         match remote {
-            Some(url) => println!("  would    add git remote origin {url} (not pushed)"),
+            Some(url) => println!(
+                "  would    add git remote origin {} (not pushed)",
+                display_remote_url(url)
+            ),
             None => println!("  would    not add a git remote"),
         }
         if std::env::var_os(OPERATOR_KEY_ENV).is_some() {
@@ -10078,7 +10093,7 @@ fn cmd_init(
                     "command": "init",
                     "dry_run": true,
                     "branch": branch,
-                    "remote": remote,
+                    "remote": remote.map(display_remote_url),
                     "next_steps": init_next_steps(packs_empty, remote, branch_name),
                 }),
             ))?;
@@ -10286,7 +10301,7 @@ fn cmd_init(
             "keys_dir": keys_dir.display().to_string(),
             "commit": commit,
             "branch": branch,
-            "remote": remote,
+            "remote": remote.map(display_remote_url),
             "next_steps": init_next_steps(packs_empty, remote, branch_name),
         });
         if let Some(path) = phrase_out {
@@ -11422,6 +11437,27 @@ fn strip_source_userinfo(source: &str) -> String {
         return source.to_owned();
     };
     format!("https://{host}{path}")
+}
+
+/// Redact credentials in a `--remote` URL before printing it or putting it
+/// in JSON. `https://user:token@host/path` becomes `https://host/path`.
+/// The real URL is still passed to `git remote add`.
+fn display_remote_url(url: &str) -> String {
+    let url = url.trim();
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        let Some(rest) = url.strip_prefix(scheme) else {
+            continue;
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(end) => (&rest[..end], &rest[end..]),
+            None => (rest, ""),
+        };
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return format!("{scheme}{host}{path}");
+        }
+        return url.to_owned();
+    }
+    url.to_owned()
 }
 
 /// Test-only operator key override (CONFIDANT_TEST_OPERATOR_KEY).
@@ -15136,10 +15172,26 @@ backup\tgit@host.example:org/repo.git (push)
             label.contains("https://host.example/org/repo.git"),
             "{label}"
         );
+    }
+
+    #[test]
+    fn display_remote_url_strips_userinfo() {
+        use super::display_remote_url;
         assert_eq!(
-            label,
-            "[external pack: not shipped with confidant; text is from \
-             https://host.example/org/repo.git at 0123456789ab]"
+            display_remote_url("https://user:token@example.invalid/vault.git"),
+            "https://example.invalid/vault.git"
+        );
+        assert_eq!(
+            display_remote_url("http://user:token@example.invalid/vault.git"),
+            "http://example.invalid/vault.git"
+        );
+        assert_eq!(
+            display_remote_url("https://example.invalid/vault.git"),
+            "https://example.invalid/vault.git"
+        );
+        assert_eq!(
+            display_remote_url("git@example.invalid:org/vault.git"),
+            "git@example.invalid:org/vault.git"
         );
     }
 

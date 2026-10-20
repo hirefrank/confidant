@@ -1916,6 +1916,60 @@ fn bootstrap_remote_rollback_on_failed_init() {
     assert!(!phrase_path.exists());
 }
 
+/// `--remote` URLs that start with `-` would be parsed as git options.
+#[test]
+fn bootstrap_remote_rejects_leading_dash() {
+    let b = Boot::new();
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote=-uorigin",
+        "--no-input",
+        "--json",
+    ]);
+    assert!(!out.status.success(), "leading-dash URL must be refused");
+    assert_eq!(out.status.code(), Some(2), "usage error");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let msg = v["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("must not start with '-'"), "{msg}");
+    assert!(!b.vault.exists(), "refused --remote must not scaffold");
+}
+
+/// `--remote` with userinfo must not print the credential; git still gets
+/// the real URL.
+#[test]
+fn bootstrap_remote_redacts_userinfo_in_output() {
+    let b = Boot::new();
+    let secret = "https://user:s3cret-token@example.invalid/vault.git";
+    let out = b.at_vault(&[
+        "init",
+        "--create",
+        "--remote",
+        secret,
+        "--no-input",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("s3cret-token") && !stderr.contains("s3cret-token"),
+        "credential leaked: stdout={stdout} stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["remote"], "https://example.invalid/vault.git");
+    let remotes = git_out(&b.vault, &["remote", "-v"]);
+    assert!(
+        remotes.contains(secret),
+        "git must still store the real URL:\n{remotes}"
+    );
+}
+
 /// Human `--create` output names clone + `keys device-add`, not `recover`
 /// as the second-device path. The pack-add line still appears once.
 #[test]

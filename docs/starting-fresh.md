@@ -340,8 +340,9 @@ Tracked defect from verification:
 - If `doctor` says `not enrolled`, run `init` (new vault), clone and
   `keys device-add` (existing vault, an enrolled device still works), or
   `recover` (every enrolled device is lost). On a headless host with no
-  Secret Service, provide `CONFIDANT_DEVICE_KEY` (and `CONFIDANT_INBOX_KEY`
-  if you run `inbox`) from the host's secret store. For the full pre-init
+  Secret Service, provide `CONFIDANT_DEVICE_KEY` and
+  `CONFIDANT_OPERATOR_KEY` before `init`. `CONFIDANT_INBOX_KEY` is only
+  needed after the vault exists, if you run `inbox`. For the full pre-init
   flow (`age-keygen`, `CONFIDANT_DEVICE_KEY`, and `CONFIDANT_OPERATOR_KEY`),
   see [Headless hosts and agents](agent-setup.md#headless-hosts-and-agents).
 - After `recover` or a `keys shred` rotation, run

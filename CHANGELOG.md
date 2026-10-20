@@ -17,6 +17,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   scaffolding and does not push. `init` JSON reports `remote` and a
   clone-then-`keys device-add` next step (#686).
 
+### Fixed
+- `init --create --remote` passes `--` to `git remote add` and refuses a
+  URL that starts with `-`. Printed and JSON `remote` URLs strip userinfo
+  so a credential in `https://user:token@host/…` does not leak (#686).
+
 ### Changed
 - `--initiate` no longer refuses when `CONFIDANT_DEVICE_KEY` is set (#153
   nit 4). `--from-request` still refuses a previously-seen pubkey. `keys
