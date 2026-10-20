@@ -4553,3 +4553,172 @@ fn palette_record_edit_is_refused_outside_people_and_context() {
         "the refusal issues no CLI call"
     );
 }
+
+// #665: unpushed-commit visibility and the confirmed push on quit.
+
+fn sync_json(ahead: u64, behind: u64) -> String {
+    serde_json::json!({
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "remote": "origin",
+        "branch": "main",
+        "upstream": "origin/main",
+        "ahead": ahead,
+        "behind": behind,
+        "crypto_mode": "encrypted",
+        "fetched": false,
+        "dry_run": true,
+        "action": "none",
+        "applied": false
+    })
+    .to_string()
+}
+
+#[test]
+fn sync_pill_shows_unpushed_commits_and_quit_pushes_only_on_confirm() {
+    let pushed = serde_json::json!({
+        "ok": true,
+        "schema_version": "1",
+        "vault": "/fake/demo-vault",
+        "remote": "origin",
+        "branch": "main",
+        "upstream": "origin/main",
+        "ahead": 0,
+        "behind": 0,
+        "crypto_mode": "encrypted",
+        "fetched": true,
+        "dry_run": false,
+        "action": "push",
+        "applied": true
+    })
+    .to_string();
+    let fake = people_runner()
+        .with_response("sync", 0, sync_json(2, 0))
+        .with_argv_response(&["sync", "--push", "--yes"], 0, pushed);
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("sync  2 unpushed"), "{rendered}");
+
+    // `q` pauses on the push offer; a stray key neither quits nor pushes.
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(!app.should_quit);
+    assert_eq!(app.quit_prompt, Some(2));
+    let prompt = render_to_string(&app);
+    assert!(
+        prompt.contains("Quit: local commits not pushed"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Type y to push and quit"), "{prompt}");
+    app.handle_key(key(KeyCode::Char('x')));
+    assert!(!app.should_quit);
+    assert_eq!(app.quit_prompt, Some(2));
+
+    // `y` runs the explicit `--yes` push (the TUI always passes
+    // `--no-input`, so the human confirmation is this keypress), then quits.
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.should_quit);
+    assert_eq!(app.quit_prompt, None);
+    assert_eq!(app.sync.ahead(), 0);
+    assert!(
+        app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call == &vec!["sync".to_owned(), "--push".to_owned(), "--yes".to_owned()]),
+        "confirmed push ran: {:?}",
+        app.runner.recorded_calls()
+    );
+}
+
+#[test]
+fn quit_with_n_skips_the_push_and_still_quits() {
+    let fake = people_runner().with_response("sync", 0, sync_json(1, 0));
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+
+    app.handle_key(key(KeyCode::Char('q')));
+    assert_eq!(app.quit_prompt, Some(1));
+    app.handle_key(key(KeyCode::Char('n')));
+    assert!(app.should_quit);
+    assert_eq!(app.quit_prompt, None);
+    assert!(
+        !app.runner
+            .recorded_calls()
+            .iter()
+            .any(|call| call.first().map(String::as_str) == Some("sync")
+                && call.iter().any(|arg| arg == "--push")),
+        "no push without confirmation: {:?}",
+        app.runner.recorded_calls()
+    );
+}
+
+#[test]
+fn esc_cancels_the_quit_prompt_and_stays() {
+    let fake = people_runner().with_response("sync", 0, sync_json(3, 0));
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+
+    app.handle_key(key(KeyCode::Char('q')));
+    assert_eq!(app.quit_prompt, Some(3));
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.should_quit);
+    assert_eq!(app.quit_prompt, None);
+    // The pill is still visible after cancelling.
+    assert!(render_to_string(&app).contains("sync  3 unpushed"));
+}
+
+#[test]
+fn clean_and_diverged_sync_states_change_the_header_without_asking_to_push() {
+    // Up to date: no pill, and q quits immediately.
+    let fake = people_runner().with_response("sync", 0, sync_json(0, 0));
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+    assert!(!render_to_string(&app).contains("sync "));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+    assert_eq!(app.quit_prompt, None);
+
+    // Diverged: the CLI refuses with E_NOT_FAST_FORWARD. The header says so,
+    // and q never offers a push (a diverged push would be rejected anyway).
+    let diverged = r#"{
+        "ok": false, "schema_version": "1", "vault": "/fake/demo-vault",
+        "error": {"code": "E_NOT_FAST_FORWARD", "message": "branch has diverged"}
+    }"#;
+    let fake = people_runner().with_response("sync", 1, diverged);
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+    let rendered = render_to_string(&app);
+    assert!(rendered.contains("sync  diverged"), "{rendered}");
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit, "q quits: there is no safe push to offer");
+    assert_eq!(app.quit_prompt, None);
+}
+
+#[test]
+fn local_only_vault_has_no_sync_pill_and_no_quit_prompt() {
+    let err = r#"{
+        "ok": false, "schema_version": "1", "vault": "/fake/demo-vault",
+        "error": {"code": "E_NO_REMOTE", "message": "no git remote is configured"}
+    }"#;
+    let fake = people_runner().with_response("sync", 1, err);
+    let mut app = App::new(fake);
+    app.load_check();
+    app.load_roster();
+    app.load_sync();
+    assert!(!render_to_string(&app).contains("sync "));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+    assert_eq!(app.quit_prompt, None);
+}

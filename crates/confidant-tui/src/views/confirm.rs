@@ -17,11 +17,24 @@ use crate::theme::palette;
 pub struct ConfirmState {
     pub title: String,
     pub lines: Vec<String>,
+    /// Optional footer replacing the default "Type y to confirm" hint, for
+    /// prompts where another key has its own meaning (the TUI quit prompt's
+    /// `n` quits and `Esc` stays, #665).
+    pub hint: Option<String>,
 }
 
 impl ConfirmState {
     pub fn new(title: String, lines: Vec<String>) -> Self {
-        Self { title, lines }
+        Self {
+            title,
+            lines,
+            hint: None,
+        }
+    }
+
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 }
 
@@ -39,10 +52,16 @@ pub fn render(state: &ConfirmState, frame: &mut Frame<'_>, area: Rect) {
 
     let mut lines: Vec<Line> = state.lines.iter().map(|l| Line::from(l.clone())).collect();
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("Type y", Style::default().fg(palette::ACCENT).bold()),
-        Span::raw(" to confirm. Any other key cancels."),
-    ]));
+    match &state.hint {
+        Some(hint) => lines.push(Line::from(Span::styled(
+            hint.clone(),
+            Style::default().fg(palette::MUTED),
+        ))),
+        None => lines.push(Line::from(vec![
+            Span::styled("Type y", Style::default().fg(palette::ACCENT).bold()),
+            Span::raw(" to confirm. Any other key cancels."),
+        ])),
+    }
 
     let block = theme::block("").title(Span::styled(
         format!(" Confirm: {} ", state.title),

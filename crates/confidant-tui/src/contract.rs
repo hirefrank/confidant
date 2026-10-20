@@ -422,6 +422,28 @@ pub struct DoctorCheck {
     pub message: String,
 }
 
+/// Output of `confidant sync --dry-run --json --no-input` (#665).
+///
+/// Read-only: `--dry-run` reports the last-fetched upstream state without
+/// contacting the remote. Only an encrypted vault with a remote reaches this
+/// shape; otherwise the CLI returns a stable error code (see
+/// [`ErrorBody::code`]).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct SyncReport {
+    #[serde(default)]
+    pub ahead: u64,
+    #[serde(default)]
+    pub behind: u64,
+    #[serde(default)]
+    pub remote: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub upstream: String,
+    #[serde(default)]
+    pub crypto_mode: String,
+}
+
 /// One item in an `inbox --dry-run` report.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct InboxItem {
