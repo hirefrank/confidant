@@ -180,12 +180,7 @@ fn dry_run_reports_ahead_and_never_contacts_the_remote() {
     let local = git(&fixture.vault, &["rev-parse", "HEAD"]);
     // macOS resolves the temp dir's `/var` to `/private/var`; compare the
     // canonical paths so the assertion is platform-independent.
-    let own = fixture
-        .vault
-        .canonicalize()
-        .unwrap()
-        .display()
-        .to_string();
+    let own = fixture.vault.canonicalize().unwrap().display().to_string();
 
     let (status, v) = fixture.run_json(&["sync", "--dry-run", "--json", "--no-input"]);
     assert_ok(status, &v);
@@ -264,6 +259,55 @@ fn push_needs_yes_with_no_input_then_advances_the_remote() {
         git(&fixture.remote, &["rev-parse", "main"]).trim(),
         local,
         "the bare remote advanced to the local HEAD"
+    );
+}
+
+/// `push.default=simple` refuses when the upstream branch name differs
+/// from HEAD. `sync --push` must still send HEAD to that upstream on the
+/// same remote it fetched, and must not advance a same-named branch on
+/// the remote.
+#[cfg(unix)]
+#[test]
+fn push_honours_a_differently_named_upstream_branch() {
+    let fixture = SyncVault::new();
+    let main_before = git(&fixture.remote, &["rev-parse", "main"])
+        .trim()
+        .to_owned();
+    git(
+        &fixture.vault,
+        &["push", "-q", "-u", "origin", "main:trunk"],
+    );
+    git(&fixture.vault, &["config", "push.default", "simple"]);
+    let upstream = git(
+        &fixture.vault,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    );
+    assert_eq!(upstream.trim(), "origin/trunk", "{upstream}");
+
+    git(
+        &fixture.vault,
+        &["commit", "-q", "--allow-empty", "-m", "local"],
+    );
+    let local = git(&fixture.vault, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    let (status, v) = fixture.run_json(&["sync", "--push", "--yes", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["action"], "push", "{v}");
+    assert_eq!(v["applied"], true, "{v}");
+    assert_eq!(v["ahead"], 0, "{v}");
+    assert_eq!(v["remote"], "origin", "{v}");
+    assert_eq!(v["upstream"], "origin/trunk", "{v}");
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "trunk"]).trim(),
+        local,
+        "the differently named upstream advanced"
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "main"]).trim(),
+        main_before,
+        "origin/main must not move; the push targeted trunk"
     );
 }
 

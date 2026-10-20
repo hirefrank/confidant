@@ -142,13 +142,76 @@ pub fn idempotency_digests(request_id: &str, canonical_request: &str) -> (String
     (id_hash, req_hash)
 }
 
-/// Run git in `root`. With `no_input`, `GIT_TERMINAL_PROMPT=0` so git can
-/// never block on a credential prompt (ADR-7).
+/// SSH invocation used when `no_input` is set.
+///
+/// `GIT_TERMINAL_PROMPT=0` stops HTTPS credential helpers, but ssh opens
+/// `/dev/tty` for a key passphrase or an unknown host key. Append
+/// `-o BatchMode=yes` to the ssh command already in force (`GIT_SSH_COMMAND`,
+/// else `core.sshCommand`, else `ssh`) so a TUI or agent cannot hang on a
+/// prompt.
+pub(crate) fn no_input_ssh_command(
+    git_ssh_command: Option<&str>,
+    core_ssh_command: Option<&str>,
+) -> String {
+    let base = git_ssh_command
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| core_ssh_command.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("ssh");
+    if ssh_command_has_batch_mode(base) {
+        base.to_owned()
+    } else {
+        format!("{base} -o BatchMode=yes")
+    }
+}
+
+fn ssh_command_has_batch_mode(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    lower.contains("-o batchmode=yes") || lower.contains("-obatchmode=yes")
+}
+
+/// `core.sshCommand` for this repo (global/local), if set. Looked up with a
+/// direct git spawn so [`git`] does not recurse.
+fn core_ssh_command(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.sshCommand"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Run git in `root`. With `no_input`, `GIT_TERMINAL_PROMPT=0` and
+/// `GIT_SSH_COMMAND` includes `-o BatchMode=yes`, so git can never block
+/// on a credential or ssh prompt (ADR-7).
 pub fn git(root: &Path, args: &[&str], no_input: bool) -> anyhow::Result<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(root).args(args);
     if no_input {
         cmd.env("GIT_TERMINAL_PROMPT", "0");
+        let env_ssh = std::env::var("GIT_SSH_COMMAND").ok();
+        let core_ssh = if env_ssh
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            None
+        } else {
+            core_ssh_command(root)
+        };
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            no_input_ssh_command(env_ssh.as_deref(), core_ssh.as_deref()),
+        );
     }
     let out = cmd
         .output()
@@ -685,6 +748,35 @@ fn apply_write_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_input_ssh_command_appends_batch_mode_and_keeps_existing() {
+        assert_eq!(no_input_ssh_command(None, None), "ssh -o BatchMode=yes");
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -p 2222"), None),
+            "ssh -p 2222 -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some(""), Some("/usr/bin/ssh")),
+            "/usr/bin/ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("   "), Some("ssh -i key")),
+            "ssh -i key -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -o BatchMode=yes"), Some("ignored")),
+            "ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -oBatchMode=yes"), None),
+            "ssh -oBatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -i key"), Some("ssh -p 22")),
+            "ssh -i key -o BatchMode=yes"
+        );
+    }
 
     #[test]
     fn digests_are_deterministic_and_domain_separated() {

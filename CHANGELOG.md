@@ -35,6 +35,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   vault with `E_PLAINTEXT_REMOTE`, a missing remote/upstream with
   `E_NO_REMOTE`, and a diverged branch with `E_NOT_FAST_FORWARD`; it
   never force-pushes and never auto-merges (#665).
+- `confidant sync --push` sends `HEAD:<upstream-branch>` to the same
+  remote it fetched (so a differently named upstream and
+  `push.default=simple` still match the reported counts). `--no-input`
+  git sets `GIT_SSH_COMMAND` to include `-o BatchMode=yes` without
+  dropping an existing ssh command (#665).
 
 ## [0.6.2] - 2026-10-20
 

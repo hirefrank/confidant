@@ -7808,6 +7808,17 @@ struct AheadBehind {
     behind: u64,
 }
 
+/// Refspec for `sync --push`: `HEAD:<upstream-branch>` on the remote that
+/// was fetched. `upstream` is `rev-parse --abbrev-ref @{u}` (`origin/main`).
+fn sync_push_refspec(remote: &str, upstream: &str) -> Option<String> {
+    let prefix = format!("{remote}/");
+    let branch = upstream.strip_prefix(&prefix)?;
+    if branch.is_empty() {
+        return None;
+    }
+    Some(format!("HEAD:{branch}"))
+}
+
 /// Parse `git rev-list --left-right --count @{u}...HEAD` output
 /// (`<behind>\t<ahead>`). Returns `None` for anything unexpected.
 fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
@@ -8049,9 +8060,17 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
             yes,
             &format!("Push {} commit(s) to {upstream}?", state.ahead),
         )? {
-            // No explicit refspec: push to the configured upstream, so a
-            // non-standard upstream branch name is honoured.
-            git(&["push", "--quiet"]).map_err(|e| {
+            // Push HEAD to the upstream branch on the same remote that
+            // was fetched and counted. A bare `git push` follows
+            // `push.default=simple` (refuses a differently named
+            // upstream) and can honour `remote.pushDefault` /
+            // `branch.<b>.pushRemote` (a different remote).
+            let Some(refspec) = sync_push_refspec(&remote, &upstream) else {
+                return Err(anyhow::Error::new(DomainError::no_remote(format!(
+                    "upstream '{upstream}' does not name a branch on remote '{remote}'"
+                ))));
+            };
+            git(&["push", "--quiet", &remote, &refspec]).map_err(|e| {
                 let detail = format!("{e:#}");
                 if detail.contains("non-fast-forward")
                     || detail.contains("fetch first")
@@ -14728,7 +14747,7 @@ mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
         parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
-        reject_unsupported_prefix, AheadBehind, InstallMethod, MIN_GIT_VERSION,
+        reject_unsupported_prefix, sync_push_refspec, AheadBehind, InstallMethod, MIN_GIT_VERSION,
     };
     use std::path::Path;
 
@@ -14791,6 +14810,27 @@ backup\tgit@host.example:org/repo.git (push)
         );
         assert_eq!(parse_ahead_behind(""), None);
         assert_eq!(parse_ahead_behind("not numbers"), None);
+    }
+
+    /// #665: `sync --push` sends HEAD to the upstream branch on the
+    /// fetched remote, even when that branch name differs from HEAD.
+    #[test]
+    fn sync_push_refspec_uses_upstream_branch_on_the_fetched_remote() {
+        assert_eq!(
+            sync_push_refspec("origin", "origin/main").as_deref(),
+            Some("HEAD:main")
+        );
+        assert_eq!(
+            sync_push_refspec("origin", "origin/trunk").as_deref(),
+            Some("HEAD:trunk")
+        );
+        assert_eq!(
+            sync_push_refspec("origin", "origin/feature/foo").as_deref(),
+            Some("HEAD:feature/foo")
+        );
+        assert_eq!(sync_push_refspec("origin", "upstream/main"), None);
+        assert_eq!(sync_push_refspec("origin", "origin"), None);
+        assert_eq!(sync_push_refspec("origin", "origin/"), None);
     }
 
     /// #653(d): `findmnt` output is a device path with an optional btrfs
