@@ -2383,6 +2383,207 @@ fn pack_add_check_failure_rolls_back() {
     );
 }
 
+/// The neutral external-pack fixture used by the #694 lifecycle tests.
+#[cfg(unix)]
+fn example_pack_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/packs/example-pack")
+}
+
+/// #694: a vault that already carries the pack's `[checks]` keys cannot be
+/// installed without listing it first; the error must say so before the
+/// generic check report, and nothing may be committed.
+#[cfg(unix)]
+#[test]
+fn pack_add_refuses_an_unlisted_pack_the_vault_already_uses() {
+    let vault = git_vault();
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nexample-pack.notes = \"warning\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use example pack checks",
+        ],
+    );
+
+    // The state is real: `check` reports the key as unknown.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "E_CONFIG"),
+        "{v}"
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = pack_add(&example_pack_fixture(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("example-pack@0.1"), "{stderr}");
+    assert!(stderr.contains("packs"), "{stderr}");
+    assert!(stderr.contains("[checks]"), "{stderr}");
+    assert!(stderr.contains("fix:"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #694: a vendored copy without a listing is an ambiguous install state.
+/// `pack add --yes` must name the listing edit instead of reporting the
+/// pin as already installed and leaving the listing missing.
+#[cfg(unix)]
+#[test]
+fn pack_add_refuses_an_unlisted_vendored_pack() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "vendor pack without listing",
+        ],
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = pack_add(&example_pack_fixture(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already vendored"), "{stderr}");
+    assert!(stderr.contains("example-pack@0.1"), "{stderr}");
+    assert!(stderr.contains("packs"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #694: removal is blocked while the vault still uses the pack's verbs and
+/// metrics. The report is unchanged (exit 1), a stderr hint names the
+/// workaround, JSON stays valid, and the pack's state is rolled back.
+#[cfg(unix)]
+#[test]
+fn pack_remove_refuses_while_the_vault_uses_the_pack() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\nexample-pack.notes = \"warning\"\n",
+    )
+    .unwrap();
+    let person = "p-01M3TC5H00MPJG000000000000";
+    let note = "n-01M3TC5H00MPJG002NAM000005";
+    std::fs::create_dir_all(vault.path().join("people").join(person).join("notes")).unwrap();
+    std::fs::write(
+        vault.path().join("people").join(person).join("profile.md"),
+        format!("---\nid: {person}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        vault
+            .path()
+            .join("people")
+            .join(person)
+            .join("notes")
+            .join(format!("{note}.md")),
+        format!(
+            "---\nid: {note}\ntype: note\nperson: {person}\ndate: 2026-10-01\n---\n\nFake note.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(vault.path().join("ledger/2026")).unwrap();
+    std::fs::write(
+        vault.path().join("ledger/2026/10.cfd"),
+        format!(
+            "2026-10-01 grant {person} package pkg-01M3TC5H00MPJG004SK4000009 6 sessions\n\
+             2026-10-01 use {person} 60m full note:{note}\n\
+             2026-10-01 balance {person} units_remaining 5\n"
+        ),
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use the pack",
+        ],
+    );
+
+    // The starting point is clean: the pack resolves its verbs and metrics.
+    let check = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("still uses"), "{stderr}");
+    assert!(stderr.contains("example-pack"), "{stderr}");
+    assert!(stderr.contains("verbs"), "{stderr}");
+    assert!(stderr.contains("orphan"), "{stderr}");
+    assert!(stderr.contains("not available yet"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    assert!(vault.path().join("packs/example-pack@0.1").is_dir());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+
+    // `--json` prints the same report on stdout and the hint on stderr.
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "E_UNKNOWN_VERB"),
+        "{v}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("still uses"));
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_update_shows_diff_then_applies_a_version_change() {

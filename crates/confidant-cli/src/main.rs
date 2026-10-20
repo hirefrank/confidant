@@ -1674,6 +1674,129 @@ fn cmd_pack_add(
         .map_err(pack_fetch::escape_domain_error)
 }
 
+/// #694: refuse `pack add --yes` before the generic pre-check when the
+/// vault already references the pack without listing it. The pre-check
+/// cannot pass while the pack's `[checks]` keys are unresolvable, and an
+/// unlisted vendored copy is an ambiguous install state rather than
+/// something the add should silently paper over. Both cases have the same
+/// one-line fix: list the exact `name@version` (or remove the dependent
+/// `[checks]` keys) first.
+fn preflight_unlisted_pack(
+    root: &Path,
+    cfg: &confidant_core::config::VaultConfig,
+    report: &pack_fetch::PackReport,
+) -> anyhow::Result<()> {
+    let has_checks = checks_reference_pack(cfg, &report.name);
+    let rel = vendored_rel(&report.name, &report.version);
+    // Fail closed on an unreadable `packs/` entry: treat it as present.
+    let vendored = confidant_core::paths::exists(root, Path::new(&rel)).unwrap_or(true);
+    if !has_checks && !vendored {
+        return Ok(());
+    }
+    let name = pack_fetch::escape_line(&report.name);
+    let version = pack_fetch::escape_line(&report.version);
+    let rel = pack_fetch::escape_line(&rel);
+    let listed = format!("{name}@{version}");
+    let checks_fix = format!(
+        "Add \"{listed}\" to `packs` in confidant.toml first (or remove the [checks] keys under `{name}.`), then re-run `confidant pack add`"
+    );
+    let (message, fix) = match (has_checks, vendored) {
+        (true, true) => (
+            format!(
+                "{listed} is not listed in `packs`, but the vault already vendors it at {rel} and sets its [checks] keys"
+            ),
+            checks_fix,
+        ),
+        (true, false) => (
+            format!(
+                "{listed} is not listed in `packs`, but the vault already sets its [checks] keys; the pre-write check cannot pass until the pack is listed"
+            ),
+            checks_fix,
+        ),
+        (false, true) => (
+            format!("{listed} is already vendored at {rel} but is not listed in `packs`"),
+            format!(
+                "Add \"{listed}\" to `packs` in confidant.toml to use the vendored copy, then re-run `confidant pack add`"
+            ),
+        ),
+        (false, false) => unreachable!("preflight requires a reason"),
+    };
+    Err(anyhow::Error::new(DomainError::invalid(message)).with_fix(&fix))
+}
+
+/// Whether any `[checks]` leaf in `cfg` names `name` or sits under it
+/// (`name.` prefix). Dotted TOML keys and `[checks.name]` tables both parse
+/// as nested tables, so walk the tree to the leaves.
+fn checks_reference_pack(cfg: &confidant_core::config::VaultConfig, name: &str) -> bool {
+    fn walk<'a, I>(prefix: &str, entries: I, name: &str) -> bool
+    where
+        I: IntoIterator<Item = (&'a String, &'a toml::Value)>,
+    {
+        entries.into_iter().any(|(key, value)| {
+            let dotted = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if dotted == name || dotted.starts_with(&format!("{name}.")) {
+                return true;
+            }
+            match value {
+                toml::Value::Table(table) => walk(&dotted, table.iter(), name),
+                _ => false,
+            }
+        })
+    }
+    walk("", cfg.checks.rules.iter(), name)
+}
+
+/// #694: a stderr hint after `pack add --yes` is blocked, tailored to the
+/// findings that name this pack's data. Returns `None` when the block is
+/// unrelated (for example a pack conflict), so the hint never misdiagnoses.
+fn pack_add_blocked_hint(
+    report: &confidant_core::check::CheckReport,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    let listed = format!(
+        "{}@{}",
+        pack_fetch::escape_line(name),
+        pack_fetch::escape_line(version)
+    );
+    let sets_checks = report
+        .findings
+        .iter()
+        .any(|finding| finding.code.as_str() == "E_CONFIG");
+    let uses_ledger = report.findings.iter().any(|finding| {
+        matches!(
+            finding.code.as_str(),
+            "E_UNKNOWN_VERB" | "E_UNKNOWN_METRIC" | "E_UNKNOWN_EDGE_KIND"
+        )
+    });
+    let mut lines = Vec::new();
+    if sets_checks {
+        lines.push(format!(
+            "hint: the findings above name [checks] keys the vault already carries for {listed}; add \"{listed}\" to `packs` in confidant.toml (or remove those keys), then re-run `confidant pack add`"
+        ));
+    }
+    if uses_ledger {
+        lines.push(format!(
+            "hint: the findings above name ledger entries that use {listed}'s verbs, metrics, or edge kinds; migrate or remove those lines first, then re-run `confidant pack add`"
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// #694: a stderr hint after `pack remove --yes` is blocked. The report
+/// still prints unchanged and the exit stays 1; this only names the
+/// workaround.
+fn pack_remove_blocked_hint(name: &str) -> String {
+    let name = pack_fetch::escape_line(name);
+    format!(
+        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Remove or migrate those entries (and drop the [checks] keys) first, or keep the pack installed. An explicit orphan flag is tracked in #696 and is not available yet."
+    )
+}
+
 fn cmd_pack_add_inner(
     cli: &Cli,
     vault_root: Option<&Path>,
@@ -1691,6 +1814,24 @@ fn cmd_pack_add_inner(
 
     if yes {
         let root = vault_root_required(vault_root, "pack add --yes")?;
+        let cfg_text = read_config_text(root)?;
+        let cfg =
+            confidant_core::config::VaultConfig::parse(&cfg_text).map_err(anyhow::Error::new)?;
+        let listed_id = format!("{}@{}", report.name, report.version);
+        // #694: the vault may already carry this pack's data or its vendored
+        // copy without listing the pack. The pre-check would then refuse the
+        // install with a generic finding, so name the exact listing change
+        // first. A listing for another version of the same name is left to
+        // the one-version-at-a-time refusal below.
+        let listed_name = cfg.packs.iter().any(|listed| {
+            listed == &report.name
+                || listed
+                    .split_once('@')
+                    .is_some_and(|(name, _)| name == report.name)
+        });
+        if !listed_name {
+            preflight_unlisted_pack(root, &cfg, &report)?;
+        }
         let lock = read_lockfile_or_empty(root)?;
         if let Some(entry) = lock.find(&report.name, &report.version) {
             if entry.hash == report.hash {
@@ -1747,12 +1888,7 @@ fn cmd_pack_add_inner(
         // repairs by writing the pin, so route it through the repairing path;
         // the post-check still gates the commit. With no such listing the
         // pre-check runs as usual.
-        let cfg_text = read_config_text(root)?;
-        let unpinned_listing = confidant_core::config::VaultConfig::parse(&cfg_text)
-            .map_err(anyhow::Error::new)?
-            .packs
-            .iter()
-            .any(|listed| listed == &format!("{}@{}", report.name, report.version));
+        let unpinned_listing = cfg.packs.iter().any(|listed| listed == &listed_id);
         let changes = install_changes(root, &report, &files, &fetched, None)?;
         let summary = format!(
             "pack: add {}@{} ({})",
@@ -1770,7 +1906,15 @@ fn cmd_pack_add_inner(
         } else {
             apply_write(root, pending, &write_options(cli))?
         };
-        return finish_write(
+        // #694: the check report still prints unchanged (exit 1); this only
+        // adds a stderr hint, so `--json` stdout stays valid.
+        let hint = match &outcome {
+            WriteOutcome::CheckBlocked {
+                report: check_report,
+            } => pack_add_blocked_hint(check_report, &report.name, &report.version),
+            _ => None,
+        };
+        let code = finish_write(
             cli,
             root,
             "pack-add",
@@ -1778,7 +1922,11 @@ fn cmd_pack_add_inner(
             serde_json::json!({
                 "pack": {"name": report.name, "version": report.version, "hash": report.hash},
             }),
-        );
+        )?;
+        if let Some(hint) = hint {
+            writeln!(io::stderr(), "{hint}")?;
+        }
+        return Ok(code);
     }
     if cli.json {
         let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
@@ -2420,13 +2568,20 @@ fn cmd_pack_remove(
             }
         }
     }
-    finish_write(
+    let blocked = matches!(outcome, WriteOutcome::CheckBlocked { .. });
+    let code = finish_write(
         cli,
         root,
         "pack-remove",
         outcome,
         serde_json::json!({ "removed": listed }),
-    )
+    )?;
+    // #694: the report still prints unchanged (exit 1); this only adds a
+    // stderr hint, so `--json` stdout stays valid.
+    if blocked {
+        writeln!(io::stderr(), "{}", pack_remove_blocked_hint(&name))?;
+    }
+    Ok(code)
 }
 
 /// `pack update <name> --rev <ref>`: re-fetch a new rev, print the diff, and
