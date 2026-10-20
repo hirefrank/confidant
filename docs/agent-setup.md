@@ -261,6 +261,24 @@ a shell history line. Generate each value **once** and retrieve the stored
 copy later; re-running `age-keygen` or `openssl rand` would create a new
 identity that no longer opens the vault.
 
+To enroll a **second** headless device into an existing vault, generate a
+**new** identity for that host (do not copy another device's
+`CONFIDANT_DEVICE_KEY`), export it, clone the vault, then run
+`keys device-add --initiate`. The command uses the env identity and does
+not write a keychain. Approve the request from an enrolled device with
+`--from-request`. Do not run `init` on the second device, and do not run
+`recover` unless every enrolled device is lost. There is no `--key-out`;
+keys never live in files.
+
+```sh
+export CONFIDANT_DEVICE_KEY="$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')"
+git clone <url> ~/vault
+export CONFIDANT_VAULT="$HOME/vault"
+confidant keys device-add --initiate --label "headless-2" --output ~/device-add-request.toml
+# copy the request to an enrolled device, confirm the fingerprint, then:
+# confidant keys device-add --from-request ~/device-add-request.toml
+```
+
 On a desktop the keychain is still the default; an env var wins over it
 for the same key and holds the value the keychain would (an age identity
 for the device or inbox key, a hex seed for the operator key), so injecting

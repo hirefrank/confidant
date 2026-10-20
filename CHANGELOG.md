@@ -8,6 +8,17 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- Headless `keys device-add --initiate`: `CONFIDANT_DEVICE_KEY` is this
+  device's identity (same as `init`). The command emits that pubkey and
+  does not write a keychain. Without an env identity and without a
+  reachable keychain it fails closed and names `age-keygen` (#684).
+
+### Changed
+- `--initiate` no longer refuses when `CONFIDANT_DEVICE_KEY` is set (#153
+  nit 4). `--from-request` still refuses a previously-seen pubkey. `keys
+  shred` still refuses the env override.
+
 ## [0.6.1] - 2026-10-19
 
 **Disclosure:** the milestone 2 encryption has had no independent review and

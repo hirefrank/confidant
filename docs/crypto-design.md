@@ -1056,10 +1056,16 @@ Closes the non-blocking follow-ups on #153 plus the `recover` anchor file
   **and absent** from the live set, so a client shredded then
   re-initialized under the same id still contributes its current
   recipients.
-- **`--initiate` with `CONFIDANT_DEVICE_KEY` (#153 nit 4).** Fails
-  closed up front: an env-var key cannot be re-generated, so `--initiate`
-  refuses rather than re-emitting the enrolled key for the enrolled
-  device to reject later (mirrors `shred`).
+- **`--initiate` with `CONFIDANT_DEVICE_KEY` (#684, supersedes #153 nit 4
+  for this command only).** Headless enrollment uses the env identity as
+  this new device (same as `init`, #650): `--initiate` emits that pubkey
+  and does not write a keychain. It does not treat the env var as
+  "already enrolled". `--from-request` still refuses a previously-seen
+  pubkey, so re-using an already-enrolled identity fails on the approve
+  side. `keys shred` still refuses while the env var is set. There is no
+  `--key-out`; keys never live in files. Without an env identity and
+  without a reachable keychain, `--initiate` fails closed and names
+  `age-keygen` + `CONFIDANT_DEVICE_KEY`.
 - **Label validation (#153 nit 6).** `keys device-add` labels now reject
   control characters (rather than stripping them) and require ASCII
   alphanumerics plus ` -_.()`.
