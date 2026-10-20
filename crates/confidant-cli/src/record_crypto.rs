@@ -210,7 +210,7 @@ impl RecordEncryptor {
                 anyhow::Error::new(
                     DomainError::invalid(format!("cannot unwrap data key for {client_id}: {e}"))
                         .with_fix(
-                            "Run `confidant init` (new vault) or `confidant recover` (new device)",
+                            "Run `confidant init` (new vault), clone this vault and `confidant keys device-add`, or `confidant recover` only if every enrolled device is lost",
                         ),
                 )
             })?;

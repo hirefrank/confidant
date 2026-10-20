@@ -296,21 +296,23 @@ enum Command {
     /// stderr, or written to `--phrase-out`), and this device's key; writes
     /// the trust anchor to ~/.config/confidant/trust.toml; creates the vault
     /// lookup key and the vault:shared client. Requires a git repo with a
-    /// clean tree.
+    /// clean tree. This is for a *new* vault. To put an existing vault on
+    /// another device, clone it and run `keys device-add` (not `init`;
+    /// `recover` only if every enrolled device is lost).
     ///
     /// With `--create`, an empty or absent vault directory is scaffolded
     /// first: the directory is created, `git init` runs when needed and the
     /// branch is set to `main`, `.gitignore` gains `.confidant/`, and a
     /// minimal `confidant.toml` is written (its `packs` list comes from the
-    /// global `--packs` flag, defaulting to `[]`) and committed. Only packs
-    /// built into this binary (today the implicit `personal@0.2`) may be
-    /// listed: an external pack is vendored into an existing vault by
-    /// `confidant pack add`, so install it after `init`. The key steps then
-    /// run unchanged.
+    /// global `--packs` flag, defaulting to `[]`) and committed. `--remote
+    /// <url>` then adds `origin` (it does not push). Only packs built into
+    /// this binary (today the implicit `personal@0.2`) may be listed: an
+    /// external pack is vendored into an existing vault by `confidant pack
+    /// add`, so install it after `init`. The key steps then run unchanged.
     ///
     /// `--dry-run` runs every preflight check and reports the plan without
     /// creating a directory, writing a file, making a commit, generating
-    /// keys, or touching the keychain.
+    /// keys, adding a remote, or touching the keychain.
     Init {
         /// Replace an existing trust anchor after initialization succeeds.
         /// Never re-initializes an existing `keys/` tree (that is refused).
@@ -326,11 +328,18 @@ enum Command {
         /// delete it after writing the phrase down.
         #[arg(long, value_name = "PATH")]
         phrase_out: Option<PathBuf>,
+        /// Add `git remote origin URL` after scaffolding. Does not push
+        /// (credentials and host keys stay yours). Requires `--create`.
+        #[arg(long, value_name = "URL", requires = "create")]
+        remote: Option<String>,
     },
-    /// Recover the vault on a new device from the recovery phrase.
+    /// Recover the vault after every enrolled device is lost.
     ///
     /// The phrase arrives via stdin or --phrase-file only (never as an
     /// argument). Requires a fresh device (no device key enrolled yet).
+    /// Rotates to a new recovery phrase and drops other devices' wrappings.
+    /// To add a second device while one is still enrolled, clone the vault
+    /// and run `keys device-add` instead.
     Recover {
         /// File containing the 24-word recovery phrase (alternative to stdin).
         #[arg(long)]
@@ -4470,7 +4479,8 @@ fn note_keychain_error() -> anyhow::Error {
              the keychain is back), or re-run without --note to log the session now (the \
              ledger line needs no key), then add the note with `confidant note add` once \
              the keychain is back. If this device was never enrolled, run \
-             `confidant init` (new vault) or `confidant recover` (new device) instead.",
+             `confidant init` (new vault), clone this vault and `confidant keys device-add`, \
+             or `confidant recover` only if every enrolled device is lost.",
         ),
     )
 }
@@ -7250,10 +7260,12 @@ fn device_key_check() -> DoctorCheck {
     const ID: &str = "device-key";
     let headless_fix = format!(
         "On a host with no D-Bus Secret Service, set {DEVICE_KEY_ENV} to the device key \
-         (AGE-SECRET-KEY-1…), {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed, and \
-         {INBOX_KEY_ENV} to the inbox key before running `confidant init`, e.g. \
-         `export {OPERATOR_KEY_ENV}=<64 hex characters>`. On a device that already has \
-         vault keys, run `confidant recover` instead. Keys never live in files."
+         (AGE-SECRET-KEY-1…) and {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed \
+         before running `confidant init`, e.g. `export {OPERATOR_KEY_ENV}=<64 hex characters>`. \
+         {INBOX_KEY_ENV} is only needed later, for inbox commands after the vault exists. \
+         To put an existing vault on another device, clone it and run \
+         `confidant keys device-add` (not `init`; `recover` only if every enrolled device \
+         is lost). Keys never live in files."
     );
     let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
         id: ID,
@@ -7719,8 +7731,13 @@ fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
         return DoctorCheck {
             id: ID,
             status: "ok",
-            message: "local-only; add a remote for backup and second-device recovery".to_owned(),
-            fix: Some("Run `git remote add origin <url>`".to_owned()),
+            message: "local-only; add a remote for backup and second-device enrollment".to_owned(),
+            fix: Some(
+                "Run `git remote add origin <url>` (or `confidant init --create --remote <url>` \
+                 on a new vault). Clone on another device, then `confidant keys device-add`; \
+                 `recover` only if every enrolled device is lost"
+                    .to_owned(),
+            ),
         };
     }
     let named = remotes.join(", ");
@@ -9067,10 +9084,16 @@ fn refuse_existing_anchor(trust_path: &Path, force: bool) -> anyhow::Result<()> 
     if trust_path.exists() && !force {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!(
-                "trust anchor already exists at {}; refusing to overwrite (run `confidant recover` on a new device, or pass --force)",
+                "trust anchor already exists at {}; refusing to overwrite (clone an existing \
+                 vault and run `confidant keys device-add`, or `confidant recover` only if \
+                 every enrolled device is lost, or pass --force)",
                 trust_path.display()
             ))
-            .with_fix("Run `confidant recover` with the recovery phrase on a new device"),
+            .with_fix(
+                "To enroll this device on an existing vault, clone it and run `confidant keys \
+                 device-add`. `confidant recover` is only for when every enrolled device is \
+                 lost. Pass --force to replace this machine's trust anchor for a new vault",
+            ),
         ));
     }
     Ok(())
@@ -9173,6 +9196,9 @@ struct Scaffold {
     wrote_config: bool,
     commit_created: bool,
     previous_head: Option<String>,
+    /// True when this run added `origin` via `--remote` on a pre-existing
+    /// repo (a repo this run created is removed entirely on rollback).
+    added_remote: bool,
     armed: bool,
 }
 
@@ -9187,7 +9213,10 @@ impl Scaffold {
         self.armed = false;
         if self.git_initialized {
             let _ = std::fs::remove_dir_all(self.root.join(".git"));
-        } else if self.commit_created {
+        } else if self.added_remote {
+            let _ = confidant_core::write::git(&self.root, &["remote", "remove", "origin"], true);
+        }
+        if self.commit_created && !self.git_initialized {
             match &self.previous_head {
                 Some(prev) => {
                     let _ =
@@ -9577,20 +9606,101 @@ fn current_branch(root: &Path, no_input: bool) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Additive `next_steps` for `init` JSON (#658): point at `pack add` only
-/// when the scaffolded `packs` list is empty.
-fn init_next_steps(packs_empty: bool) -> Value {
-    if packs_empty {
-        serde_json::json!(["confidant pack add <https-url> --yes"])
-    } else {
-        serde_json::json!([])
+/// #685/#686: second devices clone + `keys device-add`; `recover` burns the
+/// phrase. Shown after `init` (human and JSON) so a new-device operator is
+/// not sent to `init` or `recover`.
+const SECOND_DEVICE_HINT: &str = "to put this vault on another device, clone it and run `confidant keys device-add` (not `init`; `recover` only if every enrolled device is lost)";
+
+/// `--remote` on `init --create`, if present.
+fn init_remote_url(cli: &Cli) -> Option<&str> {
+    match &cli.command {
+        Command::Init { remote, .. } => remote.as_deref(),
+        _ => None,
     }
+}
+
+/// Additive `next_steps` for `init` JSON (#658, #686): `pack add` when the
+/// scaffolded list is empty, `git push` when `--remote` set origin, and
+/// always the second-device enrollment path.
+fn init_next_steps(packs_empty: bool, remote: Option<&str>, branch: &str) -> Value {
+    let mut steps = Vec::new();
+    if packs_empty {
+        steps.push("confidant pack add <https-url> --yes".to_string());
+    }
+    if remote.is_some() {
+        steps.push(format!("git push -u origin {branch}"));
+    }
+    steps.push(SECOND_DEVICE_HINT.to_string());
+    serde_json::json!(steps)
+}
+
+/// Human follow-up after a real or dry-run `init`. The pack-add line must
+/// appear at most once (#658).
+fn print_init_followup(packs_empty: bool, remote: Option<&str>, branch: &str) {
+    if packs_empty {
+        println!("optional: install a pack with `confidant pack add <https-url> --yes`");
+    }
+    if let Some(url) = remote {
+        println!("git remote origin {url} (not pushed)");
+        println!("push when ready: git push -u origin {branch}");
+    } else {
+        println!(
+            "optional: `git remote add origin <url>` for backup (or `--remote <url>` with `--create`); this command does not push"
+        );
+    }
+    println!("{SECOND_DEVICE_HINT}");
+}
+
+/// Refuse `--remote` when the URL is empty or `origin` already exists, so
+/// `--create --dry-run` reports the same error a real run would.
+fn refuse_init_remote(
+    root: &Path,
+    url: &str,
+    existing_repo: bool,
+    no_input: bool,
+) -> anyhow::Result<()> {
+    if url.trim().is_empty() {
+        return Err(anyhow::Error::new(
+            DomainError::usage("--remote needs a git URL").with_fix(
+                "Pass `--remote <url>` with a real remote, or omit it and add origin later",
+            ),
+        ));
+    }
+    if !existing_repo {
+        return Ok(());
+    }
+    let remotes = confidant_core::write::git(root, &["remote"], no_input)?;
+    if remotes.lines().any(|line| line.trim() == "origin") {
+        return Err(anyhow::Error::new(
+            DomainError::usage(format!(
+                "refusing --remote: origin already exists on {}",
+                root.display()
+            ))
+            .with_fix("Use the existing origin, or `git remote remove origin` first"),
+        ));
+    }
+    Ok(())
+}
+
+/// `git remote add origin URL`. `Scaffold::added_remote` is set only after
+/// this succeeds so a failed `git remote add` is not rolled back as if it
+/// created origin.
+fn add_init_remote(
+    root: &Path,
+    url: &str,
+    no_input: bool,
+    scaffold: &mut Scaffold,
+) -> anyhow::Result<()> {
+    confidant_core::write::git(root, &["remote", "add", "origin", url.trim()], no_input)?;
+    scaffold.added_remote = true;
+    Ok(())
 }
 
 /// #649: report the `init --create` plan without writing anything.
 fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyhow::Result<()> {
     let packs_empty = packs.is_empty();
     let (branch, branch_note) = planned_create_branch(root, cli.no_input);
+    let remote = init_remote_url(cli);
     if cli.json {
         let mut extra = serde_json::json!({
             "command": "init",
@@ -9598,7 +9708,8 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             "branch": branch,
             "scaffold": true,
             "packs": packs,
-            "next_steps": init_next_steps(packs_empty),
+            "remote": remote,
+            "next_steps": init_next_steps(packs_empty, remote, &branch),
         });
         if let Some(note) = &branch_note {
             extra["branch_note"] = Value::String(note.clone());
@@ -9613,6 +9724,10 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
         }
         println!("  would    create the vault directory (when absent)");
         println!("  would    run git init and commit .gitignore + confidant.toml");
+        match remote {
+            Some(url) => println!("  would    add git remote origin {url} (not pushed)"),
+            None => println!("  would    not add a git remote"),
+        }
         if std::env::var_os(OPERATOR_KEY_ENV).is_some() {
             println!("  would    use {OPERATOR_KEY_ENV} as the operator key");
         } else {
@@ -9620,9 +9735,7 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
         }
         println!("  would    generate the recovery phrase and device key");
         println!("  would    commit keys/ and write the trust anchor");
-        if packs_empty {
-            println!("optional: install a pack with `confidant pack add <https-url> --yes`");
-        }
+        print_init_followup(packs_empty, remote, &branch);
     }
     Ok(())
 }
@@ -9643,8 +9756,18 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
     let root = bootstrap_target(cli);
 
     // An existing vault takes today's path unchanged (anchor check, clean
-    // tree, key steps).
+    // tree, key steps). `--remote` is a scaffold-only flag: refuse rather
+    // than silently skip it on a directory that already has a vault.
     if root.join("confidant.toml").is_file() {
+        if init_remote_url(cli).is_some() {
+            return Err(anyhow::Error::new(
+                DomainError::usage(format!(
+                    "refusing --remote: {} already has a vault; --remote only applies while scaffolding",
+                    root.display()
+                ))
+                .with_fix("Add a remote with `git remote add origin <url>` (this command does not push)"),
+            ));
+        }
         return Ok(BootstrapPlan::Continue(None));
     }
 
@@ -9706,13 +9829,16 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
     // the same way a real init would at `store_device_key`.
     require_init_key_sources()?;
 
+    let existing_repo = exists && is_git_repo_root(&root, no_input);
+    if let Some(url) = init_remote_url(cli) {
+        refuse_init_remote(&root, url, existing_repo, no_input)?;
+    }
+
     // #649: dry run stops before the first write.
     if cli.dry_run {
         print_init_scaffold_dry_run(cli, &root, &packs)?;
         return Ok(BootstrapPlan::DryRun);
     }
-
-    let existing_repo = exists && is_git_repo_root(&root, no_input);
     let previous_head = if existing_repo {
         confidant_core::write::git(&root, &["rev-parse", "HEAD"], no_input)
             .ok()
@@ -9731,6 +9857,7 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         wrote_config: false,
         commit_created: false,
         previous_head,
+        added_remote: false,
         armed: true,
     };
 
@@ -9830,6 +9957,10 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         scaffold.commit_created = true;
     }
 
+    if let Some(url) = init_remote_url(cli) {
+        add_init_remote(&root, url, no_input, &mut scaffold)?;
+    }
+
     if !cli.json {
         let branch = current_branch(&root, no_input).unwrap_or_else(|| "main".to_owned());
         eprintln!("scaffolded vault at {} (branch {branch})", root.display());
@@ -9894,8 +10025,10 @@ fn cmd_init(
                 keys_dir.display()
             ))
             .with_fix(
-                "Start in a fresh vault, run `confidant recover` on a new device, or use \
-                 `confidant keys rotate` to rotate existing keys",
+                "Start in a fresh directory for a new vault. To put this vault on another \
+                 device, clone it and run `confidant keys device-add` (not `init`; `recover` \
+                 only if every enrolled device is lost). Use `confidant keys rotate` to \
+                 rotate existing keys",
             ),
         ));
     }
@@ -9935,6 +10068,8 @@ fn cmd_init(
 
     // #649: every preflight above passed; report the plan and stop before
     // key generation, keychain writes, keys/ commits, or the anchor save.
+    let remote = init_remote_url(cli);
+    let branch_name = branch.as_deref().unwrap_or("main");
     if cli.dry_run {
         if json {
             print_json(&ok_envelope(
@@ -9943,7 +10078,8 @@ fn cmd_init(
                     "command": "init",
                     "dry_run": true,
                     "branch": branch,
-                    "next_steps": init_next_steps(packs_empty),
+                    "remote": remote,
+                    "next_steps": init_next_steps(packs_empty, remote, branch_name),
                 }),
             ))?;
         } else {
@@ -9962,9 +10098,7 @@ fn cmd_init(
                 "  would    commit keys/ and write the trust anchor at {}",
                 trust_path.display()
             );
-            if packs_empty {
-                println!("optional: install a pack with `confidant pack add <https-url> --yes`");
-            }
+            print_init_followup(packs_empty, remote, branch_name);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -10152,7 +10286,8 @@ fn cmd_init(
             "keys_dir": keys_dir.display().to_string(),
             "commit": commit,
             "branch": branch,
-            "next_steps": init_next_steps(packs_empty),
+            "remote": remote,
+            "next_steps": init_next_steps(packs_empty, remote, branch_name),
         });
         if let Some(path) = phrase_out {
             extra["phrase_out"] = Value::String(path.display().to_string());
@@ -10164,9 +10299,7 @@ fn cmd_init(
             println!("branch {branch}");
         }
         println!("committed keys/ tree ({})", &commit[..8.min(commit.len())]);
-        if packs_empty {
-            println!("optional: install a pack with `confidant pack add <https-url> --yes`");
-        }
+        print_init_followup(packs_empty, remote, branch_name);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -11641,7 +11774,7 @@ pub(crate) fn device_key_bech32() -> anyhow::Result<Zeroizing<String>> {
     }
     let bytes = confidant_crypt::keychain::device_key().map_err(|_| {
         anyhow::Error::new(DomainError::invalid(
-            "no device key enrolled; run `confidant init` (new vault) or `confidant recover` (new device) first".to_string(),
+            "no device key enrolled; run `confidant init` (new vault), clone this vault and `confidant keys device-add`, or `confidant recover` only if every enrolled device is lost".to_string(),
         ))
     })?;
     Ok(Zeroizing::new(

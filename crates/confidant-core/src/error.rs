@@ -251,8 +251,9 @@ impl DomainError {
                 "{skipped} encrypted record(s) could not be decrypted"
             ));
             fixes.push(
-                "run `confidant init` (new vault) or `confidant recover` (new device) \
-                 so this device can decrypt the vault",
+                "run `confidant init` (new vault), clone this vault and `confidant keys \
+                 device-add` (another device), or `confidant recover` only if every \
+                 enrolled device is lost",
             );
         }
         if refused > 0 {

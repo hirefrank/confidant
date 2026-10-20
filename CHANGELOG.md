@@ -13,11 +13,20 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   device's identity (same as `init`). The command emits that pubkey and
   does not write a keychain. Without an env identity and without a
   reachable keychain it fails closed and names `age-keygen` (#684).
+- `confidant init --create --remote <url>` sets `git remote origin` after
+  scaffolding and does not push. `init` JSON reports `remote` and a
+  clone-then-`keys device-add` next step (#686).
 
 ### Changed
 - `--initiate` no longer refuses when `CONFIDANT_DEVICE_KEY` is set (#153
   nit 4). `--from-request` still refuses a previously-seen pubkey. `keys
   shred` still refuses the env override.
+- `doctor`'s pre-init `device-key` hint no longer requires
+  `CONFIDANT_INBOX_KEY` before `init`; the inbox key is after the vault
+  exists (#683).
+- Docs and `init`/`recover` help treat `keys device-add` as the second-device
+  path and `recover` as the lost-all-devices path (it rotates the phrase)
+  (#685, #686).
 
 ### Fixed
 - `init --dry-run` now runs the same key-source preflight as a real init:

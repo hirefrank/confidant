@@ -160,6 +160,7 @@ fn git_remote_absent_is_ok_with_add_remote_fix() {
     assert!(msg.contains("backup"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
     assert!(fix.contains("git remote add origin"), "{fix}");
+    assert!(fix.contains("keys device-add"), "{fix}");
     // Provider-neutral: no host is hard-coded.
     assert!(!fix.contains("github"), "{fix}");
 }

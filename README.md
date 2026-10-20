@@ -81,10 +81,12 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    - **Encrypted (real data):** ensure git has `user.name` and
      `user.email` (init commits). For a fresh vault, run
      `confidant init --create --no-input --phrase-out <path>` against an
-     absent or empty directory: it scaffolds the directory, starts the git
-     repo on branch `main` (and reports the branch), seeds `packs = []`
-     (packs are optional), writes `.gitignore` and `confidant.toml`, then
-     creates the keys. For an existing vault, first ensure
+     absent or empty directory (add `--remote <url>` if I already have a
+     remote; it sets origin and does not push): it scaffolds the directory,
+     starts the git repo on branch `main` (and reports the branch), seeds
+     `packs = []` (packs are optional), writes `.gitignore` and
+     `confidant.toml`, then creates the keys. For an existing directory that
+     is not yet initialized, first ensure
      `confidant.toml` does **not** set `[crypto] mode = "plaintext"` (never
      silently copy the demo vault's `mode = "plaintext"` into a vault I
      described as real) and the working tree is clean (`git status`), then
@@ -102,11 +104,16 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      **not** run `confidant init`, and warn that `git clone` exposes all
      record content and that a plaintext vault must not be pushed to any
      remote.
-5. Optional remote: ask whether I want a git remote for backup and
-   second-device recovery. `init` adds none. If I say yes, show me
-   `git remote add origin <url>` and `git push -u origin main` to run
-   myself — do not add a remote or push without my explicit confirmation.
-   A plaintext vault stays local.
+5. Optional remote: **before** encrypted `init`, ask whether I already
+   have a git remote URL for backup and putting this vault on another
+   device. If I do, pass `--remote <url>` on `confidant init --create`
+   (it sets `origin` and does not push). If I decide after init, show me
+   `git remote add origin <url>`. In either case, show `git push -u origin
+   main` for me to run myself — never push without my explicit
+   confirmation. A plaintext vault stays local. On a **new device for an
+   existing vault**, do not run `init`: clone the repo and run
+   `confidant keys device-add` (`recover` only if every enrolled device is
+   lost).
 6. Verify: run `confidant check --vault "<path>" --json --no-input` and
    `confidant doctor --vault "<path>"`; report the error/warning counts,
    the branch `init` created, and any `git-remote` warning.
@@ -132,10 +139,13 @@ Contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Remote (optional)
 
-`confidant init --create` starts a local git repo on `main` and adds **no**
-remote. Local-only is a valid setup; a remote is what makes backup and
-second-device recovery possible (`confidant recover` still needs a clone of
-the vault). To connect one, run git yourself:
+`confidant init --create` starts a local git repo on `main`. Pass
+`--remote <url>` to set `origin` (it still does not push). Local-only is a
+valid setup; a remote is what makes backup and putting the vault on another
+device possible. On a second device, clone the repo and run
+`confidant keys device-add` — not `init`, and not `recover` unless every
+enrolled device is lost (`recover` rotates the recovery phrase). If the
+vault already exists without a remote:
 
 ```sh
 git remote add origin <url>
@@ -143,7 +153,7 @@ git push -u origin main
 ```
 
 The URL is whatever your git host gives you — Confidant does not require
-GitHub, and no setup command pushes for you. `confidant doctor` reports a
+GitHub, and no command pushes for you. `confidant doctor` reports a
 `git-remote` check: local-only is fine, an encrypted vault with a remote is
 fine, and a remote on a `[crypto] mode = "plaintext"` vault is a
 **warning**.
