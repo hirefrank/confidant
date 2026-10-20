@@ -261,6 +261,30 @@ enum Command {
         #[arg(long)]
         clear_pending_inbox_rotation: bool,
     },
+    /// Show how the vault compares with its git upstream (fetch, report).
+    ///
+    /// Read-only by default: fetch the upstream remote, report ahead/behind
+    /// from the refreshed state, and exit non-zero when the branch diverged.
+    /// `--pull` fast-forwards the local branch and `--push` pushes local
+    /// commits; both are explicit, confirmed network writes and never run
+    /// automatically. Refuses a structurally plaintext vault
+    /// (`E_PLAINTEXT_REMOTE`), a vault with no remote or upstream
+    /// (`E_NO_REMOTE`), and a diverged branch (`E_NOT_FAST_FORWARD`).
+    ///
+    /// The global `--dry-run` reports state from the last fetch without
+    /// touching the network, so it is safe on metered or offline hosts.
+    Sync {
+        /// Fast-forward the local branch to the upstream after confirmation.
+        #[arg(long, conflicts_with = "push")]
+        pull: bool,
+        /// Push local commits to the upstream after confirmation.
+        #[arg(long)]
+        push: bool,
+        /// Confirm a `--pull` or `--push` without prompting. Required with
+        /// --no-input or --json; interactive sessions are asked instead.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Clear this machine's Confidant state so a new vault starts clean.
     ///
     /// Machine state only: this command never reads, writes, or deletes
@@ -1389,6 +1413,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 user_config.as_ref(),
                 *clear_pending_inbox_rotation,
             )
+        }
+        Command::Sync { pull, push, yes } => {
+            let root = vault_root.unwrap();
+            cmd_sync(&cli, &root, *pull, *push, *yes)
         }
         Command::Reset { yes, force, .. } => cmd_reset_machine_state(&cli, *yes, *force),
         Command::Init {
@@ -7770,6 +7798,334 @@ fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
     }
 }
 
+/// Ahead/behind counts from `git rev-list --left-right --count @{u}...HEAD`.
+/// `ahead` counts commits only on HEAD; `behind` counts commits only on the
+/// upstream. Both are from the last fetch (or push) — this helper never
+/// touches the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AheadBehind {
+    ahead: u64,
+    behind: u64,
+}
+
+/// Parse `git rev-list --left-right --count @{u}...HEAD` output
+/// (`<behind>\t<ahead>`). Returns `None` for anything unexpected.
+fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
+    let mut parts = output.split_whitespace();
+    let behind = parts.next()?.parse().ok()?;
+    let ahead = parts.next()?.parse().ok()?;
+    Some(AheadBehind { ahead, behind })
+}
+
+/// Run the offline ahead/behind comparison. Callers resolve the upstream
+/// first; a failure here is surfaced as a command error, never as a silent
+/// zero.
+fn git_ahead_behind(root: &Path, no_input: bool) -> anyhow::Result<AheadBehind> {
+    let out = confidant_core::write::git(
+        root,
+        &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+        no_input,
+    )?;
+    parse_ahead_behind(&out).ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "could not parse the ahead/behind counts from git",
+        ))
+    })
+}
+
+/// Resolve the current branch and its upstream (e.g. `main` and
+/// `origin/main`) without contacting a remote. `None` means "no upstream",
+/// which is a valid local-only setup rather than a failure.
+fn git_upstream(root: &Path, no_input: bool) -> Option<(String, String)> {
+    let branch = confidant_core::write::git(root, &["rev-parse", "--abbrev-ref", "HEAD"], no_input)
+        .ok()?
+        .trim()
+        .to_owned();
+    let upstream = confidant_core::write::git(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        no_input,
+    )
+    .ok()?
+    .trim()
+    .to_owned();
+    if branch.is_empty() || upstream.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some((branch, upstream))
+}
+
+/// #665: `local-commits` doctor check. Offline and advisory: it reports
+/// ahead/behind from the **last fetch** and never calls fetch, pull, or
+/// push. No remote, no upstream, or an unreadable comparison is `ok`; only
+/// a real difference warns (a warning, never an error).
+fn local_commits_check(root: &Path, no_input: bool) -> DoctorCheck {
+    const ID: &str = "local-commits";
+    let ok = |message: String, fix: Option<String>| DoctorCheck {
+        id: ID,
+        status: "ok",
+        message,
+        fix,
+    };
+    if !root.is_dir() {
+        return ok("no vault to inspect for local commits".to_owned(), None);
+    }
+    let Some((_, upstream)) = git_upstream(root, no_input) else {
+        // Distinguish "no remote at all" from "remote, no upstream branch":
+        // the first is a valid local-only setup, the second needs one git
+        // command. Neither is an error, and `git-remote` already carries the
+        // add-a-remote instructions.
+        let remotes = confidant_core::write::git(root, &["remote"], no_input)
+            .map(|out| parse_git_remotes(&out))
+            .unwrap_or_default();
+        let branch =
+            confidant_core::write::git(root, &["rev-parse", "--abbrev-ref", "HEAD"], no_input)
+                .map(|out| out.trim().to_owned())
+                .unwrap_or_else(|_| "HEAD".to_owned());
+        if remotes.is_empty() {
+            return ok(
+                "local-only; no remote to compare local commits with".to_owned(),
+                None,
+            );
+        }
+        return ok(
+            format!(
+                "no upstream branch for '{branch}'; cannot compare local commits with {}",
+                remotes.join(", ")
+            ),
+            Some(format!(
+                "Set an upstream with `git push -u {} {branch}`",
+                remotes[0]
+            )),
+        );
+    };
+    let state = match git_ahead_behind(root, no_input) {
+        Ok(state) => state,
+        Err(e) => {
+            return ok(
+                format!("could not compare with {upstream}: {e}"),
+                Some("Run `git status` to check the repository".to_owned()),
+            )
+        }
+    };
+    match (state.ahead, state.behind) {
+        (0, 0) => ok(
+            format!("up to date with {upstream} (as of the last fetch)"),
+            None,
+        ),
+        (ahead, 0) => DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "{ahead} local commit(s) not pushed to {upstream} (as of the last fetch)"
+            ),
+            fix: Some("Run `confidant sync --push`".to_owned()),
+        },
+        (0, behind) => DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "{upstream} has {behind} new commit(s) not local (as of the last fetch)"
+            ),
+            fix: Some("Run `confidant sync --pull`".to_owned()),
+        },
+        (ahead, behind) => DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "diverged from {upstream}: {ahead} local commit(s) not pushed, \
+                 {behind} remote commit(s) not local (as of the last fetch)"
+            ),
+            fix: Some(
+                "Merge or rebase the branch explicitly, then run `confidant sync`".to_owned(),
+            ),
+        },
+    }
+}
+
+/// #665: `confidant sync`. Read-only by default (fetch, report ahead/behind);
+/// `--pull` and `--push` are explicit, confirmed network writes. Refuses a
+/// plaintext vault, no remote/upstream, or a diverged branch with stable
+/// codes. `--dry-run` never touches the network and reports the state from
+/// the last fetch.
+fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow::Result<ExitCode> {
+    let no_input = cli.no_input;
+    let git = |args: &[&str]| confidant_core::write::git(root, args, no_input);
+
+    // Fail closed on a missing repository, an empty remote list, or a
+    // plaintext vault before any git command that could reach the network.
+    confidant_core::write::require_git_repo(root, no_input)?;
+    let remotes = git(&["remote", "-v"])
+        .map(|out| parse_git_remotes(&out))
+        .unwrap_or_default();
+    if remotes.is_empty() {
+        return Err(anyhow::Error::new(DomainError::no_remote(
+            "no git remote is configured for this vault",
+        )));
+    }
+    if !confidant_core::crypto_mode::is_structurally_encrypted(root) {
+        return Err(anyhow::Error::new(DomainError::plaintext_remote()));
+    }
+    let Some((branch, upstream)) = git_upstream(root, no_input) else {
+        return Err(anyhow::Error::new(DomainError::no_remote(
+            "the current branch has no upstream branch",
+        )));
+    };
+    // The upstream's first path segment is the remote name
+    // (`origin/main` → `origin`); verify it is one of the configured
+    // remotes rather than trusting the string.
+    let remote = upstream.split('/').next().unwrap_or_default().to_owned();
+    if !remotes.iter().any(|name| name == &remote) {
+        return Err(anyhow::Error::new(DomainError::no_remote(format!(
+            "upstream '{upstream}' does not name a configured remote"
+        ))));
+    }
+
+    // `--dry-run` reports the last-fetched state and never contacts the
+    // remote, so it works offline and on a metered connection. Reads of the
+    // remote's ciphertext are still refused for plaintext vaults above.
+    let mut fetched = false;
+    if !cli.dry_run {
+        git(&["fetch", "--quiet", &remote]).map_err(|_| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "git fetch {remote} failed; check the remote URL and credentials"
+            )))
+        })?;
+        fetched = true;
+    }
+
+    let mut state = git_ahead_behind(root, no_input)?;
+    if state.ahead > 0 && state.behind > 0 {
+        return Err(anyhow::Error::new(DomainError::not_fast_forward(
+            state.ahead,
+            state.behind,
+        )));
+    }
+
+    let mut action = "none";
+    let mut applied = false;
+    if pull && state.behind > 0 && !cli.dry_run {
+        action = "pull";
+        if confirm_sync_write(
+            cli,
+            yes,
+            &format!(
+                "Fast-forward {branch} to {upstream} ({} commit(s))?",
+                state.behind
+            ),
+        )? {
+            git(&["pull", "--ff-only", "--quiet"]).map_err(|e| {
+                let detail = format!("{e:#}");
+                if detail.contains("Not possible to fast-forward")
+                    || detail.contains("non-fast-forward")
+                {
+                    anyhow::Error::new(DomainError::not_fast_forward(state.ahead, state.behind))
+                } else if detail.contains("would be overwritten")
+                    || detail.contains("commit or stash")
+                    || detail.contains("commit your changes or stash")
+                {
+                    // A dirty tree is the common fast-forward refusal; a
+                    // credentials message here would send the operator to
+                    // the wrong place.
+                    anyhow::Error::new(
+                        DomainError::conflict(
+                            "git pull --ff-only refused: local changes would be overwritten",
+                        )
+                        .with_fix("Commit or stash your changes, then run `confidant sync --pull`"),
+                    )
+                } else {
+                    anyhow::Error::new(DomainError::invalid(
+                        "git pull --ff-only failed; check the remote URL and credentials",
+                    ))
+                }
+            })?;
+            state = git_ahead_behind(root, no_input)?;
+            applied = true;
+        }
+    } else if push && state.ahead > 0 && !cli.dry_run {
+        action = "push";
+        if confirm_sync_write(
+            cli,
+            yes,
+            &format!("Push {} commit(s) to {upstream}?", state.ahead),
+        )? {
+            // No explicit refspec: push to the configured upstream, so a
+            // non-standard upstream branch name is honoured.
+            git(&["push", "--quiet"]).map_err(|e| {
+                let detail = format!("{e:#}");
+                if detail.contains("non-fast-forward")
+                    || detail.contains("fetch first")
+                    || detail.contains("stale info")
+                {
+                    anyhow::Error::new(DomainError::not_fast_forward(state.ahead, state.behind))
+                } else {
+                    anyhow::Error::new(DomainError::invalid(format!(
+                        "git push {remote} failed; check the remote URL and credentials"
+                    )))
+                }
+            })?;
+            // `push` updates the remote-tracking ref, so the comparison is
+            // current without a second fetch.
+            state = git_ahead_behind(root, no_input)?;
+            applied = true;
+        }
+    }
+
+    if cli.json {
+        print_json(&ok_envelope(
+            Some(root),
+            serde_json::json!({
+                "remote": remote,
+                "branch": branch,
+                "upstream": upstream,
+                "ahead": state.ahead,
+                "behind": state.behind,
+                "crypto_mode": "encrypted",
+                "fetched": fetched,
+                "dry_run": cli.dry_run,
+                "action": action,
+                "applied": applied,
+            }),
+        ))?;
+    } else {
+        println!("{branch} -> {upstream} ({remote})");
+        println!(
+            "{ahead} ahead, {behind} behind ({})",
+            if fetched {
+                "after fetch"
+            } else {
+                "last fetched state; --dry-run did not contact the remote"
+            },
+            ahead = state.ahead,
+            behind = state.behind
+        );
+        if action != "none" {
+            if applied {
+                println!("{action} complete");
+            } else {
+                println!("{action} not confirmed; nothing changed");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Confirmation for a `sync --pull` / `--push` network write. Unlike the
+/// read-only report, these need an explicit yes: interactive sessions are
+/// prompted, and non-interactive sessions must pass `--yes` (a usage error,
+/// exit 2). Never returns `true` without confirmation.
+fn confirm_sync_write(cli: &Cli, yes: bool, question: &str) -> anyhow::Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if cli.no_input || cli.json {
+        return Err(anyhow::Error::new(DomainError::usage(
+            "--pull and --push are network writes; pass --yes with --no-input or --json",
+        )));
+    }
+    confirm_yn(question, false, false)
+}
+
 /// Parse `findmnt -no SOURCE /` output into a device path. `findmnt` can
 /// append a subvolume suffix (`/dev/sda2[/@root]`); strip it. Returns
 /// `None` for a non-device source (overlay, tmpfs, `UUID=…`), where the
@@ -7957,6 +8313,10 @@ fn cmd_doctor(
     // #660: remote visibility. Read-only and offline; warns when a
     // plaintext vault has a remote, because that leaks record bodies.
     checks.push(git_remote_check(root, cli.no_input));
+
+    // #665: ahead/behind visibility from the last fetch. Offline and
+    // advisory: no remote/upstream stays `ok`, and a real difference warns.
+    checks.push(local_commits_check(root, cli.no_input));
 
     // #175: leftover keys/ staging state from an interrupted swap.
     checks.push(keys_staging_check(root));
@@ -14367,8 +14727,8 @@ fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result
 mod tests {
     use super::{
         confirm_yn, detect_install_method, git_version_check_from, offerable_update,
-        parse_git_remotes, parse_git_version, parse_tui_version, reject_unsupported_prefix,
-        InstallMethod, MIN_GIT_VERSION,
+        parse_ahead_behind, parse_git_remotes, parse_git_version, parse_tui_version,
+        reject_unsupported_prefix, AheadBehind, InstallMethod, MIN_GIT_VERSION,
     };
     use std::path::Path;
 
@@ -14409,6 +14769,28 @@ backup\tgit@host.example:org/repo.git (push)
 ";
         assert_eq!(parse_git_remotes(out), vec!["origin", "backup"]);
         assert!(parse_git_remotes("").is_empty());
+    }
+
+    /// #665: `git rev-list --left-right --count @{u}...HEAD` prints
+    /// `<behind>\t<ahead>`; the right column is ahead, not behind.
+    #[test]
+    fn ahead_behind_parser_maps_left_to_behind() {
+        assert_eq!(
+            parse_ahead_behind("0\t2\n"),
+            Some(AheadBehind {
+                ahead: 2,
+                behind: 0
+            })
+        );
+        assert_eq!(
+            parse_ahead_behind("3\t1\n"),
+            Some(AheadBehind {
+                ahead: 1,
+                behind: 3
+            })
+        );
+        assert_eq!(parse_ahead_behind(""), None);
+        assert_eq!(parse_ahead_behind("not numbers"), None);
     }
 
     /// #653(d): `findmnt` output is a device path with an optional btrfs

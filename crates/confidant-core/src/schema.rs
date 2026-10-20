@@ -20,7 +20,7 @@ pub fn contract_schema() -> Value {
             "schema_version": {"type": "string", "const": "1"},
             "shapes": {
                 "type": "object",
-                "required": ["error", "check", "find", "allowlist", "write", "context", "doctor", "help"],
+                "required": ["error", "check", "find", "allowlist", "write", "context", "doctor", "sync", "help"],
                 "properties": {
                     "error": {"$ref": "#/$defs/error"},
                     "check": {"$ref": "#/$defs/checkReport"},
@@ -29,6 +29,7 @@ pub fn contract_schema() -> Value {
                     "write": {"$ref": "#/$defs/writeResponse"},
                     "context": {"$ref": "#/$defs/contextBundle"},
                     "doctor": {"$ref": "#/$defs/doctorReport"},
+                    "sync": {"$ref": "#/$defs/syncReport"},
                     "help": {"$ref": "#/$defs/helpJson"}
                 }
             }
@@ -291,6 +292,27 @@ pub fn contract_schema() -> Value {
                     }
                 }
             },
+            "syncReport": {
+                "title": "sync --json",
+                "description": "Ahead/behind counts after the fetch (or from the last fetch with --dry-run). Only an encrypted vault with a remote and upstream reaches this shape; otherwise the error envelope carries E_NO_REMOTE, E_PLAINTEXT_REMOTE, or E_NOT_FAST_FORWARD.",
+                "type": "object",
+                "required": ["ok", "schema_version", "vault", "remote", "branch", "upstream", "ahead", "behind", "crypto_mode", "fetched", "dry_run", "action", "applied"],
+                "properties": {
+                    "ok": {"type": "boolean", "const": true},
+                    "schema_version": {"type": "string"},
+                    "vault": {"type": "string"},
+                    "remote": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "upstream": {"type": "string"},
+                    "ahead": {"type": "integer", "minimum": 0},
+                    "behind": {"type": "integer", "minimum": 0},
+                    "crypto_mode": {"type": "string", "const": "encrypted"},
+                    "fetched": {"type": "boolean", "description": "False when --dry-run skipped the fetch."},
+                    "dry_run": {"type": "boolean"},
+                    "action": {"type": "string", "enum": ["none", "pull", "push"]},
+                    "applied": {"type": "boolean", "description": "True only when a confirmed pull or push ran."}
+                }
+            },
             "helpJson": {
                 "title": "help --json",
                 "description": "Generated from the live clap definitions, so it cannot drift from the CLI.",
@@ -345,6 +367,7 @@ mod tests {
             "write",
             "context",
             "doctor",
+            "sync",
             "help",
         ] {
             assert!(
@@ -366,6 +389,7 @@ mod tests {
             "write" => "writeResponse",
             "context" => "contextBundle",
             "doctor" => "doctorReport",
+            "sync" => "syncReport",
             "help" => "helpJson",
             _ => shape,
         }

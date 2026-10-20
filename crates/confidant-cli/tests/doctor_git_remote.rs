@@ -231,3 +231,137 @@ fn git_remote_without_a_repo_is_advisory_not_error() {
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("could not read git remotes"), "{msg}");
 }
+
+// #665: offline ahead/behind visibility in doctor.
+
+/// A plaintext git vault with a committed tree and a local bare remote on
+/// `main` with `origin/main` as its upstream. Fake data only.
+#[cfg(unix)]
+fn vault_with_upstream(dir: &Path) -> (PathBuf, PathBuf) {
+    let vault = plaintext_vault_copy(dir);
+    git(&vault, &["init", "-q", "-b", "main"]);
+    git(&vault, &["config", "user.name", "Confidant Test"]);
+    git(&vault, &["config", "user.email", "test@example.invalid"]);
+    git(&vault, &["add", "-A"]);
+    git(&vault, &["commit", "-q", "-m", "fixture"]);
+    let remote = dir.join("remote.git");
+    git(
+        dir,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
+    let url = format!("file://{}", remote.display());
+    git(&vault, &["remote", "add", "origin", &url]);
+    git(&vault, &["push", "-q", "-u", "origin", "main"]);
+    (vault, remote)
+}
+
+#[cfg(unix)]
+#[test]
+fn local_commits_up_to_date_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (vault, _remote) = vault_with_upstream(dir.path());
+
+    let v = run_doctor(&vault, home.path());
+    let c = check(&v, "local-commits").expect("local-commits check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("up to date"), "{msg}");
+    assert!(msg.contains("origin/main"), "{msg}");
+    assert!(c.get("fix").is_none(), "healthy check must omit fix: {v}");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_commits_ahead_warns_and_points_at_sync_push() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (vault, _remote) = vault_with_upstream(dir.path());
+    git(&vault, &["commit", "-q", "--allow-empty", "-m", "local"]);
+
+    let v = run_doctor(&vault, home.path());
+    let c = check(&v, "local-commits").expect("local-commits check missing");
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("1 local commit(s) not pushed"), "{msg}");
+    // Advisory, never an error: the overall report stays ok.
+    assert_eq!(v["ok"], true, "{v}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("confidant sync --push"), "{fix}");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_commits_behind_warns_and_points_at_sync_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (vault, remote) = vault_with_upstream(dir.path());
+
+    // A second clone adds a commit and pushes it; the vault has not fetched
+    // yet. Doctor must use the last-fetched state and never fetch itself.
+    let other = dir.path().join("other");
+    let url = format!("file://{}", remote.display());
+    git(dir.path(), &["clone", "-q", &url, other.to_str().unwrap()]);
+    git(&other, &["config", "user.name", "Other"]);
+    git(&other, &["config", "user.email", "other@example.invalid"]);
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    git(&vault, &["fetch", "-q", "origin"]);
+
+    let v = run_doctor(&vault, home.path());
+    let c = check(&v, "local-commits").expect("local-commits check missing");
+    assert_eq!(c["status"], "warning", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("1 new commit(s) not local"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("confidant sync --pull"), "{fix}");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_commits_without_upstream_is_ok_with_a_set_upstream_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let vault = plaintext_vault_copy(dir.path());
+    git(&vault, &["init", "-q", "-b", "main"]);
+    git(
+        &vault,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/fake/vault.git",
+        ],
+    );
+
+    let v = run_doctor(&vault, home.path());
+    let c = check(&v, "local-commits").expect("local-commits check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("no upstream branch"), "{msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("git push -u"), "{fix}");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_commits_local_only_is_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let vault = plaintext_vault_copy(dir.path());
+    git(&vault, &["init", "-q", "-b", "main"]);
+
+    let v = run_doctor(&vault, home.path());
+    let c = check(&v, "local-commits").expect("local-commits check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("local-only"), "{msg}");
+    assert!(c.get("fix").is_none(), "{v}");
+}
