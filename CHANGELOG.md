@@ -39,7 +39,7 @@ vault; keep it on trusted devices with encrypted disks.
 ### Fixed
 - `init --create --remote` passes `--` to `git remote add` and refuses a
   URL that starts with `-`. Printed and JSON `remote` URLs strip userinfo
-  so a credential in `https://user:token@host/…` does not leak (#686).
+  so a credential embedded in the URL's userinfo does not leak (#686).
 - `init --dry-run` now runs the same key-source preflight as a real init:
   a keyless headless host (no OS keychain, no `CONFIDANT_DEVICE_KEY` /
   `CONFIDANT_OPERATOR_KEY`) is refused, and dry-run reports whether an
