@@ -25,6 +25,12 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # RUSTSEC-2026-0374: basic-toml is unmaintained (the repository was
+    # archived). It reaches us only through age 0.12.1 ->
+    # i18n-embed/i18n-config, a build-time localization dependency, not a
+    # runtime crypto or data path. age 0.12.1 is the latest release and has
+    # no safe upgrade; re-evaluate when age updates that dependency.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]

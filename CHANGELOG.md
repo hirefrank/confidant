@@ -8,19 +8,22 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-20
+
+**Disclosure:** the milestone 2 encryption has had no independent review,
+and none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138)).
+Use your own judgment before storing other people's sensitive data in a
+vault; keep it on trusted devices with encrypted disks.
+
 ### Added
 - Headless `keys device-add --initiate`: `CONFIDANT_DEVICE_KEY` is this
-  device's identity (same as `init`). The command emits that pubkey and
-  does not write a keychain. Without an env identity and without a
-  reachable keychain it fails closed and names `age-keygen` (#684).
+  device's identity, the same as `init`. The command emits that pubkey and
+  does not write a keychain; without an env identity and a reachable
+  keychain it fails closed and names `age-keygen` (#684). This touches key
+  handling and still needs the outside audit in #138.
 - `confidant init --create --remote <url>` sets `git remote origin` after
   scaffolding and does not push. `init` JSON reports `remote` and a
   clone-then-`keys device-add` next step (#686).
-
-### Fixed
-- `init --create --remote` passes `--` to `git remote add` and refuses a
-  URL that starts with `-`. Printed and JSON `remote` URLs strip userinfo
-  so a credential in `https://user:token@host/…` does not leak (#686).
 
 ### Changed
 - `--initiate` no longer refuses when `CONFIDANT_DEVICE_KEY` is set (#153
@@ -34,6 +37,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   (#685, #686).
 
 ### Fixed
+- `init --create --remote` passes `--` to `git remote add` and refuses a
+  URL that starts with `-`. Printed and JSON `remote` URLs strip userinfo
+  so a credential in `https://user:token@host/…` does not leak (#686).
 - `init --dry-run` now runs the same key-source preflight as a real init:
   a keyless headless host (no OS keychain, no `CONFIDANT_DEVICE_KEY` /
   `CONFIDANT_OPERATOR_KEY`) is refused, and dry-run reports whether an
@@ -43,6 +49,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   and `setup` stores canonical absolute link targets. A regression test
   pins the #681 install sequence: absolute `HOME`, default `CONFIDANT_HOME`,
   `setup --agent auto` then `agents` then `doctor` from the vault cwd.
+
+### Dependencies
+- `sha2` 0.11.1, `unicode-normalization`, and `libc` updates (#691).
 
 ## [0.6.1] - 2026-10-19
 
@@ -614,7 +623,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/hirefrank/confidant/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/hirefrank/confidant/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hirefrank/confidant/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hirefrank/confidant/compare/v0.4.0...v0.5.0
