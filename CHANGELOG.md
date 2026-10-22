@@ -8,6 +8,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Changed
+- The `pack-author` skill spells out message-variant names (including
+  `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
+  ordering, where to read message templates during review, and that
+  `pack update` prints its diff without `--yes` and replaces same-version
+  content. It reflects the coaching-pack rebuild dogfood (#675).
+
 ## [0.6.2] - 2026-10-20
 
 **Disclosure:** the milestone 2 encryption has had no independent review,

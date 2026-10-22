@@ -58,6 +58,21 @@ Edit `manifest.toml` and keep within the declarative vocabulary in
   `activity-gap`).
 
 Do not invent keys or grammar names. Unknown keys are a hard load error.
+
+Two details come from the kind's own section, not this skill:
+
+- **Message variants.** Each rule kind lists the variants its
+  `[messages.<CODE>]` table must declare (for example `last`/`none` plus
+  their `_fix` variants for `cadence-overdue`, and the metric-named
+  variants for `ledger-balance`). Copy the names and placeholders from
+  that kind's table in `spec/pack-manifest.md` §13.2. A missing variant or
+  placeholder is a load error.
+- **Session note variants.** `note-ref` defaults to the touch-shaped
+  `default`/`default_fix` names. When the checked verb is a session verb,
+  set `variants = "session"` and name the invalid-id and wrong-type
+  message variants `session_note`/`session_note_fix`; the missing and
+  wrong-owner variants keep their names.
+
 Update `<version>.md` in the same edit: it is the human contract. If the
 claims change, bump `[pack].version` and rename the contract file to
 `<new-version>.md`.
@@ -74,7 +89,9 @@ confidant pack add --from-dir ~/confidant-packs/<name> --json --no-input
 
 Show the operator:
 
-- the manifest diff (what is claimed, and each rule's parameters);
+- the manifest diff (what is claimed, and each rule's parameters) — the
+  report summarizes the claims, so open `manifest.toml` for the full
+  parameter list and the message templates;
 - the `SKILL.md` text, because **pack text becomes agent instructions**;
 - the finding codes and message text the pack can emit.
 
@@ -97,20 +114,31 @@ or the pack without the operator's confirmation. Irreversible or ambiguous
 cases (a code collision, a reserved name) fail closed; bring the error to
 the operator.
 
+Install the pack **before** adding its `[checks]` keys to `confidant.toml`.
+`check` rejects a key whose pack is not enabled (`E_CONFIG`), and
+`pack add`'s pre-check runs before the pack is listed, so a vault that
+already carries the keys blocks its own install. Install first, then add
+the keys. When reinstalling a pack the vault already used, keep its
+`packs` listing in place while the data is still there.
+
 ## 6. Iterate
 
-Edit the source outside the vault, bump the version when the claims change,
-review the diff, then apply:
+Edit the source outside the vault, review the diff, then apply:
 
 ```sh
+confidant pack update <name> --from-dir ~/confidant-packs/<name>
 confidant pack update <name> --from-dir ~/confidant-packs/<name> --yes
 confidant check --json --no-input
 confidant pack verify
 ```
 
-`pack update` prints the diff before `--yes` applies it. A local pack is
-unsigned but hash-pinned; `pack verify` detects drift. The source directory
-is the editing surface, never the vendored copy.
+Run `pack update` without `--yes` first: it prints the file diff and stops.
+With `--yes` it applies and commits without reprinting the diff. A
+same-version update replaces the vendored content, so local iteration needs
+no version bump; bump `[pack].version` and rename the contract file before
+sharing the pack or changing its claims. A local pack is unsigned but
+hash-pinned; `pack verify` detects drift. The source directory is the
+editing surface, never the vendored copy.
 
 ## Boundaries to state out loud
 
