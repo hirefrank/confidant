@@ -8,6 +8,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-22
+
+**Disclosure:** the milestone 2 encryption has had no independent review,
+and none is scheduled ([#138](https://github.com/hirefrank/confidant/issues/138)).
+Use your own judgment before storing other people's sensitive data in a
+vault; keep it on trusted devices with encrypted disks.
+
 ### Added
 - `confidant pack add --allow-unresolved` (with `--yes`) installs a pack
   whose `[checks]` keys or ledger data the vault already carries without
@@ -62,6 +69,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Docs present packs as one feature: the built-in `personal@0.2` schema plus
   optional packs, with the install source (URL or local directory) treated
   as an implementation detail.
+
+### Dependencies
+- `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10, clearing
+  RUSTSEC-2026-0381 and RUSTSEC-2026-0382 from `cargo deny` and
+  `cargo audit` (#701).
 
 ## [0.6.2] - 2026-10-20
 
@@ -678,7 +690,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hirefrank/confidant/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/hirefrank/confidant/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/hirefrank/confidant/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/hirefrank/confidant/compare/v0.5.0...v0.6.0
