@@ -30,14 +30,14 @@ both from the same release and verify the archive against the published
 `.sha256` (or `gh attestation verify <archive> --repo hirefrank/confidant`).
 Windows users run under WSL2.
 
-## Encrypted vault vs. plaintext (demo)
+## Encrypted vault vs. plaintext
 
 Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2.2 and §14):
 
 | Mode | Use for | Consequences | Agent behavior |
 |---|---|---|---|
 | **Encrypted** (default) | Real relationship data | `confidant init` generates keys and writes a 24-word recovery phrase once (`--phrase-out <path>` is the agent-safe form; see [Recovery phrase](#recovery-phrase-save-it-then-verify-it)). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | For a **new** vault, run `confidant init --create --phrase-out <path>` (optional `--remote <url>`). For an existing directory that is not yet initialized, ensure `mode` is not `"plaintext"` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then run `confidant init`. To put an already-initialized vault on another device, clone it and run `keys device-add` — not `init`. Store the recovery phrase offline. |
-| **Plaintext opt-out** | Demo, learning, fixtures only (`examples/demo-vault`) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Never use for real PII: `git clone` exposes all record content, so never push it to a remote. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, and warn that `git clone` exposes all record content. |
+| **Plaintext** | Vaults where unencrypted record bodies are acceptable (`examples/demo-vault` is one) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Every record body, history included, is readable by anyone with the repo or a clone, and a remote on such a vault is reported as a `git-remote` warning. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, explain the exposure, and let the operator choose. |
 
 ## Create a vault
 
@@ -126,9 +126,11 @@ a `[crypto] mode = "plaintext"` vault is a **warning**) and a
 `local-commits` check with ahead/behind from the last fetch. See
 [`docs/sync.md`](sync.md).
 
-**A plaintext-mode vault must not be pushed anywhere.** Every record body is
-readable by anyone with access to the repository, including its history.
-Plaintext is only for demo, learning, and fixtures.
+**A plaintext-mode vault on a remote is a deliberate exposure.** Every record
+body, history included, is readable by anyone with access to the repository,
+and `confidant doctor` reports it as a `git-remote` warning. If that is not
+the tradeoff you want, remove the remote; anything already pushed stays
+readable in its history.
 
 ## New device, existing vault
 

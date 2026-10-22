@@ -8148,7 +8148,7 @@ fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
                  are readable by anyone with repo access"
             ),
             fix: Some(
-                "Do not push plaintext vaults; encrypt the vault first or remove the remote"
+                "Remove the remote if the exposure is unintended; anything already pushed stays readable"
                     .to_owned(),
             ),
         }
