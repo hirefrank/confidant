@@ -53,6 +53,12 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   git adds `-o BatchMode=yes` to the ssh command already in force
   (`GIT_SSH_COMMAND`, `GIT_SSH`, or `core.sshCommand`) without replacing
   it, and only the network subcommands look up `core.sshCommand` (#665).
+- Plaintext mode is documented as a supported tradeoff instead of a
+  demo-only vault: spec §2, the README, and the setup docs now state its
+  exposure (record bodies and history readable by anyone with the repo) and
+  leave the choice to the operator. `doctor`'s `git-remote` warning keeps
+  reporting a plaintext vault on a remote, but its fix hint now names the
+  exposure instead of forbidding the push.
 
 ## [0.6.2] - 2026-10-20
 

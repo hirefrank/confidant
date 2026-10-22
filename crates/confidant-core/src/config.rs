@@ -85,12 +85,12 @@ pub struct InboxConfig {
 /// Optional `[crypto]` table (spec §2, issue #148).
 ///
 /// `mode` is `"encrypted"` (the default when absent) or `"plaintext"`.
-/// `"plaintext"` is ONLY for vaults that hold no real data (demo vault,
-/// fixtures): it permits plaintext writes while the vault is structurally
-/// plaintext, and can never downgrade an encrypted vault (a `mode =
-/// "plaintext"` declaration combined with an `enc:` envelope or any `keys/`
-/// tree is `E_CONFIG`). Unknown keys are `E_CONFIG` (typo detection, same
-/// as `[checks]`).
+/// A plaintext vault keeps every record body unencrypted, so anyone with the
+/// repository or a clone can read it, history included. The mode permits
+/// plaintext writes while the vault is structurally plaintext, and can never
+/// downgrade an encrypted vault (a `mode = "plaintext"` declaration combined
+/// with an `enc:` envelope or any `keys/` tree is `E_CONFIG`). Unknown keys
+/// are `E_CONFIG` (typo detection, same as `[checks]`).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct CryptoConfig {
     #[serde(default)]

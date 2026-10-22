@@ -74,11 +74,12 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    different vault. Give me the line to add to my shell rc for interactive
    use as separate advice. If I have no vault yet, ask whether to create
    one at a path I choose or stop — do not invent a path.
-4. Ask me whether this vault is for **real relationship data** (encrypted
-   mode, the production default) or **demo / learning / fixtures only**
-   (plaintext opt-out), and explain the consequences before editing
-   `confidant.toml` or running `confidant init`:
-   - **Encrypted (real data):** ensure git has `user.name` and
+4. Ask me whether this vault should be **encrypted** (the production
+   default: record bodies are unreadable in git) or **plaintext** (simpler:
+   every record body is readable by anyone with repo access), explain the
+   tradeoff before editing `confidant.toml` or running `confidant init`, and
+   let me choose:
+   - **Encrypted (default):** ensure git has `user.name` and
      `user.email` (init commits). For a fresh vault, run
      `confidant init --create --no-input --phrase-out <path>` against an
      absent or empty directory (add `--remote <url>` if I already have a
@@ -87,31 +88,31 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      `packs = []` (packs are optional), writes `.gitignore` and
      `confidant.toml`, then creates the keys. For an existing directory that
      is not yet initialized, first ensure
-     `confidant.toml` does **not** set `[crypto] mode = "plaintext"` (never
-     silently copy the demo vault's `mode = "plaintext"` into a vault I
-     described as real) and the working tree is clean (`git status`), then
-     run `confidant init`. Record bodies are encrypted in git; ledger lines
-     stay structural plaintext. The 24-word recovery phrase goes to
-     `<path>` (mode 0600, refuses to overwrite) and the command prints
-     only the path — never echo, copy, or read the phrase into this chat.
-     Have me run the human-only check
+     `confidant.toml` does **not** set `[crypto] mode = "plaintext"` (do not
+     flip a mode I already chose) and the working tree is clean
+     (`git status`), then run `confidant init`. Record bodies are encrypted
+     in git; ledger lines stay structural plaintext. The 24-word recovery
+     phrase goes to `<path>` (mode 0600, refuses to overwrite) and the
+     command prints only the path — never echo, copy, or read the phrase into
+     this chat. Have me run the human-only check
      `confidant keys verify-recovery --phrase-file <path>` before moving
      the file offline, then move it offline and delete the local copy
      (agents must not handle or pipe the phrase).
-   - **Plaintext (demo / learning / fixtures only):** set or keep
-     `mode = "plaintext"` under `[crypto]` in `confidant.toml` (only valid
-     while the vault is structurally plaintext; never for real PII), do
-     **not** run `confidant init`, and warn that `git clone` exposes all
-     record content and that a plaintext vault must not be pushed to any
-     remote.
-5. Optional remote: **before** encrypted `init`, ask whether I already
-   have a git remote URL for backup and putting this vault on another
-   device. If I do, pass `--remote <url>` on `confidant init --create`
-   (it sets `origin` and does not push). If I decide after init, show me
-   `git remote add origin <url>`. In either case, set the upstream once
-   with `git push -u origin main`, then use `confidant sync --push` for
-   later pushes — never push without my explicit confirmation, and never
-   push a plaintext vault. A plaintext vault stays local. On a **new device
+   - **Plaintext:** set or keep `mode = "plaintext"` under `[crypto]` in
+     `confidant.toml` (only valid while the vault is structurally
+     plaintext), do **not** run `confidant init`, and tell me plainly that
+     every record body, history included, is readable by anyone with the
+     repo or a clone, and that a remote on such a vault shows up as a
+     `git-remote` warning in `confidant doctor`. `confidant sync` refuses a
+     structurally plaintext vault (`E_PLAINTEXT_REMOTE`), so a push stays a
+     manual `git push` I explicitly choose.
+5. Optional remote: **before** `init`, ask whether I already have a git
+   remote URL for backup and putting this vault on another device. If I do,
+   pass `--remote <url>` on `confidant init --create` (it sets `origin` and
+   does not push). If I decide after init, show me `git remote add origin
+   <url>`. In either case, set the upstream once with `git push -u origin
+   main`, then use `confidant sync --push` for later pushes on an encrypted
+   vault — never push without my explicit confirmation. On a **new device
    for an existing vault**, do not run `init`: clone the repo and run
    `confidant keys device-add` (`recover` only if every enrolled device is
    lost).
@@ -126,8 +127,8 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    Encryption and privacy section and `docs/privacy.md` in the GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
-vault crypto mode (encrypted vs. plaintext opt-out), the vault branch, the
-`check` result, and any `confidant doctor` warnings.
+vault crypto mode (encrypted or plaintext), the vault branch, the `check`
+result, and any `confidant doctor` warnings.
 ```
 
 **No agent?** `cargo install confidant-cli confidant-tui && confidant setup --agent auto`
@@ -172,9 +173,11 @@ encrypted vault with a remote is fine, and a remote on a
 rhythm, refusal codes, and the opt-in systemd/launchd timer are in
 [`docs/sync.md`](docs/sync.md).
 
-**Never push a plaintext-mode vault to any remote**: every record body is
-readable by anyone with access to the repository. Plaintext is only for
-demo, learning, and fixtures. Details:
+A plaintext-mode vault on a remote exposes every record body, history
+included, to anyone with access to the repository; `confidant doctor`
+reports that as a `git-remote` warning. If that is not the tradeoff you
+want, remove the remote; anything already pushed stays readable in its
+history. Details:
 [`docs/agent-setup.md`](docs/agent-setup.md#connect-a-git-remote-optional).
 
 ## First five minutes: the people in your life
@@ -242,13 +245,13 @@ confidant check
 ```
 
 `log touch` resolves the display name and writes one committed ledger line.
-The demo is plaintext fake data; for real people, `confidant init --create
---no-input --phrase-out <path>` on an empty directory makes an encrypted
-vault on branch `main` and writes a 24-word recovery phrase once to `<path>`
-(mode 0600; move it offline and delete the local copy). Never paste the
-phrase into chat or a log; `confidant keys verify-recovery --phrase-file
-<path>` is the human-only read-only check that the saved copy matches the
-vault.
+The demo is plaintext fake data. For your own vault,
+`confidant init --create --no-input --phrase-out <path>` on an empty
+directory makes an encrypted vault by default on branch `main` and writes a
+24-word recovery phrase once to `<path>` (mode 0600; move it offline and
+delete the local copy). Never paste the phrase into chat or a log;
+`confidant keys verify-recovery --phrase-file <path>` is the human-only
+read-only check that the saved copy matches the vault.
 
 ## How your agents use it
 
@@ -401,22 +404,24 @@ without QMD it falls back to `confidant find` and says so.
 
 ## Encryption and privacy
 
-**Plaintext belongs only on trusted devices** (your laptop, or an agent
-computer acting for you); a git remote must not hold notes in plaintext. On
-a keyed vault the write path encrypts record content: `record add`,
-`note add`, and `log session --note` write §14 envelopes (per-client data
-keys; `name:` lives only inside the ciphertext), and inbox items encrypt at
-drain time. Ledger entries, `import`, and `confidant.toml` stay plaintext by
-design — a `touch` line carries a date, an opaque ID, and a kind, never
-prose.
+Encrypted vaults (the default) keep record bodies out of git. On a keyed
+vault, `record add`, `note add`, and `log session --note` write §14
+envelopes (per-client data keys; `name:` lives only inside the ciphertext),
+and inbox items encrypt at drain time. Ledger entries, `import`, and
+`confidant.toml` stay plaintext by design — a `touch` line carries a date,
+an opaque ID, and a kind, never prose.
 
-A `[crypto] mode = "plaintext"` vault opts out; that is only for vaults with
-no real data and can never downgrade a keyed vault. Existing plaintext
-records are never encrypted in place. `find`, `context`, and
-MCP decrypt cleared records (never `no-ai`, except the operator-only
-`--for-operator` flag). Content an agent reads is sent to a hosted model
-provider; this is explicit and accepted, and Confidant makes no claim about
-what the provider stores.
+`[crypto] mode = "plaintext"` is the alternative: nothing is encrypted, and
+every record body is readable by anyone with the repo, history included. It
+is valid only while the vault is structurally plaintext, it can never
+downgrade a keyed vault, and existing plaintext records are never encrypted
+in place. That suits demo and learning vaults, and it is a legitimate choice
+for real data too if you are comfortable with who can read the repo.
+`find`, `context`, and MCP decrypt cleared records (never `no-ai`, except
+the operator-only `--for-operator` flag).
+
+Content an agent reads is sent to a hosted model provider; this is explicit
+and accepted, and Confidant makes no claim about what the provider stores.
 
 `no-ai` is an exposure control, not access control. Content stays out of
 `find`, `context`, the allowlist, and the search corpus, while `context`

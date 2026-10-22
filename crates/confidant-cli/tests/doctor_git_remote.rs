@@ -190,7 +190,7 @@ fn git_remote_on_plaintext_vault_warns() {
     assert!(msg.contains("plaintext"), "{msg}");
     assert!(msg.contains("readable by anyone with repo access"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
-    assert!(fix.contains("Do not push plaintext vaults"), "{fix}");
+    assert!(fix.contains("if the exposure is unintended"), "{fix}");
 }
 
 #[cfg(unix)]
