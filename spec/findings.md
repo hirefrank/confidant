@@ -101,6 +101,9 @@ Command-level error codes (not check findings):
 | `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
 | `E_LEDGER_UNREADABLE` | 1 | A ledger file could not be read. `find` returns this command error (code and count only, no path) and no hits. `check` still reports finding `E_UNREADABLE`. |
 | `E_REINDEX_REFUSED` | 1 | `confidant reindex` refused to build the search corpus: an encrypted record could not be decrypted (counts in `skipped_encrypted` / `refused_envelopes`), or the corpus path is not git-ignored. Writes nothing. |
+| `E_NO_REMOTE` | 1 | `confidant sync` found no git remote, no upstream branch, or no commits to compare. Local-only is a valid setup; nothing is fetched or pushed. |
+| `E_PLAINTEXT_REMOTE` | 1 | `confidant sync` refused a structurally plaintext vault. A remote would expose every record body, so this fails closed before any network access, including `--dry-run`. |
+| `E_NOT_FAST_FORWARD` | 1 | `confidant sync` refused a diverged branch: local and upstream each have commits the other lacks. `--pull`/`--push` are never forced and never auto-merge; reconcile explicitly. |
 | `E_IDEMPOTENCY_CONFLICT` | 1 | A `--request-id` was replayed with a different canonical request (same id, different content). |
 | `E_INBOX_DIRTY` | 1 | `confidant inbox` refused: the working tree is not clean. |
 | `E_INBOX_UNTRUSTED` | 1 | `confidant inbox` refused: the `inbox` branch tip is not signed by a key in the user config's `[trust] signers`. |

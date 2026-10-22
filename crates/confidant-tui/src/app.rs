@@ -14,7 +14,7 @@ use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus, WriteOutc
 use crate::capture::{self, Capture, CaptureKind, CapturePhase, FieldId};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, ErrorBody,
-    FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult,
+    FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult, SyncReport,
 };
 use crate::edit::{self, EditFlow, EditPhase};
 use crate::ids;
@@ -115,6 +115,54 @@ pub struct ProposalsTab {
     loaded: bool,
 }
 
+/// Last read-only `confidant sync --dry-run` result (#665).
+///
+/// The TUI never fetches, pulls, or pushes on its own. It reads ahead/behind
+/// from the last fetch and only pushes after an explicit `y` in the quit
+/// prompt. `code` carries the CLI's stable error code when sync is not
+/// available (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`) or the branch diverged
+/// (`E_NOT_FAST_FORWARD`), so no message text is ever parsed here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SyncViewState {
+    pub report: Option<SyncReport>,
+    pub code: Option<String>,
+}
+
+impl SyncViewState {
+    pub fn ahead(&self) -> u64 {
+        self.report.as_ref().map(|r| r.ahead).unwrap_or(0)
+    }
+
+    pub fn behind(&self) -> u64 {
+        self.report.as_ref().map(|r| r.behind).unwrap_or(0)
+    }
+
+    pub fn diverged(&self) -> bool {
+        self.code.as_deref() == Some("E_NOT_FAST_FORWARD")
+    }
+
+    /// Status-pill text, or `None` when there is nothing to report.
+    fn label(&self) -> Option<String> {
+        if self.diverged() {
+            return Some("diverged".to_owned());
+        }
+        match (self.ahead(), self.behind()) {
+            (0, 0) => None,
+            (ahead, 0) => Some(format!("{ahead} unpushed")),
+            (0, behind) => Some(format!("{behind} behind")),
+            (ahead, behind) => Some(format!("{ahead} unpushed, {behind} behind")),
+        }
+    }
+
+    fn tone(&self) -> theme::Tone {
+        if self.diverged() {
+            theme::Tone::Error
+        } else {
+            theme::Tone::Warn
+        }
+    }
+}
+
 /// Keyboard input mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputMode {
@@ -202,6 +250,14 @@ pub struct App<R: Runner> {
     /// the capture modal owns the keyboard; nothing is written until the
     /// operator confirms the `--dry-run` preview.
     pub capture: Option<Capture>,
+    /// Unpushed-commit status from the last read-only `sync --dry-run`
+    /// (#665). Refreshed at launch, on `r`, and when quit is requested.
+    pub sync: SyncViewState,
+    /// Quit is paused on "Push N commits? [y/N]" (#665). `Some(ahead)` owns
+    /// the keyboard: `y` pushes, `n` quits without pushing, `Esc` cancels
+    /// the quit. It is only ever set after `sync --dry-run` reported ahead
+    /// commits, and push runs only after the explicit `y`.
+    pub quit_prompt: Option<u64>,
     vault_root_override: Option<std::path::PathBuf>,
 }
 
@@ -231,6 +287,8 @@ impl<R: Runner> App<R> {
             operator_mode: false,
             edit_flow: None,
             capture: None,
+            sync: SyncViewState::default(),
+            quit_prompt: None,
             vault_root_override: None,
         }
     }
@@ -754,6 +812,124 @@ impl<R: Runner> App<R> {
             self.doctor.ok = Some(ok);
             self.doctor.selected = 0;
         }
+    }
+
+    /// Run `confidant sync --dry-run --json --no-input` and update the
+    /// unpushed-commit status (#665). Read-only: the CLI reports the
+    /// last-fetched upstream state and never contacts the remote. A stable
+    /// error code (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`,
+    /// `E_NOT_FAST_FORWARD`) is kept in `sync.code`; it is not an alert,
+    /// because a local-only or plaintext vault is a valid setup.
+    pub fn load_sync(&mut self) {
+        let raw = match self.runner.run(&["sync", "--dry-run"]) {
+            Ok(r) => r,
+            Err(_) => {
+                self.sync = SyncViewState::default();
+                return;
+            }
+        };
+        match parse_raw_output::<SyncReport>(&raw) {
+            ContractOutcome::Ok { vault, data, .. } => {
+                if vault.is_some() {
+                    self.vault = vault;
+                }
+                self.sync = SyncViewState {
+                    report: Some(data),
+                    code: None,
+                };
+            }
+            ContractOutcome::CliError { error, .. } => {
+                self.sync = SyncViewState {
+                    report: None,
+                    code: Some(error.code),
+                };
+            }
+            // A version mismatch already raises the blocking alert through
+            // other calls; invalid JSON just means "unknown".
+            ContractOutcome::VersionMismatch { .. } | ContractOutcome::InvalidJson { .. } => {
+                self.sync = SyncViewState::default();
+            }
+        }
+    }
+
+    /// Push local commits after the operator confirmed the quit prompt.
+    /// The CLI command is explicitly `--yes` because the TUI always passes
+    /// `--no-input`; the human confirmation happened here, once. On failure
+    /// the alert stays on screen and the TUI does not quit.
+    fn push_on_quit(&mut self) {
+        let raw = match self.runner.run(&["sync", "--push", "--yes"]) {
+            Ok(r) => r,
+            Err(e) => {
+                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
+                self.quit_prompt = None;
+                return;
+            }
+        };
+        match parse_raw_output::<SyncReport>(&raw) {
+            ContractOutcome::Ok { data, .. } => {
+                self.sync = SyncViewState {
+                    report: Some(data),
+                    code: None,
+                };
+                self.quit_prompt = None;
+                self.should_quit = true;
+            }
+            ContractOutcome::CliError {
+                status,
+                usage_error,
+                error,
+            } => {
+                let cli_alert = self.cli_error_alert(status, usage_error, &error);
+                self.alert = Some(cli_alert);
+                self.quit_prompt = None;
+            }
+            ContractOutcome::VersionMismatch { reported_version } => {
+                self.quit_prompt = None;
+                self.blocking_alert = Some(AlertState::version_mismatch(&reported_version));
+            }
+            ContractOutcome::InvalidJson { status } => {
+                self.quit_prompt = None;
+                self.alert = Some(AlertState::invalid_json(status));
+            }
+        }
+    }
+
+    /// Ask to quit. If the last read-only sync saw unpushed commits, refresh
+    /// that state once (no network) and pause on a confirmed-push prompt
+    /// instead of quitting. Never pushes without the `y` handled in
+    /// [`Self::handle_quit_prompt_key`].
+    fn request_quit(&mut self) {
+        if self.quit_prompt.is_some() {
+            self.should_quit = true;
+            return;
+        }
+        self.load_sync();
+        let ahead = self.sync.ahead();
+        if ahead > 0 && !self.sync.diverged() {
+            self.quit_prompt = Some(ahead);
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    /// Keys while the quit prompt is open: `y` pushes then quits, `n` quits
+    /// without pushing, `Esc` cancels the quit and stays in the TUI.
+    fn handle_quit_prompt_key(&mut self, key: KeyEvent) -> bool {
+        let Some(_ahead) = self.quit_prompt else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.push_on_quit(),
+            KeyCode::Esc => self.quit_prompt = None,
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.quit_prompt = None;
+                self.should_quit = true;
+            }
+            // Any other key is not a confirmation: keep the prompt open so a
+            // stray keypress cannot quit (or push) by accident.
+            _ => {}
+        }
+        true
     }
 
     /// Run `confidant inbox --dry-run --json --no-input` and update the
@@ -1788,6 +1964,8 @@ impl<R: Runner> App<R> {
     /// the selected person).
     pub fn refresh_current(&mut self) {
         self.alert = None;
+        // Offline status refresh: the header's unpushed pill (#665).
+        self.load_sync();
         match self.active_view {
             ActiveView::People => {
                 self.load_check();
@@ -2361,7 +2539,7 @@ impl<R: Runner> App<R> {
             "scope" => self.open_scope_modal(),
             "help" => self.open_help_modal(),
             "refresh" => self.refresh_current(),
-            "quit" => self.should_quit = true,
+            "quit" => self.request_quit(),
             _ => {}
         }
     }
@@ -2473,12 +2651,12 @@ impl<R: Runner> App<R> {
 
     fn handle_proposal_list_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => {
                 if self.alert.is_some() {
                     self.alert = None;
                 } else {
-                    self.should_quit = true;
+                    self.request_quit();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -2636,7 +2814,7 @@ impl<R: Runner> App<R> {
             FlowPhase::Browsing => match key.code {
                 KeyCode::Esc => self.close_opened_proposal(),
                 KeyCode::Char('a') => self.proposals_start_apply(),
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => self.request_quit(),
                 _ => {}
             },
             FlowPhase::Diff { step, outcome } => match key.code {
@@ -2651,7 +2829,7 @@ impl<R: Runner> App<R> {
                         flow.cancel_step(step);
                     }
                 }
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => self.request_quit(),
                 _ => {}
             },
             // Any key other than `y` cancels back to the diff. Confirm is
@@ -2674,7 +2852,7 @@ impl<R: Runner> App<R> {
                     }
                 }
                 KeyCode::Char('r') => self.proposals_start_apply(),
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => self.request_quit(),
                 _ => {}
             },
             FlowPhase::CleanupPrompt => match key.code {
@@ -2808,6 +2986,12 @@ impl<R: Runner> App<R> {
             return;
         }
 
+        // The quit prompt (#665) owns the keyboard so no other modal can
+        // swallow the confirmation or quit without answering it.
+        if self.handle_quit_prompt_key(key) {
+            return;
+        }
+
         // Scope/Help modals are informational: any key closes them.
         if self.info_modal.is_some() {
             self.info_modal = None;
@@ -2902,7 +3086,7 @@ impl<R: Runner> App<R> {
 
         match key.code {
             KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.request_quit();
             }
             KeyCode::Esc => match self.active_view {
                 ActiveView::People if !self.people.filter.trim().is_empty() => {
@@ -2923,7 +3107,7 @@ impl<R: Runner> App<R> {
                     if self.alert.is_some() {
                         self.alert = None;
                     } else {
-                        self.should_quit = true;
+                        self.request_quit();
                     }
                 }
             },
@@ -3254,11 +3438,37 @@ impl<R: Runner> App<R> {
                 }
             }
         }
+        // #665: quit pauses here when local commits are not pushed. The push
+        // itself runs only after `y`; `n` quits without pushing and `Esc`
+        // stays.
+        if let Some(ahead) = self.quit_prompt {
+            confirm::render(
+                &ConfirmState::new(
+                    "Quit: local commits not pushed".to_owned(),
+                    vec![
+                        format!(
+                            "{ahead} local commit(s) are not on the remote{}.",
+                            match self.sync.report.as_ref() {
+                                Some(report) if !report.upstream.is_empty() => {
+                                    format!(" ({})", report.upstream)
+                                }
+                                _ => String::new(),
+                            }
+                        ),
+                        String::new(),
+                        "Pushing uploads ciphertext commits; the vault is encrypted.".to_owned(),
+                    ],
+                )
+                .with_hint("Type y to push and quit, n to quit without pushing, or Esc to stay."),
+                frame,
+                area,
+            );
+        }
     }
 
     /// Two-line borderless header: workspace pills + action pills, then the
-    /// cached status pills (vault, resolved scope, doctor state). Nothing
-    /// here runs the CLI.
+    /// cached status pills (vault, resolved scope, sync, doctor state).
+    /// Nothing here runs the CLI.
     fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -3293,17 +3503,24 @@ impl<R: Runner> App<R> {
         ]);
         frame.render_widget(Paragraph::new(actions).alignment(Alignment::Right), nav[1]);
 
-        let status = Line::from(vec![
+        let mut status = vec![
             theme::label("vault "),
             theme::pill(&compact_path(&self.vault_label(), 36)),
             Span::raw("  "),
             theme::label("scope "),
             theme::pill(&self.scope_label()),
-            Span::raw("  "),
-            theme::label("doctor "),
-            theme::tone_pill(&self.doctor_label(), self.doctor_tone()),
-        ]);
-        frame.render_widget(Paragraph::new(status), rows[1]);
+        ];
+        // #665: unpushed/behind visibility. Quiet when there is nothing to
+        // report, so a clean vault keeps the familiar header.
+        if let Some(label) = self.sync.label() {
+            status.push(Span::raw("  "));
+            status.push(theme::label("sync "));
+            status.push(theme::tone_pill(&label, self.sync.tone()));
+        }
+        status.push(Span::raw("  "));
+        status.push(theme::label("doctor "));
+        status.push(theme::tone_pill(&self.doctor_label(), self.doctor_tone()));
+        frame.render_widget(Paragraph::new(Line::from(status)), rows[1]);
     }
 
     /// Borderless one-line footer with key badges and action labels. In

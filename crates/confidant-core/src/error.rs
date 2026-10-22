@@ -65,6 +65,17 @@ pub enum ErrorKind {
     /// git-ignored. A corpus that silently omits records is worse than no
     /// corpus, so this fails closed instead of building a partial one.
     ReindexRefused,
+    /// `confidant sync` found no remote or no upstream branch to compare
+    /// with. Local-only is a valid setup, so this is not a vault defect.
+    NoRemote,
+    /// `confidant sync` refused a structurally plaintext vault. Remote
+    /// access must never carry plaintext record bodies, so syncing is
+    /// fail-closed on a plaintext vault even for a read-only report.
+    PlaintextRemote,
+    /// `confidant sync` refused a diverged branch (local and remote have
+    /// commits the other does not). The operator must merge or rebase
+    /// explicitly; auto-merge is never offered.
+    NotFastForward,
     /// An external pack directory failed validation (bad manifest, disallowed
     /// file, symlink, size limit, or hash mismatch). Packs ship data and
     /// agent-facing text, never executables.
@@ -116,6 +127,9 @@ impl ErrorKind {
             Self::InboxRace => "E_INBOX_RACE",
             Self::InboxSkip => "E_INBOX_SKIP",
             Self::ReindexRefused => "E_REINDEX_REFUSED",
+            Self::NoRemote => "E_NO_REMOTE",
+            Self::PlaintextRemote => "E_PLAINTEXT_REMOTE",
+            Self::NotFastForward => "E_NOT_FAST_FORWARD",
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
             Self::RecoveryRetired => "E_RECOVERY_RETIRED",
@@ -288,6 +302,48 @@ impl DomainError {
         .with_fix(format!(
             "Add `.confidant/` to the vault's .gitignore, e.g.: (cd {vault} && echo '.confidant/' >> .gitignore), then re-run `confidant reindex`"
         ))
+    }
+
+    /// `confidant sync` has nothing to compare against: no remote, or a
+    /// remote with no upstream branch for the current branch. Local-only is
+    /// a valid setup, so this is informational, not a vault defect.
+    pub fn no_remote(detail: impl Display) -> Self {
+        Self::new(ErrorKind::NoRemote, detail.to_string()).with_fix(
+            "Add a remote with `git remote add origin <url>` and set an upstream \
+             (`git push -u origin <branch>`), then re-run `confidant sync`",
+        )
+    }
+
+    /// `confidant sync` refused a structurally plaintext vault. A remote
+    /// would expose every record body, so the command fails closed even for
+    /// a read-only report. The fix repeats the two safe options: encrypt
+    /// the vault, or keep it local-only.
+    pub fn plaintext_remote() -> Self {
+        Self::new(
+            ErrorKind::PlaintextRemote,
+            "refusing to sync a plaintext vault: record bodies are readable by \
+             anyone with access to the remote",
+        )
+        .with_fix(
+            "Run `confidant init` to encrypt the vault, or remove the remote and \
+             keep this vault local-only (`git remote remove <name>`)",
+        )
+    }
+
+    /// `confidant sync` refused a diverged branch. Pull is fast-forward-only
+    /// and push is never forced, so the operator must reconcile explicitly.
+    pub fn not_fast_forward(ahead: u64, behind: u64) -> Self {
+        Self::new(
+            ErrorKind::NotFastForward,
+            format!(
+                "branch has diverged from its upstream ({ahead} local commit(s) \
+                 not on the remote, {behind} remote commit(s) not local)"
+            ),
+        )
+        .with_fix(
+            "Merge or rebase the branch explicitly, then re-run `confidant sync`; \
+             auto-merge and forced pushes are never used",
+        )
     }
 
     pub fn inbox_dirty() -> Self {
@@ -540,6 +596,15 @@ mod tests {
         assert!(DomainError::reindex_unreadable(3, 1)
             .message()
             .contains("3 encrypted record(s)"));
+        assert_eq!(DomainError::no_remote("x").code(), "E_NO_REMOTE");
+        assert_eq!(DomainError::plaintext_remote().code(), "E_PLAINTEXT_REMOTE");
+        assert_eq!(
+            DomainError::not_fast_forward(1, 2).code(),
+            "E_NOT_FAST_FORWARD"
+        );
+        assert!(DomainError::not_fast_forward(1, 2)
+            .message()
+            .contains("1 local commit(s)"));
         // A tampered-only refusal gets a fix that does not suggest
         // init/recover (re-enrolling the device cannot fix a corrupt
         // envelope).

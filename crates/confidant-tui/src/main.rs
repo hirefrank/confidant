@@ -72,6 +72,10 @@ fn run_event_loop(
     app.sweep_stale_edit_scratch();
     app.load_check();
     app.load_roster();
+    // Offline ahead/behind for the header and the quit prompt (#665). The
+    // TUI never fetches, pulls, or pushes on launch; `confidant sync` is the
+    // explicit network command.
+    app.load_sync();
     // Populate the Review Queue badge from launch so a queued proposal, inbox
     // item, or conflict is visible from any workspace (#556 phase 3).
     app.prime_review_queue();

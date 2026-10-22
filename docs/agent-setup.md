@@ -117,9 +117,14 @@ git push -u origin main
 
 The URL is provider-neutral — whatever your git host gives you.
 `confidant init --create --remote <url>` is the one Confidant command that
-adds `origin`; it never pushes. `confidant doctor` reports a `git-remote`
-check: local-only is fine, an encrypted vault with a remote is fine, and a
-remote on a `[crypto] mode = "plaintext"` vault is a **warning**.
+adds `origin`; it never pushes. After the first `git push -u origin main`,
+use `confidant sync` to see ahead/behind and `confidant sync --push` /
+`--pull` for explicit, confirmed transfers. Nothing pushes or pulls as a
+side effect of a write. `confidant doctor` reports a `git-remote` check
+(local-only is fine; an encrypted vault with a remote is fine; a remote on
+a `[crypto] mode = "plaintext"` vault is a **warning**) and a
+`local-commits` check with ahead/behind from the last fetch. See
+[`docs/sync.md`](sync.md).
 
 **A plaintext-mode vault must not be pushed anywhere.** Every record body is
 readable by anyone with access to the repository, including its history.
@@ -192,7 +197,8 @@ Agents must not handle or pipe the phrase.
 |---|---|
 | `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [-v]` | Materialize embedded skills, link into agent skill dirs |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
-| `confidant doctor` | Vault health + CLI staleness + keychain/device-enrollment state + skills link health + `git-remote` |
+| `confidant doctor` | Vault health + CLI staleness + keychain/device-enrollment state + skills link health + `git-remote` + `local-commits` |
+| `confidant sync [--dry-run] [--pull\|--push] [--yes]` | Fetch and report ahead/behind; `--pull`/`--push` are confirmed network writes |
 | `confidant keys verify-recovery [--phrase-file <path>]` | Read-only recovery-phrase check; human-only — never ask an agent to read or pipe the phrase |
 | `confidant agents` | List supported agents and detection status |
 | `confidant which [--skills-dir]` | Print installed skills location |

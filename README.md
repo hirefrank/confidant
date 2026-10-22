@@ -108,15 +108,17 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    have a git remote URL for backup and putting this vault on another
    device. If I do, pass `--remote <url>` on `confidant init --create`
    (it sets `origin` and does not push). If I decide after init, show me
-   `git remote add origin <url>`. In either case, show `git push -u origin
-   main` for me to run myself — never push without my explicit
-   confirmation. A plaintext vault stays local. On a **new device for an
-   existing vault**, do not run `init`: clone the repo and run
+   `git remote add origin <url>`. In either case, set the upstream once
+   with `git push -u origin main`, then use `confidant sync --push` for
+   later pushes — never push without my explicit confirmation, and never
+   push a plaintext vault. A plaintext vault stays local. On a **new device
+   for an existing vault**, do not run `init`: clone the repo and run
    `confidant keys device-add` (`recover` only if every enrolled device is
    lost).
 6. Verify: run `confidant check --vault "<path>" --json --no-input` and
    `confidant doctor --vault "<path>"`; report the error/warning counts,
-   the branch `init` created, and any `git-remote` warning.
+   the branch `init` created, and any `git-remote` or `local-commits`
+   warning.
 7. Read the routing snippet (`confidant routing`) for the propose →
    confirm → apply workflow every skill follows, and the Privacy rules
    (trusted devices with encrypted disks only; `.confidant/` is never
@@ -153,10 +155,22 @@ git push -u origin main
 ```
 
 The URL is whatever your git host gives you — Confidant does not require
-GitHub, and no command pushes for you. `confidant doctor` reports a
-`git-remote` check: local-only is fine, an encrypted vault with a remote is
-fine, and a remote on a `[crypto] mode = "plaintext"` vault is a
-**warning**.
+GitHub. Writes commit locally and nothing pushes as a side effect; the only
+command that talks to a remote is `confidant sync`:
+
+```sh
+confidant sync             # fetch, report ahead/behind
+confidant sync --push      # push after confirmation (--yes with --no-input)
+confidant sync --pull      # fast-forward only, after confirmation
+confidant sync --dry-run   # report the last-fetched state; no network
+```
+
+`confidant doctor` reports a `git-remote` check: local-only is fine, an
+encrypted vault with a remote is fine, and a remote on a
+`[crypto] mode = "plaintext"` vault is a **warning**. A second
+`local-commits` check reports ahead/behind from the last fetch. The manual
+rhythm, refusal codes, and the opt-in systemd/launchd timer are in
+[`docs/sync.md`](docs/sync.md).
 
 **Never push a plaintext-mode vault to any remote**: every record body is
 readable by anyone with access to the repository. Plaintext is only for
@@ -265,6 +279,7 @@ fuzzy and `no-ai: true` people are ID-only.
 | Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred` / `device-add` / `verify-recovery` |
 | Inbox | `inbox`, `inbox rotate` |
 | Search | `reindex` + `qmd-search` skill |
+| Sync | `sync` (read-only report; `--pull` / `--push` explicit) |
 | Health | `doctor` |
 | Agents | `mcp`, `setup`, `update`, `agents`, `which`, `routing`, `tui` |
 
@@ -413,7 +428,7 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 - [`spec/0.1.md`](spec/0.1.md) — vault format; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
 - [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, shred; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
-- [`docs/crypto-design.md`](docs/crypto-design.md) — keys, envelopes, recovery; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
+- [`docs/crypto-design.md`](docs/crypto-design.md) — keys, envelopes, recovery; [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
 - [`packs/`](packs/) — pack contracts; [`docs/search-benchmark.md`](docs/search-benchmark.md) — search numbers.
 
 ## Where we're going

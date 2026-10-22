@@ -55,6 +55,7 @@ Read before changing behaviour:
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |
 | `docs/` | Architecture, crypto design, benchmarks, research |
+| `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |
 | `.github/workflows/ci.yml` | The CI gate. Source of truth for the commands below |
 
 ## Commands

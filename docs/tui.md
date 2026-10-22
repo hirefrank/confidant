@@ -100,6 +100,38 @@ skill falls back to plain `confidant find` and the tab shows a
 `fallback: <reason>` banner. If `python3` or the skill itself is missing,
 the tab shows an alert instead of falling back silently.
 
+## Unpushed commits and quitting
+
+The header shows a `sync` pill only when there is something to report:
+`2 unpushed`, `1 behind`, or `diverged`. It comes from
+`confidant sync --dry-run --json --no-input` at launch and on `r`/quit,
+which reports the last-fetched upstream state and **never contacts the
+remote**. A local-only vault, a vault with no upstream, or a plaintext
+vault has no pill: `sync` is refused there (`E_NO_REMOTE` or
+`E_PLAINTEXT_REMOTE`) and the TUI stays quiet rather than showing an
+alert.
+
+`q` (or the palette's Quit) checks that state once more. If commits are
+not pushed, it pauses on a confirm modal:
+
+- `y` runs `confidant sync --push --yes --json --no-input`, then quits.
+  The TUI always passes `--no-input`, so this keypress is the required
+  human confirmation.
+- `n` quits without pushing.
+- `Esc` cancels the quit and stays in the TUI.
+- Any other key is ignored; a stray key cannot quit or push.
+
+The TUI never runs `--pull`, never fetches on launch, and never merges. A
+`behind` or `diverged` pill is informational: run `confidant sync --pull`
+(or reconcile manually) outside the TUI.
+
+**Not implemented:** an opt-in asynchronous fetch on launch (with a
+timeout) that would show "remote has N new commits" with an explicit pull
+action. The read-only display above and the background timer in
+[`docs/sync.md`](sync.md#opt-in-continuous-sync) cover the same need
+without putting a network call on the launch path. The full rhythm, the
+stable refusal codes, and the timer units are in [`docs/sync.md`](sync.md).
+
 ## See also
 
 - [`docs/privacy.md`](privacy.md) — proposal scratch files, plaintext on

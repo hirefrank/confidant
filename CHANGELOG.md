@@ -8,12 +8,39 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `confidant sync`: the explicit git boundary (#665). Read-only by
+  default (fetch, report ahead/behind); `--pull` fast-forwards and
+  `--push` pushes only after confirmation (`--yes` with `--no-input` or
+  `--json`). `--dry-run` reports the last-fetched state without touching
+  the network. JSON carries `ahead`, `behind`, `remote`, `branch`,
+  `upstream`, `crypto_mode`, `fetched`, `action`, and `applied`.
+- `doctor`'s `local-commits` check reports ahead/behind from the last
+  fetch, offline and advisory (no remote/upstream stays `ok`; a real
+  difference warns with the `sync` command to run) (#665).
+- The TUI shows `sync N unpushed`/`N behind`/`diverged` in the header and
+  pauses on quit to offer a confirmed `confidant sync --push` (#665).
+- `contrib/` systemd user units and a launchd agent for an opt-in sync
+  timer, plus [`docs/sync.md`](docs/sync.md) covering the manual rhythm,
+  refusal codes, and timer setup (#665).
+
 ### Changed
 - The `pack-author` skill spells out message-variant names (including
   `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
   ordering, where to read message templates during review, and that
   `pack update` prints its diff without `--yes` and replaces same-version
   content. It reflects the coaching-pack rebuild dogfood (#675).
+- Writes still commit locally only; `confidant sync` is now the one
+  command that fetches or pushes. It refuses a structurally plaintext
+  vault with `E_PLAINTEXT_REMOTE`, a missing remote/upstream with
+  `E_NO_REMOTE`, and a diverged branch with `E_NOT_FAST_FORWARD`; it
+  never force-pushes and never auto-merges (#665).
+- `confidant sync --push` sends `HEAD:<upstream-branch>` to the same
+  remote it fetched (so a differently named upstream and
+  `push.default=simple` still match the reported counts). `--no-input`
+  git adds `-o BatchMode=yes` to the ssh command already in force
+  (`GIT_SSH_COMMAND`, `GIT_SSH`, or `core.sshCommand`) without replacing
+  it, and only the network subcommands look up `core.sshCommand` (#665).
 
 ## [0.6.2] - 2026-10-20
 

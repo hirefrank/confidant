@@ -142,13 +142,100 @@ pub fn idempotency_digests(request_id: &str, canonical_request: &str) -> (String
     (id_hash, req_hash)
 }
 
-/// Run git in `root`. With `no_input`, `GIT_TERMINAL_PROMPT=0` so git can
-/// never block on a credential prompt (ADR-7).
+/// SSH invocation used when `no_input` is set.
+///
+/// `GIT_TERMINAL_PROMPT=0` stops HTTPS credential helpers, but ssh opens
+/// `/dev/tty` for a key passphrase or an unknown host key. Append
+/// `-o BatchMode=yes` to the ssh command already in force (`GIT_SSH_COMMAND`,
+/// then `GIT_SSH`, then `core.sshCommand`, else `ssh`) so a TUI or agent
+/// cannot hang on a prompt.
+///
+/// `GIT_SSH` is checked because setting `GIT_SSH_COMMAND` overrides it: without
+/// this fallback, a user who configures only `GIT_SSH` would silently get the
+/// default `ssh` under `--no-input`.
+pub(crate) fn no_input_ssh_command(
+    git_ssh_command: Option<&str>,
+    git_ssh: Option<&str>,
+    core_ssh_command: Option<&str>,
+) -> String {
+    let base = git_ssh_command
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| git_ssh.map(str::trim).filter(|s| !s.is_empty()))
+        .or_else(|| core_ssh_command.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("ssh");
+    if ssh_command_has_batch_mode(base) {
+        base.to_owned()
+    } else {
+        format!("{base} -o BatchMode=yes")
+    }
+}
+
+fn ssh_command_has_batch_mode(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    lower.contains("-o batchmode=yes") || lower.contains("-obatchmode=yes")
+}
+
+/// Whether this git subcommand can reach a remote over ssh. `ls-remote` and
+/// `fetch`/`pull`/`push` are the only ones the CLI runs; everything else
+/// (add, commit, rev-parse, status, config) is local and needs no ssh client.
+fn can_use_ssh(args: &[&str]) -> bool {
+    matches!(
+        args.first().copied(),
+        Some("fetch" | "pull" | "push" | "ls-remote")
+    )
+}
+
+/// `core.sshCommand` for this repo (global/local), if set. Looked up with a
+/// direct git spawn so [`git`] does not recurse.
+fn core_ssh_command(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.sshCommand"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Run git in `root`. With `no_input`, `GIT_TERMINAL_PROMPT=0` and
+/// `GIT_SSH_COMMAND` includes `-o BatchMode=yes`, so git can never block
+/// on a credential or ssh prompt (ADR-7).
 pub fn git(root: &Path, args: &[&str], no_input: bool) -> anyhow::Result<String> {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(root).args(args);
     if no_input {
         cmd.env("GIT_TERMINAL_PROMPT", "0");
+        let env_ssh = std::env::var("GIT_SSH_COMMAND")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let env_ssh_fallback = std::env::var("GIT_SSH")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        // Only the network subcommands can invoke ssh, and `git config` is an
+        // extra spawn: skip it for the local-only calls (add, commit, rev-parse,
+        // status) that every write runs.
+        let core_ssh = if (env_ssh.is_some() || env_ssh_fallback.is_some()) || !can_use_ssh(args) {
+            None
+        } else {
+            core_ssh_command(root)
+        };
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            no_input_ssh_command(
+                env_ssh.as_deref(),
+                env_ssh_fallback.as_deref(),
+                core_ssh.as_deref(),
+            ),
+        );
     }
     let out = cmd
         .output()
@@ -685,6 +772,64 @@ fn apply_write_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_input_ssh_command_appends_batch_mode_and_keeps_existing() {
+        assert_eq!(
+            no_input_ssh_command(None, None, None),
+            "ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -p 2222"), None, None),
+            "ssh -p 2222 -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some(""), None, Some("/usr/bin/ssh")),
+            "/usr/bin/ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("   "), None, Some("ssh -i key")),
+            "ssh -i key -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -o BatchMode=yes"), None, Some("ignored")),
+            "ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -oBatchMode=yes"), None, None),
+            "ssh -oBatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -i key"), None, Some("ssh -p 22")),
+            "ssh -i key -o BatchMode=yes"
+        );
+        // `GIT_SSH` is the fallback when no `GIT_SSH_COMMAND`/`core.sshCommand`
+        // is set, and `GIT_SSH_COMMAND` still wins over it.
+        assert_eq!(
+            no_input_ssh_command(None, Some("ssh -i git_ssh"), None),
+            "ssh -i git_ssh -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(Some("ssh -i command"), Some("ssh -i git_ssh"), None),
+            "ssh -i command -o BatchMode=yes"
+        );
+        assert_eq!(
+            no_input_ssh_command(None, Some("  "), Some("ssh -i core")),
+            "ssh -i core -o BatchMode=yes"
+        );
+    }
+
+    #[test]
+    fn only_network_subcommands_use_ssh() {
+        assert!(can_use_ssh(&["fetch", "--quiet"]));
+        assert!(can_use_ssh(&["pull", "--ff-only"]));
+        assert!(can_use_ssh(&["push", "origin", "HEAD:refs/heads/main"]));
+        assert!(can_use_ssh(&["ls-remote", "--get-url", "origin"]));
+        assert!(!can_use_ssh(&["commit", "-m", "x"]));
+        assert!(!can_use_ssh(&["rev-parse", "HEAD"]));
+        assert!(!can_use_ssh(&["config", "--get", "core.sshCommand"]));
+        assert!(!can_use_ssh(&[]));
+    }
 
     #[test]
     fn digests_are_deterministic_and_domain_separated() {

@@ -1,0 +1,18 @@
+[Unit]
+Description=Confidant vault sync (fetch, then push local commits)
+Documentation=https://github.com/hirefrank/confidant/blob/main/docs/sync.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Edit both lines for this machine:
+#   - the vault directory (the timer has no shell and no working directory)
+#   - the confidant binary (cargo install puts it in ~/.cargo/bin)
+Environment=CONFIDANT_VAULT=%h/confidant
+ExecStart=%h/.cargo/bin/confidant sync --push --yes --no-input
+
+# A push is a network write. It is never interactive here: --yes is required
+# with --no-input. The command refuses a plaintext vault (E_PLAINTEXT_REMOTE)
+# and a diverged branch (E_NOT_FAST_FORWARD); it never pulls, merges, or
+# force-pushes.
