@@ -364,10 +364,14 @@ The first command prints the diff and stops. The generated copy under
 Migrating a pack with existing data: `pack add --yes` refuses when the vault
 already sets the pack's `[checks]` keys or vendors its copy but does not list
 it. Add `"<name>@<version>"` to `packs` in `confidant.toml` first (or remove
-the dependent `[checks]` keys), then re-run. `pack remove --yes` refuses
-while ledger lines, metrics, or `[checks]` keys still use the pack, so
-remove or migrate those entries first, or keep the pack installed; the
-explicit orphan flag is tracked in #696. Both errors name the workaround.
+the dependent `[checks]` keys), then re-run. If the vault already has the
+pack's data/checks, `pack add --from-dir <dir> --allow-unresolved --yes`
+installs over it: only the pre-check is skipped, the post-check and `check`
+still gate, and unrelated errors roll back. The flag needs `--yes`; without
+it, `pack add` stays the read-only review. `pack remove --yes` refuses while
+ledger lines, metrics, or `[checks]` keys still use the pack, so remove or
+migrate those entries first, or keep the pack installed; a remove-side flag
+is not available yet (#699). The errors name the workaround.
 
 A local pack is unsigned but hash-pinned: `pack verify` detects drift. Review
 its `SKILL.md` as code, because it becomes agent instructions. It cannot

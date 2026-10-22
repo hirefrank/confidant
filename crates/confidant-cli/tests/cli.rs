@@ -2709,6 +2709,58 @@ fn pack_remove_hint_ignores_an_unrelated_config_finding() {
     assert!(vault.path().join("packs/example-pack@0.1").is_dir());
 }
 
+/// #696 review: a vendored copy pinned at the same hash but missing from
+/// `packs` is a real repair, not an idempotent no-op. With the flag, the same
+/// install must add the listing so `check` passes afterwards.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_repairs_a_vendored_unlisted_pack() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "vendor pack without listing",
+        ],
+    );
+    let before: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("committed"), "{stdout}");
+    assert!(!stdout.contains("already installed"), "{stdout}");
+
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before + 1
+    );
+    assert_eq!(check_json(vault.path())["ok"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_update_shows_diff_then_applies_a_version_change() {
@@ -4144,4 +4196,321 @@ fn operator_mode_banner_labels_find_context_and_roster() {
             "{args:?} leaked the operator banner: {plain}"
         );
     }
+}
+
+/// Write the example pack's `[checks]` key without listing the pack (#694).
+#[cfg(unix)]
+fn write_unlisted_pack_checks(vault: &std::path::Path) {
+    std::fs::write(
+        vault.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nexample-pack.notes = \"warning\"\n",
+    )
+    .unwrap();
+}
+
+/// Write a fake person, note, and the example pack's `grant`/`use`/`balance`
+/// ledger lines, so a vault can carry real data before the pack is listed
+/// (#694, #696). Fake data only.
+#[cfg(unix)]
+fn write_example_pack_ledger_data(vault: &std::path::Path) {
+    let person = "p-01M3TC5H00MPJG000000000000";
+    let note = "n-01M3TC5H00MPJG002NAM000005";
+    std::fs::create_dir_all(vault.join("people").join(person).join("notes")).unwrap();
+    std::fs::write(
+        vault.join("people").join(person).join("profile.md"),
+        format!("---\nid: {person}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        vault
+            .join("people")
+            .join(person)
+            .join("notes")
+            .join(format!("{note}.md")),
+        format!(
+            "---\nid: {note}\ntype: note\nperson: {person}\ndate: 2026-10-01\n---\n\nFake note.\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(vault.join("ledger/2026")).unwrap();
+    std::fs::write(
+        vault.join("ledger/2026/10.cfd"),
+        format!(
+            "2026-10-01 grant {person} package pkg-01M3TC5H00MPJG004SK4000009 6 sessions\n\
+             2026-10-01 use {person} 60m full note:{note}\n\
+             2026-10-01 balance {person} units_remaining 5\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Run `check --json` and return the parsed report.
+#[cfg(unix)]
+fn check_json(vault: &std::path::Path) -> serde_json::Value {
+    let out = Command::new(bin())
+        .args(["check", "--json", "--no-input", "--vault"])
+        .arg(vault)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// #696: the explicit flag installs a pack whose `[checks]` keys the vault
+/// already carries; without it the #694 refusal stands.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_installs_over_existing_checks() {
+    let vault = git_vault();
+    write_unlisted_pack_checks(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use example pack checks",
+        ],
+    );
+
+    // #694 behavior is unchanged without the flag.
+    let before: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+    let out = pack_add(&example_pack_fixture(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not listed"));
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("committed"), "{stdout}");
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before + 1
+    );
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    assert!(vault.path().join("packs/example-pack@0.1").is_dir());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+
+    // The install resolved the key the pre-check used to reject.
+    let v = check_json(vault.path());
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #696: the same flag installs over existing ledger verbs, metrics, and
+/// edge kinds, and the pack resolves them in the committed state.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_installs_over_existing_ledger_data() {
+    let vault = git_vault();
+    write_example_pack_ledger_data(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use the pack verbs without listing it",
+        ],
+    );
+
+    let v = check_json(vault.path());
+    assert_eq!(v["ok"], false, "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "E_UNKNOWN_VERB"),
+        "{v}"
+    );
+    let before: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{out:?}\n{stderr}");
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before + 1
+    );
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    let v = check_json(vault.path());
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+/// #696: the flag skips only the pre-check. A finding the pack does not
+/// resolve still fails the post-check and rolls the whole write back.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_still_rolls_back_unrelated_errors() {
+    let vault = git_vault();
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nother-pack.notes = \"warning\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unrelated unresolved check key",
+        ],
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The finding names another pack, so the hint stays silent rather than
+    // claiming the flag will resolve it.
+    assert!(!stderr.contains("hint:"), "{stderr}");
+    assert!(!stderr.contains("add \"example-pack@0.1\""), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    assert!(!vault.path().join("packs").exists());
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = []"), "{cfg}");
+}
+
+/// #696: additive JSON field, present only when the flag was passed.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_json_includes_the_flag() {
+    let vault = git_vault();
+    write_unlisted_pack_checks(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use example pack checks",
+        ],
+    );
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["command"], "pack-add", "{v}");
+    assert_eq!(v["allow_unresolved"], true, "{v}");
+    assert_eq!(v["pack"]["name"], "example-pack", "{v}");
+
+    // A successful add without the flag keeps the existing envelope.
+    let other = git_vault();
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(other.path())
+        .args(["--yes", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v.get("allow_unresolved").is_none(), "{v}");
+}
+
+/// #696: the flag only takes effect with `--yes`; without it the command
+/// stays the read-only review and does not error.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_without_yes_stays_read_only() {
+    let vault = git_vault();
+    write_unlisted_pack_checks(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use example pack checks",
+        ],
+    );
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("nothing was written"), "{stdout}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+    assert!(!vault.path().join("packs").exists());
 }

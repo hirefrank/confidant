@@ -9,6 +9,13 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Added
+- `confidant pack add --allow-unresolved` (with `--yes`) installs a pack
+  whose `[checks]` keys or ledger data the vault already carries without
+  listing it; the post-check still gates, so unrelated errors roll back.
+  JSON carries `allow_unresolved: true` when the flag is passed (#696).
+  With the same flag, a copy already vendored and pinned at the same hash
+  but missing from `packs` now gets the listing added instead of being
+  reported as already installed (#696).
 - `confidant sync`: the explicit git boundary (#665). Read-only by
   default (fetch, report ahead/behind); `--pull` fast-forwards and
   `--push` pushes only after confirmation (`--yes` with `--no-input` or
