@@ -10,11 +10,6 @@ update. Each person is a Markdown file with notes, dates, and a log of every
 touch; `confidant check` turns that into who is overdue and which dates are
 coming up.
 
-The personal use case is the default: every vault has the built-in
-`personal@0.2` pack (birthdays, recurring dates, relationship, keep-in-touch
-cadence, and the `touch` verb). Other domains come from schema packs you
-author locally or install into the same vault.
-
 Records are plain-text files in a git repo (the **vault**); the Rust CLI
 `confidant` reads, checks, and writes them. There is no server, and a ledger
 of dated facts (`ledger/2026/10.cfd`) keeps the record append-only and
@@ -30,10 +25,10 @@ same vault.
 
 ## Install
 
-**The preferred path: let your agent install it.** Paste this into Claude
-Code, Cursor, Codex, or any agent that can run commands; it installs the
-CLI and TUI, links the embedded skills, and asks where your vault is. This
-README is the canonical home for the prompt;
+**The preferred path: let your agent install it.** Paste this into Muse,
+Grok Bot, Claude Code, Cursor, Codex, or any agent that can run commands; it
+installs the CLI and TUI, links the embedded skills, and asks where your
+vault is. This README is the canonical home for the prompt;
 [`docs/agent-setup.md`](docs/agent-setup.md) covers headless hosts,
 environment variables, and updates.
 
@@ -306,37 +301,37 @@ review queue. Tabs and phase history: [`docs/tui.md`](docs/tui.md).
 
 ## Packs
 
-A **schema pack** declares extra verbs, types, fields, rules, and metrics;
-its manifest ([`spec/pack-manifest.md`](spec/pack-manifest.md)) is the
-machine-readable contract.
+A **schema pack** declares verbs, record types, fields, edge kinds, balance
+metrics, and check rules; its manifest
+([`spec/pack-manifest.md`](spec/pack-manifest.md)) is the machine-readable
+contract.
 
-**`personal@0.2` — built in, always on.** Every vault has it whether or not
-`packs` lists it; a `personal@…` entry is a no-op. It adds `birthday`
-(`YYYY-MM-DD` or year-less `--MM-DD`), recurring `dates`, `relationship`,
-`cadence` (`21d`, or `never`) with `snooze_until`, identity and contact
-fields, relationship edges (`friend`, `family`, `sibling`, `partner`,
-`parent`, `mentor`, plus the core kinds), and the `touch` verb
-(`call|text|email|meet|meal|event|gift|other`). Two warning-level rules
-never block a write: `W_CADENCE_OVERDUE` and `W_DATE_UPCOMING`. Contract:
-[`packs/personal/0.2.md`](packs/personal/0.2.md).
+**`personal@0.2` is built in and always on.** It supplies the relationships
+schema this README describes: birthdays (full dates or year-less `--MM-DD`),
+recurring dates, `relationship`, `cadence` with `snooze_until`, contact
+fields, relationship edges, the `touch` verb, and two warning-level rules
+(`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never block a write. Contract:
+[`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
+to be useful.
 
-**External packs — optional.** Packs are optional: `init --create` seeds
-`packs = []`, and `check` is clean without any pack because `personal@0.2`
-is built in. Install an external pack after init with
-`confidant pack add <https-url> --yes`, or author one locally (below). A
-pack can add verbs, record types, fields, balance metrics, edge kinds, and
-check rules.
+**Extra domains are optional packs in the same vault.** `init --create`
+seeds `packs = []`, and `check` is clean without one.
 
-A vault that lists an external pack must vendor it, or `check` fails with
-`E_PACK_UNKNOWN` and writes are blocked. `pack verify` checks the vendored
-copy against the pinned hash in `confidant.lock`.
+**Installing a pack.** Where a pack comes from is an implementation detail:
+`pack add` takes a `https://` URL or a local directory (`--from-dir`), and
+both behave the same. Without `--yes` it fetches to a temp directory,
+validates, prints every claim and the full skill text, and writes nothing.
+With `--yes` it vendors the pack under `packs/`, pins its hash in
+`confidant.lock`, lists it in `packs`, runs `check`, and commits. Review that
+report as code first: a pack's `SKILL.md` becomes agent instructions.
 
-### Local packs
+A vault that lists a pack must vendor it. A missing copy or a drifted hash
+makes `check` fail with `E_PACK_UNKNOWN` and blocks writes; `pack verify`
+re-checks the vendored copy against the pin.
 
-An agent can write a pack for a local need without a git host or a core
-change. Keep the source outside the vault (for example
-`~/confidant-packs/weekly-checkin/`). The embedded `pack-author` skill walks
-an agent through the same steps; review its output as code:
+**Writing a pack.** An agent can build one for a local need with no git host
+and no core change — `pack init` scaffolds and validates it, and the
+embedded `pack-author` skill walks through the same steps:
 
 ```sh
 confidant pack init ~/confidant-packs/weekly-checkin
@@ -345,24 +340,19 @@ confidant pack add --from-dir ~/confidant-packs/weekly-checkin --yes      # inst
 confidant pack verify
 ```
 
-`pack init` writes `manifest.toml`, `SKILL.md`, `<version>.md`, and
-`README.md`, and validates the result. Fill in `[[fields]]`, `[[verbs]]`,
-finding codes, `[checks]` keys, and `[[rules]]` in the manifest. A rule
-names a core-implemented kind; the pack carries no code.
-
-`pack add --from-dir` without `--yes` is the review step: it validates the
-directory, prints every claim and the full skill text, and writes nothing.
-Only `--yes` vendors, pins, adds the pack to `packs`, runs `check`, and
-commits. After editing the source, bump `[pack].version`, rename the
-contract file, and review the change:
+Keep the source outside the vault: the copy under `<vault>/packs/` is
+generated, never the editing surface. `pack init` scaffolds the manifest,
+skill, and versioned contract; fill in fields, verbs, finding codes,
+`[checks]` keys, and rules in the manifest. A rule names a core-implemented
+kind — the pack carries no code. After editing, bump `[pack].version`,
+rename the contract file, and review the change before applying it:
 
 ```sh
 confidant pack update <name> --from-dir ~/confidant-packs/weekly-checkin
 confidant pack update <name> --from-dir ~/confidant-packs/weekly-checkin --yes
 ```
 
-The first command prints the diff and stops. The generated copy under
-`<vault>/packs/` is not the editing surface.
+The first command prints the diff and stops.
 
 Migrating a pack with existing data: `pack add --yes` refuses when the vault
 already sets the pack's `[checks]` keys or vendors its copy but does not list
@@ -376,15 +366,13 @@ ledger lines, metrics, or `[checks]` keys still use the pack, so remove or
 migrate those entries first, or keep the pack installed; a remove-side flag
 is not available yet (#699). The errors name the workaround.
 
-A local pack is unsigned but hash-pinned: `pack verify` detects drift. Review
-its `SKILL.md` as code, because it becomes agent instructions. It cannot
-widen the §12 allowlist or read `no-ai` content; the CLI enforces that, not
-the pack text.
+A local pack is hash-pinned but unsigned: `pack verify` detects drift, and
+nobody vets it for you. Review its `SKILL.md` as code, because it becomes
+agent instructions. It cannot widen the §12 allowlist or read `no-ai`
+content; the CLI enforces that, not the pack text.
 
-Packs share a vault; `--packs` scopes a read to the packs you name. They
-are vendored under `packs/` and pinned in `confidant.lock`, and `pack
-verify` checks them against the pin. Scoping is a read-time policy filter,
-not per-pack cryptography
+**Scoping.** Packs share a vault, and `--packs` scopes a read to the packs
+you name. That is a read-time policy filter, not per-pack cryptography
 ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178)).
 
 ## Search

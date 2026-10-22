@@ -59,6 +59,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
   leave the choice to the operator. `doctor`'s `git-remote` warning keeps
   reporting a plaintext vault on a remote, but its fix hint now names the
   exposure instead of forbidding the push.
+- Docs present packs as one feature: the built-in `personal@0.2` schema plus
+  optional packs, with the install source (URL or local directory) treated
+  as an implementation detail.
 
 ## [0.6.2] - 2026-10-20
 
