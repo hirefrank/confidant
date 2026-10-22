@@ -38,8 +38,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - `confidant sync --push` sends `HEAD:<upstream-branch>` to the same
   remote it fetched (so a differently named upstream and
   `push.default=simple` still match the reported counts). `--no-input`
-  git sets `GIT_SSH_COMMAND` to include `-o BatchMode=yes` without
-  dropping an existing ssh command (#665).
+  git adds `-o BatchMode=yes` to the ssh command already in force
+  (`GIT_SSH_COMMAND`, `GIT_SSH`, or `core.sshCommand`) without replacing
+  it, and only the network subcommands look up `core.sshCommand` (#665).
 
 ## [0.6.2] - 2026-10-20
 

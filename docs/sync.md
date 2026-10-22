@@ -58,6 +58,15 @@ network writes and are explicit:
   the command exits 2 with `usage_error` and touches nothing. The TUI
   passes `--yes` only after the operator confirms the quit prompt.
 
+Under `--no-input`, git also runs ssh with `-o BatchMode=yes`, so a key
+passphrase or an unknown host key cannot hang an agent or the TUI (which
+would otherwise draw the prompt over its own screen). The flag is
+appended to whichever client is already configured — `GIT_SSH_COMMAND`,
+`GIT_SSH`, or `core.sshCommand`, and plain `ssh` when none is — so an
+existing `-p`/`-i` setup keeps working. This assumes an
+OpenSSH-compatible client: if `core.sshCommand` is `plink`, set
+`GIT_SSH_COMMAND` to an OpenSSH client for non-interactive runs.
+
 `--dry-run` reports the state from the last fetch and does not contact the
 remote, so it is safe offline and on a metered connection. `--pull` uses
 `git pull --ff-only`; `--push` pushes to the configured upstream without a
