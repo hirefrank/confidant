@@ -5,7 +5,7 @@ Two operator jobs that are easy to get wrong:
 - **Starting fresh:** replacing or wiping a vault without leaving the old
   vault's trust anchor, keys, or config entries behind.
 - **Adopting in stages:** using one vault for personal relationships first,
-  then adding external packs later.
+  then adding packs later.
 
 Confidant's data lives in a vault you can copy or delete. The *machine* also
 remembers things outside the vault, and those are what usually break a reset.
@@ -31,7 +31,7 @@ Everything a vault needs to be read and written is inside the vault directory:
 | `ledger/YYYY/MM.cfd` | dated ledger lines (structural, plaintext) |
 | `people/`, `orgs/`, `deals/`, `interactions/`, `notes/` | records; encrypted bodies on an encrypted vault |
 | `keys/` | wrapped per-client data keys, vault lookup key, operator certificate |
-| `confidant.lock`, `packs/<name>@<version>/` | vendored external packs and their pins |
+| `confidant.lock`, `packs/<name>@<version>/` | vendored packs and their pins |
 | `.confidant/` | local index/cache, gitignored, rebuildable |
 
 Deleting the vault deletes `keys/`. **The old recovery phrase on its own
@@ -303,7 +303,7 @@ read or pipe the phrase.
 
 A new vault starts with `packs = []`. That is fine: `personal@0.2` is
 implicit and already enabled (§3.1), and `check` is clean without packs.
-Install an external pack later with `confidant pack add <https-url> --yes`.
+Install a pack later with `confidant pack add <https-url> --yes`.
 
 ### 2.5 The `init --force` case
 
@@ -374,8 +374,8 @@ Quote display names with spaces. A `no-ai: true` person is addressed by
 
 ### 3.2 Add a pack later
 
-When you are ready, author or install an external pack into the same vault.
-A local pack needs no git host:
+When you are ready, author or install another pack into the same vault. A
+pack can come from a local directory or an HTTPS URL:
 
 ```sh
 confidant pack init ~/confidant-packs/weekly-checkin
@@ -385,8 +385,8 @@ confidant pack add --from-dir ~/confidant-packs/weekly-checkin --yes    # instal
 
 `pack init` writes `manifest.toml`, `SKILL.md`, `<version>.md`, and
 `README.md` for the new pack. Fill in its verbs, fields, finding codes,
-`[checks]` keys, and rules, then install it. An external pack fetched over
-HTTPS uses `confidant pack add <https-url> --yes` instead.
+`[checks]` keys, and rules, then install it. A pack fetched over HTTPS uses
+`confidant pack add <https-url> --yes` instead.
 
 Installing a pack:
 
@@ -400,10 +400,10 @@ It does **not** touch records, client keys, or the trust anchor. `check`
 starts applying the pack's rules and its verbs become valid. Existing
 personal records stay where they are; there is no migration.
 
-Do not try to seed an external pack at `init` time with
-`--packs <name>@<version>`. `init` only seeds packs built into the binary
-(today the implicit `personal@0.2`); naming an external pack is a usage
-error (exit 2) with a fix telling you to install it after init
+Do not try to seed a pack at `init` time with `--packs <name>@<version>`.
+`init` only seeds packs built into the binary (today the implicit
+`personal@0.2`); naming any other pack is a usage error (exit 2) with a fix
+telling you to install it after init
 ([#639](https://github.com/hirefrank/confidant/issues/639)). Init with no
 packs, then `pack add`.
 
