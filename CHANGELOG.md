@@ -9,6 +9,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ## [Unreleased]
 
 ### Changed
+- `confidant pack add --yes` on a pack that is already vendored (or whose
+  `[checks]` keys the vault already sets) but not listed in `packs` now
+  refuses with the exact listing change, instead of reporting the pin as
+  already installed and leaving `check` failing. The stderr hints after a
+  blocked add or remove only name this pack's own data (#694).
 - The `pack-author` skill spells out message-variant names (including
   `note-ref`'s `variants = "session"`), the install-before-`[checks]`-keys
   ordering, where to read message templates during review, and that

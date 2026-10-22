@@ -2584,6 +2584,131 @@ fn pack_remove_refuses_while_the_vault_uses_the_pack() {
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
 }
 
+/// #694 review: the add hint must not blame `example-pack` for an unrelated
+/// `[checks]` typo. The report still prints and the exit stays 1, but no
+/// pack-specific hint appears.
+#[cfg(unix)]
+#[test]
+fn pack_add_hint_ignores_an_unrelated_config_finding() {
+    let vault = git_vault();
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nbogus_key = \"warning\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unrelated typo",
+        ],
+    );
+
+    let out = pack_add(&example_pack_fixture(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("E_CONFIG"), "{stdout}");
+    assert!(!stderr.contains("hint:"), "{stderr}");
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #694 review: when the vault's ledger already uses the pack's verbs, the
+/// hint must lead with the listing change (the repairing path) rather than
+/// telling the operator to delete the data.
+#[cfg(unix)]
+#[test]
+fn pack_add_hint_leads_with_the_listing_for_ledger_data() {
+    let vault = git_vault();
+    std::fs::create_dir_all(vault.path().join("ledger/2026")).unwrap();
+    std::fs::write(
+        vault.path().join("ledger/2026/10.cfd"),
+        "2026-10-01 use p-01M3TC5H00MPJG000000000000 60m full\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "use an uninstalled verb",
+        ],
+    );
+
+    let out = pack_add(&example_pack_fixture(), vault.path(), true);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("E_UNKNOWN_VERB"),
+        "{out:?}"
+    );
+    assert!(stderr.contains("example-pack@0.1"), "{stderr}");
+    assert!(
+        stderr.contains("add \"example-pack@0.1\" to `packs`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("migrate or remove those lines first"),
+        "{stderr}"
+    );
+    assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
+}
+
+/// #694 review: the remove hint must stay silent when the blocked write was
+/// a pre-check failure on an unrelated vault, not data from this pack.
+#[cfg(unix)]
+#[test]
+fn pack_remove_hint_ignores_an_unrelated_config_finding() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    std::fs::write(
+        vault.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01TEST00000000000000000000\"\n\n[checks]\nbogus_key = \"warning\"\n",
+    )
+    .unwrap();
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unrelated typo",
+        ],
+    );
+
+    let before = git(vault.path(), &["rev-list", "--count", "HEAD"]);
+    let out = Command::new(bin())
+        .args(["pack", "remove", "example-pack", "--vault"])
+        .arg(vault.path())
+        .args(["--yes", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("E_CONFIG"),
+        "{out:?}"
+    );
+    assert!(!stderr.contains("hint:"), "{stderr}");
+    assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
+    assert!(vault.path().join("packs/example-pack@0.1").is_dir());
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_update_shows_diff_then_applies_a_version_change() {
