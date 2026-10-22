@@ -2022,8 +2022,9 @@ fn cmd_pack_add_inner(
         }
         let lock = read_lockfile_or_empty(root)?;
         if let Some(entry) = lock.find(&report.name, &report.version) {
-            if entry.hash == report.hash {
-                // Same pin, same bytes: nothing to write (PD10 idempotence).
+            if entry.hash == report.hash && listed_name {
+                // Same pin, same bytes, already listed: nothing to write
+                // (PD10 idempotence).
                 if cli.json {
                     print_json(&ok_envelope(
                         Some(root),
@@ -2045,16 +2046,28 @@ fn cmd_pack_add_inner(
                 }
                 return Ok(ExitCode::SUCCESS);
             }
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "{}@{} is already installed with a different hash",
-                report.name, report.version
-            )))
-            .with_fix("Use `confidant pack update <name> --rev <ref>` to move it"));
+            if entry.hash != report.hash {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "{}@{} is already installed with a different hash",
+                    report.name, report.version
+                )))
+                .with_fix("Use `confidant pack update <name> --rev <ref>` to move it"));
+            }
+            // #696 review: pinned at this hash but missing from `packs`. The
+            // vendored copy is already the right bytes, so the only repair is
+            // adding the listing; fall through to the write instead of
+            // claiming "nothing to do" while `check` still fails.
         }
         // One version at a time: installing a second version of the same name
         // side by side leaves `pack update` unable to tell which to move, so
-        // refuse up front and point at `update` (which replaces in place).
-        if let Some(other) = lock.packs.iter().find(|e| e.name == report.name) {
+        // refuse up front and point at `update` (which replaces in place). The
+        // same name and version as the pin already handled above is not a
+        // second version.
+        if let Some(other) = lock
+            .packs
+            .iter()
+            .find(|e| e.name == report.name && e.version != report.version)
+        {
             return Err(anyhow::Error::new(DomainError::invalid(format!(
                 "{}@{} is already installed; {}@{} cannot be added alongside it",
                 report.name, other.version, report.name, report.version

@@ -2709,6 +2709,58 @@ fn pack_remove_hint_ignores_an_unrelated_config_finding() {
     assert!(vault.path().join("packs/example-pack@0.1").is_dir());
 }
 
+/// #696 review: a vendored copy pinned at the same hash but missing from
+/// `packs` is a real repair, not an idempotent no-op. With the flag, the same
+/// install must add the listing so `check` passes afterwards.
+#[cfg(unix)]
+#[test]
+fn pack_add_allow_unresolved_repairs_a_vendored_unlisted_pack() {
+    let vault = git_vault();
+    install_example_pack(vault.path());
+    git(vault.path(), &["add", "-A"]);
+    git(
+        vault.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "vendor pack without listing",
+        ],
+    );
+    let before: u32 = git(vault.path(), &["rev-list", "--count", "HEAD"])
+        .trim()
+        .parse()
+        .unwrap();
+
+    let out = Command::new(bin())
+        .args(["pack", "add", "--from-dir"])
+        .arg(example_pack_fixture())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["--allow-unresolved", "--yes", "--no-input"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("committed"), "{stdout}");
+    assert!(!stdout.contains("already installed"), "{stdout}");
+
+    let cfg = std::fs::read_to_string(vault.path().join("confidant.toml")).unwrap();
+    assert!(cfg.contains("packs = [\"example-pack@0.1\"]"), "{cfg}");
+    assert_eq!(
+        git(vault.path(), &["rev-list", "--count", "HEAD"])
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        before + 1
+    );
+    assert_eq!(check_json(vault.path())["ok"], true);
+}
+
 #[cfg(unix)]
 #[test]
 fn pack_update_shows_diff_then_applies_a_version_change() {
@@ -4363,10 +4415,9 @@ fn pack_add_allow_unresolved_still_rolls_back_unrelated_errors() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("post-check still failed"), "{stderr}");
-    assert!(stderr.contains("nothing was committed"), "{stderr}");
-    assert!(stderr.contains("other pack"), "{stderr}");
-    // The hint must not claim the flag will resolve unrelated findings.
+    // The finding names another pack, so the hint stays silent rather than
+    // claiming the flag will resolve it.
+    assert!(!stderr.contains("hint:"), "{stderr}");
     assert!(!stderr.contains("add \"example-pack@0.1\""), "{stderr}");
     assert_eq!(git(vault.path(), &["rev-list", "--count", "HEAD"]), before);
     assert_eq!(git(vault.path(), &["status", "--porcelain"]), "");
