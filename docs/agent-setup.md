@@ -85,7 +85,7 @@ confidant pack add --from-dir ~/confidant-packs/my-pack --yes
 ```
 
 The pack is vendored under `packs/`, pinned in `confidant.lock`, and listed
-in `confidant.toml`. Naming a pack at init time is a usage error:
+in `confidant.toml`. Naming any other pack at init time is a usage error:
 init with no packs, then `pack add`.
 
 ## Connect a git remote (optional)

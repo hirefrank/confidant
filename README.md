@@ -312,15 +312,16 @@ recurring dates, `relationship`, `cadence` with `snooze_until`, contact
 fields, relationship edges, the `touch` verb, and two warning-level rules
 (`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never block a write. Contract:
 [`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
-to be useful.
+to be useful, and a `personal@…` entry in `packs` is a no-op.
 
 **Extra domains are optional packs in the same vault.** `init --create`
 seeds `packs = []`, and `check` is clean without one.
 
 **Installing a pack.** Where a pack comes from is an implementation detail:
 `pack add` takes a `https://` URL or a local directory (`--from-dir`), and
-both behave the same. Without `--yes` it fetches to a temp directory,
-validates, prints every claim and the full skill text, and writes nothing.
+both behave the same. Without `--yes` it fetches the URL (or reads the local
+directory), validates, prints every claim and the full skill text, and writes
+nothing.
 With `--yes` it vendors the pack under `packs/`, pins its hash in
 `confidant.lock`, lists it in `packs`, runs `check`, and commits. Review that
 report as code first: a pack's `SKILL.md` becomes agent instructions.
