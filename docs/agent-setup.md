@@ -245,6 +245,14 @@ confidant pack update <name> --from-dir ~/confidant-packs/<name> --yes
 `pack update` prints the diff and stops without `--yes`. The vendored tree
 under the vault is generated and pinned; edit the source directory instead.
 
+Migrating a pack with existing data: `pack add --yes` refuses when the vault
+already sets the pack's `[checks]` keys or vendors its copy but does not list
+it. Add `"<name>@<version>"` to `packs` in `confidant.toml` first (or remove
+the dependent `[checks]` keys), then re-run. `pack remove --yes` refuses
+while ledger lines, metrics, or `[checks]` keys still use the pack, so
+remove or migrate those entries first, or keep the pack installed; the
+explicit orphan flag is tracked in #696. Both errors name the workaround.
+
 A local pack is unsigned but hash-pinned, so `pack verify` catches drift.
 The operator must review the manifest and `SKILL.md`: the skill text is
 served to the agent as instructions. Packs cannot widen the §12 allowlist or

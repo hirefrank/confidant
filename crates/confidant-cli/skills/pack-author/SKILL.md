@@ -121,6 +121,23 @@ already carries the keys blocks its own install. Install first, then add
 the keys. When reinstalling a pack the vault already used, keep its
 `packs` listing in place while the data is still there.
 
+### Migrating a pack with existing data
+
+`pack add --yes` and `pack remove --yes` refuse rather than half-apply a
+vault that still carries the pack's data:
+
+- **Adding** when the vault already has the pack's `[checks]` keys (or a
+  vendored copy) but no `packs` listing fails before the generic check. Add
+  `"<name>@<version>"` to `packs` in `confidant.toml` first, or remove the
+  dependent `[checks]` keys, then re-run.
+- **Removing** while ledger lines, metrics, edge kinds, or `[checks]` keys
+  still use the pack fails the post-check and rolls back. Remove or migrate
+  those entries first, or keep the pack installed; an explicit orphan flag
+  is tracked in #696 and is not available yet.
+
+The error text names the blocking data. Bring it to the operator; do not
+edit the vault around it.
+
 ## 6. Iterate
 
 Edit the source outside the vault, review the diff, then apply:

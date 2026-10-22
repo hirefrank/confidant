@@ -1702,6 +1702,241 @@ fn cmd_pack_add(
         .map_err(pack_fetch::escape_domain_error)
 }
 
+/// #694: refuse `pack add --yes` before the generic pre-check when the
+/// vault already references the pack without listing it. The pre-check
+/// cannot pass while the pack's `[checks]` keys are unresolvable, and an
+/// unlisted vendored copy is an ambiguous install state rather than
+/// something the add should silently paper over. Both cases have the same
+/// one-line fix: list the exact `name@version` (or remove the dependent
+/// `[checks]` keys) first.
+fn preflight_unlisted_pack(
+    root: &Path,
+    cfg: &confidant_core::config::VaultConfig,
+    report: &pack_fetch::PackReport,
+) -> anyhow::Result<()> {
+    let has_checks = checks_reference_pack(cfg, &report.name);
+    let rel = vendored_rel(&report.name, &report.version);
+    // An unreadable `packs/` entry is an error, not evidence of a vendored
+    // copy: surface it instead of claiming the pack is already there.
+    let vendored = confidant_core::paths::exists(root, Path::new(&rel))?;
+    if !has_checks && !vendored {
+        return Ok(());
+    }
+    let name = pack_fetch::escape_line(&report.name);
+    let version = pack_fetch::escape_line(&report.version);
+    let rel = pack_fetch::escape_line(&rel);
+    let listed = format!("{name}@{version}");
+    let checks_fix = format!(
+        "Add \"{listed}\" to `packs` in confidant.toml first (or remove the [checks] keys under `{name}.`), then re-run `confidant pack add`"
+    );
+    let (message, fix) = match (has_checks, vendored) {
+        (true, true) => (
+            format!(
+                "{listed} is not listed in `packs`, but the vault already vendors it at {rel} and sets its [checks] keys"
+            ),
+            checks_fix,
+        ),
+        (true, false) => (
+            format!(
+                "{listed} is not listed in `packs`, but the vault already sets its [checks] keys; the pre-write check cannot pass until the pack is listed"
+            ),
+            checks_fix,
+        ),
+        (false, true) => (
+            format!("{listed} is already vendored at {rel} but is not listed in `packs`"),
+            format!(
+                "Add \"{listed}\" to `packs` in confidant.toml to use the vendored copy, then re-run `confidant pack add`"
+            ),
+        ),
+        (false, false) => unreachable!("preflight requires a reason"),
+    };
+    Err(anyhow::Error::new(DomainError::invalid(message)).with_fix(&fix))
+}
+
+/// Whether any `[checks]` leaf in `cfg` names `name` or sits under it
+/// (`name.` prefix). Dotted TOML keys and `[checks.name]` tables both parse
+/// as nested tables, so walk the tree to the leaves.
+fn checks_reference_pack(cfg: &confidant_core::config::VaultConfig, name: &str) -> bool {
+    fn walk<'a, I>(prefix: &str, entries: I, name: &str) -> bool
+    where
+        I: IntoIterator<Item = (&'a String, &'a toml::Value)>,
+    {
+        entries.into_iter().any(|(key, value)| {
+            let dotted = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            // Exact match or a prefix under the pack's namespace. A pack
+            // name cannot collide with a built-in `[checks]` namespace: the
+            // manifest name rules reject the reserved built-in names (PD14).
+            if dotted == name || dotted.starts_with(&format!("{name}.")) {
+                return true;
+            }
+            match value {
+                toml::Value::Table(table) => walk(&dotted, table.iter(), name),
+                _ => false,
+            }
+        })
+    }
+    walk("", cfg.checks.rules.iter(), name)
+}
+
+/// #694 review: whether a blocked-check finding can be blamed on the pack
+/// being added or removed.
+///
+/// A finding counts when its message names the pack — an unknown `[checks]`
+/// key renders as `unknown [checks] key 'name.key'` — or when the file:line
+/// it points at contains one of the pack's declared verbs, metrics, or edge
+/// kinds. Findings with no readable location do not count: the hint must
+/// never blame this pack for another pack's data.
+fn finding_names_pack(
+    root: &Path,
+    finding: &confidant_core::check::Finding,
+    name: &str,
+    owned: &[String],
+) -> bool {
+    let quoted = format!("'{name}.");
+    let bare = format!("'{name}'");
+    if finding.message.contains(&quoted) || finding.message.contains(&bare) {
+        return true;
+    }
+    let Some(file) = finding.file.as_deref() else {
+        return false;
+    };
+    let Some(line) = finding.line.and_then(|line| line.checked_sub(1)) else {
+        return false;
+    };
+    let Ok(text) = confidant_core::paths::read_to_string(root, Path::new(file)) else {
+        return false;
+    };
+    text.lines()
+        .nth(line as usize)
+        .is_some_and(|text| line_mentions_any(text, owned))
+}
+
+/// Whether `line` carries one of `owned` as a whole token, so a short verb
+/// like `use` does not match `user`.
+fn line_mentions_any(line: &str, owned: &[String]) -> bool {
+    line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .filter(|token| !token.is_empty())
+        .any(|token| owned.iter().any(|owned| owned.eq_ignore_ascii_case(token)))
+}
+
+/// The finding codes a pack's own data can produce once it is missing or
+/// unlisted: an unknown `[checks]` key and an unresolved verb/metric/edge
+/// kind.
+fn is_pack_data_finding(finding: &confidant_core::check::Finding) -> bool {
+    matches!(
+        finding.code.as_str(),
+        "E_CONFIG" | "E_UNKNOWN_VERB" | "E_UNKNOWN_METRIC" | "E_UNKNOWN_EDGE_KIND"
+    )
+}
+
+/// The names a manifest declares: verbs, balance metrics, and edge kinds.
+fn manifest_tokens(manifest: &confidant_core::packs::manifest::PackManifest) -> Vec<String> {
+    manifest
+        .verbs
+        .iter()
+        .map(|verb| verb.name.clone())
+        .chain(manifest.balance_metrics.iter().cloned())
+        .chain(manifest.edge_kinds.iter().map(|kind| kind.name.clone()))
+        .collect()
+}
+
+/// The names the vault's loaded copy of `name` declares. Empty when the
+/// pack is not loadable (a missing or unreadable copy), so the hint stays
+/// silent rather than guessing.
+fn installed_pack_tokens(root: &Path, name: &str) -> Vec<String> {
+    let Ok(vault) = confidant_core::load_vault(root) else {
+        return Vec::new();
+    };
+    vault
+        .pack_registry()
+        .all()
+        .iter()
+        .find(|pack| pack.name() == name)
+        .map(|pack| {
+            pack.verbs()
+                .iter()
+                .map(|verb| (*verb).to_owned())
+                .chain(
+                    pack.balance_metrics()
+                        .iter()
+                        .map(|metric| (*metric).to_owned()),
+                )
+                .chain(pack.edge_kinds().iter().map(|kind| kind.name.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #694: a stderr hint after `pack add --yes` is blocked, tailored to the
+/// findings that name this pack's data. Returns `None` when the block is
+/// unrelated (for example a pack conflict), so the hint never misdiagnoses.
+fn pack_add_blocked_hint(
+    root: &Path,
+    report: &confidant_core::check::CheckReport,
+    name: &str,
+    version: &str,
+    manifest: &confidant_core::packs::manifest::PackManifest,
+) -> Option<String> {
+    let owned = manifest_tokens(manifest);
+    let scoped: Vec<&confidant_core::check::Finding> = report
+        .findings
+        .iter()
+        .filter(|finding| is_pack_data_finding(finding))
+        .filter(|finding| finding_names_pack(root, finding, name, &owned))
+        .collect();
+    let listed = format!(
+        "{}@{}",
+        pack_fetch::escape_line(name),
+        pack_fetch::escape_line(version)
+    );
+    let sets_checks = scoped
+        .iter()
+        .any(|finding| finding.code.as_str() == "E_CONFIG");
+    let uses_ledger = scoped
+        .iter()
+        .any(|finding| finding.code.as_str() != "E_CONFIG");
+    let mut lines = Vec::new();
+    if sets_checks {
+        lines.push(format!(
+            "hint: the findings above name [checks] keys the vault already carries for {listed}; add \"{listed}\" to `packs` in confidant.toml first (or remove those keys), then re-run `confidant pack add`"
+        ));
+    }
+    if uses_ledger {
+        lines.push(format!(
+            "hint: the findings above name ledger entries or edges that use {listed}'s verbs, metrics, or edge kinds; add \"{listed}\" to `packs` in confidant.toml first so the write lists it (or migrate/remove those lines if the pack is going away), then re-run `confidant pack add`"
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// #694: a stderr hint after `pack remove --yes` is blocked. The report
+/// still prints unchanged and the exit stays 1; this only names the
+/// workaround. Returns `None` when no finding names this pack, so a
+/// pre-check failure on an unrelated vault does not blame the removal.
+fn pack_remove_blocked_hint(
+    root: &Path,
+    report: &confidant_core::check::CheckReport,
+    name: &str,
+    owned: &[String],
+) -> Option<String> {
+    let blocked = report
+        .findings
+        .iter()
+        .filter(|finding| is_pack_data_finding(finding))
+        .any(|finding| finding_names_pack(root, finding, name, owned));
+    if !blocked {
+        return None;
+    }
+    let name = pack_fetch::escape_line(name);
+    Some(format!(
+        "hint: the vault still uses {name}'s verbs, metrics, [checks] keys, or edge kinds, so removing the pack would leave orphan data. Remove or migrate those entries (and drop the [checks] keys) first, or keep the pack installed. An explicit orphan flag is tracked in #696 and is not available yet."
+    ))
+}
+
 fn cmd_pack_add_inner(
     cli: &Cli,
     vault_root: Option<&Path>,
@@ -1719,6 +1954,24 @@ fn cmd_pack_add_inner(
 
     if yes {
         let root = vault_root_required(vault_root, "pack add --yes")?;
+        let cfg_text = read_config_text(root)?;
+        let cfg =
+            confidant_core::config::VaultConfig::parse(&cfg_text).map_err(anyhow::Error::new)?;
+        let listed_id = format!("{}@{}", report.name, report.version);
+        // #694: the vault may already carry this pack's data or its vendored
+        // copy without listing the pack. The pre-check would then refuse the
+        // install with a generic finding, so name the exact listing change
+        // first. A listing for another version of the same name is left to
+        // the one-version-at-a-time refusal below.
+        let listed_name = cfg.packs.iter().any(|listed| {
+            listed == &report.name
+                || listed
+                    .split_once('@')
+                    .is_some_and(|(name, _)| name == report.name)
+        });
+        if !listed_name {
+            preflight_unlisted_pack(root, &cfg, &report)?;
+        }
         let lock = read_lockfile_or_empty(root)?;
         if let Some(entry) = lock.find(&report.name, &report.version) {
             if entry.hash == report.hash {
@@ -1775,12 +2028,7 @@ fn cmd_pack_add_inner(
         // repairs by writing the pin, so route it through the repairing path;
         // the post-check still gates the commit. With no such listing the
         // pre-check runs as usual.
-        let cfg_text = read_config_text(root)?;
-        let unpinned_listing = confidant_core::config::VaultConfig::parse(&cfg_text)
-            .map_err(anyhow::Error::new)?
-            .packs
-            .iter()
-            .any(|listed| listed == &format!("{}@{}", report.name, report.version));
+        let unpinned_listing = cfg.packs.iter().any(|listed| listed == &listed_id);
         let changes = install_changes(root, &report, &files, &fetched, None)?;
         let summary = format!(
             "pack: add {}@{} ({})",
@@ -1798,7 +2046,21 @@ fn cmd_pack_add_inner(
         } else {
             apply_write(root, pending, &write_options(cli))?
         };
-        return finish_write(
+        // #694: the check report still prints unchanged (exit 1); this only
+        // adds a stderr hint, so `--json` stdout stays valid.
+        let hint = match &outcome {
+            WriteOutcome::CheckBlocked {
+                report: check_report,
+            } => pack_add_blocked_hint(
+                root,
+                check_report,
+                &report.name,
+                &report.version,
+                &report.manifest,
+            ),
+            _ => None,
+        };
+        let code = finish_write(
             cli,
             root,
             "pack-add",
@@ -1806,7 +2068,11 @@ fn cmd_pack_add_inner(
             serde_json::json!({
                 "pack": {"name": report.name, "version": report.version, "hash": report.hash},
             }),
-        );
+        )?;
+        if let Some(hint) = hint {
+            writeln!(io::stderr(), "{hint}")?;
+        }
+        return Ok(code);
     }
     if cli.json {
         let payload = report.to_json(&fetched.source, &fetched.rev, &fetched.subdir);
@@ -2448,13 +2714,27 @@ fn cmd_pack_remove(
             }
         }
     }
-    finish_write(
+    // #694: the report still prints unchanged (exit 1); this only adds a
+    // stderr hint, so `--json` stdout stays valid. Only findings that name
+    // this pack produce one, so an unrelated pre-check failure stays quiet.
+    let hint = match &outcome {
+        WriteOutcome::CheckBlocked { report } => {
+            let owned = installed_pack_tokens(root, &name);
+            pack_remove_blocked_hint(root, report, &name, &owned)
+        }
+        _ => None,
+    };
+    let code = finish_write(
         cli,
         root,
         "pack-remove",
         outcome,
         serde_json::json!({ "removed": listed }),
-    )
+    )?;
+    if let Some(hint) = hint {
+        writeln!(io::stderr(), "{hint}")?;
+    }
+    Ok(code)
 }
 
 /// `pack update <name> --rev <ref>`: re-fetch a new rev, print the diff, and

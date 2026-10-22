@@ -361,6 +361,14 @@ confidant pack update <name> --from-dir ~/confidant-packs/weekly-checkin --yes
 The first command prints the diff and stops. The generated copy under
 `<vault>/packs/` is not the editing surface.
 
+Migrating a pack with existing data: `pack add --yes` refuses when the vault
+already sets the pack's `[checks]` keys or vendors its copy but does not list
+it. Add `"<name>@<version>"` to `packs` in `confidant.toml` first (or remove
+the dependent `[checks]` keys), then re-run. `pack remove --yes` refuses
+while ledger lines, metrics, or `[checks]` keys still use the pack, so
+remove or migrate those entries first, or keep the pack installed; the
+explicit orphan flag is tracked in #696. Both errors name the workaround.
+
 A local pack is unsigned but hash-pinned: `pack verify` detects drift. Review
 its `SKILL.md` as code, because it becomes agent instructions. It cannot
 widen the §12 allowlist or read `no-ai` content; the CLI enforces that, not
