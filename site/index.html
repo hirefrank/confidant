@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Confidant is relationship memory you own — a local-first, encrypted, git-backed memory for the people in your life. Open source, Apache-2.0." />
+    <link rel="icon" href="data:," />
+    <title>Confidant — Relationship memory you own</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Quicksand:wght@500;600;700&family=Nunito:wght@400;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body { margin: 0; font-family: system-ui, sans-serif; background: #170e38; }
+      [hidden] { display: none !important; }
+      a { color: inherit; }
+      ::selection { background: #2fd6c0; color: #170e38; }
+
+      /* ================================================================
+         CONFIDANT — PRIME SEVENS
+         Deep violet, teal / coral / gold shards, rounded geometric type.
+         ================================================================ */
+      .page {
+        --bg: #1d1247; --bg2: #170e38; --panel: #291a5e; --panel2: #31206c;
+        --ink: #f5f2ff; --dim: #c3baf0; --faint: #8f83c9;
+        --teal: #2fd6c0; --coral: #ff7a5c; --gold: #ffc857; --violet: #9d7bff;
+        background: linear-gradient(180deg, var(--bg) 0%, var(--bg2) 100%);
+        color: var(--ink);
+        font-family: "Nunito", system-ui, sans-serif;
+        --disp: "Quicksand", "Nunito", sans-serif;
+        --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+        overflow: hidden;
+      }
+      .page .wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; position: relative; }
+      .page nav { display: flex; align-items: center; gap: 26px; padding: 22px 0; }
+      .page .wordmark { font-family: var(--disp); font-weight: 700; font-size: 21px; letter-spacing: .01em; display: flex; align-items: center; gap: 10px; }
+      .page .wordmark .mark { display: inline-flex; gap: 3px; }
+      .page .wordmark .mark i { width: 9px; height: 14px; display: block; clip-path: polygon(0 0, 100% 18%, 72% 100%, 0 82%); }
+      .page .wordmark .mark i:nth-child(1) { background: var(--teal); }
+      .page .wordmark .mark i:nth-child(2) { background: var(--coral); transform: translateY(3px); }
+      .page .wordmark .mark i:nth-child(3) { background: var(--gold); }
+      .page nav .links { display: flex; gap: 24px; margin-left: auto; font-weight: 700; font-size: 14.5px; }
+      .page nav .links a { color: var(--dim); text-decoration: none; }
+      .page nav .links a:hover { color: var(--teal); }
+      .page .btn {
+        display: inline-flex; align-items: center; gap: 9px;
+        font-family: var(--disp); font-weight: 700; font-size: 15px;
+        text-decoration: none; padding: 13px 24px; border-radius: 999px;
+        border: 2px solid rgba(245,242,255,.25); color: var(--ink); background: transparent; cursor: pointer;
+        transition: transform .15s ease, border-color .15s, background .15s;
+      }
+      .page .btn:hover { transform: translateY(-2px); border-color: var(--teal); }
+      .page .btn.solid { background: var(--coral); border-color: var(--coral); color: #2a0e04; }
+      .page .btn.solid:hover { background: #ff8f73; }
+      .page .btn.teal { background: var(--teal); border-color: var(--teal); color: #04302a; }
+      .page .btn.teal:hover { background: #54e3d0; }
+      .page nav .btn { padding: 9px 18px; font-size: 13.5px; }
+
+      /* ---------- Hero ---------- */
+      .page .hero { padding: 72px 0 92px; position: relative; }
+      .page .hero-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 48px; align-items: center; }
+      .page .pill {
+        display: inline-flex; align-items: center; gap: 8px;
+        background: rgba(47,214,192,.12); color: var(--teal);
+        border: 1px solid rgba(47,214,192,.35); border-radius: 999px;
+        font-family: var(--disp); font-weight: 700; font-size: 12.5px; letter-spacing: .05em;
+        padding: 7px 14px; margin-bottom: 26px;
+      }
+      .page h1 {
+        font-family: var(--disp); font-weight: 700; margin: 0 0 24px;
+        font-size: clamp(42px, 5.8vw, 66px); line-height: 1.06; letter-spacing: -.01em;
+      }
+      .page h1 .t { color: var(--teal); }
+      .page h1 .co { color: var(--coral); }
+      .page h1 .g { color: var(--gold); }
+      .page .lede { font-size: 18.5px; line-height: 1.65; color: var(--dim); max-width: 34em; margin: 0 0 34px; }
+      .page .lede strong { color: var(--ink); }
+      .page .cta-row { display: flex; gap: 12px; flex-wrap: wrap; }
+      .page .hero-note { margin-top: 26px; font-size: 14px; color: var(--faint); font-weight: 600; }
+
+      .page .shard-stage { position: relative; min-height: 420px; }
+      .page .shard { position: absolute; filter: drop-shadow(0 14px 24px rgba(0,0,0,.35)); animation: float 7s ease-in-out infinite; }
+      .page .shard.s1 { width: 190px; top: 6%; left: 8%; animation-delay: 0s; }
+      .page .shard.s2 { width: 150px; top: 2%; right: 10%; animation-delay: 1.2s; }
+      .page .shard.s3 { width: 170px; bottom: 14%; left: 0; animation-delay: 2s; }
+      .page .shard.s4 { width: 210px; bottom: 4%; right: 4%; animation-delay: .6s; }
+      .page .shard.s5 { width: 110px; top: 40%; left: 42%; animation-delay: 1.6s; }
+      @keyframes float { 0%, 100% { transform: translateY(0) rotate(var(--r, 0deg)); } 50% { transform: translateY(-13px) rotate(var(--r, 0deg)); } }
+      .page .core-card {
+        position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        background: var(--panel2); border: 1px solid rgba(245,242,255,.14); border-radius: 22px;
+        padding: 22px 24px; width: 250px; box-shadow: 0 30px 60px rgba(0,0,0,.4);
+      }
+      .page .core-card .who { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+      .page .core-card .avatar {
+        width: 44px; height: 44px; border-radius: 14px; flex: none;
+        background: conic-gradient(from 40deg, var(--teal), var(--violet), var(--coral), var(--gold), var(--teal));
+      }
+      .page .core-card b { font-family: var(--disp); font-size: 16.5px; display: block; }
+      .page .core-card span { font-size: 12.5px; color: var(--faint); font-weight: 700; }
+      .page .core-card ul { list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px dashed rgba(245,242,255,.18); display: grid; gap: 8px; font-size: 13.5px; color: var(--dim); font-weight: 600; }
+      .page .core-card li::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 9px; clip-path: polygon(50% 0, 100% 100%, 0 100%); background: var(--teal); }
+      .page .core-card li:nth-child(2)::before { background: var(--coral); }
+      .page .core-card li:nth-child(3)::before { background: var(--gold); }
+
+      /* ---------- Sections ---------- */
+      .page section.block { padding: 84px 0; position: relative; }
+      .page .sec-head { max-width: 44em; margin-bottom: 48px; }
+      .page .sec-tag {
+        font-family: var(--disp); font-weight: 700; font-size: 12.5px; letter-spacing: .14em; text-transform: uppercase;
+        color: var(--gold); margin: 0 0 14px;
+      }
+      .page h2 { font-family: var(--disp); font-weight: 700; font-size: clamp(30px, 4.2vw, 46px); line-height: 1.12; margin: 0 0 16px; }
+      .page h2 .t { color: var(--teal); } .page h2 .co { color: var(--coral); } .page h2 .g { color: var(--gold); }
+      .page .sec-sub { color: var(--dim); font-size: 17px; line-height: 1.65; margin: 0; }
+      .page .sec-sub code, .page .pack-card code {
+        font-family: var(--mono); font-size: .88em; background: rgba(0,0,0,.3);
+        color: var(--teal); padding: 2px 8px; border-radius: 7px; white-space: nowrap;
+      }
+
+      /* ---------- Packs ---------- */
+      .page .pack-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-bottom: 18px; }
+      .page .pack-card {
+        background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 22px;
+        padding: 28px 26px 30px; position: relative;
+        transition: transform .18s ease, border-color .18s ease;
+      }
+      .page .pack-card:hover { transform: translateY(-4px); border-color: rgba(47,214,192,.45); }
+      .page .pack-card .chip {
+        width: 46px; height: 46px; margin-bottom: 18px;
+        clip-path: polygon(12% 0, 100% 8%, 88% 100%, 0 88%);
+        display: grid; place-items: center; font-family: var(--disp); font-weight: 700; font-size: 19px; color: #170e38;
+      }
+      .page .pack-card.c-core .chip { background: var(--teal); }
+      .page .pack-card.c-draft .chip { background: var(--coral); }
+      .page .pack-card.c-yours .chip { background: var(--gold); }
+      .page .pack-card .pack-kicker {
+        font-family: var(--mono); font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase;
+        color: var(--faint); margin: 0 0 8px;
+      }
+      .page .pack-card h3 { font-family: var(--disp); font-size: 21px; font-weight: 700; margin: 0 0 10px; }
+      .page .pack-card p { margin: 0 0 14px; color: var(--dim); font-size: 15px; line-height: 1.65; }
+      .page .pack-card p:last-child { margin-bottom: 0; }
+      .page .noun-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+      .page .noun-list li {
+        font-family: var(--disp); font-weight: 700; font-size: 13.5px;
+        border: 1px solid rgba(245,242,255,.18); border-radius: 999px; padding: 6px 13px; color: var(--ink);
+      }
+      .page .metric-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; font-size: 14.5px; color: var(--dim); font-weight: 600; }
+      .page .metric-list li { display: flex; gap: 10px; align-items: baseline; }
+      .page .metric-list li::before { content: ""; width: 7px; height: 7px; flex: none; transform: translateY(-1px); clip-path: polygon(50% 0, 100% 100%, 0 100%); background: var(--coral); }
+      .page .metric-list code { font-family: var(--mono); font-size: 12.5px; background: rgba(0,0,0,.3); color: var(--gold); padding: 2px 8px; border-radius: 7px; white-space: nowrap; }
+
+      /* ---------- Code / CLI cards ---------- */
+      .page .cli-card {
+        background: #120a2e; border: 1px solid rgba(157,123,255,.35); border-radius: 24px;
+        padding: 30px 32px 34px; box-shadow: 0 30px 70px rgba(0,0,0,.35);
+      }
+      .page .cli-card .cap { display: flex; gap: 8px; align-items: center; margin-bottom: 20px; }
+      .page .cli-card .cap i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+      .page .cli-card .cap i:nth-child(1) { background: var(--coral); }
+      .page .cli-card .cap i:nth-child(2) { background: var(--gold); }
+      .page .cli-card .cap i:nth-child(3) { background: var(--teal); }
+      .page .cli-card .cap span { margin-left: 8px; font-family: var(--mono); font-size: 12px; color: var(--faint); }
+      .page .cli-card pre { margin: 0; font-family: var(--mono); font-size: 13.5px; line-height: 1.9; overflow-x: auto; color: var(--ink); }
+      .page .cli-card .p { color: var(--teal); font-weight: 600; }
+      .page .cli-card .o { color: var(--dim); }
+      .page .cli-card .cm { color: var(--faint); }
+      .page .cli-card .hl { color: var(--gold); }
+      .page .cli-card .ok { color: var(--teal); }
+
+      /* ---------- The one contrast line ---------- */
+      .page .contrast { padding: 30px 0 6px; }
+      .page .contrast-inner {
+        text-align: center; padding: 64px 32px; position: relative;
+        border-top: 1px dashed rgba(245,242,255,.16); border-bottom: 1px dashed rgba(245,242,255,.16);
+      }
+      .page .contrast p {
+        font-family: var(--disp); font-weight: 700; margin: 0;
+        font-size: clamp(28px, 4.6vw, 50px); line-height: 1.25; letter-spacing: -.01em;
+      }
+      .page .contrast .line-a { color: var(--faint); display: block; }
+      .page .contrast .line-b { color: var(--ink); display: block; margin-top: 10px; }
+      .page .contrast .line-b .t { color: var(--teal); }
+      .page .contrast .line-b .co { color: var(--coral); }
+
+      /* ---------- Features ---------- */
+      .page .feat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+      .page .feat {
+        background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 22px;
+        padding: 28px 26px 30px; transition: transform .18s ease, border-color .18s ease;
+      }
+      .page .feat:hover { transform: translateY(-4px); border-color: rgba(47,214,192,.45); }
+      .page .feat .chip {
+        width: 46px; height: 46px; margin-bottom: 18px;
+        clip-path: polygon(12% 0, 100% 8%, 88% 100%, 0 88%);
+        display: grid; place-items: center; font-family: var(--disp); font-weight: 700; font-size: 17px; color: #170e38;
+      }
+      .page .feat:nth-child(3n+1) .chip { background: var(--teal); }
+      .page .feat:nth-child(3n+2) .chip { background: var(--coral); }
+      .page .feat:nth-child(3n) .chip { background: var(--gold); }
+      .page .feat h3 { font-family: var(--disp); font-size: 20px; font-weight: 700; margin: 0 0 10px; }
+      .page .feat p { margin: 0; color: var(--dim); font-size: 15px; line-height: 1.65; }
+
+      /* ---------- Steps ---------- */
+      .page .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+      .page .step {
+        border-radius: 22px; padding: 30px 28px 32px; position: relative;
+        background: linear-gradient(160deg, var(--panel2), var(--panel));
+        border: 1px solid rgba(245,242,255,.09);
+      }
+      .page .step .snum {
+        font-family: var(--disp); font-weight: 700; font-size: 15px;
+        width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; color: #170e38;
+        margin-bottom: 18px;
+      }
+      .page .step:nth-child(1) .snum { background: var(--teal); }
+      .page .step:nth-child(2) .snum { background: var(--coral); }
+      .page .step:nth-child(3) .snum { background: var(--gold); }
+      .page .step h3 { font-family: var(--disp); font-size: 20px; margin: 0 0 10px; font-weight: 700; }
+      .page .step p { margin: 0 0 16px; color: var(--dim); font-size: 15px; line-height: 1.65; }
+      .page .step code { font-family: var(--mono); font-size: 12.5px; background: rgba(0,0,0,.3); color: var(--teal); padding: 4px 10px; border-radius: 8px; }
+
+      /* ---------- Privacy ---------- */
+      .page .trust-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 52px; align-items: start; }
+      .page .trust-grid .big { font-family: var(--disp); font-size: 24px; font-weight: 600; line-height: 1.45; margin: 0 0 18px; }
+      .page .trust-grid p { color: var(--dim); font-size: 16.5px; line-height: 1.7; margin: 0 0 16px; }
+      .page .pieces { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+      .page .pieces li {
+        background: var(--panel); border: 1px solid rgba(245,242,255,.09); border-radius: 16px;
+        padding: 18px 20px; font-size: 15.5px; font-weight: 700; display: flex; gap: 14px; align-items: center;
+      }
+      .page .pieces li i { width: 16px; height: 16px; flex: none; clip-path: polygon(15% 0, 100% 20%, 80% 100%, 0 80%); }
+      .page .pieces li:nth-child(4n+1) i { background: var(--teal); }
+      .page .pieces li:nth-child(4n+2) i { background: var(--coral); }
+      .page .pieces li:nth-child(4n+3) i { background: var(--gold); }
+      .page .pieces li:nth-child(4n) i { background: var(--violet); }
+      .page .pieces li span { display: block; font-weight: 600; color: var(--dim); font-size: 13.5px; margin-top: 2px; line-height: 1.5; }
+
+      /* ---------- CTA / footer ---------- */
+      .page .cta-band { padding: 40px 0 96px; }
+      .page .cta-card {
+        border-radius: 28px; padding: 60px 48px; text-align: center; position: relative; overflow: hidden;
+        background: linear-gradient(135deg, #3a2386, #241457);
+        border: 1px solid rgba(157,123,255,.4);
+      }
+      .page .cta-card::before, .page .cta-card::after {
+        content: ""; position: absolute; width: 190px; height: 190px; opacity: .35;
+        clip-path: polygon(20% 0, 100% 30%, 75% 100%, 0 70%);
+      }
+      .page .cta-card::before { background: var(--teal); top: -70px; left: -50px; transform: rotate(24deg); }
+      .page .cta-card::after { background: var(--coral); bottom: -80px; right: -40px; transform: rotate(-18deg); }
+      .page .cta-card h2 { font-size: clamp(30px, 4.4vw, 48px); max-width: 17em; margin: 0 auto 18px; position: relative; z-index: 1; }
+      .page .cta-card p { color: var(--dim); font-size: 17px; line-height: 1.65; max-width: 36em; margin: 0 auto 32px; position: relative; z-index: 1; }
+      .page .cta-card .cta-row { justify-content: center; position: relative; z-index: 1; }
+      .page footer { border-top: 1px solid rgba(245,242,255,.12); padding: 30px 0 42px; }
+      .page footer .frow { display: flex; gap: 24px; flex-wrap: wrap; align-items: center; font-size: 13.5px; color: var(--faint); font-weight: 600; }
+      .page footer a { color: var(--dim); text-decoration: none; }
+      .page footer a:hover { color: var(--teal); }
+      .page footer .spacer { flex: 1; }
+
+      @media (max-width: 900px) {
+        .page .hero-grid, .page .trust-grid { grid-template-columns: 1fr; }
+        .page .feat-grid, .page .steps, .page .pack-grid { grid-template-columns: 1fr; }
+        .page .shard-stage { min-height: 380px; }
+        .page nav .links { display: none; }
+        .page .cta-card { padding: 44px 24px; }
+        .page .cli-card { padding: 24px 20px 26px; }
+        .page .cli-card pre { white-space: pre-wrap; word-break: break-word; }
+        .page .contrast-inner { padding: 48px 20px; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
+        .page .shard { animation: none; }
+        .page .btn, .page .feat, .page .pack-card { transition: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page" aria-label="Confidant — relationship memory you own">
+      <div class="wrap">
+        <nav>
+          <div class="wordmark"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>confidant</div>
+          <div class="links">
+            <a href="#packs">Packs</a>
+            <a href="#features">Features</a>
+            <a href="#how">How it works</a>
+            <a href="#privacy">Privacy</a>
+          </div>
+          <a class="btn teal" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">GitHub ↗</a>
+        </nav>
+      </div>
+
+      <section class="hero">
+        <div class="wrap">
+          <div class="hero-grid">
+            <div>
+              <span class="pill">● Open source · Apache-2.0 · Local-first</span>
+              <h1>Relationship memory <span class="co">you</span> <span class="t">own</span>.</h1>
+              <p class="lede">Confidant is a <strong>local-first, encrypted, git-backed memory for the people in your life</strong> — every person, conversation, and small human detail kept on your machine, under your key. And when your AI agents help you prepare, they work from that same memory. <strong>Your agents share a memory you own</strong> — not one rented from someone else's cloud.</p>
+              <div class="cta-row">
+                <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">Get it on GitHub</a>
+                <a class="btn" href="#packs">Meet the packs</a>
+              </div>
+              <p class="hero-note">Free forever — it's open source. Runs anywhere the <b>confidant</b> CLI runs.</p>
+            </div>
+            <div class="shard-stage" aria-hidden="true">
+              <svg class="shard s1" style="--r:-8deg" viewBox="0 0 100 100"><polygon points="8,12 92,4 74,88 0,70" fill="#2fd6c0" opacity=".92"/></svg>
+              <svg class="shard s2" style="--r:10deg" viewBox="0 0 100 100"><polygon points="15,0 100,22 82,100 0,78" fill="#ff7a5c" opacity=".92"/></svg>
+              <svg class="shard s3" style="--r:6deg" viewBox="0 0 100 100"><polygon points="0,25 78,0 100,80 22,100" fill="#ffc857" opacity=".92"/></svg>
+              <svg class="shard s4" style="--r:-12deg" viewBox="0 0 100 100"><polygon points="10,0 95,15 85,95 0,82" fill="#9d7bff" opacity=".9"/></svg>
+              <svg class="shard s5" style="--r:14deg" viewBox="0 0 100 100"><polygon points="20,5 100,40 65,100 0,60" fill="#2fd6c0" opacity=".75"/></svg>
+              <div class="core-card">
+                <div class="who">
+                  <div class="avatar"></div>
+                  <div><b>Maya Chen</b><span>Northwind Labs · Founder</span></div>
+                </div>
+                <ul>
+                  <li>Intro'd by Sam, last spring</li>
+                  <li>Seed round — ask Friday</li>
+                  <li>Kid named Theo, likes trains</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" id="packs">
+        <div class="wrap">
+          <div class="sec-head">
+            <p class="sec-tag">Packs</p>
+            <h2>Teach it <span class="t">your world</span>.</h2>
+            <p class="sec-sub">The core of Confidant stays deliberately simple and human — people, conversations, notes. A <strong>pack</strong> is a new shard that locks onto that core and teaches it the language of <em>your</em> world. And you don't write it by hand: <strong>an agent can author a pack for you</strong>. Describe how your world works in plain language, and the pack it drafts becomes a fluency Confidant — and every agent working from your memory — speaks from then on.</p>
+          </div>
+          <div class="pack-grid">
+            <article class="pack-card c-core">
+              <div class="chip" aria-hidden="true">◆</div>
+              <p class="pack-kicker">Always there</p>
+              <h3>The core: people, plainly</h3>
+              <p>Four things, and that's the whole foundation — the pieces every relationship in every world is made of. The core never grows kitchen-sink features; it stays human on purpose.</p>
+              <ul class="noun-list">
+                <li>People</li>
+                <li>Organizations</li>
+                <li>Interactions</li>
+                <li>Notes</li>
+              </ul>
+            </article>
+            <article class="pack-card c-draft">
+              <div class="chip" aria-hidden="true">◆</div>
+              <p class="pack-kicker">Your vocabulary</p>
+              <h3>Your world, in your words</h3>
+              <p>Your life doesn't fit generic software's objects — so don't bend your relationships into someone else's schema. A pack extends the memory until it understands things the way you already think about them:</p>
+              <ul class="metric-list">
+                <li>Your verbs — what happens between people, in your words</li>
+                <li>Your metrics — what matters, counted your way</li>
+                <li>Your rules — what should never slip</li>
+              </ul>
+            </article>
+            <article class="pack-card c-yours">
+              <div class="chip" aria-hidden="true">◆</div>
+              <p class="pack-kicker">Authored for you</p>
+              <h3>Your agent writes the pack</h3>
+              <p>There's a <strong>pack-author</strong> skill for exactly this. You describe your world in plain language; your agent drafts the pack — verbs, metrics, rules — and you approve it before anything is installed. From then on it's declared in your vault, versioned like <code>packs = ["your-world@0.1"]</code>, and <code>confidant check</code> verifies your memory against its rules.</p>
+              <p>One memory underneath. A new fluency on top, whenever you need it.</p>
+            </article>
+          </div>
+          <div class="steps" style="margin-bottom: 18px;">
+            <article class="step">
+              <div class="snum">1</div>
+              <h3>Describe your world</h3>
+              <p>Talk the way you already talk — the things that happen between people, what you keep track of, what must never fall through the cracks.</p>
+            </article>
+            <article class="step">
+              <div class="snum">2</div>
+              <h3>Your agent drafts the pack</h3>
+              <p>The pack-author skill turns your description into a declared pack of verbs, metrics, and rules. You read it, tweak it, approve it — nothing installs itself.</p>
+            </article>
+            <article class="step">
+              <div class="snum">3</div>
+              <h3>Confidant speaks your language</h3>
+              <p>The new shard locks into the whole. Same owned memory underneath — now fluent in your world, for you and for every agent that briefs from it.</p>
+            </article>
+          </div>
+          <div class="cli-card">
+            <div class="cap"><i></i><i></i><i></i><span>confidant — a pack, authored &amp; checked</span></div>
+            <pre><span class="cm"># in plain language, to your agent</span>
+<span class="o">"Teach Confidant how my world works — draft me a pack."</span>
+<span class="ok">✓</span> <span class="o">pack-author skill: verbs, metrics &amp; rules drafted from your description</span>
+<span class="ok">✓</span> <span class="o">draft saved for your approval — nothing installed until you say yes</span>
+
+<span class="cm"># once approved — declared in your vault, per-vault &amp; versioned</span>
+packs = [<span class="hl">"your-world@0.1"</span>]
+
+<span class="p">$</span> confidant check
+<span class="ok">✓</span> <span class="o">your-world pack loaded — memory reconciled against its rules</span>
+<span class="ok">✓</span> <span class="o">every metric within bounds · no unexplained gaps</span></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="contrast" aria-label="What Confidant is not">
+        <div class="wrap">
+          <div class="contrast-inner">
+            <p><span class="line-a">Businesses need CRMs.</span><span class="line-b">Humans need to <span class="co">remember</span>.</span></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" id="features">
+        <div class="wrap">
+          <div class="sec-head">
+            <p class="sec-tag">Why Confidant</p>
+            <h2>Scattered to everyone else. <span class="t">Whole</span> to you.</h2>
+            <p class="sec-sub">Most tools keep your relationships in one very readable, very breachable place. Confidant takes the opposite bet: pieces only you can assemble.</p>
+          </div>
+          <div class="feat-grid">
+            <article class="feat">
+              <div class="chip">1</div>
+              <h3>An encrypted vault</h3>
+              <p>Contacts and notes are encrypted on your device before they're stored. Anyone who finds the files finds confetti, not a contact list.</p>
+            </article>
+            <article class="feat">
+              <div class="chip">2</div>
+              <h3>Backed by git</h3>
+              <p>Your vault is a git repo, so every change is versioned and syncable anywhere git goes — while the remote only ever holds sealed pieces.</p>
+            </article>
+            <article class="feat">
+              <div class="chip">3</div>
+              <h3>Search that stays home</h3>
+              <p>Ask for a name, a company, a half-remembered detail. Search runs locally and decrypts in memory — nothing is sent anywhere to be "processed."</p>
+            </article>
+            <article class="feat">
+              <div class="chip">4</div>
+              <h3>A memory your agents share</h3>
+              <p>Your AI helpers brief themselves from the same vault you keep — who's who, what you discussed, what's next. One shared memory, on your machine, owned by you.</p>
+            </article>
+            <article class="feat">
+              <div class="chip">5</div>
+              <h3>No cloud, no account</h3>
+              <p>No subscription seat-tax on your own friendships, no company sitting on a map of everyone you know. There's no server because there doesn't need to be.</p>
+            </article>
+            <article class="feat">
+              <div class="chip">6</div>
+              <h3>Open source, in Rust</h3>
+              <p>Apache-2.0 and fast. Don't take our word for any of this — the whole puzzle box is on GitHub for anyone to inspect.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" id="how">
+        <div class="wrap">
+          <div class="sec-head">
+            <p class="sec-tag">How it works</p>
+            <h2>Three steps to <span class="co">reassembled</span>.</h2>
+          </div>
+          <div class="steps">
+            <article class="step">
+              <div class="snum">1</div>
+              <h3>Make your vault</h3>
+              <p>One command creates an encrypted, git-backed vault on your machine and mints your key locally. The pieces start out yours.</p>
+              <code>confidant init</code>
+            </article>
+            <article class="step">
+              <div class="snum">2</div>
+              <h3>Collect the pieces</h3>
+              <p>Add people, organizations, and notes as life happens. Each one is sealed and committed — small fragments, safely scattered.</p>
+              <code>confidant add "…"</code>
+            </article>
+            <article class="step">
+              <div class="snum">3</div>
+              <h3>Put it together</h3>
+              <p>Before a call, pull the whole picture back together in a keystroke — for you, or as a briefing for your agents.</p>
+              <code>confidant find "…"</code>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" id="cli">
+        <div class="wrap">
+          <div class="sec-head">
+            <p class="sec-tag">The CLI moment</p>
+            <h2>Watch the pieces <span class="t">click</span>.</h2>
+            <p class="sec-sub">The <b>confidant</b> CLI is where it all comes together — quick, friendly, and entirely local.</p>
+          </div>
+          <div class="cli-card">
+            <div class="cap"><i></i><i></i><i></i><span>confidant — your terminal</span></div>
+            <pre><span class="cm"># walking into a call in two minutes…</span>
+<span class="p">$</span> confidant show maya-chen
+<span class="o">Maya Chen — founder, Northwind Labs
+Last contact: 12 days ago · Introduced by Sam Okafor</span>
+<span class="hl">Open thread: seed round timing; hiring a head of eng</span>
+
+<span class="cm"># …and one note afterward keeps it whole</span>
+<span class="p">$</span> confidant note maya-chen "Term sheet expected Friday."
+<span class="o">Saved ✓ sealed with your key, committed to your vault.</span></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="block" id="privacy">
+        <div class="wrap">
+          <div class="sec-head">
+            <p class="sec-tag">Privacy, by construction</p>
+            <h2>Pieces only <span class="co">you</span> can assemble.</h2>
+          </div>
+          <div class="trust-grid">
+            <div>
+              <p class="big">Privacy here isn't a promise in a policy document. It's what falls out of how the thing is built.</p>
+              <p>Encryption happens on your device, with a key generated there and kept there. Sync moves sealed fragments through git — history and shape, never contents. There is no Confidant server holding a readable copy of your life, because there is no Confidant server.</p>
+              <p>And since the code is fully open source, "trust us" is never the ask. Check the pieces yourself.</p>
+            </div>
+            <ul class="pieces">
+              <li><i></i><div>Your key, your device<span>Minted locally, never uploaded, never escrowed.</span></div></li>
+              <li><i></i><div>Ciphertext in transit<span>Git remotes store sealed records — nothing readable.</span></div></li>
+              <li><i></i><div>No accounts, no tracking<span>Nothing to sign up for; nothing phones home.</span></div></li>
+              <li><i></i><div>Yours to walk away with<span>The vault is plain files in a folder you own.</span></div></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="cta-band">
+        <div class="wrap">
+          <div class="cta-card">
+            <h2>Ready to hold all the pieces yourself?</h2>
+            <p>Confidant is free and open source. Grab it from GitHub, spin up a vault, and keep your network in the one pair of hands it belongs in — yours.</p>
+            <div class="cta-row">
+              <a class="btn solid" href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">github.com/hirefrank/confidant</a>
+              <a class="btn teal" href="#how">How it works</a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <div class="wrap">
+          <div class="frow">
+            <span>confidant</span>
+            <span>Relationship memory you own — local-first, encrypted, git-backed, open source.</span>
+            <span class="spacer"></span>
+            <a href="https://github.com/hirefrank/confidant" target="_blank" rel="noopener">GitHub</a>
+            <span>Apache-2.0</span>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </body>
+</html>
