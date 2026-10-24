@@ -988,6 +988,57 @@ fn device_add_check_failure_leaves_keys_untouched() {
 }
 
 #[test]
+fn device_add_initiate_json_output_writes_request_file() {
+    // #719: `--json --output` used to print the envelope and never write
+    // the file (the --json branch swallowed --output). The file must
+    // exist, hold exactly the TOML document carried in the envelope's
+    // "request" field, and parse as a device-add request; the JSON must
+    // state its path.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req-json.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("initiate JSON");
+    assert_eq!(v["output"].as_str(), Some(req.to_str().unwrap()));
+    let file_body = std::fs::read_to_string(&req).expect("request file must exist");
+    assert_eq!(
+        file_body,
+        v["request"].as_str().expect("request in JSON"),
+        "file must hold exactly the envelope's request document"
+    );
+    let doc: toml::Value = toml::from_str(&file_body).unwrap();
+    assert_eq!(doc["label"].as_str(), Some("b"));
+    assert!(
+        !doc["pubkey"].as_str().unwrap_or("").is_empty(),
+        "request file must carry a pubkey"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&req.display().to_string()),
+        "stderr must state the written path, got: {stderr}"
+    );
+}
+
+#[test]
 fn revoke_check_failure_leaves_keys_untouched() {
     // #175: same guarantee as device-add — a failing pre-commit check
     // after a revoke mutation leaves keys/ byte-identical.
