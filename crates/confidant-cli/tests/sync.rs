@@ -486,3 +486,72 @@ fn pull_refuses_a_dirty_tree_that_would_be_overwritten() {
     assert!(after.ends_with("# local edit\n"), "{after}");
     assert!(!after.contains("# remote edit"), "{after}");
 }
+
+/// #736: the default report prints its own resolution. The original
+/// repro was an operator who ran `sync`, saw the vault was behind, and
+/// did not know `sync --pull` existed — because nothing in the report
+/// said so. Behind names `--pull`, ahead names `--push`, and an
+/// up-to-date report names nothing.
+#[cfg(unix)]
+#[test]
+fn default_report_names_its_remedy() {
+    // Behind: the report names --pull, in text and in JSON, and the
+    // remedy survives into a --dry-run report of the same state.
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 ahead, 1 behind"), "{text}");
+    assert!(
+        text.contains(
+            "Run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s))"
+        ),
+        "{text}"
+    );
+
+    let (status, v) = fixture.run_json(&["sync", "--dry-run", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["behind"], 1, "{v}");
+    assert_eq!(
+        v["remedy"],
+        "Run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s))",
+        "{v}"
+    );
+
+    // Ahead: the report names --push.
+    let fixture = SyncVault::new();
+    git(
+        &fixture.vault,
+        &["commit", "-q", "--allow-empty", "-m", "local"],
+    );
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1 ahead, 0 behind"), "{text}");
+    assert!(
+        text.contains("Run `confidant sync --push` to push 1 commit(s) to origin/main"),
+        "{text}"
+    );
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["ahead"], 1, "{v}");
+    assert_eq!(
+        v["remedy"], "Run `confidant sync --push` to push 1 commit(s) to origin/main",
+        "{v}"
+    );
+
+    // Up to date: no remedy line, and the JSON field is null.
+    let fixture = SyncVault::new();
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 ahead, 0 behind"), "{text}");
+    assert!(!text.contains("Run `confidant sync"), "{text}");
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert!(v["remedy"].is_null(), "{v}");
+}
