@@ -224,6 +224,109 @@ def assume_from_user_config(home=None):
     return isinstance(qmd, dict) and _truthy(qmd.get("assume_encrypted_disk", ""))
 
 
+def persist_encrypted_disk_assumption(home=None):
+    """Persist the operator's disk election: [qmd] assume_encrypted_disk.
+
+    Issue #723: the election happens once, at setup, in the user config
+    — the same file and [qmd] table that already carry this key (#540),
+    so no new key is invented. Text edit, not a TOML round-trip:
+    comments and unrelated keys (e.g. the #722 preflight keys) survive
+    byte-for-byte. Creates the [qmd] section when absent. Returns the
+    config path written.
+    """
+    home = home or os.environ.get("HOME")
+    if not home:
+        raise OSError("no HOME: cannot locate the user config")
+    path = os.path.join(home, USER_CONFIG_REL)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    lines = text.splitlines()
+    section_re = re.compile(r"^\s*\[qmd\]\s*(#.*)?$")
+    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
+    key_re = re.compile(r"^\s*assume_encrypted_disk\s*=")
+    section_at = next((i for i, ln in enumerate(lines) if section_re.match(ln)),
+                      None)
+    if section_at is None:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append("[qmd]")
+        lines.append("assume_encrypted_disk = true")
+    else:
+        end = len(lines)
+        for i in range(section_at + 1, len(lines)):
+            if header_re.match(lines[i]):
+                end = i
+                break
+        key_at = next((i for i in range(section_at + 1, end)
+                       if key_re.match(lines[i])), None)
+        if key_at is not None:
+            lines[key_at] = "assume_encrypted_disk = true"
+        else:
+            lines.insert(section_at + 1, "assume_encrypted_disk = true")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def elect_encrypted_disk(vault):
+    """The setup-time election (issue #723), in plain language.
+
+    Runs only when the caller already knows the gate failed and stdin
+    is a TTY: the operator is present and thinking about it, which is
+    exactly when this decision belongs. Returns True when the operator
+    asserts and the assertion is persisted (the build may proceed), or
+    exits: a decline means QMD stays off, and EOF means the operator
+    walked away — both are refused builds, never silent ones.
+    """
+    detected = encrypted_disk_detected(vault)
+    if detected is False:
+        known = ("Checked this host: no encrypted disk was found "
+                 "(FileVault/dm-crypt detection ran and came back negative).")
+    else:
+        known = ("This host could not be checked from inside — common on "
+                 "cloud VMs and containers, where there is no local disk "
+                 "for detection to find.")
+    print("The search index is a readable copy of your vault's cleared "
+          "notes: anyone who can read this computer's disk can read the "
+          "index. That is why indexing asks about disk encryption.",
+          file=sys.stderr)
+    print(f"{known} If you have verified the disk is encrypted another "
+          "way (your provider encrypts it, for example), you can assert "
+          "that here and the answer is recorded, so the next run — or "
+          "the next agent — does not have to ask again. If you decline, "
+          "QMD stays off and keyword search (`confidant find`) remains "
+          "the search path.", file=sys.stderr)
+    while True:
+        print("Assert the disk is encrypted and record it? "
+              "[a]ssert and record / [d]ecline (QMD stays off): ",
+              file=sys.stderr, end="")
+        try:
+            answer = sys.stdin.readline()
+        except OSError:
+            answer = ""
+        if not answer:  # EOF: the operator walked away — refuse, don't assume
+            sys.exit("error: refusing to build: no disk-encryption "
+                     "election was made (see --i-confirm-encrypted-disk / "
+                     "--assert-and-persist-encrypted-disk).")
+        answer = answer.strip().lower()
+        if answer in ("a", "assert"):
+            path = persist_encrypted_disk_assumption()
+            print(f"encrypted disk: asserted by operator at setup, recorded "
+                  f"in {path} [qmd].assume_encrypted_disk — ok",
+                  file=sys.stderr)
+            return True
+        if answer in ("d", "decline"):
+            sys.exit("QMD stays off: disk encryption was declined at setup; "
+                     "keyword search (`confidant find`) remains the search "
+                     "path. Re-run this script to elect again.")
+        print("Please answer 'a' (assert and record) or 'd' (decline).",
+              file=sys.stderr)
+
+
 def encrypted_disk_confirmation(vault, confirmed_flag):
     """The mechanism that satisfies the encrypted-disk gate, or None.
 
@@ -252,10 +355,17 @@ def ensure_encrypted_disk(vault, confirmed_flag):
 
     Prints which mechanism satisfied the gate to stderr (issue #540), so
     the trust assumption is visible in logs and never looks like a check.
+    When nothing satisfies the gate and the operator is present (stdin
+    is a TTY), issue #723's election runs instead of the bare refusal:
+    assert-and-record, or decline with QMD staying off. A non-TTY run
+    keeps the old refusal — an unattended script must not be prompted.
     """
     mechanism = encrypted_disk_confirmation(vault, confirmed_flag)
     if mechanism is not None:
         print(f"encrypted disk: {mechanism} — ok", file=sys.stderr)
+        return
+    if sys.stdin.isatty():
+        elect_encrypted_disk(vault)
         return
     sys.exit(
         "error: refusing to build: could not confirm the disk is encrypted.\n"
@@ -393,12 +503,23 @@ def main():
                          "end of setup (issue #722: preflight is part of "
                          "setup so the first real query is not the first "
                          "cold-start surprise)")
+    ap.add_argument("--assert-and-persist-encrypted-disk", action="store_true",
+                    help="issue #723: the scripted-setup form of answering "
+                         "'assert' at the setup prompt — assert the disk is "
+                         "encrypted AND record it as [qmd] "
+                         "assume_encrypted_disk in the user config, so the "
+                         "next run does not ask again (only if you have "
+                         "verified it yourself)")
     args = ap.parse_args()
 
     vault = resolve_vault(args.vault)
     # Device policy stays here (architecture §9b item 4): the corpus and the
     # QMD store hold plaintext chunks.
-    ensure_encrypted_disk(vault, args.i_confirm_encrypted_disk)
+    confirmed = args.i_confirm_encrypted_disk
+    if args.assert_and_persist_encrypted_disk:
+        persist_encrypted_disk_assumption()
+        confirmed = True
+    ensure_encrypted_disk(vault, confirmed)
     ensure_store_dirs(vault)
     migrate_default_store()
 
