@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `video` touch kind: video calls are now a core `touch` kind alongside `call` (phone) and `meet` (in person), so 1:1 video contact no longer has to be filed as `meet`, `call`, or `other` (#735).
+
 ## [0.7.0] - 2026-10-22
 
 **Disclosure:** the milestone 2 encryption has had no independent review,
