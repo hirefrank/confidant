@@ -358,6 +358,114 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
             "asserted via --i-confirm-encrypted-disk")
 
 
+class FakeTtyStdin(io.StringIO):
+    """stdin with isatty() True, so the #723 election prompt runs."""
+
+    def isatty(self):
+        return True
+
+
+class FakePipeStdin(io.StringIO):
+    """stdin with isatty() False, so the #723 election never prompts."""
+
+    def isatty(self):
+        return False
+
+
+class QmdIndexDiskElectionTest(unittest.TestCase):
+    """#723: the disk election happens once, at setup, and persists.
+
+    No new key is invented: the election writes the existing #540
+    `[qmd] assume_encrypted_disk` key. The interactive prompt runs only
+    on a TTY; anything else keeps the old refusal.
+    """
+
+    def setUp(self):
+        self.index = load_index_module()
+        self._saved_home = os.environ.get("HOME")
+        self._saved_stdin = sys.stdin
+        self._detected = self.index.encrypted_disk_detected
+        os.environ.pop("CONFIDANT_ASSUME_ENCRYPTED_DISK", None)
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-723-")
+        self.home = Path(self.tmp.name)
+        os.environ["HOME"] = str(self.home)
+
+    def tearDown(self):
+        self.index.encrypted_disk_detected = self._detected
+        sys.stdin = self._saved_stdin
+        if self._saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved_home
+        self.tmp.cleanup()
+
+    def user_config(self):
+        cfg = self.home / ".config" / "confidant" / "config.toml"
+        return cfg.read_text(encoding="utf-8") if cfg.is_file() else None
+
+    def test_persist_preserves_other_keys_and_comments(self):
+        cfg = self.home / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(
+            "# Preflight choice (issue #722).\n"
+            "[qmd]\noffline = true\n",
+            encoding="utf-8")
+        self.index.persist_encrypted_disk_assumption()
+        text = self.user_config()
+        self.assertIn("offline = true", text)
+        self.assertIn("# Preflight choice", text)
+        self.assertIn("assume_encrypted_disk = true", text)
+        # Idempotent: a second persist replaces, never duplicates.
+        self.index.persist_encrypted_disk_assumption()
+        self.assertEqual(self.user_config().count("assume_encrypted_disk"), 1)
+
+    def test_persist_creates_qmd_section(self):
+        self.index.persist_encrypted_disk_assumption()
+        self.assertEqual(
+            self.index.assume_from_user_config(), True)
+
+    def test_election_assert_persists_and_proceeds(self):
+        self.index.encrypted_disk_detected = lambda vault: None
+        sys.stdin = FakeTtyStdin("a\n")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIn("asserted by operator at setup", err.getvalue())
+        self.assertIn("assume_encrypted_disk = true", self.user_config())
+
+    def test_election_decline_keeps_qmd_off(self):
+        self.index.encrypted_disk_detected = lambda vault: None
+        sys.stdin = FakeTtyStdin("d\n")
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIn("stays off", str(caught.exception.code))
+        self.assertIsNone(self.user_config())
+
+    def test_election_eof_refuses_without_assuming(self):
+        self.index.encrypted_disk_detected = lambda vault: None
+        sys.stdin = FakeTtyStdin("")
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIsNone(self.user_config())
+
+    def test_election_reprompts_then_asserts(self):
+        self.index.encrypted_disk_detected = lambda vault: None
+        sys.stdin = FakeTtyStdin("maybe\na\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIn("assume_encrypted_disk = true", self.user_config())
+
+    def test_non_tty_keeps_the_old_refusal(self):
+        self.index.encrypted_disk_detected = lambda vault: None
+        sys.stdin = FakePipeStdin("")
+        with self.assertRaises(SystemExit) as caught:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.index.ensure_encrypted_disk("/vault", False)
+        self.assertIn("could not confirm", str(caught.exception.code))
+        self.assertIsNone(self.user_config())
+
+
 if __name__ == "__main__":
     # Strip our own --cli flag; leave any unittest flags (-v, -k, …) alone.
     argv, rest, i = [sys.argv[0]], sys.argv[1:], 0
