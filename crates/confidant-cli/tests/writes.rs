@@ -2902,7 +2902,7 @@ fn log_touch_rejects_unknown_kind_exit_2() {
     assert_eq!(v["error"]["code"], "usage_error");
     let message = v["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("call, text, email, meet, meal, event, gift, other"),
+        message.contains("call, text, email, meet, meal, event, gift, video, other"),
         "the error must list the core kinds: {message}"
     );
 }
@@ -2916,7 +2916,7 @@ fn log_touch_accepts_every_core_kind() {
     enable_personal(root);
 
     for (i, kind) in [
-        "call", "text", "email", "meet", "meal", "event", "gift", "other",
+        "call", "text", "email", "meet", "meal", "event", "gift", "video", "other",
     ]
     .iter()
     .enumerate()
@@ -2966,7 +2966,7 @@ fn log_touch_rejects_coffee_and_lists_v1_kinds() {
     assert_eq!(v["error"]["code"], "usage_error");
     let message = v["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("call, text, email, meet, meal, event, gift, other"),
+        message.contains("call, text, email, meet, meal, event, gift, video, other"),
         "the error must list the v1 kinds: {message}"
     );
 }

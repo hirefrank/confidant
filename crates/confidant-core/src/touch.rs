@@ -9,10 +9,11 @@
 use crate::ledger::{Arg, LedgerEntry};
 
 /// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.1 set
-/// as amended by #509). `coffee` was removed, not aliased: `meal` replaces
-/// it.
+/// as amended by #509, plus `video` per #735). `coffee` was removed, not
+/// aliased: `meal` replaces it. `video` is a video call: distinct from
+/// `call` (phone) and `meet` (in person).
 pub const TOUCH_KINDS: &[&str] = &[
-    "call", "text", "email", "meet", "meal", "event", "gift", "other",
+    "call", "text", "email", "meet", "meal", "event", "gift", "video", "other",
 ];
 
 /// Whether `kind` is one of [`TOUCH_KINDS`].
@@ -104,14 +105,16 @@ mod tests {
         }
     }
 
-    /// The 0.1 list is closed and pinned (#509): `coffee` is gone, `meal`
-    /// replaces it, and the order is the order the usage text lists.
+    /// The 0.1 list is closed and pinned (#509, plus `video` per #735):
+    /// `coffee` is gone, `meal` replaces it, and the order is the order
+    /// the usage text lists.
     #[test]
     fn touch_kinds_are_the_closed_v1_list() {
         assert_eq!(
             TOUCH_KINDS,
-            &["call", "text", "email", "meet", "meal", "event", "gift", "other"]
+            &["call", "text", "email", "meet", "meal", "event", "gift", "video", "other"]
         );
+        assert!(is_valid_touch_kind("video"));
         assert!(is_valid_touch_kind("meal"));
         assert!(!is_valid_touch_kind("coffee"));
         assert!(!is_valid_touch_kind(""));

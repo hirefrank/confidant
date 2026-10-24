@@ -602,7 +602,7 @@ enum LogAction {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
         person: String,
-        /// Touchpoint kind: call, text, email, meet, meal, event, gift, or other.
+        /// Touchpoint kind: call, text, email, meet, meal, event, gift, video, or other.
         kind: String,
         /// Touchpoint date YYYY-MM-DD (default today).
         #[arg(long)]

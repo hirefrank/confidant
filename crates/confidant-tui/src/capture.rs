@@ -87,7 +87,7 @@ impl CaptureKind {
                     FieldId::TouchKind,
                     "kind",
                     true,
-                    "call|text|email|meet|meal|event|gift|other",
+                    "call|text|email|meet|meal|event|gift|video|other",
                 ),
                 text(FieldId::Date, "date", false, "YYYY-MM-DD (blank for today)"),
                 text(
