@@ -152,7 +152,14 @@ export CONFIDANT_VAULT="$HOME/vault"
 # on the new device:
 confidant keys device-add --initiate --label "laptop-2" --output ~/device-add-request.toml
 # copy the request to an enrolled device, confirm the fingerprint out of band, then:
-confidant keys device-add --from-request ~/device-add-request.toml
+confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml
+# copy the anchor file back to the new device, pull, then finish enrollment there:
+git -C ~/vault pull
+confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
+# --complete verifies the anchor against the pulled vault (operator
+# certificate, lookup key, one client key) before installing it. Without
+# this step the new device holds wrapped keys but cannot decrypt: `doctor`
+# reports the missing anchor as an error. Never copy another vault's anchor.
 ```
 
 Headless hosts without an OS keychain: the **new** device needs only

@@ -501,7 +501,7 @@ enum KeysAction {
         #[arg(long)]
         phrase_file: Option<PathBuf>,
     },
-    /// Add a new device: two-step ceremony.
+    /// Add a new device: three-step ceremony (#713).
     ///
     /// On the new device, `keys device-add --initiate` emits a request
     /// carrying only the public key + a label — the private key never
@@ -511,7 +511,14 @@ enum KeysAction {
     /// not write a keychain. On an already-enrolled device,
     /// `keys device-add --from-request <file>` verifies the fingerprint
     /// out of band, re-wraps every client's every retained epoch plus the
-    /// vault lookup key to the new device, and commits.
+    /// vault lookup key to the new device, and commits. Enrollment alone
+    /// does not let the new device decrypt: after pulling, the new device
+    /// must also establish its trust anchor with
+    /// `keys device-add --complete --anchor-file <file>`, where the file
+    /// is this device's `trust.toml` as emitted by `--from-request
+    /// --anchor-out <file>` (or copied from the enrolled device). The
+    /// anchor is verified against the vault before it is installed, and
+    /// installation is refused when verification fails.
     DeviceAdd {
         /// Generate a device-add request on this (new) device. The request
         /// carries only the public key + label. Needs no vault.
@@ -523,6 +530,21 @@ enum KeysAction {
         /// --no-input.
         #[arg(long, value_name = "FILE")]
         from_request: Option<PathBuf>,
+        /// Finish enrollment on this (new) device: verify the trust anchor
+        /// in --anchor-file against the pulled vault and install it.
+        /// Needs the vault (after pull) and this device's identity.
+        #[arg(long)]
+        complete: bool,
+        /// Trust-anchor file to install (with --complete): a `trust.toml`
+        /// from an enrolled device, e.g. as written by
+        /// `--from-request --anchor-out`. Never a path inside the vault.
+        #[arg(long, value_name = "FILE")]
+        anchor_file: Option<PathBuf>,
+        /// Write this device's trust anchor to FILE (with --from-request),
+        /// for transfer to the new device. The file holds public-key
+        /// material only; it is written 0600 and never overwritten.
+        #[arg(long, value_name = "FILE")]
+        anchor_out: Option<PathBuf>,
         /// Human label for the new device (with --initiate).
         #[arg(long)]
         label: Option<String>,
@@ -1445,20 +1467,42 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 KeysAction::DeviceAdd {
                     initiate,
                     from_request,
+                    complete,
+                    anchor_file,
+                    anchor_out,
                     label,
                     output,
                     fingerprint_verified,
                     force,
                 } => {
                     // B6: flag combinations are usage errors (exit 2).
-                    if *initiate && from_request.is_some() {
+                    let modes = [*initiate, from_request.is_some(), *complete]
+                        .iter()
+                        .filter(|m| **m)
+                        .count();
+                    if modes != 1 {
                         return Err(anyhow::Error::new(DomainError::usage(
-                            "--initiate and --from-request are mutually exclusive",
+                            "keys device-add needs exactly one of --initiate, --from-request <file>, or --complete",
                         )));
                     }
                     if !initiate && (label.is_some() || output.is_some()) {
                         return Err(anyhow::Error::new(DomainError::usage(
                             "--label and --output only make sense with --initiate",
+                        )));
+                    }
+                    if anchor_file.is_some() && !complete {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--anchor-file only makes sense with --complete",
+                        )));
+                    }
+                    if anchor_out.is_some() && from_request.is_none() {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--anchor-out only makes sense with --from-request",
+                        )));
+                    }
+                    if *complete && *fingerprint_verified {
+                        return Err(anyhow::Error::new(DomainError::usage(
+                            "--fingerprint-verified only makes sense with --from-request",
                         )));
                     }
                     if *initiate {
@@ -1468,6 +1512,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                             output.as_deref(),
                             *force,
                         )
+                    } else if *complete {
+                        let root = vault_root.unwrap();
+                        cmd_keys_device_add_complete(&cli, &root, anchor_file.as_deref())
                     } else {
                         let root = vault_root.unwrap();
                         cmd_keys_device_add_from_request(
@@ -1475,6 +1522,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                             &root,
                             from_request.as_deref(),
                             *fingerprint_verified,
+                            anchor_out.as_deref(),
                         )
                     }
                 }
@@ -7042,13 +7090,26 @@ fn cmd_context(
             // ⚠2b: the person's key is absent (their record is an envelope
             // this device cannot read) is a hard error, not "not found".
             if record_decrypt::person_has_envelope(&vault.root, &person.to_string()) {
+                // #713: a missing trust anchor is the common just-added
+                // case, and neither suggested fix below applies to it
+                // (device-add already happened; `recover` rotates the
+                // phrase and drops other wrappings). Point at --complete.
+                let anchor_missing = confidant_config_dir()
+                    .is_none_or(|dir| confidant_crypt::anchor::load(&dir, &vault.root).is_err());
+                let fix = if anchor_missing {
+                    "This device has no trust anchor yet: get it from an enrolled device \
+                     (`confidant keys device-add --from-request <file> --anchor-out <anchor-file>` \
+                     there, or copy its trust.toml) and run \
+                     `confidant keys device-add --complete --anchor-file <anchor-file>` after pulling; \
+                     run `confidant doctor` to confirm"
+                } else {
+                    "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`"
+                };
                 return Err(anyhow::Error::new(
                     DomainError::invalid(format!(
                         "cannot decrypt records for {person_raw}: this device has no key for them"
                     ))
-                    .with_fix(
-                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                    ),
+                    .with_fix(fix),
                 ));
             }
             return Err(anyhow::Error::new(DomainError::not_found(format!(
@@ -7690,6 +7751,156 @@ fn device_key_check() -> DoctorCheck {
                  then re-run `confidant doctor`"
             )),
         ),
+    }
+}
+
+/// #713: trust-anchor state for this device. Before this check, a device
+/// added via `device-add` that had never established its trust anchor
+/// passed `doctor` clean while being unable to decrypt a single record:
+/// the `device-key` check only verifies a key *source* exists. This check
+/// closes that gap for encrypted vaults: a missing/unreadable anchor is
+/// an error (with the `--complete` fix), a certificate mismatch is an
+/// error, and a trial unwrap of one client key proves the anchor matches
+/// this vault and this device. Read-only: the client trial never advances
+/// the seq tracker. Plaintext vaults, unkeyed vaults, and unreadable
+/// vaults stay `ok` — the anchor question does not apply to them, and
+/// their own checks already report their state.
+fn trust_anchor_check(root: &Path) -> DoctorCheck {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+
+    const ID: &str = "trust-anchor";
+    let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
+        id: ID,
+        status,
+        message,
+        fix,
+    };
+    let vault = match load_vault(root) {
+        Ok(v) => v,
+        Err(_) => {
+            return check(
+                "ok",
+                "could not determine (vault unreadable; see vault-load check)".to_owned(),
+                None,
+            );
+        }
+    };
+    match confidant_core::crypto_mode::resolve_write_mode(root, &vault.config) {
+        Ok(confidant_core::crypto_mode::WriteMode::Plaintext) => {
+            return check(
+                "ok",
+                "plaintext vault; no trust anchor required".to_owned(),
+                None,
+            );
+        }
+        Ok(confidant_core::crypto_mode::WriteMode::Encrypted) => {}
+        Err(_) => {
+            return check(
+                "ok",
+                "vault not yet keyed; no trust anchor to check".to_owned(),
+                None,
+            );
+        }
+    }
+    let complete_fix = "On the new device, finish enrollment: get the trust anchor from an \
+         enrolled device (`confidant keys device-add --from-request <file> --anchor-out <anchor-file>` \
+         there, or copy its trust.toml) and run \
+         `confidant keys device-add --complete --anchor-file <anchor-file>` after pulling. \
+         Do not run `confidant recover` unless every enrolled device is lost.";
+    let config_dir = match confidant_config_dir() {
+        Some(d) => d,
+        None => {
+            return check(
+                "error",
+                "cannot locate the config dir (HOME unset); trust anchor cannot be checked"
+                    .to_owned(),
+                None,
+            );
+        }
+    };
+    let loaded = match anchor::load(&config_dir, root) {
+        Ok((a, _warnings)) => a,
+        Err(e) => {
+            return check(
+                "error",
+                format!("trust anchor missing or unreadable: {e}; agent reads cannot decrypt"),
+                Some(complete_fix.to_owned()),
+            );
+        }
+    };
+    if let Err(e) = verify_anchor_cert(root, &vault.config.vault_id, &loaded) {
+        let domain = DomainError::of(&e)
+            .cloned()
+            .unwrap_or_else(|| DomainError::internal(format!("{e:#}")));
+        return check(
+            "error",
+            domain.message().to_owned(),
+            domain.fix().map(str::to_owned),
+        );
+    }
+    // No device identity (or no client keys) means no trial is possible;
+    // the anchor itself is present and certificate-clean, and the
+    // `device-key` check already reports the key side.
+    let identity = match keys_device_identity() {
+        Ok(i) => i,
+        Err(_) => {
+            return check(
+                "ok",
+                "trust anchor present; no device key available to trial-unwrap with".to_owned(),
+                None,
+            );
+        }
+    };
+    let device_pubkey = match device_pubkey_string() {
+        Ok(p) => p,
+        Err(_) => {
+            return check(
+                "ok",
+                "trust anchor present; no device key available to trial-unwrap with".to_owned(),
+                None,
+            );
+        }
+    };
+    let store =
+        match KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                return check(
+                    "error",
+                    format!("trust anchor present but the key store cannot be read: {e}"),
+                    None,
+                );
+            }
+        };
+    match trial_unwrap_first_client(&store, &loaded, identity.as_ref(), &device_pubkey) {
+        Ok(true) => check(
+            "ok",
+            "trust anchor present and verified (trial unwrap of a client key passed)".to_owned(),
+            None,
+        ),
+        Ok(false) => check(
+            "ok",
+            "trust anchor present; no client keys to trial-unwrap".to_owned(),
+            None,
+        ),
+        Err(confidant_crypt::error::Error::NoKey(_)) => check(
+            "warning",
+            "trust anchor present but this device is not enrolled in this vault's client keys"
+                .to_owned(),
+            Some(
+                "Ask an enrolled device to run `confidant keys device-add --from-request` \
+                 for this device, then pull and retry"
+                    .to_owned(),
+            ),
+        ),
+        Err(e) => {
+            let domain = map_unwrap_failure(e);
+            check(
+                "error",
+                domain.message().to_owned(),
+                domain.fix().map(str::to_owned),
+            )
+        }
     }
 }
 
@@ -8891,6 +9102,10 @@ fn cmd_doctor(
     // have no Secret Service, so the failure an agent hits is otherwise an
     // opaque NoKey; this names the source and the env-var fix.
     checks.push(device_key_check());
+
+    // #713: the anchor is what makes decryption possible; a device-key
+    // source alone proves nothing about it.
+    checks.push(trust_anchor_check(root));
 
     // #105: report pending inbox rotation as a warning until explicitly cleared.
     if let Ok(pending_path) = pending_inbox_rotation_path() {
@@ -12324,6 +12539,18 @@ pub(crate) fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + S
     Ok(Box::new(identity))
 }
 
+/// This device's age recipient string (public key) from its identity.
+/// Public material only; used to derive the device key id for trial
+/// unwraps (#713).
+fn device_pubkey_string() -> anyhow::Result<String> {
+    let bech32 = device_key_bech32()?;
+    let identity: age::x25519::Identity = bech32
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}"))))?;
+    Ok(identity.to_public().to_string())
+}
+
 /// Derive the recipient key id for a device from its age pubkey.
 ///
 /// Stable and unique per device: `device-` + 8 chars from the pubkey.
@@ -12976,6 +13203,7 @@ fn cmd_keys_device_add_from_request(
     root: &Path,
     from_request: Option<&Path>,
     fingerprint_verified: bool,
+    anchor_out: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
     use confidant_crypt::{anchor, manifest::RecipientEntry};
 
@@ -13054,6 +13282,15 @@ fn cmd_keys_device_add_from_request(
 
     let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
     let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+    // #713: emit the trust anchor for the new device BEFORE mutating
+    // anything. The anchor holds public-key material only and is
+    // unchanged by device-add, so a later failure here leaves a file the
+    // new device's --complete step verifies against the pulled vault
+    // (and refuses when enrollment did not land). Written 0600,
+    // create-new: never silently overwrite an existing file.
+    if let Some(path) = anchor_out {
+        write_anchor_out_file(&config_dir, path)?;
+    }
     let identity = keys_device_identity()?;
     let operator_sk = load_operator_sk(&anchor)?;
 
@@ -13105,7 +13342,7 @@ fn cmd_keys_device_add_from_request(
     )?;
 
     if cli.json {
-        print_json(&serde_json::json!({
+        let mut value = serde_json::json!({
             "ok": true,
             "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
             "vault": root.to_string_lossy(),
@@ -13114,11 +13351,345 @@ fn cmd_keys_device_add_from_request(
             "key_id": key_id,
             "clients": clients,
             "client_count": clients.len(),
-        }))?;
+        });
+        if let Some(path) = anchor_out {
+            value["anchor_out"] = serde_json::Value::String(path.display().to_string());
+        }
+        print_json(&value)?;
     } else {
         println!(
             "added device {key_id} ({label}) to {} client(s)",
             clients.len()
+        );
+        if let Some(path) = anchor_out {
+            println!(
+                "wrote trust anchor to {}; copy it to the new device and run \
+                 `confidant keys device-add --complete --anchor-file {}` there after pulling",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write this device's `trust.toml` bytes to `path` for transfer to a new
+/// device (#713). The anchor holds public-key material only, but it is
+/// still written 0600 and create-new: overwriting an existing file could
+/// swap the anchor a pending `--complete` run is about to install.
+fn write_anchor_out_file(config_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    use confidant_crypt::anchor;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = std::fs::read(config_dir.join(anchor::TRUST_FILE)).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot read trust anchor for --anchor-out: {e}"
+        )))
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            let fix = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "Choose a new --anchor-out path, or remove the existing file first"
+            } else {
+                "Choose a writable --anchor-out path in an existing directory"
+            };
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write trust anchor to {}: {e}",
+                path.display()
+            )))
+            .with_fix(fix)
+        })?;
+    file.write_all(&bytes).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot write trust anchor to {}: {e}",
+            path.display()
+        )))
+    })?;
+    Ok(())
+}
+
+/// Outcome of verifying a candidate trust anchor against the pulled vault
+/// (#713). `cert`, `lookup`, and `client_unwrap` are each `pass` or
+/// `absent` (nothing to check against); a failed check is an error, never
+/// a status string — a candidate anchor is installed only when every
+/// applicable check passes.
+struct AnchorChecks {
+    cert: &'static str,
+    lookup: &'static str,
+    client_unwrap: &'static str,
+}
+
+/// Verify the candidate anchor's operator key against the vault's
+/// operator certificate (`keys/operator.toml`, signed at `init` by the
+/// recovery key). Returns `pass` when the certificate verifies to the
+/// candidate operator key, `absent` when the vault predates certificates.
+/// A present-but-mismatching certificate is a hard error: the candidate
+/// anchor is for another vault (or a transplanted one), and installing it
+/// would leave every read failing against the wrong trust root.
+fn verify_anchor_cert(
+    root: &Path,
+    vault_id: &str,
+    anchor: &confidant_crypt::anchor::Anchor,
+) -> anyhow::Result<&'static str> {
+    use confidant_crypt::anchor;
+    let keys_dir = root.join("keys");
+    if !keys_dir.join(anchor::OPERATOR_CERT_FILE).is_file() {
+        return Ok("absent");
+    }
+    let operator =
+        anchor::verify_operator_cert(&keys_dir, vault_id, &anchor.recovery).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "trust anchor does not match this vault's operator certificate: {e}"
+            )))
+            .with_fix(
+                "Use the trust anchor from an enrolled device of THIS vault; \
+                 an anchor copied from another vault can never decrypt here",
+            )
+        })?;
+    if operator != anchor.operator {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "trust anchor operator key does not match this vault's operator certificate",
+            )
+            .with_fix(
+                "Use the trust anchor from an enrolled device of THIS vault; \
+                 an anchor copied from another vault can never decrypt here",
+            ),
+        ));
+    }
+    Ok("pass")
+}
+
+/// Map a trial-unwrap failure to the fix the operator actually needs
+/// (#713). A manifest failure means the candidate anchor does not verify
+/// this vault's signed manifests; any other failure (no wrapping, age
+/// open failure) means this device holds no usable key here — most often
+/// `--from-request` has not run (or has not been pulled) yet.
+fn map_unwrap_failure(e: confidant_crypt::error::Error) -> DomainError {
+    use confidant_crypt::error::Error as CryptError;
+    match e {
+        CryptError::Manifest(_) => DomainError::invalid(format!(
+            "trust anchor does not verify this vault's key manifests: {e}"
+        ))
+        .with_fix(
+            "Use the trust anchor from an enrolled device of THIS vault; \
+             an anchor copied from another vault can never decrypt here",
+        ),
+        _ => DomainError::invalid(format!(
+            "this device cannot unwrap vault keys with its device key: {e}"
+        ))
+        .with_fix(
+            "Ask an enrolled device to run `confidant keys device-add --from-request` \
+             for this device, pull on this device, then retry --complete",
+        ),
+    }
+}
+
+/// Trial-unwrap one client data key with this device's identity under the
+/// candidate anchor. Read-only: `trial_unwrap_data_key` verifies the
+/// manifest without advancing the off-vault seq tracker, so this is safe
+/// for `doctor` as well as `--complete`. Returns `Ok(true)` on a pass,
+/// `Ok(false)` when the vault has no client keys to trial (a vault with
+/// only a lookup key), and the raw crypto error otherwise (callers map it:
+/// `NoKey` means "not enrolled", `Manifest` means "anchor does not match
+/// this vault"). Tries clients in order until one passes so a single
+/// uninitialized client cannot block the check; the first failure is
+/// reported when none pass.
+fn trial_unwrap_first_client(
+    store: &confidant_crypt::lifecycle::KeyStore,
+    anchor: &confidant_crypt::anchor::Anchor,
+    identity: &dyn age::Identity,
+    device_pubkey: &str,
+) -> Result<bool, confidant_crypt::error::Error> {
+    use confidant_crypt::manifest::VAULT_CLIENT_ID;
+    let key_id = device_key_id(device_pubkey);
+    let mut clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != VAULT_CLIENT_ID)
+        .collect();
+    clients.sort();
+    let mut first_error: Option<confidant_crypt::error::Error> = None;
+    for client_id in &clients {
+        let epoch = match store.current_epoch(client_id) {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
+        match store.trial_unwrap_data_key(client_id, &key_id, epoch, identity, anchor) {
+            Ok(key) => {
+                drop(key);
+                return Ok(true);
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
+}
+
+/// `keys device-add --complete` (#713): run on the new device after
+/// pulling the enrolled device's device-add commit. Verifies the trust
+/// anchor in `--anchor-file` against the pulled vault — operator
+/// certificate when present, vault lookup key, and one client data key —
+/// and installs it as this device's `trust.toml`. Fails loudly, writing
+/// nothing, when any applicable check fails, when this device is not
+/// enrolled yet, or when an anchor is already installed and differs.
+/// Re-running with the same anchor is a verified no-op.
+fn cmd_keys_device_add_complete(
+    cli: &Cli,
+    root: &Path,
+    anchor_file: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    use confidant_crypt::{anchor, lifecycle::KeyStore};
+
+    let anchor_path = anchor_file.ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(
+            "keys device-add --complete requires --anchor-file <file>",
+        ))
+    })?;
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+    // Parse + shape-validate the candidate first: `load_from` refuses an
+    // anchor file inside the vault (a vault copy is informational only
+    // and never trusted) and rejects malformed keys.
+    let candidate = anchor::load_from(anchor_path, root).map_err(anyhow::Error::new)?;
+
+    // An installed anchor is never silently replaced: identical is a
+    // verified no-op, different is a hard refusal (re-pin via `recover`).
+    let trust_path = config_dir.join(anchor::TRUST_FILE);
+    if trust_path.is_file() {
+        let (existing, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
+        if existing.operator == candidate.operator
+            && existing.recovery == candidate.recovery
+            && existing.recovery_age == candidate.recovery_age
+        {
+            // Still verify: an identical-but-unusable anchor (wrong vault
+            // pulled under it) must not report success.
+            let vault = load_vault(root)?;
+            let cert = verify_anchor_cert(root, &vault.config.vault_id, &candidate)?;
+            let identity = keys_device_identity()?;
+            let device_pubkey = device_pubkey_string()?;
+            let store =
+                KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir)
+                    .map_err(anyhow::Error::new)?;
+            let client_unwrap =
+                trial_unwrap_first_client(&store, &candidate, identity.as_ref(), &device_pubkey)
+                    .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+                    "vault": root.to_string_lossy(),
+                    "anchor": "already_present",
+                    "checks": {
+                        "cert": cert,
+                        "client_unwrap": if client_unwrap { "pass" } else { "absent" },
+                    },
+                }))?;
+            } else {
+                println!("trust anchor already installed and verified for this vault");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "a different trust anchor is already installed at {}; refusing to replace it",
+                trust_path.display()
+            ))
+            .with_fix(
+                "If this device belongs to another vault, use that vault's config dir; \
+                 to re-pin this vault, run `confidant recover` (only when every enrolled device is lost)",
+            ),
+        ));
+    }
+
+    let vault = load_vault(root)?;
+    let cert = verify_anchor_cert(root, &vault.config.vault_id, &candidate)?;
+    let identity = keys_device_identity()?;
+    let device_pubkey = device_pubkey_string()?;
+    let mut store =
+        KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir)
+            .map_err(anyhow::Error::new)?;
+
+    // The vault lookup key: device-add re-wraps it to every new device,
+    // so it is the enrollment proof even for a vault with no clients yet.
+    // `read_lookup_key` verifies the vault manifest against the candidate
+    // anchor and commitment-checks the unwrapped key. (It advances the
+    // off-vault seq tracker; that is fine for a setup command, and
+    // `doctor` uses only the read-only client trial instead.)
+    let lookup = if root.join("keys/vault/lookup.age").is_file() {
+        match store.read_lookup_key(identity.as_ref(), &candidate) {
+            Ok((key, _, _)) => {
+                drop(key);
+                "pass"
+            }
+            Err(e) => return Err(anyhow::Error::new(map_unwrap_failure(e))),
+        }
+    } else {
+        "absent"
+    };
+    let client_unwrap =
+        trial_unwrap_first_client(&store, &candidate, identity.as_ref(), &device_pubkey)
+            .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
+    if lookup == "absent" && !client_unwrap {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(
+                "cannot verify the trust anchor: this vault has no lookup key and no client keys to trial-unwrap",
+            )
+            .with_fix(
+                "Ask an enrolled device to run `confidant keys device-add --from-request` \
+                 for this device, pull on this device, then retry --complete",
+            ),
+        ));
+    }
+
+    anchor::save(
+        &config_dir,
+        root,
+        &candidate.operator,
+        &candidate.recovery,
+        &candidate.recovery_age,
+    )
+    .map_err(anyhow::Error::new)?;
+
+    let checks = AnchorChecks {
+        cert,
+        lookup,
+        client_unwrap: if client_unwrap { "pass" } else { "absent" },
+    };
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "anchor": "installed",
+            "checks": {
+                "cert": checks.cert,
+                "lookup": checks.lookup,
+                "client_unwrap": checks.client_unwrap,
+            },
+        }))?;
+    } else {
+        println!("trust anchor installed for this vault");
+        println!("  certificate   {}", checks.cert);
+        println!("  lookup key    {}", checks.lookup);
+        println!("  client key    {}", checks.client_unwrap);
+        println!(
+            "agent reads on this device should now decrypt; run `confidant doctor` to confirm"
         );
     }
     Ok(ExitCode::SUCCESS)
