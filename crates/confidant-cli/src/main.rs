@@ -526,7 +526,9 @@ enum KeysAction {
         /// Human label for the new device (with --initiate).
         #[arg(long)]
         label: Option<String>,
-        /// Write the request to FILE instead of stdout (with --initiate).
+        /// Write the request to FILE (with --initiate). Without --json
+        /// this replaces the stdout document; with --json the file is
+        /// written in addition to the JSON envelope.
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
         /// Confirm the request fingerprint was verified out of band.
@@ -12928,6 +12930,16 @@ fn cmd_keys_device_add_initiate(
         eprintln!("using {DEVICE_KEY_ENV} as this device's identity (not stored in a keychain)");
     }
 
+    // #719: --output must materialize the request file in every output
+    // mode. Previously the --json branch swallowed --output entirely:
+    // the file write lived in the `else if` arm, so `--json --output`
+    // printed the envelope and never wrote the file. Write (and verify)
+    // first, so a write failure exits non-zero before any success output.
+    if let Some(path) = output {
+        write_device_add_request(path, &document)?;
+        eprintln!("wrote device-add request to {}", path.display());
+    }
+
     if cli.json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -12939,32 +12951,48 @@ fn cmd_keys_device_add_initiate(
             "key_source": key_source,
             "pubkey": recipient,
             "request": document,
+            "output": output.map(|p| p.display().to_string()),
         }))?;
-    } else if let Some(path) = output {
-        // 0644 explicit: the request carries only the public key + label,
-        // safe to transfer. Deliberate, not a default.
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(document.as_bytes())
-            })
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot write device-add request to {}: {e}",
-                    path.display()
-                )))
-            })?;
-        eprintln!("wrote device-add request to {}", path.display());
-    } else {
+    } else if output.is_none() {
         print!("{document}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write a device-add request document to `path` and verify the bytes
+/// landed by reading them back. A write or verification failure is an
+/// error, so the caller never reports success for a request file that
+/// does not exist. 0644 explicit: the request carries only the public
+/// key + label, safe to transfer. Deliberate, not a default.
+fn write_device_add_request(path: &Path, document: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)
+        .and_then(|mut f| f.write_all(document.as_bytes()))
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write device-add request to {}: {e}",
+                path.display()
+            )))
+        })?;
+    let written = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot verify device-add request at {}: {e}",
+            path.display()
+        )))
+    })?;
+    if written != document {
+        return Err(anyhow::Error::new(DomainError::internal(format!(
+            "device-add request at {} failed verification: written bytes differ",
+            path.display()
+        ))));
+    }
+    Ok(())
 }
 
 /// `keys device-add --from-request <file>`: run on an already-enrolled
