@@ -141,7 +141,7 @@ fn search_with(
     if needle.is_empty() {
         return Ok(SearchResult {
             hits: Vec::new(),
-            findings,
+            findings: with_skipped_encrypted_warning(findings, true, vault.skipped_encrypted),
             skipped_encrypted: vault.skipped_encrypted,
             refused_envelopes: vault.refused_envelopes,
         });
@@ -185,9 +185,10 @@ fn search_with(
         }
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    let empty = hits.is_empty();
     Ok(SearchResult {
         hits,
-        findings,
+        findings: with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted),
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
     })
@@ -1048,6 +1049,43 @@ fn tokens_allowed_with(
         }
     }
     true
+}
+
+/// #718: a zero-match `find` over a vault with skipped encrypted records
+/// must not read as "not in the vault". When no hit was found and at least
+/// one encrypted record could not be searched, append a warning finding
+/// carrying the count and the remedy, in-band with the other findings —
+/// so JSON callers branch on `W_SKIPPED_ENCRYPTED` instead of gliding
+/// past the `skipped_encrypted` count. Deliberately empty-only: a
+/// non-empty result already shows the search found something, and the
+/// count field still reports the skips. Refused (tampered) envelopes are
+/// not folded in — they are a different, already-counted condition.
+/// No vault content goes into the message: only the count.
+fn with_skipped_encrypted_warning(
+    mut findings: Vec<Finding>,
+    empty: bool,
+    skipped_encrypted: u32,
+) -> Vec<Finding> {
+    if empty && skipped_encrypted > 0 {
+        let message = if skipped_encrypted == 1 {
+            "1 encrypted record was not searched; this result does not establish \
+             absence — try `resolve`/`context`, or build the search corpus with `reindex`."
+                .to_owned()
+        } else {
+            format!(
+                "{skipped_encrypted} encrypted records were not searched; this result \
+                 does not establish absence — try `resolve`/`context`, or build the \
+                 search corpus with `reindex`."
+            )
+        };
+        findings.push(Finding::new(
+            FindingCode::SkippedEncrypted,
+            Severity::Warning,
+            message,
+        ));
+        sort_findings(&mut findings);
+    }
+    findings
 }
 
 fn findings_for_find(allow: &Allowlist<'_>) -> Vec<Finding> {
