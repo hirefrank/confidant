@@ -83,6 +83,10 @@ pub enum ErrorKind {
     /// `--person` / `resolve` matched more than one cleared person by exact
     /// display name. Fail closed: the caller must disambiguate.
     AmbiguousPerson,
+    /// A person lookup could not search the vault: encrypted records went
+    /// unread (no usable key material) or envelopes were refused. A miss
+    /// against that partial set must never be reported as `NotFound` (#717).
+    CannotSearch,
     /// `keys verify-recovery` found a phrase that a later `recover` or
     /// `keys shred` replaced. The derived recipient is in the vault's
     /// append-only recovery history but is not the anchor's current one.
@@ -132,6 +136,7 @@ impl ErrorKind {
             Self::NotFastForward => "E_NOT_FAST_FORWARD",
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
+            Self::CannotSearch => "E_CANNOT_SEARCH",
             Self::RecoveryRetired => "E_RECOVERY_RETIRED",
             Self::RecoveryMismatch => "E_RECOVERY_MISMATCH",
             Self::RecoveryMalformed => "E_RECOVERY_MALFORMED",
@@ -240,6 +245,48 @@ impl DomainError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Internal, message)
+    }
+
+    /// A person lookup miss against a vault that did not load in full
+    /// (#717). The message names the cause and the counts, and states
+    /// plainly that the miss does not establish absence; it never claims
+    /// the person is not in the vault. The fix names the actual remedy
+    /// for each cause: missing key material (trust anchor / device key)
+    /// for skips, git-history restore for refused envelopes. It
+    /// deliberately does not suggest `recover`: recovery is only for
+    /// when every enrolled device is lost, and it rotates keys — the
+    /// field case (#713) was a device whose anchor was simply absent.
+    pub fn cannot_search(skipped: u32, refused: u32) -> Self {
+        let mut parts = Vec::new();
+        let mut fixes = Vec::new();
+        if skipped > 0 {
+            parts.push(format!(
+                "{skipped} encrypted record(s) could not be decrypted on this device"
+            ));
+            fixes.push(
+                "check this device's key material: the trust anchor (trust.toml) \
+                 and device key (CONFIDANT_DEVICE_KEY) must both be present for \
+                 this vault, or re-establish them from an enrolled device",
+            );
+        }
+        if refused > 0 {
+            parts.push(format!(
+                "{refused} envelope(s) were refused as tampered or corrupt"
+            ));
+            fixes.push(
+                "an envelope failed authentication (tampered or corrupt); restore \
+                 the affected record from git history",
+            );
+        }
+        Self::new(
+            ErrorKind::CannotSearch,
+            format!(
+                "cannot search the vault: {}; a miss against a partially unread \
+                 vault does not mean the person is absent",
+                parts.join(", ")
+            ),
+        )
+        .with_fix(format!("{}; then retry", fixes.join("; ")))
     }
 
     pub fn vault_not_found() -> Self {
@@ -668,6 +715,20 @@ mod tests {
         assert_eq!(ambiguous.exit_code(), 1);
         assert!(ambiguous.message().contains("p-01HZZZ, p-01HYYY"));
         assert!(ambiguous.fix().unwrap().contains("p-<ULID>"));
+        let unsearchable = DomainError::cannot_search(19, 0);
+        assert_eq!(unsearchable.code(), "E_CANNOT_SEARCH");
+        assert_eq!(unsearchable.exit_code(), 1);
+        assert!(unsearchable.message().contains("19 encrypted record(s)"));
+        assert!(unsearchable.message().contains("does not mean"));
+        assert!(!unsearchable.message().contains("no person matches"));
+        assert!(unsearchable.fix().unwrap().contains("trust.toml"));
+        assert!(unsearchable.fix().unwrap().contains("CONFIDANT_DEVICE_KEY"));
+        assert!(!unsearchable.fix().unwrap_or("").contains("recover"));
+        let refused_only = DomainError::cannot_search(0, 2);
+        assert_eq!(refused_only.code(), "E_CANNOT_SEARCH");
+        assert!(refused_only.message().contains("2 envelope(s)"));
+        assert!(refused_only.fix().unwrap().contains("git history"));
+        assert!(!refused_only.fix().unwrap_or("").contains("trust.toml"));
     }
 
     #[test]

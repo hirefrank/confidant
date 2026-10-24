@@ -4044,6 +4044,11 @@ fn person_resolve_error(
             let ids: Vec<String> = candidates.iter().map(RecordId::to_string).collect();
             anyhow::Error::new(DomainError::ambiguous_person(query, &ids))
         }
+        // #717: the vault was not fully searched, so this is not a
+        // not-found: the person may be in an unread record.
+        PersonResolveError::CannotSearch { skipped, refused } => {
+            anyhow::Error::new(DomainError::cannot_search(skipped, refused))
+        }
     }
 }
 
@@ -7256,6 +7261,11 @@ fn alias_resolve_error(
         PersonResolveError::Ambiguous { candidates } => {
             let ids: Vec<String> = candidates.iter().map(RecordId::to_string).collect();
             anyhow::Error::new(DomainError::ambiguous_alias(kind, &ids))
+        }
+        // #717: same distinction as name resolution — an alias miss
+        // against a partially unread vault does not establish absence.
+        PersonResolveError::CannotSearch { skipped, refused } => {
+            anyhow::Error::new(DomainError::cannot_search(skipped, refused))
         }
     }
 }

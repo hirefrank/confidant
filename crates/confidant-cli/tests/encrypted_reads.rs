@@ -518,6 +518,68 @@ fn record_list_unkeyed_surfaces_skips_never_silently_empty() {
     }
 }
 
+/// #717: without a device key, `resolve` must not report an existing
+/// person as not found. The encrypted record is skipped, so the name set
+/// is incomplete and the miss is a cannot-search error naming the cause,
+/// with a fix pointing at the missing key material — never E_NOT_FOUND.
+/// With the key, the same vault still resolves the person, and a
+/// genuinely unknown name is still E_NOT_FOUND.
+#[test]
+fn resolve_unkeyed_is_cannot_search_not_not_found() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    // Keyed sanity: the person resolves, and a genuine miss is E_NOT_FOUND.
+    let out = h
+        .cmd(&["resolve", "Ada Example", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "keyed resolve failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON);
+
+    let out = h
+        .cmd(&["resolve", "Nobody Here", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "genuine miss must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+
+    // Unkeyed: the existing person's name AND id are both cannot-search.
+    for query in ["Ada Example", PERSON] {
+        let out = h
+            .cmd_no_device_key(&["resolve", query, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "unkeyed resolve must fail: {query}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("no person matches"),
+            "must never claim absence: {message}"
+        );
+        assert!(message.contains("could not be decrypted"), "{message}");
+        let fix = v["error"]["fix"].as_str().unwrap();
+        assert!(fix.contains("trust.toml"), "{fix}");
+        assert!(fix.contains("CONFIDANT_DEVICE_KEY"), "{fix}");
+        assert_eq!(out.status.code(), Some(1));
+    }
+}
+
 /// #572: `context` is operator-only for `no-ai` too. Without the flag the
 /// person is a keyless shell (PII withheld, no `for_operator`); the flag
 /// decrypts through the operator path and badges the tri-state.
