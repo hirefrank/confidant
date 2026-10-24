@@ -4246,6 +4246,22 @@ fn cmd_inbox_rotate(
     Ok(ExitCode::SUCCESS)
 }
 
+/// #732: refuse a `log` verb up front when the vault cannot accept it,
+/// so `--dry-run` fails exactly where apply's post-check would
+/// (`E_UNKNOWN_VERB`) instead of reporting `ok:true` for a write that
+/// cannot commit. Runs before person resolution and before the
+/// `--fallback-inbox` queueing path: a line the vault will reject must
+/// not be queued either. The fix mirrors the check finding's own fix.
+fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow::Result<()> {
+    if confidant_core::check::verb_passes_check(vault, verb) {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(DomainError::invalid(format!(
+        "verb '{verb}' is not enabled in this vault"
+    )))
+    .with_fix("Use a core verb or enable the pack that defines it"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_log_session(
     cli: &Cli,
@@ -4260,6 +4276,7 @@ fn cmd_log_session(
     fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
+    require_log_verb(&vault, "session")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
     if parse_duration_minutes(duration).is_none() {
@@ -4409,7 +4426,10 @@ fn cmd_log_touch(
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     // #551: the built-in personal pack is implicit, so `touch` is always
-    // owned by an enabled pack; the #510 enable gate is gone.
+    // owned by an enabled pack; the #510 enable gate is gone. The #732
+    // gate below is still applied so both log verbs share the same
+    // dry-run/apply parity rule (it never fires for a core verb).
+    require_log_verb(&vault, "touch")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
     // #510: the kind grammar is core-owned; validate against the core list
