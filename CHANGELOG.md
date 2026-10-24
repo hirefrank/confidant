@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `name` alias kind: former/married names, nicknames, and preferred names can now be recorded as `alias` ledger lines and resolved by the same keyed-HMAC mechanism as email/phone/handle, so e.g. a married name finds the original record; the record's display name is unchanged unless the operator renames it (#748).
+
 ## [0.7.0] - 2026-10-22
 
 **Disclosure:** the milestone 2 encryption has had no independent review,
