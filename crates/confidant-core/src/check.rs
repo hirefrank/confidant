@@ -122,6 +122,7 @@ pub enum FindingCode {
     TouchMalformed,
     CadenceOverdue,
     DateUpcoming,
+    DuplicateTouch,
     Pack(&'static str),
 }
 
@@ -176,6 +177,7 @@ impl FindingCode {
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
+            Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
             Self::Pack(code) => code,
         }
     }
@@ -231,6 +233,7 @@ impl FindingCode {
         "E_TOUCH_MALFORMED",
         "W_CADENCE_OVERDUE",
         "W_DATE_UPCOMING",
+        "W_DUPLICATE_TOUCH",
     ];
 
     /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
@@ -356,6 +359,7 @@ impl FindingCode {
             "E_TOUCH_MALFORMED" => Self::TouchMalformed,
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
+            "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
             _ => return None,
         })
     }
@@ -650,6 +654,7 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     check_edges(vault, &known_ids, &enabled_packs, &orphans, &mut findings);
     check_with_lists(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
+    check_duplicate_touches(vault, &mut findings);
 
     if conflict.is_none() {
         let mut states: Vec<(&dyn Pack, Box<dyn PackState>)> = Vec::new();
@@ -1816,6 +1821,38 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
     }
 }
 
+/// #747: flag every `touch` line after the first for the same person,
+/// date, and kind (see [`crate::touch::touch_identity`]). A warning, not
+/// an error: duplicates already in a vault are historical noise to clean
+/// up, and warnings never block writes — the write-time refusal lives in
+/// `log touch`/`log session`, not here. Kind-less mirrored lines carry no
+/// identity and are never flagged.
+fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
+    let mut seen: BTreeMap<(RecordId, NaiveDate, String), (String, u32)> = BTreeMap::new();
+    for sourced in &vault.entries {
+        let Some(identity) = crate::touch::touch_identity(&sourced.entry) else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(identity) {
+            slot.insert((sourced.file.clone(), sourced.line));
+        } else {
+            findings.push(
+                Finding::new(
+                    FindingCode::DuplicateTouch,
+                    Severity::Warning,
+                    "touch already recorded for the same person, date, and kind".to_owned(),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&sourced.entry.id)
+                .with_fix(
+                    "Remove the duplicate touch line, or keep it if it records a genuinely separate contact",
+                ),
+            );
+        }
+    }
+}
+
 pub(crate) fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.severity
@@ -2020,6 +2057,7 @@ mod tests {
             FindingCode::TouchMalformed,
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
+            FindingCode::DuplicateTouch,
         ];
         for code in &variants {
             match code {
@@ -2070,7 +2108,8 @@ mod tests {
                 | FindingCode::UnknownEdgeKind
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
-                | FindingCode::DateUpcoming => {}
+                | FindingCode::DateUpcoming
+                | FindingCode::DuplicateTouch => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }
