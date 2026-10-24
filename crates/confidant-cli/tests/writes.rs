@@ -2342,12 +2342,16 @@ fn log_session_by_name_echoes_resolved_person() {
 
     // Human output echoes the pick too. It says "resolving to" because the
     // line prints before the remaining validation (#537 review).
+    // #747: the second call re-logs the same session, so it passes
+    // --force; the refusal for the identical session is covered by the
+    // #747 tests, and this test is about the echo.
     let (ok, stdout, stderr) = run_raw(&[
         "log",
         "session",
         "Test Person",
         "60m",
         "paid",
+        "--force",
         "--no-input",
         "--vault",
         &vroot,
@@ -3390,6 +3394,178 @@ fn log_touch_rejects_coffee_and_lists_v1_kinds() {
         message.contains("call, text, email, meet, meal, event, gift, video, other"),
         "the error must list the v1 kinds: {message}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #747: semantic idempotency for `log touch` / `log session`
+// ---------------------------------------------------------------------------
+
+fn log_touch_args<'a>(kind: &'a str, vroot: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "log",
+        "touch",
+        PERSON,
+        kind,
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        vroot,
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn log_touch_refuses_identical_touch_and_force_logs_it() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let (ok, _) = run_json(&log_touch_args("meal", &vroot, &[]));
+    assert!(ok);
+    let before = commits(root);
+
+    // Same person, date, kind — refused, nothing written, no new commit.
+    // A different src: does not make it distinct.
+    let (ok, v) = run_json(&log_touch_args("meal", &vroot, &["--src", "zoom/t-9"]));
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    assert!(
+        fix.contains("--force"),
+        "the refusal must name the escape hatch: {fix}"
+    );
+    assert_eq!(commits(root), before, "a refused touch writes nothing");
+
+    // A different kind the same day is a different touchpoint.
+    let (ok, v) = run_json(&log_touch_args("call", &vroot, &[]));
+    assert!(ok, "{v}");
+
+    // --force logs the genuine repeat.
+    let (ok, v) = run_json(&log_touch_args("meal", &vroot, &["--force"]));
+    assert!(ok, "{v}");
+
+    // And `check` flags the forced repeat as a warning on the later line.
+    let (ok, report) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{report}");
+    let dups: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_DUPLICATE_TOUCH")
+        .collect();
+    assert_eq!(dups.len(), 1, "{report}");
+    assert_eq!(dups[0]["severity"], "warning");
+}
+
+#[test]
+fn log_touch_refusal_writes_no_note_record() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let (ok, _) = run_json(&log_touch_args("meal", &vroot, &[]));
+    assert!(ok);
+    let notes_dir = root.join(format!("people/{PERSON}/notes"));
+    let before = std::fs::read_dir(&notes_dir)
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    // Refused even with a --note: no note record may be left behind.
+    let (ok, v) = run_json(&log_touch_args(
+        "meal",
+        &vroot,
+        &["--note", "Second meal note"],
+    ));
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
+    let after = std::fs::read_dir(&notes_dir)
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(after, before, "a refused touch must not stage a note");
+}
+
+#[test]
+fn log_session_refuses_identical_session_and_force_logs_it() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let base = [
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    let (ok, v) = run_json(&base);
+    assert!(ok, "{v}");
+    let before = commits(root);
+
+    // `1h` is the same 60 minutes: refused, not a distinct session.
+    let hour = [
+        "log",
+        "session",
+        PERSON,
+        "1h",
+        "paid",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    let (ok, v) = run_json(&hour);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
+    assert_eq!(commits(root), before, "a refused session writes nothing");
+
+    // A different tag the same day is a different session.
+    let other_tag = [
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "pps",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    let (ok, v) = run_json(&other_tag);
+    assert!(ok, "{v}");
+
+    // --force logs the genuine repeat.
+    let forced = [
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--date",
+        "2026-10-05",
+        "--force",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ];
+    let (ok, v) = run_json(&forced);
+    assert!(ok, "{v}");
 }
 
 // ---------------------------------------------------------------------------

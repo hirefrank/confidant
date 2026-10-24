@@ -426,6 +426,29 @@ pub fn parse_duration_minutes(s: &str) -> Option<u32> {
     None
 }
 
+/// Identity of a `session` line for semantic idempotency (#747): the
+/// person, the date, the duration in minutes, and the billing tag (empty
+/// when untagged). Durations compare by minutes, so `60m` and `1h` are the
+/// same session; `note:` and `src:` pairs are not part of the identity,
+/// matching [`crate::touch::touch_identity`]. Returns `None` for
+/// non-`session` lines and for lines whose first argument is not a
+/// duration. The tag is the second positional token when present; a
+/// `note:`/`src:` pair in that position means the line is untagged.
+pub fn session_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, u32, String)> {
+    if entry.verb != "session" {
+        return None;
+    }
+    let duration = entry.args.first()?.as_token()?;
+    let minutes = parse_duration_minutes(duration)?;
+    let tag = entry
+        .args
+        .get(1)
+        .and_then(Arg::as_token)
+        .unwrap_or("")
+        .to_owned();
+    Some((entry.id.clone(), entry.date, minutes, tag))
+}
+
 /// Parse a balance number as hundredths (so `1.75` → 175).
 pub fn parse_decimal_hundredths(s: &str) -> Option<i64> {
     if let Some((whole, frac)) = s.split_once('.') {
@@ -601,5 +624,41 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, 1);
+    }
+
+    /// #747: session identity is person + date + minutes + tag; `60m`
+    /// and `1h` are the same session, `note:`/`src:` do not distinguish.
+    #[test]
+    fn session_identity_normalizes_duration_and_ignores_note_src() {
+        let id = super::session_identity;
+        let base = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 60m paid")
+            .unwrap()
+            .unwrap();
+        let same_hour = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 1h paid")
+            .unwrap()
+            .unwrap();
+        let noted = parse_line(
+            "2026-10-08 session p-01M3TC5H00MPJG000000000000 60m paid note:n-01M3TC5H00MPJG002NAM000005 src:zoom/t-1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(id(&base), id(&same_hour));
+        assert_eq!(id(&base), id(&noted));
+        let other_tag = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 60m pps")
+            .unwrap()
+            .unwrap();
+        assert_ne!(id(&base), id(&other_tag));
+        let untagged = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 60m")
+            .unwrap()
+            .unwrap();
+        assert_ne!(id(&base), id(&untagged));
+        let other_day = parse_line("2026-10-09 session p-01M3TC5H00MPJG000000000000 60m paid")
+            .unwrap()
+            .unwrap();
+        assert_ne!(id(&base), id(&other_day));
+        let touch = parse_line("2026-10-08 touch p-01M3TC5H00MPJG000000000000 meet")
+            .unwrap()
+            .unwrap();
+        assert!(id(&touch).is_none());
     }
 }

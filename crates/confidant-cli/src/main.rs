@@ -596,6 +596,10 @@ enum LogAction {
         /// closed).
         #[arg(long)]
         fallback_inbox: bool,
+        /// Log even when an identical session (same person, date,
+        /// duration, tag) is already in the ledger (#747).
+        #[arg(long)]
+        force: bool,
     },
     /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
@@ -618,6 +622,10 @@ enum LogAction {
         /// instead of failing closed.
         #[arg(long)]
         fallback_inbox: bool,
+        /// Log even when an identical touch (same person, date, kind)
+        /// is already in the ledger (#747).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1269,6 +1277,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note,
                     src,
                     fallback_inbox,
+                    force,
                 } => cmd_log_session(
                     &cli,
                     &root,
@@ -1280,6 +1289,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note.clone(),
                     src.clone(),
                     *fallback_inbox,
+                    *force,
                 ),
                 LogAction::Touch {
                     person,
@@ -1288,6 +1298,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note,
                     src,
                     fallback_inbox,
+                    force,
                 } => cmd_log_touch(
                     &cli,
                     &root,
@@ -1298,6 +1309,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note.clone(),
                     src.clone(),
                     *fallback_inbox,
+                    *force,
                 ),
             }
         }
@@ -4308,6 +4320,59 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
     Err(refuse_unknown_verb(verb))
 }
 
+/// #747: semantic idempotency for `log touch` / `log session`. Returns
+/// the existing line's vault-relative file and line number when an
+/// identical line is already in the ledger, so the refusal can point at
+/// it. The caller runs this after building the canonical request but
+/// before applying or queueing anything, so a refusal writes nothing and
+/// queues nothing. `note:` and `src:` never make a line distinct — a
+/// backfill that re-adds the same contact with a fresh note or
+/// provenance is still the same touchpoint.
+fn find_duplicate_touch(
+    vault: &confidant_core::Vault,
+    person: &RecordId,
+    date: &chrono::NaiveDate,
+    kind: &str,
+) -> Option<(String, u32)> {
+    vault.entries.iter().find_map(|sourced| {
+        let (id, d, k) = confidant_core::touch::touch_identity(&sourced.entry)?;
+        (id == *person && d == *date && k == kind).then_some((sourced.file.clone(), sourced.line))
+    })
+}
+
+fn find_duplicate_session(
+    vault: &confidant_core::Vault,
+    person: &RecordId,
+    date: &chrono::NaiveDate,
+    duration: &str,
+    tag: Option<&str>,
+) -> Option<(String, u32)> {
+    let minutes = parse_duration_minutes(duration)?;
+    let tag = tag.unwrap_or("");
+    vault.entries.iter().find_map(|sourced| {
+        let (id, d, m, t) = confidant_core::ledger::session_identity(&sourced.entry)?;
+        (id == *person && d == *date && m == minutes && t == tag)
+            .then_some((sourced.file.clone(), sourced.line))
+    })
+}
+
+/// #747: whether `apply_record_write` should decide this write instead of
+/// the duplicate refusal. True when `--request-id` is present and either
+/// invalid (so the write path reports the usage error) or already
+/// committed (so it replays an exact retry or reports an idempotency
+/// conflict). Without this, a retry after a timeout would be refused as
+/// a duplicate instead of replaying.
+fn defer_to_write_path(root: &Path, cli: &Cli, canonical: &str) -> anyhow::Result<bool> {
+    let Some(rid) = cli.request_id.as_deref() else {
+        return Ok(false);
+    };
+    if rid.trim().is_empty() || rid.chars().count() < 22 {
+        return Ok(true);
+    }
+    let (id_hash, _) = confidant_core::write::idempotency_digests(rid, canonical);
+    Ok(confidant_core::write::find_request_commit(root, &id_hash, cli.no_input)?.is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_log_session(
     cli: &Cli,
@@ -4320,6 +4385,7 @@ fn cmd_log_session(
     note: Option<String>,
     src: Option<String>,
     fallback_inbox: bool,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     require_log_verb(&vault, "session")?;
@@ -4399,6 +4465,27 @@ fn cmd_log_session(
         person.id,
         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
     );
+    // #747: refuse an identical session before applying or queueing
+    // anything, unless --force or the write path owns the decision
+    // (a known --request-id replays or conflicts there).
+    if !force {
+        if let Some((file, line)) =
+            find_duplicate_session(&vault, &person.id, &date, duration, tag.as_deref())
+        {
+            if !defer_to_write_path(root, cli, &canonical)? {
+                return Err(anyhow::Error::new(
+                    DomainError::already_exists(format!(
+                        "a {duration}{} session for {} on {date} is already in the ledger ({file}:{line})",
+                        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
+                        person.id,
+                    ))
+                    .with_file(file)
+                    .with_line(line)
+                    .with_fix("Pass --force to log a genuinely separate session anyway"),
+                ));
+            }
+        }
+    }
     // #176: a session WITH a note needs the device key (the note record
     // is encrypted). Probe the key early so a keychain failure fails
     // closed here with a note-specific fix, instead of surfacing the
@@ -4469,6 +4556,7 @@ fn cmd_log_touch(
     note: Option<String>,
     src: Option<String>,
     fallback_inbox: bool,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     // #551: the built-in personal pack is implicit, so `touch` is always
@@ -4545,6 +4633,24 @@ fn cmd_log_touch(
         src.as_deref().unwrap_or(""),
     );
     let summary = format!("touch {} {kind}", person.id);
+    // #747: refuse an identical touch before applying or queueing
+    // anything, unless --force or the write path owns the decision
+    // (a known --request-id replays or conflicts there).
+    if !force {
+        if let Some((file, line)) = find_duplicate_touch(&vault, &person.id, &date, kind) {
+            if !defer_to_write_path(root, cli, &canonical)? {
+                return Err(anyhow::Error::new(
+                    DomainError::already_exists(format!(
+                        "a {kind} touch for {} on {date} is already in the ledger ({file}:{line})",
+                        person.id,
+                    ))
+                    .with_file(file)
+                    .with_line(line)
+                    .with_fix("Pass --force to log a genuinely separate touch anyway"),
+                ));
+            }
+        }
+    }
     if note_body.is_some() {
         let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
             .map_err(anyhow::Error::new)?;
