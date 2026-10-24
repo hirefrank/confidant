@@ -691,6 +691,97 @@ fn find_unkeyed_skips_and_counts_never_silent_empty() {
     assert!(!text.contains("sourdough"), "content leaked without key");
 }
 
+/// #718: a zero-match `find` over skipped encrypted records must warn
+/// in-band — a `findings` entry in JSON, the findings block plus a stderr
+/// note in text — not just the `skipped_encrypted` count an agent can
+/// glide past. The warning carries the count only, never record content.
+#[test]
+fn find_unkeyed_zero_matches_warns_in_band() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+
+    let out = h
+        .cmd_no_device_key(&["find", "sourdough", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v["skipped_encrypted"].as_u64().unwrap() >= 2, "{v}");
+    let warning = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "W_SKIPPED_ENCRYPTED")
+        .expect("zero-match find over skipped records must carry W_SKIPPED_ENCRYPTED");
+    assert_eq!(warning["severity"], "warning", "{warning}");
+    let msg = warning["message"].as_str().unwrap();
+    assert!(msg.contains("does not establish absence"), "{msg}");
+    assert!(
+        !msg.contains("sourdough"),
+        "warning must not leak content: {msg}"
+    );
+    assert!(
+        !msg.contains("quantum"),
+        "warning must not leak content: {msg}"
+    );
+    assert!(
+        !stderr(&out).contains("W_SKIPPED_ENCRYPTED"),
+        "JSON mode carries the warning in-band and stays stderr-clean"
+    );
+
+    let out = h
+        .cmd_no_device_key(&["find", "sourdough", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("0 matches"), "{text}");
+    assert!(text.contains("W_SKIPPED_ENCRYPTED"), "{text}");
+    assert!(text.contains("does not establish absence"), "{text}");
+    assert!(
+        stderr(&out).contains("does not establish absence"),
+        "text mode must repeat the warning on stderr, got: {}",
+        stderr(&out)
+    );
+}
+
+/// #718, control case: the warning is empty-only. A non-empty result over
+/// a vault that also skipped encrypted records carries the count but no
+/// `W_SKIPPED_ENCRYPTED` finding — the result already shows a hit.
+#[test]
+fn find_nonempty_with_skips_carries_no_absence_warning() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+    // One plaintext person alongside the encrypted records: searchable
+    // without a device key, while the encrypted records still skip.
+    let plain_id = "p-01J9Z3K4QH0000000000000000";
+    let dir = h.vault.join("people").join(plain_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("profile.md"),
+        person_md(plain_id, "Bo Example", "Bio with plaintextmarker."),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "plaintext person"]);
+
+    let out = h
+        .cmd_no_device_key(&["find", "plaintextmarker", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v["skipped_encrypted"].as_u64().unwrap() >= 1, "{v}");
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "W_SKIPPED_ENCRYPTED"),
+        "non-empty result must not carry the absence warning: {v}"
+    );
+}
+
 #[test]
 fn context_keyed_bundles_encrypted_unkeyed_counts() {
     // Keyed half: a regular (cleared) person bundles decrypted content.
