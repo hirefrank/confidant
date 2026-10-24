@@ -20,6 +20,10 @@
 //! canonicalizes to a hidden id and does not resolve by name, or echoing
 //! the pick would leak the hidden person. More than one cleared person
 //! with the same name is [`PersonResolveError::Ambiguous`], never a guess.
+//! And a miss against a vault whose record files did not all load
+//! (skipped encrypted records, refused envelopes) is
+//! [`PersonResolveError::CannotSearch`], never `NotFound` (#717): the
+//! searched set is incomplete, so absence cannot be established.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -42,13 +46,26 @@ pub struct PersonMatch {
 /// Why a query did not resolve to exactly one person.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersonResolveError {
-    /// No person matched. Deliberately carries no detail: a `no-ai: true`
+    /// No person matched, and the vault was fully searched: every record
+    /// file loaded, so the miss genuinely establishes absence from the
+    /// cleared set. Deliberately carries no detail: a `no-ai: true`
     /// person's existence must not be confirmed by the error.
     NotFound,
     /// More than one cleared person matched (after merge canonicalization).
     /// Candidates are the canonical person ids, sorted and deduped. They
     /// are opaque ids, never names.
     Ambiguous { candidates: Vec<RecordId> },
+    /// The vault could not be fully searched, so a miss cannot establish
+    /// absence (#717). `skipped` record files were skipped as
+    /// encrypted-but-unreadable (no usable key material on this device)
+    /// and `refused` envelopes were refused as tampered or corrupt; a
+    /// person in any of them would be missed. Callers must surface this
+    /// as a cannot-search error, never as `NotFound`: a confident wrong
+    /// negative ("no person matches") about a real person is the failure
+    /// this variant exists to prevent. A match found in the searched set
+    /// is still returned normally — only the negative outcome is gated,
+    /// because only the negative asserts absence.
+    CannotSearch { skipped: u32, refused: u32 },
 }
 
 impl std::fmt::Display for PersonResolveError {
@@ -58,7 +75,31 @@ impl std::fmt::Display for PersonResolveError {
             Self::Ambiguous { candidates } => {
                 write!(formatter, "{} people matched", candidates.len())
             }
+            Self::CannotSearch { skipped, refused } => {
+                let mut parts = Vec::new();
+                if *skipped > 0 {
+                    parts.push(format!("{skipped} encrypted record(s) unreadable"));
+                }
+                if *refused > 0 {
+                    parts.push(format!("{refused} envelope(s) refused"));
+                }
+                write!(formatter, "cannot search the vault: {}", parts.join(", "))
+            }
         }
+    }
+}
+
+/// The miss outcome for `vault`: `CannotSearch` when any record file went
+/// unread (skipped or refused), so the searched set is incomplete and a
+/// miss proves nothing; `NotFound` only when the vault loaded in full.
+fn miss(vault: &Vault) -> PersonResolveError {
+    if vault.skipped_encrypted > 0 || vault.refused_envelopes > 0 {
+        PersonResolveError::CannotSearch {
+            skipped: vault.skipped_encrypted,
+            refused: vault.refused_envelopes,
+        }
+    } else {
+        PersonResolveError::NotFound
     }
 }
 
@@ -67,8 +108,10 @@ impl std::error::Error for PersonResolveError {}
 /// Resolve `query` to exactly one person (see the module docs for the rule).
 ///
 /// An unknown `p-<ULID>` (or any non-person id) and an unmatched name both
-/// return [`PersonResolveError::NotFound`]; the caller applies the same
-/// generic "not found" error to either so a hidden person cannot be probed.
+/// return [`PersonResolveError::NotFound`] when the vault loaded in full,
+/// or [`PersonResolveError::CannotSearch`] when record files went unread
+/// (see [`miss`]); the caller applies the same generic error to either
+/// form so a hidden person cannot be probed.
 pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonResolveError> {
     // Id form: resolve directly, no cleared-set gate and no
     // canonicalization. This keeps every `p-<ULID>` write — including to a
@@ -79,13 +122,13 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
                 id,
                 matched_by_name: false,
             }),
-            _ => Err(PersonResolveError::NotFound),
+            _ => Err(miss(vault)),
         };
     }
 
     let needle = case_fold(query.trim());
     if needle.is_empty() {
-        return Err(PersonResolveError::NotFound);
+        return Err(miss(vault));
     }
 
     let cleared = cleared_record_ids(vault);
@@ -121,7 +164,7 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
     }
 
     match matches.len() {
-        0 => Err(PersonResolveError::NotFound),
+        0 => Err(miss(vault)),
         1 => Ok(PersonMatch {
             id: matches.into_iter().next().expect("one match"),
             matched_by_name: true,
@@ -181,7 +224,7 @@ pub fn resolve_alias(
     }
 
     match matches.len() {
-        0 => Err(PersonResolveError::NotFound),
+        0 => Err(miss(vault)),
         1 => Ok(PersonMatch {
             id: matches.into_iter().next().expect("one match"),
             matched_by_name: false,
@@ -242,6 +285,22 @@ mod tests {
 
     fn load(root: &Path) -> Vault {
         crate::load_vault(root).unwrap()
+    }
+
+    /// Load with a hook that refuses to read any record file, standing in
+    /// for a device with no usable key material (`skipped`) or with
+    /// tampered envelopes (`refused`): the vault loads, but the record
+    /// set is incomplete and the skip/refuse counts are nonzero.
+    fn load_unread(root: &Path, skipped: bool) -> Vault {
+        use crate::vault::ContentOutcome;
+        let hook = std::sync::Arc::new(move |_: &str, _: &[u8]| {
+            if skipped {
+                ContentOutcome::Skipped
+            } else {
+                ContentOutcome::Refused
+            }
+        });
+        crate::vault::load_vault_with_hook(root, Some(hook)).unwrap()
     }
 
     const ADA: &str = "p-01J9Z3K4QF0000000000000000";
@@ -407,6 +466,38 @@ mod tests {
                 matched_by_name: false,
             })
         );
+    }
+
+    #[test]
+    fn unread_vault_miss_is_cannot_search_not_not_found() {
+        // #717: the field case — the person exists, but this device
+        // cannot read the record file, so the name set is incomplete and
+        // a miss must not be reported as "not found".
+        for skipped in [true, false] {
+            let (_tmp, root) = vault("unread", |root| {
+                person(root, ADA, Some("Ada Example"), None);
+            });
+            let vault = load_unread(&root, skipped);
+            assert!(vault.skipped_encrypted + vault.refused_envelopes > 0);
+            let expected = if skipped {
+                PersonResolveError::CannotSearch {
+                    skipped: 1,
+                    refused: 0,
+                }
+            } else {
+                PersonResolveError::CannotSearch {
+                    skipped: 0,
+                    refused: 1,
+                }
+            };
+            // The existing person's own name is missed too: her file
+            // went unread, so the lookup cannot establish anything.
+            assert_eq!(resolve_person(&vault, "Ada Example"), Err(expected.clone()));
+            assert_eq!(resolve_person(&vault, "Nobody Here"), Err(expected.clone()));
+            assert_eq!(resolve_person(&vault, ADA), Err(expected.clone()));
+            // Alias lookups consult the same incomplete cleared set.
+            assert_eq!(resolve_alias(&vault, "email", H1), Err(expected));
+        }
     }
 
     #[test]
