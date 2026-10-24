@@ -49,7 +49,11 @@ confidant sync --push          # fetch, then push after confirmation
 ```
 
 `sync` is read-only unless `--pull` or `--push` is passed. Both are
-network writes and are explicit:
+network writes and are explicit. The default report names its own
+remedy when it reports ahead/behind state (#736): a behind report ends
+with `Run `confidant sync --pull` to fast-forward …`, an ahead report
+with `Run `confidant sync --push` to push …` — the same text is carried
+as the `remedy` field in JSON output, and is absent when up to date.
 
 - Interactive: the command asks `Fast-forward main to origin/main (2
   commits)? [y/N]` or `Push 2 commit(s) to origin/main? [y/N]`. Only `y`
@@ -88,12 +92,16 @@ force flag.
   "fetched": true,
   "dry_run": false,
   "action": "none",
-  "applied": false
+  "applied": false,
+  "remedy": "Run `confidant sync --pull` to fast-forward main to origin/main (2 commit(s))"
 }
 ```
 
 `action` is `none`, `pull`, or `push`; `applied` is true only when a
-confirmed write ran. `fetched` is false for `--dry-run`.
+confirmed write ran. `fetched` is false for `--dry-run`. `remedy` is
+the command that applies the reported state, or `null` when the branch
+is up to date or a write was requested (a requested-but-unconfirmed
+write already names its own command).
 
 ### Refusals (stable codes)
 
