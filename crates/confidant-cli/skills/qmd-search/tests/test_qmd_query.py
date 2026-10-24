@@ -28,7 +28,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -356,6 +358,217 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
         self.assertEqual(
             self.index.encrypted_disk_confirmation("/vault", True),
             "asserted via --i-confirm-encrypted-disk")
+
+
+def load_module(name, path):
+    """Import a hyphenated skill script as a module."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class QmdQueryConfigTest(unittest.TestCase):
+    """#722: qmd-query.py honors the persisted preflight choices.
+
+    No CLI needed: these are pure module-level tests, so they run even
+    when the suite skips the QmdQueryTest class for want of a binary.
+    """
+
+    def setUp(self):
+        self.query = load_module("qmd_query", QUERY)
+        self._saved_home = os.environ.get("HOME")
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-query-722-")
+        os.environ["HOME"] = self.tmp.name
+
+    def tearDown(self):
+        if self._saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved_home
+        self.tmp.cleanup()
+
+    def write_user_config(self, text):
+        cfg = Path(self.tmp.name) / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(text, encoding="utf-8")
+
+    def test_explicit_mode_wins_over_config(self):
+        self.assertEqual(self.query.resolve_mode("vector", {"default_mode": "bm25"}),
+                         "vector")
+
+    def test_config_default_mode_used_when_no_flag(self):
+        self.assertEqual(self.query.resolve_mode(None, {"default_mode": "vector"}),
+                         "vector")
+
+    def test_invalid_config_mode_falls_back_to_bm25(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            mode = self.query.resolve_mode(None, {"default_mode": "sideways"})
+        self.assertEqual(mode, "bm25")
+        self.assertIn("sideways", err.getvalue())
+
+    def test_no_config_means_bm25(self):
+        self.assertEqual(self.query.resolve_mode(None, {}), "bm25")
+
+    def test_read_qmd_config_round_trips(self):
+        self.write_user_config("[qmd]\noffline = true\ndefault_mode = \"vector\"\n")
+        config = self.query.read_qmd_config()
+        self.assertTrue(self.query._truthy(config.get("offline", "")))
+        self.assertEqual(config.get("default_mode"), "vector")
+
+    def test_read_qmd_config_fail_closed(self):
+        self.write_user_config("[qmd]\noffline = true\n[broken\n")
+        self.assertEqual(self.query.read_qmd_config(), {})
+
+    def test_runtime_env_sets_offline_from_config(self):
+        env = self.query.qmd_runtime_env("/vault", {"offline": True})
+        self.assertEqual(env.get("HF_HUB_OFFLINE"), "1")
+        self.assertIn("INDEX_PATH", env)
+
+    def test_runtime_env_explicit_shell_wins(self):
+        with unittest.mock.patch.dict(os.environ, {"HF_HUB_OFFLINE": "0"}):
+            env = self.query.qmd_runtime_env("/vault", {"offline": True})
+        self.assertEqual(env.get("HF_HUB_OFFLINE"), "0")
+
+    def test_timeout_hint_names_the_hub_and_the_fix(self):
+        self.assertIn("Hugging Face", self.query.TIMEOUT_HINT)
+        self.assertIn("HF_HUB_OFFLINE=1", self.query.TIMEOUT_HINT)
+
+
+class QmdPreflightTest(unittest.TestCase):
+    """#722: qmd-preflight.py reports spec, hub, smoke, recommendation."""
+
+    def setUp(self):
+        self.preflight = load_module(
+            "qmd_preflight", SKILL_DIR / "bin" / "qmd-preflight.py")
+        self._saved_home = os.environ.get("HOME")
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-preflight-722-")
+        self.root = Path(self.tmp.name)
+        os.environ["HOME"] = str(self.root)
+
+    def tearDown(self):
+        if self._saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved_home
+        self.tmp.cleanup()
+
+    def test_host_spec_shape(self):
+        vault = self.root / "vault"
+        vault.mkdir()
+        spec = self.preflight.host_spec(str(vault))
+        self.assertIsInstance(spec["cpus"], int)
+        self.assertGreater(spec["cpus"], 0)
+        self.assertIsInstance(spec["disk_free_gb"], float)
+        self.assertEqual(spec["model_footprint_gb"], 2.5)
+
+    def test_hub_probe_reachable_local_server(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/"
+            result = self.preflight.probe_model_hub(url, timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertTrue(result["reachable"])
+        self.assertIn("200", result["detail"])
+
+    def test_hub_probe_unreachable_is_fast_not_hanging(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        start = time.time()
+        result = self.preflight.probe_model_hub(
+            f"http://127.0.0.1:{port}/", timeout=5)
+        self.assertFalse(result["reachable"])
+        self.assertLess(time.time() - start, 5)
+
+    def test_config_edit_preserves_other_keys_and_comments(self):
+        cfg = self.root / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(
+            "# Operator election (see issue #723).\n"
+            "[qmd]\nassume_encrypted_disk = true\n",
+            encoding="utf-8")
+        self.preflight.set_qmd_config_value(str(self.root), "default_mode",
+                                            '"vector"')
+        self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
+        text = (cfg / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("assume_encrypted_disk = true", text)
+        self.assertIn("# Operator election", text)
+        self.assertIn('default_mode = "vector"', text)
+        self.assertIn("offline = true", text)
+        # Idempotent: a second write replaces, never duplicates.
+        self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
+        text = (cfg / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual(text.count("offline = true"), 1)
+
+    def test_config_edit_creates_qmd_section(self):
+        self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
+        config = self.preflight.read_qmd_config(str(self.root))
+        self.assertTrue(self.preflight._truthy(config.get("offline", "")))
+
+    def test_recommendation_prefers_hybrid_within_budget(self):
+        results = {
+            "hybrid": {"status": "ok", "seconds": 6.3},
+            "vector": {"status": "ok", "seconds": 2.0},
+            "bm25": {"status": "ok", "seconds": 0.5},
+        }
+        self.assertEqual(self.preflight.recommend_default_mode(results, 60),
+                         "hybrid")
+
+    def test_recommendation_skips_over_budget_modes(self):
+        results = {
+            "hybrid": {"status": "ok", "seconds": 90.0},
+            "vector": {"status": "ok", "seconds": 5.0},
+            "bm25": {"status": "ok", "seconds": 0.5},
+        }
+        self.assertEqual(self.preflight.recommend_default_mode(results, 60),
+                         "vector")
+
+    def test_recommendation_none_when_nothing_ran(self):
+        results = {m: {"status": "skipped", "seconds": None}
+                   for m in ("hybrid", "vector", "bm25")}
+        self.assertIsNone(self.preflight.recommend_default_mode(results, 60))
+
+    def test_smoke_with_stub_query_script(self):
+        stub = self.root / "stub-query.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            "print(json.dumps({'mode': mode, 'matches': []}))\n",
+            encoding="utf-8")
+        results = self.preflight.run_smoke(
+            str(stub), "/vault", "preflight", timeout=30, env=dict(os.environ),
+            qmd_present=True, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "ok", results[mode])
+            self.assertEqual(results[mode]["matches"], 0)
+
+    def test_smoke_skips_when_qmd_missing(self):
+        results = self.preflight.run_smoke(
+            "/nonexistent/qmd-query.py", "/vault", "preflight", timeout=30,
+            env=dict(os.environ), qmd_present=False, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "skipped")
+            self.assertIn("not installed", results[mode]["reason"])
 
 
 if __name__ == "__main__":
