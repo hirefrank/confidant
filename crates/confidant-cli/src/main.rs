@@ -8316,6 +8316,13 @@ fn local_commits_check(root: &Path, no_input: bool) -> DoctorCheck {
 /// plaintext vault, no remote/upstream, or a diverged branch with stable
 /// codes. `--dry-run` never touches the network and reports the state from
 /// the last fetch.
+///
+/// #736: the default report names its own remedy. A report of "N commits
+/// behind" that names no next step left the product's author reaching for
+/// a bare `git pull` when `confidant sync --pull` already existed, so when
+/// no write was requested or applied and the branch is ahead or behind,
+/// the report prints (and the JSON carries) the exact command that applies
+/// the state it just reported.
 fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow::Result<ExitCode> {
     let no_input = cli.no_input;
     let git = |args: &[&str]| confidant_core::write::git(root, args, no_input);
@@ -8447,6 +8454,31 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
         }
     }
 
+    // #736: the remedy for the state just reported, printed only when the
+    // report itself changed nothing. A requested-but-unconfirmed write
+    // already names its own command ("pull not confirmed"), so it gets no
+    // second pointer. Diverged never reaches here: it errors above.
+    let mut remedies = Vec::new();
+    if action == "none" {
+        if state.behind > 0 {
+            remedies.push(format!(
+                "Run `confidant sync --pull` to fast-forward {branch} to {upstream} ({} commit(s))",
+                state.behind
+            ));
+        }
+        if state.ahead > 0 {
+            remedies.push(format!(
+                "Run `confidant sync --push` to push {} commit(s) to {upstream}",
+                state.ahead
+            ));
+        }
+    }
+    let remedy = if remedies.is_empty() {
+        None
+    } else {
+        Some(remedies.join(" "))
+    };
+
     if cli.json {
         print_json(&ok_envelope(
             Some(root),
@@ -8461,6 +8493,7 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
                 "dry_run": cli.dry_run,
                 "action": action,
                 "applied": applied,
+                "remedy": remedy,
             }),
         ))?;
     } else {
@@ -8481,6 +8514,9 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
             } else {
                 println!("{action} not confirmed; nothing changed");
             }
+        }
+        for line in &remedies {
+            println!("{line}");
         }
     }
     Ok(ExitCode::SUCCESS)
