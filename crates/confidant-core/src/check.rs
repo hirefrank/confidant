@@ -1868,13 +1868,19 @@ mod tests {
             id: RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap(),
             args: vec![
                 Arg::Token(kind.to_owned()),
-                Arg::Token("hmac:6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677".to_owned()),
+                Arg::Token(
+                    "hmac:6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
+                        .to_owned(),
+                ),
             ],
             comment: None,
         };
         let (kind, hex) = parse_alias(&entry("name")).unwrap();
         assert_eq!(kind, "name");
-        assert_eq!(hex, "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677");
+        assert_eq!(
+            hex,
+            "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
+        );
         assert!(parse_alias(&entry("twitter")).is_err());
     }
 
