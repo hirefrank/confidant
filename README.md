@@ -60,7 +60,44 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
    shell rc too, this session and permanently, only if I want that
    request disabled.)
-3. Ask me where my vault is. Export it for this session only:
+3. Check git before anything vault-shaped — a vault is a git repo, and
+   every vault step below (`init`, clone, push/pull sync) needs it. Do
+   this now, not at the first failure, when it is hardest to tell
+   git-missing from git-unauthenticated from something else:
+   - Run `git --version`. If git is missing, install it, then re-check
+     before continuing: macOS `xcode-select --install` or
+     `brew install git`; Linux via the distro package manager
+     (`apt install git`, `dnf install git`, or `pacman -S git`); Windows
+     runs under WSL2, so install git inside WSL2 the same way (a
+     standalone git-scm/winget install is native Windows git, which
+     Confidant does not support). If the version is below 2.34.0,
+     upgrade: `confidant doctor` enforces that floor.
+   - Make sure git has an identity, because `init` commits: ask me for
+     the values (do not invent them) and set
+     `git config --global user.name "Your Name"` and
+     `git config --global user.email "you@example.com"`.
+   - If this vault will use a remote (a `--remote <url>` at init, or a
+     clone onto a new device), suss out git credentials now too: git
+     installed and working does **not** mean a private clone works.
+     Probe it: `git ls-remote <url>` must succeed before any clone or
+     `init --remote` step, and `gh auth status` (when `gh` is present)
+     must show a logged-in account — `gh` installed but never logged in
+     authenticates nothing. If the probe fails on auth, fix credentials
+     first; do not debug the vault step. Recommended default on a GitHub
+     host: `gh auth login` (the device flow suits headless/agent
+     machines; once logged in, gh registers as git's credential helper
+     and plain clone/pull/push work). Alternatives: an SSH key, where
+     SSH to the host actually works, or a PAT stored via the git
+     credential helper / OS keychain — never pasted into a repo config,
+     never committed, and never an account password (GitHub rejects
+     passwords for git operations). A token that only exists somewhere
+     else (for example one an agent can only use through an API) does
+     not count: if it cannot be handed to git, the clone path is not
+     working yet.
+   - If this vault will be local-only, git is still required for `init`
+     but remote auth is not — do not conflate the two: a missing
+     credential is not a blocker for a local-only vault.
+4. Ask me where my vault is. Export it for this session only:
    `export CONFIDANT_VAULT="<path>"`, and pass `--vault "<path>"`
    explicitly on the commands you run. Do **not** rely on
    `source ~/.bashrc` in a non-interactive or agent shell: an interactive
@@ -69,13 +106,13 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    different vault. Give me the line to add to my shell rc for interactive
    use as separate advice. If I have no vault yet, ask whether to create
    one at a path I choose or stop — do not invent a path.
-4. Ask me whether this vault should be **encrypted** (the production
+5. Ask me whether this vault should be **encrypted** (the production
    default: record bodies are unreadable in git) or **plaintext** (simpler:
    every record body is readable by anyone with repo access), explain the
    tradeoff before editing `confidant.toml` or running `confidant init`, and
    let me choose:
-   - **Encrypted (default):** ensure git has `user.name` and
-     `user.email` (init commits). For a fresh vault, run
+   - **Encrypted (default):** git identity was set in step 3 (init
+     commits). For a fresh vault, run
      `confidant init --create --no-input --phrase-out <path>` against an
      absent or empty directory (add `--remote <url>` if I already have a
      remote; it sets origin and does not push): it scaffolds the directory,
@@ -101,21 +138,22 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      `git-remote` warning in `confidant doctor`. `confidant sync` refuses a
      structurally plaintext vault (`E_PLAINTEXT_REMOTE`), so a push stays a
      manual `git push` I explicitly choose.
-5. Optional remote: **before** `init`, ask whether I already have a git
+6. Optional remote: **before** `init`, ask whether I already have a git
    remote URL for backup and putting this vault on another device. If I do,
    pass `--remote <url>` on `confidant init --create` (it sets `origin` and
    does not push). If I decide after init, show me `git remote add origin
    <url>`. In either case, set the upstream once with `git push -u origin
    main`, then use `confidant sync --push` for later pushes on an encrypted
    vault — never push without my explicit confirmation. On a **new device
-   for an existing vault**, do not run `init`: clone the repo and run
-   `confidant keys device-add` (`recover` only if every enrolled device is
+   for an existing vault**, do not run `init`: confirm
+   `git ls-remote <url>` succeeds first (step 3), then clone the repo and
+   run `confidant keys device-add` (`recover` only if every enrolled device is
    lost).
-6. Verify: run `confidant check --vault "<path>" --json --no-input` and
+7. Verify: run `confidant check --vault "<path>" --json --no-input` and
    `confidant doctor --vault "<path>"`; report the error/warning counts,
    the branch `init` created, and any `git-remote` or `local-commits`
    warning.
-7. Read the routing snippet (`confidant routing`) for the propose →
+8. Read the routing snippet (`confidant routing`) for the propose →
    confirm → apply workflow every skill follows, and the Privacy rules
    (trusted devices with encrypted disks only; `.confidant/` is never
    committed; `no-ai` records stay out of agent output — see the README's

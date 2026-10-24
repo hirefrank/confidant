@@ -30,6 +30,51 @@ both from the same release and verify the archive against the published
 `.sha256` (or `gh attestation verify <archive> --repo hirefrank/confidant`).
 Windows users run under WSL2.
 
+## Git first: required before any vault step
+
+A vault is a git repo: `init` scaffolds one and commits into it, a second
+device clones one, and sync pushes and pulls one. Check git up front, in
+this order, before any vault step — not at the first failure, when it is
+hardest to tell git-missing from git-unauthenticated from something else.
+This is the long form of step 3 of the install prompt in
+[`README.md`](../README.md#install); that prompt is canonical.
+
+1. **Git installed, new enough.** Run `git --version`. If git is missing,
+   install it and re-check before continuing: macOS
+   `xcode-select --install` or `brew install git`; Linux via the distro
+   package manager (`apt install git`, `dnf install git`, or
+   `pacman -S git`); Windows runs under WSL2, so install git inside WSL2
+   the same way. If the version is below 2.34.0, upgrade:
+   `confidant doctor` enforces that floor.
+2. **Git identity.** `init` commits, so it needs one. Ask the operator
+   for the values (do not invent them) and set them before `init`:
+
+   ```sh
+   git config --global user.name "Your Name"
+   git config --global user.email "you@example.com"
+   ```
+
+3. **Git credentials, when the vault will use a remote.** Git installed
+   and working does **not** mean a private clone works: public clones can
+   succeed while a private vault clone fails for lack of a credential for
+   the host. Before any clone or `init --remote` step, probe it:
+   `git ls-remote <url>` must succeed, and `gh auth status` (when `gh`
+   is present) must show a logged-in account — `gh` installed but never
+   logged in authenticates nothing. If the probe fails on auth, fix
+   credentials first; do not debug the vault step. Recommended default on
+   a GitHub host: `gh auth login` (the device flow suits headless/agent
+   machines; once logged in, gh registers as git's credential helper and
+   plain clone/pull/push work). Alternatives: an SSH key, where SSH to
+   the host actually works, or a PAT stored via the git credential helper
+   / OS keychain — never pasted into a repo config, never committed, and
+   never an account password (GitHub rejects passwords for git
+   operations). A token that only exists somewhere else (for example one
+   an agent can only use through an API) does not count: if it cannot be
+   handed to git, the clone path is not working yet.
+4. **Local-only is different.** Git is still required for `init`, but
+   remote auth is not — do not conflate the two: a missing credential is
+   not a blocker for a local-only vault.
+
 ## Encrypted vault vs. plaintext
 
 Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2.2 and §14):
@@ -44,7 +89,8 @@ Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2
 `confidant init --create` only scaffolds an absent or empty directory (a
 directory holding just `.git` and/or `.gitignore` also counts as empty). A
 non-empty directory is refused, so a stray `--create` cannot turn a project
-checkout into a vault. Git needs an identity first, because init commits:
+checkout into a vault. Git needs an identity first, because init commits
+(see [Git first](#git-first-required-before-any-vault-step)):
 
 ```sh
 git config --global user.name "Your Name"
@@ -108,6 +154,11 @@ confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-
 git push -u origin main    # you run this; credentials and host keys stay yours
 ```
 
+Before that first push — and before any clone below — confirm
+`git ls-remote <url>` succeeds (see
+[Git first](#git-first-required-before-any-vault-step)): an auth failure
+there is a credentials problem to fix first, not a vault problem.
+
 If the vault already exists, run git yourself:
 
 ```sh
@@ -144,7 +195,8 @@ machine to the vault you already have.
 | This vault on another device, and an enrolled device still works | Clone the repo, then `confidant keys device-add` (`--initiate` on the new device, `--from-request` on an enrolled one) |
 | Every enrolled device is lost | Clone the repo, then `confidant recover` (this rotates and revokes the current recovery phrase) |
 
-Typical second-device flow:
+Typical second-device flow (confirm `git ls-remote <url>` succeeds before
+the clone — see [Git first](#git-first-required-before-any-vault-step)):
 
 ```sh
 git clone <url> ~/vault
