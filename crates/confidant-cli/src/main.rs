@@ -7774,6 +7774,40 @@ fn skills_links_check() -> DoctorCheck {
     }
 }
 
+/// #723: the persisted encrypted-disk election, as `doctor` reports it.
+///
+/// The `[qmd] assume_encrypted_disk` key is skill-side device policy, so
+/// `UserConfig` drops the table — read the raw TOML instead. `Some` only
+/// when the file itself asserts: the message names it an assertion, never
+/// a detection result (#709's rule — an assumption never masquerades as
+/// detection). A detected disk needs no report; there is no assumption
+/// to disclose. Anything unreadable or unparsable is not an assertion.
+fn qmd_disk_assertion_check() -> Option<DoctorCheck> {
+    let home = setup::home_dir().ok()?;
+    let text = std::fs::read_to_string(home.join(".config/confidant/config.toml")).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let asserted = value
+        .get("qmd")
+        .and_then(|q| q.get("assume_encrypted_disk"))
+        .is_some_and(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_str().is_some_and(|s| {
+                    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                })
+        });
+    if !asserted {
+        return None;
+    }
+    Some(DoctorCheck {
+        id: "qmd-disk",
+        status: "ok",
+        message: "disk encryption: asserted by operator (persisted [qmd] \
+                  assume_encrypted_disk; an assertion, not a detection)"
+            .to_owned(),
+        fix: None,
+    })
+}
+
 /// #386: informational `qmd` search-availability check. qmd is optional,
 /// so a missing qmd is `ok` — the same rule as the offline staleness check:
 /// it just means search falls back to `confidant find` (see
@@ -8952,6 +8986,11 @@ fn cmd_doctor(
         // #386/#657: qmd search availability. Missing qmd is `ok`; an
         // installed qmd without a corpus warns and points at `reindex`.
         checks.push(qmd_search_check(root));
+        // #723: the persisted disk election, reported honestly forever
+        // after — present only when the operator asserted it.
+        if let Some(check) = qmd_disk_assertion_check() {
+            checks.push(check);
+        }
     }
 
     let ok = !checks.iter().any(|c| c.status == "error");
