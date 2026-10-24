@@ -219,6 +219,112 @@ fn log_session_dry_run_touches_nothing() {
     assert!(content.contains(&format!("session {PERSON} 60m paid")));
 }
 
+/// #732: a `packs = []` vault owns no `session` verb, so both the
+/// dry run and the apply must refuse up front instead of the dry run
+/// reporting `ok:true` for a write apply's post-check blocks with
+/// `E_UNKNOWN_VERB`. The fixture ledger holds only a core `touch`
+/// line, so the vault is otherwise check-clean, and a `touch` apply
+/// still succeeds afterwards (the gate is verb-specific, not a blanket
+/// write refusal).
+#[test]
+fn log_session_dry_run_fails_when_verb_not_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    // Dry run refuses with the same up-front error apply gets.
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+        "--dry-run",
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("session"),
+        "{v}"
+    );
+    assert_eq!(commits(root), 1, "no commit on refused dry run");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        before,
+        "no file change on refused dry run"
+    );
+
+    // Apply refuses identically (no CheckBlocked report, no commit).
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert_eq!(commits(root), 1, "no commit on refused apply");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        before,
+        "no file change on refused apply"
+    );
+
+    // The core `touch` verb is unaffected in the same vault.
+    let (ok, v) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "meal",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(commits(root), 2, "touch apply still commits");
+}
+
 #[test]
 fn log_session_with_note_creates_note_record() {
     let dir = make_vault();

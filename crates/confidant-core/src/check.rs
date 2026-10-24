@@ -838,6 +838,33 @@ fn known_verbs<'a>(enabled_packs: &[&dyn Pack]) -> HashSet<&'a str> {
     verbs
 }
 
+/// #732: whether `check` would accept a ledger line with this verb in this
+/// vault — i.e. whether apply's post-check would pass the verb gate.
+/// Mirrors `run`'s verb set exactly: core verbs, enabled-pack verbs, and
+/// problem-pack verbs (kept known so a load failure does not cascade
+/// into `E_UNKNOWN_VERB` noise), plus verbs owned by a registered-but-
+/// disabled pack (a warning, never an error, so apply still commits).
+/// `log` commands refuse up front when this is false, so `--dry-run`
+/// fails exactly where apply would instead of reporting `ok:true` for
+/// a write that cannot commit.
+pub fn verb_passes_check(vault: &Vault, verb: &str) -> bool {
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
+    let mut known = known_verbs(&enabled);
+    for problem in &vault.pack_problems {
+        for problem_verb in &problem.known_verbs {
+            known.insert(problem_verb.as_str());
+        }
+    }
+    if known.contains(verb) {
+        return true;
+    }
+    vault
+        .pack_registry()
+        .orphan_owners(&enabled)
+        .verbs
+        .contains_key(verb)
+}
+
 fn check_ledger_paths(vault: &Vault, findings: &mut Vec<Finding>) {
     for entry in &vault.entries {
         if let Some((year, month)) = parse_ledger_file(&entry.file) {
