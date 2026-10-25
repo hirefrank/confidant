@@ -5,26 +5,52 @@ Usage: qmd-preflight.py [--vault PATH] [--persist] [--json]
 
 Reports, in order:
 
-1. Spec check: cores, RAM, free disk at the vault, against the layer's
-   real needs (model footprint ~2.5 GB disk once everything lands;
-   field data, 0.7.0: a 2-vCPU / 8 GB slice ran BM25 and vector fine).
-   CPU-only inference is assumed when no GPU is detected.
+1. Spec check: cores, RAM, free disk at the vault AND at the model
+   cache (they may be different filesystems), against the layer's real
+   needs (model footprint ~2.5 GB disk once everything lands; field
+   data, 0.7.0: a 2-vCPU / 8 GB slice ran BM25 and vector fine — hosts
+   below that floor get an explicit warning, not a silent pass).
+   CPU-only inference is assumed when no NVIDIA GPU is detected
+   (Apple Silicon / AMD GPUs are not probed; see `detect_gpu`).
 2. Model-hub reachability: the 0.7.0 field failure was NOT compute — a
    cold hybrid/vector query spent 3m01s with 0.76s user CPU waiting on
    a Hugging Face hub check through an egress proxy, then silently fell
-   back. The probe below makes one short-timeout request to the hub and
-   says whether the host can reach it. When the probe fails (or the
-   models are already cached, so no hub call is ever needed), offline
-   mode is recommended: `qmd-query.py` then runs qmd with
-   `HF_HUB_OFFLINE=1`, and `--persist` records that choice.
+   back. The probe below makes one short-timeout request to the
+   configured hub endpoint (`--hub-url`, else `HF_ENDPOINT`, else
+   huggingface.co) and says whether the host can reach it. A 4xx/5xx
+   response (e.g. a proxy's 502) does NOT count as reachable: the host
+   talked to a proxy, not to a usable hub. The probe is skipped
+   entirely when `HF_HUB_OFFLINE` is already forced in the shell.
+   When the probe fails, or when a hybrid smoke run proves the
+   heaviest models are already cached (see below), offline mode is
+   recommended: `qmd-query.py` then runs qmd with `HF_HUB_OFFLINE=1`,
+   and `--persist` records that choice.
 3. Timed smoke query per mode (bm25 / vector / hybrid) on the freshly
-   built corpus, reporting actual seconds and flagging modes over the
-   budget (default 60s). Modes are skipped, not failed, when qmd or the
-   corpus is missing or embeddings are not built yet.
+   built corpus, reporting cold AND warm seconds separately: the first
+   run per mode may pay a model download, so a mode that ran `ok` is
+   run a second time and the recommendation is derived from the warm
+   run, never from a single cold sample. Modes are skipped, not
+   failed, when qmd or the corpus is missing or embeddings are not
+   built yet. A run that answers with zero hits is reported distinctly
+   as `ok-empty`, never as proof of anything: it is not recommended
+   and does not count toward cache-completeness. Only a hit-bearing
+   `ok` proves a mode's models are cached — a `timeout`, `failed`, or
+   `fallback` run proves nothing of the kind (the original #722 failure
+   IS a hybrid timeout, and treating it as "cached" would persist
+   offline mode and break the very download that would fix it).
+   Progress lines go to stderr as each run starts/finishes, so a slow
+   preflight is never a silent wait: worst case is 6 x the per-mode
+   timeout (cold + warm per mode) plus the hub probe.
 4. A recommended default mode for this host, recorded where the query
    wrapper honors it: `--persist` writes `[qmd] default_mode` (and
    `[qmd] offline`, when recommended) to `~/.config/confidant/config.toml`,
    preserving every other key in the file. `qmd-query.py` reads both.
+   `--persist` also clears stale preflight-written keys (a
+   `default_mode` with no hit-bearing mode behind it, an `offline`
+   written by an earlier preflight run when the hub has recovered),
+   and says so explicitly; values not marked as preflight-written are
+   left alone and reported. NOTE: that config is per-user, not
+   per-vault — a persisted recommendation applies to every vault.
 
 This script never builds anything and never phones home beyond the one
 hub probe: smoke queries run through `qmd-query.py` (same allowlist
@@ -34,8 +60,12 @@ into a 3-minute silent fallback.
 
 Exit code is 0 whenever the report completes, even when the verdict is
 "no mode recommended" — the report is the deliverable, not a gate.
+Automation MUST NOT chain on the exit code (`preflight && next-step`):
+read the report (or `--json`) instead — a LOW DISK / unreachable-hub /
+no-mode-recommended outcome still exits 0.
 """
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -55,11 +85,21 @@ TRUTHY = ("1", "true", "yes", "on")
 # Planning figure from #722: ~1.6 GB landed in 0.7.0 (embed 319 MB + 1.7B
 # query-expansion 1.2 GB) with the 0.6B reranker still to download.
 MODEL_FOOTPRINT_GB = 2.5
+# Field-proven floor from #722 (a 2-vCPU / 8 GB slice ran BM25 and vector
+# fine). Hosts below it get warnings; these are not pass/fail gates —
+# the report, not a verdict bit, is the deliverable.
+MIN_CPUS = 2
+MIN_RAM_GB = 8
 MODES = ("hybrid", "vector", "bm25")
 DEFAULT_BUDGET_S = 60
 DEFAULT_QUERY_TIMEOUT_S = 180  # mirrors qmd-query.py's qmd timeout
 DEFAULT_HUB_URL = "https://huggingface.co"
 DEFAULT_HUB_TIMEOUT_S = 10
+# Provenance markers --persist writes next to the keys it owns, so a
+# later --persist run can tell its own stale values apart from values
+# the operator set by hand (which it must not clobber).
+SOURCE_SUFFIX = "_source"
+SOURCE_VALUE = "preflight"
 
 
 def resolve_vault(explicit):
@@ -96,7 +136,12 @@ def total_ram_bytes():
 
 
 def detect_gpu():
-    """First GPU name from nvidia-smi, or None when none is detected."""
+    """First NVIDIA GPU name from nvidia-smi, or None.
+
+    NVIDIA-only by design: Apple Silicon / AMD GPUs are NOT probed, so
+    None means "no NVIDIA GPU detected", never "this host has no usable
+    GPU". Callers must word it that way.
+    """
     nvidia_smi = shutil.which("nvidia-smi")
     if nvidia_smi is None:
         return None
@@ -110,60 +155,168 @@ def detect_gpu():
     return name[0].strip() if p.returncode == 0 and name else None
 
 
-def host_spec(vault):
-    """Cores, RAM, free disk at the vault, and GPU detection."""
-    disk_path = os.path.join(vault, STORE_REL)
+def model_cache_path():
+    """Where downloaded models land (HF_HOME, else the XDG cache default).
+
+    The disk verdict must consider this filesystem too: the vault store
+    and the model cache can live on different disks, and a verdict
+    measured only at the vault can be on the wrong filesystem.
+    """
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return os.path.abspath(os.path.expanduser(hf_home))
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "huggingface")
+
+
+def _free_gb(path):
     try:
-        usage = shutil.disk_usage(disk_path if os.path.isdir(disk_path) else vault)
-        free_gb = usage.free / (1024 ** 3)
+        usage = shutil.disk_usage(path if os.path.isdir(path) else
+                                  os.path.dirname(path) or path)
+        return round(usage.free / (1024 ** 3), 1)
     except OSError:
-        free_gb = None
+        return None
+
+
+def host_spec(vault):
+    """Cores, RAM, free disk at the vault and the model cache, GPU probe."""
+    disk_path = os.path.join(vault, STORE_REL)
+    cache_path = model_cache_path()
+    free_gb = _free_gb(disk_path if os.path.isdir(disk_path) else vault)
+    cache_free_gb = _free_gb(cache_path)
     ram = total_ram_bytes()
     return {
         "cpus": os.cpu_count(),
         "ram_gb": round(ram / (1024 ** 3), 1) if ram is not None else None,
-        "disk_free_gb": round(free_gb, 1) if free_gb is not None else None,
+        "disk_free_gb": free_gb,
         "disk_path": disk_path,
+        "model_cache_path": cache_path,
+        "model_cache_free_gb": cache_free_gb,
         "gpu": detect_gpu(),
+        "gpu_detector": "nvidia-smi",
         "model_footprint_gb": MODEL_FOOTPRINT_GB,
     }
 
 
-def probe_model_hub(url, timeout):
+def spec_warnings(spec):
+    """Explicit threshold comparisons (or an explicit 'unknown').
+
+    A 1-CPU / 1 GB host must not get the same verdict shape as the
+    field host: every dimension is either compared to a threshold or
+    flagged as unmeasurable. Disk uses the tightest known figure across
+    the vault store and the model cache (either may be unmeasurable).
+    """
+    warnings = []
+    if spec["cpus"] is None:
+        warnings.append("CPU count unknown: cannot compare to the "
+                        f"{MIN_CPUS}-vCPU field floor")
+    elif spec["cpus"] < MIN_CPUS:
+        warnings.append(f"only {spec['cpus']} CPU(s): below the "
+                        f"{MIN_CPUS}-vCPU field host that ran BM25/vector fine")
+    if spec["ram_gb"] is None:
+        warnings.append("RAM unknown: cannot compare to the "
+                        f"{MIN_RAM_GB} GB field floor or judge headroom "
+                        "for the largest model")
+    elif spec["ram_gb"] < MIN_RAM_GB:
+        warnings.append(f"only {spec['ram_gb']} GB RAM: below the "
+                        f"{MIN_RAM_GB} GB field host")
+    figures = [f for f in (spec["disk_free_gb"],
+                           spec["model_cache_free_gb"]) if f is not None]
+    if not figures:
+        warnings.append("free disk unknown at both the vault store and "
+                        "the model cache: cannot compare to the "
+                        f"~{MODEL_FOOTPRINT_GB} GB model footprint")
+    elif min(figures) < MODEL_FOOTPRINT_GB:
+        vault_txt = (f"{spec['disk_free_gb']} GB" if
+                     spec["disk_free_gb"] is not None else "unknown")
+        cache_txt = (f"{spec['model_cache_free_gb']} GB" if
+                     spec["model_cache_free_gb"] is not None else "unknown")
+        warnings.append(f"LOW DISK: tightest free-disk figure is "
+                        f"{min(figures)} GB (vault store {vault_txt}, "
+                        f"model cache {cache_txt}) vs the "
+                        f"~{MODEL_FOOTPRINT_GB} GB model footprint")
+    return warnings
+
+
+def resolve_hub_url(explicit):
+    """--hub-url wins, else HF_ENDPOINT, else the default hub root."""
+    if explicit:
+        return explicit
+    return os.environ.get("HF_ENDPOINT") or DEFAULT_HUB_URL
+
+
+def probe_model_hub(url, timeout, offline_forced=False):
     """One short-timeout hub request. Never hangs: the probe IS the budget.
 
-    Returns {reachable, seconds, detail}. An HTTP error response still
-    proves reachability (the host talked to the hub); a timeout or
-    connection error does not.
+    Returns {reachable, skipped, seconds, detail}. Only a 2xx/3xx
+    response counts as reachable: a proxy answering 403/502 quickly
+    proves the host talked to a proxy, not to a usable hub. The probe
+    fetches the endpoint root only — it does not prove a specific
+    model/CDN path. When offline is already forced in the shell the
+    probe is skipped outright (no phone-home when the operator already
+    decided), reported as skipped, not as unreachable.
     """
+    if offline_forced:
+        return {"reachable": False, "skipped": True, "seconds": 0.0,
+                "detail": "skipped: HF_HUB_OFFLINE is set in the shell"}
     start = time.monotonic()
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             resp.read(1)
-        return {"reachable": True,
+        return {"reachable": True, "skipped": False,
                 "seconds": round(time.monotonic() - start, 2),
                 "detail": f"HTTP {resp.status}"}
     except urllib.error.HTTPError as e:
-        return {"reachable": True,
+        # A gateway/proxy error is not hub reachability: models cannot
+        # be downloaded through it.
+        return {"reachable": False, "skipped": False,
                 "seconds": round(time.monotonic() - start, 2),
-                "detail": f"HTTP {e.code}"}
+                "detail": f"HTTP {e.code} (hub not usable through this response)"}
     except (TimeoutError, urllib.error.URLError) as e:
         reason = getattr(e, "reason", e)
         if isinstance(reason, TimeoutError) or "timed out" in str(reason).lower():
             detail = f"timed out after {timeout}s"
         else:
             detail = f"{type(reason).__name__}: {reason}" if reason else str(e)
-        return {"reachable": False,
+        return {"reachable": False, "skipped": False,
                 "seconds": round(time.monotonic() - start, 2),
                 "detail": detail}
     except (OSError, ValueError) as e:
-        return {"reachable": False,
+        return {"reachable": False, "skipped": False,
                 "seconds": round(time.monotonic() - start, 2),
                 "detail": f"{type(e).__name__}: {e}"}
 
 
+def _load_query_module():
+    """Load the sibling qmd-query.py as a module, or None if absent.
+
+    qmd-query.py is the single source of truth for the [qmd] config
+    helpers: preflight used to carry its own copies, which drifted.
+    A lone copy of this script (sibling missing) falls back to local
+    implementations below rather than failing outright.
+    """
+    sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qmd-query.py")
+    if not os.path.isfile(sibling):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "qmd_query_sibling", sibling)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (OSError, ImportError):
+        return None
+
+
+_QUERY_MODULE = _load_query_module()
+
+
 def _truthy(value):
+    if _QUERY_MODULE is not None:
+        return _QUERY_MODULE._truthy(value)
     return str(value).strip().lower() in TRUTHY
 
 
@@ -171,8 +324,11 @@ def read_qmd_config(home=None):
     """The [qmd] table from the user config, or {} when absent/unreadable.
 
     Fail closed: a missing file, invalid TOML, or a non-table [qmd] is
-    not a configuration — callers fall back to defaults.
+    not a configuration — callers fall back to defaults. Delegates to
+    qmd-query.py's implementation when the sibling is present.
     """
+    if _QUERY_MODULE is not None:
+        return _QUERY_MODULE.read_qmd_config(home)
     home = home or os.environ.get("HOME")
     if not home:
         return {}
@@ -234,12 +390,55 @@ def set_qmd_config_value(home, key, value_repr):
     return path
 
 
+def remove_qmd_config_value(home, key):
+    """Remove one key from the [qmd] table; True when something was removed.
+
+    Text edit like set_qmd_config_value: comments and unrelated keys
+    survive. Removing the last key leaves an empty [qmd] section rather
+    than rewriting the file's structure.
+    """
+    home = home or os.environ.get("HOME")
+    if not home:
+        raise OSError("no HOME: cannot locate the user config")
+    path = os.path.join(home, USER_CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    lines = text.splitlines()
+    section_re = re.compile(r"^\s*\[qmd\]\s*(#.*)?$")
+    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    section_at = next((i for i, ln in enumerate(lines) if section_re.match(ln)),
+                      None)
+    if section_at is None:
+        return False
+    end = len(lines)
+    for i in range(section_at + 1, len(lines)):
+        if header_re.match(lines[i]):
+            end = i
+            break
+    key_at = next((i for i in range(section_at + 1, end)
+                   if key_re.match(lines[i])), None)
+    if key_at is None:
+        return False
+    del lines[key_at]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
 def recommend_default_mode(results, budget):
-    """First preferred mode that ran within budget, else first that ran.
+    """First preferred hit-bearing mode within budget, else first that ran.
 
     Preference order is hybrid > vector > bm25 (quality first); a mode
     that only ran over budget is still better than no mode, but it is
-    never preferred over a mode within budget. None when nothing ran.
+    never preferred over a mode within budget. Only status "ok" counts:
+    "ok-empty" (zero hits) is not a recommendation — a corpus that
+    answers nothing has not demonstrated a usable mode — and neither
+    do timeout/failed/fallback runs. Seconds are the warm run's when a
+    warm run exists (see run_smoke). None when no hit-bearing mode ran.
     """
     for mode in MODES:
         r = results.get(mode, {})
@@ -252,73 +451,187 @@ def recommend_default_mode(results, budget):
     return None
 
 
+def cache_complete(results):
+    """True only when a hybrid run proved the heaviest models are cached.
+
+    Hybrid needs the embedding model AND the reranker, so a hit-bearing
+    hybrid `ok` is the strictest cache proof available. A vector `ok`
+    proves only the embedding model; a hybrid timeout proves nothing —
+    it is exactly the cold-download case offline mode would then break.
+    """
+    return results.get("hybrid", {}).get("status") == "ok"
+
+
+def offline_recommended_for(hub, results):
+    """Fresh-evidence offline decision: hub unusable, or cache complete.
+
+    Deliberately NOT "or offline was already configured": a prior
+    choice is not fresh evidence, and counting it would make a stale
+    offline=true self-perpetuating. main() keeps a pre-existing
+    offline=true in place (it never clears a value it did not write
+    without the provenance marker) — this function only answers what
+    today's evidence recommends.
+    """
+    return (not hub["reachable"]) or cache_complete(results)
+
+
+def tradeoff_note(results, recommendation):
+    """Runner-up timing note, or None when there is no tradeoff to show.
+
+    A hybrid answering in 59s is not obviously better than a vector
+    answering in 2s just because the budget is 60s: surface the fastest
+    hit-bearing mode's timing whenever the recommendation is more than
+    twice as slow as it, so the operator sees the cost of quality.
+    """
+    if recommendation is None:
+        return None
+    rec_seconds = results.get(recommendation, {}).get("seconds")
+    if rec_seconds is None:
+        return None
+    fastest = None
+    for mode in MODES:
+        r = results.get(mode, {})
+        if r.get("status") == "ok" and r.get("seconds") is not None:
+            if fastest is None or r["seconds"] < fastest[1]:
+                fastest = (mode, r["seconds"])
+    if fastest is None or fastest[0] == recommendation:
+        return None
+    if rec_seconds > 2 * fastest[1]:
+        return (f"tradeoff: {recommendation} ({rec_seconds}s) is more "
+                f"than twice as slow as {fastest[0]} ({fastest[1]}s) — "
+                "consider the faster mode for interactive use, or a "
+                "tighter --budget")
+    return None
+
+
+def _run_one_smoke(query_script, vault, query, timeout, env, mode):
+    """One timed qmd-query.py run; classifies its outcome precisely.
+
+    Statuses: "ok" (hit-bearing), "ok-empty" (answered, zero hits —
+    distinct from ok: it proves timing, not a usable mode), "skipped",
+    "timeout", "failed", "fallback". Only "ok" ever feeds a
+    recommendation or a cache-completeness claim.
+    """
+    start = time.monotonic()
+    try:
+        p = subprocess.run([sys.executable, query_script,
+                            "--vault", vault, "--mode", mode, query],
+                           capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout",
+                "reason": f"no answer within {timeout}s",
+                "seconds": round(time.monotonic() - start, 2),
+                "matches": None}
+    except OSError as e:
+        return {"status": "failed", "reason": str(e),
+                "seconds": round(time.monotonic() - start, 2),
+                "matches": None}
+    elapsed = round(time.monotonic() - start, 2)
+    try:
+        data = json.loads(p.stdout) if p.stdout.strip() else None
+    except json.JSONDecodeError:
+        data = None
+    if p.returncode != 0 and "needs embeddings" in (p.stderr or ""):
+        return {"status": "skipped",
+                "reason": "no embeddings (run qmd-index.py --embed)",
+                "seconds": elapsed, "matches": None}
+    if p.returncode == 0 and isinstance(data, dict) \
+            and data.get("mode") == mode:
+        matches = data.get("matches")
+        count = len(matches) if isinstance(matches, list) else None
+        if count == 0:
+            return {"status": "ok-empty",
+                    "reason": "answered with zero hits — pass --query "
+                              "with a term known to hit the corpus for a "
+                              "hit-bearing measurement",
+                    "seconds": elapsed, "matches": 0}
+        return {"status": "ok", "reason": "", "seconds": elapsed,
+                "matches": count}
+    if p.returncode == 0 and isinstance(data, dict) \
+            and data.get("mode") == "find-fallback":
+        return {"status": "fallback",
+                "reason": data.get("fallback", "qmd unavailable"),
+                "seconds": elapsed, "matches": None}
+    detail = (p.stderr or "").strip().splitlines()
+    return {"status": "failed",
+            "reason": detail[-1] if detail else f"exit {p.returncode}",
+            "seconds": elapsed, "matches": None}
+
+
 def run_smoke(query_script, vault, query, timeout, env,
-              qmd_present, corpus_present):
-    """One timed qmd-query.py run per mode; skips are reported, not failed."""
+              qmd_present, corpus_present, progress=None):
+    """Cold + warm timed runs per mode; skips are reported, not failed.
+
+    The first run per mode is the cold run: it may pay a model
+    download, so its timing is exactly the misleading sample #722
+    warns about. A mode whose cold run is "ok" (or "ok-empty") is run
+    a second time and the warm run becomes the mode's canonical result
+    — recommendations and cache claims derive from warm runs, never
+    from a single cold sample. A mode whose cold run timed out, failed,
+    or fell back gets no warm rerun (there is no recommendation to
+    protect, and a second cold download would just repeat the wait);
+    its warm entry records that it was not measured. `progress`, when
+    given, is called as progress(mode, phase, result) after each run
+    so a slow preflight is never silent.
+    """
     results = {}
     for mode in MODES:
         if not qmd_present:
-            results[mode] = {"status": "skipped", "reason": "qmd not installed",
-                             "seconds": None, "matches": None}
+            skip = {"status": "skipped", "reason": "qmd not installed",
+                    "seconds": None, "matches": None}
+            results[mode] = dict(skip, cold=dict(skip), warm=dict(skip))
             continue
         if not corpus_present:
-            results[mode] = {"status": "skipped",
-                             "reason": "corpus missing (run qmd-index.py)",
-                             "seconds": None, "matches": None}
+            skip = {"status": "skipped",
+                    "reason": "corpus missing (run qmd-index.py)",
+                    "seconds": None, "matches": None}
+            results[mode] = dict(skip, cold=dict(skip), warm=dict(skip))
             continue
-        start = time.monotonic()
-        try:
-            p = subprocess.run([sys.executable, query_script,
-                                "--vault", vault, "--mode", mode, query],
-                               capture_output=True, text=True,
-                               timeout=timeout, env=env)
-        except subprocess.TimeoutExpired:
-            results[mode] = {"status": "timeout",
-                             "reason": f"no answer within {timeout}s",
-                             "seconds": round(time.monotonic() - start, 2),
-                             "matches": None}
-            continue
-        except OSError as e:
-            results[mode] = {"status": "failed", "reason": str(e),
-                             "seconds": round(time.monotonic() - start, 2),
-                             "matches": None}
-            continue
-        elapsed = round(time.monotonic() - start, 2)
-        try:
-            data = json.loads(p.stdout) if p.stdout.strip() else None
-        except json.JSONDecodeError:
-            data = None
-        if p.returncode != 0 and "needs embeddings" in (p.stderr or ""):
-            results[mode] = {"status": "skipped",
-                             "reason": "no embeddings (run qmd-index.py --embed)",
-                             "seconds": elapsed, "matches": None}
-        elif p.returncode == 0 and isinstance(data, dict) \
-                and data.get("mode") == mode:
-            matches = data.get("matches")
-            results[mode] = {"status": "ok", "reason": "",
-                             "seconds": elapsed,
-                             "matches": len(matches) if isinstance(matches, list)
-                             else None}
-        elif p.returncode == 0 and isinstance(data, dict) \
-                and data.get("mode") == "find-fallback":
-            results[mode] = {"status": "fallback",
-                             "reason": data.get("fallback", "qmd unavailable"),
-                             "seconds": elapsed, "matches": None}
+        if progress is not None:
+            progress(mode, "cold-start", None)
+        cold = _run_one_smoke(query_script, vault, query, timeout, env, mode)
+        if progress is not None:
+            progress(mode, "cold-finish", cold)
+        if cold["status"] in ("ok", "ok-empty"):
+            if progress is not None:
+                progress(mode, "warm-start", None)
+            warm = _run_one_smoke(query_script, vault, query, timeout,
+                                  env, mode)
+            if progress is not None:
+                progress(mode, "warm-finish", warm)
+            canonical = warm if warm["status"] in ("ok", "ok-empty") else cold
+            results[mode] = dict(canonical, cold=cold, warm=warm)
         else:
-            detail = (p.stderr or "").strip().splitlines()
-            results[mode] = {"status": "failed",
-                             "reason": detail[-1] if detail else
-                             f"exit {p.returncode}",
-                             "seconds": elapsed, "matches": None}
+            warm = {"status": "not-measured",
+                    "reason": "cold run did not complete ok; warm timing "
+                              "not measured (no recommendation derives "
+                              "from this mode)",
+                    "seconds": None, "matches": None}
+            results[mode] = dict(cold, cold=cold, warm=warm)
     return results
 
 
-def main():
+def _progress_printer(mode, phase, result):
+    """stderr progress for smoke runs: a slow preflight is never silent."""
+    if phase.endswith("start"):
+        print(f"  smoke {mode} {phase.split('-')[0]} run starting…",
+              file=sys.stderr)
+    else:
+        seconds = result["seconds"] if result else None
+        print(f"  smoke {mode} {phase.split('-')[0]} run: "
+              f"{result['status']} in {seconds}s",
+              file=sys.stderr)
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--vault", default=None)
     ap.add_argument("--query", default="preflight smoke test",
-                    help="query text for the per-mode smoke runs (timing "
-                         "only; the hits are not evaluated)")
+                    help="query text for the per-mode smoke runs; a "
+                         "zero-hit answer is reported as ok-empty, not "
+                         "recommended — pass a term known to hit the "
+                         "corpus for a hit-bearing measurement")
     ap.add_argument("--query-timeout", type=int,
                     default=DEFAULT_QUERY_TIMEOUT_S,
                     help="per-mode smoke timeout in seconds "
@@ -326,25 +639,38 @@ def main():
     ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET_S,
                     help="seconds a mode must answer within to be "
                          f"recommended (default {DEFAULT_BUDGET_S})")
-    ap.add_argument("--hub-url", default=DEFAULT_HUB_URL)
+    ap.add_argument("--hub-url", default=None,
+                    help="hub endpoint to probe (default: $HF_ENDPOINT, "
+                         "else https://huggingface.co)")
     ap.add_argument("--hub-timeout", type=int, default=DEFAULT_HUB_TIMEOUT_S,
                     help="seconds the hub probe may take "
                          f"(default {DEFAULT_HUB_TIMEOUT_S})")
     ap.add_argument("--persist", action="store_true",
                     help="write the recommendation ([qmd] default_mode, and "
-                         "[qmd] offline when recommended) to the user config")
+                         "[qmd] offline when recommended) to the user "
+                         "config; also clears stale preflight-written "
+                         "keys the fresh evidence no longer supports")
     ap.add_argument("--json", action="store_true",
                     help="print the report as JSON instead of text")
     ap.add_argument("--query-script", default=None,
                     help="qmd-query.py path (default: the sibling script; "
                          "tests point it at a stub)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     vault = resolve_vault(args.vault)
     home = os.environ.get("HOME")
+    # --persist without HOME cannot write anything: fail cleanly BEFORE
+    # the (potentially minutes-long) smoke runs, never after them.
+    if args.persist and not home:
+        sys.exit("error: --persist needs HOME to locate "
+                 "~/.config/confidant/config.toml; rerun without --persist "
+                 "for a report-only run, or set HOME")
     spec = host_spec(vault)
     config = read_qmd_config(home)
-    hub = probe_model_hub(args.hub_url, args.hub_timeout)
+    hub_url = resolve_hub_url(args.hub_url)
+    offline_forced = _truthy(os.environ.get("HF_HUB_OFFLINE", ""))
+    hub = probe_model_hub(hub_url, args.hub_timeout,
+                          offline_forced=offline_forced)
 
     # Smoke env: the hub probe already answered the reachability question,
     # so a failing probe must not turn the smoke runs into another
@@ -361,83 +687,174 @@ def main():
     query_script = args.query_script or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "qmd-query.py")
     results = run_smoke(query_script, vault, args.query, args.query_timeout,
-                        smoke_env, qmd_present, corpus_present)
+                        smoke_env, qmd_present, corpus_present,
+                        progress=_progress_printer)
 
-    # Embeddings are present when a vector/hybrid run got past the
-    # embeddings gate (ran, timed out, or failed for another reason).
-    # Cached models never need the hub again, so that alone recommends
-    # offline mode — the phone-home per query is pure liability then.
-    embeddings_present = any(
-        results[m]["status"] in ("ok", "timeout", "failed", "fallback")
-        for m in ("vector", "hybrid"))
-    offline_recommended = (not hub["reachable"]) or offline_configured \
-        or embeddings_present
+    # Cache-completeness is PROOF, not vibes: only a hit-bearing hybrid
+    # ok shows the embedding model and the reranker are both cached. A
+    # timeout/failed/fallback run — the #722 failure itself — proves
+    # nothing and must never persist offline mode.
+    embeddings_present = cache_complete(results)
+    offline_recommended = offline_recommended_for(hub, results)
     recommendation = recommend_default_mode(results, args.budget)
+    note = tradeoff_note(results, recommendation)
 
     persisted = {}
+    persist_error = None
     if args.persist:
-        if recommendation is not None:
-            set_qmd_config_value(home, "default_mode",
-                                 json.dumps(recommendation))
-            persisted["default_mode"] = recommendation
-        if offline_recommended:
-            set_qmd_config_value(home, "offline", "true")
-            persisted["offline"] = True
+        try:
+            if recommendation is not None:
+                set_qmd_config_value(home, "default_mode",
+                                     json.dumps(recommendation))
+                set_qmd_config_value(home, "default_mode" + SOURCE_SUFFIX,
+                                     json.dumps(SOURCE_VALUE))
+                persisted["default_mode"] = recommendation
+            elif "default_mode" in config:
+                if config.get("default_mode" + SOURCE_SUFFIX) == SOURCE_VALUE:
+                    old = config["default_mode"]
+                    remove_qmd_config_value(home, "default_mode")
+                    remove_qmd_config_value(home, "default_mode" + SOURCE_SUFFIX)
+                    persisted["default_mode_cleared"] = old
+                else:
+                    persisted["default_mode_left"] = config["default_mode"]
+            if offline_recommended:
+                set_qmd_config_value(home, "offline", "true")
+                set_qmd_config_value(home, "offline" + SOURCE_SUFFIX,
+                                     json.dumps(SOURCE_VALUE))
+                persisted["offline"] = True
+            elif _truthy(config.get("offline", "")):
+                # A stale offline=true from an earlier preflight run is
+                # cleared when fresh evidence no longer supports it (the
+                # hub recovered, the cache proof lapsed); a value the
+                # operator set by hand (no provenance marker) is left
+                # alone and reported — preflight must not clobber a
+                # deliberate privacy choice.
+                if config.get("offline" + SOURCE_SUFFIX) == SOURCE_VALUE:
+                    remove_qmd_config_value(home, "offline")
+                    remove_qmd_config_value(home, "offline" + SOURCE_SUFFIX)
+                    persisted["offline_cleared"] = True
+                else:
+                    persisted["offline_left"] = True
+        except OSError as e:
+            # Report the failure with the report, not a traceback: the
+            # diagnosis is still delivered even when the write failed.
+            persist_error = str(e)
+            persisted["error"] = persist_error
+
+    warnings = list(spec_warnings(spec))
+    if not hub["reachable"] and not hub.get("skipped"):
+        warnings.append(f"model hub unreachable ({hub['detail']}): "
+                        "first queries may pay a hub wait or fall back")
+    if recommendation is None:
+        warnings.append("no hit-bearing mode ran: no default mode "
+                        "recommended; search falls back to "
+                        "`confidant find` until the corpus/embeddings "
+                        "are built (qmd-index.py)")
+    if note is not None:
+        warnings.append(note)
 
     report = {
         "vault": vault,
         "spec": spec,
+        "spec_warnings": warnings,
         "hub": hub,
+        "hub_url": hub_url,
         "offline_for_smoke": offline_for_smoke,
+        "offline_configured": offline_configured,
         "offline_recommended": offline_recommended,
         "embeddings_present": embeddings_present,
         "modes": results,
         "budget_s": args.budget,
         "recommended_mode": recommendation,
+        "tradeoff_note": note,
+        "warnings": warnings,
         "persisted": persisted,
     }
     if args.json:
         print(json.dumps(report, indent=2))
+        if persist_error is not None:
+            print(f"error: persist failed: {persist_error}", file=sys.stderr)
         return 0
 
     print(f"qmd preflight: {vault}")
     cpus = spec["cpus"] if spec["cpus"] is not None else "?"
     ram = f"{spec['ram_gb']} GB" if spec["ram_gb"] is not None else "unknown"
-    disk = (f"{spec['disk_free_gb']} GB free"
+    disk = (f"{spec['disk_free_gb']} GB free at the vault store"
             if spec["disk_free_gb"] is not None else "unknown free disk")
-    disk_ok = spec["disk_free_gb"] is None or \
-        spec["disk_free_gb"] >= MODEL_FOOTPRINT_GB
-    print(f"  spec: {cpus} CPUs, {ram} RAM, {disk} "
-          f"(model footprint ~{MODEL_FOOTPRINT_GB} GB) "
-          f"— {'ok' if disk_ok else 'LOW DISK'}")
-    gpu = spec["gpu"] or "none detected — CPU-only inference"
+    cache_disk = (f"{spec['model_cache_free_gb']} GB free at the model "
+                  f"cache ({spec['model_cache_path']})"
+                  if spec["model_cache_free_gb"] is not None
+                  else "unknown free disk at the model cache")
+    print(f"  spec: {cpus} CPUs, {ram} RAM, {disk}; {cache_disk} "
+          f"(model footprint ~{MODEL_FOOTPRINT_GB} GB)")
+    gpu = spec["gpu"] or ("no NVIDIA GPU detected (Apple Silicon / AMD "
+                          "GPUs are not probed) — assuming CPU-only "
+                          "inference")
     print(f"  gpu: {gpu}")
-    print(f"  model hub ({args.hub_url}): "
-          f"{'reachable' if hub['reachable'] else 'UNREACHABLE'} "
-          f"in {hub['seconds']}s ({hub['detail']})")
+    if hub.get("skipped"):
+        print(f"  model hub ({hub_url}): probe SKIPPED ({hub['detail']})")
+    else:
+        print(f"  model hub ({hub_url}): "
+              f"{'reachable' if hub['reachable'] else 'UNREACHABLE'} "
+              f"in {hub['seconds']}s ({hub['detail']})")
     if offline_for_smoke:
         print("  smoke runs use HF_HUB_OFFLINE=1 "
-              "(hub unreachable or offline already configured)")
+              "(hub unreachable, probe skipped, or offline already configured)")
     for mode in MODES:
         r = results[mode]
+        cold = r.get("cold", {})
+        warm = r.get("warm", {})
+        cold_txt = (f"cold {cold.get('seconds')}s" if cold.get("seconds")
+                    is not None else f"cold {cold.get('status')}")
+        warm_txt = (f"warm {warm.get('seconds')}s" if warm.get("seconds")
+                    is not None else f"warm {warm.get('status')}")
         if r["status"] == "ok":
             over = " — OVER BUDGET" if r["seconds"] > args.budget else ""
             print(f"  {mode}: ok in {r['seconds']}s "
-                  f"({r['matches']} matches){over}")
+                  f"({r['matches']} matches; {cold_txt}, {warm_txt}){over}")
+        elif r["status"] == "ok-empty":
+            print(f"  {mode}: ok-empty in {r['seconds']}s (zero hits; "
+                  f"{cold_txt}, {warm_txt}) — not recommended")
         elif r["status"] == "skipped":
             print(f"  {mode}: skipped ({r['reason']})")
         else:
-            print(f"  {mode}: {r['status']} in {r['seconds']}s ({r['reason']})")
+            print(f"  {mode}: {r['status']} in {r['seconds']}s "
+                  f"({r['reason']}; {warm_txt})")
     if recommendation is not None:
-        print(f"  recommended default mode: {recommendation}")
+        print(f"  recommended default mode: {recommendation} "
+              f"(warm run; cold cost shown above)")
     else:
-        print("  recommended default mode: none (no mode ran; "
+        print("  recommended default mode: none (no hit-bearing mode ran; "
               "search falls back to `confidant find`)")
+    if note is not None:
+        print(f"  {note}")
     if offline_recommended:
         print("  offline mode recommended: persist with --persist "
               "(or set [qmd] offline = true)")
     if args.persist:
         print(f"  persisted: {persisted or 'nothing to persist'}")
+        if "default_mode_cleared" in persisted:
+            print(f"  note: cleared stale default_mode "
+                  f"({persisted['default_mode_cleared']!r}) — no "
+                  "hit-bearing mode ran")
+        if "offline_cleared" in persisted:
+            print("  note: cleared stale preflight-written offline = true "
+                  "— fresh evidence no longer supports it")
+        if "default_mode_left" in persisted or "offline_left" in persisted:
+            print("  note: a [qmd] value set by hand (not marked as "
+                  "preflight-written) was left alone despite fresh "
+                  "evidence; edit it yourself if it is stale")
+        if persisted:
+            print("  note: [qmd] config is per-user, not per-vault — "
+                  "this recommendation applies to every vault")
+    if persist_error is not None:
+        print(f"  error: persist failed: {persist_error}")
+    if warnings:
+        print("  warnings:")
+        for w in warnings:
+            print(f"    - {w}")
+    print("  note: exit 0 is not a gate — read this report (or --json) "
+          "before the next setup step")
     return 0
 
 

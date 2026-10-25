@@ -58,12 +58,32 @@ CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
 TRUTHY = ("1", "true", "yes", "on")
 MODES = ("hybrid", "bm25", "vector")
-TIMEOUT_HINT = ("the model runtime may be waiting on a model-hub "
-                "(Hugging Face) check through a proxy — the 0.7.0 field "
-                "failure was a 3-minute network wait, not compute. Retry "
-                "with HF_HUB_OFFLINE=1, or persist [qmd] offline = true "
-                "in ~/.config/confidant/config.toml (qmd-preflight.py "
-                "--persist does both the diagnosis and the persist).")
+# The timeout hint is CONDITIONED, not unconditional: a timeout can
+# equally be slow CPU, a large corpus, or model load, and when
+# HF_HUB_OFFLINE is already set a hub check cannot be the cause at all
+# (suggesting it then would be a no-op repeating the original
+# misdiagnosis in the opposite direction). timeout_hint() picks one.
+TIMEOUT_HINT = ("one possible cause is a model-hub (Hugging Face) check "
+                "through a proxy — the 0.7.0 field failure was a 3-minute "
+                "network wait, not compute. Other possible causes: slow "
+                "CPU, a large corpus, or model load. If the hub is the "
+                "suspect, retry with HF_HUB_OFFLINE=1, or persist [qmd] "
+                "offline = true in ~/.config/confidant/config.toml "
+                "(qmd-preflight.py --persist does both the diagnosis "
+                "and the persist).")
+TIMEOUT_HINT_OFFLINE = ("HF_HUB_OFFLINE is already set, so a model-hub "
+                        "check is not the cause of this timeout. Possible "
+                        "causes: slow CPU, a large corpus, or model load "
+                        "— or a model download that offline mode is now "
+                        "blocking (unset HF_HUB_OFFLINE / [qmd] offline "
+                        "and retry if the models are not cached yet).")
+
+
+def timeout_hint(env):
+    """The timeout hint for this run's environment (see above)."""
+    if _truthy(env.get("HF_HUB_OFFLINE", "")):
+        return TIMEOUT_HINT_OFFLINE
+    return TIMEOUT_HINT
 
 # qmd --json shapes vary by subcommand/version; accept the common ones.
 # NOTE: `file` arrives as a qmd://<collection>/<relpath> URI, not a
@@ -396,11 +416,15 @@ def main():
                             "-c", COLLECTION],
                            capture_output=True, text=True, timeout=180, env=env)
     except subprocess.TimeoutExpired:
-        # #722 item 6: a query that blocks on network I/O must say so.
-        # The 0.7.0 timeout reported only `via: find-fallback`, sending
+        # #722 item 6: a query that blocks must say so. The 0.7.0
+        # timeout reported only `via: find-fallback`, sending
         # diagnosticians off to blame the hardware; the wait was a hub
-        # check. Name the suspect and the fix, on stderr and in JSON.
-        return fallback(f"qmd {sub} timed out after 180s", hint=TIMEOUT_HINT)
+        # check. Name the hypotheses and the fix, on stderr and in JSON
+        # — conditioned on whether offline mode is already forced
+        # (timeout_hint), so an already-offline timeout is never blamed
+        # on the hub.
+        return fallback(f"qmd {sub} timed out after 180s",
+                        hint=timeout_hint(env))
     if p.returncode != 0:
         return fallback(f"qmd {sub} failed")
     try:

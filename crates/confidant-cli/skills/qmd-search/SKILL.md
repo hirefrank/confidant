@@ -83,11 +83,19 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 # store gets the vectors (a bare `qmd embed` targets the default store)
 "$(confidant which --skills-dir)"/qmd-search/bin/qmd-index.py --vault /path/to/vault --embed
 
-# preflight the host (issue #722): spec check, model-hub reachability, and a
-# timed smoke query per mode, with a recommended default mode. --persist
-# records the recommendation ([qmd] default_mode, and [qmd] offline when
-# the hub is unreachable or models are already cached) in
-# ~/.config/confidant/config.toml, where qmd-query.py honors it.
+# preflight the host (issue #722): spec check, model-hub reachability, and
+# cold + warm timed smoke queries per mode, with a recommended default
+# mode. qmd-index.py runs preflight automatically at the end of setup
+# (unless --skip-preflight); running it standalone is the same check.
+# --persist records the recommendation ([qmd] default_mode, and
+# [qmd] offline when the hub is unreachable or a hybrid smoke run proves
+# the models are cached) in ~/.config/confidant/config.toml, where
+# qmd-query.py honors it. --persist also clears stale values an earlier
+# preflight run wrote that fresh evidence no longer supports, and leaves
+# hand-set values alone (saying so). A smoke run that answers with zero
+# hits is reported as ok-empty, never recommended. Exit 0 is NOT a gate:
+# read the report (or --json) — a LOW DISK / unreachable-hub /
+# no-mode-recommended outcome still exits 0.
 "$(confidant which --skills-dir)"/qmd-search/bin/qmd-preflight.py --vault /path/to/vault --persist
 ```
 
@@ -148,20 +156,25 @@ now). If QMD or the
 index is missing, the script falls back to `confidant find --json` and notes
 it on stderr.
 
-A timed-out query says so, and names the suspect (#722): the 0.7.0 field
+A timed-out query says so, and names the suspects (#722): the 0.7.0 field
 failure was a 3-minute model-hub (Hugging Face) check through an egress
 proxy, not compute — the old fallback reported only `via: find-fallback`
 and sent diagnosticians off to blame the hardware. A timeout now reports
-the hub hypothesis plus the fix (`HF_HUB_OFFLINE=1`, or persist
-`[qmd] offline = true` via `qmd-preflight.py --persist`) on stderr and
-as `fallback_hint` in the JSON. When `--mode` is omitted, the script uses
-the persisted `[qmd] default_mode` from preflight when present, else bm25;
-`[qmd] offline = true` runs qmd with `HF_HUB_OFFLINE=1` (an explicit
-`HF_HUB_OFFLINE` in the shell still wins).
+the hub as one hypothesis among slow compute / large corpus / model load,
+plus the fix (`HF_HUB_OFFLINE=1`, or persist `[qmd] offline = true` via
+`qmd-preflight.py --persist`), on stderr and as `fallback_hint` in the
+JSON — unless offline mode is already forced, in which case the hint says
+so and blames slow compute instead (a hub check cannot be the cause then).
+When `--mode` is omitted, the script uses the persisted `[qmd]
+default_mode` from preflight when present, else bm25; `[qmd] offline =
+true` runs qmd with `HF_HUB_OFFLINE=1` (an explicit `HF_HUB_OFFLINE` in
+the shell still wins). Note the persisted `[qmd]` config is per-user, not
+per-vault: a preflight recommendation measured on one vault applies to
+every vault until re-persisted.
 
 ## Tooling
 
-- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk]` — runs
+- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk] [--skip-preflight]` — runs
   `confidant reindex` to (re)build `<vault>/.confidant/qmd-corpus/` (a full
   rebuild: the CLI wipes the old corpus), then registers it as the `confidant`
   QMD collection (removing any previous one first). It never walks the vault
@@ -175,20 +188,35 @@ the persisted `[qmd] default_mode` from preflight when present, else bm25;
   binary (default `confidant` on PATH). Each kept `ledger/*.cfd` is written by
   the CLI with a sibling `.cfd.md` so QMD's `**/*.md` collection pattern
   covers ledger facts too (hits map back to the real `.cfd` path). `--embed`
-  runs `qmd embed` afterwards.
+  runs `qmd embed` afterwards. Setup ends with an automatic
+  `qmd-preflight.py` run (issue #722) unless `--skip-preflight` is given:
+  preflight is part of setup, so a cold-start or unreachable-hub problem
+  surfaces here, not on the first real query; a preflight failure never
+  fails the index build.
 - `bin/qmd-preflight.py [--vault PATH] [--persist] [--json]` — issue #722:
-  spec check (cores, RAM, free disk vs the ~2.5 GB model footprint,
-  CPU-only warning when no GPU is detected), a short-timeout model-hub
-  reachability probe, and a timed smoke query per mode on the built
-  corpus, ending in a recommended default mode. Modes are skipped (not
-  failed) when qmd, the corpus, or embeddings are missing; modes over
-  the 60s budget are never recommended over a mode within it. Smoke
-  runs inherit the probe's offline decision so a hanging hub cannot
-  turn preflight itself into a silent fallback. `--persist` writes
-  `[qmd] default_mode` and, when the hub is unreachable or models are
-  already cached, `[qmd] offline = true` to the user config,
-  preserving every other key (including the #723 disk-election key).
-  Exit 0 whenever the report completes, even with no mode recommended.
+  spec check (cores, RAM, free disk at the vault store AND the model
+  cache vs the ~2.5 GB model footprint, with explicit warnings below the
+  2-vCPU / 8 GB field floor; "no NVIDIA GPU detected" wording, since
+  Apple Silicon / AMD GPUs are not probed), a short-timeout model-hub
+  reachability probe (the configured endpoint: `--hub-url`, else
+  `HF_ENDPOINT`, else huggingface.co; a proxy 4xx/5xx does not count as
+  reachable; skipped entirely when `HF_HUB_OFFLINE` is already set),
+  and cold + warm timed smoke queries per mode on the built corpus,
+  ending in a recommended default mode derived from the warm runs.
+  Modes are skipped (not failed) when qmd, the corpus, or embeddings
+  are missing; modes over the 60s budget are never recommended over a
+  mode within it; a zero-hit answer is `ok-empty`, never recommended,
+  and only a hit-bearing hybrid `ok` counts as proof the models are
+  cached (a timeout/failed/fallback run proves nothing). Smoke runs
+  inherit the probe's offline decision so a hanging hub cannot turn
+  preflight itself into a silent fallback, and progress lines go to
+  stderr per run. `--persist` writes `[qmd] default_mode` and, when the
+  hub is unreachable or the hybrid cache proof holds, `[qmd] offline =
+  true` to the user config, preserving every other key (including the
+  #723 disk-election key), and clears stale preflight-written keys the
+  fresh evidence no longer supports (hand-set values are left alone and
+  reported). Exit 0 whenever the report completes, even with no mode
+  recommended — read the report, do not gate on the exit code.
 - `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY`
   — queries QMD, verifies every hit against `confidant allowlist --json`
   (one call per query; #538), and emits the JSON above. A ledger hit is kept

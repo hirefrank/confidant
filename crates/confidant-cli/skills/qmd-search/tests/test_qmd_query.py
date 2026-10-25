@@ -433,6 +433,54 @@ class QmdQueryConfigTest(unittest.TestCase):
     def test_timeout_hint_names_the_hub_and_the_fix(self):
         self.assertIn("Hugging Face", self.query.TIMEOUT_HINT)
         self.assertIn("HF_HUB_OFFLINE=1", self.query.TIMEOUT_HINT)
+        self.assertIn("one possible cause", self.query.TIMEOUT_HINT)
+
+    def test_timeout_hint_conditioned_on_offline(self):
+        # Offline already forced: the hub cannot be the cause, and the
+        # hint must say so instead of suggesting the no-op fix.
+        hint = self.query.timeout_hint({"HF_HUB_OFFLINE": "1"})
+        self.assertIn("not the cause", hint)
+        self.assertNotIn("Hugging Face", hint)
+        self.assertEqual(self.query.timeout_hint({}),
+                         self.query.TIMEOUT_HINT)
+
+    def test_timeout_fallback_json_carries_conditioned_hint(self):
+        # In-process main() with qmd patched to time out: the fallback
+        # JSON must carry fallback_hint, conditioned on the env.
+        vault = Path(self.tmp.name) / "vault"
+        vault.mkdir()
+        (vault / "confidant.toml").write_text("", encoding="utf-8")
+        (vault / ".confidant" / "qmd-corpus").mkdir(parents=True)
+        find_envelope = {"ok": True, "matches": [
+            {"path": "people/p-01M3TC5H00MPJG000000000101/profile.md"}]}
+
+        def fake_run(cmd, **kwargs):
+            if "find" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=json.dumps(find_envelope), stderr="")
+            raise subprocess.TimeoutExpired(cmd, 180)
+
+        for env_offline, want in ((None, self.query.TIMEOUT_HINT),
+                                  ("1", self.query.TIMEOUT_HINT_OFFLINE)):
+            argv = ["qmd-query.py", "--vault", str(vault),
+                    "--mode", "bm25", "hello"]
+            # "" is falsy: deterministic "not offline" regardless of
+            # the ambient environment.
+            env_patch = {"HF_HUB_OFFLINE": env_offline or ""}
+            out = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", argv), \
+                    unittest.mock.patch.object(
+                        shutil, "which", return_value="/fake/bin"), \
+                    unittest.mock.patch.object(
+                        subprocess, "run", side_effect=fake_run), \
+                    unittest.mock.patch.dict(os.environ, env_patch), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = self.query.main()
+            self.assertEqual(code, 0)
+            data = json.loads(out.getvalue())
+            self.assertEqual(data["mode"], "find-fallback")
+            self.assertEqual(data["fallback_hint"], want)
 
 
 class QmdPreflightTest(unittest.TestCase):
@@ -548,6 +596,8 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertIsNone(self.preflight.recommend_default_mode(results, 60))
 
     def test_smoke_with_stub_query_script(self):
+        # A zero-hit answer is ok-empty, not ok: it proves timing, not
+        # a usable mode, and is never recommended.
         stub = self.root / "stub-query.py"
         stub.write_text(
             "#!/usr/bin/env python3\n"
@@ -559,8 +609,83 @@ class QmdPreflightTest(unittest.TestCase):
             str(stub), "/vault", "preflight", timeout=30, env=dict(os.environ),
             qmd_present=True, corpus_present=True)
         for mode in ("hybrid", "vector", "bm25"):
-            self.assertEqual(results[mode]["status"], "ok", results[mode])
+            self.assertEqual(results[mode]["status"], "ok-empty", results[mode])
             self.assertEqual(results[mode]["matches"], 0)
+        self.assertIsNone(
+            self.preflight.recommend_default_mode(results, 60))
+        self.assertFalse(self.preflight.cache_complete(results))
+
+    def test_smoke_hit_bearing_ok_reports_cold_and_warm(self):
+        # A hit-bearing stub is run twice (cold, then warm); the warm
+        # run is canonical and both timings are reported.
+        stub = self.root / "stub-hits.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            "print(json.dumps({'mode': mode, "
+            "'matches': [{'path': 'x.md', 'score': 1.0}]}))\n",
+            encoding="utf-8")
+        calls = []
+        results = self.preflight.run_smoke(
+            str(stub), "/vault", "preflight", timeout=30, env=dict(os.environ),
+            qmd_present=True, corpus_present=True,
+            progress=lambda m, ph, r: calls.append((m, ph)))
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "ok", results[mode])
+            self.assertEqual(results[mode]["matches"], 1)
+            self.assertEqual(results[mode]["cold"]["status"], "ok")
+            self.assertEqual(results[mode]["warm"]["status"], "ok")
+            self.assertIsNotNone(results[mode]["seconds"])
+        # Two runs per mode (cold + warm), each announced on progress.
+        self.assertEqual(len(calls), 12)
+        self.assertEqual(
+            self.preflight.recommend_default_mode(results, 60), "hybrid")
+        self.assertTrue(self.preflight.cache_complete(results))
+
+    def test_smoke_timeout_failure_fallback_classification(self):
+        # Timeout: the stub sleeps past the timeout (killed, not hung).
+        sleepy = self.root / "stub-sleep.py"
+        sleepy.write_text(
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n",
+            encoding="utf-8")
+        results = self.preflight.run_smoke(
+            str(sleepy), "/vault", "preflight", timeout=1,
+            env=dict(os.environ), qmd_present=True, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "timeout", results[mode])
+            self.assertEqual(results[mode]["warm"]["status"], "not-measured")
+        # A timeout proves nothing about the cache: offline must NOT
+        # be recommended on hub-reachable + timeout evidence alone.
+        hub = {"reachable": True, "skipped": False}
+        self.assertFalse(
+            self.preflight.offline_recommended_for(hub, results))
+        # Failure: nonzero exit. Fallback: find-fallback envelope.
+        failing = self.root / "stub-fail.py"
+        failing.write_text(
+            "#!/usr/bin/env python3\nimport sys\n"
+            "print('boom', file=sys.stderr)\nsys.exit(3)\n",
+            encoding="utf-8")
+        results = self.preflight.run_smoke(
+            str(failing), "/vault", "preflight", timeout=30,
+            env=dict(os.environ), qmd_present=True, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "failed", results[mode])
+            self.assertIn("boom", results[mode]["reason"])
+        fallback_stub = self.root / "stub-fallback.py"
+        fallback_stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'mode': 'find-fallback', "
+            "'fallback': 'qmd missing', 'matches': []}))\n",
+            encoding="utf-8")
+        results = self.preflight.run_smoke(
+            str(fallback_stub), "/vault", "preflight", timeout=30,
+            env=dict(os.environ), qmd_present=True, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "fallback", results[mode])
+        self.assertFalse(
+            self.preflight.offline_recommended_for(hub, results))
 
     def test_smoke_skips_when_qmd_missing(self):
         results = self.preflight.run_smoke(
@@ -569,6 +694,290 @@ class QmdPreflightTest(unittest.TestCase):
         for mode in ("hybrid", "vector", "bm25"):
             self.assertEqual(results[mode]["status"], "skipped")
             self.assertIn("not installed", results[mode]["reason"])
+
+    def test_hub_probe_stalling_server_times_out(self):
+        # A stalling hub (connection accepted, never answered — the slow
+        # proxy case) must hit the probe timeout, not hang preflight.
+        import socket
+        import threading
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        def hold():
+            try:
+                conn, _ = listener.accept()
+                time.sleep(30)
+                conn.close()
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        try:
+            start = time.time()
+            result = self.preflight.probe_model_hub(
+                f"http://127.0.0.1:{port}/", timeout=2)
+            elapsed = time.time() - start
+        finally:
+            listener.close()
+        self.assertFalse(result["reachable"])
+        self.assertLess(elapsed, 8)
+        self.assertIn("timed out", result["detail"])
+
+    def test_hub_probe_proxy_error_not_reachable(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(b"Bad Gateway")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}/"
+            result = self.preflight.probe_model_hub(url, timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertFalse(result["reachable"])
+        self.assertIn("502", result["detail"])
+
+    def test_hub_probe_skipped_when_offline_forced(self):
+        result = self.preflight.probe_model_hub(
+            "http://127.0.0.1:1/", timeout=5, offline_forced=True)
+        self.assertFalse(result["reachable"])
+        self.assertTrue(result["skipped"])
+        self.assertIn("HF_HUB_OFFLINE", result["detail"])
+
+    def test_hub_url_prefers_flag_then_hf_endpoint(self):
+        with unittest.mock.patch.dict(
+                os.environ, {"HF_ENDPOINT": "https://endpoint.example"}):
+            self.assertEqual(
+                self.preflight.resolve_hub_url(None),
+                "https://endpoint.example")
+            self.assertEqual(
+                self.preflight.resolve_hub_url("https://flag.example"),
+                "https://flag.example")
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HF_ENDPOINT", None)
+            self.assertEqual(self.preflight.resolve_hub_url(None),
+                             self.preflight.DEFAULT_HUB_URL)
+
+    def test_spec_warnings_compare_thresholds(self):
+        low = {"cpus": 1, "ram_gb": 1.0, "disk_free_gb": 1.0,
+               "model_cache_free_gb": 10.0}
+        warnings = self.preflight.spec_warnings(low)
+        self.assertTrue(any("CPU" in w for w in warnings), warnings)
+        self.assertTrue(any("RAM" in w for w in warnings), warnings)
+        self.assertTrue(any("LOW DISK" in w for w in warnings), warnings)
+        field = {"cpus": 2, "ram_gb": 8.0, "disk_free_gb": 10.0,
+                 "model_cache_free_gb": 10.0}
+        self.assertEqual(self.preflight.spec_warnings(field), [])
+        unknown = {"cpus": None, "ram_gb": None, "disk_free_gb": None,
+                   "model_cache_free_gb": None}
+        warnings = self.preflight.spec_warnings(unknown)
+        self.assertEqual(len(warnings), 3)
+        self.assertTrue(all("unknown" in w for w in warnings), warnings)
+
+    def test_tradeoff_note_surfaces_runner_up(self):
+        # The fastest hit-bearing mode is the runner-up: bm25 here.
+        results = {
+            "hybrid": {"status": "ok", "seconds": 59.0},
+            "vector": {"status": "ok", "seconds": 2.0},
+            "bm25": {"status": "ok", "seconds": 0.5},
+        }
+        note = self.preflight.tradeoff_note(results, "hybrid")
+        self.assertIsNotNone(note)
+        self.assertIn("bm25", note)
+        self.assertIn("0.5", note)
+        # With bm25 out, the runner-up is vector (#722's own example:
+        # hybrid ~40s warm, vector recommended).
+        results["bm25"] = {"status": "skipped", "seconds": None}
+        results["hybrid"] = {"status": "ok", "seconds": 40.0}
+        note = self.preflight.tradeoff_note(results, "hybrid")
+        self.assertIsNotNone(note)
+        self.assertIn("vector", note)
+        self.assertIn("2.0", note)
+        close = {
+            "hybrid": {"status": "ok", "seconds": 0.9},
+            "vector": {"status": "ok", "seconds": 2.0},
+            "bm25": {"status": "ok", "seconds": 0.5},
+        }
+        self.assertIsNone(self.preflight.tradeoff_note(close, "hybrid"))
+
+    # --persist end-to-end through main() (offline/hub/config together).
+
+    def _fake_vault(self):
+        vault = self.root / "vault"
+        vault.mkdir(exist_ok=True)
+        (vault / "confidant.toml").write_text("", encoding="utf-8")
+        (vault / ".confidant" / "qmd-corpus").mkdir(parents=True)
+        return vault
+
+    def _fake_qmd_on_path(self):
+        bindir = self.root / "bin"
+        bindir.mkdir(exist_ok=True)
+        write_exec(bindir / "qmd", "#!/bin/sh\nexit 0\n")
+        return bindir
+
+    def _stub(self, name, matches):
+        stub = self.root / name
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            f"print(json.dumps({{'mode': mode, 'matches': {matches!r}}}))\n",
+            encoding="utf-8")
+        return stub
+
+    def _closed_port_url(self):
+        import socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return f"http://127.0.0.1:{port}/"
+
+    def _run_main(self, vault, stub, hub_url, extra=()):
+        bindir = self._fake_qmd_on_path()
+        # main(argv) passes argv straight to parse_args: no prog name.
+        argv = ["--vault", str(vault),
+                "--query-script", str(stub), "--hub-url", hub_url,
+                "--json", *extra]
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.dict(
+                os.environ, {"PATH": f"{bindir}{os.pathsep}"
+                             f"{os.environ.get('PATH', '')}"}), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = self.preflight.main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        return json.loads(out.getvalue())
+
+    def test_persist_sets_recommendation_and_offline(self):
+        vault = self._fake_vault()
+        stub = self._stub("stub-hits2.py", [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertTrue(report["offline_recommended"])
+        self.assertTrue(report["embeddings_present"])
+        self.assertEqual(report["persisted"]["default_mode"], "hybrid")
+        self.assertTrue(report["persisted"]["offline"])
+        cfg = (self.root / ".config" / "confidant" / "config.toml")
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "hybrid"', text)
+        self.assertIn("offline = true", text)
+
+    def test_persist_clears_stale_preflight_keys(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
+            vault = self._fake_vault()
+            cfg = self.root / ".config" / "confidant"
+            cfg.mkdir(parents=True, exist_ok=True)
+            (cfg / "config.toml").write_text(
+                "[qmd]\ndefault_mode = \"vector\"\n"
+                "default_mode_source = \"preflight\"\n"
+                "offline = true\noffline_source = \"preflight\"\n",
+                encoding="utf-8")
+            stub = self._stub("stub-empty2.py", [])
+            report = self._run_main(vault, stub, hub_url,
+                                    extra=("--persist",))
+            self.assertIsNone(report["recommended_mode"])
+            self.assertFalse(report["offline_recommended"])
+            self.assertEqual(report["persisted"]["default_mode_cleared"],
+                             "vector")
+            self.assertTrue(report["persisted"]["offline_cleared"])
+            text = (cfg / "config.toml").read_text(encoding="utf-8")
+            self.assertNotIn("default_mode", text)
+            self.assertNotIn("offline", text)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_persist_leaves_hand_set_values_alone(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
+            vault = self._fake_vault()
+            cfg = self.root / ".config" / "confidant"
+            cfg.mkdir(parents=True, exist_ok=True)
+            (cfg / "config.toml").write_text(
+                "[qmd]\ndefault_mode = \"bm25\"\noffline = true\n",
+                encoding="utf-8")
+            stub = self._stub("stub-empty3.py", [])
+            report = self._run_main(vault, stub, hub_url,
+                                    extra=("--persist",))
+            self.assertEqual(report["persisted"]["default_mode_left"],
+                             "bm25")
+            self.assertTrue(report["persisted"]["offline_left"])
+            text = (cfg / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('default_mode = "bm25"', text)
+            self.assertIn("offline = true", text)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_persist_without_home_fails_before_smoke(self):
+        vault = self._fake_vault()
+        counter = self.root / "smoke-calls.txt"
+        stub = self.root / "stub-count.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"open({str(counter)!r}, 'a').write('x')\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            "print(json.dumps({'mode': mode, 'matches': []}))\n",
+            encoding="utf-8")
+        bindir = self._fake_qmd_on_path()
+        argv = ["--vault", str(vault),
+                "--query-script", str(stub),
+                "--hub-url", self._closed_port_url(), "--persist"]
+        with unittest.mock.patch.dict(os.environ, {
+                "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+            os.environ.pop("HOME", None)
+            with self.assertRaises(SystemExit):
+                self.preflight.main(argv)
+        self.assertFalse(counter.exists(),
+                         "smoke ran despite --persist having no HOME")
 
 
 if __name__ == "__main__":
