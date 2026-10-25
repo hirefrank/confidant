@@ -49,7 +49,12 @@ confidant sync --push          # fetch, then push after confirmation
 ```
 
 `sync` is read-only unless `--pull` or `--push` is passed. Both are
-network writes and are explicit:
+network writes and are explicit. The default report names its own
+remedy when it reports ahead/behind state (#736): a behind report ends
+with `Run `confidant sync --pull` to fast-forward …`, an ahead report
+with `Run `confidant sync --push` to push …` — the same text is carried
+as the `remedy` field in JSON output, and is absent when up to date,
+after an applied write, or after a declined confirm (see JSON below).
 
 - Interactive: the command asks `Fast-forward main to origin/main (2
   commits)? [y/N]` or `Push 2 commit(s) to origin/main? [y/N]`. Only `y`
@@ -82,18 +87,37 @@ force flag.
   "remote": "origin",
   "branch": "main",
   "upstream": "origin/main",
-  "ahead": 2,
-  "behind": 0,
+  "ahead": 0,
+  "behind": 2,
   "crypto_mode": "encrypted",
   "fetched": true,
   "dry_run": false,
   "action": "none",
-  "applied": false
+  "applied": false,
+  "remedy": "Run `confidant sync --pull` to fast-forward main to origin/main (2 commit(s))"
 }
 ```
 
 `action` is `none`, `pull`, or `push`; `applied` is true only when a
-confirmed write ran. `fetched` is false for `--dry-run`.
+confirmed write ran. `fetched` is false for `--dry-run`. `remedy` is
+the command that applies the reported state. It is present exactly when
+`action` is `none` and the branch is ahead or behind, and `null`
+otherwise: when the branch is up to date, when a write was applied, or
+when a requested write reached the confirm prompt and was declined (in
+text output that prints "`pull`/`push` not confirmed; nothing changed"
+with no remedy line). A `--dry-run` report does carry a remedy — dry-run
+never takes a write branch, so `action` stays `none` — but its counts
+are last-fetched, so the remedy string itself ends with "(as of the
+last fetch)". A `--pull` request on an ahead-only branch (or `--push`
+on a behind-only one) likewise falls through with `action` `none` and
+names the other direction's command. On a dirty tree, a behind remedy
+names commit-or-stash first, because `--pull` refuses a tree it would
+overwrite.
+
+Existing JSON consumers gain a `remedy` key (string or null) on every
+`sync` success envelope. Tolerant parsers are unaffected; strict-schema
+or exact-snapshot consumers will see a new key. That is intended, not a
+breaking change to the envelope shape.
 
 ### Refusals (stable codes)
 
@@ -110,7 +134,9 @@ anyone with repository access, which defeats the encryption boundary. Run
 `confidant init` to encrypt the vault, or remove the remote and keep it
 local-only. The `git-remote` doctor check warns about this setup too.
 
-If the branch diverged, reconcile it yourself:
+If the branch diverged, reconcile it yourself. The `E_NOT_FAST_FORWARD`
+error carries these steps as its `fix`, naming the branch and upstream,
+so a diverged report names its recovery instead of just refusing:
 
 ```sh
 git fetch origin

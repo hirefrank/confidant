@@ -357,7 +357,19 @@ fn diverged_branch_refuses_push_and_pull_with_a_stable_code() {
         assert_eq!(v["error"]["code"], "E_NOT_FAST_FORWARD", "{v}");
         let message = v["error"]["message"].as_str().unwrap();
         assert!(message.contains("diverged"), "{message}");
+        // #736: the refusal itself names the recovery, with the branch
+        // and upstream, instead of leaving the operator with no next step.
+        let fix = v["error"]["fix"].as_str().unwrap();
+        assert!(fix.contains("origin/main"), "{fix}");
+        assert!(fix.contains("git merge origin/main"), "{fix}");
+        assert!(fix.contains("confidant sync --push"), "{fix}");
     }
+    // The default report refuses the same way, with the same fix.
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_eq!(status, 1, "default sync must refuse a diverged branch: {v}");
+    assert_eq!(v["error"]["code"], "E_NOT_FAST_FORWARD", "{v}");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    assert!(fix.contains("git rebase origin/main"), "{fix}");
     assert_eq!(
         git(&fixture.remote, &["rev-parse", "main"]).trim(),
         remote_head,
@@ -485,4 +497,209 @@ fn pull_refuses_a_dirty_tree_that_would_be_overwritten() {
     let after = std::fs::read_to_string(&local_config).unwrap();
     assert!(after.ends_with("# local edit\n"), "{after}");
     assert!(!after.contains("# remote edit"), "{after}");
+}
+
+/// #736: the default report prints its own resolution. The original
+/// repro was an operator who ran `sync`, saw the vault was behind, and
+/// did not know `sync --pull` existed — because nothing in the report
+/// said so. Behind names `--pull`, ahead names `--push`, and an
+/// up-to-date report names nothing.
+#[cfg(unix)]
+#[test]
+fn default_report_names_its_remedy() {
+    // Behind: the report names --pull, in text and in JSON, and the
+    // remedy survives into a --dry-run report of the same state,
+    // qualified there as last-fetched (dry-run never contacts the remote).
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 ahead, 1 behind"), "{text}");
+    assert!(
+        text.contains(
+            "Run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s))"
+        ),
+        "{text}"
+    );
+
+    let (status, v) = fixture.run_json(&["sync", "--dry-run", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["behind"], 1, "{v}");
+    assert_eq!(
+        v["remedy"],
+        "Run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s)) (as of the last fetch)",
+        "{v}"
+    );
+
+    // Ahead: the report names --push.
+    let fixture = SyncVault::new();
+    git(
+        &fixture.vault,
+        &["commit", "-q", "--allow-empty", "-m", "local"],
+    );
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("1 ahead, 0 behind"), "{text}");
+    assert!(
+        text.contains("Run `confidant sync --push` to push 1 commit(s) to origin/main"),
+        "{text}"
+    );
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["ahead"], 1, "{v}");
+    assert_eq!(
+        v["remedy"], "Run `confidant sync --push` to push 1 commit(s) to origin/main",
+        "{v}"
+    );
+
+    // Up to date: no remedy line, and the JSON field is null.
+    let fixture = SyncVault::new();
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 ahead, 0 behind"), "{text}");
+    assert!(!text.contains("Run `confidant sync"), "{text}");
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert!(v["remedy"].is_null(), "{v}");
+}
+
+/// #736: a remedy is a report of state that changed nothing. Once a write
+/// was applied, there is nothing left to point at, so the JSON `remedy`
+/// is null after a confirmed pull and after a confirmed push.
+#[cfg(unix)]
+#[test]
+fn remedy_is_null_after_an_applied_pull_or_push() {
+    // Applied pull.
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let (status, v) = fixture.run_json(&["sync", "--pull", "--yes", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["action"], "pull", "{v}");
+    assert_eq!(v["applied"], true, "{v}");
+    assert_eq!(v["behind"], 0, "{v}");
+    assert!(v["remedy"].is_null(), "{v}");
+
+    // Applied push.
+    let fixture = SyncVault::new();
+    git(
+        &fixture.vault,
+        &["commit", "-q", "--allow-empty", "-m", "local"],
+    );
+    let (status, v) = fixture.run_json(&["sync", "--push", "--yes", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["action"], "push", "{v}");
+    assert_eq!(v["applied"], true, "{v}");
+    assert_eq!(v["ahead"], 0, "{v}");
+    assert!(v["remedy"].is_null(), "{v}");
+}
+
+/// #736: a declined confirm likewise names no remedy — the report says
+/// "pull not confirmed; nothing changed" and prints no pointer line.
+/// (No `--no-input`/`--json` here: those turn an unconfirmed write into
+/// a usage error before any report exists. Under the test harness stdin
+/// is not a TTY, so the prompt declines without an answer.)
+#[cfg(unix)]
+#[test]
+fn declined_confirm_names_no_remedy() {
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let local = git(&fixture.vault, &["rev-parse", "HEAD"]);
+
+    let out = fixture.run(&["sync", "--pull"]);
+    assert!(out.status.success(), "a declined pull still exits 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("pull not confirmed; nothing changed"),
+        "{text}"
+    );
+    assert!(!text.contains("Run `confidant sync"), "{text}");
+    assert_eq!(
+        git(&fixture.vault, &["rev-parse", "HEAD"]),
+        local,
+        "nothing was fast-forwarded"
+    );
+}
+
+/// #736: a dry-run remedy reports last-fetched state, and says so in the
+/// remedy itself. This test exercises real staleness: after priming the
+/// state with a fetch, a second remote commit lands that no fetch has
+/// seen, so the dry-run report still shows the old count — qualified.
+#[cfg(unix)]
+#[test]
+fn dry_run_remedy_is_qualified_and_reports_last_fetched_state() {
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote-1"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    // Prime the last-fetched state: behind 1.
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+
+    // A second remote commit nobody has fetched: the true state is now
+    // behind 2, but a dry run must still report behind 1, qualified.
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote-2"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    let (status, v) = fixture.run_json(&["sync", "--dry-run", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(v["fetched"], false, "{v}");
+    assert_eq!(v["behind"], 1, "{v}");
+    assert_eq!(
+        v["remedy"],
+        "Run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s)) (as of the last fetch)",
+        "{v}"
+    );
+    let out = fixture.run(&["sync", "--dry-run", "--no-input"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("(1 commit(s)) (as of the last fetch)"),
+        "{text}"
+    );
+}
+
+/// #736: the plain pull remedy promises a fast-forward `--pull` would
+/// refuse on a dirty tree. On a dirty tree the behind remedy names
+/// commit-or-stash first instead.
+#[cfg(unix)]
+#[test]
+fn behind_remedy_on_a_dirty_tree_names_commit_or_stash_first() {
+    let fixture = SyncVault::new();
+    let other = fixture.other_clone();
+    git(&other, &["commit", "-q", "--allow-empty", "-m", "remote"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+
+    // An uncommitted edit to a tracked file the remote did not touch.
+    let local_config = fixture.vault.join("confidant.toml");
+    let mut local = std::fs::read_to_string(&local_config).unwrap();
+    local.push_str("# local edit\n");
+    std::fs::write(&local_config, local).unwrap();
+
+    let out = fixture.run(&["sync", "--no-input"]);
+    assert!(out.status.success(), "default sync must exit 0");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("0 ahead, 1 behind"), "{text}");
+    assert!(
+        text.contains(
+            "Commit or stash your changes, then run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s))"
+        ),
+        "{text}"
+    );
+    let (status, v) = fixture.run_json(&["sync", "--json", "--no-input"]);
+    assert_ok(status, &v);
+    assert_eq!(
+        v["remedy"],
+        "Commit or stash your changes, then run `confidant sync --pull` to fast-forward main to origin/main (1 commit(s))",
+        "{v}"
+    );
 }
