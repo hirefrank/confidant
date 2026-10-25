@@ -1027,14 +1027,238 @@ fn device_add_initiate_json_output_writes_request_file() {
     );
     let doc: toml::Value = toml::from_str(&file_body).unwrap();
     assert_eq!(doc["label"].as_str(), Some("b"));
+    assert_eq!(doc["version"].as_integer(), Some(1));
     assert!(
         !doc["pubkey"].as_str().unwrap_or("").is_empty(),
         "request file must carry a pubkey"
     );
+    // Nit 5: parse as the request struct itself (not just toml::Value),
+    // closing the loop to the --from-request receiving side.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TestDeviceAddRequest {
+        version: u32,
+        pubkey: String,
+        label: String,
+    }
+    let req_doc: TestDeviceAddRequest = toml::from_str(&file_body).unwrap();
+    assert_eq!(req_doc.version, 1);
+    assert_eq!(req_doc.label, "b");
+    assert!(!req_doc.pubkey.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(&req.display().to_string()),
         "stderr must state the written path, got: {stderr}"
+    );
+}
+
+#[test]
+fn device_add_initiate_output_failure_provisions_no_key() {
+    // #719 review SF1/SF3: an --output into a nonexistent directory must
+    // exit non-zero with no success envelope on stdout, and must not
+    // provision (or replace) a key: the pre-enrolled test key is byte-
+    // identical afterwards, and a retry with --force to a good path
+    // succeeds. (with_test_keychain pre-enrolls a key, so the failing
+    // run is deliberately without --force: preflight must fire before
+    // the enrollment refusal. In --json mode the error envelope is on
+    // stdout, not stderr.)
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let key_file = h2.keychain_dir.as_ref().unwrap().join("device.key");
+    let key_before = std::fs::read(&key_file).unwrap();
+    let bad = h2.home.join("no-such-dir").join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            bad.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "initiate to a missing directory must fail"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("\"ok\": true"),
+        "no success envelope on stdout, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("no-such-dir"),
+        "error envelope must name the bad destination, got: {stdout}"
+    );
+    assert!(!bad.exists(), "failed run must not create the file");
+    assert_eq!(
+        std::fs::read(&key_file).unwrap(),
+        key_before,
+        "failed run must not touch the enrolled key"
+    );
+    let good = h2.home.join("req.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            good.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "retry with --force must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(good.is_file(), "retry must write the request file");
+}
+
+#[test]
+fn device_add_initiate_human_output_writes_file_and_suppresses_stdout() {
+    // #719 review SF3: human-mode --output still writes the file and
+    // suppresses the stdout document after the write moved into the
+    // shared helper.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let req = h2.home.join("req-human.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stdout document must be suppressed with --output, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let file_body = std::fs::read_to_string(&req).expect("request file must exist");
+    let doc: toml::Value = toml::from_str(&file_body).unwrap();
+    assert_eq!(doc["label"].as_str(), Some("b"));
+    assert_eq!(doc["version"].as_integer(), Some(1));
+    assert!(!doc["pubkey"].as_str().unwrap_or("").is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&req.display().to_string()),
+        "stderr must state the written path, got: {stderr}"
+    );
+}
+
+#[test]
+fn device_add_initiate_output_refuses_existing_file() {
+    // #719 review SF2: a typo'd --output must not destroy an existing
+    // file, and the refusal must happen before provisioning (the
+    // pre-enrolled test key is untouched; a retry with --force to a
+    // fresh path succeeds).
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let key_file = h2.keychain_dir.as_ref().unwrap().join("device.key");
+    let key_before = std::fs::read(&key_file).unwrap();
+    let req = h2.home.join("req.toml");
+    std::fs::write(&req, "keep me\n").unwrap();
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            req.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "overwrite must be refused");
+    assert_eq!(
+        std::fs::read_to_string(&req).unwrap(),
+        "keep me\n",
+        "existing file must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(&key_file).unwrap(),
+        key_before,
+        "refused run must not touch the enrolled key"
+    );
+    let good = h2.home.join("req-fresh.toml");
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            good.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "retry with --force must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(good.is_file());
+}
+
+#[test]
+#[cfg(unix)]
+fn device_add_initiate_output_refuses_symlink() {
+    // #719 review SF2: --output through a symlink must not write to the
+    // link target.
+    let mut h2 = Harness::new();
+    h2.with_test_keychain();
+    let victim = h2.home.join("victim.toml");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    let link = h2.home.join("req.toml");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let out = h2
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--no-input",
+            "--json",
+            "--label",
+            "b",
+            "--output",
+            link.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "symlink target must be refused");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "keep me\n",
+        "symlink target must be untouched"
     );
 }
 
