@@ -139,6 +139,10 @@ fn search_with(
     let allow = Allowlist::build_with(vault, scope, operator);
     let findings = findings_for_find(&allow);
     if needle.is_empty() {
+        // #718 fix wave: an empty query runs no search, so it carries no
+        // absence warning — the result makes no absence claim at all.
+        // (The CLI rejects empty queries; this path is only reachable
+        // from direct core callers.)
         return Ok(SearchResult {
             hits: Vec::new(),
             findings,
@@ -185,9 +189,14 @@ fn search_with(
         }
     }
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    let empty = hits.is_empty();
+    // #718 fix wave: the skip count is vault-wide even under a `--packs`
+    // scope — skipped records' pack ownership is unknowable without
+    // decrypting them — so a scoped warning says so.
+    let scoped = matches!(scope, PackScope::Only(_));
     Ok(SearchResult {
         hits,
-        findings,
+        findings: with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted, scoped),
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
     })
@@ -1050,6 +1059,52 @@ fn tokens_allowed_with(
     true
 }
 
+/// #718: a zero-match `find` over a vault with skipped encrypted records
+/// must not read as "not in the vault". When no hit was found and at least
+/// one encrypted record could not be searched, append a warning finding
+/// carrying the count and the remedy, in-band with the other findings —
+/// so JSON callers branch on `W_SKIPPED_ENCRYPTED` instead of gliding
+/// past the `skipped_encrypted` count. Deliberately empty-only: a
+/// non-empty result already shows the search found something, and the
+/// count field still reports the skips. Refused (tampered) envelopes are
+/// not folded in: tampering is a distinct condition with a different
+/// remedy (investigate/repair, not `resolve`/`context`/`reindex`), and
+/// folding it into this warning would misdirect the remedy; refused
+/// envelopes stay counted separately in `refused_envelopes`. Under a
+/// pack scope the count stays vault-wide — a skipped record's pack
+/// ownership is unknowable without decrypting it — and the message says
+/// so. No vault content goes into the message: only the count.
+fn with_skipped_encrypted_warning(
+    mut findings: Vec<Finding>,
+    empty: bool,
+    skipped_encrypted: u32,
+    scoped: bool,
+) -> Vec<Finding> {
+    if empty && skipped_encrypted > 0 {
+        let qualifier = if scoped { " (vault-wide count)" } else { "" };
+        let message = if skipped_encrypted == 1 {
+            format!(
+                "1 encrypted record was not searched{qualifier}; this result does not \
+                 establish absence — try `resolve`/`context`, or build the search \
+                 corpus with `reindex`."
+            )
+        } else {
+            format!(
+                "{skipped_encrypted} encrypted records were not searched{qualifier}; \
+                 this result does not establish absence — try `resolve`/`context`, \
+                 or build the search corpus with `reindex`."
+            )
+        };
+        findings.push(Finding::new(
+            FindingCode::SkippedEncrypted,
+            Severity::Warning,
+            message,
+        ));
+        sort_findings(&mut findings);
+    }
+    findings
+}
+
 fn findings_for_find(allow: &Allowlist<'_>) -> Vec<Finding> {
     let mut kept = Vec::new();
     let mut redacted: BTreeMap<FindingCode, (Severity, usize)> = BTreeMap::new();
@@ -1453,6 +1508,114 @@ mod tests {
                 .all(|h| !h.path.contains("0036CR000006")),
             "unattributed note leaked via its `type:` line: {:?}",
             by_type.hits
+        );
+    }
+
+    /// #718 fix wave: a vault with exactly one skipped encrypted record,
+    /// via a content hook that skips the single profile file. Mirrors the
+    /// pack setup of [`example_pack_vault`] so the vault loads cleanly.
+    fn skipped_encrypted_vault() -> (tempfile::TempDir, crate::vault::Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/packs/example-pack");
+        let dst = dir.path().join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&dst).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+        let hash = crate::packs::dir::read_pack_dir(&dst).unwrap().hash;
+        std::fs::write(
+            dir.path().join("confidant.lock"),
+            format!(
+                "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let ada = "p-01M3TC5H00MPJG000000000000";
+        std::fs::create_dir_all(dir.path().join("people").join(ada)).unwrap();
+        std::fs::write(
+            dir.path().join("people").join(ada).join("profile.md"),
+            format!("---\nid: {ada}\ntype: person\nname: Ada Example\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+        let hook: crate::vault::ContentHook = std::sync::Arc::new(|file: &str, bytes: &[u8]| {
+            if file.ends_with("profile.md") {
+                crate::vault::ContentOutcome::Skipped
+            } else {
+                crate::vault::ContentOutcome::Content(bytes.to_vec())
+            }
+        });
+        let vault = crate::vault::load_vault_with_hook(dir.path(), Some(hook)).unwrap();
+        assert_eq!(vault.skipped_encrypted, 1, "expected exactly one skip");
+        assert_eq!(vault.refused_envelopes, 0);
+        (dir, vault)
+    }
+
+    #[test]
+    fn skipped_encrypted_warning_singular_scoped_and_empty_query() {
+        use crate::check::{FindingCode, Severity};
+        let (_dir, vault) = skipped_encrypted_vault();
+
+        // Zero matches, one skip: the singular message, unqualified
+        // when unscoped.
+        let result = search(&vault, "zzzznomatch", &PackScope::All).unwrap();
+        assert!(result.hits.is_empty());
+        let warning = result
+            .findings
+            .iter()
+            .find(|f| f.code == FindingCode::SkippedEncrypted)
+            .expect("singular skip must warn");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert!(
+            warning
+                .message
+                .starts_with("1 encrypted record was not searched;"),
+            "singular message: {}",
+            warning.message
+        );
+        assert!(
+            !warning.message.contains("vault-wide"),
+            "unscoped warning carries no qualifier: {}",
+            warning.message
+        );
+
+        // Same search under a pack scope: the count is still vault-wide
+        // (a skipped record's pack ownership is unknowable), and the
+        // message says so.
+        let scoped = PackScope::Only(["example-pack@0.1".to_owned()].into_iter().collect());
+        let result = search(&vault, "zzzznomatch", &scoped).unwrap();
+        assert!(result.hits.is_empty());
+        let warning = result
+            .findings
+            .iter()
+            .find(|f| f.code == FindingCode::SkippedEncrypted)
+            .expect("scoped zero-match over a skip must warn");
+        assert!(
+            warning
+                .message
+                .starts_with("1 encrypted record was not searched (vault-wide count);"),
+            "scoped singular message: {}",
+            warning.message
+        );
+
+        // An empty query runs no search, so it carries no absence
+        // warning even though the vault has a skip.
+        let result = search(&vault, "", &PackScope::All).unwrap();
+        assert!(result.hits.is_empty());
+        assert_eq!(result.skipped_encrypted, 1);
+        assert!(
+            !result
+                .findings
+                .iter()
+                .any(|f| f.code == FindingCode::SkippedEncrypted),
+            "empty query must not warn: {:?}",
+            result.findings
         );
     }
 

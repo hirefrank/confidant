@@ -342,6 +342,50 @@ fn search_exact_toggle_reruns_query() {
     assert!(rendered.contains("find-exact"), "{rendered}");
 }
 
+/// #718 fix wave: a zero-match exact search over skipped encrypted
+/// records must render the in-band warning in the Search status block,
+/// not just a bare "0 matches" — the TUI case the PR body claimed but
+/// the view did not actually render.
+#[test]
+fn search_exact_zero_matches_with_skips_renders_warning() {
+    let find_json = r#"{
+        "ok": true, "schema_version": "1", "vault": "/fake/v",
+        "query": "sourdough", "matches": [],
+        "findings": [{"code": "W_SKIPPED_ENCRYPTED", "severity": "warning",
+          "message": "2 encrypted records were not searched; this result does not establish absence — try `resolve`/`context`, or build the search corpus with `reindex`."}],
+        "skipped_encrypted": 2, "refused_envelopes": 0, "scope": []
+    }"#;
+    let fake = FakeRunner::new().with_response("find", 0, find_json);
+    let mut app = App::new(fake);
+    app.active_view = ActiveView::Search;
+    app.search.exact = true;
+    app.run_search("sourdough");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert!(res.kept.is_empty(), "zero matches expected");
+    assert_eq!(res.result.skipped_encrypted, 2);
+    assert!(
+        res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_SKIPPED_ENCRYPTED"),
+        "warning finding must carry through"
+    );
+
+    // Wider buffer so the full warning line survives on one row.
+    let rendered = render_to_string_at(&app, 160, 24);
+    assert!(rendered.contains("0 matches"), "{rendered}");
+    assert!(
+        rendered.contains("W_SKIPPED_ENCRYPTED"),
+        "warning code must render in the status block:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("does not establish absence"),
+        "warning message must render:\n{rendered}"
+    );
+}
+
 #[test]
 fn error_alert_and_usage_error_alert_snapshots() {
     let err_json = r#"{

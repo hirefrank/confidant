@@ -122,6 +122,7 @@ pub enum FindingCode {
     TouchMalformed,
     CadenceOverdue,
     DateUpcoming,
+    SkippedEncrypted,
     Pack(&'static str),
 }
 
@@ -176,6 +177,7 @@ impl FindingCode {
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
+            Self::SkippedEncrypted => "W_SKIPPED_ENCRYPTED",
             Self::Pack(code) => code,
         }
     }
@@ -231,6 +233,7 @@ impl FindingCode {
         "E_TOUCH_MALFORMED",
         "W_CADENCE_OVERDUE",
         "W_DATE_UPCOMING",
+        "W_SKIPPED_ENCRYPTED",
     ];
 
     /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
@@ -356,6 +359,7 @@ impl FindingCode {
             "E_TOUCH_MALFORMED" => Self::TouchMalformed,
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
+            "W_SKIPPED_ENCRYPTED" => Self::SkippedEncrypted,
             _ => return None,
         })
     }
@@ -2049,6 +2053,7 @@ mod tests {
             FindingCode::TouchMalformed,
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
+            FindingCode::SkippedEncrypted,
         ];
         for code in &variants {
             match code {
@@ -2099,7 +2104,8 @@ mod tests {
                 | FindingCode::UnknownEdgeKind
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
-                | FindingCode::DateUpcoming => {}
+                | FindingCode::DateUpcoming
+                | FindingCode::SkippedEncrypted => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }

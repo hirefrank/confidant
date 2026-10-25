@@ -3,6 +3,9 @@
 //! Renders the fail-closed [`FilteredSearchResult`]: only `via == "qmd"` or
 //! `via == "find"` matches are shown, the fallback banner appears when the
 //! skill fell back to `confidant find`, and drop counts are always visible.
+//! A `W_SKIPPED_ENCRYPTED` warning finding (#718) renders in the status
+//! block, so a zero-match exact search over skipped records does not read
+//! as absence in the TUI either.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -16,11 +19,21 @@ use crate::theme::palette;
 
 /// Pure renderer for the Search view.
 pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
+    // #718: the status block grows by one row when it carries the
+    // skipped-encrypted warning, so the warning is never clipped; every
+    // other result keeps the previous layout.
+    let warns_skipped = state.result.as_ref().is_some_and(|res| {
+        res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_SKIPPED_ENCRYPTED")
+    });
+    let status_len = if warns_skipped { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(4),
+            Constraint::Length(status_len),
             Constraint::Min(5),
             Constraint::Length(5),
         ])
@@ -112,6 +125,22 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
         count_spans.push(theme::label(")"));
     }
     lines.push(Line::from(count_spans));
+    // #718: the in-band warning from `confidant find` (carried through
+    // `find_result_to_search`) renders here, not just in the counts:
+    // a bare "0 matches" over skipped records must not read as absence.
+    // Only the warning code renders — other findings keep their existing
+    // (non-)rendering, and the message itself carries only the count.
+    for finding in &res.result.findings {
+        if finding.code == "W_SKIPPED_ENCRYPTED" {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "W_SKIPPED_ENCRYPTED: ",
+                    Style::default().fg(palette::WARNING).bold(),
+                ),
+                Span::styled(finding.message.clone(), palette::TEXT),
+            ]));
+        }
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
