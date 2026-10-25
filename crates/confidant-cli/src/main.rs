@@ -508,6 +508,17 @@ enum KeysAction {
         #[arg(long)]
         phrase_file: Option<PathBuf>,
     },
+    /// Manage this device's trust anchor (off-vault public-key material).
+    ///
+    /// `keys anchor export` writes this device's `trust.toml` to a file
+    /// for transfer to a new device — the standalone form of
+    /// `device-add --from-request --anchor-out`, for when the new device's
+    /// request file is not at hand. No enrollment, no commit, no device
+    /// key: the anchor is already installed on this device.
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorAction,
+    },
     /// Add a new device: three-step ceremony (#713).
     ///
     /// On the new device, `keys device-add --initiate` emits a request
@@ -578,6 +589,19 @@ enum KeysAction {
         /// Without this, --initiate refuses if a device key exists.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AnchorAction {
+    /// Write this device's trust anchor to a file for transfer to a new
+    /// device (#713). The file holds public-key material only; it is
+    /// written 0600 on Unix and create-new (never overwritten). Refused
+    /// inside the vault.
+    Export {
+        /// Destination file (never a path inside the vault).
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
     },
 }
 
@@ -1571,6 +1595,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         KeysAction::VerifyRecovery { phrase_file } => {
                             cmd_keys_verify_recovery(&cli, &root, phrase_file.as_deref())
                         }
+                        KeysAction::Anchor { action } => cmd_keys_anchor(&cli, &root, action),
                         KeysAction::DeviceAdd { .. } => {
                             unreachable!("handled by the outer match arm")
                         }
@@ -13796,6 +13821,47 @@ fn cmd_keys_device_add_complete(
         println!("  client key    {}", checks.client_unwrap);
         println!(
             "agent reads on this device should now decrypt; run `confidant doctor` to confirm"
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `keys anchor` subcommand dispatch.
+fn cmd_keys_anchor(cli: &Cli, root: &Path, action: &AnchorAction) -> anyhow::Result<ExitCode> {
+    match action {
+        AnchorAction::Export { out } => cmd_keys_anchor_export(cli, root, out),
+    }
+}
+
+/// `keys anchor export --out <file>` (#713): write this device's trust
+/// anchor (`trust.toml`) to a file for transfer to a new device. The
+/// standalone form of `device-add --from-request --anchor-out`, for when
+/// the new device's request file is no longer at hand. No enrollment, no
+/// commit, no device key — the anchor is already installed on this
+/// device, so there is nothing to verify here; the new device's
+/// `device-add --complete` verifies the file against the vault before
+/// installing it. Public-key material only, written 0600 on Unix and
+/// create-new (never overwritten), refused inside the vault.
+fn cmd_keys_anchor_export(cli: &Cli, root: &Path, out: &Path) -> anyhow::Result<ExitCode> {
+    let config_dir = confidant_config_dir().ok_or_else(|| {
+        anyhow::Error::new(DomainError::invalid(
+            "HOME is not set; cannot locate the operator config dir",
+        ))
+    })?;
+    write_anchor_out_file(&config_dir, root, out)?;
+    if cli.json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
+            "vault": root.to_string_lossy(),
+            "anchor_out": out.display().to_string(),
+        }))?;
+    } else {
+        println!(
+            "wrote trust anchor to {}; copy it to the new device and run \
+             `confidant keys device-add --complete --anchor-file {}` there after pulling",
+            out.display(),
+            out.display()
         );
     }
     Ok(ExitCode::SUCCESS)

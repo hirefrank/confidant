@@ -1968,6 +1968,68 @@ fn device_add_from_request_anchor_out_refuses_overwrite() {
     );
 }
 
+#[test]
+fn keys_anchor_export_writes_trust_anchor_and_refuses_in_vault() {
+    // `keys anchor export` is the standalone form of `--anchor-out`: it
+    // copies this device's trust.toml to a file for transfer, with no
+    // enrollment, no commit, and no device key. It must refuse a
+    // destination inside the vault.
+    let h = Harness::new();
+    let out = h.init(&[]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dest = h.home.join("anchor-export.toml");
+    let out = h
+        .cmd(&[
+            "keys",
+            "anchor",
+            "export",
+            "--out",
+            dest.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The exported file matches this device's trust.toml byte-for-byte.
+    let trust = std::fs::read(h.home.join(".config/confidant/trust.toml")).unwrap();
+    let exported = std::fs::read(&dest).unwrap();
+    assert_eq!(exported, trust);
+
+    // JSON carries ok + anchor_out.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["anchor_out"], dest.to_str().unwrap());
+
+    // A destination inside the vault is refused and nothing is written.
+    let inside = h.vault.join("anchor.toml");
+    let out = h
+        .cmd(&[
+            "keys",
+            "anchor",
+            "export",
+            "--out",
+            inside.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "in-vault export must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("inside the vault"), "got: {stderr}");
+    assert!(!inside.exists(), "nothing must be written inside the vault");
+}
+
 /// Decrypt a client's wrapping file for `key_id` at the current epoch
 /// with the given Bech32 age identity. Returns the raw data-key bytes.
 fn unwrap_wrapping(vault: &std::path::Path, client: &str, key_id: &str, bech32: &str) -> Vec<u8> {
