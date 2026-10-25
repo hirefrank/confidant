@@ -139,12 +139,25 @@ that skill lands, this section moves there.
    - the operator replies substantively on at least 2 separate days in
      30 days.
    Below threshold, track silently and say nothing — no drip of "should I
-   add…?" questions.
+   add…?" questions. This guidance names no store for those
+   below-threshold counts — there is no record yet to hold them — so do
+   not improvise a side list or ledger for them.
 3. **Operator overrides, both directions.** "Add X" qualifies instantly at
    any time; "never track X" excludes permanently. Either override beats
-   the threshold in either direction.
+   rules 1–2 in either direction: "never track X" excludes even on
+   meeting/call contact, and "add X" qualifies even below the email
+   threshold. "Never track" here is distinct from `cadence: never`
+   (Fields): the latter means "never overdue" for a person already in
+   the vault and keeps the record; "never track" means no record at all.
 4. **Approval discipline unchanged.** Crossing a threshold earns a
    *proposal*, not a write: propose → confirm → apply, every time.
+
+Scope: this section classifies only meeting/call contact (rule 1) and
+email-only contact (rule 2). It does not classify the other `touch`
+kinds — `text`, `meal`, `event`, `gift`, `other` — and it does not say
+whether a meal or event counts as a meeting for rule 1. For those
+kinds, fall back to operator judgment; do not extend rules 1–2 to
+them by analogy.
 
 The threshold numbers above are defaults the operator can tune; the shape
 is the guidance: meetings in, email earned, silent below threshold,
