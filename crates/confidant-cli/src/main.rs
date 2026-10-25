@@ -526,7 +526,11 @@ enum KeysAction {
         /// Human label for the new device (with --initiate).
         #[arg(long)]
         label: Option<String>,
-        /// Write the request to FILE instead of stdout (with --initiate).
+        /// Write the TOML request to FILE (with --initiate). The file
+        /// always holds TOML whatever the suffix. Refuses to overwrite
+        /// an existing file and refuses to follow a symlink. Without
+        /// --json this replaces the stdout document; with --json the
+        /// file is written in addition to the JSON envelope.
         #[arg(long, value_name = "FILE")]
         output: Option<PathBuf>,
         /// Confirm the request fingerprint was verified out of band.
@@ -12847,6 +12851,16 @@ fn cmd_keys_device_add_initiate(
     // controls into the commit message/manifest/stderr.)
     let label = validate_device_label(label.unwrap_or("device"))?;
 
+    // #719 review SF1: preflight --output BEFORE any key-source probe or
+    // provisioning. A bad output path must not store a key and then
+    // error — the retry would need --force, and with --force the
+    // fingerprint the operator already saw changes. The write itself
+    // re-checks with `create_new`, so a race between preflight and
+    // write still fails closed instead of overwriting.
+    if let Some(path) = output {
+        preflight_device_add_output(path)?;
+    }
+
     // #684: `CONFIDANT_DEVICE_KEY` is this new device's identity, the same
     // way `init` uses it (#650). Do not generate a different key, do not
     // write a keychain, and do not require --force: the env value is not
@@ -12928,6 +12942,16 @@ fn cmd_keys_device_add_initiate(
         eprintln!("using {DEVICE_KEY_ENV} as this device's identity (not stored in a keychain)");
     }
 
+    // #719: --output must materialize the request file in every output
+    // mode. Previously the --json branch swallowed --output entirely:
+    // the file write lived in the `else if` arm, so `--json --output`
+    // printed the envelope and never wrote the file. Write (and verify)
+    // first, so a write failure exits non-zero before any success output.
+    if let Some(path) = output {
+        write_device_add_request(path, &document)?;
+        eprintln!("wrote device-add request to {}", path.display());
+    }
+
     if cli.json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -12939,32 +12963,128 @@ fn cmd_keys_device_add_initiate(
             "key_source": key_source,
             "pubkey": recipient,
             "request": document,
+            // display() is lossy for non-UTF-8 paths, as for every other
+            // path in this CLI's JSON output: a JSON string cannot carry
+            // non-UTF-8 exactly. The file itself is written via the Path,
+            // so only this reporting string is lossy, never the artifact.
+            "output": output.map(|p| p.display().to_string()),
         }))?;
-    } else if let Some(path) = output {
-        // 0644 explicit: the request carries only the public key + label,
-        // safe to transfer. Deliberate, not a default.
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(path)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(document.as_bytes())
-            })
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot write device-add request to {}: {e}",
-                    path.display()
-                )))
-            })?;
-        eprintln!("wrote device-add request to {}", path.display());
-    } else {
+    } else if output.is_none() {
         print!("{document}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Preflight a `keys device-add --initiate --output` destination before
+/// any key is provisioned. Refuses an existing path (a symlink counts as
+/// existing, dangling or not — never write through one), a missing or
+/// non-directory parent, and a read-only parent. A destination that
+/// passes here can still fail at write time (race, disk full); that
+/// residual failure carries a fix hint on the write error itself.
+fn preflight_device_add_output(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "refusing to overwrite existing device-add request path {}",
+                path.display()
+            )))
+            .with_fix("remove the existing file or choose a different --output path"));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(DomainError::invalid(format!(
+                "cannot inspect device-add request path {}: {e}",
+                path.display()
+            ))));
+        }
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        match std::fs::metadata(parent) {
+            Ok(md) => {
+                if !md.is_dir() {
+                    return Err(anyhow::Error::new(DomainError::invalid(format!(
+                        "device-add request parent {} is not a directory",
+                        parent.display()
+                    ))));
+                }
+                if md.permissions().readonly() {
+                    return Err(anyhow::Error::new(DomainError::invalid(format!(
+                        "device-add request parent {} is not writable",
+                        parent.display()
+                    )))
+                    .with_fix("choose a writable --output directory"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "device-add request parent directory {} does not exist",
+                    parent.display()
+                )))
+                .with_fix("create the directory first or choose a different --output path"));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(DomainError::invalid(format!(
+                    "cannot inspect device-add request parent {}: {e}",
+                    parent.display()
+                ))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a device-add request document to `path` and verify the bytes
+/// landed by fsyncing and reading them back. A write or verification
+/// failure is an error, so the caller never reports success for a
+/// request file that does not exist. `create_new` refuses an existing
+/// file and never follows a symlink, so a typo'd --output cannot
+/// destroy an unrelated file; because only fresh files are ever
+/// written, the 0644 mode below always applies to the result. The
+/// request carries only the public key + label, safe to transfer.
+/// Deliberate, not a default.
+fn write_device_add_request(path: &Path, document: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Residual failure after provisioning (preflight passed but the
+    // write still failed): the key is already stored, so say so — a
+    // retry replaces it and changes the fingerprint.
+    let write_fix = "a device key was already provisioned and a partial file may exist \
+        at this path: remove the file if present, then retry with --force to replace \
+        the key (the fingerprint will change)";
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write device-add request to {}: {e}",
+                path.display()
+            )))
+            .with_fix(write_fix)
+        })?;
+    f.write_all(document.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot write device-add request to {}: {e}",
+                path.display()
+            )))
+            .with_fix(write_fix)
+        })?;
+    let written = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot verify device-add request at {}: {e}",
+            path.display()
+        )))
+    })?;
+    if written != document {
+        return Err(anyhow::Error::new(DomainError::internal(format!(
+            "device-add request at {} failed verification: written bytes differ",
+            path.display()
+        ))));
+    }
+    Ok(())
 }
 
 /// `keys device-add --from-request <file>`: run on an already-enrolled
