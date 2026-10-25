@@ -160,7 +160,7 @@ enum Command {
         /// A `p-<ULID>` or an exact display name (cleared records only).
         query: String,
     },
-    /// Add or resolve person aliases (email/phone/handle → keyed HMAC).
+    /// Add or resolve person aliases (email/phone/handle/name → keyed HMAC).
     ///
     /// The raw alias value is PII: it is read from stdin or `--value-file`
     /// only, never an argument, and never echoed in output or errors.
@@ -625,14 +625,14 @@ enum LogAction {
 enum AliasAction {
     /// Append an alias ledger line: `DATE alias <p-ULID> KIND hmac:HEX`.
     ///
-    /// The raw value (email, phone, or handle) is read from stdin or
+    /// The raw value (email, phone, handle, or name) is read from stdin or
     /// `--value-file` only — never an argument — and is never echoed in
     /// output, errors, or logs. One commit; check-gated.
     Add {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
         person: String,
-        /// Alias kind: email, phone, or handle.
+        /// Alias kind: email, phone, handle, or name.
         kind: String,
         /// File holding the alias value (alternative to stdin).
         #[arg(long, value_name = "FILE")]
@@ -647,7 +647,7 @@ enum AliasAction {
     /// argument. Honors `no-ai` like other reads: an alias on a `no-ai: true`
     /// person is not surfaced.
     Resolve {
-        /// Alias kind: email, phone, or handle.
+        /// Alias kind: email, phone, handle, or name.
         kind: String,
         /// File holding the alias value (alternative to stdin).
         #[arg(long, value_name = "FILE")]
@@ -7202,7 +7202,7 @@ fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// Read an alias value (email/phone/handle) from `--value-file` or stdin.
+/// Read an alias value (email/phone/handle/name) from `--value-file` or stdin.
 ///
 /// B7/#547: the raw value is PII and never arrives as an argument or leaves
 /// this process in output, errors, or `Debug`. Wrapped in [`Zeroizing`] so
@@ -7235,14 +7235,17 @@ fn read_alias_value(value_file: Option<&Path>) -> anyhow::Result<Zeroizing<Strin
     Ok(value)
 }
 
-/// Alias kinds are fixed by spec §6. A bad kind is a usage error (exit 2),
-/// refused before any key is touched or anything is read from stdin.
+/// Alias kinds are fixed by spec §6 (#748 adds `name`: a former/married
+/// name, nickname, or preferred name — resolved by the same HMAC mechanism
+/// as the other kinds; it never changes the record's display name). A bad
+/// kind is a usage error (exit 2), refused before any key is touched or
+/// anything is read from stdin.
 fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
-    if matches!(kind, "email" | "phone" | "handle") {
+    if matches!(kind, "email" | "phone" | "handle" | "name") {
         Ok(())
     } else {
         Err(anyhow::Error::new(DomainError::usage(format!(
-            "bad alias kind '{kind}'; use one of: email, phone, handle"
+            "bad alias kind '{kind}'; use one of: email, phone, handle, name"
         ))))
     }
 }

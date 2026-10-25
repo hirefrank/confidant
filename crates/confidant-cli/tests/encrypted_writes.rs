@@ -7537,6 +7537,78 @@ fn alias_add_then_resolve_round_trips() {
 }
 
 #[test]
+fn alias_add_name_then_resolve_round_trips() {
+    // #748: a `name` alias (former name) added through the CLI path
+    // resolves through `cmd_alias_resolve`/`resolve_alias`, and the
+    // record's display name is unchanged. The value normalizes (NFC,
+    // trim, lowercase) on both sides, so the round-trip is
+    // case/whitespace insensitive.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let out = add_person_record(&h, PERSON, "Ada Example", "");
+    assert!(out.status.success(), "record add failed: {}", stderr(&out));
+
+    let value_file = write_file(h._tmp.path(), "alias-name.txt", " Ada Oldname \n");
+    let out = h
+        .cmd(&[
+            "alias",
+            "add",
+            "Ada Example",
+            "name",
+            "--value-file",
+            value_file.to_str().unwrap(),
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    assert_eq!(v["kind"], "name");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    let hmac = v["hmac"].as_str().unwrap();
+    assert!(hmac.starts_with("hmac:"), "{v}");
+    assert!(!stdout(&out).contains("Ada Oldname"), "value leaked");
+
+    // The ledger line carries the kind and the HMAC, never the value.
+    let ledger = std::fs::read_to_string(h.vault.join("ledger/2026/10.cfd")).unwrap();
+    assert!(
+        ledger.contains(&format!("alias {PERSON} name {hmac}")),
+        "{ledger}"
+    );
+    assert!(!ledger.contains("Ada Oldname"), "value leaked into ledger");
+
+    // Resolve via stdin, with different case: same HMAC, display name
+    // unchanged.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "name", "--json", "--no-input"],
+        "ADA OLDNAME",
+    );
+    assert!(
+        out.status.success(),
+        "alias resolve failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-resolve");
+    assert_eq!(v["matched_by"], "alias");
+    assert_eq!(v["person"]["id"], PERSON);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert!(!stdout(&out).contains("ADA OLDNAME"), "value leaked");
+
+    // Kind-scoped: the same value under `email` does not match.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        "ada oldname",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+}
+
+#[test]
 fn alias_resolve_ambiguous_value_fails_closed() {
     // One value on two cleared people: fail closed rather than guess, with
     // opaque candidate ids.

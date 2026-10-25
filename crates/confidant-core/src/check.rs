@@ -1228,9 +1228,9 @@ pub(crate) fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), Strin
     }
     let kind = entry.args[0]
         .as_token()
-        .ok_or_else(|| "alias kind must be a token (email, phone, or handle)".to_owned())?;
-    if !matches!(kind, "email" | "phone" | "handle") {
-        return Err("alias kind must be email, phone, or handle".to_owned());
+        .ok_or_else(|| "alias kind must be a token (email, phone, handle, or name)".to_owned())?;
+    if !matches!(kind, "email" | "phone" | "handle" | "name") {
+        return Err("alias kind must be email, phone, handle, or name".to_owned());
     }
     let hmac = match &entry.args[1] {
         Arg::Token(s) if s.starts_with("hmac:") => s.clone(),
@@ -1838,7 +1838,7 @@ pub(crate) fn duration_of(entry: &LedgerEntry) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
+    use super::{parse_alias, parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
 
     #[test]
     fn fail_on_and_summary() {
@@ -1853,6 +1853,35 @@ mod tests {
         };
         assert!(!s.fails(Severity::Error));
         assert!(s.fails(Severity::Warning));
+    }
+
+    /// #748: `name` is a valid alias kind (former/married name, nickname,
+    /// preferred name); an unknown kind is still refused by the parser.
+    #[test]
+    fn parse_alias_accepts_name_kind() {
+        use crate::id::RecordId;
+        use crate::ledger::{Arg, LedgerEntry};
+        use chrono::NaiveDate;
+        let entry = |kind: &str| LedgerEntry {
+            date: NaiveDate::from_ymd_opt(2026, 10, 24).unwrap(),
+            verb: "alias".to_owned(),
+            id: RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap(),
+            args: vec![
+                Arg::Token(kind.to_owned()),
+                Arg::Token(
+                    "hmac:6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
+                        .to_owned(),
+                ),
+            ],
+            comment: None,
+        };
+        let (kind, hex) = parse_alias(&entry("name")).unwrap();
+        assert_eq!(kind, "name");
+        assert_eq!(
+            hex,
+            "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
+        );
+        assert!(parse_alias(&entry("twitter")).is_err());
     }
 
     #[test]

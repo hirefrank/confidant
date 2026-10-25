@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `name` alias kind: former/married names, nicknames, and preferred names can now be recorded as `alias` ledger lines and resolved via `alias resolve name` by the same keyed-HMAC mechanism as email/phone/handle; the record's display name is unchanged unless the operator renames it. Plain `resolve` (display-name path) and `find` (plaintext scan) do not consult aliases, so a former name that appears nowhere else in plaintext does not surface through them — `alias resolve name` is the lookup path (#748). A vault containing `name` alias lines fails `check` on a pre-0.7.1 CLI, since old `parse_alias` rejects the kind as `E_ALIAS_PLAINTEXT` (expected for an additive enum pre-1.0; operators running mixed versions will see an error, not a warning).
+
 ## [0.7.0] - 2026-10-22
 
 **Disclosure:** the milestone 2 encryption has had no independent review,
