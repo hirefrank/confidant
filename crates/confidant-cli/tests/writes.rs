@@ -2848,6 +2848,35 @@ fn log_touch_writes_one_commit_and_appears_in_context() {
 }
 
 #[test]
+fn log_touch_video_appears_in_context() {
+    // #735 follow-up (review 5643154823): a logged `video` touch reads
+    // back through `context` with kind "video".
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let (ok, added) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "video",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{added}");
+
+    let (ok, ctx) = run_json(&["context", PERSON, "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{ctx}");
+    assert_eq!(ctx["touchpoints"].as_array().unwrap().len(), 1, "{ctx}");
+    assert_eq!(ctx["touchpoints"][0]["kind"], "video");
+}
+
+#[test]
 fn log_touch_bad_kind_is_usage_error() {
     let dir = make_vault();
     let root = dir.path();

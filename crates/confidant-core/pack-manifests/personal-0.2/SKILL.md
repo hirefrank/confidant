@@ -186,7 +186,7 @@ code, emitted by `check`.)
 
 **Do:** rewrite the line as
 `DATE touch PERSON-ID <kind> [note:NOTE-ID] [src:…]` with a kind from
-`call`, `text`, `email`, `meet`, `meal`, `event`, `gift`, `other`. Use
+`call`, `text`, `email`, `meet`, `meal`, `event`, `gift`, `video`, `other`. Use
 `interaction` for anything richer.
 
 ### `E_INVALID_ID`
