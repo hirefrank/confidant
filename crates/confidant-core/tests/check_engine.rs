@@ -4969,6 +4969,24 @@ fn personal_touch_unknown_kind_is_malformed_when_enabled() {
 }
 
 #[test]
+fn personal_touch_video_kind_accepted_positional_and_mirrored_when_enabled() {
+    // #735 follow-up (review 5643154823): a `video` line survives `check`
+    // in both the positional form and the mirrored `kind:` form.
+    let dir = personal_vault();
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 touch {ADA} video\n\
+             2026-10-02 touch {ADA} kind:video\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
 fn personal_touch_positional_form_valid_with_empty_packs() {
     // #551: the built-in personal pack is implicit, so `packs = []` still
     // enables the richer `touch` grammar and there is no W_PACK_ORPHAN.

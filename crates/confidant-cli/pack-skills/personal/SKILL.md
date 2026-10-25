@@ -88,16 +88,16 @@ carries no body and no `no-ai`.
 ### `touch`
 
 ```
-DATE touch PERSON-ID call|text|email|meet|meal|event|gift|other [note:NOTE-ID] [src:PROVENANCE]
+DATE touch PERSON-ID call|text|email|meet|meal|event|gift|video|other [note:NOTE-ID] [src:PROVENANCE]
 ```
 
 Records one touchpoint on a date. The kind is a closed list: `call`, `text`,
-`email`, `meet`, `meal`, `event`, `gift`, `other`. (In 0.1 the list was
+`email`, `meet`, `meal`, `event`, `gift`, `video`, `other`. (In 0.1 the list was
 `call`, `text`, `coffee`, `gift`, `meet`; `coffee` was removed, not aliased —
 use `meal`.) The pack also accepts the core mirrored shape:
 
 ```
-DATE touch PERSON-ID [kind:call|text|email|meet|meal|event|gift|other]
+DATE touch PERSON-ID [kind:call|text|email|meet|meal|event|gift|video|other]
 ```
 
 Rich, multi-person events stay in core `interaction` records. Optional
@@ -186,7 +186,7 @@ code, emitted by `check`.)
 
 **Do:** rewrite the line as
 `DATE touch PERSON-ID <kind> [note:NOTE-ID] [src:…]` with a kind from
-`call`, `text`, `email`, `meet`, `meal`, `event`, `gift`, `other`. Use
+`call`, `text`, `email`, `meet`, `meal`, `event`, `gift`, `video`, `other`. Use
 `interaction` for anything richer.
 
 ### `E_INVALID_ID`

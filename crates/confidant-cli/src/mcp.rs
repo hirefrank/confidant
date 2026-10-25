@@ -185,12 +185,12 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "log_touch",
-            "Append a personal touchpoint ledger line (call, text, email, meet, meal, event, gift, or other). One commit; check-gated.",
+            "Append a personal touchpoint ledger line (call, text, email, meet, meal, event, gift, video, or other). One commit; check-gated.",
             obj(
                 &["person", "kind"],
                 json!({
                     "person": str_prop("Opaque person id (p-…)."),
-                    "kind": str_prop("Touchpoint kind: call, text, email, meet, meal, event, gift, or other."),
+                    "kind": str_prop("Touchpoint kind: call, text, email, meet, meal, event, gift, video, or other."),
                     "date": str_prop("YYYY-MM-DD; default today."),
                     "note": str_prop("Touchpoint note text; creates a note record."),
                     "src": str_prop("Source token."),
