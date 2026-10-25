@@ -230,8 +230,56 @@ export CONFIDANT_VAULT="$HOME/vault"
 # on the new device:
 confidant keys device-add --initiate --label "laptop-2" --output ~/device-add-request.toml
 # copy the request to an enrolled device, confirm the fingerprint out of band, then:
-confidant keys device-add --from-request ~/device-add-request.toml
+confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml
+# copy the anchor file back to the new device, pull, then finish enrollment there:
+git -C ~/vault pull
+confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
+# --complete verifies the anchor against the pulled vault (operator
+# certificate, lookup key, every client key) before installing it. Without
+# this step the new device holds wrapped keys but cannot decrypt: `doctor`
+# reports the missing anchor as an error. Never copy another vault's anchor.
+# Re-running --complete with an already-installed anchor re-verifies the
+# same three checks and is a no-op.
+# --from-request without --anchor-out still enrolls, but warns loudly and
+# reports anchor_out: null in JSON: the new device cannot decrypt until
+# --complete installs an anchor. Get one afterwards with --re-emit-anchor
+# (below) instead of re-enrolling.
+# A device enrolled before --anchor-out existed (wrapped keys, no anchor)
+# cannot be re-enrolled — re-running --from-request refuses it. Re-emit
+# just the anchor instead (no new enrollment, no commit):
+confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml --re-emit-anchor
+# then --complete on the new device as above. Copying an enrolled device's
+# trust.toml works as a fallback, but it is unverified — prefer --anchor-out.
+# --complete verifies EVERY client key, not just one: a device missing some
+# clients' wrappings (partial enrollment) fails --complete naming the
+# missing clients, and a plain --from-request re-run or --re-emit-anchor
+# for such a device fails the same way. There is no top-up: re-enrollment
+# refuses any keypair already enrolled anywhere, so generate a fresh
+# device keypair (--initiate) and enroll that request instead. The
+# --from-request enrollment probe is side-effect-free: it never touches
+# the operator's seq tracker, even when the re-run then fails fast.
 ```
+
+Two things the commands above don't make obvious:
+
+- **`keys anchor export`** — `confidant keys anchor export --out <file>`
+  writes this device's `trust.toml` for transfer, with no enrollment, no
+  commit, and no device key. It is the standalone form of
+  `--from-request --anchor-out`, for when the new device's request file is
+  no longer at hand. It copies the installed anchor verbatim (public-key
+  material only) and does not verify it against the vault — the new
+  device's `--complete` is what verifies. Prefer it over hand-copying
+  `trust.toml`, which is an unverified fallback.
+
+- **Pre-certificate vaults.** On a vault that predates operator
+  certificates (no `keys/operator.toml`), `--complete` has no out-of-band
+  operator binding to check, so it proceeds on manifest-signature and
+  commitment-checked unwrap verification alone; the trust root is then the
+  anchor file's transfer channel plus the git remote. There is no post-hoc
+  command that adds a certificate (only `init`, `recover`, and shred
+  mutation write `operator.toml`), so such a vault keeps this weaker
+  binding until it is recovered. Make sure the anchor file came from a
+  device you trust.
 
 Headless hosts without an OS keychain: the **new** device needs only
 `CONFIDANT_DEVICE_KEY` for `keys device-add --initiate`. The already-enrolled
