@@ -65,6 +65,7 @@ USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
 # host, which is exactly what the old global-only persist did.
 VAULT_PREFLIGHT_REL = os.path.join(".confidant", "qmd-preflight.toml")
 TRUTHY = ("1", "true", "yes", "on")
+FALSEY = ("0", "false", "no", "off")
 MODES = ("hybrid", "bm25", "vector")
 # The timeout hint is CONDITIONED, not unconditional: a timeout can
 # equally be slow CPU, a large corpus, or model load, and when
@@ -364,17 +365,25 @@ def resolve_offline(vault_config, global_config):
     """The persisted offline choice: per-vault wins, global is fallback.
 
     Returns (offline_bool, source) where source is "vault", "global",
-    or "none". A vault value that is present but falsy (e.g. false)
-    still counts as the vault's answer — it shadows a global true —
-    because preflight only ever writes true or clears the key, so a
-    present falsy value is a deliberate choice, not an absence.
+    or "none". Only recognized tokens count as a deliberate answer: a
+    truthy token opts in, a falsy token opts out (and shadows the next
+    level, because preflight only ever writes true or clears the key,
+    so a recognized falsy value is a deliberate choice, not an
+    absence). Any other present value — a typo, a TOML table — is
+    ignored with a note and falls through, mirroring `resolve_mode`, so
+    garbage can never silently disable a global `offline = true`.
     """
-    vault_offline = vault_config.get("offline", "")
-    if vault_offline not in ("", None):
-        return _truthy(vault_offline), "vault"
-    global_offline = global_config.get("offline", "")
-    if global_offline not in ("", None):
-        return _truthy(global_offline), "global"
+    for label, config in (("vault", vault_config), ("global", global_config)):
+        value = config.get("offline", "")
+        if value in ("", None):
+            continue
+        token = str(value).strip().lower()
+        if token in TRUTHY:
+            return True, label
+        if token in FALSEY:
+            return False, label
+        print(f"note: ignoring invalid {label} [qmd] offline {value!r} "
+              f"(want true or false)", file=sys.stderr)
     return False, "none"
 
 

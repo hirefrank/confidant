@@ -205,9 +205,14 @@ true` runs qmd with `HF_HUB_OFFLINE=1` (an explicit `HF_HUB_OFFLINE` in
 the shell still wins). The persisted `[qmd]` config is per-vault first:
 qmd-query.py reads `<vault>/.confidant/qmd-preflight.toml`, and falls
 back to the global `~/.config/confidant/config.toml` `[qmd]` table only
-when the vault has no per-vault value — so one vault's recommendation
-never leaks into another vault, and a global value set by hand is still
-honored for vaults never preflighted.
+when the vault has no per-vault value — so a *new* per-vault
+recommendation never leaks into another vault, and a global value set by
+hand is still honored for vaults never preflighted. One legacy caveat: a
+global value written by an old `--persist` run (before per-vault
+persistence existed) carries no vault attribution, so it is served as
+fallback to *every* vault without its own file — including vaults that
+never ran preflight. Each such vault stops inheriting that legacy global
+value once its own preflight persists a per-vault value.
 
 ## Tooling
 

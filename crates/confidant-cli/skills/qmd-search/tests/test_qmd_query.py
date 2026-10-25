@@ -499,6 +499,22 @@ class QmdQueryConfigTest(unittest.TestCase):
         self.assertEqual(self.query.resolve_offline(
             {"offline": True}, {"offline": False}), (True, "vault"))
 
+    def test_resolve_offline_garbage_falls_through_to_global(self):
+        # #773 S2: an unrecognized vault value (typo, TOML table) is not
+        # a deliberate answer — it falls through to global with a note,
+        # mirroring resolve_mode, so garbage can't silently disable a
+        # global offline=true.
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "flase"}, {"offline": True}), (True, "global"))
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": {"table": True}}, {"offline": True}),
+            (True, "global"))
+        # Recognized falsy tokens are still deliberate: they shadow global.
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "false"}, {"offline": True}), (False, "vault"))
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "off"}, {"offline": True}), (False, "vault"))
+
     def test_runtime_env_vault_offline_beats_global(self):
         # Per-vault offline=true beats a global offline=false, and a
         # per-vault offline=false shadows a global offline=true: the
@@ -1009,6 +1025,46 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertIn('offline_source = "preflight"', text)
         self.assertFalse(
             (self.root / ".config" / "confidant" / "config.toml").exists())
+
+    def test_resolve_offline_fallback_garbage_falls_through(self):
+        # #773 S2: the fallback copy (sibling qmd-query.py absent on a
+        # broken install) must agree with the query copy — garbage falls
+        # through, never silently disabling a global offline=true.
+        saved = self.preflight._QUERY_MODULE
+        try:
+            self.preflight._QUERY_MODULE = None
+            self.assertEqual(self.preflight.resolve_offline(
+                {"offline": "flase"}, {"offline": True}), (True, "global"))
+            self.assertEqual(self.preflight.resolve_offline(
+                {"offline": "off"}, {"offline": True}), (False, "vault"))
+        finally:
+            self.preflight._QUERY_MODULE = saved
+
+    def test_set_vault_qmd_config_value_refuses_on_invalid_toml(self):
+        # #773 S3: writing into a file that is already unparseable (a
+        # garbage line elsewhere) must raise, not report success on a
+        # value that will never take effect.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("[qmd\nbroken = true\n", encoding="utf-8")
+        with self.assertRaises(OSError):
+            self.preflight.set_vault_qmd_config_value(
+                str(vault), "default_mode", '"hybrid"')
+
+    def test_persist_invalid_toml_reports_error_not_success(self):
+        # #773 S3 end-to-end: --persist against an unparseable vault-local
+        # file reports persist failure (persisted.error), never a
+        # "persisted to:" success with a value that never takes effect.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("[qmd\nbroken = true\n", encoding="utf-8")
+        stub = self._stub("stub-s3.py", [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertIn("error", report["persisted"])
+        self.assertNotIn("default_mode", report["persisted"])
 
     def test_vault_config_edit_preserves_other_keys_and_comments(self):
         vault = self._fake_vault()

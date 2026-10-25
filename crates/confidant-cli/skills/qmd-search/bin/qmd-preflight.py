@@ -100,6 +100,7 @@ CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 STORE_REL = os.path.join(".confidant", "qmd")
 USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
 TRUTHY = ("1", "true", "yes", "on")
+FALSEY = ("0", "false", "no", "off")
 
 # Planning figure from #722: ~1.6 GB landed in 0.7.0 (embed 319 MB + 1.7B
 # query-expansion 1.2 GB) with the 0.6B reranker still to download.
@@ -490,12 +491,17 @@ def resolve_offline(vault_config, global_config):
     """
     if _QUERY_MODULE is not None:
         return _QUERY_MODULE.resolve_offline(vault_config, global_config)
-    vault_offline = vault_config.get("offline", "")
-    if vault_offline not in ("", None):
-        return _truthy(vault_offline), "vault"
-    global_offline = global_config.get("offline", "")
-    if global_offline not in ("", None):
-        return _truthy(global_offline), "global"
+    for label, config in (("vault", vault_config), ("global", global_config)):
+        value = config.get("offline", "")
+        if value in ("", None):
+            continue
+        token = str(value).strip().lower()
+        if token in TRUTHY:
+            return True, label
+        if token in FALSEY:
+            return False, label
+        print(f"note: ignoring invalid {label} [qmd] offline {value!r} "
+              f"(want true or false)", file=sys.stderr)
     return False, "none"
 
 
@@ -538,6 +544,16 @@ def set_vault_qmd_config_value(vault, key, value_repr):
             lines.insert(section_at + 1, f"{key} = {value_repr}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    # Verify the write round-trips (#773 S3): a text edit can "succeed"
+    # while leaving the file unparseable (a garbage line elsewhere), so
+    # the value would silently never take effect. Re-read and confirm the
+    # key parses back to exactly what was written; otherwise the caller
+    # reports a persist failure, not a false success.
+    parsed = read_vault_qmd_config(vault)
+    if json.dumps(parsed.get(key)) != value_repr:
+        raise OSError(f"persisted {key}={value_repr} in {path} but it did "
+                      "not read back; the vault-local qmd-preflight.toml "
+                      "is unreadable or invalid — fix it by hand and retry")
     return path
 
 
@@ -1025,7 +1041,7 @@ def main(argv=None):
     if offline_recommended:
         print("  offline mode recommended: persist with --persist "
               "(or set [qmd] offline = true)")
-    if args.persist:
+    if args.persist and persist_error is None:
         print(f"  persisted: {persisted or 'nothing to persist'}")
         # "path" alone means nothing needed writing or clearing — only
         # name the file when an actual persist action happened.
