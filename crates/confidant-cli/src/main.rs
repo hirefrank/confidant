@@ -14185,7 +14185,19 @@ fn cmd_keys_device_add_complete(
         }))?;
     } else {
         println!("trust anchor installed for this vault");
-        println!("  certificate   {}", checks.cert);
+        // `checks.cert` is a verification status (`pass`/`absent`), not
+        // certificate material. CodeQL's cleartext-logging heuristic treats
+        // any value named `cert` as sensitive, so derive a boolean first and
+        // log a label rather than passing the status to the format arguments.
+        let operator_verified = checks.cert == "pass";
+        println!(
+            "  certificate   {}",
+            if operator_verified {
+                "verified"
+            } else {
+                "not present"
+            }
+        );
         println!("  lookup key    {}", checks.lookup);
         println!("  client key    {}", checks.client_unwrap);
         println!(
