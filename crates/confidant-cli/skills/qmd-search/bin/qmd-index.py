@@ -135,7 +135,10 @@ def encrypted_disk_detected(vault):
 
     macOS: `fdesetup isactive` (FileVault). Linux: the vault's backing
     device has a `crypt`-type ancestor in lsblk (dm-crypt, incl. LUKS
-    under LVM).
+    under LVM). False means the device's ancestors were actually walked
+    and none is `crypt`; a device that is absent from the lsblk table
+    (overlayfs, tmpfs, network mounts — the normal container/cloud
+    shape) is unknown, not a negative, so it returns None.
     """
     if sys.platform == "darwin":
         fdesetup = shutil.which("fdesetup")
@@ -178,6 +181,12 @@ def encrypted_disk_detected(vault):
         by_name[name] = (typ, pk)
         by_majmin[mm] = name
     node = by_majmin.get(majmin)
+    if node is None:
+        # The backing device is not in the lsblk table at all (overlayfs,
+        # tmpfs, a network mount): detection established nothing, so this
+        # is unknown — returning False here would mislabel an unmapped
+        # device as a checked-and-negative one.
+        return None
     seen = set()
     while node and node not in seen:
         seen.add(node)
@@ -198,6 +207,33 @@ def assume_from_env():
     return _truthy(os.environ.get(ASSUME_ENV, ""))
 
 
+def _toml_parser():
+    """tomllib, or tomli as a fallback, or None on a Python with neither."""
+    try:
+        import tomllib
+        return tomllib
+    except ImportError:
+        pass
+    try:
+        import tomli
+        return tomli
+    except ImportError:
+        return None
+
+
+def _resolve_home(home=None):
+    """The home dir for the user config, mirroring Rust setup::home_dir().
+
+    An explicit argument wins, then $HOME, then $USERPROFILE (the
+    Windows fallback `doctor` uses); an empty value falls through, so
+    the Python election and the Rust `doctor` check never look in
+    different homes on a host where only one of the two is set.
+    """
+    if home:
+        return home
+    return os.environ.get("HOME") or os.environ.get("USERPROFILE") or None
+
+
 def assume_from_user_config(home=None):
     """True when ~/.config/confidant/config.toml opts in via [qmd].
 
@@ -205,15 +241,14 @@ def assume_from_user_config(home=None):
     (never the vault), so the trust assumption is declared once on the
     device rather than passed per run (issue #540). Fail closed: a missing
     file, invalid TOML, or an unreadable value is not a confirmation. On a
-    Python without `tomllib` (< 3.11) the config key is unavailable and the
+    Python without `tomllib`/`tomli` the config key is unavailable and the
     env var / flag / detection still work.
     """
-    home = home or os.environ.get("HOME")
+    home = _resolve_home(home)
     if not home:
         return False
-    try:
-        import tomllib
-    except ImportError:
+    tomllib = _toml_parser()
+    if tomllib is None:
         return False
     try:
         with open(os.path.join(home, USER_CONFIG_REL), "rb") as f:
@@ -231,30 +266,87 @@ def persist_encrypted_disk_assumption(home=None):
     — the same file and [qmd] table that already carry this key (#540),
     so no new key is invented. Text edit, not a TOML round-trip:
     comments and unrelated keys (e.g. the #722 preflight keys) survive
-    byte-for-byte. Creates the [qmd] section when absent. Returns the
-    config path written.
+    byte-for-byte. Creates the [qmd] section when absent, rewrites the
+    key inside an inline-table `qmd = {...}` when that is the form in
+    use, and replaces a dotted `qmd.assume_encrypted_disk` key the same
+    way — appending a second `[qmd]` section to either form would
+    produce a duplicate-definition TOML error.
+
+    The write is verified before this returns: the file is re-parsed
+    and `assume_from_user_config()` must read back True, so "assert
+    and record" can never report success without recording. If the
+    pre-existing file is already invalid TOML, nothing is written at
+    all. If verification fails after writing, the original file is
+    restored (or the new file removed) and OSError is raised — callers
+    turn that into a clean refusal, never a traceback, and never a
+    build that proceeds on an unrecorded assertion. On a Python with
+    no TOML parser (neither tomllib nor tomli), verification cannot
+    pass, so persist refuses rather than reporting a recording the
+    gate could never read back.
+
+    The assertion is scoped to this home directory, not to a host or a
+    disk: a shared or restored $HOME carries it to a different disk.
+    Revoke it by deleting the key from the user config or setting it
+    to `false`. Returns the config path written.
     """
-    home = home or os.environ.get("HOME")
+    home = _resolve_home(home)
     if not home:
-        raise OSError("no HOME: cannot locate the user config")
+        raise OSError("no HOME (or USERPROFILE): cannot locate the user config")
     path = os.path.join(home, USER_CONFIG_REL)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(path, encoding="utf-8") as f:
-            text = f.read()
+            original = f.read()
     except OSError:
-        text = ""
+        original = None
+    except UnicodeDecodeError:
+        raise OSError(f"user config {path} is not readable UTF-8: fix it "
+                      "by hand; refusing to record the election in it")
+    text = original if original is not None else ""
+    tomllib = _toml_parser()
+    if text.strip() and tomllib is not None:
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            raise OSError(f"user config {path} is not valid TOML: fix it "
+                          "by hand; refusing to record the election in it")
     lines = text.splitlines()
     section_re = re.compile(r"^\s*\[qmd\]\s*(#.*)?$")
     header_re = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
     key_re = re.compile(r"^\s*assume_encrypted_disk\s*=")
+    inline_re = re.compile(r"^(\s*)qmd\s*=\s*\{(.*)\}\s*(#.*)?$")
+    dotted_re = re.compile(r"^\s*qmd\s*\.\s*assume_encrypted_disk\s*=")
+    dotted_any_re = re.compile(r"^\s*qmd\s*\.")
+    inline_at = next((i for i, ln in enumerate(lines)
+                      if inline_re.match(ln)), None)
     section_at = next((i for i, ln in enumerate(lines) if section_re.match(ln)),
                       None)
-    if section_at is None:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.append("[qmd]")
-        lines.append("assume_encrypted_disk = true")
+    dotted_at = next((i for i, ln in enumerate(lines)
+                      if dotted_re.match(ln)), None)
+    if inline_at is not None:
+        m = inline_re.match(lines[inline_at])
+        inner = m.group(2)
+        if re.search(r"assume_encrypted_disk\s*=", inner):
+            inner = re.sub(r"assume_encrypted_disk\s*=\s*[^,}]+",
+                           "assume_encrypted_disk = true", inner, count=1)
+        elif inner.strip():
+            inner = inner.rstrip() + ", assume_encrypted_disk = true"
+        else:
+            inner = "assume_encrypted_disk = true"
+        comment = f" {m.group(3)}" if m.group(3) else ""
+        lines[inline_at] = f"{m.group(1)}qmd = {{{inner}}}{comment}"
+    elif dotted_at is not None:
+        lines[dotted_at] = "qmd.assume_encrypted_disk = true"
+    elif section_at is None:
+        first_dotted = next((i for i, ln in enumerate(lines)
+                             if dotted_any_re.match(ln)), None)
+        if first_dotted is not None:
+            lines.insert(first_dotted + 1, "qmd.assume_encrypted_disk = true")
+        else:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append("[qmd]")
+            lines.append("assume_encrypted_disk = true")
     else:
         end = len(lines)
         for i in range(section_at + 1, len(lines)):
@@ -269,20 +361,48 @@ def persist_encrypted_disk_assumption(home=None):
             lines.insert(section_at + 1, "assume_encrypted_disk = true")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    # Strict read-back: the recorded assertion must satisfy the same
+    # gate read the next run will use. A textual check is not enough —
+    # on a Python with no TOML parser, assume_from_user_config() is
+    # always False, so verification fails here and the write is rolled
+    # back instead of claiming a recording the gate could never read.
+    verified = assume_from_user_config(home)
+    if not verified:
+        if original is None:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(original)
+        raise OSError(f"recorded election in {path} did not verify on "
+                      "read-back; the original config was restored and "
+                      "the build must not proceed on an unrecorded assertion")
     return path
 
 
-def elect_encrypted_disk(vault):
+_DETECTION_UNSET = object()
+
+
+def elect_encrypted_disk(vault, detected=_DETECTION_UNSET):
     """The setup-time election (issue #723), in plain language.
 
     Runs only when the caller already knows the gate failed and stdin
     is a TTY: the operator is present and thinking about it, which is
-    exactly when this decision belongs. Returns True when the operator
-    asserts and the assertion is persisted (the build may proceed), or
-    exits: a decline means QMD stays off, and EOF means the operator
-    walked away — both are refused builds, never silent ones.
+    exactly when this decision belongs. `detected` is the gate's own
+    detection result, threaded through so the election never re-runs
+    detection and disagrees with the gate that just failed; callers
+    that omit it get a fresh detection run. Returns True when the
+    operator asserts and the assertion is persisted and verified (the
+    build may proceed), or exits: a decline means QMD stays off, EOF
+    means the operator walked away, garbage input three times means
+    no election was made, and an unrecordable assertion means the
+    build must not proceed on a promise that is not on disk — all are
+    refused builds, never silent ones.
     """
-    detected = encrypted_disk_detected(vault)
+    if detected is _DETECTION_UNSET:
+        detected = encrypted_disk_detected(vault)
     if detected is False:
         known = ("Checked this host: no encrypted disk was found "
                  "(FileVault/dm-crypt detection ran and came back negative).")
@@ -296,11 +416,14 @@ def elect_encrypted_disk(vault):
           file=sys.stderr)
     print(f"{known} If you have verified the disk is encrypted another "
           "way (your provider encrypts it, for example), you can assert "
-          "that here and the answer is recorded, so the next run — or "
-          "the next agent — does not have to ask again. If you decline, "
-          "QMD stays off and keyword search (`confidant find`) remains "
-          "the search path.", file=sys.stderr)
-    while True:
+          "that here and the answer is recorded in your user config, so "
+          "the next run under this home directory — or the next agent — "
+          "does not have to ask again. You can revoke it later by "
+          "deleting [qmd] assume_encrypted_disk from "
+          "~/.config/confidant/config.toml or setting it to false. "
+          "If you decline, QMD stays off and keyword search "
+          "(`confidant find`) remains the search path.", file=sys.stderr)
+    for attempt in range(3):
         print("Assert the disk is encrypted and record it? "
               "[a]ssert and record / [d]ecline (QMD stays off): ",
               file=sys.stderr, end="")
@@ -314,7 +437,11 @@ def elect_encrypted_disk(vault):
                      "--assert-and-persist-encrypted-disk).")
         answer = answer.strip().lower()
         if answer in ("a", "assert"):
-            path = persist_encrypted_disk_assumption()
+            try:
+                path = persist_encrypted_disk_assumption()
+            except OSError as e:
+                sys.exit(f"error: refusing to build: could not record "
+                         f"the disk election: {e}")
             print(f"encrypted disk: asserted by operator at setup, recorded "
                   f"in {path} [qmd].assume_encrypted_disk — ok",
                   file=sys.stderr)
@@ -323,23 +450,36 @@ def elect_encrypted_disk(vault):
             sys.exit("QMD stays off: disk encryption was declined at setup; "
                      "keyword search (`confidant find`) remains the search "
                      "path. Re-run this script to elect again.")
-        print("Please answer 'a' (assert and record) or 'd' (decline).",
-              file=sys.stderr)
+        if attempt < 2:
+            print("Please answer 'a' (assert and record) or 'd' (decline).",
+                  file=sys.stderr)
+    sys.exit("error: refusing to build: no valid disk-encryption election "
+             "was made after 3 attempts (see --i-confirm-encrypted-disk / "
+             "--assert-and-persist-encrypted-disk).")
 
 
-def encrypted_disk_confirmation(vault, confirmed_flag):
+def encrypted_disk_confirmation(vault, confirmed_flag, detected=_DETECTION_UNSET,
+                                persisted_mechanism=None):
     """The mechanism that satisfies the encrypted-disk gate, or None.
 
     Detection is preferred over every assertion, so a real FileVault /
     dm-crypt answer is reported as `detected` rather than as an operator
-    assumption. `--i-confirm-encrypted-disk` is strongest among the
-    assertions (per run); the persisted confirmations (#540) come next.
-    A definite `False` from detection does not short-circuit: like the
-    original per-run flag, any explicit operator assertion still allows
-    the build, and the printed mechanism makes clear it was asserted.
+    assumption. `persisted_mechanism` is the scripted-persist path's own
+    label (it records a permanent assertion, so it must not render as
+    the per-run flag); `--i-confirm-encrypted-disk` comes next, then
+    the persisted confirmations (#540). A definite `False` from
+    detection does not short-circuit: like the original per-run flag,
+    any explicit operator assertion still allows the build, and the
+    printed mechanism makes clear it was asserted. `detected` lets the
+    caller thread one detection run through the gate and the election
+    instead of running detection twice.
     """
-    if encrypted_disk_detected(vault) is True:
+    if detected is _DETECTION_UNSET:
+        detected = encrypted_disk_detected(vault)
+    if detected is True:
         return "detected (FileVault/dm-crypt)"
+    if persisted_mechanism:
+        return persisted_mechanism
     if confirmed_flag:
         return "asserted via --i-confirm-encrypted-disk"
     if assume_from_env():
@@ -350,27 +490,33 @@ def encrypted_disk_confirmation(vault, confirmed_flag):
     return None
 
 
-def ensure_encrypted_disk(vault, confirmed_flag):
+def ensure_encrypted_disk(vault, confirmed_flag, persisted_mechanism=None):
     """Refuse unless the disk is encrypted (detected) or the operator asserts it.
 
     Prints which mechanism satisfied the gate to stderr (issue #540), so
     the trust assumption is visible in logs and never looks like a check.
-    When nothing satisfies the gate and the operator is present (stdin
-    is a TTY), issue #723's election runs instead of the bare refusal:
+    Detection runs exactly once here and its result is threaded into
+    both the confirmation and, on a TTY, the election. When nothing
+    satisfies the gate and the operator is present (stdin is a TTY),
+    issue #723's election runs instead of the bare refusal:
     assert-and-record, or decline with QMD staying off. A non-TTY run
     keeps the old refusal — an unattended script must not be prompted.
     """
-    mechanism = encrypted_disk_confirmation(vault, confirmed_flag)
+    detected = encrypted_disk_detected(vault)
+    mechanism = encrypted_disk_confirmation(
+        vault, confirmed_flag, detected=detected,
+        persisted_mechanism=persisted_mechanism)
     if mechanism is not None:
         print(f"encrypted disk: {mechanism} — ok", file=sys.stderr)
         return
     if sys.stdin.isatty():
-        elect_encrypted_disk(vault)
+        elect_encrypted_disk(vault, detected=detected)
         return
     sys.exit(
         "error: refusing to build: could not confirm the disk is encrypted.\n"
-        "The QMD index holds plaintext vault content (including no-ai records)\n"
-        "and architecture §9b item 4 requires an encrypted disk.\n"
+        "The QMD index holds plaintext copies of cleared vault content\n"
+        "(no-ai records are excluded at index time) and architecture §9b\n"
+        "item 4 requires an encrypted disk.\n"
         "Fix: run on a FileVault/dm-crypt volume, re-run with\n"
         "  --i-confirm-encrypted-disk   (only if you have verified it yourself),\n"
         "or persist the assertion once for this device:\n"
@@ -516,10 +662,19 @@ def main():
     # Device policy stays here (architecture §9b item 4): the corpus and the
     # QMD store hold plaintext chunks.
     confirmed = args.i_confirm_encrypted_disk
+    persisted_mechanism = None
     if args.assert_and_persist_encrypted_disk:
-        persist_encrypted_disk_assumption()
+        try:
+            persisted_path = persist_encrypted_disk_assumption()
+        except OSError as e:
+            sys.exit(f"error: refusing to build: could not record the "
+                     f"disk election: {e}")
+        persisted_mechanism = (
+            "asserted via --assert-and-persist-encrypted-disk "
+            f"(recorded in {persisted_path} [qmd].assume_encrypted_disk)")
         confirmed = True
-    ensure_encrypted_disk(vault, confirmed)
+    ensure_encrypted_disk(vault, confirmed,
+                          persisted_mechanism=persisted_mechanism)
     ensure_store_dirs(vault)
     migrate_default_store()
 

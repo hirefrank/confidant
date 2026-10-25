@@ -7882,6 +7882,9 @@ fn skills_links_check() -> DoctorCheck {
 /// a detection result (#709's rule — an assumption never masquerades as
 /// detection). A detected disk needs no report; there is no assumption
 /// to disclose. Anything unreadable or unparsable is not an assertion.
+/// A truthy value is a bool true, the integer 1, or a string in
+/// 1/true/yes/on — the same set the Python gate's TRUTHY accepts, so a
+/// hand-edited integer key is not silently invisible to `doctor`.
 fn qmd_disk_assertion_check() -> Option<DoctorCheck> {
     let home = setup::home_dir().ok()?;
     let text = std::fs::read_to_string(home.join(".config/confidant/config.toml")).ok()?;
@@ -7891,6 +7894,7 @@ fn qmd_disk_assertion_check() -> Option<DoctorCheck> {
         .and_then(|q| q.get("assume_encrypted_disk"))
         .is_some_and(|v| {
             v.as_bool().unwrap_or(false)
+                || v.as_integer().is_some_and(|n| n == 1)
                 || v.as_str().is_some_and(|s| {
                     matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
                 })

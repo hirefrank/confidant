@@ -53,7 +53,14 @@ truth for the search allowlist.
   known/unknown about this host — then asks: assert and record, or
   decline. Asserting writes the existing `[qmd] assume_encrypted_disk`
   key (no new key) to the user config, preserving every other key; the
-  next run — or the next agent — never asks again. Declining means QMD
+  next run under the same home directory — or the next agent — never
+  asks again, because the write is re-parsed and verified before the
+  build proceeds (a config that cannot be recorded cleanly refuses
+  instead of proceeding on an unrecorded assertion). The election is
+  scoped to the home directory, not to a host or a disk: a shared or
+  restored `$HOME` carries the assertion to a different disk, and
+  `doctor` cannot distinguish that from a local election — revoke it
+  by deleting the key or setting it to `false`. Declining means QMD
   stays off and `confidant find` remains the search path. There is no
   third, silent outcome, and a non-TTY run keeps the old refusal rather
   than prompting. Scripted setup uses

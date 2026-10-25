@@ -270,3 +270,48 @@ fn doctor_qmd_disk_assertion_absent_without_key() {
     let v = run_doctor(&demo(), empty.path().as_os_str(), &[]);
     assert!(check(&v, "qmd-disk").is_none(), "{v}");
 }
+
+fn doctor_qmd_disk_with_config(text: &str) -> Value {
+    let home = tempfile::tempdir().unwrap();
+    let conf_dir = home.path().join(".config/confidant");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::write(conf_dir.join("config.toml"), text).unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    // Keep the tempdirs alive until doctor has run: the home path is
+    // only borrowed by run_doctor_home, so hold both guards here.
+    let v = run_doctor_home(&demo(), empty.path().as_os_str(), &[], home.path());
+    drop(empty);
+    drop(home);
+    v
+}
+
+#[test]
+fn doctor_qmd_disk_assertion_absent_when_false() {
+    // #723 review SF4(d): an explicit false is a declined election,
+    // not an assertion to report.
+    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = false\n");
+    assert!(check(&v, "qmd-disk").is_none(), "{v}");
+}
+
+#[test]
+fn doctor_qmd_disk_assertion_absent_for_bogus_value() {
+    // A hand-edited value outside the truthy set is not an assertion.
+    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = \"maybe\"\n");
+    assert!(check(&v, "qmd-disk").is_none(), "{v}");
+}
+
+#[test]
+fn doctor_qmd_disk_assertion_absent_for_malformed_config() {
+    // Unparsable TOML is not an assertion (fail closed, no check).
+    let v = doctor_qmd_disk_with_config("[qmd\nassume_encrypted_disk = true\n");
+    assert!(check(&v, "qmd-disk").is_none(), "{v}");
+}
+
+#[test]
+fn doctor_qmd_disk_assertion_reported_for_integer_one() {
+    // Parser alignment with the Python gate's TRUTHY set: an integer 1
+    // hand-edit counts, just as it satisfies qmd-index.py.
+    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = 1\n");
+    let c = check(&v, "qmd-disk").expect("qmd-disk check missing");
+    assert_eq!(c["status"], "ok", "{v}");
+}
