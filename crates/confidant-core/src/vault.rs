@@ -96,6 +96,15 @@ pub struct Vault {
     /// Envelopes refused as tampered/corrupt by the content hook (spec 4).
     /// Never folded into `skipped_encrypted`.
     pub refused_envelopes: u32,
+    /// Skipped record files that are person records (see
+    /// `is_person_record_job`). Person-lookup gating (#717) uses these,
+    /// not the vault-wide counts: an unreadable org, deal, note, edge, or
+    /// interaction cannot hide a person, so it must not flip a person
+    /// miss to `E_CANNOT_SEARCH`.
+    pub skipped_person_records: u32,
+    /// Refused envelopes that are person records (same rule as
+    /// `skipped_person_records`).
+    pub refused_person_records: u32,
     /// The vault's own pack registry: compiled packs plus the loaded
     /// external packs (#438). Replaces #432's process-wide static.
     pack_registry: PackRegistry,
@@ -213,6 +222,8 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     let mut ledger_unread_count = 0u32;
     let mut skipped_encrypted = 0u32;
     let mut refused_envelopes = 0u32;
+    let mut skipped_person_records = 0u32;
+    let mut refused_person_records = 0u32;
 
     if config.spec == SPEC_VERSION {
         let mut jobs = Vec::new();
@@ -222,6 +233,10 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         for (job, out) in jobs.iter().zip(outs) {
             skipped_encrypted += out.skipped;
             refused_envelopes += out.refused;
+            if is_person_record_job(job) {
+                skipped_person_records += out.skipped;
+                refused_person_records += out.refused;
+            }
             if out.conflicted {
                 if let Some(id) = &job.path_id {
                     conflicted_ids.insert(id.clone());
@@ -254,6 +269,8 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         path_ulids,
         skipped_encrypted,
         refused_envelopes,
+        skipped_person_records,
+        refused_person_records,
         pack_registry,
         pack_problems,
     })
@@ -865,6 +882,24 @@ struct MarkdownJob {
 
 /// Read, parse and check the jobs on worker threads, preserving job
 /// order in the output so the merge is deterministic.
+/// Whether a markdown job is a person record for #717 gating: its
+/// path-derived id has the person prefix and it is not a note under a
+/// person directory (notes carry `note_owner`). The path id is the only
+/// signal available when the file itself went unread — a skipped or
+/// refused envelope's header is never parsed — so a job whose path claims
+/// a person id is counted as a person record, and every other job (orgs,
+/// deals, interactions, notes, edges, and any path whose id does not
+/// parse as a person) is not. Jobs always carry a path id in practice
+/// (a filename that does not parse never becomes a job); the `None` arm
+/// simply never counts.
+fn is_person_record_job(job: &MarkdownJob) -> bool {
+    job.note_owner.is_none()
+        && job
+            .path_id
+            .as_ref()
+            .is_some_and(|id| id.prefix() == Prefix::Person)
+}
+
 fn load_markdown_jobs(
     root: &Path,
     jobs: &[MarkdownJob],

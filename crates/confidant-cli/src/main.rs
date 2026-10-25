@@ -4056,20 +4056,40 @@ fn person_resolve_error(
 /// the already-loaded write vault (its id and type sit in the plaintext
 /// envelope header, so a `no-ai: true` person stays addressable by id without
 /// decrypting), or an exact display name against the `for_reads` cleared set.
+///
+/// An id miss in the write vault is not a confident not-found: the id
+/// could belong to a record the read path could not search, so the miss
+/// is resolved again against the `for_reads` vault, whose unread person
+/// records gate it to `E_CANNOT_SEARCH` exactly like a name miss (#717).
+/// Id arguments never echo a name, so the read-vault hit path cannot leak
+/// a hidden person's name.
 fn resolve_person_arg(
     root: &Path,
     vault: &confidant_core::Vault,
     raw: &str,
 ) -> anyhow::Result<ResolvedPersonArg> {
     if let Ok(id) = RecordId::parse(raw) {
-        return match vault.records.get(&id) {
-            Some(r) if r.kind == RecordKind::Person => Ok(ResolvedPersonArg {
-                id,
+        if let Some(r) = vault.records.get(&id) {
+            if r.kind == RecordKind::Person {
+                return Ok(ResolvedPersonArg {
+                    id,
+                    matched_name: None,
+                });
+            }
+        }
+        // Miss (or a non-person record) in the write vault: fall through
+        // to the read vault, where `resolve_person` applies the same
+        // cannot-search gate a name lookup gets. A non-person id stays
+        // NotFound there too (positive knowledge), and a hit — e.g. a
+        // `no-ai` shell the un-hooked write load could not surface —
+        // still resolves by id.
+        let read_vault = load_read_vault(root)?;
+        return match confidant_core::resolve::resolve_person(&read_vault, raw) {
+            Ok(m) => Ok(ResolvedPersonArg {
+                id: m.id,
                 matched_name: None,
             }),
-            _ => Err(anyhow::Error::new(DomainError::not_found(format!(
-                "no person with id {raw}"
-            )))),
+            Err(err) => Err(person_resolve_error(raw, err)),
         };
     }
     let read_vault = load_read_vault(root)?;
@@ -7023,10 +7043,11 @@ fn cmd_context(
         Err(code) => return Ok(code),
     };
     // #537: a `p-<ULID>` keeps its exact previous behaviour (unsupported id
-    // shapes still fall through to the ⚠2b / not-found branches below); a
-    // non-id argument is an exact display name resolved against the cleared
-    // set and canonicalized. Id args are not canonicalized here — `context`
-    // already folds merge groups when it builds the bundle.
+    // shapes still fall through to the cannot-search / ⚠2b / not-found
+    // branches below); a non-id argument is an exact display name resolved
+    // against the cleared set and canonicalized. Id args are not
+    // canonicalized here — `context` already folds merge groups when it
+    // builds the bundle.
     let person = match RecordId::parse(person_raw) {
         Ok(id) => id,
         Err(_) => match confidant_core::resolve::resolve_person(&vault, person_raw) {
@@ -7044,6 +7065,18 @@ fn cmd_context(
     let bundle = match build_context(&vault, &person, include_private, &scope, for_operator) {
         Some(b) => b,
         None => {
+            // #717: a missing bundle against a vault with unread person
+            // records is a cannot-search, not a confident not-found —
+            // and not the E_INVALID recovery remedy below, which is
+            // exactly the wrong fix when the anchor is simply absent.
+            // The person may be in an unread record, so absence cannot
+            // be established.
+            if vault.skipped_person_records > 0 || vault.refused_person_records > 0 {
+                return Err(anyhow::Error::new(DomainError::cannot_search(
+                    vault.skipped_person_records,
+                    vault.refused_person_records,
+                )));
+            }
             // ⚠2b: the person's key is absent (their record is an envelope
             // this device cannot read) is a hard error, not "not found".
             if record_decrypt::person_has_envelope(&vault.root, &person.to_string()) {

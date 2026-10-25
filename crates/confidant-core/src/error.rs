@@ -252,10 +252,11 @@ impl DomainError {
     /// plainly that the miss does not establish absence; it never claims
     /// the person is not in the vault. The fix names the actual remedy
     /// for each cause: missing key material (trust anchor / device key)
-    /// for skips, git-history restore for refused envelopes. It
-    /// deliberately does not suggest `recover`: recovery is only for
-    /// when every enrolled device is lost, and it rotates keys — the
-    /// field case (#713) was a device whose anchor was simply absent.
+    /// for skips, git-history restore (or a backup, for a vault without
+    /// git history) for refused envelopes. It deliberately does not
+    /// suggest `recover`: recovery is only for when every enrolled
+    /// device is lost, and it rotates keys — the field case (#713) was
+    /// a device whose anchor was simply absent.
     pub fn cannot_search(skipped: u32, refused: u32) -> Self {
         let mut parts = Vec::new();
         let mut fixes = Vec::new();
@@ -275,8 +276,16 @@ impl DomainError {
             ));
             fixes.push(
                 "an envelope failed authentication (tampered or corrupt); restore \
-                 the affected record from git history",
+                 the affected record from git history, or from a backup if the \
+                 vault has no git history",
             );
+        }
+        if parts.is_empty() {
+            // The constructor is public, so a (0, 0) call can happen even
+            // though every real caller passes a nonzero count; never
+            // render an empty cause list or a fix of "; then retry".
+            parts.push("the vault could not be fully searched".to_owned());
+            fixes.push("check this device's key material and restore any unread records");
         }
         Self::new(
             ErrorKind::CannotSearch,
@@ -323,7 +332,8 @@ impl DomainError {
             ));
             fixes.push(
                 "an envelope failed authentication (tampered or corrupt); restore \
-                 the affected record from git history",
+                 the affected record from git history, or from a backup if the \
+                 vault has no git history",
             );
         }
         Self::new(
@@ -728,7 +738,19 @@ mod tests {
         assert_eq!(refused_only.code(), "E_CANNOT_SEARCH");
         assert!(refused_only.message().contains("2 envelope(s)"));
         assert!(refused_only.fix().unwrap().contains("git history"));
+        assert!(refused_only.fix().unwrap().contains("backup"));
         assert!(!refused_only.fix().unwrap_or("").contains("trust.toml"));
+        // A (0, 0) construction still renders a cause and a fix, never an
+        // empty list or a fix of "; then retry".
+        let empty = DomainError::cannot_search(0, 0);
+        assert_eq!(empty.code(), "E_CANNOT_SEARCH");
+        assert!(empty.message().contains("cannot search the vault: "));
+        assert!(!empty.message().contains("cannot search the vault: ;"));
+        assert!(empty.message().contains("could not be fully searched"));
+        let empty_fix = empty.fix().unwrap();
+        assert!(!empty_fix.starts_with(';'));
+        assert!(!empty_fix.contains(";;"));
+        assert!(empty_fix.contains("then retry"));
     }
 
     #[test]
