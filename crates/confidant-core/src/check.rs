@@ -624,17 +624,12 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
 
     // The set borrows every claim string: pack verbs are already
     // `'static` and problem-pack verbs live in `vault` for the whole run,
-    // so nothing needs leaking (#497 item 1).
-    let mut known_verbs = known_verbs(&enabled_packs);
-    // Problem packs are not folded, but their claimed verbs stay known
-    // (spec/pack-lock.md §5) so the failure does not cascade into
-    // E_UNKNOWN_VERB noise.
-    for problem in &vault.pack_problems {
-        for verb in &problem.known_verbs {
-            known_verbs.insert(verb.as_str());
-        }
-    }
-    let orphans = vault.pack_registry().orphan_owners(&enabled_packs);
+    // so nothing needs leaking (#497 item 1). Built from the same helper
+    // `verb_passes_check` uses, so the gate and the post-check cannot
+    // drift apart (#732 fix wave).
+    let accepted = accepted_verbs(vault, &enabled_packs);
+    let known_verbs = accepted.known;
+    let orphans = accepted.orphans;
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
 
     check_ledger_paths(vault, &mut findings);
@@ -836,6 +831,47 @@ fn known_verbs<'a>(enabled_packs: &[&dyn Pack]) -> HashSet<&'a str> {
         verbs.extend(pack.verbs().iter().copied());
     }
     verbs
+}
+
+/// #732 fix wave: the single construction of the verb set `run` treats
+/// as known, plus the disabled-pack claims it treats as warnings. Both
+/// `run` and `verb_passes_check` build their set from this helper, so a
+/// new verb source added here reaches both and the gate cannot drift
+/// from the post-check it stands in for. A verb passes the check when
+/// it is in `known` or owned by a registered-but-disabled pack
+/// (`orphans.verbs`): the latter yields `W_PACK_ORPHAN`, never
+/// `E_UNKNOWN_VERB`, so apply still commits those lines.
+pub struct AcceptedVerbs<'a> {
+    pub known: HashSet<&'a str>,
+    pub orphans: OrphanOwners,
+}
+
+pub fn accepted_verbs<'a>(vault: &'a Vault, enabled_packs: &[&'a dyn Pack]) -> AcceptedVerbs<'a> {
+    let mut known = known_verbs(enabled_packs);
+    // Problem packs are not folded, but their claimed verbs stay known
+    // (spec/pack-lock.md §5) so the failure does not cascade into
+    // `E_UNKNOWN_VERB` noise.
+    for problem in &vault.pack_problems {
+        for verb in &problem.known_verbs {
+            known.insert(verb.as_str());
+        }
+    }
+    let orphans = vault.pack_registry().orphan_owners(enabled_packs);
+    AcceptedVerbs { known, orphans }
+}
+
+/// #732: whether `check` would accept a ledger line with this verb in this
+/// vault — i.e. whether apply's post-check would pass the verb gate.
+/// Built from the same [`accepted_verbs`] helper `run` uses, so the two
+/// cannot diverge: core verbs, enabled-pack verbs, problem-pack verbs,
+/// and verbs owned by a registered-but-disabled pack (a warning, never
+/// an error, so apply still commits). `log` commands refuse up front
+/// when this is false, so `--dry-run` fails instead of reporting
+/// `ok:true` for a write that cannot commit.
+pub fn verb_passes_check(vault: &Vault, verb: &str) -> bool {
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
+    let accepted = accepted_verbs(vault, &enabled);
+    accepted.known.contains(verb) || accepted.orphans.verbs.contains_key(verb)
 }
 
 fn check_ledger_paths(vault: &Vault, findings: &mut Vec<Finding>) {
@@ -1886,6 +1922,70 @@ mod tests {
             "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
         );
         assert!(parse_alias(&entry("twitter")).is_err());
+    }
+
+    /// #732 fix wave: the orphan branch of the shared verb-set helper.
+    /// No vault config can produce a registered-but-disabled pack
+    /// through `load_vault` today (externals load only when listed, and
+    /// the personal pack is implicit since #551), so the branch is
+    /// exercised here by passing a deliberately restricted enabled set:
+    /// with nothing enabled, the loaded example pack's verbs surface as
+    /// orphans, and the gate predicate still passes them — exactly the
+    /// `W_PACK_ORPHAN`, never `E_UNKNOWN_VERB`, behaviour `run` gives
+    /// those lines. With the pack enabled, the same verbs are known.
+    #[test]
+    fn accepted_verbs_orphan_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/packs/example-pack");
+        let dst = root.join("packs/example-pack@0.1");
+        std::fs::create_dir_all(&dst).unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+        let hash = crate::packs::dir::read_pack_dir(&dst).unwrap().hash;
+        std::fs::write(
+            root.join("confidant.lock"),
+            format!(
+                "lock_version = 1\n\n[[pack]]\nname = \"example-pack\"\nversion = \"0.1\"\nsource = \"dir\"\nrev = \"\"\nsubdir = \"\"\nhash = \"{hash}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("confidant.toml"),
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        )
+        .unwrap();
+        let vault = crate::vault::load_vault(root).unwrap();
+        assert!(
+            vault.pack_problems.is_empty(),
+            "fixture pack must load: {:?}",
+            vault.pack_problems
+        );
+
+        // Nothing enabled: the example pack's verbs are orphans.
+        let accepted = super::accepted_verbs(&vault, &[]);
+        assert!(!accepted.known.contains("session"));
+        assert_eq!(
+            accepted.orphans.verbs.get("session"),
+            Some(&"example-pack@0.1")
+        );
+        assert!(accepted.orphans.verbs.contains_key("grant"));
+        // Core verbs stay known regardless of the enabled set.
+        assert!(accepted.known.contains("touch"));
+
+        // Pack enabled: the same verbs are known, not orphans.
+        let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
+        let accepted = super::accepted_verbs(&vault, &enabled);
+        assert!(accepted.known.contains("session"));
+        assert!(!accepted.orphans.verbs.contains_key("session"));
+
+        // The gate itself agrees on the real vault.
+        assert!(super::verb_passes_check(&vault, "session"));
+        assert!(super::verb_passes_check(&vault, "touch"));
+        assert!(!super::verb_passes_check(&vault, "bogus-verb"));
     }
 
     #[test]

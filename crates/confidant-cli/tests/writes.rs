@@ -219,6 +219,398 @@ fn log_session_dry_run_touches_nothing() {
     assert!(content.contains(&format!("session {PERSON} 60m paid")));
 }
 
+/// #732: a `packs = []` vault owns no `session` verb, so both the
+/// dry run and the apply must refuse up front instead of the dry run
+/// reporting `ok:true` for a write apply's post-check blocks with
+/// `E_UNKNOWN_VERB`. The fixture ledger holds only a core `touch`
+/// line, so the vault is otherwise check-clean, and a `touch` apply
+/// still succeeds afterwards (the gate is verb-specific, not a blanket
+/// write refusal).
+#[test]
+fn log_session_dry_run_fails_when_verb_not_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    // Dry run refuses with the same up-front error apply gets.
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+        "--dry-run",
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("session"),
+        "{v}"
+    );
+    assert_eq!(commits(root), 1, "no commit on refused dry run");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        before,
+        "no file change on refused dry run"
+    );
+
+    // Apply refuses identically (no CheckBlocked report, no commit).
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert_eq!(commits(root), 1, "no commit on refused apply");
+    assert_eq!(
+        std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+        before,
+        "no file change on refused apply"
+    );
+
+    // The core `touch` verb is unaffected in the same vault.
+    let (ok, v) = run_json(&[
+        "log",
+        "touch",
+        PERSON,
+        "meal",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(commits(root), 2, "touch apply still commits");
+}
+
+/// #732 fix wave: a vendored-but-unlisted pack is NOT a disabled pack
+/// — the loader only registers listed packs, so its verbs are unknown
+/// and the gate refuses them. (A registered-but-disabled pack can only
+/// arise inside the registry itself; that branch is covered by the
+/// `accepted_verbs_orphan_branch` unit test in `check.rs`, since no
+/// vault config can produce one through `load_vault` today — the last
+/// CLI-reachable orphan case went away when the personal pack became
+/// implicit in #551.)
+#[test]
+fn log_session_refuses_unlisted_pack_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_example_pack(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args: Vec<&str> = vec![
+            "log",
+            "session",
+            PERSON,
+            "60m",
+            "--date",
+            "2026-10-23",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ];
+        args.extend_from_slice(extra);
+        let (ok, v) = run_json(&args);
+        assert!(!ok, "{v}");
+        assert_eq!(v["error"]["code"], "E_INVALID");
+        assert_eq!(commits(root), 1, "no commit on refused log");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+            before,
+            "no file change on refused log"
+        );
+    }
+}
+
+/// #732 fix wave: a problem pack's claimed verbs stay known (spec
+/// pack-lock §5), so the gate must pass them. Tampering a vendored file
+/// makes the listed example pack a hash problem while its manifest
+/// still sells `session`; the dry run must therefore not refuse the
+/// verb (apply still blocks, but on the pack hash, not the verb).
+#[test]
+fn log_session_dry_run_passes_for_problem_pack_verb() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    install_example_pack(root);
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    // Break the lockfile hash without breaking the manifest parse.
+    let skill = root.join("packs/example-pack@0.1/SKILL.md");
+    let mut contents = std::fs::read_to_string(&skill).unwrap();
+    contents.push_str("\n<!-- tampered for the problem-pack fixture -->\n");
+    std::fs::write(&skill, contents).unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+        "--dry-run",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["dry_run"], true);
+
+    // Apply is blocked by the pack problem, but not by the verb gate.
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "--date",
+        "2026-10-23",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_ne!(v["error"]["code"], "E_INVALID", "{v}");
+    assert_eq!(commits(root), 1, "no commit on blocked apply");
+}
+
+/// #732 fix wave: the gate runs before the `--fallback-inbox` queueing
+/// path, so a refused `log session --note --fallback-inbox` queues
+/// nothing. This plaintext fixture cannot reach the encrypted-only
+/// queue branch itself, so the test pins the observable contract: the
+/// refusal, no commit, no ledger change, and no `inbox` branch.
+#[test]
+fn log_session_refused_before_fallback_inbox_queueing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let mut args: Vec<&str> = vec![
+            "log",
+            "session",
+            PERSON,
+            "60m",
+            "--date",
+            "2026-10-23",
+            "--note",
+            "Great session",
+            "--fallback-inbox",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ];
+        args.extend_from_slice(extra);
+        let (ok, v) = run_json(&args);
+        assert!(!ok, "{v}");
+        assert_eq!(v["error"]["code"], "E_INVALID");
+        assert_eq!(commits(root), 1, "no commit on refused log");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
+            before,
+            "no file change on refused log"
+        );
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["branch", "--list", "inbox"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "no inbox branch may be created by a refused log"
+    );
+}
+
+/// #732 fix wave: `import` gets the same up-front verb gate as `log`.
+/// A `session` line into a `packs = []` vault refuses before writing
+/// anything; a core `touch` line still imports.
+#[test]
+fn import_refuses_unknown_verb_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+    )
+    .unwrap();
+    let person_dir = root.join(format!("people/{PERSON}"));
+    std::fs::create_dir_all(&person_dir).unwrap();
+    std::fs::write(
+        person_dir.join("profile.md"),
+        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
+    )
+    .unwrap();
+    let ledger_dir = root.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 touch {PERSON} call\n"),
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    let vroot = vault_arg(root);
+    let scratch = tempfile::tempdir().unwrap();
+
+    let bad = scratch.path().join("bad.cfd");
+    std::fs::write(&bad, format!("2026-10-06 session {PERSON} 60m\n")).unwrap();
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &bad.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_INVALID");
+    assert_eq!(commits(root), 1, "no commit on refused import");
+    assert!(
+        !std::fs::read_to_string(root.join("ledger/2026/10.cfd"))
+            .unwrap()
+            .contains("60m"),
+        "refused import must not append"
+    );
+
+    let good = scratch.path().join("good.cfd");
+    std::fs::write(&good, format!("2026-10-06 touch {PERSON} meal\n")).unwrap();
+    let (ok, v) = run_json(&[
+        "import",
+        "--file",
+        &good.display().to_string(),
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(commits(root), 2, "core-verb import still commits");
+}
+
 #[test]
 fn log_session_with_note_creates_note_record() {
     let dir = make_vault();

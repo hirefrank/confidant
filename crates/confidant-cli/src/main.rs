@@ -4284,6 +4284,30 @@ fn cmd_inbox_rotate(
     Ok(ExitCode::SUCCESS)
 }
 
+/// #732: refuse a `log` verb up front when the vault cannot accept it,
+/// so `--dry-run` refuses with `E_INVALID` before any check runs
+/// instead of reporting `ok:true` for a write apply's post-check would
+/// block with `E_UNKNOWN_VERB`. Runs before person resolution and
+/// before the `--fallback-inbox` queueing path: a line the vault will
+/// reject must not be queued either. The fix mirrors the check
+/// finding's own fix.
+fn refuse_unknown_verb(verb: &str) -> anyhow::Error {
+    // Deliberate echo, unlike `check_verbs_and_refs`' bare "unknown
+    // verb": a verb is a command name the operator typed, not vault
+    // content, so naming it cannot leak record text.
+    anyhow::Error::new(DomainError::invalid(format!(
+        "verb '{verb}' is not enabled in this vault"
+    )))
+    .with_fix("Use a core verb or enable the pack that defines it")
+}
+
+fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow::Result<()> {
+    if confidant_core::check::verb_passes_check(vault, verb) {
+        return Ok(());
+    }
+    Err(refuse_unknown_verb(verb))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_log_session(
     cli: &Cli,
@@ -4298,6 +4322,7 @@ fn cmd_log_session(
     fallback_inbox: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
+    require_log_verb(&vault, "session")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
     if parse_duration_minutes(duration).is_none() {
@@ -4447,7 +4472,10 @@ fn cmd_log_touch(
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     // #551: the built-in personal pack is implicit, so `touch` is always
-    // owned by an enabled pack; the #510 enable gate is gone.
+    // owned by an enabled pack; the #510 enable gate is gone. The #732
+    // gate below is still applied so both log verbs share the same
+    // dry-run/apply parity rule (it never fires for a core verb).
+    require_log_verb(&vault, "touch")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
     // #510: the kind grammar is core-owned; validate against the core list
@@ -4935,6 +4963,19 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
         return Err(anyhow::Error::new(DomainError::usage(
             "import file has no ledger lines",
         )));
+    }
+    // #732 fix wave: `import` appends arbitrary verbs, so it gets the
+    // same up-front verb gate as `log` — in dry-run and apply alike,
+    // and for MCP `import_ledger`, which routes through this command.
+    // Without it, a dry-run preview would report `ok:true` for lines
+    // apply's post-check blocks with `E_UNKNOWN_VERB`.
+    {
+        let vault = vault_or!(root, cli.json);
+        for entry in &entries {
+            if !confidant_core::check::verb_passes_check(&vault, &entry.verb) {
+                return Err(refuse_unknown_verb(&entry.verb));
+            }
+        }
     }
 
     let mut by_file: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
