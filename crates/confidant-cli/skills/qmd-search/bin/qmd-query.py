@@ -49,6 +49,42 @@ SCHEMA_VERSION = "1"
 STORE_REL = os.path.join(".confidant", "qmd")
 CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 
+# Persisted QMD choices (issue #722, written by qmd-preflight.py
+# --persist) in the same user config that carries the #540/#723
+# encrypted-disk assertion. `offline` stops the model runtime phoning
+# home to its model hub per query (the 0.7.0 field failure: a 3m01s
+# wait with 0.76s user CPU, silently degraded to the find fallback);
+# `default_mode` is the preflight-recommended mode for this host.
+USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
+TRUTHY = ("1", "true", "yes", "on")
+MODES = ("hybrid", "bm25", "vector")
+# The timeout hint is CONDITIONED, not unconditional: a timeout can
+# equally be slow CPU, a large corpus, or model load, and when
+# HF_HUB_OFFLINE is already set a hub check cannot be the cause at all
+# (suggesting it then would be a no-op repeating the original
+# misdiagnosis in the opposite direction). timeout_hint() picks one.
+TIMEOUT_HINT = ("one possible cause is a model-hub (Hugging Face) check "
+                "through a proxy — the 0.7.0 field failure was a 3-minute "
+                "network wait, not compute. Other possible causes: slow "
+                "CPU, a large corpus, or model load. If the hub is the "
+                "suspect, retry with HF_HUB_OFFLINE=1, or persist [qmd] "
+                "offline = true in ~/.config/confidant/config.toml "
+                "(qmd-preflight.py --persist does both the diagnosis "
+                "and the persist).")
+TIMEOUT_HINT_OFFLINE = ("HF_HUB_OFFLINE is already set, so a model-hub "
+                        "check is not the cause of this timeout. Possible "
+                        "causes: slow CPU, a large corpus, or model load "
+                        "— or a model download that offline mode is now "
+                        "blocking (unset HF_HUB_OFFLINE / [qmd] offline "
+                        "and retry if the models are not cached yet).")
+
+
+def timeout_hint(env):
+    """The timeout hint for this run's environment (see above)."""
+    if _truthy(env.get("HF_HUB_OFFLINE", "")):
+        return TIMEOUT_HINT_OFFLINE
+    return TIMEOUT_HINT
+
 # qmd --json shapes vary by subcommand/version; accept the common ones.
 # NOTE: `file` arrives as a qmd://<collection>/<relpath> URI, not a
 # filesystem path -- strip it to the vault-relative path.
@@ -242,6 +278,65 @@ def qmd_env(vault):
     return env
 
 
+def _truthy(value):
+    """A config/env value that opts in: 1/true/yes/on, case-insensitive."""
+    return str(value).strip().lower() in TRUTHY
+
+
+def read_qmd_config(home=None):
+    """The [qmd] table from the user config, or {} when absent/unreadable.
+
+    Fail closed: a missing file, invalid TOML, or a non-table [qmd] is
+    not a configuration — callers fall back to defaults.
+    """
+    home = home or os.environ.get("HOME")
+    if not home:
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    try:
+        with open(os.path.join(home, USER_CONFIG_REL), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    qmd = data.get("qmd")
+    return dict(qmd) if isinstance(qmd, dict) else {}
+
+
+def resolve_mode(explicit, config):
+    """Explicit --mode wins; else the persisted preflight recommendation.
+
+    An invalid persisted value is ignored with a stderr note, never
+    fatal: a stale config must not break search. Default is bm25
+    (works with no model downloads).
+    """
+    if explicit:
+        return explicit
+    configured = config.get("default_mode", "")
+    if isinstance(configured, str) and configured in MODES:
+        return configured
+    if configured not in ("", None):
+        print(f"note: ignoring invalid [qmd] default_mode "
+              f"{configured!r} (want one of {', '.join(MODES)})",
+              file=sys.stderr)
+    return "bm25"
+
+
+def qmd_runtime_env(vault, config):
+    """qmd_env plus the persisted offline choice (#722).
+
+    An explicit HF_HUB_OFFLINE in the process env wins over the config:
+    the operator's current shell outranks a persisted default.
+    """
+    env = qmd_env(vault)
+    if _truthy(config.get("offline", "")) \
+            and "HF_HUB_OFFLINE" not in env:
+        env["HF_HUB_OFFLINE"] = "1"
+    return env
+
+
 def vectors_available(qmd, env):
     """True if the qmd index has any embedded vectors (hybrid/vector need them)."""
     try:
@@ -256,9 +351,11 @@ def vectors_available(qmd, env):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vault", default=None)
-    ap.add_argument("--mode", default="bm25", choices=["hybrid", "bm25", "vector"],
+    ap.add_argument("--mode", default=None, choices=["hybrid", "bm25", "vector"],
                     help="bm25 works with no model downloads (default); "
-                         "hybrid/vector need `qmd embed` first")
+                         "hybrid/vector need `qmd embed` first; when "
+                         "omitted, the persisted [qmd] default_mode from "
+                         "qmd-preflight.py --persist wins over bm25")
     ap.add_argument("-n", type=int, default=10)
     ap.add_argument("--packs", default=None, metavar="LIST",
                     help="comma-separated pack scope (issue #178); passed to "
@@ -270,15 +367,21 @@ def main():
         ap.error("QUERY is required")
 
     vault = resolve_vault(args.vault)
+    # Persisted preflight choices (#722): the recommended mode and the
+    # offline decision. Explicit --mode still wins over the config.
+    config = read_qmd_config()
+    mode = resolve_mode(args.mode, config)
     # Extra args for the allowlist and fallback `confidant find` calls.
     find_extra = ["--packs", args.packs] if args.packs else []
     corpus = os.path.join(vault, CORPUS_REL)
     qmd = shutil.which("qmd")
-    env = qmd_env(vault)
+    env = qmd_runtime_env(vault, config)
 
-    def fallback(reason):
+    def fallback(reason, hint=None):
         print(f"note: qmd unavailable ({reason}); falling back to `confidant find`",
               file=sys.stderr)
+        if hint:
+            print(f"note: {hint}", file=sys.stderr)
         # find --json already honors §12; emit its envelope with our fields added
         exe = shutil.which("confidant")
         if exe is None:
@@ -291,6 +394,8 @@ def main():
             sys.exit(f"error: confidant find failed: {p.stderr.strip()}")
         data["mode"] = "find-fallback"
         data["fallback"] = reason
+        if hint:
+            data["fallback_hint"] = hint
         data["query"] = query
         data["dropped_uncleared"] = 0
         for m in data.get("matches", []):
@@ -301,17 +406,25 @@ def main():
     if qmd is None or not os.path.isdir(corpus):
         return fallback("qmd or index missing" if qmd is None else "index missing")
 
-    if args.mode in ("hybrid", "vector") and not vectors_available(qmd, env):
-        sys.exit(f"error: --mode {args.mode} needs embeddings: run `qmd embed` "
+    if mode in ("hybrid", "vector") and not vectors_available(qmd, env):
+        sys.exit(f"error: --mode {mode} needs embeddings: run `qmd embed` "
                  f"first (downloads models on first run), or use --mode bm25")
 
-    sub = {"hybrid": "query", "bm25": "search", "vector": "vsearch"}[args.mode]
+    sub = {"hybrid": "query", "bm25": "search", "vector": "vsearch"}[mode]
     try:
         p = subprocess.run([qmd, sub, query, "--json", "-n", str(args.n),
                             "-c", COLLECTION],
                            capture_output=True, text=True, timeout=180, env=env)
     except subprocess.TimeoutExpired:
-        return fallback(f"qmd {sub} timed out")
+        # #722 item 6: a query that blocks must say so. The 0.7.0
+        # timeout reported only `via: find-fallback`, sending
+        # diagnosticians off to blame the hardware; the wait was a hub
+        # check. Name the hypotheses and the fix, on stderr and in JSON
+        # — conditioned on whether offline mode is already forced
+        # (timeout_hint), so an already-offline timeout is never blamed
+        # on the hub.
+        return fallback(f"qmd {sub} timed out after 180s",
+                        hint=timeout_hint(env))
     if p.returncode != 0:
         return fallback(f"qmd {sub} failed")
     try:
@@ -320,7 +433,7 @@ def main():
         return fallback("unparseable qmd output")
     if not hits:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": True,
-                          "vault": vault, "mode": args.mode, "query": query,
+                          "vault": vault, "mode": mode, "query": query,
                           "matches": [], "dropped_uncleared": 0,
                           "findings": []}, indent=2))
         return 0
@@ -376,7 +489,7 @@ def main():
     matches.sort(key=lambda m: m["score"], reverse=True)
 
     print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": True,
-                      "vault": vault, "mode": args.mode, "query": query,
+                      "vault": vault, "mode": mode, "query": query,
                       "matches": matches, "dropped_uncleared": dropped,
                       "findings": []}, indent=2))
     return 0

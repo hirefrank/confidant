@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Build (or rebuild) the QMD search corpus + collection for a vault.
 
-Usage: qmd-index.py [--vault PATH] [--cli PATH] [--embed]
+Usage: qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--skip-preflight]
+
+Ends by running the sibling qmd-preflight.py (issue #722) with
+--persist unless --skip-preflight is given, so setup itself both
+surfaces a cold-start or unreachable-hub problem AND records the
+recommendation where qmd-query.py honors it, instead of leaving either
+for the first real query.
 
 The corpus build lives in the CLI (issue #37, ADR-6). This script is the
 QMD integration on top:
@@ -349,6 +355,26 @@ def run_qmd(args, env, check=True):
     return p
 
 
+def run_setup_preflight(preflight, vault):
+    """Run preflight as the last setup step, recording via --persist.
+
+    The recommendation must land in [qmd] config during setup itself
+    (issue #722 item 3): a report-only auto-run would leave the
+    operator to rerun preflight with --persist by hand before the
+    query wrapper honored anything. Returns the preflight exit code;
+    a nonzero code is reported as a rerun note, never a setup failure
+    — the index build above already succeeded.
+    """
+    p = subprocess.run([sys.executable, preflight, "--vault", vault,
+                        "--persist"], capture_output=False)
+    if p.returncode != 0:
+        print("note: qmd-preflight.py did not complete (exit "
+              f"{p.returncode}); the index above is still built — rerun "
+              "bin/qmd-preflight.py --vault " + vault + " --persist "
+              "on its own")
+    return p.returncode
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vault", default=None)
@@ -362,6 +388,11 @@ def main():
                          "verified it yourself; detection is attempted first; "
                          f"or set {ASSUME_ENV}=1 / [qmd] "
                          "assume_encrypted_disk in the user config)")
+    ap.add_argument("--skip-preflight", action="store_true",
+                    help="skip the automatic qmd-preflight.py run at the "
+                         "end of setup (issue #722: preflight is part of "
+                         "setup so the first real query is not the first "
+                         "cold-start surprise)")
     args = ap.parse_args()
 
     vault = resolve_vault(args.vault)
@@ -391,6 +422,36 @@ def main():
         run_qmd(["embed"], env)
     print("done. query with: bin/qmd-query.py --vault "
           + vault + ' "your question"')
+
+    # #722: preflight is part of setup, not an optional extra. An
+    # operator who runs only this script must not meet the old
+    # first-query timeout as their first impression, and must not
+    # need a second command before the query wrapper honors the
+    # recommendation — hence --persist. The preflight report is
+    # printed in full; its exit code is never a gate (it is 0 whenever
+    # the report completes), and a preflight failure never fails the
+    # index build that just succeeded.
+    if args.skip_preflight:
+        print("note: preflight skipped (--skip-preflight); run "
+              "bin/qmd-preflight.py --vault " + vault + " --persist "
+              "before relying on hybrid/vector search")
+        return
+    preflight = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "qmd-preflight.py")
+    if not os.path.isfile(preflight):
+        print("REQUIRED SETUP STEP (preflight script not found beside "
+              "this script): run qmd-preflight.py --vault " + vault +
+              " --persist to check the host, hub reachability, and "
+              "per-mode timings, and record the recommendation, "
+              "before the first real query (issue #722)")
+        return
+    print("running qmd-preflight.py --persist (issue #722) — spec, hub, "
+          "and cold/warm smoke per mode; this is part of setup, its "
+          "recommendation is recorded in [qmd] config, and its report "
+          "(not its exit code) is the result to read. Worst case is "
+          "~18 minutes at the default 180s per-mode timeout; progress "
+          "lines go to stderr:")
+    run_setup_preflight(preflight, vault)
 
 
 if __name__ == "__main__":
