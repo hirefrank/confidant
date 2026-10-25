@@ -359,6 +359,22 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
             self.index.encrypted_disk_confirmation("/vault", True),
             "asserted via --i-confirm-encrypted-disk")
 
+    def test_setup_preflight_passes_persist(self):
+        # Round-2 N2: setup's automatic preflight run must record the
+        # recommendation itself — the stub records the argv it got.
+        seen = self.home / "preflight-argv.json"
+        stub = self.home / "stub-preflight.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"open({str(seen)!r}, 'w').write(json.dumps(sys.argv[1:]))\n",
+            encoding="utf-8")
+        code = self.index.run_setup_preflight(str(stub), "/vault")
+        self.assertEqual(code, 0)
+        argv = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertIn("--persist", argv)
+        self.assertEqual(argv[argv.index("--vault") + 1], "/vault")
+
 
 def load_module(name, path):
     """Import a hyphenated skill script as a module."""
@@ -643,6 +659,46 @@ class QmdPreflightTest(unittest.TestCase):
             self.preflight.recommend_default_mode(results, 60), "hybrid")
         self.assertTrue(self.preflight.cache_complete(results))
 
+    def test_smoke_warm_failure_downgrades_mode(self):
+        # Round-2 N1: a cold ok followed by a warm failure must NOT
+        # fall back to the cold sample — the mode is the warm failure,
+        # not recommended, and proves no cache. The stub answers ok on
+        # odd-numbered calls (each mode's cold run) and fails on even
+        # ones (each mode's warm run).
+        counter = self.root / "warm-fail-calls.txt"
+        stub = self.root / "stub-warm-fail.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"counter = {str(counter)!r}\n"
+            "try:\n"
+            "    n = len(open(counter).read())\n"
+            "except OSError:\n"
+            "    n = 0\n"
+            "open(counter, 'a').write('x')\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            "if n % 2 == 0:\n"
+            "    print(json.dumps({'mode': mode, "
+            "'matches': [{'path': 'x.md', 'score': 1.0}]}))\n"
+            "else:\n"
+            "    print('boom', file=sys.stderr)\n"
+            "    sys.exit(3)\n",
+            encoding="utf-8")
+        results = self.preflight.run_smoke(
+            str(stub), "/vault", "preflight", timeout=30,
+            env=dict(os.environ), qmd_present=True, corpus_present=True)
+        for mode in ("hybrid", "vector", "bm25"):
+            self.assertEqual(results[mode]["status"], "failed",
+                             results[mode])
+            self.assertEqual(results[mode]["cold"]["status"], "ok")
+            self.assertEqual(results[mode]["warm"]["status"], "failed")
+        self.assertIsNone(
+            self.preflight.recommend_default_mode(results, 60))
+        self.assertFalse(self.preflight.cache_complete(results))
+        hub = {"reachable": True, "skipped": False}
+        self.assertFalse(
+            self.preflight.offline_recommended_for(hub, results))
+
     def test_smoke_timeout_failure_fallback_classification(self):
         # Timeout: the stub sleeps past the timeout (killed, not hung).
         sleepy = self.root / "stub-sleep.py"
@@ -870,13 +926,49 @@ class QmdPreflightTest(unittest.TestCase):
                                 extra=("--persist",))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertTrue(report["offline_recommended"])
-        self.assertTrue(report["embeddings_present"])
+        self.assertTrue(report["hybrid_cache_complete"])
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         self.assertTrue(report["persisted"]["offline"])
         cfg = (self.root / ".config" / "confidant" / "config.toml")
         text = cfg.read_text(encoding="utf-8")
         self.assertIn('default_mode = "hybrid"', text)
         self.assertIn("offline = true", text)
+
+    def test_persist_does_not_persist_cold_sample_on_warm_failure(self):
+        # Round-2 N1 end to end: cold ok + warm failure under --persist
+        # must persist no default_mode at all (the hub here is
+        # unreachable, so offline=true from hub evidence is expected
+        # and is not a cold-sample artifact).
+        vault = self._fake_vault()
+        counter = self.root / "persist-warm-fail-calls.txt"
+        stub = self.root / "stub-persist-warm-fail.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"counter = {str(counter)!r}\n"
+            "try:\n"
+            "    n = len(open(counter).read())\n"
+            "except OSError:\n"
+            "    n = 0\n"
+            "open(counter, 'a').write('x')\n"
+            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+            "if n % 2 == 0:\n"
+            "    print(json.dumps({'mode': mode, "
+            "'matches': [{'path': 'x.md', 'score': 1.0}]}))\n"
+            "else:\n"
+            "    print('boom', file=sys.stderr)\n"
+            "    sys.exit(3)\n",
+            encoding="utf-8")
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertIsNone(report["recommended_mode"])
+        self.assertEqual(report["modes"]["hybrid"]["status"], "failed")
+        self.assertEqual(report["modes"]["hybrid"]["cold"]["status"], "ok")
+        self.assertNotIn("default_mode", report["persisted"])
+        cfg = (self.root / ".config" / "confidant" / "config.toml")
+        if cfg.exists():
+            self.assertNotIn("default_mode",
+                             cfg.read_text(encoding="utf-8"))
 
     def test_persist_clears_stale_preflight_keys(self):
         import http.server
@@ -919,7 +1011,12 @@ class QmdPreflightTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
-    def test_persist_leaves_hand_set_values_alone(self):
+    def test_persist_migrates_unmarked_legacy_keys(self):
+        # Round-2 N4: keys written by the pre-fix --persist carry no
+        # marker. On the first --persist run under the marker scheme
+        # (no migration stamp yet), an unmarked key the fresh evidence
+        # does not support is cleared distinctly as legacy, and the
+        # migration stamp is recorded.
         import http.server
         import threading
 
@@ -941,7 +1038,75 @@ class QmdPreflightTest(unittest.TestCase):
             cfg = self.root / ".config" / "confidant"
             cfg.mkdir(parents=True, exist_ok=True)
             (cfg / "config.toml").write_text(
-                "[qmd]\ndefault_mode = \"bm25\"\noffline = true\n",
+                "[qmd]\ndefault_mode = \"vector\"\noffline = true\n",
+                encoding="utf-8")
+            stub = self._stub("stub-empty-legacy.py", [])
+            report = self._run_main(vault, stub, hub_url,
+                                    extra=("--persist",))
+            self.assertIsNone(report["recommended_mode"])
+            self.assertFalse(report["offline_recommended"])
+            self.assertEqual(
+                report["persisted"]["default_mode_legacy_cleared"],
+                "vector")
+            self.assertTrue(report["persisted"]["offline_legacy_cleared"])
+            self.assertTrue(report["persisted"]["legacy_migrated"])
+            text = (cfg / "config.toml").read_text(encoding="utf-8")
+            self.assertNotIn("default_mode", text)
+            self.assertNotIn("offline = true", text)
+            self.assertIn("preflight_legacy_migrated = true", text)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_persist_adopts_supported_legacy_keys(self):
+        # The other half of the N4 migration: a legacy key the fresh
+        # evidence DOES support is adopted — rewritten with its
+        # provenance marker — rather than cleared.
+        vault = self._fake_vault()
+        cfg = self.root / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(
+            "[qmd]\ndefault_mode = \"hybrid\"\noffline = true\n",
+            encoding="utf-8")
+        stub = self._stub("stub-hits-legacy.py",
+                          [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertEqual(report["persisted"]["default_mode"], "hybrid")
+        self.assertTrue(report["persisted"]["offline"])
+        text = (cfg / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('default_mode_source = "preflight"', text)
+        self.assertIn('offline_source = "preflight"', text)
+
+    def test_persist_leaves_hand_set_values_alone(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
+            vault = self._fake_vault()
+            cfg = self.root / ".config" / "confidant"
+            cfg.mkdir(parents=True, exist_ok=True)
+            # The migration stamp marks this as post-migration: these
+            # unmarked values are hand-set values added AFTER the
+            # one-time legacy migration, so they must be left alone
+            # (without the stamp they would be legacy-cleared instead).
+            (cfg / "config.toml").write_text(
+                "[qmd]\npreflight_legacy_migrated = true\n"
+                "default_mode = \"bm25\"\noffline = true\n",
                 encoding="utf-8")
             stub = self._stub("stub-empty3.py", [])
             report = self._run_main(vault, stub, hub_url,

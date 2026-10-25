@@ -29,7 +29,10 @@ Reports, in order:
    built corpus, reporting cold AND warm seconds separately: the first
    run per mode may pay a model download, so a mode that ran `ok` is
    run a second time and the recommendation is derived from the warm
-   run, never from a single cold sample. Modes are skipped, not
+   run, never from a single cold sample. If the warm run fails or
+   times out, the mode is downgraded to that warm failure — the cold
+   sample is never reused as the mode's result, so no recommendation
+   or --persist can derive from it. Modes are skipped, not
    failed, when qmd or the corpus is missing or embeddings are not
    built yet. A run that answers with zero hits is reported distinctly
    as `ok-empty`, never as proof of anything: it is not recommended
@@ -40,7 +43,10 @@ Reports, in order:
    offline mode and break the very download that would fix it).
    Progress lines go to stderr as each run starts/finishes, so a slow
    preflight is never a silent wait: worst case is 6 x the per-mode
-   timeout (cold + warm per mode) plus the hub probe.
+   timeout (cold + warm per mode) plus the hub probe — at the default
+   180s per-mode timeout that is ~18 minutes plus the probe, so pass
+   --query-timeout to bound it (the 60s recommendation budget is a
+   separate, unchanged figure).
 4. A recommended default mode for this host, recorded where the query
    wrapper honors it: `--persist` writes `[qmd] default_mode` (and
    `[qmd] offline`, when recommended) to `~/.config/confidant/config.toml`,
@@ -49,8 +55,15 @@ Reports, in order:
    `default_mode` with no hit-bearing mode behind it, an `offline`
    written by an earlier preflight run when the hub has recovered),
    and says so explicitly; values not marked as preflight-written are
-   left alone and reported. NOTE: that config is per-user, not
-   per-vault — a persisted recommendation applies to every vault.
+   left alone and reported. Keys written by a pre-fix `--persist`
+   carry no marker, so the FIRST `--persist` run after this change
+   treats unmarked keys as legacy, not hand-set: a legacy key the
+   fresh evidence supports is adopted (rewritten with its marker), a
+   legacy key it does not support is cleared and reported distinctly,
+   and a one-time migration stamp (`preflight_legacy_migrated`) is then
+   recorded — values the operator adds by hand AFTER that stamp are
+   left alone on later runs, as before. NOTE: that config is per-user,
+   not per-vault — a persisted recommendation applies to every vault.
 
 This script never builds anything and never phones home beyond the one
 hub probe: smoke queries run through `qmd-query.py` (same allowlist
@@ -100,6 +113,10 @@ DEFAULT_HUB_TIMEOUT_S = 10
 # the operator set by hand (which it must not clobber).
 SOURCE_SUFFIX = "_source"
 SOURCE_VALUE = "preflight"
+# One-time migration stamp (see main()): written by the first --persist
+# run that encounters the marker scheme, so unmarked keys added by hand
+# AFTER the migration are not mistaken for pre-fix preflight output.
+MIGRATION_STAMP = "preflight_legacy_migrated"
 
 
 def resolve_vault(explicit):
@@ -568,12 +585,17 @@ def run_smoke(query_script, vault, query, timeout, env,
     warns about. A mode whose cold run is "ok" (or "ok-empty") is run
     a second time and the warm run becomes the mode's canonical result
     — recommendations and cache claims derive from warm runs, never
-    from a single cold sample. A mode whose cold run timed out, failed,
-    or fell back gets no warm rerun (there is no recommendation to
-    protect, and a second cold download would just repeat the wait);
-    its warm entry records that it was not measured. `progress`, when
-    given, is called as progress(mode, phase, result) after each run
-    so a slow preflight is never silent.
+    from a single cold sample. If the warm run fails, times out, or
+    falls back, the mode is downgraded to that warm failure (its cold
+    entry is kept for diagnosis, but the cold sample is never reused
+    as the result): the mode is not recommended, proves no cache, and
+    a --persist run writes no default_mode for it. A mode whose cold
+    run timed out, failed, or fell back gets no warm rerun (there is
+    no recommendation to protect, and a second cold download would
+    just repeat the wait); its warm entry records that it was not
+    measured. `progress`, when given, is called as
+    progress(mode, phase, result) after each run so a slow preflight
+    is never silent.
     """
     results = {}
     for mode in MODES:
@@ -600,8 +622,11 @@ def run_smoke(query_script, vault, query, timeout, env,
                                   env, mode)
             if progress is not None:
                 progress(mode, "warm-finish", warm)
-            canonical = warm if warm["status"] in ("ok", "ok-empty") else cold
-            results[mode] = dict(canonical, cold=cold, warm=warm)
+            # The warm run is ALWAYS canonical here — including when
+            # it failed: reusing `cold` on a warm failure would let a
+            # recommendation/--persist derive from a single cold sample
+            # (round-2 N1). The cold entry is kept for diagnosis only.
+            results[mode] = dict(warm, cold=cold, warm=warm)
         else:
             warm = {"status": "not-measured",
                     "reason": "cold run did not complete ok; warm timing "
@@ -693,8 +718,11 @@ def main(argv=None):
     # Cache-completeness is PROOF, not vibes: only a hit-bearing hybrid
     # ok shows the embedding model and the reranker are both cached. A
     # timeout/failed/fallback run — the #722 failure itself — proves
-    # nothing and must never persist offline mode.
-    embeddings_present = cache_complete(results)
+    # nothing and must never persist offline mode. The JSON field is
+    # named for what it is (hybrid cache proof), not for embeddings in
+    # general: a vector-ok / hybrid-failed host HAS embeddings, but
+    # this field is false for it (round-2 N5).
+    hybrid_cache_complete = cache_complete(results)
     offline_recommended = offline_recommended_for(hub, results)
     recommendation = recommend_default_mode(results, args.budget)
     note = tradeoff_note(results, recommendation)
@@ -702,6 +730,16 @@ def main(argv=None):
     persisted = {}
     persist_error = None
     if args.persist:
+        # One-time migration (round-2 N4): the pre-fix --persist wrote
+        # keys with no provenance marker, so on the first --persist run
+        # under the marker scheme an unmarked key is legacy preflight
+        # output, not a hand-set value. The overwrite paths above adopt
+        # a legacy key the fresh evidence supports (rewriting it with
+        # its marker); the branches below clear a legacy key it does
+        # not support, reported distinctly from a marked clear. The
+        # stamp is then recorded, so unmarked values added by hand
+        # AFTER the migration are left alone on later runs, as before.
+        legacy_migrated = _truthy(config.get(MIGRATION_STAMP, ""))
         try:
             if recommendation is not None:
                 set_qmd_config_value(home, "default_mode",
@@ -715,6 +753,10 @@ def main(argv=None):
                     remove_qmd_config_value(home, "default_mode")
                     remove_qmd_config_value(home, "default_mode" + SOURCE_SUFFIX)
                     persisted["default_mode_cleared"] = old
+                elif not legacy_migrated:
+                    old = config["default_mode"]
+                    remove_qmd_config_value(home, "default_mode")
+                    persisted["default_mode_legacy_cleared"] = old
                 else:
                     persisted["default_mode_left"] = config["default_mode"]
             if offline_recommended:
@@ -728,13 +770,21 @@ def main(argv=None):
                 # hub recovered, the cache proof lapsed); a value the
                 # operator set by hand (no provenance marker) is left
                 # alone and reported — preflight must not clobber a
-                # deliberate privacy choice.
+                # deliberate privacy choice. An unmarked value on a
+                # pre-migration run is legacy output, not hand-set, and
+                # is cleared distinctly (see above).
                 if config.get("offline" + SOURCE_SUFFIX) == SOURCE_VALUE:
                     remove_qmd_config_value(home, "offline")
                     remove_qmd_config_value(home, "offline" + SOURCE_SUFFIX)
                     persisted["offline_cleared"] = True
+                elif not legacy_migrated:
+                    remove_qmd_config_value(home, "offline")
+                    persisted["offline_legacy_cleared"] = True
                 else:
                     persisted["offline_left"] = True
+            if not legacy_migrated:
+                set_qmd_config_value(home, MIGRATION_STAMP, "true")
+                persisted["legacy_migrated"] = True
         except OSError as e:
             # Report the failure with the report, not a traceback: the
             # diagnosis is still delivered even when the write failed.
@@ -762,7 +812,7 @@ def main(argv=None):
         "offline_for_smoke": offline_for_smoke,
         "offline_configured": offline_configured,
         "offline_recommended": offline_recommended,
-        "embeddings_present": embeddings_present,
+        "hybrid_cache_complete": hybrid_cache_complete,
         "modes": results,
         "budget_s": args.budget,
         "recommended_mode": recommendation,
@@ -817,6 +867,14 @@ def main(argv=None):
                   f"{cold_txt}, {warm_txt}) — not recommended")
         elif r["status"] == "skipped":
             print(f"  {mode}: skipped ({r['reason']})")
+        elif cold.get("status") in ("ok", "ok-empty") and warm.get("status") \
+                not in ("ok", "ok-empty", "not-measured"):
+            # Warm failure after a cold ok: say so loudly — the cold
+            # sample was NOT reused, and this mode is not recommended.
+            print(f"  {mode}: {r['status']} on the warm run in "
+                  f"{r['seconds']}s ({r['reason']}; cold was "
+                  f"{cold['status']} in {cold['seconds']}s) — not "
+                  "recommended; the cold sample is not reused")
         else:
             print(f"  {mode}: {r['status']} in {r['seconds']}s "
                   f"({r['reason']}; {warm_txt})")
@@ -840,6 +898,21 @@ def main(argv=None):
         if "offline_cleared" in persisted:
             print("  note: cleared stale preflight-written offline = true "
                   "— fresh evidence no longer supports it")
+        if "default_mode_legacy_cleared" in persisted:
+            print(f"  note: cleared unmarked legacy default_mode "
+                  f"({persisted['default_mode_legacy_cleared']!r}) — it "
+                  "was written before provenance markers existed, so it "
+                  "could not be distinguished from a hand-set value, "
+                  "and fresh evidence no longer supports it; if it was "
+                  "a deliberate hand choice, re-add it now — post-"
+                  "migration hand-set values are left alone")
+        if "offline_legacy_cleared" in persisted:
+            print("  note: cleared unmarked legacy offline = true — it "
+                  "was written before provenance markers existed, so it "
+                  "could not be distinguished from a hand-set value, "
+                  "and fresh evidence no longer supports it; if it was "
+                  "a deliberate hand choice, re-add it now — post-"
+                  "migration hand-set values are left alone")
         if "default_mode_left" in persisted or "offline_left" in persisted:
             print("  note: a [qmd] value set by hand (not marked as "
                   "preflight-written) was left alone despite fresh "
