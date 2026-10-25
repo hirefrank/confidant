@@ -160,6 +160,18 @@ confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
 # certificate, lookup key, one client key) before installing it. Without
 # this step the new device holds wrapped keys but cannot decrypt: `doctor`
 # reports the missing anchor as an error. Never copy another vault's anchor.
+# Re-running --complete with an already-installed anchor re-verifies the
+# same three checks and is a no-op.
+# --from-request without --anchor-out still enrolls, but warns loudly and
+# reports anchor_out: null in JSON: the new device cannot decrypt until
+# --complete installs an anchor. Get one afterwards with --re-emit-anchor
+# (below) instead of re-enrolling.
+# A device enrolled before --anchor-out existed (wrapped keys, no anchor)
+# cannot be re-enrolled — re-running --from-request refuses it. Re-emit
+# just the anchor instead (no new enrollment, no commit):
+confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml --re-emit-anchor
+# then --complete on the new device as above. Copying an enrolled device's
+# trust.toml works as a fallback, but it is unverified — prefer --anchor-out.
 ```
 
 Headless hosts without an OS keychain: the **new** device needs only

@@ -3981,3 +3981,406 @@ fn keys_shred_warning_reflects_zero_deleted_edges() {
         "warnings must reflect zero deleted edges: {warnings:?}"
     );
 }
+
+/// Initiate a fresh device and return (harness, request path)
+/// (#713 follow-up tests). Mirrors the h2 half of device_add_setup.
+fn initiate_fresh_device(label: &str) -> (Harness, PathBuf) {
+    let mut h = Harness::new();
+    h.with_test_keychain();
+    let req_path = h.home.join("device-add-request.toml");
+    let out = h
+        .cmd_no_vault(&[
+            "keys",
+            "device-add",
+            "--initiate",
+            "--force",
+            "--label",
+            label,
+            "--output",
+            req_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "initiate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (h, req_path)
+}
+
+#[test]
+fn device_add_from_request_without_anchor_out_warns_and_reports_null() {
+    // B1: the default ceremony must not silently leave the new device
+    // anchorless — success output warns, and JSON carries anchor_out
+    // null so callers can branch on it.
+    let (h1, _h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let (_h3, req3) = initiate_fresh_device("thirddev");
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req3.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "from-request without --anchor-out failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("from-request JSON");
+    assert!(
+        v.get("anchor_out").is_some_and(|a| a.is_null()),
+        "JSON must carry anchor_out: null without --anchor-out: {v}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("WARNING"),
+        "success output must warn that no anchor was emitted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn device_add_reemit_anchor_for_already_enrolled_device() {
+    // B2: the issue's own reporter case — a device enrolled before
+    // --anchor-out existed gets a supported re-emit path, and a plain
+    // re-run fails fast before writing anything (no orphaned file).
+    let (h1, mut h2, req_path, _key_id, _init_stderr) = device_add_setup();
+    let reemit_path = h1.home.join("reemitted-anchor.toml");
+
+    // Plain re-run: fails, points at --re-emit-anchor, writes nothing.
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--anchor-out",
+            reemit_path.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "re-running --from-request for an enrolled device must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--re-emit-anchor"),
+        "failure must point at --re-emit-anchor: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !reemit_path.exists(),
+        "failed re-run must not leave an anchor file behind"
+    );
+
+    // Re-emit: succeeds, makes no commit, emits the enrolled anchor.
+    let before = std::process::Command::new("git")
+        .args([
+            "-C",
+            h1.vault.to_str().unwrap(),
+            "rev-list",
+            "--count",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req_path.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--anchor-out",
+            reemit_path.to_str().unwrap(),
+            "--re-emit-anchor",
+            "--no-input",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--re-emit-anchor failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("re-emit JSON");
+    assert_eq!(v["already_enrolled"], true, "{v}");
+    assert_eq!(
+        v["anchor_out"].as_str().unwrap(),
+        reemit_path.to_str().unwrap(),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(&reemit_path).unwrap(),
+        std::fs::read(h1.home.join(".config/confidant/trust.toml")).unwrap(),
+        "re-emitted anchor must equal the enrolled device's trust.toml"
+    );
+    let after = std::process::Command::new("git")
+        .args([
+            "-C",
+            h1.vault.to_str().unwrap(),
+            "rev-list",
+            "--count",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        before.stdout, after.stdout,
+        "re-emit must not create a commit"
+    );
+
+    // The re-emitted anchor completes the new device's enrollment.
+    h2.vault = h1.vault.clone();
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            reemit_path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--complete with the re-emitted anchor failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--complete JSON");
+    assert_eq!(v["anchor"], "installed", "{v}");
+}
+
+#[test]
+fn device_add_reemit_anchor_refuses_unenrolled_device() {
+    // B2: --re-emit-anchor is for already-enrolled devices only; it
+    // must not silently stand in for enrollment.
+    let (h1, _h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let (_h3, req3) = initiate_fresh_device("thirddev");
+    let reemit_path = h1.home.join("reemitted-anchor.toml");
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req3.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--anchor-out",
+            reemit_path.to_str().unwrap(),
+            "--re-emit-anchor",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--re-emit-anchor for an unenrolled device must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not already enrolled"),
+        "failure must say the device is not already enrolled: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !reemit_path.exists(),
+        "refused re-emit must not leave an anchor file behind"
+    );
+}
+
+#[test]
+fn device_add_anchor_out_inside_vault_refused() {
+    // S1: --anchor-out into the vault working tree is refused, like
+    // --anchor-file inside the vault already is.
+    let (h1, _h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let (_h3, req3) = initiate_fresh_device("thirddev");
+    let inside = h1.vault.join("anchor-out.toml");
+    let out = h1
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--from-request",
+            req3.to_str().unwrap(),
+            "--fingerprint-verified",
+            "--anchor-out",
+            inside.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--anchor-out inside the vault must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("inside the vault"),
+        "failure must name the vault containment rule: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!inside.exists(), "refused --anchor-out must write nothing");
+}
+
+#[test]
+fn device_add_complete_anchor_file_inside_vault_refused() {
+    // S5: the load_from vault-containment refusal the help text
+    // promises for --anchor-file.
+    let (h1, mut h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let anchor_path = h1.home.join("device-add-anchor.toml");
+    let inside = h1.vault.join("trust-copy.toml");
+    std::fs::copy(&anchor_path, &inside).unwrap();
+    h2.vault = h1.vault.clone();
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            inside.to_str().unwrap(),
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--anchor-file inside the vault must fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("inside the vault"),
+        "failure must name the vault containment rule: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn device_add_complete_pre_certificate_vault() {
+    // S5: --complete against a vault that predates operator
+    // certificates — the "cert: absent" branch the code supports.
+    let (h1, mut h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    for name in ["operator.toml", "operator.sig"] {
+        let p = h1.vault.join("keys").join(name);
+        if p.is_file() {
+            std::fs::remove_file(&p).unwrap();
+        }
+    }
+    h2.vault = h1.vault.clone();
+    let anchor_path = h1.home.join("device-add-anchor.toml");
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            anchor_path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--complete on a pre-certificate vault failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--complete JSON");
+    assert_eq!(v["anchor"], "installed", "{v}");
+    assert_eq!(v["checks"]["cert"], "absent", "{v}");
+    assert_eq!(v["checks"]["lookup"], "pass", "{v}");
+    assert_eq!(v["checks"]["client_unwrap"], "pass", "{v}");
+}
+
+#[test]
+fn device_add_complete_already_present_reports_lookup_check() {
+    // S2 + JSON-shape nit: the already_present re-run reports the same
+    // checks as a fresh install, including the lookup key.
+    let (h1, mut h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let anchor_path = h1.home.join("device-add-anchor.toml");
+    h2.vault = h1.vault.clone();
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            anchor_path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "first --complete failed");
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            anchor_path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "re-running --complete must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("--complete JSON");
+    assert_eq!(v["anchor"], "already_present", "{v}");
+    assert_eq!(v["checks"]["cert"], "pass", "{v}");
+    assert_eq!(v["checks"]["lookup"], "pass", "{v}");
+    assert_eq!(v["checks"]["client_unwrap"], "pass", "{v}");
+}
+
+#[test]
+fn doctor_trust_anchor_trial_unavailable_is_warning() {
+    // S4: an anchor that could not be trial-verified (no device key
+    // available) must not be blessed as "ok".
+    let (h1, mut h2, _req_path, _key_id, _init_stderr) = device_add_setup();
+    let anchor_path = h1.home.join("device-add-anchor.toml");
+    h2.vault = h1.vault.clone();
+    let out = h2
+        .cmd(&[
+            "keys",
+            "device-add",
+            "--complete",
+            "--anchor-file",
+            anchor_path.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "--complete failed");
+
+    // Same vault + installed anchor, but no device key at all.
+    let mut h3 = Harness::new();
+    h3.vault = h1.vault.clone();
+    let h3_config = h3.home.join(".config/confidant");
+    std::fs::create_dir_all(&h3_config).unwrap();
+    std::fs::copy(
+        h2.home.join(".config/confidant/trust.toml"),
+        h3_config.join("trust.toml"),
+    )
+    .unwrap();
+    let mut cmd = h3.cmd(&["doctor", "--json", "--no-input"]);
+    cmd.env_remove("CONFIDANT_DEVICE_KEY");
+    let out = cmd.output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor JSON");
+    assert_eq!(
+        doctor_check(&v, "trust-anchor")["status"],
+        "warning",
+        "doctor must not bless an anchor it could not trial-verify: {v}"
+    );
+}
