@@ -26,10 +26,14 @@ pub fn is_valid_touch_kind(kind: &str) -> bool {
 /// Extract the touchpoint kind from either a positional `KIND` token
 /// (`2026-10-12 touch p-… call`) or a `kind:KIND` pair
 /// (`2026-10-12 touch p-… kind:call`). A `kind:` pair wins over a positional
-/// token. Returns `None` when the entry carries no (valid) kind.
+/// token, and it is validated against [`TOUCH_KINDS`] exactly like the
+/// positional branch (#747 review): an invalid pair yields no kind,
+/// instead of letting two malformed `kind:coffee` lines draw a duplicate
+/// finding on top of `E_TOUCH_MALFORMED`. Returns `None` when the entry
+/// carries no (valid) kind.
 pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
     if let Some(k) = entry.pair("kind") {
-        return Some(k.to_owned());
+        return is_valid_touch_kind(k).then(|| k.to_owned());
     }
     if let Some(tok) = entry.args.first().and_then(Arg::as_token) {
         if is_valid_touch_kind(tok) {
@@ -196,6 +200,11 @@ mod tests {
         // A positional token outside the list is not a kind.
         assert!(extract_touch_kind(&entry(vec![token("coffee")])).is_none());
         assert!(extract_touch_kind(&entry(vec![])).is_none());
+        // #747 review: a `kind:` pair is validated the same way — a
+        // malformed pair yields no kind, even when a valid positional
+        // token is also present (the pair wins).
+        assert!(extract_touch_kind(&entry(vec![pair("kind", "coffee")])).is_none());
+        assert!(extract_touch_kind(&entry(vec![token("meet"), pair("kind", "coffee")])).is_none());
     }
 
     /// #747: identity is person + date + kind; note:/src: do not
@@ -215,8 +224,10 @@ mod tests {
         assert_ne!(touch_identity(&base), touch_identity(&other_kind));
         // Kind-less mirrored line: no identity.
         assert!(touch_identity(&entry(vec![])).is_none());
-        // Unknown kind: no identity (E_TOUCH_MALFORMED covers it).
+        // Unknown kind: no identity (E_TOUCH_MALFORMED covers it),
+        // whether it arrives positionally or as a `kind:` pair.
         assert!(touch_identity(&entry(vec![token("coffee")])).is_none());
+        assert!(touch_identity(&entry(vec![pair("kind", "coffee")])).is_none());
         // Another verb: no identity.
         let mut session = base.clone();
         session.verb = "session".to_owned();

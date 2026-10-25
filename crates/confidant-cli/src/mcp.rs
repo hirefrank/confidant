@@ -180,6 +180,7 @@ fn tools() -> Vec<Value> {
                     "src": str_prop("Source token."),
                     "request_id": str_prop("Idempotency key."),
                     "dry_run": {"type": "boolean", "description": "Show the logical change only."},
+                    "force": {"type": "boolean", "description": "Log even when an identical session is already in the ledger; use only for a genuinely separate session the same day."},
                 }),
             ),
         ),
@@ -196,6 +197,7 @@ fn tools() -> Vec<Value> {
                     "src": str_prop("Source token."),
                     "request_id": str_prop("Idempotency key."),
                     "dry_run": {"type": "boolean", "description": "Show the logical change only."},
+                    "force": {"type": "boolean", "description": "Log even when an identical touchpoint is already in the ledger; use only for a genuinely separate contact the same day."},
                 }),
             ),
         ),
@@ -354,6 +356,13 @@ fn build_argv(
                     cli.push(v);
                 }
             }
+            // #747 review: MCP is the agent surface, so it needs the
+            // same escape hatch the CLI has — otherwise a legitimate
+            // same-day repeat is loggable from the CLI and impossible
+            // from MCP.
+            if get_bool(args, "force") {
+                cli.push("--force".to_owned());
+            }
         }
         "log_touch" => {
             cli.push("log".to_owned());
@@ -365,6 +374,9 @@ fn build_argv(
                     cli.push(flag.to_owned());
                     cli.push(v);
                 }
+            }
+            if get_bool(args, "force") {
+                cli.push("--force".to_owned());
             }
         }
         "import_ledger" => {
@@ -675,6 +687,47 @@ mod tests {
                     .iter()
                     .any(|a| a.contains("for-operator") || a.contains("for_edit")),
                 "{name} passed an operator flag: {argv:?}"
+            );
+        }
+    }
+
+    /// #747 review: both log tools carry the `--force` escape hatch the
+    /// CLI has — MCP is the agent surface, so a legitimate same-day
+    /// repeat must be loggable from it, and the flag must be absent
+    /// unless the caller explicitly sets it.
+    #[test]
+    fn mcp_passes_force_to_log_tools_only_when_set() {
+        let vault = Path::new("/tmp/vault");
+        for (name, args) in [
+            (
+                "log_session",
+                json!({"person": "p-01ABC", "duration": "60m", "force": true}),
+            ),
+            (
+                "log_touch",
+                json!({"person": "p-01ABC", "kind": "meal", "force": true}),
+            ),
+        ] {
+            let argv = build_argv(name, &args, vault, &None).unwrap();
+            assert!(
+                argv.iter().any(|a| a == "--force"),
+                "{name} dropped force: {argv:?}"
+            );
+        }
+        for (name, args) in [
+            (
+                "log_session",
+                json!({"person": "p-01ABC", "duration": "60m"}),
+            ),
+            (
+                "log_touch",
+                json!({"person": "p-01ABC", "kind": "meal", "force": false}),
+            ),
+        ] {
+            let argv = build_argv(name, &args, vault, &None).unwrap();
+            assert!(
+                !argv.iter().any(|a| a == "--force"),
+                "{name} passed force unasked: {argv:?}"
             );
         }
     }

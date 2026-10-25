@@ -2561,6 +2561,53 @@ fn log_session_note_fallback_inbox_queues_and_drains() {
 }
 
 #[test]
+fn log_session_fallback_queued_twice_drains_to_one_line() {
+    // #747 review: a session queued via `--fallback-inbox` lives in
+    // the inbox, not the ledger, so the write-time refusal cannot see
+    // it — re-logging the identical session queues a second copy.
+    // The drain must merge it at most once: the second queued line is
+    // a semantic duplicate (same person, date, duration, tag; its
+    // fresh `src:fallback/…` token does not distinguish it) and is
+    // skipped, not appended.
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    for _ in 0..2 {
+        let out = log_session_no_key(&h, &["--fallback-inbox"]);
+        assert!(
+            out.status.success(),
+            "fallback queue failed: {}",
+            stderr(&out)
+        );
+    }
+
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let session_lines: Vec<&str> = ledger
+        .lines()
+        .filter(|l| l.contains("2026-10-13 session"))
+        .collect();
+    assert_eq!(
+        session_lines.len(),
+        1,
+        "the second queued copy must not append a second line:\n{ledger}"
+    );
+}
+
+#[test]
 fn log_session_note_fallback_refuses_pin_mismatch() {
     // #213: the fallback refuses when the vault pubkey does not match
     // the user-config pin — encrypting to an unverified key would be

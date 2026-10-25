@@ -4327,7 +4327,9 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
 /// before applying or queueing anything, so a refusal writes nothing and
 /// queues nothing. `note:` and `src:` never make a line distinct — a
 /// backfill that re-adds the same contact with a fresh note or
-/// provenance is still the same touchpoint.
+/// provenance is still the same touchpoint. Lines already queued to the
+/// inbox are not visible here (they are encrypted to the inbox key);
+/// the drain skips them instead (see `plan_item`'s semantic check).
 fn find_duplicate_touch(
     vault: &confidant_core::Vault,
     person: &RecordId,
@@ -4348,7 +4350,9 @@ fn find_duplicate_session(
     tag: Option<&str>,
 ) -> Option<(String, u32)> {
     let minutes = parse_duration_minutes(duration)?;
-    let tag = tag.unwrap_or("");
+    // Tags compare lowercased, matching `session_identity`, so a
+    // historical `Paid` line matches a `paid` re-log.
+    let tag = tag.unwrap_or("").to_ascii_lowercase();
     vault.entries.iter().find_map(|sourced| {
         let (id, d, m, t) = confidant_core::ledger::session_identity(&sourced.entry)?;
         (id == *person && d == *date && m == minutes && t == tag)
@@ -4391,10 +4395,23 @@ fn cmd_log_session(
     require_log_verb(&vault, "session")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
-    if parse_duration_minutes(duration).is_none() {
+    let Some(minutes) = parse_duration_minutes(duration) else {
         return Err(anyhow::Error::new(DomainError::usage(format!(
             "bad duration '{duration}'; use like 60m or 1h30m"
         ))));
+    };
+    // #747 review: the billing tag is a closed vocabulary (paid, pps,
+    // comp) — a free-form token would silently count as untagged in
+    // balance math, and `Paid` would be a distinct session from `paid`.
+    // Validate before the refusal, like touch kinds are validated
+    // before comparison, so the refusal never compares raw tags.
+    if let Some(t) = &tag {
+        if !confidant_core::ledger::is_valid_session_tag(t) {
+            return Err(anyhow::Error::new(DomainError::usage(format!(
+                "bad session tag '{t}'; use one of: {}",
+                confidant_core::ledger::SESSION_TAGS.join(", ")
+            ))));
+        }
     }
     let date = parse_date_arg(&date_raw)?;
 
@@ -4475,7 +4492,12 @@ fn cmd_log_session(
             if !defer_to_write_path(root, cli, &canonical)? {
                 return Err(anyhow::Error::new(
                     DomainError::already_exists(format!(
-                        "a {duration}{} session for {} on {date} is already in the ledger ({file}:{line})",
+                        // #747 review: name the normalized minutes, not
+                        // the raw typed duration — re-logging `1h`
+                        // against a stored `60m` line reports a `60m`
+                        // session, so the message points at the line
+                        // matched.
+                        "a {minutes}m{} session for {} on {date} is already in the ledger ({file}:{line})",
                         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
                         person.id,
                     ))

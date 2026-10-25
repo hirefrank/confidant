@@ -426,14 +426,31 @@ pub fn parse_duration_minutes(s: &str) -> Option<u32> {
     None
 }
 
+/// Closed billing-tag vocabulary for `session` lines (#747 review):
+/// the CLI help already documents `paid, pps, comp`, and the pack
+/// session-checks rule counts exactly these three, so `log session`
+/// validates against this list instead of letting a free-form token
+/// silently count as untagged in balance math.
+pub const SESSION_TAGS: &[&str] = &["paid", "pps", "comp"];
+
+/// Whether `tag` is one of [`SESSION_TAGS`]. Case-sensitive: `Paid` is
+/// not `paid` — the caller rejects it rather than silently normalizing
+/// a billing token the operator did not type.
+pub fn is_valid_session_tag(tag: &str) -> bool {
+    SESSION_TAGS.contains(&tag)
+}
+
 /// Identity of a `session` line for semantic idempotency (#747): the
 /// person, the date, the duration in minutes, and the billing tag (empty
 /// when untagged). Durations compare by minutes, so `60m` and `1h` are the
-/// same session; `note:` and `src:` pairs are not part of the identity,
-/// matching [`crate::touch::touch_identity`]. Returns `None` for
-/// non-`session` lines and for lines whose first argument is not a
-/// duration. The tag is the second positional token when present; a
-/// `note:`/`src:` pair in that position means the line is untagged.
+/// same session; tags compare lowercased, so a historical `Paid` line
+/// still matches a `paid` re-log even though new lines must use the
+/// exact vocabulary (see [`is_valid_session_tag`]); `note:` and `src:`
+/// pairs are not part of the identity, matching
+/// [`crate::touch::touch_identity`]. Returns `None` for non-`session`
+/// lines and for lines whose first argument is not a duration. The tag
+/// is the second positional token when present; a `note:`/`src:` pair in
+/// that position means the line is untagged.
 pub fn session_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, u32, String)> {
     if entry.verb != "session" {
         return None;
@@ -445,7 +462,7 @@ pub fn session_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, u32
         .get(1)
         .and_then(Arg::as_token)
         .unwrap_or("")
-        .to_owned();
+        .to_ascii_lowercase();
     Some((entry.id.clone(), entry.date, minutes, tag))
 }
 
@@ -648,6 +665,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(id(&base), id(&other_tag));
+        // #747 review: tags compare lowercased, so a historical `Paid`
+        // line is the same session as a `paid` re-log.
+        let cased_tag = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 60m Paid")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id(&base), id(&cased_tag));
+        // The vocabulary itself is closed and case-sensitive.
+        assert!(super::is_valid_session_tag("paid"));
+        assert!(super::is_valid_session_tag("pps"));
+        assert!(super::is_valid_session_tag("comp"));
+        assert!(!super::is_valid_session_tag("Paid"));
+        assert!(!super::is_valid_session_tag("full"));
+        assert!(!super::is_valid_session_tag(""));
+        assert_eq!(super::SESSION_TAGS, &["paid", "pps", "comp"]);
         let untagged = parse_line("2026-10-08 session p-01M3TC5H00MPJG000000000000 60m")
             .unwrap()
             .unwrap();

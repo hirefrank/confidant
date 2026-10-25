@@ -54,7 +54,7 @@ pub use queue::{queue_items, QueueItem};
 use git::{clear_inbox, discard_inbox};
 use item::describe_target;
 use merge::{apply_writes, commit_applied, revert_applied, unstage_applied, AppliedChange};
-use plan::{collect_vault_srcs, plan_item};
+use plan::{collect_semantic_identities, collect_vault_srcs, plan_item};
 use preflight::{preflight, PreflightOutcome};
 
 #[cfg(test)]
@@ -383,6 +383,7 @@ pub fn run_inbox(
     let skip_set: std::collections::HashSet<&str> = opts.skip.iter().map(String::as_str).collect();
 
     let existing_srcs = collect_vault_srcs(&vault);
+    let mut semantic_identities = collect_semantic_identities(&vault);
     let mut ledger_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut outcomes = Vec::new();
     let mut skipped = Vec::new();
@@ -412,6 +413,7 @@ pub fn run_inbox(
                 &existing_srcs,
                 &mut ledger_cache,
                 decrypt_existing,
+                &mut semantic_identities,
             )? {
                 Some((outcome, writes)) => {
                     if !opts.dry_run {
@@ -895,7 +897,23 @@ mod tests {
         item: &ParsedItem,
         srcs: &BTreeSet<String>,
     ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
-        plan_item(root, item, srcs, &mut HashMap::new(), None)
+        plan_item(
+            root,
+            item,
+            srcs,
+            &mut HashMap::new(),
+            None,
+            &mut BTreeSet::new(),
+        )
+    }
+
+    fn plan_test_with_identities(
+        root: &Path,
+        item: &ParsedItem,
+        srcs: &BTreeSet<String>,
+        identities: &mut BTreeSet<String>,
+    ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
+        plan_item(root, item, srcs, &mut HashMap::new(), None, identities)
     }
 
     #[test]
@@ -955,6 +973,61 @@ mod tests {
         assert!(plan_test(dir.path(), &item, &BTreeSet::new())
             .unwrap()
             .is_none());
+    }
+
+    /// #747 review: the drain is the semantic-duplicate checkpoint for
+    /// queued lines — a re-log with a fresh `src:fallback/…` token is
+    /// still the same touch/session, so it plans nothing.
+    #[test]
+    fn skips_semantic_duplicate_ledger_lines() {
+        let dir = TempDir::new().unwrap();
+        // An identity already in the ledger: a queued copy with a fresh
+        // src: still skips, for both verbs.
+        let mut identities = BTreeSet::new();
+        identities.insert("touch|p-01M3TC5H00MPJG000000000000|2026-10-08|meal".to_string());
+        identities.insert("session|p-01M3TC5H00MPJG000000000000|2026-10-08|60|paid".to_string());
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:fallback/fresh-1\n2026-10-08 session p-01M3TC5H00MPJG000000000000 1h paid src:fallback/fresh-2\n",
+        )
+        .unwrap();
+        assert!(
+            plan_test_with_identities(dir.path(), &item, &BTreeSet::new(), &mut identities)
+                .unwrap()
+                .is_none()
+        );
+
+        // Two copies inside one drain run: the first plans, the second
+        // skips — the shared set, not the vault, catches the second.
+        let mut identities = BTreeSet::new();
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:fallback/a\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:fallback/b\n",
+        )
+        .unwrap();
+        let (_, writes) =
+            plan_test_with_identities(dir.path(), &item, &BTreeSet::new(), &mut identities)
+                .unwrap()
+                .unwrap();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        match &writes[0] {
+            PlannedWrite::LedgerAppend { lines, .. } => {
+                assert_eq!(lines.len(), 1, "the second copy must not plan: {lines:?}");
+            }
+            other => panic!("expected a ledger append, got {other:?}"),
+        }
+        // A different kind the same day is a different touchpoint and
+        // still plans.
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 call src:fallback/c\n",
+        )
+        .unwrap();
+        assert!(
+            plan_test_with_identities(dir.path(), &item, &BTreeSet::new(), &mut identities)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

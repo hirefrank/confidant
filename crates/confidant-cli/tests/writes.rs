@@ -3566,6 +3566,135 @@ fn log_session_refuses_identical_session_and_force_logs_it() {
     ];
     let (ok, v) = run_json(&forced);
     assert!(ok, "{v}");
+
+    // #747 review: `check` flags the forced session repeat as a
+    // warning on the later line, mirroring `W_DUPLICATE_TOUCH`.
+    let (ok, report) = run_json(&["check", "--json", "--no-input", "--vault", &vroot]);
+    assert!(ok, "{report}");
+    let dups: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_DUPLICATE_SESSION")
+        .collect();
+    assert_eq!(dups.len(), 1, "{report}");
+    assert_eq!(dups[0]["severity"], "warning");
+}
+
+/// #747 review: when the two identities disagree — same `--request-id`,
+/// same person/date/kind, different `--note` — the input is both a
+/// semantic duplicate (refusal would say `E_ALREADY_EXISTS`) and a
+/// request-id conflict (write path would say `E_IDEMPOTENCY_CONFLICT`).
+/// The spec promises the write path wins.
+#[test]
+fn log_touch_request_id_conflict_beats_semantic_refusal() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let rid = "01J9Z3K4QF00000000000000ID";
+    let (ok, v) = run_json(&log_touch_args("meal", &vroot, &["--request-id", rid]));
+    assert!(ok, "{v}");
+    let before = commits(root);
+
+    // Same person/date/kind, same request-id, different note: the
+    // write path's conflict, not the semantic refusal.
+    let (ok, v) = run_json(&log_touch_args(
+        "meal",
+        &vroot,
+        &["--note", "A different meal note", "--request-id", rid],
+    ));
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_IDEMPOTENCY_CONFLICT");
+    assert_eq!(commits(root), before, "a conflict writes nothing");
+}
+
+/// #747 review: the billing tag is a closed vocabulary, so `log session`
+/// rejects anything outside paid/pps/comp — including a correctly
+/// spelled tag in the wrong case.
+#[test]
+fn log_session_rejects_unknown_and_cased_tags() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+    let before = commits(root);
+
+    for tag in ["full", "Paid", "PAID"] {
+        let (ok, v) = run_json(&[
+            "log",
+            "session",
+            PERSON,
+            "60m",
+            tag,
+            "--date",
+            "2026-10-05",
+            "--json",
+            "--no-input",
+            "--vault",
+            &vroot,
+        ]);
+        assert!(!ok, "tag {tag} must be rejected: {v}");
+        assert_eq!(v["error"]["code"], "usage_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("paid, pps, comp"),
+            "the error must list the vocabulary: {message}"
+        );
+    }
+    assert_eq!(commits(root), before, "rejected tags write nothing");
+}
+
+/// #747 review: the session refusal names the normalized duration, not
+/// the raw typed one — re-logging `1h` against a stored `60m` line
+/// reports a `60m` session, so the message points at the line matched.
+#[test]
+fn log_session_refusal_names_normalized_minutes() {
+    let dir = make_vault();
+    let root = dir.path();
+    let vroot = vault_arg(root);
+    enable_personal(root);
+
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "60m",
+        "paid",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(ok, "{v}");
+
+    let (ok, v) = run_json(&[
+        "log",
+        "session",
+        PERSON,
+        "1h",
+        "paid",
+        "--date",
+        "2026-10-05",
+        "--json",
+        "--no-input",
+        "--vault",
+        &vroot,
+    ]);
+    assert!(!ok, "{v}");
+    assert_eq!(v["error"]["code"], "E_ALREADY_EXISTS");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("a 60m paid session"),
+        "refusal must name normalized minutes: {message}"
+    );
+    assert!(
+        !message.contains("a 1h "),
+        "refusal must not echo the raw typed duration: {message}"
+    );
 }
 
 // ---------------------------------------------------------------------------

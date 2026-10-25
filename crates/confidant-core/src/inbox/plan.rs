@@ -37,6 +37,31 @@ pub(crate) fn collect_vault_srcs(vault: &crate::vault::Vault) -> BTreeSet<String
     srcs
 }
 
+/// Canonical key for one `touch`/`session` identity (#747), shared by
+/// [`collect_semantic_identities`] and [`plan_item`]. `note:`/`src:`
+/// never appear here, so a re-log with fresh provenance still matches.
+fn semantic_identity_key(entry: &crate::ledger::LedgerEntry) -> Option<String> {
+    if let Some((id, date, kind)) = crate::touch::touch_identity(entry) {
+        return Some(format!("touch|{id}|{date}|{kind}"));
+    }
+    if let Some((id, date, minutes, tag)) = crate::ledger::session_identity(entry) {
+        return Some(format!("session|{id}|{date}|{minutes}|{tag}"));
+    }
+    None
+}
+
+/// Every semantic identity already in the loaded vault ledger (#747
+/// review: inbox-queued lines bypass the write-time refusal, because
+/// the queued item is encrypted to the inbox key and the log command
+/// cannot see it — so the drain is where the duplicate must be caught).
+pub(crate) fn collect_semantic_identities(vault: &crate::vault::Vault) -> BTreeSet<String> {
+    vault
+        .entries
+        .iter()
+        .filter_map(|sourced| semantic_identity_key(&sourced.entry))
+        .collect()
+}
+
 fn month_file(date: &chrono::NaiveDate) -> PathBuf {
     PathBuf::from(format!("ledger/{}.cfd", date.format("%Y/%m")))
 }
@@ -47,12 +72,22 @@ fn month_file(date: &chrono::NaiveDate) -> PathBuf {
 /// `decrypt_existing` decrypts an existing record envelope for the retry
 /// idempotency check on structurally encrypted vaults (see
 /// [`DecryptExistingFn`]); `None` keeps the fail-closed byte comparison.
+///
+/// `semantic_identities` holds every `touch`/`session` identity already
+/// in the ledger plus every identity planned so far in this drain run;
+/// [`plan_item`] skips a ledger line whose identity is in the set and
+/// inserts every identity it plans (#747 review). The caller owns the
+/// set across items, so two queued copies of the same line — e.g. a
+/// session queued twice via `--fallback-inbox` — merge at most once.
+/// A skipped line is not an error: the item reports `skip` (or `merge`
+/// for its surviving lines) and is cleared like any idempotent item.
 pub(crate) fn plan_item(
     vault_root: &Path,
     item: &ParsedItem,
     existing_srcs: &BTreeSet<String>,
     ledger_cache: &mut HashMap<PathBuf, String>,
     decrypt_existing: Option<&super::DecryptExistingFn>,
+    semantic_identities: &mut BTreeSet<String>,
 ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
     match item.kind {
         ItemKind::Ledger => {
@@ -89,6 +124,18 @@ pub(crate) fn plan_item(
                         item.name
                     ))));
                 }
+                // #747 review: skip lines that are semantic duplicates
+                // of a line already in the ledger or already planned in
+                // this drain run — the drain-time half of the write-time
+                // refusal, for lines the log command could not see
+                // because they were queued (encrypted) to the inbox.
+                // `note:`/`src:` do not distinguish, so a re-queued line
+                // with a fresh `src:fallback/…` token still matches.
+                if let Some(key) = semantic_identity_key(&entry) {
+                    if semantic_identities.contains(&key) {
+                        continue;
+                    }
+                }
                 let target = month_file(&entry.date);
                 // Idempotency: skip lines already imported (by src: or exact text).
                 let dominated = entry_srcs(&entry.args)
@@ -102,6 +149,9 @@ pub(crate) fn plan_item(
                 });
                 if existing.lines().any(|l| l.trim_end() == raw.trim_end()) {
                     continue;
+                }
+                if let Some(key) = semantic_identity_key(&entry) {
+                    semantic_identities.insert(key);
                 }
                 match by_file.iter_mut().find(|(f, _)| *f == target) {
                     Some((_, lines)) => lines.push(raw.to_string()),
