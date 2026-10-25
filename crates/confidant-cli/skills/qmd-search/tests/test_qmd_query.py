@@ -410,21 +410,67 @@ class QmdQueryConfigTest(unittest.TestCase):
         (cfg / "config.toml").write_text(text, encoding="utf-8")
 
     def test_explicit_mode_wins_over_config(self):
-        self.assertEqual(self.query.resolve_mode("vector", {"default_mode": "bm25"}),
-                         "vector")
+        self.assertEqual(self.query.resolve_mode(
+            "vector", {"default_mode": "bm25"}, {}), "vector")
 
     def test_config_default_mode_used_when_no_flag(self):
-        self.assertEqual(self.query.resolve_mode(None, {"default_mode": "vector"}),
-                         "vector")
+        self.assertEqual(self.query.resolve_mode(
+            None, {"default_mode": "vector"}, {}), "vector")
 
     def test_invalid_config_mode_falls_back_to_bm25(self):
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            mode = self.query.resolve_mode(None, {"default_mode": "sideways"})
+            mode = self.query.resolve_mode(
+                None, {"default_mode": "sideways"}, {})
         self.assertEqual(mode, "bm25")
         self.assertIn("sideways", err.getvalue())
 
     def test_no_config_means_bm25(self):
-        self.assertEqual(self.query.resolve_mode(None, {}), "bm25")
+        self.assertEqual(self.query.resolve_mode(None, {}, {}), "bm25")
+
+    def test_vault_config_beats_global_config(self):
+        # Per-vault scoping (#722 remainder): a vault-local
+        # recommendation wins over the global user config.
+        self.assertEqual(self.query.resolve_mode(
+            None, {"default_mode": "vector"},
+            {"default_mode": "hybrid"}), "vector")
+
+    def test_global_config_is_fallback(self):
+        # A vault with no per-vault file still honors the global value,
+        # so single-vault setups keep working unchanged.
+        self.assertEqual(self.query.resolve_mode(
+            None, {}, {"default_mode": "hybrid"}), "hybrid")
+
+    def test_invalid_vault_mode_falls_through_to_global(self):
+        # An invalid per-vault value is noted and falls through to the
+        # global value instead of shadowing it with the bm25 default.
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            mode = self.query.resolve_mode(
+                None, {"default_mode": "sideways"},
+                {"default_mode": "vector"})
+        self.assertEqual(mode, "vector")
+        self.assertIn("per-vault", err.getvalue())
+        self.assertIn("sideways", err.getvalue())
+
+    def test_vault_qmd_config_round_trips(self):
+        vault = Path(self.tmp.name) / "vault"
+        (vault / ".confidant").mkdir(parents=True)
+        (vault / ".confidant" / "qmd-preflight.toml").write_text(
+            "[qmd]\noffline = true\ndefault_mode = \"vector\"\n",
+            encoding="utf-8")
+        config = self.query.read_vault_qmd_config(str(vault))
+        self.assertTrue(self.query._truthy(config.get("offline", "")))
+        self.assertEqual(config.get("default_mode"), "vector")
+
+    def test_vault_qmd_config_fail_closed(self):
+        vault = Path(self.tmp.name) / "vault"
+        (vault / ".confidant").mkdir(parents=True)
+        (vault / ".confidant" / "qmd-preflight.toml").write_text(
+            "[qmd]\noffline = true\n[broken\n", encoding="utf-8")
+        self.assertEqual(self.query.read_vault_qmd_config(str(vault)), {})
+        # A vault with no preflight file at all is not an error either.
+        bare = Path(self.tmp.name) / "bare"
+        bare.mkdir()
+        self.assertEqual(self.query.read_vault_qmd_config(str(bare)), {})
 
     def test_read_qmd_config_round_trips(self):
         self.write_user_config("[qmd]\noffline = true\ndefault_mode = \"vector\"\n")
@@ -437,14 +483,52 @@ class QmdQueryConfigTest(unittest.TestCase):
         self.assertEqual(self.query.read_qmd_config(), {})
 
     def test_runtime_env_sets_offline_from_config(self):
-        env = self.query.qmd_runtime_env("/vault", {"offline": True})
+        env = self.query.qmd_runtime_env("/vault", {"offline": True}, {})
         self.assertEqual(env.get("HF_HUB_OFFLINE"), "1")
         self.assertIn("INDEX_PATH", env)
 
     def test_runtime_env_explicit_shell_wins(self):
         with unittest.mock.patch.dict(os.environ, {"HF_HUB_OFFLINE": "0"}):
-            env = self.query.qmd_runtime_env("/vault", {"offline": True})
+            env = self.query.qmd_runtime_env("/vault", {"offline": True}, {})
         self.assertEqual(env.get("HF_HUB_OFFLINE"), "0")
+
+    def test_resolve_offline_sources(self):
+        self.assertEqual(self.query.resolve_offline({}, {}), (False, "none"))
+        self.assertEqual(self.query.resolve_offline(
+            {}, {"offline": True}), (True, "global"))
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": True}, {"offline": False}), (True, "vault"))
+
+    def test_resolve_offline_garbage_falls_through_to_global(self):
+        # #773 S2: an unrecognized vault value (typo, TOML table) is not
+        # a deliberate answer — it falls through to global with a note,
+        # mirroring resolve_mode, so garbage can't silently disable a
+        # global offline=true.
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "flase"}, {"offline": True}), (True, "global"))
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": {"table": True}}, {"offline": True}),
+            (True, "global"))
+        # Recognized falsy tokens are still deliberate: they shadow global.
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "false"}, {"offline": True}), (False, "vault"))
+        self.assertEqual(self.query.resolve_offline(
+            {"offline": "off"}, {"offline": True}), (False, "vault"))
+
+    def test_runtime_env_vault_offline_beats_global(self):
+        # Per-vault offline=true beats a global offline=false, and a
+        # per-vault offline=false shadows a global offline=true: the
+        # vault's answer is an answer, not an absence.
+        env = self.query.qmd_runtime_env(
+            "/vault", {"offline": True}, {"offline": False})
+        self.assertEqual(env.get("HF_HUB_OFFLINE"), "1")
+        env = self.query.qmd_runtime_env(
+            "/vault", {"offline": False}, {"offline": True})
+        self.assertNotIn("HF_HUB_OFFLINE", env)
+
+    def test_runtime_env_global_offline_is_fallback(self):
+        env = self.query.qmd_runtime_env("/vault", {}, {"offline": True})
+        self.assertEqual(env.get("HF_HUB_OFFLINE"), "1")
 
     def test_timeout_hint_names_the_hub_and_the_fix(self):
         self.assertIn("Hugging Face", self.query.TIMEOUT_HINT)
@@ -929,10 +1013,80 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertTrue(report["hybrid_cache_complete"])
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         self.assertTrue(report["persisted"]["offline"])
-        cfg = (self.root / ".config" / "confidant" / "config.toml")
+        # Per-vault scoping (#722 remainder): the recommendation lands
+        # in the vault-local file, and the global user config is never
+        # touched by --persist.
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        self.assertEqual(report["persisted"]["path"], str(cfg))
         text = cfg.read_text(encoding="utf-8")
         self.assertIn('default_mode = "hybrid"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
         self.assertIn("offline = true", text)
+        self.assertIn('offline_source = "preflight"', text)
+        self.assertFalse(
+            (self.root / ".config" / "confidant" / "config.toml").exists())
+
+    def test_resolve_offline_fallback_garbage_falls_through(self):
+        # #773 S2: the fallback copy (sibling qmd-query.py absent on a
+        # broken install) must agree with the query copy — garbage falls
+        # through, never silently disabling a global offline=true.
+        saved = self.preflight._QUERY_MODULE
+        try:
+            self.preflight._QUERY_MODULE = None
+            self.assertEqual(self.preflight.resolve_offline(
+                {"offline": "flase"}, {"offline": True}), (True, "global"))
+            self.assertEqual(self.preflight.resolve_offline(
+                {"offline": "off"}, {"offline": True}), (False, "vault"))
+        finally:
+            self.preflight._QUERY_MODULE = saved
+
+    def test_set_vault_qmd_config_value_refuses_on_invalid_toml(self):
+        # #773 S3: writing into a file that is already unparseable (a
+        # garbage line elsewhere) must raise, not report success on a
+        # value that will never take effect.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("[qmd\nbroken = true\n", encoding="utf-8")
+        with self.assertRaises(OSError):
+            self.preflight.set_vault_qmd_config_value(
+                str(vault), "default_mode", '"hybrid"')
+
+    def test_persist_invalid_toml_reports_error_not_success(self):
+        # #773 S3 end-to-end: --persist against an unparseable vault-local
+        # file reports persist failure (persisted.error), never a
+        # "persisted to:" success with a value that never takes effect.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("[qmd\nbroken = true\n", encoding="utf-8")
+        stub = self._stub("stub-s3.py", [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertIn("error", report["persisted"])
+        self.assertNotIn("default_mode", report["persisted"])
+
+    def test_vault_config_edit_preserves_other_keys_and_comments(self):
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "# Operator note.\n"
+            "[qmd]\nassume_encrypted_disk = true\n",
+            encoding="utf-8")
+        self.preflight.set_vault_qmd_config_value(
+            str(vault), "default_mode", '"vector"')
+        self.preflight.set_vault_qmd_config_value(
+            str(vault), "offline", "true")
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn("assume_encrypted_disk = true", text)
+        self.assertIn("# Operator note", text)
+        self.assertIn('default_mode = "vector"', text)
+        self.assertIn("offline = true", text)
+        # Idempotent: a second write replaces, never duplicates.
+        self.preflight.set_vault_qmd_config_value(
+            str(vault), "offline", "true")
+        text = cfg.read_text(encoding="utf-8")
+        self.assertEqual(text.count("offline = true"), 1)
 
     def test_persist_does_not_persist_cold_sample_on_warm_failure(self):
         # Round-2 N1 end to end: cold ok + warm failure under --persist
@@ -965,7 +1119,7 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertEqual(report["modes"]["hybrid"]["status"], "failed")
         self.assertEqual(report["modes"]["hybrid"]["cold"]["status"], "ok")
         self.assertNotIn("default_mode", report["persisted"])
-        cfg = (self.root / ".config" / "confidant" / "config.toml")
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
         if cfg.exists():
             self.assertNotIn("default_mode",
                              cfg.read_text(encoding="utf-8"))
@@ -989,9 +1143,11 @@ class QmdPreflightTest(unittest.TestCase):
         try:
             hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
             vault = self._fake_vault()
-            cfg = self.root / ".config" / "confidant"
-            cfg.mkdir(parents=True, exist_ok=True)
-            (cfg / "config.toml").write_text(
+            # Per-vault scoping: the stale marked keys live in the
+            # vault-local file now, and that file is what --persist
+            # clears. The global config is not created at all.
+            cfg = vault / ".confidant" / "qmd-preflight.toml"
+            cfg.write_text(
                 "[qmd]\ndefault_mode = \"vector\"\n"
                 "default_mode_source = \"preflight\"\n"
                 "offline = true\noffline_source = \"preflight\"\n",
@@ -1004,19 +1160,23 @@ class QmdPreflightTest(unittest.TestCase):
             self.assertEqual(report["persisted"]["default_mode_cleared"],
                              "vector")
             self.assertTrue(report["persisted"]["offline_cleared"])
-            text = (cfg / "config.toml").read_text(encoding="utf-8")
+            text = cfg.read_text(encoding="utf-8")
             self.assertNotIn("default_mode", text)
             self.assertNotIn("offline", text)
+            self.assertFalse(
+                (self.root / ".config" / "confidant" / "config.toml")
+                .exists())
         finally:
             server.shutdown()
             server.server_close()
 
-    def test_persist_migrates_unmarked_legacy_keys(self):
-        # Round-2 N4: keys written by the pre-fix --persist carry no
-        # marker. On the first --persist run under the marker scheme
-        # (no migration stamp yet), an unmarked key the fresh evidence
-        # does not support is cleared distinctly as legacy, and the
-        # migration stamp is recorded.
+    def test_persist_leaves_global_keys_untouched(self):
+        # Per-vault scoping replaces the old global legacy migration
+        # (round-2 N4): the global user config is read-only fallback
+        # now. Keys an old --persist wrote there — marked or not —
+        # are never rewritten, cleared, or stamped by a per-vault run,
+        # even when the fresh evidence does not support them: clearing
+        # them could clobber a fallback another vault still relies on.
         import http.server
         import threading
 
@@ -1045,23 +1205,28 @@ class QmdPreflightTest(unittest.TestCase):
                                     extra=("--persist",))
             self.assertIsNone(report["recommended_mode"])
             self.assertFalse(report["offline_recommended"])
-            self.assertEqual(
-                report["persisted"]["default_mode_legacy_cleared"],
-                "vector")
-            self.assertTrue(report["persisted"]["offline_legacy_cleared"])
-            self.assertTrue(report["persisted"]["legacy_migrated"])
+            self.assertNotIn("default_mode", report["persisted"])
+            self.assertNotIn("offline", report["persisted"])
+            self.assertNotIn("legacy_migrated", report["persisted"])
+            # The global file is byte-identical; no vault-local file
+            # was created because nothing needed writing or clearing.
             text = (cfg / "config.toml").read_text(encoding="utf-8")
-            self.assertNotIn("default_mode", text)
-            self.assertNotIn("offline = true", text)
-            self.assertIn("preflight_legacy_migrated = true", text)
+            self.assertIn('default_mode = "vector"', text)
+            self.assertIn("offline = true", text)
+            self.assertNotIn("preflight_legacy_migrated", text)
+            self.assertNotIn("default_mode_source", text)
+            self.assertFalse(
+                (vault / ".confidant" / "qmd-preflight.toml").exists())
         finally:
             server.shutdown()
             server.server_close()
 
-    def test_persist_adopts_supported_legacy_keys(self):
-        # The other half of the N4 migration: a legacy key the fresh
-        # evidence DOES support is adopted — rewritten with its
-        # provenance marker — rather than cleared.
+    def test_persist_writes_vault_local_and_leaves_global_alone(self):
+        # The fresh-evidence half of the same rule: a --persist run
+        # writes the new recommendation to the vault-local file with
+        # markers, while a global file carrying the same values
+        # (unmarked, written by an old --persist) is left exactly as
+        # it was — still honored as fallback, never re-marked.
         vault = self._fake_vault()
         cfg = self.root / ".config" / "confidant"
         cfg.mkdir(parents=True, exist_ok=True)
@@ -1075,9 +1240,15 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         self.assertTrue(report["persisted"]["offline"])
-        text = (cfg / "config.toml").read_text(encoding="utf-8")
+        text = (vault / ".confidant" / "qmd-preflight.toml") \
+            .read_text(encoding="utf-8")
         self.assertIn('default_mode_source = "preflight"', text)
         self.assertIn('offline_source = "preflight"', text)
+        global_text = (cfg / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('default_mode = "hybrid"', global_text)
+        self.assertIn("offline = true", global_text)
+        self.assertNotIn("default_mode_source", global_text)
+        self.assertNotIn("offline_source", global_text)
 
     def test_persist_leaves_hand_set_values_alone(self):
         import http.server
@@ -1098,15 +1269,13 @@ class QmdPreflightTest(unittest.TestCase):
         try:
             hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
             vault = self._fake_vault()
-            cfg = self.root / ".config" / "confidant"
-            cfg.mkdir(parents=True, exist_ok=True)
-            # The migration stamp marks this as post-migration: these
-            # unmarked values are hand-set values added AFTER the
-            # one-time legacy migration, so they must be left alone
-            # (without the stamp they would be legacy-cleared instead).
-            (cfg / "config.toml").write_text(
-                "[qmd]\npreflight_legacy_migrated = true\n"
-                "default_mode = \"bm25\"\noffline = true\n",
+            # Per-vault scoping: the vault-local file is new, so it
+            # has no legacy-migration branch — an unmarked value there
+            # is a hand-set value, full stop, and is left alone even
+            # when the fresh evidence does not support it.
+            cfg = vault / ".confidant" / "qmd-preflight.toml"
+            cfg.write_text(
+                "[qmd]\ndefault_mode = \"bm25\"\noffline = true\n",
                 encoding="utf-8")
             stub = self._stub("stub-empty3.py", [])
             report = self._run_main(vault, stub, hub_url,
@@ -1114,35 +1283,40 @@ class QmdPreflightTest(unittest.TestCase):
             self.assertEqual(report["persisted"]["default_mode_left"],
                              "bm25")
             self.assertTrue(report["persisted"]["offline_left"])
-            text = (cfg / "config.toml").read_text(encoding="utf-8")
+            text = cfg.read_text(encoding="utf-8")
             self.assertIn('default_mode = "bm25"', text)
             self.assertIn("offline = true", text)
         finally:
             server.shutdown()
             server.server_close()
 
-    def test_persist_without_home_fails_before_smoke(self):
+    def test_persist_without_home_writes_vault_local(self):
+        # Per-vault persist needs no HOME, so the old early exit (fail
+        # before smoke when HOME is absent) is gone: a --persist run
+        # with no HOME still diagnoses, still smokes, and still
+        # writes the vault-local file. A missing HOME just means no
+        # global fallback is read.
         vault = self._fake_vault()
-        counter = self.root / "smoke-calls.txt"
-        stub = self.root / "stub-count.py"
-        stub.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, sys\n"
-            f"open({str(counter)!r}, 'a').write('x')\n"
-            "mode = sys.argv[sys.argv.index('--mode') + 1]\n"
-            "print(json.dumps({'mode': mode, 'matches': []}))\n",
-            encoding="utf-8")
+        stub = self._stub("stub-hits-nohome.py",
+                          [{"path": "x.md", "score": 1.0}])
         bindir = self._fake_qmd_on_path()
         argv = ["--vault", str(vault),
                 "--query-script", str(stub),
-                "--hub-url", self._closed_port_url(), "--persist"]
+                "--hub-url", self._closed_port_url(), "--json", "--persist"]
+        out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.dict(os.environ, {
-                "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                "PATH": f"{bindir}{os.pathsep}"
+                        f"{os.environ.get('PATH', '')}"}):
             os.environ.pop("HOME", None)
-            with self.assertRaises(SystemExit):
-                self.preflight.main(argv)
-        self.assertFalse(counter.exists(),
-                         "smoke ran despite --persist having no HOME")
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                code = self.preflight.main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report["persisted"]["default_mode"], "hybrid")
+        text = (vault / ".confidant" / "qmd-preflight.toml") \
+            .read_text(encoding="utf-8")
+        self.assertIn('default_mode = "hybrid"', text)
 
 
 class FakeTtyStdin(io.StringIO):

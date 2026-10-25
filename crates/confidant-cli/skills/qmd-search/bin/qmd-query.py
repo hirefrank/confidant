@@ -50,13 +50,22 @@ STORE_REL = os.path.join(".confidant", "qmd")
 CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 
 # Persisted QMD choices (issue #722, written by qmd-preflight.py
-# --persist) in the same user config that carries the #540/#723
-# encrypted-disk assertion. `offline` stops the model runtime phoning
-# home to its model hub per query (the 0.7.0 field failure: a 3m01s
-# wait with 0.76s user CPU, silently degraded to the find fallback);
-# `default_mode` is the preflight-recommended mode for this host.
+# --persist). The per-vault file wins; the user config is the fallback
+# for vaults with no per-vault file (and for single-vault setups, where
+# the two agree). `offline` stops the model runtime phoning home to its
+# model hub per query (the 0.7.0 field failure: a 3m01s wait with 0.76s
+# user CPU, silently degraded to the find fallback); `default_mode` is
+# the preflight-recommended mode for this host. The user config is the
+# same file that carries the #540/#723 encrypted-disk assertion.
 USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
+# Per-vault preflight state (issue #722 remainder): under the vault's
+# own .confidant/ dir, which is local and gitignored like the corpus
+# and the QMD store — never tracked, never synced. A recommendation
+# measured on one vault must not leak into another vault on the same
+# host, which is exactly what the old global-only persist did.
+VAULT_PREFLIGHT_REL = os.path.join(".confidant", "qmd-preflight.toml")
 TRUTHY = ("1", "true", "yes", "on")
+FALSEY = ("0", "false", "no", "off")
 MODES = ("hybrid", "bm25", "vector")
 # The timeout hint is CONDITIONED, not unconditional: a timeout can
 # equally be slow CPU, a large corpus, or model load, and when
@@ -305,35 +314,91 @@ def read_qmd_config(home=None):
     return dict(qmd) if isinstance(qmd, dict) else {}
 
 
-def resolve_mode(explicit, config):
-    """Explicit --mode wins; else the persisted preflight recommendation.
+def vault_preflight_path(vault):
+    """The vault-local preflight file for this vault."""
+    return os.path.join(vault, VAULT_PREFLIGHT_REL)
 
-    An invalid persisted value is ignored with a stderr note, never
-    fatal: a stale config must not break search. Default is bm25
-    (works with no model downloads).
+
+def read_vault_qmd_config(vault):
+    """The [qmd] table from the vault-local preflight file, or {}.
+
+    Fail closed like read_qmd_config: a missing file, invalid TOML, or
+    a non-table [qmd] is not a configuration — callers fall back to
+    the global config, then to defaults.
+    """
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    try:
+        with open(vault_preflight_path(vault), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    qmd = data.get("qmd")
+    return dict(qmd) if isinstance(qmd, dict) else {}
+
+
+def resolve_mode(explicit, vault_config, global_config):
+    """Explicit --mode wins; else the per-vault preflight recommendation;
+    else the global [qmd] default_mode; else bm25.
+
+    An invalid value at either level is ignored with a stderr note and
+    falls through to the next level, never fatal: a stale config must
+    not break search. Default is bm25 (works with no model downloads).
     """
     if explicit:
         return explicit
-    configured = config.get("default_mode", "")
-    if isinstance(configured, str) and configured in MODES:
-        return configured
-    if configured not in ("", None):
-        print(f"note: ignoring invalid [qmd] default_mode "
-              f"{configured!r} (want one of {', '.join(MODES)})",
-              file=sys.stderr)
+    for label, config in (("per-vault", vault_config),
+                          ("global", global_config)):
+        configured = config.get("default_mode", "")
+        if isinstance(configured, str) and configured in MODES:
+            return configured
+        if configured not in ("", None):
+            print(f"note: ignoring invalid {label} [qmd] default_mode "
+                  f"{configured!r} (want one of {', '.join(MODES)})",
+                  file=sys.stderr)
     return "bm25"
 
 
-def qmd_runtime_env(vault, config):
+def resolve_offline(vault_config, global_config):
+    """The persisted offline choice: per-vault wins, global is fallback.
+
+    Returns (offline_bool, source) where source is "vault", "global",
+    or "none". Only recognized tokens count as a deliberate answer: a
+    truthy token opts in, a falsy token opts out (and shadows the next
+    level, because preflight only ever writes true or clears the key,
+    so a recognized falsy value is a deliberate choice, not an
+    absence). Any other present value — a typo, a TOML table — is
+    ignored with a note and falls through, mirroring `resolve_mode`, so
+    garbage can never silently disable a global `offline = true`.
+    """
+    for label, config in (("vault", vault_config), ("global", global_config)):
+        value = config.get("offline", "")
+        if value in ("", None):
+            continue
+        token = str(value).strip().lower()
+        if token in TRUTHY:
+            return True, label
+        if token in FALSEY:
+            return False, label
+        print(f"note: ignoring invalid {label} [qmd] offline {value!r} "
+              f"(want true or false)", file=sys.stderr)
+    return False, "none"
+
+
+def qmd_runtime_env(vault, vault_config, global_config):
     """qmd_env plus the persisted offline choice (#722).
 
-    An explicit HF_HUB_OFFLINE in the process env wins over the config:
-    the operator's current shell outranks a persisted default.
+    Per-vault offline wins over global offline; an explicit
+    HF_HUB_OFFLINE in the process env wins over both: the operator's
+    current shell outranks any persisted default.
     """
     env = qmd_env(vault)
-    if _truthy(config.get("offline", "")) \
-            and "HF_HUB_OFFLINE" not in env:
-        env["HF_HUB_OFFLINE"] = "1"
+    if "HF_HUB_OFFLINE" not in env:
+        offline, _source = resolve_offline(vault_config, global_config)
+        if offline:
+            env["HF_HUB_OFFLINE"] = "1"
     return env
 
 
@@ -368,14 +433,16 @@ def main():
 
     vault = resolve_vault(args.vault)
     # Persisted preflight choices (#722): the recommended mode and the
-    # offline decision. Explicit --mode still wins over the config.
+    # offline decision, per-vault first with the global user config as
+    # fallback. Explicit --mode still wins over either config.
     config = read_qmd_config()
-    mode = resolve_mode(args.mode, config)
+    vault_config = read_vault_qmd_config(vault)
+    mode = resolve_mode(args.mode, vault_config, config)
     # Extra args for the allowlist and fallback `confidant find` calls.
     find_extra = ["--packs", args.packs] if args.packs else []
     corpus = os.path.join(vault, CORPUS_REL)
     qmd = shutil.which("qmd")
-    env = qmd_runtime_env(vault, config)
+    env = qmd_runtime_env(vault, vault_config, config)
 
     def fallback(reason, hint=None):
         print(f"note: qmd unavailable ({reason}); falling back to `confidant find`",
