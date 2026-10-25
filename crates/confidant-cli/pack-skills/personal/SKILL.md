@@ -1,6 +1,6 @@
 ---
 name: "personal"
-description: "Personal relationships pack (personal@0.2): identity and contact fields, the touch ledger verb, birthdays/dates, keep-in-touch cadence with never/snooze, relationship edge kinds, and every finding code the pack can emit — what each means and what to do about it."
+description: "Personal relationships pack (personal@0.2): identity and contact fields, the touch ledger verb, birthdays/dates, keep-in-touch cadence with never/snooze, relationship edge kinds, the capture policy for who belongs in the vault, and every finding code the pack can emit — what each means and what to do about it."
 ---
 
 # personal@0.2
@@ -115,6 +115,53 @@ links an encrypted note; `--fallback-inbox` queues that note to the `inbox`
 branch when the keychain fails, instead of failing closed (#213). Every
 command takes `--json` and `--no-input` (ADR-7); branch on the error `code`,
 never on message text.
+
+## Who belongs in the vault
+
+An agent keeping a vault current sweeps the operator's calendar and email
+and constantly meets people who are *not in the vault*. Who gets added is
+policy, and policy that lives only in one agent's memory dies with that
+agent. This section is the standing policy (#728). It lives here, in the
+skill that owns the `touch` verb, until the meta skill (#724) exists; when
+that skill lands, this section moves there.
+
+1. **Meeting/call contact qualifies immediately.** If the operator is
+   meeting with someone — a meeting or a call — that person belongs in the
+   vault. Propose a minimal, factual record (name + what the sources show,
+   nothing inferred) together with the touch entry, in one approval.
+2. **Email-only contact must cross a threshold.** Not everyone who emails
+   the operator belongs in their relationship memory: cold outreach,
+   one-off threads, and scheduling mail must not mint records. Count
+   "exchange days": a day with a substantive human thread.
+   Automated, booking, and newsletter mail never counts. A person
+   qualifies when either of these holds in a 30-day window:
+   - at least 3 exchange days in 30 days; or
+   - the operator replies substantively on at least 2 separate days in
+     30 days.
+   Below threshold, track silently and say nothing — no drip of "should I
+   add…?" questions. This guidance names no store for those
+   below-threshold counts — there is no record yet to hold them — so do
+   not improvise a side list or ledger for them.
+3. **Operator overrides, both directions.** "Add X" qualifies instantly at
+   any time; "never track X" excludes permanently. Either override beats
+   rules 1–2 in either direction: "never track X" excludes even on
+   meeting/call contact, and "add X" qualifies even below the email
+   threshold. "Never track" here is distinct from `cadence: never`
+   (Fields): the latter means "never overdue" for a person already in
+   the vault and keeps the record; "never track" means no record at all.
+4. **Approval discipline unchanged.** Crossing a threshold earns a
+   *proposal*, not a write: propose → confirm → apply, every time.
+
+Scope: this section classifies only meeting/call contact (rule 1) and
+email-only contact (rule 2). It does not classify the other `touch`
+kinds — `text`, `meal`, `event`, `gift`, `other` — and it does not say
+whether a meal or event counts as a meeting for rule 1. For those
+kinds, fall back to operator judgment; do not extend rules 1–2 to
+them by analogy.
+
+The threshold numbers above are defaults the operator can tune; the shape
+is the guidance: meetings in, email earned, silent below threshold,
+overrides both ways.
 
 ## Configuration ([checks] keys)
 
