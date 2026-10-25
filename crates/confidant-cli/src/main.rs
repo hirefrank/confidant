@@ -13233,33 +13233,97 @@ fn cmd_keys_device_add_initiate(
 }
 
 /// `keys device-add --from-request <file>`: run on an already-enrolled
-// Read-only enrollment probe for `--from-request` (#713 follow-up).
-// Returns `Some(true)` when the request's key id or pubkey appears in
-// any verified recipient map (a client or the vault lookup key),
-// `Some(false)` when every map verified and neither appears, and `None`
-// when any map cannot be verified — callers then fall through to the
-// normal path, whose verify-first `add_recipient` fails closed on its
-// own. Verification advances the off-vault seq high-water marks, but
-// only past manifests that actually verified, so a probe that precedes
-// a staged mutation stays consistent with the staged tracker's copy.
-fn device_already_enrolled(
+// Per-client enrollment coverage for one device keypair (round-2 N1).
+// `enrolled` and `missing` partition the vault's expected clients:
+// every manifest client plus the vault lookup key. A device is fully
+// enrolled only when `missing` is empty; a non-empty `missing` alongside
+// a non-empty `enrolled` is partial enrollment, which no command can top
+// up in place (`add_recipient` refuses any re-used pubkey — the shred
+// guard), so callers must fail closed and name the missing clients.
+struct EnrollmentCoverage {
+    enrolled: Vec<String>,
+    missing: Vec<String>,
+}
+
+/// Read-only enrollment probe for `--from-request` (#713 follow-up).
+/// Returns `Some(coverage)` when every expected client's map verifies,
+/// and `None` when any map cannot be verified — callers then fall through
+/// to the normal path, whose verify-first `add_recipient` fails closed on
+/// its own. Unlike the original boolean probe, this checks ALL expected
+/// clients' wrappings: a single hit no longer reads as "enrolled".
+fn device_enrollment_coverage(
     store: &mut confidant_crypt::lifecycle::KeyStore,
     anchor: &confidant_crypt::anchor::Anchor,
     key_id: &str,
     pubkey: &str,
-) -> Option<bool> {
+) -> Option<EnrollmentCoverage> {
     use confidant_crypt::manifest::VAULT_CLIENT_ID;
     let mut clients = store.manifest_clients();
     if !clients.iter().any(|c| c == VAULT_CLIENT_ID) {
         clients.push(VAULT_CLIENT_ID.to_string());
     }
+    clients.sort();
+    let mut enrolled = Vec::new();
+    let mut missing = Vec::new();
     for client in &clients {
         let (_epoch, map, _commitments) = store.verified_recipients(client, anchor).ok()?;
         if map.contains_key(key_id) || map.values().any(|e| e.age_pubkey == pubkey) {
-            return Some(true);
+            enrolled.push(client.clone());
+        } else {
+            missing.push(client.clone());
         }
     }
-    Some(false)
+    Some(EnrollmentCoverage { enrolled, missing })
+}
+
+/// The fail-closed error for a partially enrolled device (round-2 N1):
+/// the anchor-only path cannot fix it, and no top-up exists, so name the
+/// missing clients and point at the supported recovery — a fresh device
+/// keypair enrolled from scratch. The stale key id may be revoked from
+/// the clients where it lingers once the fresh enrollment lands.
+fn partial_enrollment_error(
+    key_id: &str,
+    label: &str,
+    coverage: &EnrollmentCoverage,
+) -> anyhow::Error {
+    anyhow::Error::new(
+        DomainError::invalid(format!(
+            "device {key_id} ({label}) is only partially enrolled: it holds wrappings for {} but is missing wrappings for {}; refusing an anchor-only fix",
+            coverage.enrolled.join(", "),
+            coverage.missing.join(", ")
+        ))
+        .with_fix(format!(
+            "A partially enrolled keypair cannot be topped up in place: re-enrollment refuses any keypair already enrolled anywhere. Generate a fresh device keypair on the new device with `confidant keys device-add --initiate`, enroll that request with `confidant keys device-add --from-request <file> --anchor-out <anchor-file>`, then run `confidant keys device-add --complete --anchor-file <anchor-file>` on the new device after pulling. Optionally revoke the stale key id from the clients where it lingers with `confidant keys revoke <client> {key_id}`"
+        )),
+    )
+}
+
+/// Build the enrollment probe's KeyStore against a throwaway copy of the
+/// seq tracker (round-2 N5): the probe must be side-effect-free, so its
+/// verified-manifest advances land in a temp file, never in the real
+/// `manifest-seq.toml`. The copy carries the real high-water marks, so
+/// the replay check sees exactly what the real tracker would. Returns
+/// `None` when the throwaway cannot be built; callers then skip the probe
+/// and fall through to the normal path, as for an unverifiable probe.
+/// The caller removes the temp file after probing (best-effort); a
+/// leftover is never read, since the next probe deletes it first.
+fn probe_keystore(
+    root: &Path,
+    vault_id: &str,
+    config_dir: &Path,
+) -> Option<(confidant_crypt::lifecycle::KeyStore, PathBuf)> {
+    use confidant_crypt::manifest::{seq_tracker_path, SeqTracker};
+    let temp = config_dir.join(format!("manifest-seq.probe-{}.toml", std::process::id()));
+    remove_path_best_effort(&temp);
+    let real = seq_tracker_path(config_dir);
+    match std::fs::copy(&real, &temp) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let tracker = SeqTracker::load(&temp).ok()?;
+    let store = confidant_crypt::lifecycle::KeyStore::new(root.join("keys"), vault_id, tracker);
+    Some((store, temp))
 }
 
 /// device. Verifies the fingerprint out of band, re-wraps every client's
@@ -13356,33 +13420,50 @@ fn cmd_keys_device_add_from_request(
     // already-enrolled key — so probe enrollment BEFORE writing
     // anything. A plain re-run fails fast here (no orphaned anchor
     // file, no misleading failure after a write); --re-emit-anchor
-    // emits just the anchor with no enrollment and no commit.
+    // emits just the anchor with no enrollment and no commit. The probe
+    // is side-effect-free (round-2 N5): it runs against a throwaway copy
+    // of the seq tracker, so even a failing re-run leaves the operator's
+    // real tracker untouched.
     let vault = load_vault(root)?;
-    let mut probe_store = confidant_crypt::lifecycle::KeyStore::with_config_dir(
-        root.join("keys"),
-        &vault.config.vault_id,
-        &config_dir,
-    )
-    .map_err(anyhow::Error::new)?;
-    let already_enrolled =
-        device_already_enrolled(&mut probe_store, &anchor, &key_id, &request.pubkey);
-    drop(probe_store);
-    if already_enrolled == Some(true) && !re_emit_anchor {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "device {key_id} ({label}) is already enrolled; refusing to enroll it again"
-            ))
-            .with_fix(
-                "This device needs only its trust anchor: re-run with \
-                 `confidant keys device-add --from-request <file> --anchor-out <anchor-file> \
-                 --re-emit-anchor` (no new enrollment, no commit), then run \
-                 `confidant keys device-add --complete --anchor-file <anchor-file>` on the new device after pulling",
-            ),
-        ));
+    let coverage = match probe_keystore(root, &vault.config.vault_id, &config_dir) {
+        Some((mut probe_store, probe_tracker)) => {
+            let coverage =
+                device_enrollment_coverage(&mut probe_store, &anchor, &key_id, &request.pubkey);
+            drop(probe_store);
+            remove_path_best_effort(&probe_tracker);
+            coverage
+        }
+        None => None,
+    };
+    // Round-2 N1: partial enrollment fails closed in BOTH modes. The
+    // old fail-fast text ("needs only its trust anchor") asserted an
+    // anchor-only diagnosis on a single recipient-map hit; a device
+    // missing some clients' wrappings must never be routed down the
+    // anchor-only path, since --complete would then report success
+    // while those clients stay undecryptable.
+    if let Some(cov) = &coverage {
+        if !cov.enrolled.is_empty() && !cov.missing.is_empty() {
+            return Err(partial_enrollment_error(&key_id, &label, cov));
+        }
+    }
+    if let Some(cov) = &coverage {
+        if cov.missing.is_empty() && !re_emit_anchor {
+            return Err(anyhow::Error::new(
+                DomainError::invalid(format!(
+                    "device {key_id} ({label}) is already enrolled; refusing to enroll it again"
+                ))
+                .with_fix(
+                    "This device needs only its trust anchor: re-run with \
+                     `confidant keys device-add --from-request <file> --anchor-out <anchor-file> \
+                     --re-emit-anchor` (no new enrollment, no commit), then run \
+                     `confidant keys device-add --complete --anchor-file <anchor-file>` on the new device after pulling",
+                ),
+            ));
+        }
     }
     if re_emit_anchor {
-        match already_enrolled {
-            Some(false) => {
+        match &coverage {
+            Some(cov) if cov.enrolled.is_empty() => {
                 return Err(anyhow::Error::new(
                     DomainError::invalid(format!(
                         "device {key_id} ({label}) is not already enrolled; --re-emit-anchor only re-emits an anchor for an enrolled device"
@@ -13402,7 +13483,8 @@ fn cmd_keys_device_add_from_request(
                      a plain --from-request also verifies enrollment before mutating",
                 ));
             }
-            Some(true) => {}
+            // Full coverage: missing is empty (partial returned above).
+            Some(_) => {}
         }
         let path = anchor_out.ok_or_else(|| {
             anyhow::Error::new(DomainError::usage(
@@ -13444,8 +13526,6 @@ fn cmd_keys_device_add_from_request(
         write_anchor_out_file(&config_dir, root, path)?;
         anchor_written = true;
     }
-    let identity = keys_device_identity()?;
-    let operator_sk = load_operator_sk(&anchor)?;
     // #175: device-add runs against a staged copy of keys/; the
     // pre-commit check runs inside staged_keys_mutation before the swap,
     // so a failure leaves keys/ (and the seq tracker) exactly as they
@@ -13455,7 +13535,12 @@ fn cmd_keys_device_add_from_request(
     // anchor is public-key material only, and --complete verifies it
     // against the pulled vault and refuses when enrollment did not
     // land — but the operator must not conclude nothing was emitted.
+    // The device-identity and operator-key loads live inside the wrapper
+    // too (round-2 N2): a failure there also follows a successful anchor
+    // write and must carry the same NOTE.
     let enroll = || -> anyhow::Result<Vec<String>> {
+        let identity = keys_device_identity()?;
+        let operator_sk = load_operator_sk(&anchor)?;
         let clients = staged_keys_mutation(root, &vault, &config_dir, |store| {
             // #154 must-fix 4: the retired-recovery / shredded-client
             // denylist is load-bearing here, so fail closed rather than warn
@@ -13583,13 +13668,45 @@ fn anchor_out_inside_vault(root: &Path, path: &Path) -> bool {
             Err(_) => return false,
         }
     };
-    let Some(parent) = abs.parent() else {
+    // Round-2 N3: resolve a final-component symlink chain before the
+    // parent check. A dangling symlink pointing into the vault passes the
+    // parent check (its parent is outside) and `create_new` would follow
+    // it, writing anchor bytes into the working tree. Resolve links
+    // lexically — canonicalize cannot resolve a dangling target — and
+    // fail closed (treat as inside) on an unresolvable chain.
+    let mut dest = abs;
+    for _ in 0..40 {
+        let Ok(md) = std::fs::symlink_metadata(&dest) else {
+            break;
+        };
+        if !md.file_type().is_symlink() {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&dest) else {
+            return true;
+        };
+        dest = if target.is_absolute() {
+            target
+        } else {
+            match dest.parent() {
+                Some(parent) => parent.join(target),
+                None => return true,
+            }
+        };
+    }
+    if std::fs::symlink_metadata(&dest)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(parent) = dest.parent() else {
         return false;
     };
     let Ok(parent_canon) = parent.canonicalize() else {
         return false;
     };
-    let dest = match abs.file_name() {
+    let dest = match dest.file_name() {
         Some(name) => parent_canon.join(name),
         None => parent_canon,
     };
@@ -13778,14 +13895,82 @@ fn trial_unwrap_first_client(
     }
 }
 
+/// Per-client trial-unwrap outcome for `--complete` (round-2 N1). Unlike
+/// `trial_unwrap_first_client` (kept for `doctor`, where one passing
+/// client proves the anchor), `--complete` must not report success while
+/// some clients' wrappings are missing: it trials EVERY client. A
+/// `NoKey` trial (no wrapping for this device) lands in `missing`; any
+/// other failure is a hard error, since an unreadable client is not
+/// evidence of anything. Trials are side-effect-free: the trial path
+/// verifies manifests without advancing the seq tracker.
+struct ClientTrialCoverage {
+    passed: Vec<String>,
+    missing: Vec<String>,
+}
+
+fn trial_unwrap_coverage(
+    store: &confidant_crypt::lifecycle::KeyStore,
+    anchor: &confidant_crypt::anchor::Anchor,
+    identity: &dyn age::Identity,
+    device_pubkey: &str,
+) -> Result<ClientTrialCoverage, confidant_crypt::error::Error> {
+    use confidant_crypt::{error::Error, manifest::VAULT_CLIENT_ID};
+    let key_id = device_key_id(device_pubkey);
+    let mut clients: Vec<String> = store
+        .manifest_clients()
+        .into_iter()
+        .filter(|c| c != VAULT_CLIENT_ID)
+        .collect();
+    clients.sort();
+    let mut passed = Vec::new();
+    let mut missing = Vec::new();
+    for client_id in &clients {
+        let epoch = store.current_epoch(client_id)?;
+        match store.trial_unwrap_data_key(client_id, &key_id, epoch, identity, anchor) {
+            Ok(key) => {
+                drop(key);
+                passed.push(client_id.clone());
+            }
+            Err(Error::NoKey(_)) => missing.push(client_id.clone()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(ClientTrialCoverage { passed, missing })
+}
+
+/// The fail-closed error for `--complete` on a partially enrolled device
+/// (round-2 N1): the anchor is not installed (fresh path) or left exactly
+/// as it was (already-present path), and the missing clients are named.
+/// Recovery is a fresh device keypair enrolled from scratch — the same
+/// no-top-up rule as the operator-side probe. A device enrolled nowhere
+/// never reaches this error: it fails earlier as unenrolled.
+fn partial_complete_error(missing: &[String], anchor_already_installed: bool) -> anyhow::Error {
+    let installed_note = if anchor_already_installed {
+        " The installed trust anchor is left untouched."
+    } else {
+        " Nothing was installed."
+    };
+    anyhow::Error::new(
+        DomainError::invalid(format!(
+            "this device is only partially enrolled: it is missing wrappings for {}.{installed_note}",
+            missing.join(", ")
+        ))
+        .with_fix(
+            "A partially enrolled keypair cannot be topped up in place: re-enrollment refuses any keypair already enrolled anywhere. Generate a fresh device keypair on this device with `confidant keys device-add --initiate`, ask an enrolled device to enroll that request with `confidant keys device-add --from-request <file> --anchor-out <anchor-file>`, pull, then retry --complete",
+        ),
+    )
+}
+
 /// `keys device-add --complete` (#713): run on the new device after
 /// pulling the enrolled device's device-add commit. Verifies the trust
 /// anchor in `--anchor-file` against the pulled vault — operator
-/// certificate when present, vault lookup key, and one client data key —
+/// certificate when present, vault lookup key, and EVERY client data key
+/// (round-2 N1: a single passing client no longer proves coverage) —
 /// and installs it as this device's `trust.toml`. Fails loudly, writing
 /// nothing, when any applicable check fails, when this device is not
-/// enrolled yet, or when an anchor is already installed and differs.
-/// Re-running with the same anchor is a verified no-op.
+/// enrolled yet, when it is only partially enrolled, or when an anchor
+/// is already installed and differs. Re-running with the same anchor on
+/// a fully enrolled device is a verified no-op.
 fn cmd_keys_device_add_complete(
     cli: &Cli,
     root: &Path,
@@ -13820,7 +14005,7 @@ fn cmd_keys_device_add_complete(
             // Still verify: an identical-but-unusable anchor (wrong vault
             // pulled under it) must not report success. The re-run path
             // runs the same checks as a fresh install (S2) — certificate,
-            // lookup key, one client key — and reports the same JSON
+            // lookup key, every client key — and reports the same JSON
             // shape, so callers branching on `checks` see no difference.
             let vault = load_vault(root)?;
             let cert = verify_anchor_cert(root, &vault.config.vault_id, &candidate)?;
@@ -13840,9 +14025,47 @@ fn cmd_keys_device_add_complete(
             } else {
                 "absent"
             };
-            let client_unwrap =
-                trial_unwrap_first_client(&store, &candidate, identity.as_ref(), &device_pubkey)
+            let coverage =
+                trial_unwrap_coverage(&store, &candidate, identity.as_ref(), &device_pubkey)
                     .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
+            let client_unwrap = !coverage.passed.is_empty();
+            if !coverage.missing.is_empty() {
+                if lookup == "pass" || client_unwrap {
+                    // Round-2 N1: enrolled somewhere but missing some
+                    // clients — fail closed, anchor left untouched.
+                    return Err(partial_complete_error(&coverage.missing, true));
+                }
+                // Enrolled nowhere for any client and no lookup proof:
+                // the old first-client trial failed here too.
+                return Err(anyhow::Error::new(map_unwrap_failure(
+                    confidant_crypt::error::Error::NoKey(format!(
+                        "this device holds no wrapping for {}",
+                        coverage.missing.join(", ")
+                    )),
+                )));
+            }
+            if cert == "absent" && lookup == "absent" && !client_unwrap {
+                // Round-2 N4: every check is "absent", so nothing
+                // positively proved this anchor. The old code printed
+                // "could not be verified" yet reported ok:true with a
+                // success exit — the fresh-install path errors in this
+                // same case, and so does the re-run now.
+                return Err(anyhow::Error::new(
+                    DomainError::invalid(
+                        "trust anchor already installed but could not be verified against this vault: \
+                         no operator certificate, lookup key, or client keys were available to check against",
+                    )
+                    .with_fix(
+                        "Ask an enrolled device to run `confidant keys device-add --from-request` \
+                         for this device, pull on this device, then retry --complete",
+                    ),
+                ));
+            }
+            let client_coverage: serde_json::Map<String, serde_json::Value> = coverage
+                .passed
+                .iter()
+                .map(|c| (c.clone(), serde_json::Value::String("pass".to_string())))
+                .collect();
             if cli.json {
                 print_json(&serde_json::json!({
                     "ok": true,
@@ -13854,16 +14077,10 @@ fn cmd_keys_device_add_complete(
                         "lookup": lookup,
                         "client_unwrap": if client_unwrap { "pass" } else { "absent" },
                     },
+                    "client_coverage": client_coverage,
                 }))?;
-            } else if cert == "pass" || lookup == "pass" || client_unwrap {
-                println!("trust anchor already installed and verified for this vault");
             } else {
-                // Every check is "absent": nothing positively proved this
-                // anchor, so do not call it verified (S2).
-                println!(
-                    "trust anchor already installed but could not be verified against this vault: \
-                     no operator certificate, lookup key, or client keys were available to check against"
-                );
+                println!("trust anchor already installed and verified for this vault");
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -13904,9 +14121,24 @@ fn cmd_keys_device_add_complete(
     } else {
         "absent"
     };
-    let client_unwrap =
-        trial_unwrap_first_client(&store, &candidate, identity.as_ref(), &device_pubkey)
-            .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
+    let coverage = trial_unwrap_coverage(&store, &candidate, identity.as_ref(), &device_pubkey)
+        .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
+    let client_unwrap = !coverage.passed.is_empty();
+    if !coverage.missing.is_empty() {
+        if lookup == "pass" || client_unwrap {
+            // Round-2 N1: enrolled somewhere but missing some clients —
+            // fail closed without installing, naming the missing coverage.
+            return Err(partial_complete_error(&coverage.missing, false));
+        }
+        // Enrolled nowhere for any client and no lookup proof: the old
+        // first-client trial failed here too.
+        return Err(anyhow::Error::new(map_unwrap_failure(
+            confidant_crypt::error::Error::NoKey(format!(
+                "this device holds no wrapping for {}",
+                coverage.missing.join(", ")
+            )),
+        )));
+    }
     if lookup == "absent" && !client_unwrap {
         return Err(anyhow::Error::new(
             DomainError::invalid(
@@ -13933,6 +14165,11 @@ fn cmd_keys_device_add_complete(
         lookup,
         client_unwrap: if client_unwrap { "pass" } else { "absent" },
     };
+    let client_coverage: serde_json::Map<String, serde_json::Value> = coverage
+        .passed
+        .iter()
+        .map(|c| (c.clone(), serde_json::Value::String("pass".to_string())))
+        .collect();
     if cli.json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -13944,6 +14181,7 @@ fn cmd_keys_device_add_complete(
                 "lookup": checks.lookup,
                 "client_unwrap": checks.client_unwrap,
             },
+            "client_coverage": client_coverage,
         }))?;
     } else {
         println!("trust anchor installed for this vault");

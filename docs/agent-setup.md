@@ -157,7 +157,7 @@ confidant keys device-add --from-request ~/device-add-request.toml --anchor-out 
 git -C ~/vault pull
 confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
 # --complete verifies the anchor against the pulled vault (operator
-# certificate, lookup key, one client key) before installing it. Without
+# certificate, lookup key, every client key) before installing it. Without
 # this step the new device holds wrapped keys but cannot decrypt: `doctor`
 # reports the missing anchor as an error. Never copy another vault's anchor.
 # Re-running --complete with an already-installed anchor re-verifies the
@@ -172,6 +172,14 @@ confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
 confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml --re-emit-anchor
 # then --complete on the new device as above. Copying an enrolled device's
 # trust.toml works as a fallback, but it is unverified — prefer --anchor-out.
+# --complete verifies EVERY client key, not just one: a device missing some
+# clients' wrappings (partial enrollment) fails --complete naming the
+# missing clients, and a plain --from-request re-run or --re-emit-anchor
+# for such a device fails the same way. There is no top-up: re-enrollment
+# refuses any keypair already enrolled anywhere, so generate a fresh
+# device keypair (--initiate) and enroll that request instead. The
+# --from-request enrollment probe is side-effect-free: it never touches
+# the operator's seq tracker, even when the re-run then fails fast.
 ```
 
 Headless hosts without an OS keychain: the **new** device needs only
