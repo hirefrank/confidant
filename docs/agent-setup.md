@@ -36,7 +36,9 @@ A vault is a git repo: `init` scaffolds one and commits into it, a second
 device clones one, and sync pushes and pulls one. Check git up front, in
 this order, before any vault step — not at the first failure, when it is
 hardest to tell git-missing from git-unauthenticated from something else.
-This is the long form of step 3 of the install prompt in
+One exception, made explicit in item 3: credentials cannot be probed up
+front because no remote URL is known yet, so they are checked where the
+URL is known instead. This is the long form of step 3 of the install prompt in
 [`README.md`](../README.md#install); that prompt is canonical.
 
 1. **Git installed, new enough.** Run `git --version`. If git is missing,
@@ -44,33 +46,41 @@ This is the long form of step 3 of the install prompt in
    `xcode-select --install` or `brew install git`; Linux via the distro
    package manager (`apt install git`, `dnf install git`, or
    `pacman -S git`); Windows runs under WSL2, so install git inside WSL2
-   the same way. If the version is below 2.34.0, upgrade:
-   `confidant doctor` enforces that floor.
-2. **Git identity.** `init` commits, so it needs one. Ask the operator
-   for the values (do not invent them) and set them before `init`:
+   with that distro's package manager (for example `apt install git` on
+   Ubuntu/Debian, `dnf install git` on Fedora, `pacman -S git` on Arch).
+   If the version is below 2.34.0, upgrade (strongly recommended):
+   macOS `brew upgrade git`, Linux `apt upgrade git`, `dnf upgrade git`,
+   or `pacman -Syu git` (inside WSL2 for Windows). Below the floor is
+   not a hard block on a fresh install: `confidant doctor` reports it as
+   a warning unless SSH signers are configured, when it is an error —
+   SSH signature verification needs git >= 2.34, so upgrade before
+   configuring signers.
+2. **Git identity.** `init` commits, so it needs one. Check first with
+   `git config --global user.name` and `git config --global user.email`,
+   and set only values that are unset — do not overwrite an existing
+   identity. If a value is missing, ask the operator for it (do not
+   invent it) and set it before `init`:
 
    ```sh
    git config --global user.name "Your Name"
    git config --global user.email "you@example.com"
    ```
 
-3. **Git credentials, when the vault will use a remote.** Git installed
-   and working does **not** mean a private clone works: public clones can
-   succeed while a private vault clone fails for lack of a credential for
-   the host. Before any clone or `init --remote` step, probe it:
-   `git ls-remote <url>` must succeed, and `gh auth status` (when `gh`
-   is present) must show a logged-in account — `gh` installed but never
-   logged in authenticates nothing. If the probe fails on auth, fix
-   credentials first; do not debug the vault step. Recommended default on
-   a GitHub host: `gh auth login` (the device flow suits headless/agent
-   machines; once logged in, gh registers as git's credential helper and
-   plain clone/pull/push work). Alternatives: an SSH key, where SSH to
-   the host actually works, or a PAT stored via the git credential helper
-   / OS keychain — never pasted into a repo config, never committed, and
-   never an account password (GitHub rejects passwords for git
-   operations). A token that only exists somewhere else (for example one
-   an agent can only use through an API) does not count: if it cannot be
-   handed to git, the clone path is not working yet.
+3. **Git credentials — checked where the URL is known, not here.** At
+   this point no remote URL is known yet, so there is nothing to probe:
+   do not ask for one out of order and do not silently defer a probe
+   framed as happening now. The probe lives in
+   [Connect a git remote](#connect-a-git-remote-optional) and runs
+   immediately before the first clone or first push that uses the URL —
+   never as a precondition for `init --remote`, which only sets `origin`
+   and never contacts the host. In short: git installed and working
+   does **not** mean a private clone works (public clones can succeed
+   while a private vault clone fails for lack of a credential for the
+   host), and `GIT_TERMINAL_PROMPT=0 git ls-remote <url>` succeeding is
+   the gate. `gh auth status` is a diagnostic only, never a second gate:
+   a clone that already succeeds via an SSH key or a PAT in the
+   credential helper passes even when `gh` is not logged in, and on a
+   non-GitHub host a `gh` login is irrelevant.
 4. **Local-only is different.** Git is still required for `init`, but
    remote auth is not — do not conflate the two: a missing credential is
    not a blocker for a local-only vault.
@@ -89,13 +99,9 @@ Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2
 `confidant init --create` only scaffolds an absent or empty directory (a
 directory holding just `.git` and/or `.gitignore` also counts as empty). A
 non-empty directory is refused, so a stray `--create` cannot turn a project
-checkout into a vault. Git needs an identity first, because init commits
-(see [Git first](#git-first-required-before-any-vault-step)):
-
-```sh
-git config --global user.name "Your Name"
-git config --global user.email "you@example.com"
-```
+checkout into a vault. Git needs an identity first, because init commits — check first and
+set only if unset, as in [Git first](#git-first-required-before-any-vault-step)
+§2 (the identity block lives there, not here).
 
 Then create the vault. `--remote <url>` is optional and only sets `origin`
 (it does not push):
@@ -154,10 +160,29 @@ confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-
 git push -u origin main    # you run this; credentials and host keys stay yours
 ```
 
-Before that first push — and before any clone below — confirm
-`git ls-remote <url>` succeeds (see
-[Git first](#git-first-required-before-any-vault-step)): an auth failure
-there is a credentials problem to fix first, not a vault problem.
+Before that first push — and before any clone below — probe the URL,
+non-interactively so a missing credential fails instead of hanging on
+a prompt in an agent shell: `GIT_TERMINAL_PROMPT=0 git ls-remote <url>`
+must succeed. That success is the gate. If it fails, tell the two
+failures apart: an auth failure is a credentials problem to fix first,
+not a vault problem; a repository-not-found failure means the repo does
+not exist on the host yet — create it there first, then re-probe
+(credentials that are not broken do not need fixing). `gh auth status`
+is only a diagnostic, never a second gate: it matters only when
+`ls-remote` also fails and the chosen route is GitHub-over-HTTPS via
+`gh`. Recommended default on a GitHub host: `gh auth login` (the device
+flow suits headless/agent machines; an interactive login registers `gh`
+as git's credential helper, so plain clone/pull/push work on the HTTPS
+route). After a non-interactive `gh auth login --with-token`, run
+`gh auth setup-git` separately — that login alone does not register the
+helper. If the operator chose SSH during login, the helper claim does
+not apply at all. Alternatives: an SSH key, where SSH to the host
+actually works, or a PAT stored via the git credential helper / OS
+keychain — never pasted into a repo config, never committed, and never
+an account password (GitHub rejects passwords for git operations). A
+token that only exists somewhere else (for example one an agent can
+only use through an API) does not count: if it cannot be handed to git,
+the clone path is not working yet.
 
 If the vault already exists, run git yourself:
 
@@ -196,7 +221,8 @@ machine to the vault you already have.
 | Every enrolled device is lost | Clone the repo, then `confidant recover` (this rotates and revokes the current recovery phrase) |
 
 Typical second-device flow (confirm `git ls-remote <url>` succeeds before
-the clone — see [Git first](#git-first-required-before-any-vault-step)):
+the clone — see [Connect a git remote](#connect-a-git-remote-optional) for
+the probe, including its non-interactive form and failure modes):
 
 ```sh
 git clone <url> ~/vault

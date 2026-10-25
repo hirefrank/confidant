@@ -68,34 +68,32 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      before continuing: macOS `xcode-select --install` or
      `brew install git`; Linux via the distro package manager
      (`apt install git`, `dnf install git`, or `pacman -S git`); Windows
-     runs under WSL2, so install git inside WSL2 the same way (a
+     runs under WSL2, so install git inside WSL2 with that distro's
+     package manager (for example `apt install git` on Ubuntu/Debian,
+     `dnf install git` on Fedora, `pacman -S git` on Arch) — a
      standalone git-scm/winget install is native Windows git, which
-     Confidant does not support). If the version is below 2.34.0,
-     upgrade: `confidant doctor` enforces that floor.
-   - Make sure git has an identity, because `init` commits: ask me for
-     the values (do not invent them) and set
+     Confidant does not support. If the version is below 2.34.0,
+     upgrade (strongly recommended): macOS `brew upgrade git`, Linux
+     `apt upgrade git`, `dnf upgrade git`, or `pacman -Syu git` (inside
+     WSL2 for Windows). Below the floor is not a hard block on a fresh
+     install: `confidant doctor` reports it as a warning unless SSH
+     signers are configured, when it is an error — SSH signature
+     verification needs git >= 2.34, so upgrade before configuring
+     signers.
+   - Make sure git has an identity, because `init` commits: check first
+     with `git config --global user.name` and
+     `git config --global user.email`, and set only values that are
+     unset — do not overwrite an existing identity. If a value is
+     missing, ask me for it (do not invent it) and set
      `git config --global user.name "Your Name"` and
      `git config --global user.email "you@example.com"`.
-   - If this vault will use a remote (a `--remote <url>` at init, or a
-     clone onto a new device), suss out git credentials now too: git
-     installed and working does **not** mean a private clone works.
-     Probe it: `git ls-remote <url>` must succeed before any clone or
-     `init --remote` step, and `gh auth status` (when `gh` is present)
-     must show a logged-in account — `gh` installed but never logged in
-     authenticates nothing. If the probe fails on auth, fix credentials
-     first; do not debug the vault step. Recommended default on a GitHub
-     host: `gh auth login` (the device flow suits headless/agent
-     machines; once logged in, gh registers as git's credential helper
-     and plain clone/pull/push work). Alternatives: an SSH key, where
-     SSH to the host actually works, or a PAT stored via the git
-     credential helper / OS keychain — never pasted into a repo config,
-     never committed, and never an account password (GitHub rejects
-     passwords for git operations). A token that only exists somewhere
-     else (for example one an agent can only use through an API) does
-     not count: if it cannot be handed to git, the clone path is not
-     working yet.
-   - If this vault will be local-only, git is still required for `init`
-     but remote auth is not — do not conflate the two: a missing
+   - Do not probe remote credentials here: at this point you do not
+     yet know whether there is a remote at all, let alone its URL (step
+     6 asks that). Version and identity above are the whole of step 3;
+     the credential probe lives in step 6, at the point the URL is
+     known, immediately before the first clone or first push that uses
+     it. If this vault will be local-only, git is still required for
+     `init` but remote auth is not — do not conflate the two: a missing
      credential is not a blocker for a local-only vault.
 4. Ask me where my vault is. Export it for this session only:
    `export CONFIDANT_VAULT="<path>"`, and pass `--vault "<path>"`
@@ -141,12 +139,43 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
 6. Optional remote: **before** `init`, ask whether I already have a git
    remote URL for backup and putting this vault on another device. If I do,
    pass `--remote <url>` on `confidant init --create` (it sets `origin` and
-   does not push). If I decide after init, show me `git remote add origin
-   <url>`. In either case, set the upstream once with `git push -u origin
+   does not push). Before the first clone or first push that uses that
+   URL — not before `init --remote` itself, which only sets `origin`
+   and never contacts the host — probe it, non-interactively so a
+   missing credential fails instead of hanging on a prompt in an agent
+   shell: `GIT_TERMINAL_PROMPT=0 git ls-remote <url>` must succeed.
+   That success is the gate; git installed and working does **not**
+   mean a private clone works. If it fails, tell the two failures
+   apart: an auth failure means fix credentials first and do not debug
+   the vault step; a repository-not-found failure means the repo does
+   not exist on the host yet — create it there first, then re-probe
+   (credentials that are not broken do not need fixing).
+   `gh auth status` is only a diagnostic, never a second gate: a
+   private clone that already succeeds via an SSH key or a PAT in the
+   credential helper passes the gate even when `gh` is not logged in,
+   and on a non-GitHub host a `gh` login is irrelevant. `gh auth status`
+   matters only when `ls-remote` also fails and the chosen route is
+   GitHub-over-HTTPS via `gh`. Recommended default on a GitHub host:
+   `gh auth login` (the device flow suits headless/agent machines; an
+   interactive login registers `gh` as git's credential helper, so plain
+   clone/pull/push work on the HTTPS route). After a non-interactive
+   `gh auth login --with-token`, run `gh auth setup-git` separately —
+   that login alone does not register the helper. If the operator chose
+   SSH during login, the helper claim does not apply at all.
+   Alternatives: an SSH key, where SSH to the host actually works, or a
+   PAT stored via the git credential helper / OS keychain — never
+   pasted into a repo config, never committed, and never an account
+   password (GitHub rejects passwords for git operations). A token
+   that only exists somewhere else (for example one an agent can only
+   use through an API) does not count: if it cannot be handed to git,
+   the clone path is not working yet.
+   If I decide after init, show me `git remote add origin
+   <url>` (and probe before the first push, as above). In either case,
+   set the upstream once with `git push -u origin
    main`, then use `confidant sync --push` for later pushes on an encrypted
    vault — never push without my explicit confirmation. On a **new device
    for an existing vault**, do not run `init`: confirm
-   `git ls-remote <url>` succeeds first (step 3), then clone the repo and
+   `git ls-remote <url>` succeeds first (the probe above), then clone the repo and
    run `confidant keys device-add` (`recover` only if every enrolled device is
    lost).
 7. Verify: run `confidant check --vault "<path>" --json --no-input` and
