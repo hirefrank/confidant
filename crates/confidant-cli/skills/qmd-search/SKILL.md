@@ -46,6 +46,29 @@ truth for the search allowlist.
   are moved under the vault via `INDEX_PATH`/`QMD_CONFIG_DIR` (never
   `~/.cache`), and any `confidant` collection left in qmd's default store
   is removed on first run.
+- **The disk election happens once, at setup (#723).** When the gate
+  fails and the operator is present (stdin is a TTY), `qmd-index`
+  explains in plain language what the index is (a readable copy of the
+  cleared records), why the disk question matters, and what is
+  known/unknown about this host — then asks: assert and record, or
+  decline. Asserting writes the existing `[qmd] assume_encrypted_disk`
+  key (no new key) to the user config, preserving every other key; the
+  next run under the same home directory — or the next agent — never
+  asks again, because the write is re-parsed and verified before the
+  build proceeds (a config that cannot be recorded cleanly refuses
+  instead of proceeding on an unrecorded assertion). The election is
+  scoped to the home directory, not to a host or a disk: a shared or
+  restored `$HOME` carries the assertion to a different disk, and
+  `doctor` cannot distinguish that from a local election — revoke it
+  by deleting the key or setting it to `false`. Declining means QMD
+  stays off and `confidant find` remains the search path. There is no
+  third, silent outcome, and a non-TTY run keeps the old refusal rather
+  than prompting. Scripted setup uses
+  `--assert-and-persist-encrypted-disk` (the non-interactive form of
+  answering "assert"). `confidant doctor` reports the persisted
+  election forever after as a `qmd-disk` check — "asserted by operator
+  (…; an assertion, not a detection)" — per #709, so an assumption
+  never renders as detected.
 - **The §12 allowlist is enforced at query time, and uncleared records are
   also excluded at index time.** `confidant reindex` copies only the exact
   cleared set computed by the CLI (cleared record files and cleared ledger
@@ -182,7 +205,7 @@ every vault until re-persisted.
 
 ## Tooling
 
-- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk] [--skip-preflight]` — runs
+- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk] [--skip-preflight] [--assert-and-persist-encrypted-disk]` — runs
   `confidant reindex` to (re)build `<vault>/.confidant/qmd-corpus/` (a full
   rebuild: the CLI wipes the old corpus), then registers it as the `confidant`
   QMD collection (removing any previous one first). It never walks the vault
