@@ -209,6 +209,34 @@ fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     p
 }
 
+/// Flip base64 chars in an envelope file's body (after the closing
+/// `---`), keeping the header intact so structural parse succeeds and
+/// AEAD authentication fails — the tamper half of
+/// `tampered_envelope_refused_counted_no_content`, factored for reuse.
+fn tamper_envelope_body(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut fences = text.match_indices("---\n");
+    fences.next(); // opening fence
+    let (close_idx, _) = fences.next().expect("no closing fence");
+    let body_start = close_idx + 4;
+    for i in 0..8 {
+        let idx = body_start + i * 7;
+        if idx < bytes.len() {
+            // Stay inside the base64 alphabet so parse succeeds; the
+            // flipped ciphertext then fails AEAD authentication.
+            bytes[idx] = match bytes[idx] {
+                b'A' => b'B',
+                b'a' => b'b',
+                b'0' => b'1',
+                c if c.is_ascii_alphanumeric() => b'A',
+                c => c,
+            };
+        }
+    }
+    std::fs::write(path, &bytes).unwrap();
+}
+
 const PERSON: &str = "p-01J9Z3K4QF0000000000000000";
 
 fn person_md(id: &str, name: &str, bio: &str) -> String {
@@ -516,6 +544,285 @@ fn record_list_unkeyed_surfaces_skips_never_silently_empty() {
         );
         assert_eq!(v["refused_envelopes"], 0);
     }
+}
+
+/// #717: without a device key, `resolve` must not report an existing
+/// person as not found. The encrypted record is skipped, so the name set
+/// is incomplete and the miss is a cannot-search error naming the cause,
+/// with a fix pointing at the missing key material — never E_NOT_FOUND.
+/// With the key, the same vault still resolves the person, and a
+/// genuinely unknown name is still E_NOT_FOUND.
+#[test]
+fn resolve_unkeyed_is_cannot_search_not_not_found() {
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    // Keyed sanity: the person resolves, and a genuine miss is E_NOT_FOUND.
+    let out = h
+        .cmd(&["resolve", "Ada Example", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "keyed resolve failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON);
+
+    let out = h
+        .cmd(&["resolve", "Nobody Here", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "genuine miss must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+
+    // Unkeyed: the existing person's name AND id are both cannot-search.
+    for query in ["Ada Example", PERSON] {
+        let out = h
+            .cmd_no_device_key(&["resolve", query, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "unkeyed resolve must fail: {query}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("no person matches"),
+            "must never claim absence: {message}"
+        );
+        assert!(message.contains("could not be decrypted"), "{message}");
+        let fix = v["error"]["fix"].as_str().unwrap();
+        assert!(fix.contains("trust.toml"), "{fix}");
+        assert!(fix.contains("CONFIDANT_DEVICE_KEY"), "{fix}");
+        assert_eq!(out.status.code(), Some(1));
+    }
+}
+
+/// #717 review: the mixed vault at CLI level — one readable person plus
+/// one refused person envelope. The readable person still resolves; the
+/// refused person's name and id, and any unknown name, are
+/// cannot-search. This also covers the refused-only path at CLI level
+/// (the unit tests cover it; the original CLI test covers skipped only)
+/// and asserts the human (non-`--json`) rendering of `E_CANNOT_SEARCH`.
+#[test]
+fn resolve_mixed_vault_refused_person_is_cannot_search() {
+    let bea = "p-01J9Z3K4QH0000000000000000";
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+    h.init_client(bea);
+    let input2 = write_file(
+        h._tmp.path(),
+        "person2.md",
+        &person_md(bea, "Bea Demo", "Bio."),
+    );
+    h.record_add(&input2);
+
+    // Refuse Bea's profile envelope: flip ciphertext, keep the header.
+    tamper_envelope_body(&h.vault.join(format!("people/{bea}/profile.md")));
+
+    // Keyed: Ada still resolves; Bea and unknown names are cannot-search.
+    let out = h
+        .cmd(&["resolve", "Ada Example", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "Ada must resolve: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON);
+
+    for query in ["Bea Demo", bea, "Nobody Here"] {
+        let out = h
+            .cmd(&["resolve", query, "--json", "--no-input"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "refused resolve must fail: {query}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("envelope(s) were refused"), "{message}");
+        let fix = v["error"]["fix"].as_str().unwrap();
+        assert!(fix.contains("git history"), "{fix}");
+        assert!(fix.contains("backup"), "{fix}");
+        assert_eq!(out.status.code(), Some(1));
+    }
+
+    // Human rendering: code and fix on stderr, never a silent failure.
+    let out = h
+        .cmd(&["resolve", "Bea Demo", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = stdout(&out) + &stderr(&out);
+    assert!(text.contains("E_CANNOT_SEARCH"), "{text}");
+    assert!(text.contains("fix:"), "{text}");
+    assert!(text.contains("git history"), "{text}");
+}
+
+/// #717 review: `--person <p-ULID>` on write commands is gated like a
+/// name lookup. An existing encrypted id still resolves from the
+/// envelope header even without the device key (the write-vault hit is
+/// unchanged); a miss against the unkeyed vault is cannot-search, not a
+/// confident not-found; and a miss against the fully searched keyed
+/// vault is still not-found.
+#[test]
+fn write_person_id_unkeyed_is_cannot_search_not_not_found() {
+    let unknown = "p-01J9Z3K4QF9999999999999999";
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    // Keyed sanity: a note write by id works.
+    h.note_add(PERSON, "Note.", false);
+
+    // Unkeyed: the existing id still resolves (log touch needs no key).
+    let out = h
+        .cmd_no_device_key(&[
+            "log",
+            "touch",
+            PERSON,
+            "meal",
+            "--date",
+            "2026-10-13",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "existing id must still resolve unkeyed: {}",
+        stderr(&out)
+    );
+
+    // Unkeyed: a miss is cannot-search on both write paths.
+    let out = h
+        .cmd_no_device_key(&[
+            "log",
+            "touch",
+            unknown,
+            "meal",
+            "--date",
+            "2026-10-13",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unkeyed miss must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+    assert_eq!(out.status.code(), Some(1));
+
+    let body = write_file(h._tmp.path(), "note2.txt", "Note.");
+    let out = h
+        .cmd_no_device_key(&[
+            "note",
+            "add",
+            "--person",
+            unknown,
+            "--body-file",
+            body.to_str().unwrap(),
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unkeyed note miss must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+
+    // Keyed: the same miss is still a genuine not-found.
+    let out = h
+        .cmd(&[
+            "log",
+            "touch",
+            unknown,
+            "meal",
+            "--date",
+            "2026-10-13",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "keyed miss must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND", "{v}");
+}
+
+/// #717 review: `context` by id is gated like a name lookup. Unkeyed,
+/// the existing person's bundle cannot be built, but that is a
+/// cannot-search — never the old `E_INVALID` recovery remedy, which
+/// rotates keys for what is simply an absent anchor. A keyed miss is
+/// still not-found.
+#[test]
+fn context_id_unkeyed_is_cannot_search_not_invalid() {
+    let unknown = "p-01J9Z3K4QF9999999999999999";
+    let h = Harness::new();
+    h.keyed(PERSON);
+    let input = write_file(
+        h._tmp.path(),
+        "person.md",
+        &person_md(PERSON, "Ada Example", "Bio."),
+    );
+    h.record_add(&input);
+
+    let out = h
+        .cmd_no_device_key(&["context", PERSON, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unkeyed context must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+    let fix = v["error"]["fix"].as_str().unwrap();
+    assert!(
+        !fix.contains("recover"),
+        "fix must not suggest recovery: {fix}"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("could not be decrypted"),
+        "{v}"
+    );
+
+    let out = h
+        .cmd_no_device_key(&["context", unknown, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "unkeyed unknown context must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_CANNOT_SEARCH", "{v}");
+
+    let out = h
+        .cmd(&["context", unknown, "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "keyed unknown context must fail");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND", "{v}");
 }
 
 /// #572: `context` is operator-only for `no-ai` too. Without the flag the
