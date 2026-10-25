@@ -197,6 +197,16 @@ enum Command {
         /// Refused during `inbox rotate`.
         #[arg(long)]
         skip: Vec<String>,
+        /// Process semantic duplicates instead of skipping them (#747):
+        /// a queued ledger line whose touch/session identity is already
+        /// in the ledger still merges. A forced repeat queued via
+        /// `--fallback-inbox` carries its own per-item marker and needs
+        /// no drain flag; this flag is for unmarked duplicates (queued
+        /// by an outside tool, or before the marker existed). `src:` /
+        /// exact-text idempotency still applies. Refused during
+        /// `inbox rotate` (a rotate drain never forces).
+        #[arg(long)]
+        force: bool,
         /// Discard items by stem (repeatable) without merging them: remove
         /// them from the `inbox` branch in one signed commit. For an item
         /// the operator chose not to apply after `record resolve
@@ -596,6 +606,10 @@ enum LogAction {
         /// closed).
         #[arg(long)]
         fallback_inbox: bool,
+        /// Log even when an identical session (same person, date,
+        /// duration, tag) is already in the ledger (#747).
+        #[arg(long)]
+        force: bool,
     },
     /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
@@ -618,6 +632,10 @@ enum LogAction {
         /// instead of failing closed.
         #[arg(long)]
         fallback_inbox: bool,
+        /// Log even when an identical touch (same person, date, kind)
+        /// is already in the ledger (#747).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1219,12 +1237,23 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             dry_run,
             allow_unsigned,
             skip,
+            force,
             discard,
             action,
         } => {
             let root = vault_root.unwrap();
             // #457: `--discard` removes items without merging. It does not
             // combine with the drain or with rotate.
+            if *force && action.is_some() {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "`inbox --force` does not combine with `inbox rotate`: a rotate drain never forces duplicates",
+                )));
+            }
+            if *force && !discard.is_empty() {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "`inbox --force` does not combine with `inbox --discard`",
+                )));
+            }
             if !discard.is_empty() {
                 if action.is_some() {
                     return Err(anyhow::Error::new(DomainError::usage(
@@ -1255,6 +1284,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     *dry_run,
                     *allow_unsigned,
                     skip,
+                    *force,
                 ),
             }
         }
@@ -1269,6 +1299,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note,
                     src,
                     fallback_inbox,
+                    force,
                 } => cmd_log_session(
                     &cli,
                     &root,
@@ -1280,6 +1311,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note.clone(),
                     src.clone(),
                     *fallback_inbox,
+                    *force,
                 ),
                 LogAction::Touch {
                     person,
@@ -1288,6 +1320,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note,
                     src,
                     fallback_inbox,
+                    force,
                 } => cmd_log_touch(
                     &cli,
                     &root,
@@ -1298,6 +1331,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     note.clone(),
                     src.clone(),
                     *fallback_inbox,
+                    *force,
                 ),
             }
         }
@@ -3554,6 +3588,7 @@ fn cmd_inbox(
     dry_run: bool,
     allow_unsigned: bool,
     skip: &[String],
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault_path = root.display().to_string();
     let trusted_signers = user_config
@@ -3637,6 +3672,7 @@ fn cmd_inbox(
             pinned_pubkey,
             skip: skip.to_vec(),
             is_rotate_drain: false,
+            force,
         },
         &decrypt,
         inbox_keys.as_deref(),
@@ -3660,6 +3696,7 @@ fn cmd_inbox(
                     "kind": i.kind,
                     "target": i.target,
                     "action": i.action,
+                    "semantic_skipped": i.semantic_skipped,
                 })).collect::<Vec<_>>(),
                 "skipped": report.skipped.iter().map(|s| serde_json::json!({
                     "name": s.name,
@@ -3689,7 +3726,21 @@ fn cmd_inbox(
             );
         }
         for i in &report.items {
-            println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+            if i.semantic_skipped > 0 {
+                println!(
+                    "  {}  {:<6}  {}  {}  ({} semantic duplicate line(s) dropped)",
+                    i.name, i.kind, i.target, i.action, i.semantic_skipped
+                );
+            } else {
+                println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+            }
+        }
+        let total_semantic_skipped: usize = report.items.iter().map(|i| i.semantic_skipped).sum();
+        if total_semantic_skipped > 0 {
+            println!(
+                "inbox: {total_semantic_skipped} semantic duplicate line(s) dropped \
+                 (a forced repeat needs `inbox --force`, or a per-item force marker)"
+            );
         }
         for s in &report.skipped {
             println!("  {}  {:<6}  {}  deferred", s.name, s.kind, s.target);
@@ -4308,6 +4359,63 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
     Err(refuse_unknown_verb(verb))
 }
 
+/// #747: semantic idempotency for `log touch` / `log session`. Returns
+/// the existing line's vault-relative file and line number when an
+/// identical line is already in the ledger, so the refusal can point at
+/// it. The caller runs this after building the canonical request but
+/// before applying or queueing anything, so a refusal writes nothing and
+/// queues nothing. `note:` and `src:` never make a line distinct — a
+/// backfill that re-adds the same contact with a fresh note or
+/// provenance is still the same touchpoint. Lines already queued to the
+/// inbox are not visible here (they are encrypted to the inbox key);
+/// the drain skips them instead (see `plan_item`'s semantic check).
+fn find_duplicate_touch(
+    vault: &confidant_core::Vault,
+    person: &RecordId,
+    date: &chrono::NaiveDate,
+    kind: &str,
+) -> Option<(String, u32)> {
+    vault.entries.iter().find_map(|sourced| {
+        let (id, d, k) = confidant_core::touch::touch_identity(&sourced.entry)?;
+        (id == *person && d == *date && k == kind).then_some((sourced.file.clone(), sourced.line))
+    })
+}
+
+fn find_duplicate_session(
+    vault: &confidant_core::Vault,
+    person: &RecordId,
+    date: &chrono::NaiveDate,
+    duration: &str,
+    tag: Option<&str>,
+) -> Option<(String, u32)> {
+    let minutes = parse_duration_minutes(duration)?;
+    // Tags compare lowercased, matching `session_identity`, so a
+    // historical `Paid` line matches a `paid` re-log.
+    let tag = tag.unwrap_or("").to_ascii_lowercase();
+    vault.entries.iter().find_map(|sourced| {
+        let (id, d, m, t) = confidant_core::ledger::session_identity(&sourced.entry)?;
+        (id == *person && d == *date && m == minutes && t == tag)
+            .then_some((sourced.file.clone(), sourced.line))
+    })
+}
+
+/// #747: whether `apply_record_write` should decide this write instead of
+/// the duplicate refusal. True when `--request-id` is present and either
+/// invalid (so the write path reports the usage error) or already
+/// committed (so it replays an exact retry or reports an idempotency
+/// conflict). Without this, a retry after a timeout would be refused as
+/// a duplicate instead of replaying.
+fn defer_to_write_path(root: &Path, cli: &Cli, canonical: &str) -> anyhow::Result<bool> {
+    let Some(rid) = cli.request_id.as_deref() else {
+        return Ok(false);
+    };
+    if rid.trim().is_empty() || rid.chars().count() < 22 {
+        return Ok(true);
+    }
+    let (id_hash, _) = confidant_core::write::idempotency_digests(rid, canonical);
+    Ok(confidant_core::write::find_request_commit(root, &id_hash, cli.no_input)?.is_some())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_log_session(
     cli: &Cli,
@@ -4320,15 +4428,36 @@ fn cmd_log_session(
     note: Option<String>,
     src: Option<String>,
     fallback_inbox: bool,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     require_log_verb(&vault, "session")?;
     let person = resolve_person_arg(root, &vault, person_raw)?;
     announce_resolved_person(cli, &person);
-    if parse_duration_minutes(duration).is_none() {
+    let Some(minutes) = parse_duration_minutes(duration) else {
         return Err(anyhow::Error::new(DomainError::usage(format!(
             "bad duration '{duration}'; use like 60m or 1h30m"
         ))));
+    };
+    // #747 review: the billing tag is a closed vocabulary — a
+    // free-form token would silently count as untagged in balance
+    // math, and `Paid` would be a distinct session from `paid`.
+    // Validate before the refusal, like touch kinds are validated
+    // before comparison, so the refusal never compares raw tags.
+    // #747 round 3: the vocabulary is the union of the enabled packs'
+    // `session-checks` billing tags for verb `session`, falling back
+    // to the core default (`paid`, `pps`, `comp`) when no enabled pack
+    // declares any — so a pack that bills under different tags is no
+    // longer overruled at log time. Fail-closed enforcement is
+    // unchanged: an unlisted tag still fails, in any case.
+    if let Some(t) = &tag {
+        let tags = confidant_core::packs::session_billing_tags_for_vault(&vault);
+        if !tags.iter().any(|valid| valid == t) {
+            return Err(anyhow::Error::new(DomainError::usage(format!(
+                "bad session tag '{t}'; use one of: {}",
+                tags.join(", ")
+            ))));
+        }
     }
     let date = parse_date_arg(&date_raw)?;
 
@@ -4399,6 +4528,32 @@ fn cmd_log_session(
         person.id,
         tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
     );
+    // #747: refuse an identical session before applying or queueing
+    // anything, unless --force or the write path owns the decision
+    // (a known --request-id replays or conflicts there).
+    if !force {
+        if let Some((file, line)) =
+            find_duplicate_session(&vault, &person.id, &date, duration, tag.as_deref())
+        {
+            if !defer_to_write_path(root, cli, &canonical)? {
+                return Err(anyhow::Error::new(
+                    DomainError::already_exists(format!(
+                        // #747 review: name the normalized minutes, not
+                        // the raw typed duration — re-logging `1h`
+                        // against a stored `60m` line reports a `60m`
+                        // session, so the message points at the line
+                        // matched.
+                        "a {minutes}m{} session for {} on {date} is already in the ledger ({file}:{line})",
+                        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
+                        person.id,
+                    ))
+                    .with_file(file)
+                    .with_line(line)
+                    .with_fix("Pass --force to log a genuinely separate session anyway"),
+                ));
+            }
+        }
+    }
     // #176: a session WITH a note needs the device key (the note record
     // is encrypted). Probe the key early so a keychain failure fails
     // closed here with a note-specific fix, instead of surfacing the
@@ -4436,6 +4591,7 @@ fn cmd_log_session(
                     &note_rel,
                     &note_contents,
                     &person,
+                    force,
                 );
             }
             return Err(note_keychain_error());
@@ -4469,6 +4625,7 @@ fn cmd_log_touch(
     note: Option<String>,
     src: Option<String>,
     fallback_inbox: bool,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     // #551: the built-in personal pack is implicit, so `touch` is always
@@ -4545,6 +4702,24 @@ fn cmd_log_touch(
         src.as_deref().unwrap_or(""),
     );
     let summary = format!("touch {} {kind}", person.id);
+    // #747: refuse an identical touch before applying or queueing
+    // anything, unless --force or the write path owns the decision
+    // (a known --request-id replays or conflicts there).
+    if !force {
+        if let Some((file, line)) = find_duplicate_touch(&vault, &person.id, &date, kind) {
+            if !defer_to_write_path(root, cli, &canonical)? {
+                return Err(anyhow::Error::new(
+                    DomainError::already_exists(format!(
+                        "a {kind} touch for {} on {date} is already in the ledger ({file}:{line})",
+                        person.id,
+                    ))
+                    .with_file(file)
+                    .with_line(line)
+                    .with_fix("Pass --force to log a genuinely separate touch anyway"),
+                ));
+            }
+        }
+    }
     if note_body.is_some() {
         let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
             .map_err(anyhow::Error::new)?;
@@ -4570,6 +4745,7 @@ fn cmd_log_touch(
                     &note_rel,
                     &note_contents,
                     &person,
+                    force,
                 );
             }
             return Err(note_keychain_error());
@@ -4773,7 +4949,10 @@ fn run_offered_command(
 /// token (in addition to any operator `--src`), so the drain's
 /// idempotency skips it on re-import. The note record item carries the
 /// exact bytes a normal write would have produced, so the drained
-/// result matches a normal write.
+/// result matches a normal write. When `force` is true, the ledger
+/// item also carries a `force: true` header so the drain processes a
+/// deliberately repeated line instead of semantically skipping it
+/// (#747 round 3).
 #[allow(clippy::too_many_arguments)]
 fn queue_session_note_to_inbox(
     cli: &Cli,
@@ -4784,6 +4963,7 @@ fn queue_session_note_to_inbox(
     note_rel: &Path,
     note_contents: &str,
     person: &ResolvedPersonArg,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     use confidant_core::QueueItem;
     // The pin is the verification: the fallback encrypts to the pinned
@@ -4833,10 +5013,22 @@ fn queue_session_note_to_inbox(
 
     let batch = confidant_core::write::new_ulid();
     let ledger_line = format!("{line} src:fallback/{batch}");
+    // #747 round 3: a forced repeat carries its force through the queue
+    // as a `force: true` item header, so the drain processes it instead
+    // of applying the semantic duplicate skip — without it, `--force`
+    // + `--note` + key-unavailable + `--fallback-inbox` silently lost
+    // the ledger line at drain while its note still merged, leaving a
+    // note without its session. The header is on the ledger item only;
+    // the note record item merges by path as usual.
+    let ledger_header = if force {
+        "confidant-inbox/1\nkind: ledger\nforce: true\n"
+    } else {
+        "confidant-inbox/1\nkind: ledger\n"
+    };
     let items = vec![
         QueueItem {
             stem: batch.clone(),
-            plaintext: format!("confidant-inbox/1\nkind: ledger\n---\n{ledger_line}\n"),
+            plaintext: format!("{ledger_header}---\n{ledger_line}\n"),
         },
         QueueItem {
             stem: format!("{batch}-note"),

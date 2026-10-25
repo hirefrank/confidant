@@ -6,7 +6,9 @@
 //! malformed lines through them, `context` reads kinds through them, and
 //! `confidant log touch` validates against the same constant.
 
+use crate::id::RecordId;
 use crate::ledger::{Arg, LedgerEntry};
+use chrono::NaiveDate;
 
 /// Closed list of touchpoint kinds for `touch` (#182, #227 Q1; the 0.1 set
 /// as amended by #509, plus `video` per #735). `coffee` was removed, not
@@ -24,10 +26,14 @@ pub fn is_valid_touch_kind(kind: &str) -> bool {
 /// Extract the touchpoint kind from either a positional `KIND` token
 /// (`2026-10-12 touch p-… call`) or a `kind:KIND` pair
 /// (`2026-10-12 touch p-… kind:call`). A `kind:` pair wins over a positional
-/// token. Returns `None` when the entry carries no (valid) kind.
+/// token, and it is validated against [`TOUCH_KINDS`] exactly like the
+/// positional branch (#747 review): an invalid pair yields no kind,
+/// instead of letting two malformed `kind:coffee` lines draw a duplicate
+/// finding on top of `E_TOUCH_MALFORMED`. Returns `None` when the entry
+/// carries no (valid) kind.
 pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
     if let Some(k) = entry.pair("kind") {
-        return Some(k.to_owned());
+        return is_valid_touch_kind(k).then(|| k.to_owned());
     }
     if let Some(tok) = entry.args.first().and_then(Arg::as_token) {
         if is_valid_touch_kind(tok) {
@@ -35,6 +41,22 @@ pub fn extract_touch_kind(entry: &LedgerEntry) -> Option<String> {
         }
     }
     None
+}
+
+/// Identity of a `touch` line for semantic idempotency (#747): the person,
+/// the date, and the kind. `note:` and `src:` pairs are deliberately not
+/// part of the identity — a backfill that re-adds the same contact with a
+/// fresh note or provenance is still the same touchpoint. Returns `None`
+/// for non-`touch` lines and for `touch` lines with no (valid) kind: a
+/// kind-less mirrored touchpoint cannot be shown identical to another, so
+/// `check` leaves those alone and `log touch` (which always carries a
+/// kind) never writes one.
+pub fn touch_identity(entry: &LedgerEntry) -> Option<(RecordId, NaiveDate, String)> {
+    if entry.verb != "touch" {
+        return None;
+    }
+    let kind = extract_touch_kind(entry)?;
+    Some((entry.id.clone(), entry.date, kind))
 }
 
 /// Validate a `touch` line's arguments when the owning pack is enabled.
@@ -178,5 +200,37 @@ mod tests {
         // A positional token outside the list is not a kind.
         assert!(extract_touch_kind(&entry(vec![token("coffee")])).is_none());
         assert!(extract_touch_kind(&entry(vec![])).is_none());
+        // #747 review: a `kind:` pair is validated the same way — a
+        // malformed pair yields no kind, even when a valid positional
+        // token is also present (the pair wins).
+        assert!(extract_touch_kind(&entry(vec![pair("kind", "coffee")])).is_none());
+        assert!(extract_touch_kind(&entry(vec![token("meet"), pair("kind", "coffee")])).is_none());
+    }
+
+    /// #747: identity is person + date + kind; note:/src: do not
+    /// distinguish, and kind-less or non-touch lines have no identity.
+    #[test]
+    fn touch_identity_ignores_note_and_src() {
+        let base = entry(vec![token("meet")]);
+        let noted = entry(vec![
+            token("meet"),
+            pair("note", "n-01M3TC5H00MPJG000000000000"),
+            pair("src", "zoom/t-1"),
+        ]);
+        assert_eq!(touch_identity(&base), touch_identity(&noted));
+        let mirrored = entry(vec![pair("kind", "meet")]);
+        assert_eq!(touch_identity(&base), touch_identity(&mirrored));
+        let other_kind = entry(vec![token("call")]);
+        assert_ne!(touch_identity(&base), touch_identity(&other_kind));
+        // Kind-less mirrored line: no identity.
+        assert!(touch_identity(&entry(vec![])).is_none());
+        // Unknown kind: no identity (E_TOUCH_MALFORMED covers it),
+        // whether it arrives positionally or as a `kind:` pair.
+        assert!(touch_identity(&entry(vec![token("coffee")])).is_none());
+        assert!(touch_identity(&entry(vec![pair("kind", "coffee")])).is_none());
+        // Another verb: no identity.
+        let mut session = base.clone();
+        session.verb = "session".to_owned();
+        assert!(touch_identity(&session).is_none());
     }
 }

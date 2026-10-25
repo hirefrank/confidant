@@ -788,6 +788,103 @@ fn merge_fork_duplicate_ulid_and_src() {
     assert!(c.contains(&"E_DUPLICATE_SRC".into()), "{c:?}");
 }
 
+/// #747: a second `touch` line for the same person, date, and kind is
+/// `W_DUPLICATE_TOUCH`; `note:`/`src:` do not distinguish, while a
+/// different kind, a different date, and kind-less mirrored lines do not
+/// flag.
+#[test]
+fn duplicate_touch_lines_are_w_duplicate_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 touch {ADA} meet\n\
+             2026-10-01 touch {ADA} meet note:{NOTE} src:zoom/t-1\n\
+             2026-10-01 touch {ADA} call\n\
+             2026-10-02 touch {ADA} meet\n\
+             2026-10-01 touch {ADA}\n\
+             2026-10-01 touch {ADA}\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let dups: Vec<&Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_DUPLICATE_TOUCH")
+        .collect();
+    assert_eq!(dups.len(), 1, "{json}");
+    assert_eq!(dups[0]["severity"], "warning");
+    assert_eq!(dups[0]["file"], "ledger/2026/10.cfd");
+    assert_eq!(dups[0]["line"], 2);
+    assert_eq!(dups[0]["id"], ADA);
+}
+
+/// #747 review: a second `session` line for the same person, date,
+/// duration, and tag is `W_DUPLICATE_SESSION` — the session mirror of
+/// `W_DUPLICATE_TOUCH`. Durations compare by minutes (`1h` flags
+/// against `60m`); a different tag or a different date does not flag.
+#[test]
+fn duplicate_session_lines_are_w_duplicate_session() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    note(dir.path(), NOTE, ADA, "2026-10-01");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 session {ADA} 60m paid\n\
+             2026-10-01 session {ADA} 60m paid note:{NOTE} src:zoom/t-1\n\
+             2026-10-01 session {ADA} 1h paid\n\
+             2026-10-01 session {ADA} 60m pps\n\
+             2026-10-02 session {ADA} 60m paid\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let dups: Vec<&Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "W_DUPLICATE_SESSION")
+        .collect();
+    assert_eq!(dups.len(), 2, "{json}");
+    assert_eq!(dups[0]["severity"], "warning");
+    assert_eq!(dups[0]["file"], "ledger/2026/10.cfd");
+    assert_eq!(dups[0]["line"], 2);
+    assert_eq!(dups[0]["id"], ADA);
+    assert_eq!(dups[1]["line"], 3);
+}
+
+/// #747 review: two malformed `kind:coffee` mirrored lines draw
+/// `E_TOUCH_MALFORMED` but no `W_DUPLICATE_TOUCH` — the pair branch of
+/// `extract_touch_kind` is validated like the positional branch.
+#[test]
+fn malformed_kind_pair_lines_are_not_duplicate_touches() {
+    let dir = tempfile::tempdir().unwrap();
+    vault_toml(dir.path(), DEFAULT_CHECKS);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!(
+            "2026-10-01 touch {ADA} kind:coffee\n\
+             2026-10-01 touch {ADA} kind:coffee\n"
+        ),
+    );
+    let json = report_json(dir.path(), None);
+    let c = codes(&json);
+    assert!(c.contains(&"E_TOUCH_MALFORMED".to_string()), "{c:?}");
+    assert!(
+        !c.contains(&"W_DUPLICATE_TOUCH".to_string()),
+        "malformed kind: lines must not draw a duplicate finding: {c:?}"
+    );
+}
+
 #[test]
 fn config_errors_are_e_config() {
     let dir = tempfile::tempdir().unwrap();

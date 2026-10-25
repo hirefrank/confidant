@@ -108,6 +108,17 @@ pub trait Pack: Send + Sync {
     fn edge_kinds(&self) -> &'static [EdgeKind] {
         &[]
     }
+    /// Billing tags this pack's `session-checks` rules declare (#747
+    /// round 3). Only rules whose `verb` is `session` count: a rule
+    /// checking another verb's lines does not change what `log
+    /// session` accepts. Defaults to none — a pack without a
+    /// `session-checks` rule for `session` has no opinion, and the
+    /// caller falls back to [`crate::ledger::SESSION_TAGS`].
+    /// Manifest packs override this from their manifest; other packs
+    /// keep the default.
+    fn session_billing_tags(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Finding codes this pack's rules can emit (its `fold`, `findings`,
     /// and `check_balance` implementations). Every code listed here must
     /// be documented in the pack's `SKILL.md` ("what it means, what to do")
@@ -290,6 +301,38 @@ pub fn resolve_enabled<'a>(
         }
     }
     (found, unknown)
+}
+
+/// The billing-tag vocabulary `log session` accepts for this vault
+/// (#747 round 3): the union, in enabled-pack order, of every enabled
+/// pack's `session-checks` tags for verb `session`, deduplicated. When
+/// no enabled pack declares any (the implicit personal pack has no
+/// `session-checks` rule, so this is the common case), this is the core
+/// default [`crate::ledger::SESSION_TAGS`]. The union is deliberate:
+/// tag validation at log time is permissive across packs, while each
+/// pack's own `session-checks` rule still counts only its declared
+/// tags at `check` time, so a tag valid in one pack but not another is
+/// accepted at log time and flagged by the stricter pack's check, never
+/// silently dropped. Unknown pack listings contribute nothing (they
+/// are reported elsewhere as orphans); a pack whose manifest fails to
+/// load is not enabled, so its tags cannot widen validation.
+pub fn session_billing_tags_for_vault(vault: &Vault) -> Vec<String> {
+    let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
+    let mut tags: Vec<String> = Vec::new();
+    for pack in enabled {
+        for tag in pack.session_billing_tags() {
+            if !tag.trim().is_empty() && !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+    if tags.is_empty() {
+        tags = crate::ledger::SESSION_TAGS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+    }
+    tags
 }
 
 /// A claim two packs make on the same verb, record type, field, balance

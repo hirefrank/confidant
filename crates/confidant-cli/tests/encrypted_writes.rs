@@ -2561,6 +2561,208 @@ fn log_session_note_fallback_inbox_queues_and_drains() {
 }
 
 #[test]
+fn log_session_fallback_queued_twice_drains_to_one_line() {
+    // #747 review: a session queued via `--fallback-inbox` lives in
+    // the inbox, not the ledger, so the write-time refusal cannot see
+    // it — re-logging the identical session queues a second copy.
+    // The drain must merge it at most once: the second queued line is
+    // a semantic duplicate (same person, date, duration, tag; its
+    // fresh `src:fallback/…` token does not distinguish it) and is
+    // skipped, not appended.
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    for _ in 0..2 {
+        let out = log_session_no_key(&h, &["--fallback-inbox"]);
+        assert!(
+            out.status.success(),
+            "fallback queue failed: {}",
+            stderr(&out)
+        );
+    }
+
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let session_lines: Vec<&str> = ledger
+        .lines()
+        .filter(|l| l.contains("2026-10-13 session"))
+        .collect();
+    assert_eq!(
+        session_lines.len(),
+        1,
+        "the second queued copy must not append a second line:\n{ledger}"
+    );
+}
+
+#[test]
+fn log_session_forced_fallback_repeat_drains_to_a_session() {
+    // #747 round 3: `--force` + `--note` + key-unavailable +
+    // `--fallback-inbox` on an already-logged session must not lose
+    // the ledger line at drain while its note still merges (a note
+    // without its session). The queued ledger item carries a
+    // `force: true` header, so a plain drain processes the repeat.
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    // First copy: queue and drain normally — one session line.
+    let out = log_session_no_key(&h, &["--fallback-inbox"]);
+    assert!(
+        out.status.success(),
+        "fallback queue failed: {}",
+        stderr(&out)
+    );
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+
+    // Forced repeat: the write-time refusal is bypassed by --force,
+    // the key is still unavailable, so it queues with a force marker.
+    let out = log_session_no_key(&h, &["--force", "--fallback-inbox"]);
+    assert!(
+        out.status.success(),
+        "forced fallback queue failed: {}",
+        stderr(&out)
+    );
+
+    // A plain drain must now produce the second session, not drop it.
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let session_lines: Vec<&str> = ledger
+        .lines()
+        .filter(|l| l.contains("2026-10-13 session"))
+        .collect();
+    assert_eq!(
+        session_lines.len(),
+        2,
+        "the forced repeat must drain to a second session line, not a note without one:\n{ledger}"
+    );
+}
+
+#[test]
+fn log_session_fallback_duplicates_drain_with_force() {
+    // #747 round 3: `confidant inbox --force` is the drain-time escape
+    // for unmarked duplicates — two queued copies of the same session
+    // (no per-item marker) both merge when the operator drains with
+    // --force, and the drain report names no semantic drops.
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    for _ in 0..2 {
+        let out = log_session_no_key(&h, &["--fallback-inbox"]);
+        assert!(
+            out.status.success(),
+            "fallback queue failed: {}",
+            stderr(&out)
+        );
+    }
+
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--force", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+    assert!(
+        !stdout(&out).contains("semantic duplicate"),
+        "a forced drain drops nothing: {}",
+        stdout(&out)
+    );
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    let session_lines: Vec<&str> = ledger
+        .lines()
+        .filter(|l| l.contains("2026-10-13 session"))
+        .collect();
+    assert_eq!(
+        session_lines.len(),
+        2,
+        "drain --force must merge both queued copies:\n{ledger}"
+    );
+}
+
+#[test]
+fn log_session_fallback_duplicate_drain_reports_semantic_drop() {
+    // #747 round 3: without --force, the second queued copy is dropped
+    // at drain — and the drain report now says so, per item, instead
+    // of reporting a bare `skip`/`merge` with no indication a line was
+    // dropped (distinguishing a semantic drop from an exact re-import).
+    let h = Harness::new();
+    let ledger_dir = fallback_setup(&h);
+
+    let inbox_bech32 = age_generate_bech32();
+    let inbox_recipient = age_recipient(&inbox_bech32);
+    advertise_vault_inbox_pubkey(&h, &inbox_recipient);
+    write_user_config_pin(&h.home, &inbox_recipient);
+    let Some(_signing) = ssh_signing(&h) else {
+        eprintln!("SKIP: ssh-keygen unavailable");
+        return;
+    };
+
+    for _ in 0..2 {
+        let out = log_session_no_key(&h, &["--fallback-inbox"]);
+        assert!(
+            out.status.success(),
+            "fallback queue failed: {}",
+            stderr(&out)
+        );
+    }
+
+    let mut drain = h.cmd(&["inbox", "--allow-unsigned", "--no-input"]);
+    drain.env("CONFIDANT_INBOX_KEY", &inbox_bech32);
+    let out = drain.output().unwrap();
+    assert!(out.status.success(), "drain failed: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("semantic duplicate line(s) dropped"),
+        "the drain report must name the semantic drop: {}",
+        stdout(&out)
+    );
+
+    let ledger = std::fs::read_to_string(ledger_dir.join("10.cfd")).unwrap();
+    assert_eq!(
+        ledger
+            .lines()
+            .filter(|l| l.contains("2026-10-13 session"))
+            .count(),
+        1,
+        "the unforced second copy still merges at most once:\n{ledger}"
+    );
+}
+
+#[test]
 fn log_session_note_fallback_refuses_pin_mismatch() {
     // #213: the fallback refuses when the vault pubkey does not match
     // the user-config pin — encrypting to an unverified key would be

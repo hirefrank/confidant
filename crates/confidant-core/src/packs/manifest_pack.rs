@@ -177,6 +177,34 @@ impl Pack for ManifestPack {
         self.finding_codes
     }
 
+    /// #747 round 3: the pack's `session-checks` billing tags for verb
+    /// `session`, in rule order, deduplicated. Malformed entries
+    /// (missing/non-array/non-string tags, a rule for another verb)
+    /// contribute nothing here — manifest validation rejects them
+    /// elsewhere, and log-time validation must not crash on them.
+    fn session_billing_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = Vec::new();
+        for rule in &self.manifest.rules {
+            if rule.kind != "session-checks" {
+                continue;
+            }
+            if rule.params.get("verb").and_then(|v| v.as_str()) != Some("session") {
+                continue;
+            }
+            let Some(list) = rule.params.get("billing_tags").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for tag in list {
+                if let Some(tag) = tag.as_str() {
+                    if !tag.trim().is_empty() && !tags.contains(&tag.to_string()) {
+                        tags.push(tag.to_string());
+                    }
+                }
+            }
+        }
+        tags
+    }
+
     /// `verb → id-type` constraints from the manifest's `[[verbs]]`.
     fn verb_id_type(&self, verb: &str) -> Option<Prefix> {
         self.verb_id_types
@@ -365,5 +393,115 @@ pub struct ManifestState {
 impl PackState for ManifestState {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::manifest::parse_manifest_compiled_in;
+    use crate::packs::Pack;
+
+    /// A v2 manifest whose `session-checks` rule bills under different
+    /// tags than the core default, plus a second `session-checks` rule
+    /// for another verb that must not change `log session` validation.
+    fn session_pack() -> &'static ManifestPack {
+        let text = r#"manifest_version = 2
+record_types = []
+balance_metrics = []
+finding_codes = ["E_SESS_DURATION", "E_SESS_TAGS", "W_SESS_UNTAGGED", "E_SESS_NOTES", "E_OTHER_DURATION", "E_OTHER_TAGS", "W_OTHER_UNTAGGED", "E_OTHER_NOTES"]
+
+[pack]
+name = "billing-pack"
+version = "0.1"
+skill = "SKILL.md"
+requires_spec = ["0.1"]
+
+[[verbs]]
+name = "session"
+id_type = "person"
+
+[[verbs]]
+name = "use"
+
+[[checks.severity]]
+key = "billing-pack.duration"
+default = "error"
+
+[[checks.severity]]
+key = "billing-pack.notes"
+default = "error"
+
+[[rules]]
+id = "sessions"
+kind = "session-checks"
+code = "E_SESS_DURATION"
+severity_duration_key = "billing-pack.duration"
+severity_notes_key = "billing-pack.notes"
+verb = "session"
+billing_tags = ["full", "barter"]
+tags_code = "E_SESS_TAGS"
+untagged_code = "W_SESS_UNTAGGED"
+notes_code = "E_SESS_NOTES"
+
+[[rules]]
+id = "uses"
+kind = "session-checks"
+code = "E_OTHER_DURATION"
+severity_duration_key = "billing-pack.duration"
+severity_notes_key = "billing-pack.notes"
+verb = "use"
+billing_tags = ["other-tag"]
+tags_code = "E_OTHER_TAGS"
+untagged_code = "W_OTHER_UNTAGGED"
+notes_code = "E_OTHER_NOTES"
+
+[messages."E_SESS_DURATION"]
+default = "session needs a duration"
+default_fix = "Add a duration"
+
+[messages."E_SESS_TAGS"]
+default = "session has the wrong tags"
+default_fix = "Fix the tags"
+
+[messages."W_SESS_UNTAGGED"]
+default = "session is untagged"
+default_fix = "Tag it"
+
+[messages."E_SESS_NOTES"]
+default = "session has no notes"
+default_fix = "Add a note"
+
+[messages."E_OTHER_DURATION"]
+default = "use needs a duration"
+default_fix = "Add a duration"
+
+[messages."E_OTHER_TAGS"]
+default = "use has the wrong tags"
+default_fix = "Fix the tags"
+
+[messages."W_OTHER_UNTAGGED"]
+default = "use is untagged"
+default_fix = "Tag it"
+
+[messages."E_OTHER_NOTES"]
+default = "use has no notes"
+default_fix = "Add a note"
+"#;
+        let manifest = parse_manifest_compiled_in(text).expect("fixture manifest parses");
+        build_manifest_pack(manifest, "skill".to_string())
+    }
+
+    /// #747 round 3: a pack's `session-checks` tags for verb
+    /// `session` are its log-time vocabulary; a rule for another verb
+    /// contributes nothing.
+    #[test]
+    fn session_billing_tags_read_from_manifest() {
+        let pack = session_pack();
+        assert_eq!(
+            pack.session_billing_tags(),
+            vec!["full".to_string(), "barter".to_string()],
+            "only the session-verb rule counts, in rule order"
+        );
     }
 }

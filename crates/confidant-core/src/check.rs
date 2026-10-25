@@ -123,6 +123,8 @@ pub enum FindingCode {
     CadenceOverdue,
     DateUpcoming,
     SkippedEncrypted,
+    DuplicateTouch,
+    DuplicateSession,
     Pack(&'static str),
 }
 
@@ -178,6 +180,8 @@ impl FindingCode {
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
             Self::SkippedEncrypted => "W_SKIPPED_ENCRYPTED",
+            Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
+            Self::DuplicateSession => "W_DUPLICATE_SESSION",
             Self::Pack(code) => code,
         }
     }
@@ -234,6 +238,8 @@ impl FindingCode {
         "W_CADENCE_OVERDUE",
         "W_DATE_UPCOMING",
         "W_SKIPPED_ENCRYPTED",
+        "W_DUPLICATE_TOUCH",
+        "W_DUPLICATE_SESSION",
     ];
 
     /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
@@ -360,6 +366,8 @@ impl FindingCode {
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
             "W_SKIPPED_ENCRYPTED" => Self::SkippedEncrypted,
+            "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
+            "W_DUPLICATE_SESSION" => Self::DuplicateSession,
             _ => return None,
         })
     }
@@ -649,6 +657,8 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     check_edges(vault, &known_ids, &enabled_packs, &orphans, &mut findings);
     check_with_lists(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
+    check_duplicate_touches(vault, &mut findings);
+    check_duplicate_sessions(vault, &mut findings);
 
     if conflict.is_none() {
         let mut states: Vec<(&dyn Pack, Box<dyn PackState>)> = Vec::new();
@@ -1856,6 +1866,75 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
     }
 }
 
+/// #747: flag every `touch` line after the first for the same person,
+/// date, and kind (see [`crate::touch::touch_identity`]). A warning, not
+/// an error: duplicates already in a vault are historical noise to clean
+/// up, and warnings never block writes — the write-time refusal lives in
+/// `log touch`/`log session`, not here. Kind-less mirrored lines carry no
+/// identity and are never flagged.
+/// #747 review: sessions get the same treatment (see
+/// [`check_duplicate_sessions`]) so a `--force` session repeat is not
+/// invisible while a `--force` touch repeat is flagged.
+fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
+    let mut seen: BTreeMap<(RecordId, NaiveDate, String), (String, u32)> = BTreeMap::new();
+    for sourced in &vault.entries {
+        let Some(identity) = crate::touch::touch_identity(&sourced.entry) else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(identity) {
+            slot.insert((sourced.file.clone(), sourced.line));
+        } else {
+            findings.push(
+                Finding::new(
+                    FindingCode::DuplicateTouch,
+                    Severity::Warning,
+                    "touch already recorded for the same person, date, and kind".to_owned(),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&sourced.entry.id)
+                .with_fix(
+                    "Remove the duplicate touch line, or keep it if it records a genuinely separate contact",
+                ),
+            );
+        }
+    }
+}
+
+/// #747 review: flag every `session` line after the first for the same
+/// person, date, duration, and billing tag (see
+/// [`crate::ledger::session_identity`]) — the session mirror of
+/// [`check_duplicate_touches`], including its warning severity and its
+/// "warnings never block writes" rationale. Durations compare by
+/// minutes (`60m` and `1h` flag) and tags compare lowercased; lines
+/// with no parseable duration carry no identity and are never flagged.
+fn check_duplicate_sessions(vault: &Vault, findings: &mut Vec<Finding>) {
+    let mut seen: BTreeMap<(RecordId, NaiveDate, u32, String), (String, u32)> = BTreeMap::new();
+    for sourced in &vault.entries {
+        let Some(identity) = crate::ledger::session_identity(&sourced.entry) else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(identity) {
+            slot.insert((sourced.file.clone(), sourced.line));
+        } else {
+            findings.push(
+                Finding::new(
+                    FindingCode::DuplicateSession,
+                    Severity::Warning,
+                    "session already recorded for the same person, date, duration, and tag"
+                        .to_owned(),
+                )
+                .at_file(&sourced.file)
+                .at_line(sourced.line)
+                .for_id(&sourced.entry.id)
+                .with_fix(
+                    "Remove the duplicate session line, or keep it if it records a genuinely separate session",
+                ),
+            );
+        }
+    }
+}
+
 pub(crate) fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.severity
@@ -2154,6 +2233,8 @@ mod tests {
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
             FindingCode::SkippedEncrypted,
+            FindingCode::DuplicateTouch,
+            FindingCode::DuplicateSession,
         ];
         for code in &variants {
             match code {
@@ -2206,6 +2287,8 @@ mod tests {
                 | FindingCode::CadenceOverdue
                 | FindingCode::DateUpcoming
                 | FindingCode::SkippedEncrypted => {}
+                FindingCode::DuplicateTouch => {}
+                FindingCode::DuplicateSession => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }
