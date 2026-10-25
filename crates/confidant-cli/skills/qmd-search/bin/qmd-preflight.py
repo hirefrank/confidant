@@ -49,21 +49,27 @@ Reports, in order:
    separate, unchanged figure).
 4. A recommended default mode for this host, recorded where the query
    wrapper honors it: `--persist` writes `[qmd] default_mode` (and
-   `[qmd] offline`, when recommended) to `~/.config/confidant/config.toml`,
-   preserving every other key in the file. `qmd-query.py` reads both.
-   `--persist` also clears stale preflight-written keys (a
+   `[qmd] offline`, when recommended) to the VAULT-LOCAL preflight
+   file, `<vault>/.confidant/qmd-preflight.toml` — local and gitignored
+   like the corpus and the QMD store. A recommendation measured on one
+   vault must not leak into another vault on the same host, which is
+   what the old global-only persist did. `qmd-query.py` reads the
+   per-vault value first and falls back to the global user config
+   (`~/.config/confidant/config.toml`, `[qmd]` table) for vaults with
+   no per-vault file, so single-vault setups keep working unchanged
+   and a global value set by hand is still honored. The global file
+   is NOT touched by `--persist`: its values remain as fallback, and
+   clearing a global value from a per-vault run could clobber a
+   fallback another vault still relies on. `--persist` also clears
+   stale preflight-written keys in the vault-local file (a
    `default_mode` with no hit-bearing mode behind it, an `offline`
    written by an earlier preflight run when the hub has recovered),
    and says so explicitly; values not marked as preflight-written are
-   left alone and reported. Keys written by a pre-fix `--persist`
-   carry no marker, so the FIRST `--persist` run after this change
-   treats unmarked keys as legacy, not hand-set: a legacy key the
-   fresh evidence supports is adopted (rewritten with its marker), a
-   legacy key it does not support is cleared and reported distinctly,
-   and a one-time migration stamp (`preflight_legacy_migrated`) is then
-   recorded — values the operator adds by hand AFTER that stamp are
-   left alone on later runs, as before. NOTE: that config is per-user,
-   not per-vault — a persisted recommendation applies to every vault.
+   left alone and reported. (The global file keeps its own older
+   scheme — provenance markers plus the one-time
+   `preflight_legacy_migrated` stamp — for values an old `--persist`
+   wrote there; those values are read-only fallback now and are never
+   rewritten by a per-vault run.)
 
 This script never builds anything and never phones home beyond the one
 hub probe: smoke queries run through `qmd-query.py` (same allowlist
@@ -113,10 +119,10 @@ DEFAULT_HUB_TIMEOUT_S = 10
 # the operator set by hand (which it must not clobber).
 SOURCE_SUFFIX = "_source"
 SOURCE_VALUE = "preflight"
-# One-time migration stamp (see main()): written by the first --persist
-# run that encounters the marker scheme, so unmarked keys added by hand
-# AFTER the migration are not mistaken for pre-fix preflight output.
-MIGRATION_STAMP = "preflight_legacy_migrated"
+# NOTE: the old global persist scheme also had a one-time
+# `preflight_legacy_migrated` stamp (see the module docstring). New
+# runs never write it — the global file is read-only fallback now —
+# so no constant is kept for it.
 
 
 def resolve_vault(explicit):
@@ -446,6 +452,176 @@ def remove_qmd_config_value(home, key):
     return True
 
 
+def vault_preflight_path(vault):
+    """The vault-local preflight file for this vault."""
+    if _QUERY_MODULE is not None:
+        return _QUERY_MODULE.vault_preflight_path(vault)
+    return os.path.join(vault, ".confidant", "qmd-preflight.toml")
+
+
+def read_vault_qmd_config(vault):
+    """The [qmd] table from the vault-local preflight file, or {}.
+
+    Delegates to qmd-query.py's implementation when the sibling is
+    present (single source of truth, as with read_qmd_config).
+    """
+    if _QUERY_MODULE is not None:
+        return _QUERY_MODULE.read_vault_qmd_config(vault)
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    try:
+        with open(vault_preflight_path(vault), "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    qmd = data.get("qmd")
+    return dict(qmd) if isinstance(qmd, dict) else {}
+
+
+def resolve_offline(vault_config, global_config):
+    """The persisted offline choice: per-vault wins, global is fallback.
+
+    Delegates to qmd-query.py's implementation when the sibling is
+    present (single source of truth, as with read_qmd_config).
+    Returns (offline_bool, source) with source "vault", "global", or
+    "none".
+    """
+    if _QUERY_MODULE is not None:
+        return _QUERY_MODULE.resolve_offline(vault_config, global_config)
+    vault_offline = vault_config.get("offline", "")
+    if vault_offline not in ("", None):
+        return _truthy(vault_offline), "vault"
+    global_offline = global_config.get("offline", "")
+    if global_offline not in ("", None):
+        return _truthy(global_offline), "global"
+    return False, "none"
+
+
+def set_vault_qmd_config_value(vault, key, value_repr):
+    """Set one key in the vault-local [qmd] table, preserving the rest.
+
+    Text edit like set_qmd_config_value: comments and unrelated keys
+    survive byte-for-byte. Creates the .confidant dir and the [qmd]
+    section when absent. Returns the config path written.
+    """
+    path = vault_preflight_path(vault)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    lines = text.splitlines()
+    section_re = re.compile(r"^\s*\[qmd\]\s*(#.*)?$")
+    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    section_at = next((i for i, ln in enumerate(lines) if section_re.match(ln)),
+                      None)
+    if section_at is None:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append("[qmd]")
+        lines.append(f"{key} = {value_repr}")
+    else:
+        end = len(lines)
+        for i in range(section_at + 1, len(lines)):
+            if header_re.match(lines[i]):
+                end = i
+                break
+        key_at = next((i for i in range(section_at + 1, end)
+                       if key_re.match(lines[i])), None)
+        if key_at is not None:
+            lines[key_at] = f"{key} = {value_repr}"
+        else:
+            lines.insert(section_at + 1, f"{key} = {value_repr}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def remove_vault_qmd_config_value(vault, key):
+    """Remove one key from the vault-local [qmd] table; True if removed.
+
+    Text edit like remove_qmd_config_value. A missing file or a
+    missing key is not an error: it returns False.
+    """
+    path = vault_preflight_path(vault)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    lines = text.splitlines()
+    section_re = re.compile(r"^\s*\[qmd\]\s*(#.*)?$")
+    header_re = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    section_at = next((i for i, ln in enumerate(lines) if section_re.match(ln)),
+                      None)
+    if section_at is None:
+        return False
+    end = len(lines)
+    for i in range(section_at + 1, len(lines)):
+        if header_re.match(lines[i]):
+            end = i
+            break
+    key_at = next((i for i in range(section_at + 1, end)
+                   if key_re.match(lines[i])), None)
+    if key_at is None:
+        return False
+    del lines[key_at]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
+def persist_preflight(vault, recommendation, offline_recommended):
+    """Write the preflight recommendation to the vault-local file.
+
+    Per-vault (issue #722 remainder): the file is
+    `<vault>/.confidant/qmd-preflight.toml`, never the global user
+    config — the global file's [qmd] values remain as fallback for
+    vaults with no per-vault file and are never rewritten here.
+    Marked values the fresh evidence no longer supports are cleared
+    and reported distinctly; unmarked (hand-set) values are left
+    alone and reported. The vault-local file is new, so it has no
+    legacy-migration branch: every value it carries was either
+    written with a marker by this function or added by hand.
+    Returns the persisted dict (including the path written).
+    """
+    persisted = {}
+    config = read_vault_qmd_config(vault)
+    if recommendation is not None:
+        set_vault_qmd_config_value(vault, "default_mode",
+                                   json.dumps(recommendation))
+        set_vault_qmd_config_value(vault, "default_mode" + SOURCE_SUFFIX,
+                                   json.dumps(SOURCE_VALUE))
+        persisted["default_mode"] = recommendation
+    elif "default_mode" in config:
+        if config.get("default_mode" + SOURCE_SUFFIX) == SOURCE_VALUE:
+            old = config["default_mode"]
+            remove_vault_qmd_config_value(vault, "default_mode")
+            remove_vault_qmd_config_value(vault, "default_mode" + SOURCE_SUFFIX)
+            persisted["default_mode_cleared"] = old
+        else:
+            persisted["default_mode_left"] = config["default_mode"]
+    if offline_recommended:
+        set_vault_qmd_config_value(vault, "offline", "true")
+        set_vault_qmd_config_value(vault, "offline" + SOURCE_SUFFIX,
+                                   json.dumps(SOURCE_VALUE))
+        persisted["offline"] = True
+    elif _truthy(config.get("offline", "")):
+        if config.get("offline" + SOURCE_SUFFIX) == SOURCE_VALUE:
+            remove_vault_qmd_config_value(vault, "offline")
+            remove_vault_qmd_config_value(vault, "offline" + SOURCE_SUFFIX)
+            persisted["offline_cleared"] = True
+        else:
+            persisted["offline_left"] = True
+    persisted["path"] = vault_preflight_path(vault)
+    return persisted
+
+
 def recommend_default_mode(results, budget):
     """First preferred hit-bearing mode within budget, else first that ran.
 
@@ -684,14 +860,14 @@ def main(argv=None):
 
     vault = resolve_vault(args.vault)
     home = os.environ.get("HOME")
-    # --persist without HOME cannot write anything: fail cleanly BEFORE
-    # the (potentially minutes-long) smoke runs, never after them.
-    if args.persist and not home:
-        sys.exit("error: --persist needs HOME to locate "
-                 "~/.config/confidant/config.toml; rerun without --persist "
-                 "for a report-only run, or set HOME")
+    # Per-vault persist needs no HOME (the file lives under the vault),
+    # so there is no --persist-without-HOME failure any more: the old
+    # early exit existed only because persist wrote the global user
+    # config. A missing HOME just means no global fallback is read
+    # (read_qmd_config fails closed to {}).
     spec = host_spec(vault)
     config = read_qmd_config(home)
+    vault_config = read_vault_qmd_config(vault)
     hub_url = resolve_hub_url(args.hub_url)
     offline_forced = _truthy(os.environ.get("HF_HUB_OFFLINE", ""))
     hub = probe_model_hub(hub_url, args.hub_timeout,
@@ -702,7 +878,9 @@ def main(argv=None):
     # 3-minute wait — run them offline, exactly as qmd-query.py would
     # with [qmd] offline persisted.
     smoke_env = dict(os.environ)
-    offline_configured = _truthy(config.get("offline", ""))
+    # Resolved offline for the smoke runs: per-vault wins, global is
+    # fallback (same rule the query wrapper honors).
+    offline_configured, offline_source = resolve_offline(vault_config, config)
     offline_for_smoke = offline_configured or not hub["reachable"]
     if offline_for_smoke and "HF_HUB_OFFLINE" not in smoke_env:
         smoke_env["HF_HUB_OFFLINE"] = "1"
@@ -730,61 +908,17 @@ def main(argv=None):
     persisted = {}
     persist_error = None
     if args.persist:
-        # One-time migration (round-2 N4): the pre-fix --persist wrote
-        # keys with no provenance marker, so on the first --persist run
-        # under the marker scheme an unmarked key is legacy preflight
-        # output, not a hand-set value. The overwrite paths above adopt
-        # a legacy key the fresh evidence supports (rewriting it with
-        # its marker); the branches below clear a legacy key it does
-        # not support, reported distinctly from a marked clear. The
-        # stamp is then recorded, so unmarked values added by hand
-        # AFTER the migration are left alone on later runs, as before.
-        legacy_migrated = _truthy(config.get(MIGRATION_STAMP, ""))
+        # Per-vault persist (issue #722 remainder): persist_preflight
+        # writes only the vault-local file. The global user config is
+        # read-only fallback now and is never rewritten here — the old
+        # global persist block (including its one-time legacy-migration
+        # stamp) is gone by design, not by accident: values an old
+        # --persist wrote globally are still honored as fallback, and
+        # clearing them from a per-vault run could clobber a fallback
+        # another vault still relies on.
         try:
-            if recommendation is not None:
-                set_qmd_config_value(home, "default_mode",
-                                     json.dumps(recommendation))
-                set_qmd_config_value(home, "default_mode" + SOURCE_SUFFIX,
-                                     json.dumps(SOURCE_VALUE))
-                persisted["default_mode"] = recommendation
-            elif "default_mode" in config:
-                if config.get("default_mode" + SOURCE_SUFFIX) == SOURCE_VALUE:
-                    old = config["default_mode"]
-                    remove_qmd_config_value(home, "default_mode")
-                    remove_qmd_config_value(home, "default_mode" + SOURCE_SUFFIX)
-                    persisted["default_mode_cleared"] = old
-                elif not legacy_migrated:
-                    old = config["default_mode"]
-                    remove_qmd_config_value(home, "default_mode")
-                    persisted["default_mode_legacy_cleared"] = old
-                else:
-                    persisted["default_mode_left"] = config["default_mode"]
-            if offline_recommended:
-                set_qmd_config_value(home, "offline", "true")
-                set_qmd_config_value(home, "offline" + SOURCE_SUFFIX,
-                                     json.dumps(SOURCE_VALUE))
-                persisted["offline"] = True
-            elif _truthy(config.get("offline", "")):
-                # A stale offline=true from an earlier preflight run is
-                # cleared when fresh evidence no longer supports it (the
-                # hub recovered, the cache proof lapsed); a value the
-                # operator set by hand (no provenance marker) is left
-                # alone and reported — preflight must not clobber a
-                # deliberate privacy choice. An unmarked value on a
-                # pre-migration run is legacy output, not hand-set, and
-                # is cleared distinctly (see above).
-                if config.get("offline" + SOURCE_SUFFIX) == SOURCE_VALUE:
-                    remove_qmd_config_value(home, "offline")
-                    remove_qmd_config_value(home, "offline" + SOURCE_SUFFIX)
-                    persisted["offline_cleared"] = True
-                elif not legacy_migrated:
-                    remove_qmd_config_value(home, "offline")
-                    persisted["offline_legacy_cleared"] = True
-                else:
-                    persisted["offline_left"] = True
-            if not legacy_migrated:
-                set_qmd_config_value(home, MIGRATION_STAMP, "true")
-                persisted["legacy_migrated"] = True
+            persisted = persist_preflight(vault, recommendation,
+                                          offline_recommended)
         except OSError as e:
             # Report the failure with the report, not a traceback: the
             # diagnosis is still delivered even when the write failed.
@@ -811,6 +945,8 @@ def main(argv=None):
         "hub_url": hub_url,
         "offline_for_smoke": offline_for_smoke,
         "offline_configured": offline_configured,
+        "offline_configured_source": offline_source,
+        "vault_preflight_path": vault_preflight_path(vault),
         "offline_recommended": offline_recommended,
         "hybrid_cache_complete": hybrid_cache_complete,
         "modes": results,
@@ -891,35 +1027,25 @@ def main(argv=None):
               "(or set [qmd] offline = true)")
     if args.persist:
         print(f"  persisted: {persisted or 'nothing to persist'}")
+        # "path" alone means nothing needed writing or clearing — only
+        # name the file when an actual persist action happened.
+        if any(k != "path" for k in persisted):
+            print(f"  persisted to: {persisted['path']} (per-vault; the "
+                  "global [qmd] config is left untouched and remains "
+                  "the fallback for vaults with no per-vault file)")
         if "default_mode_cleared" in persisted:
             print(f"  note: cleared stale default_mode "
-                  f"({persisted['default_mode_cleared']!r}) — no "
-                  "hit-bearing mode ran")
+                  f"({persisted['default_mode_cleared']!r}) from the "
+                  "vault-local file — no hit-bearing mode ran")
         if "offline_cleared" in persisted:
             print("  note: cleared stale preflight-written offline = true "
-                  "— fresh evidence no longer supports it")
-        if "default_mode_legacy_cleared" in persisted:
-            print(f"  note: cleared unmarked legacy default_mode "
-                  f"({persisted['default_mode_legacy_cleared']!r}) — it "
-                  "was written before provenance markers existed, so it "
-                  "could not be distinguished from a hand-set value, "
-                  "and fresh evidence no longer supports it; if it was "
-                  "a deliberate hand choice, re-add it now — post-"
-                  "migration hand-set values are left alone")
-        if "offline_legacy_cleared" in persisted:
-            print("  note: cleared unmarked legacy offline = true — it "
-                  "was written before provenance markers existed, so it "
-                  "could not be distinguished from a hand-set value, "
-                  "and fresh evidence no longer supports it; if it was "
-                  "a deliberate hand choice, re-add it now — post-"
-                  "migration hand-set values are left alone")
+                  "from the vault-local file — fresh evidence no longer "
+                  "supports it")
         if "default_mode_left" in persisted or "offline_left" in persisted:
-            print("  note: a [qmd] value set by hand (not marked as "
-                  "preflight-written) was left alone despite fresh "
-                  "evidence; edit it yourself if it is stale")
-        if persisted:
-            print("  note: [qmd] config is per-user, not per-vault — "
-                  "this recommendation applies to every vault")
+            print("  note: a [qmd] value set by hand in the vault-local "
+                  "file (not marked as preflight-written) was left "
+                  "alone despite fresh evidence; edit it yourself if "
+                  "it is stale")
     if persist_error is not None:
         print(f"  error: persist failed: {persist_error}")
     if warnings:

@@ -614,8 +614,9 @@ def run_qmd(args, env, check=True):
 def run_setup_preflight(preflight, vault):
     """Run preflight as the last setup step, recording via --persist.
 
-    The recommendation must land in [qmd] config during setup itself
-    (issue #722 item 3): a report-only auto-run would leave the
+    The recommendation must land in the vault-local [qmd] preflight
+    file during setup itself (issue #722 item 3): a report-only
+    auto-run would leave the
     operator to rerun preflight with --persist by hand before the
     query wrapper honored anything. Returns the preflight exit code;
     a nonzero code is reported as a rerun note, never a setup failure

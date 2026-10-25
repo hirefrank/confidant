@@ -113,13 +113,16 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 # recommendation; running it standalone with --persist is the same check.
 # --persist records the recommendation ([qmd] default_mode, and
 # [qmd] offline when the hub is unreachable or a hybrid smoke run proves
-# the models are cached) in ~/.config/confidant/config.toml, where
-# qmd-query.py honors it. --persist also clears stale values an earlier
-# preflight run wrote that fresh evidence no longer supports, migrates
-# unmarked keys a pre-fix --persist wrote (adopted when fresh evidence
-# supports them, cleared when it does not, then a one-time migration
-# stamp so later hand-set values are left alone again), and leaves
-# hand-set values alone (saying so). A warm-run failure downgrades the
+# the models are cached) in the VAULT-LOCAL preflight file,
+# <vault>/.confidant/qmd-preflight.toml, where qmd-query.py honors it
+# first, falling back to the global ~/.config/confidant/config.toml
+# [qmd] table for vaults with no per-vault file — so a recommendation
+# measured on one vault never leaks into another vault on the same
+# host, while single-vault setups keep working unchanged. --persist
+# never touches the global file: values an old --persist wrote there
+# stay honored as fallback. It also clears stale values an earlier
+# preflight run wrote to the vault-local file that fresh evidence no
+# longer supports, and leaves hand-set values alone (saying so). A warm-run failure downgrades the
 # mode to that failure — the cold sample is never reused. A smoke run
 # that answers with zero hits is reported as ok-empty, never
 # recommended. Worst case is ~18 minutes at the default 180s per-mode
@@ -199,9 +202,12 @@ so and blames slow compute instead (a hub check cannot be the cause then).
 When `--mode` is omitted, the script uses the persisted `[qmd]
 default_mode` from preflight when present, else bm25; `[qmd] offline =
 true` runs qmd with `HF_HUB_OFFLINE=1` (an explicit `HF_HUB_OFFLINE` in
-the shell still wins). Note the persisted `[qmd]` config is per-user, not
-per-vault: a preflight recommendation measured on one vault applies to
-every vault until re-persisted.
+the shell still wins). The persisted `[qmd]` config is per-vault first:
+qmd-query.py reads `<vault>/.confidant/qmd-preflight.toml`, and falls
+back to the global `~/.config/confidant/config.toml` `[qmd]` table only
+when the vault has no per-vault value — so one vault's recommendation
+never leaks into another vault, and a global value set by hand is still
+honored for vaults never preflighted.
 
 ## Tooling
 
@@ -251,13 +257,13 @@ every vault until re-persisted.
   the default 180s per-mode timeout, bound it with `--query-timeout`.
   `--persist` writes `[qmd] default_mode` and, when the hub is
   unreachable or the hybrid cache proof holds, `[qmd] offline =
-  true` to the user config, preserving every other key (including the
-  #723 disk-election key), and clears stale preflight-written keys the
-  fresh evidence no longer supports (hand-set values are left alone and
-  reported); unmarked keys from a pre-fix `--persist` are migrated on
-  the first `--persist` run under the marker scheme (adopted when
-  fresh evidence supports them, cleared when it does not, then a
-  one-time `preflight_legacy_migrated` stamp). Exit 0 whenever the
+  true` to the vault-local `<vault>/.confidant/qmd-preflight.toml`
+  (local, gitignored), preserving every other key in that file, and
+  clears stale preflight-written keys the fresh evidence no longer
+  supports (hand-set values are left alone and reported). It never
+  touches the global user config: values an old `--persist` wrote
+  there (including the #723 disk-election key) stay honored as
+  fallback for vaults with no per-vault file. Exit 0 whenever the
   report completes, even with no mode recommended — read the report,
   do not gate on the exit code.
 - `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY`
