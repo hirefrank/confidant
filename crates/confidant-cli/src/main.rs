@@ -4285,19 +4285,27 @@ fn cmd_inbox_rotate(
 }
 
 /// #732: refuse a `log` verb up front when the vault cannot accept it,
-/// so `--dry-run` fails exactly where apply's post-check would
-/// (`E_UNKNOWN_VERB`) instead of reporting `ok:true` for a write that
-/// cannot commit. Runs before person resolution and before the
-/// `--fallback-inbox` queueing path: a line the vault will reject must
-/// not be queued either. The fix mirrors the check finding's own fix.
+/// so `--dry-run` refuses with `E_INVALID` before any check runs
+/// instead of reporting `ok:true` for a write apply's post-check would
+/// block with `E_UNKNOWN_VERB`. Runs before person resolution and
+/// before the `--fallback-inbox` queueing path: a line the vault will
+/// reject must not be queued either. The fix mirrors the check
+/// finding's own fix.
+fn refuse_unknown_verb(verb: &str) -> anyhow::Error {
+    // Deliberate echo, unlike `check_verbs_and_refs`' bare "unknown
+    // verb": a verb is a command name the operator typed, not vault
+    // content, so naming it cannot leak record text.
+    anyhow::Error::new(DomainError::invalid(format!(
+        "verb '{verb}' is not enabled in this vault"
+    )))
+    .with_fix("Use a core verb or enable the pack that defines it")
+}
+
 fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow::Result<()> {
     if confidant_core::check::verb_passes_check(vault, verb) {
         return Ok(());
     }
-    Err(anyhow::Error::new(DomainError::invalid(format!(
-        "verb '{verb}' is not enabled in this vault"
-    )))
-    .with_fix("Use a core verb or enable the pack that defines it"))
+    Err(refuse_unknown_verb(verb))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4955,6 +4963,19 @@ fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
         return Err(anyhow::Error::new(DomainError::usage(
             "import file has no ledger lines",
         )));
+    }
+    // #732 fix wave: `import` appends arbitrary verbs, so it gets the
+    // same up-front verb gate as `log` — in dry-run and apply alike,
+    // and for MCP `import_ledger`, which routes through this command.
+    // Without it, a dry-run preview would report `ok:true` for lines
+    // apply's post-check blocks with `E_UNKNOWN_VERB`.
+    {
+        let vault = vault_or!(root, cli.json);
+        for entry in &entries {
+            if !confidant_core::check::verb_passes_check(&vault, &entry.verb) {
+                return Err(refuse_unknown_verb(&entry.verb));
+            }
+        }
     }
 
     let mut by_file: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
