@@ -1641,6 +1641,7 @@ fn skip_refused_during_rotate_drain() {
             pinned_pubkey: None,
             skip: vec!["01JAAA".to_string()],
             is_rotate_drain: true,
+            force: false,
         },
         identity,
         None,

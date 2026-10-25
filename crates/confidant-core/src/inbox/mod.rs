@@ -54,7 +54,7 @@ pub use queue::{queue_items, QueueItem};
 use git::{clear_inbox, discard_inbox};
 use item::describe_target;
 use merge::{apply_writes, commit_applied, revert_applied, unstage_applied, AppliedChange};
-use plan::{collect_semantic_identities, collect_vault_srcs, plan_item};
+use plan::{collect_semantic_identities, collect_vault_srcs, plan_item, PlanState};
 use preflight::{preflight, PreflightOutcome};
 
 #[cfg(test)]
@@ -118,6 +118,16 @@ pub struct InboxOptions {
     /// is refused — leftovers encrypted to the old key must not survive
     /// `--finish` (§8a.3). Not settable from the CLI.
     pub is_rotate_drain: bool,
+    /// Process semantic duplicates instead of skipping them (#747 round
+    /// 3, `confidant inbox --force`): every queued ledger line plans,
+    /// including lines whose identity is already in the ledger. This is
+    /// the drain-time half of `log --force` — a forced repeat queued
+    /// via `--fallback-inbox` carries its own per-item `force` marker
+    /// and needs no drain flag, but an unmarked duplicate (queued
+    /// before the marker existed, or by an outside tool) still needs an
+    /// explicit operator decision at drain time. Never set for a rotate
+    /// drain. `src:`/exact-text idempotency still applies.
+    pub force: bool,
 }
 
 /// What happened to one item.
@@ -131,6 +141,11 @@ pub struct ItemOutcome {
     pub target: String,
     /// `"merge"` or `"skip"` (already present).
     pub action: String,
+    /// Ledger lines dropped by the #747 semantic duplicate skip in this
+    /// item (0 when none). `src:`/exact-text re-import skips do not
+    /// count here, so the drain report can tell a semantic drop from
+    /// an exact re-import (#747 round 3).
+    pub semantic_skipped: usize,
 }
 
 /// An item the operator deferred with `--skip`: not merged, not cleared,
@@ -383,7 +398,11 @@ pub fn run_inbox(
     let skip_set: std::collections::HashSet<&str> = opts.skip.iter().map(String::as_str).collect();
 
     let existing_srcs = collect_vault_srcs(&vault);
-    let mut semantic_identities = collect_semantic_identities(&vault);
+    let mut plan_state = PlanState {
+        semantic_identities: collect_semantic_identities(&vault),
+        drain_force: opts.force,
+        semantic_skipped: 0,
+    };
     let mut ledger_cache: HashMap<PathBuf, String> = HashMap::new();
     let mut outcomes = Vec::new();
     let mut skipped = Vec::new();
@@ -407,15 +426,17 @@ pub fn run_inbox(
                 });
                 continue;
             }
+            plan_state.semantic_skipped = 0;
             match plan_item(
                 vault_root,
                 item,
                 &existing_srcs,
                 &mut ledger_cache,
                 decrypt_existing,
-                &mut semantic_identities,
+                &mut plan_state,
             )? {
-                Some((outcome, writes)) => {
+                Some((mut outcome, writes)) => {
+                    outcome.semantic_skipped = plan_state.semantic_skipped;
                     if !opts.dry_run {
                         apply_writes(vault_root, &writes, &mut applied, encrypt)?;
                     }
@@ -426,6 +447,7 @@ pub fn run_inbox(
                     kind: item.kind.as_str().to_string(),
                     target: describe_target(item),
                     action: "skip".to_string(),
+                    semantic_skipped: plan_state.semantic_skipped,
                 }),
             }
         }
@@ -504,7 +526,7 @@ mod tests {
     };
     use crate::inbox::item::{parse_item, ItemKind, ParsedItem};
     use crate::inbox::merge::PlannedWrite;
-    use crate::inbox::plan::{collect_vault_srcs, plan_item};
+    use crate::inbox::plan::{collect_vault_srcs, plan_item, PlanState};
     use crate::inbox::rotate::commit_vault_config;
     use crate::inbox::trust::{
         check_inbox_pubkey, check_local_inbox_pubkey, verify_inbox_signatures,
@@ -897,14 +919,12 @@ mod tests {
         item: &ParsedItem,
         srcs: &BTreeSet<String>,
     ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
-        plan_item(
-            root,
-            item,
-            srcs,
-            &mut HashMap::new(),
-            None,
-            &mut BTreeSet::new(),
-        )
+        let mut state = PlanState {
+            semantic_identities: BTreeSet::new(),
+            drain_force: false,
+            semantic_skipped: 0,
+        };
+        plan_item(root, item, srcs, &mut HashMap::new(), None, &mut state)
     }
 
     fn plan_test_with_identities(
@@ -913,7 +933,33 @@ mod tests {
         srcs: &BTreeSet<String>,
         identities: &mut BTreeSet<String>,
     ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
-        plan_item(root, item, srcs, &mut HashMap::new(), None, identities)
+        let mut state = PlanState {
+            semantic_identities: std::mem::take(identities),
+            drain_force: false,
+            semantic_skipped: 0,
+        };
+        let out = plan_item(root, item, srcs, &mut HashMap::new(), None, &mut state);
+        *identities = state.semantic_identities;
+        out
+    }
+
+    fn plan_test_forced(
+        root: &Path,
+        item: &ParsedItem,
+        srcs: &BTreeSet<String>,
+        identities: &mut BTreeSet<String>,
+        drain_force: bool,
+        semantic_skipped: &mut usize,
+    ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
+        let mut state = PlanState {
+            semantic_identities: std::mem::take(identities),
+            drain_force,
+            semantic_skipped: 0,
+        };
+        let out = plan_item(root, item, srcs, &mut HashMap::new(), None, &mut state);
+        *identities = state.semantic_identities;
+        *semantic_skipped = state.semantic_skipped;
+        out
     }
 
     #[test]
@@ -1028,6 +1074,144 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// #747 round 3: a forced item plans despite its identity already
+    /// being in the ledger, and a drain-wide `--force` does the same
+    /// for an unmarked item. A forced plan still inserts the identity,
+    /// so a later unforced copy in the same drain still skips.
+    #[test]
+    fn forced_items_and_drain_force_plan_semantic_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let mut identities = BTreeSet::new();
+        identities.insert("session|p-01M3TC5H00MPJG000000000000|2026-10-08|60|paid".to_string());
+        // Per-item marker: `log --force --fallback-inbox`.
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\nforce: true\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 1h paid src:fallback/forced-1\n",
+        )
+        .unwrap();
+        assert!(item.force);
+        let mut skipped = 0usize;
+        let (_, writes) = plan_test_forced(
+            dir.path(),
+            &item,
+            &BTreeSet::new(),
+            &mut identities,
+            false,
+            &mut skipped,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped, 0, "a forced line is not a semantic drop");
+        assert_eq!(writes.len(), 1);
+        // The forced plan inserted the identity: an unforced copy now
+        // skips (and counts as a semantic drop).
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 session p-01M3TC5H00MPJG000000000000 60m paid src:fallback/plain-1\n",
+        )
+        .unwrap();
+        let mut skipped = 0usize;
+        assert!(plan_test_forced(
+            dir.path(),
+            &item,
+            &BTreeSet::new(),
+            &mut identities,
+            false,
+            &mut skipped,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(skipped, 1);
+        // Drain-wide `--force` plans an unmarked duplicate too.
+        let mut skipped = 0usize;
+        assert!(plan_test_forced(
+            dir.path(),
+            &item,
+            &BTreeSet::new(),
+            &mut identities,
+            true,
+            &mut skipped,
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(skipped, 0);
+    }
+
+    /// #747 round 3: the semantic-skip count distinguishes a semantic
+    /// drop from a `src:`/exact-text re-import — a mixed item reports
+    /// its dropped lines while still merging its new ones.
+    #[test]
+    fn semantic_skip_count_covers_mixed_items() {
+        let dir = TempDir::new().unwrap();
+        let mut identities = BTreeSet::new();
+        identities.insert("touch|p-01M3TC5H00MPJG000000000000|2026-10-08|meal".to_string());
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:fallback/dup\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 call src:fallback/new\n",
+        )
+        .unwrap();
+        let mut skipped = 0usize;
+        let (_, writes) = plan_test_forced(
+            dir.path(),
+            &item,
+            &BTreeSet::new(),
+            &mut identities,
+            false,
+            &mut skipped,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped, 1, "only the duplicate line is a semantic drop");
+        match &writes[0] {
+            PlannedWrite::LedgerAppend { lines, .. } => {
+                assert_eq!(lines.len(), 1);
+                assert!(lines[0].contains("call"));
+            }
+            other => panic!("expected a ledger append, got {other:?}"),
+        }
+        // A `src:` re-import skip is not a semantic drop.
+        let mut srcs = BTreeSet::new();
+        srcs.insert("tt-1".to_string());
+        let item = parse_item("01JDEF", LEDGER_ITEM).unwrap();
+        let mut skipped = 0usize;
+        assert!(plan_test_forced(
+            dir.path(),
+            &item,
+            &srcs,
+            &mut BTreeSet::new(),
+            false,
+            &mut skipped
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(skipped, 0);
+    }
+
+    /// #747 round 3: the `force` item header parses, and malformed
+    /// uses fail closed — never silently treated as unforced.
+    #[test]
+    fn force_header_parsing() {
+        let item = parse_item(
+            "01JDEF",
+            "confidant-inbox/1\nkind: ledger\nforce: false\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:a\n",
+        )
+        .unwrap();
+        assert!(!item.force);
+        for bad in [
+            "confidant-inbox/1\nkind: ledger\nforce: yes\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:a\n",
+            "confidant-inbox/1\nkind: ledger\nforce: true\nforce: true\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:a\n",
+            "confidant-inbox/1\nkind: record\nforce: true\npath: people/p-acme/profile.md\n---\n# Acme\n",
+            "confidant-inbox/1\nkind: ledger\nbogus: true\n---\n2026-10-08 touch p-01M3TC5H00MPJG000000000000 meal src:a\n",
+        ] {
+            let err = parse_item("01JDEF", bad).unwrap_err();
+            assert_eq!(
+                DomainError::of(&err).unwrap().code(),
+                "E_INBOX_ITEM",
+                "bad={bad:?}"
+            );
+        }
     }
 
     #[test]

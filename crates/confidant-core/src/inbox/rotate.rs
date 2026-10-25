@@ -243,6 +243,10 @@ fn drain_for_rotate(
             // #318: a rotate drain refuses `--skip` — leftovers encrypted
             // to the old key must not survive `--finish` (§8a.3).
             is_rotate_drain: true,
+            // A rotate drain never forces duplicates: the operator
+            // re-runs a plain drain with `--force` first if a forced
+            // repeat is waiting (#747 round 3).
+            force: false,
         },
         &decrypt,
         Some(keys.as_ref()),

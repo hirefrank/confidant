@@ -73,21 +73,45 @@ fn month_file(date: &chrono::NaiveDate) -> PathBuf {
 /// idempotency check on structurally encrypted vaults (see
 /// [`DecryptExistingFn`]); `None` keeps the fail-closed byte comparison.
 ///
-/// `semantic_identities` holds every `touch`/`session` identity already
-/// in the ledger plus every identity planned so far in this drain run;
-/// [`plan_item`] skips a ledger line whose identity is in the set and
-/// inserts every identity it plans (#747 review). The caller owns the
-/// set across items, so two queued copies of the same line — e.g. a
-/// session queued twice via `--fallback-inbox` — merge at most once.
+/// Mutable drain-run state for [`plan_item`], owned by the caller
+/// across items so two queued copies of the same line — e.g. a session
+/// queued twice via `--fallback-inbox` — merge at most once (#747
+/// review).
+pub(crate) struct PlanState {
+    /// Every `touch`/`session` identity already in the ledger plus
+    /// every identity planned so far in this drain run.
+    pub(crate) semantic_identities: BTreeSet<String>,
+    /// `confidant inbox --force` for this drain run (#747 round 3).
+    pub(crate) drain_force: bool,
+    /// Lines dropped by the semantic skip for the item most recently
+    /// planned (reset by the caller per item). Counts semantic drops
+    /// only, so the drain report can name them as distinct from
+    /// `src:`/exact-text re-imports.
+    pub(crate) semantic_skipped: usize,
+}
+
+/// Plan one item. Returns `None` when everything it carries is already
+/// present (idempotent re-import adds nothing).
+///
 /// A skipped line is not an error: the item reports `skip` (or `merge`
 /// for its surviving lines) and is cleared like any idempotent item.
+///
+/// The semantic skip is bypassed for a forced line (#747 round 3): a
+/// line from an item carrying `force: true` (queued by `log --force
+/// --fallback-inbox`) or a drain run with `drain_force` (`confidant
+/// inbox --force`). A forced line still inserts its identity, so a
+/// later *unforced* copy in the same drain still skips, while a later
+/// forced copy — a second genuinely separate repeat — still plans.
+/// `src:`/exact-text idempotency is never bypassed: a forced repeat
+/// carries a fresh `src:fallback/…` token and a fresh note id, so it is
+/// not an exact re-import.
 pub(crate) fn plan_item(
     vault_root: &Path,
     item: &ParsedItem,
     existing_srcs: &BTreeSet<String>,
     ledger_cache: &mut HashMap<PathBuf, String>,
     decrypt_existing: Option<&super::DecryptExistingFn>,
-    semantic_identities: &mut BTreeSet<String>,
+    state: &mut PlanState,
 ) -> anyhow::Result<Option<(ItemOutcome, Vec<PlannedWrite>)>> {
     match item.kind {
         ItemKind::Ledger => {
@@ -132,7 +156,9 @@ pub(crate) fn plan_item(
                 // `note:`/`src:` do not distinguish, so a re-queued line
                 // with a fresh `src:fallback/…` token still matches.
                 if let Some(key) = semantic_identity_key(&entry) {
-                    if semantic_identities.contains(&key) {
+                    if state.semantic_identities.contains(&key) && !item.force && !state.drain_force
+                    {
+                        state.semantic_skipped += 1;
                         continue;
                     }
                 }
@@ -151,7 +177,7 @@ pub(crate) fn plan_item(
                     continue;
                 }
                 if let Some(key) = semantic_identity_key(&entry) {
-                    semantic_identities.insert(key);
+                    state.semantic_identities.insert(key);
                 }
                 match by_file.iter_mut().find(|(f, _)| *f == target) {
                     Some((_, lines)) => lines.push(raw.to_string()),
@@ -176,6 +202,9 @@ pub(crate) fn plan_item(
                     kind: "ledger".to_string(),
                     target,
                     action: "merge".to_string(),
+                    // The caller (run_inbox) fills in the per-item
+                    // semantic-skip count from the out-param.
+                    semantic_skipped: 0,
                 },
                 writes,
             )))
@@ -222,6 +251,7 @@ pub(crate) fn plan_item(
                     kind: "record".to_string(),
                     target: rel.display().to_string(),
                     action: "merge".to_string(),
+                    semantic_skipped: 0,
                 },
                 writes,
             )))

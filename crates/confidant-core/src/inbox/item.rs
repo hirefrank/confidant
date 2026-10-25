@@ -14,6 +14,12 @@ pub(crate) struct ParsedItem {
     /// Vault-relative target path (records only).
     pub(crate) path: Option<PathBuf>,
     pub(crate) content: String,
+    /// Set by a `force: true` header (#747 round 3): the operator logged
+    /// this line with `--force` (a deliberately repeated touch/session),
+    /// so the drain processes it instead of applying the semantic
+    /// duplicate skip. Absent means `false`; outside tools that do not
+    /// know the header are unaffected.
+    pub(crate) force: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +56,7 @@ pub(crate) fn describe_target(item: &ParsedItem) -> String {
 /// confidant-inbox/1
 /// kind: ledger            # or: kind: record
 /// path: people/p-.../profile.md   # records only
+/// force: true             # optional, ledger items only (#747 round 3)
 /// ---
 /// <content>
 /// ```
@@ -61,6 +68,8 @@ pub(crate) fn parse_item(name: &str, text: &str) -> anyhow::Result<ParsedItem> {
     };
     let mut kind: Option<ItemKind> = None;
     let mut path: Option<String> = None;
+    let mut force = false;
+    let mut force_seen = false;
     let mut body_at: Option<usize> = None;
     let all: Vec<&str> = text.lines().collect();
     match all.first() {
@@ -92,7 +101,18 @@ pub(crate) fn parse_item(name: &str, text: &str) -> anyhow::Result<ParsedItem> {
                 }
                 path = Some(v.trim().to_string());
             }
-            _ => return Err(fail("unknown header (only `kind` and `path`)")),
+            "force" => {
+                if force_seen {
+                    return Err(fail("duplicate force header"));
+                }
+                force_seen = true;
+                force = match v.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(fail("force must be `true` or `false`")),
+                };
+            }
+            _ => return Err(fail("unknown header (only `kind`, `path`, and `force`)")),
         }
     }
     let kind = kind.ok_or_else(|| fail("missing `kind` header"))?;
@@ -124,11 +144,15 @@ pub(crate) fn parse_item(name: &str, text: &str) -> anyhow::Result<ParsedItem> {
             Some(validate_record_path(&p).map_err(|why| fail(&why))?)
         }
     };
+    if force && kind != ItemKind::Ledger {
+        return Err(fail("`force` is only for `kind: ledger`"));
+    }
     Ok(ParsedItem {
         name: name.to_string(),
         kind,
         path,
         content,
+        force,
     })
 }
 

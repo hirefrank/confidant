@@ -197,6 +197,16 @@ enum Command {
         /// Refused during `inbox rotate`.
         #[arg(long)]
         skip: Vec<String>,
+        /// Process semantic duplicates instead of skipping them (#747):
+        /// a queued ledger line whose touch/session identity is already
+        /// in the ledger still merges. A forced repeat queued via
+        /// `--fallback-inbox` carries its own per-item marker and needs
+        /// no drain flag; this flag is for unmarked duplicates (queued
+        /// by an outside tool, or before the marker existed). `src:` /
+        /// exact-text idempotency still applies. Refused during
+        /// `inbox rotate` (a rotate drain never forces).
+        #[arg(long)]
+        force: bool,
         /// Discard items by stem (repeatable) without merging them: remove
         /// them from the `inbox` branch in one signed commit. For an item
         /// the operator chose not to apply after `record resolve
@@ -1227,12 +1237,23 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             dry_run,
             allow_unsigned,
             skip,
+            force,
             discard,
             action,
         } => {
             let root = vault_root.unwrap();
             // #457: `--discard` removes items without merging. It does not
             // combine with the drain or with rotate.
+            if *force && action.is_some() {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "`inbox --force` does not combine with `inbox rotate`: a rotate drain never forces duplicates",
+                )));
+            }
+            if *force && !discard.is_empty() {
+                return Err(anyhow::Error::new(DomainError::usage(
+                    "`inbox --force` does not combine with `inbox --discard`",
+                )));
+            }
             if !discard.is_empty() {
                 if action.is_some() {
                     return Err(anyhow::Error::new(DomainError::usage(
@@ -1263,6 +1284,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     *dry_run,
                     *allow_unsigned,
                     skip,
+                    *force,
                 ),
             }
         }
@@ -3566,6 +3588,7 @@ fn cmd_inbox(
     dry_run: bool,
     allow_unsigned: bool,
     skip: &[String],
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault_path = root.display().to_string();
     let trusted_signers = user_config
@@ -3649,6 +3672,7 @@ fn cmd_inbox(
             pinned_pubkey,
             skip: skip.to_vec(),
             is_rotate_drain: false,
+            force,
         },
         &decrypt,
         inbox_keys.as_deref(),
@@ -3672,6 +3696,7 @@ fn cmd_inbox(
                     "kind": i.kind,
                     "target": i.target,
                     "action": i.action,
+                    "semantic_skipped": i.semantic_skipped,
                 })).collect::<Vec<_>>(),
                 "skipped": report.skipped.iter().map(|s| serde_json::json!({
                     "name": s.name,
@@ -3701,7 +3726,21 @@ fn cmd_inbox(
             );
         }
         for i in &report.items {
-            println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+            if i.semantic_skipped > 0 {
+                println!(
+                    "  {}  {:<6}  {}  {}  ({} semantic duplicate line(s) dropped)",
+                    i.name, i.kind, i.target, i.action, i.semantic_skipped
+                );
+            } else {
+                println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
+            }
+        }
+        let total_semantic_skipped: usize = report.items.iter().map(|i| i.semantic_skipped).sum();
+        if total_semantic_skipped > 0 {
+            println!(
+                "inbox: {total_semantic_skipped} semantic duplicate line(s) dropped \
+                 (a forced repeat needs `inbox --force`, or a per-item force marker)"
+            );
         }
         for s in &report.skipped {
             println!("  {}  {:<6}  {}  deferred", s.name, s.kind, s.target);
@@ -4400,16 +4439,23 @@ fn cmd_log_session(
             "bad duration '{duration}'; use like 60m or 1h30m"
         ))));
     };
-    // #747 review: the billing tag is a closed vocabulary (paid, pps,
-    // comp) — a free-form token would silently count as untagged in
-    // balance math, and `Paid` would be a distinct session from `paid`.
+    // #747 review: the billing tag is a closed vocabulary — a
+    // free-form token would silently count as untagged in balance
+    // math, and `Paid` would be a distinct session from `paid`.
     // Validate before the refusal, like touch kinds are validated
     // before comparison, so the refusal never compares raw tags.
+    // #747 round 3: the vocabulary is the union of the enabled packs'
+    // `session-checks` billing tags for verb `session`, falling back
+    // to the core default (`paid`, `pps`, `comp`) when no enabled pack
+    // declares any — so a pack that bills under different tags is no
+    // longer overruled at log time. Fail-closed enforcement is
+    // unchanged: an unlisted tag still fails, in any case.
     if let Some(t) = &tag {
-        if !confidant_core::ledger::is_valid_session_tag(t) {
+        let tags = confidant_core::packs::session_billing_tags_for_vault(&vault);
+        if !tags.iter().any(|valid| valid == t) {
             return Err(anyhow::Error::new(DomainError::usage(format!(
                 "bad session tag '{t}'; use one of: {}",
-                confidant_core::ledger::SESSION_TAGS.join(", ")
+                tags.join(", ")
             ))));
         }
     }
@@ -4545,6 +4591,7 @@ fn cmd_log_session(
                     &note_rel,
                     &note_contents,
                     &person,
+                    force,
                 );
             }
             return Err(note_keychain_error());
@@ -4698,6 +4745,7 @@ fn cmd_log_touch(
                     &note_rel,
                     &note_contents,
                     &person,
+                    force,
                 );
             }
             return Err(note_keychain_error());
@@ -4901,7 +4949,10 @@ fn run_offered_command(
 /// token (in addition to any operator `--src`), so the drain's
 /// idempotency skips it on re-import. The note record item carries the
 /// exact bytes a normal write would have produced, so the drained
-/// result matches a normal write.
+/// result matches a normal write. When `force` is true, the ledger
+/// item also carries a `force: true` header so the drain processes a
+/// deliberately repeated line instead of semantically skipping it
+/// (#747 round 3).
 #[allow(clippy::too_many_arguments)]
 fn queue_session_note_to_inbox(
     cli: &Cli,
@@ -4912,6 +4963,7 @@ fn queue_session_note_to_inbox(
     note_rel: &Path,
     note_contents: &str,
     person: &ResolvedPersonArg,
+    force: bool,
 ) -> anyhow::Result<ExitCode> {
     use confidant_core::QueueItem;
     // The pin is the verification: the fallback encrypts to the pinned
@@ -4961,10 +5013,22 @@ fn queue_session_note_to_inbox(
 
     let batch = confidant_core::write::new_ulid();
     let ledger_line = format!("{line} src:fallback/{batch}");
+    // #747 round 3: a forced repeat carries its force through the queue
+    // as a `force: true` item header, so the drain processes it instead
+    // of applying the semantic duplicate skip — without it, `--force`
+    // + `--note` + key-unavailable + `--fallback-inbox` silently lost
+    // the ledger line at drain while its note still merged, leaving a
+    // note without its session. The header is on the ledger item only;
+    // the note record item merges by path as usual.
+    let ledger_header = if force {
+        "confidant-inbox/1\nkind: ledger\nforce: true\n"
+    } else {
+        "confidant-inbox/1\nkind: ledger\n"
+    };
     let items = vec![
         QueueItem {
             stem: batch.clone(),
-            plaintext: format!("confidant-inbox/1\nkind: ledger\n---\n{ledger_line}\n"),
+            plaintext: format!("{ledger_header}---\n{ledger_line}\n"),
         },
         QueueItem {
             stem: format!("{batch}-note"),

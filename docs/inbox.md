@@ -321,3 +321,13 @@ Edge case: if the session was logged with `--src X` and the vault
 already contains `src:X`, the drain skips the fallback ledger line as a
 duplicate while still merging the note record — the note then has no
 session line pointing at it.
+
+Semantic duplicates (#747) are different from that `src:` case: a
+queued line whose touch/session identity already exists in the ledger
+is skipped at drain, and the drain report names the drop per item
+(`semantic_skipped` in `--json`, a `(N semantic duplicate line(s)
+dropped)` note in text output). A deliberately repeated line is not
+dropped: `log --force --fallback-inbox` marks its ledger item with a
+`force: true` header so a plain drain processes it, and `confidant
+inbox --force` processes unmarked duplicates (never during a rotate
+drain). Neither escape bypasses `src:`/exact-text idempotency.
