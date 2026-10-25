@@ -7193,11 +7193,11 @@ fn read_alias_value(value_file: Option<&Path>) -> anyhow::Result<Zeroizing<Strin
     Ok(value)
 }
 
-/// Alias kinds are fixed by spec §6. A bad kind is a usage error (exit 2),
-/// refused before any key is touched or anything is read from stdin.
 /// Alias kinds are fixed by spec §6 (#748 adds `name`: a former/married
 /// name, nickname, or preferred name — resolved by the same HMAC mechanism
-/// as the other kinds; it never changes the record's display name).
+/// as the other kinds; it never changes the record's display name). A bad
+/// kind is a usage error (exit 2), refused before any key is touched or
+/// anything is read from stdin.
 fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
     if matches!(kind, "email" | "phone" | "handle" | "name") {
         Ok(())

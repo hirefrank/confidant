@@ -499,6 +499,61 @@ mod tests {
     }
 
     #[test]
+    fn resolve_alias_name_kind_matches_one_cleared_person() {
+        // #748: a `name` alias resolves through the same HMAC path as the
+        // other kinds, and is kind-scoped — the same HMAC under `email`
+        // does not match it.
+        let (_tmp, root) = vault("alias-name", |root| {
+            person(root, ADA, Some("Ada Example"), None);
+            alias(root, "2026-10-03", ADA, "name", H1);
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "name", H1),
+            Ok(PersonMatch {
+                id: RecordId::parse(ADA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+        // Different case/whitespace-insensitive comparison is on the HMAC
+        // hex, as for the other kinds.
+        assert_eq!(
+            resolve_alias(&vault, "name", &H1.to_ascii_uppercase()),
+            Ok(PersonMatch {
+                id: RecordId::parse(ADA).unwrap(),
+                matched_by_name: false,
+            })
+        );
+        assert_eq!(
+            resolve_alias(&vault, "email", H1),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "twitter", H1),
+            Err(PersonResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn resolve_alias_name_kind_shared_by_two_cleared_people_is_ambiguous() {
+        // #748: the shared-alias ambiguity rule applies to `name` exactly
+        // as to the other kinds — two cleared people, fail closed.
+        let (_tmp, root) = vault("alias-name-dup", |root| {
+            person(root, ADA, Some("Ada Example"), None);
+            person(root, BEA, Some("Bea Demo"), None);
+            alias(root, "2026-10-03", ADA, "name", H1);
+            alias(root, "2026-10-03", BEA, "name", H1);
+        });
+        let vault = load(&root);
+        assert_eq!(
+            resolve_alias(&vault, "name", H1),
+            Err(PersonResolveError::Ambiguous {
+                candidates: vec![RecordId::parse(ADA).unwrap(), RecordId::parse(BEA).unwrap()],
+            })
+        );
+    }
+
+    #[test]
     fn resolve_alias_canonicalizes_merged_away_member() {
         let (_tmp, root) = vault("alias-merged", |root| {
             person(root, ADA, Some("Ada Old"), None);

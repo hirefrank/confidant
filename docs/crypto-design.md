@@ -630,9 +630,12 @@ normalized value.
 A keyed HMAC over a low-entropy value is an **equality oracle**: anyone who
 holds the lookup key — every enrolled device and agent, and the operator —
 can test a candidate (`HMAC(key, candidate) == hmac:HEX?`) and confirm whether
-a given email, phone number, or handle belongs to a person. Alias values are
-enumerable in practice (address books, domain guesses), so this oracle
-reveals the *values*, not just their hashes.
+a given email, phone number, handle, or former/married name belongs to a person. Alias values are
+enumerable in practice (address books, domain guesses, and — for names —
+public records and social profiles), so this oracle
+reveals the *values*, not just their hashes. A former/married name is no
+less enumerable than an email, and more sensitive: it is a name the person
+may no longer use.
 
 This is **accepted and deliberate**, not an oversight:
 
@@ -695,7 +698,7 @@ writes.
   *how much*, never *who* or *what*.
 - **Guessing an alias value.** The alias index is a keyed HMAC over an
   enumerable value, so a key holder (any enrolled device) can confirm a
-  guessed email, phone, or handle by recomputing the HMAC. Accepted and
+  guessed email, phone, handle, or name by recomputing the HMAC. Accepted and
   documented in §10 ("Accepted dictionary-attack oracle") — it is inherent to
   a matchable, non-plaintext alias.
 - Rubber-hose / compelled disclosure of the recovery phrase (it reads the
