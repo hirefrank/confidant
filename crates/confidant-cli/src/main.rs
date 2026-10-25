@@ -7153,7 +7153,7 @@ fn cmd_context(
                 let anchor_missing = confidant_config_dir()
                     .is_none_or(|dir| confidant_crypt::anchor::load(&dir, &vault.root).is_err());
                 let fix = if anchor_missing {
-                    "This device has no trust anchor yet: get it from an enrolled device \
+                    "This device's trust anchor is missing or unreadable: get it from an enrolled device \
                      (`confidant keys device-add --from-request <file> --anchor-out <anchor-file>` \
                      there; copying its trust.toml is an unverified fallback) and run \
                      `confidant keys device-add --complete --anchor-file <anchor-file>` after pulling; \

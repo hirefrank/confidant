@@ -182,6 +182,27 @@ confidant keys device-add --from-request ~/device-add-request.toml --anchor-out 
 # the operator's seq tracker, even when the re-run then fails fast.
 ```
 
+Two things the commands above don't make obvious:
+
+- **`keys anchor export`** — `confidant keys anchor export --out <file>`
+  writes this device's `trust.toml` for transfer, with no enrollment, no
+  commit, and no device key. It is the standalone form of
+  `--from-request --anchor-out`, for when the new device's request file is
+  no longer at hand. It copies the installed anchor verbatim (public-key
+  material only) and does not verify it against the vault — the new
+  device's `--complete` is what verifies. Prefer it over hand-copying
+  `trust.toml`, which is an unverified fallback.
+
+- **Pre-certificate vaults.** On a vault that predates operator
+  certificates (no `keys/operator.toml`), `--complete` has no out-of-band
+  operator binding to check, so it proceeds on manifest-signature and
+  commitment-checked unwrap verification alone; the trust root is then the
+  anchor file's transfer channel plus the git remote. There is no post-hoc
+  command that adds a certificate (only `init`, `recover`, and shred
+  mutation write `operator.toml`), so such a vault keeps this weaker
+  binding until it is recovered. Make sure the anchor file came from a
+  device you trust.
+
 Headless hosts without an OS keychain: the **new** device needs only
 `CONFIDANT_DEVICE_KEY` for `keys device-add --initiate`. The already-enrolled
 device that runs `--from-request` is the one that needs
