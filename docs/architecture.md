@@ -398,7 +398,29 @@ registry, no signing in v1. External packs affect `check` only.
 
 Out of v0: hosted version, integration plugin system, GUI.
 
-## 8a. Worked example: encrypted intake (the inbox pattern)
+## 8a. Release and milestone policy (2026-10-26)
+
+Milestones are time horizons, not version containers. `Now` is the next
+two weeks, `Next` the following six, and `Later` an unscheduled backlog
+that is not a commitment. Version numbers are tags cut when a coherent
+slice ships, and the CHANGELOG is the record. Keep a release to 5-8
+issues; if a milestone needs more, it is a theme, not a slice.
+
+Pre-1.0 with one supported user, optimize for learning speed on the UX,
+the schema, and the command surface. Keep the review gates for crypto,
+the vault format, and the privacy model: those mistakes are expensive to
+reverse even when nobody else is using the vault.
+
+**The 1.0 bar.** 1.0 is a stability claim, not a feature checklist. It
+ships only when (a) the delegated-writer auth model and headless custody
+have shipped and been dogfooded on the operator's own vault for at least
+one full minor cycle, (b) no known data-loss, key-loss, or privacy-model
+bugs are open, (c) a fresh clone can install, init, recover, upgrade, and
+sync from the README alone, and (d) the outside audit in #138 is complete
+or the release still carries the unaudited disclosure. If any of those is
+false, the next release is 0.x.
+
+## 8b. Worked example: encrypted intake (the inbox pattern)
 
 An outside tool can hand material to the vault without a server and without
 being able to read the vault. This flow exercises the architecture without a

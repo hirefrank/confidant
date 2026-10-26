@@ -186,6 +186,11 @@ These are blocking. Do not open a PR for review that breaks one.
 
 - **One PR per milestone or topic.** Do not bundle unrelated changes, and
   do not edit files outside your topic.
+- **Milestones are time horizons.** `Now` (two weeks), `Next` (six
+  weeks), and `Later` (unscheduled) are not version containers; version
+  numbers are release tags. Keep a release to 5-8 issues, put design
+  spikes in `Now` when they block core work, and read the 1.0 bar in
+  `docs/architecture.md` §8a before scheduling a release.
 - **PR body** has these sections: title, summary, spec changes (or "none"),
   test evidence (commands run and results), and **Decisions I made** (each
   place the spec was silent and what you chose).
