@@ -8,9 +8,27 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-25
+
 ### Added
 - `name` alias kind: former/married names, nicknames, and preferred names can now be recorded as `alias` ledger lines and resolved via `alias resolve name` by the same keyed-HMAC mechanism as email/phone/handle; the record's display name is unchanged unless the operator renames it. Plain `resolve` (display-name path) and `find` (plaintext scan) do not consult aliases, so a former name that appears nowhere else in plaintext does not surface through them — `alias resolve name` is the lookup path (#748). A vault containing `name` alias lines fails `check` on a pre-0.7.1 CLI, since old `parse_alias` rejects the kind as `E_ALIAS_PLAINTEXT` (expected for an additive enum pre-1.0; operators running mixed versions will see an error, not a warning).
 - `video` touch kind: video calls are now a core `touch` kind alongside `call` (phone) and `meet` (in person), so 1:1 video contact no longer has to be filed as `meet`, `call`, or `other` (#735). Forward-compat note: a vault that logs `video` touches fails `check` with `E_TOUCH_MALFORMED` on older CLIs that do not know the kind, so mixed-version setups should upgrade together.
+- Trust-anchor ceremony for `keys device-add`: `--from-request --anchor-out` emits the anchor for out-of-band transfer, `--complete --anchor-file` verifies it (recovery-signed operator certificate, lookup-key unwrap, every-client trial unwrap) and installs it, failing closed and writing nothing on any failure; `--re-emit-anchor` re-emits the anchor for devices enrolled before `--anchor-out` existed, and `keys anchor export` is the standalone hand-off. `doctor` now errors on a missing or mismatched anchor for encrypted vaults, so the #713 shape (working wrapped keys, no anchor, reads silently skipping records) can no longer ship silently (#713, #772).
+- QMD preflight persistence is per-vault: `--persist` writes `<vault>/.confidant/qmd-preflight.toml` (gitignored) and the query wrapper reads the per-vault value first, falling back to the global `[qmd]` table, so one vault's recommendation never leaks into another vault. Legacy caveat: a global value written by an old `--persist` run carries no vault attribution and is served as fallback to every vault without its own file until that vault persists its own value (#722).
+
+### Changed
+- `log` commands refuse verbs the vault cannot accept up front, in both dry-run and apply, so dry-run no longer reports `ok` for a write apply would reject (#732).
+- `resolve` distinguishes "not found" from "cannot search" instead of returning `E_NOT_FOUND` for both (#717).
+- `find` warns in-band when a search skipped encrypted records, instead of reporting zero matches with no explanation (#718).
+- `keys device-add --initiate --output` now writes the request file as documented (#719).
+- Encrypted-disk assumption is a setup-time election persisted to config instead of an implicit default (#723).
+- Capture policy is documented in skill guidance: who belongs in the vault and on what evidence (#728).
+- `sync` defaults now apply, and `--pull` is surfaced, instead of the flags existing without effect (#736).
+- `log touch` refuses identical touches and `check` flags duplicate touches in the ledger (#747).
+- Install prompt and skill surface the git requirement for remote-git vaults (#708).
+
+### Fixed
+- `cargo audit` and `cargo deny` green on main again: `ctutils` bumped 0.4.3 to 0.4.5, and RUSTSEC-2026-0387 allowlisted with rationale (no bump path: `age` pins `p256` 0.13, fixed `crypto-bigint` only exists at 0.7.6+) (#766).
 
 ## [0.7.0] - 2026-10-22
 
@@ -694,7 +712,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/hirefrank/confidant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/hirefrank/confidant/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/hirefrank/confidant/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/hirefrank/confidant/compare/v0.6.0...v0.6.1
