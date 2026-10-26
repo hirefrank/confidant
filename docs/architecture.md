@@ -398,7 +398,7 @@ registry, no signing in v1. External packs affect `check` only.
 
 Out of v0: hosted version, integration plugin system, GUI.
 
-### 8b. Release and milestone policy (2026-10-26)
+## 8a. Release and milestone policy (2026-10-26)
 
 Milestones are time horizons, not version containers. `Now` is the next
 two weeks, `Next` the following six, and `Later` an unscheduled backlog
@@ -420,7 +420,7 @@ sync from the README alone, and (d) the outside audit in #138 is complete
 or the release still carries the unaudited disclosure. If any of those is
 false, the next release is 0.x.
 
-## 8a. Worked example: encrypted intake (the inbox pattern)
+## 8b. Worked example: encrypted intake (the inbox pattern)
 
 An outside tool can hand material to the vault without a server and without
 being able to read the vault. This flow exercises the architecture without a
