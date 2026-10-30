@@ -708,7 +708,8 @@ listed in §26): expiry is enforced for new-head acceptance but not
 re-checked when re-verifying already-accepted history for read/decrypt
 (otherwise history dies every 30 days) — now qualified by the
 acceptance checkpoint: the split holds only for ancestry already
-covered by a recorded checkpoint, and a fresh clone checks the whole
+covered by a recorded checkpoint or an acceptance attestation
+seed, and a fresh clone with neither checks the whole
 introduced chain; the review's "old-root certs stop verifying once
 the new operator cert is pinned" is read as a new-acceptance rule,
 with history preserved via the anchor-at-commit chain while the
@@ -720,6 +721,74 @@ made in the fix round, for Silas to confirm with the rest: there is
 no clock-skew allowance (the verifier's clock is authoritative, and
 a wrong clock fails closed), and writer-signed merge commits are
 checked against each parent rather than refused outright.
+
+What fix round 2 added (normative in spec §14, except the
+attestation, which is a proposal):
+
+- **Causal, ordered validation replaces the global-maximum cert
+  resolution.** Cert versions in newly introduced ancestry are
+  resolved in causal order, with a per-writer high-water that
+  starts from the seed (checkpoint and/or attestation, combined
+  by maximum) and advances only as each link is accepted, so
+  offline catch-up across a cert renewal validates both the
+  `seq = 1` and the `seq = 2` links while a `seq = 1` link
+  after `seq = 2` in the same chain is still refused. Merges
+  validate each parent's side independently from the shared
+  seed, and the merge commit is checked against the maximum
+  of the parents' high-waters. Above an attestation seed the
+  walk starts from the attestation high-waters. This
+  supersedes decision (e) in §26: the highest-`seq`-across-tree-
+  and-history rule no longer exists for newly introduced
+  ancestry; its force-push protection now comes from seed
+  floors, and a seedless fresh clone has no such floor (a
+  limit the attestation proposal states plainly). Revoked
+  and expired certs mid-chain are handled in the walk: the
+  revocation seq rule preserves already-accepted history but
+  never authorizes new acceptance by a revoked writer, and
+  an expired-at-acceptance link above the seed is refused
+  even if it was valid when written.
+- **Ledger authorization is semantic, not just positional.**
+  Every appended ledger line's affected set — every client
+  whose effective state the line changes — must be in the
+  writer's scope. Core verbs have fixed classifications
+  (`merge` affects both ends; `touch` affects its subject
+  plus the owners of referenced records; id-shaped tokens
+  anywhere in the line are references), and pack verbs are
+  writer-appendable only if the pack declares how to
+  extract affected clients; anything unclassifiable fails
+  closed for writers. Root appends are unaffected.
+- **Record modification checks both images.** Pre-image and
+  post-image must classify to the same scoped client and
+  the same scoped type, so front-matter edits cannot move
+  a record between clients or types under a modification.
+  An id change between images is a deletion plus an
+  addition, and the deletion refuses it.
+- **Acceptance attestation, as a proposal for review (not
+  settled).** A root-signed in-vault attestation over an
+  accepted tip and its high-waters would let a fresh reader
+  seed its checkpoint without prior state, preserving
+  legitimate history older than 30 days without admitting
+  forged ancestry above the attested tip. The proposal
+  defines format, domain separation, signer eligibility
+  (operator/recovery only, never writers), precise
+  selection ("newest" by ancestry dominance, set-maximum
+  seeding on forks, inapplicable tips ignored), and
+  rollback rules (monotone floors, no silent fallback to
+  an older seed, checkpoint combination by maximum, chain
+  conflicts refused, force-push limit stated). Four open
+  questions are flagged in the spec for Silas/Frank: the
+  `attested_at` field, recovery-key signatures alone,
+  mandatory on-acceptance writing vs a cadence bound, and
+  whether forked attestations should fail closed outright.
+  No implementation may build on the attestation until
+  those are answered and the subsection is approved.
+- **Agreed choices recorded:** no clock-skew allowance,
+  with a `doctor`/diagnostic hint that a wrong system
+  clock is the likely cause of a window failure near a
+  00:00 UTC boundary; and writers should rebase rather
+  than merge, since a merge pulling in an operator change
+  to `keys/` or `confidant.toml` is refused against the
+  writer's own parent.
 
 ## 9. Recovery (ADR-15)
 
@@ -1027,7 +1096,20 @@ in the repo, tests, or CI.
     ledger-only commit is accepted; a ledger commit that rewrites an
     existing line is refused; a writer commit touching
     `keys/writers/` is refused; a writer-signed merge commit is
-    checked against each parent. Migration: an existing
+    checked against each parent. Ledger affected clients: a
+    `merge A into B` line appended by a writer scoped to A but not
+    B is refused, the same merge by a writer scoped to both A and
+    B is accepted, and an unclassifiable pack verb (no
+    affected-clients declaration, or a declaration that cannot be
+    evaluated against the line) is refused for a writer; a
+    `touch` line naming a note owned by an unscoped client is
+    refused. Record pre/post-image: a modification whose
+    pre-image classifies to client A / type `note` and whose
+    post-image classifies to client B is refused, and one whose
+    post-image changes type to an unscoped or different type is
+    refused; a modification whose pre- and post-images carry
+    different record ids is classified as deletion plus addition
+    and is refused. Migration: an existing
     operator-signed vault still verifies; the first writer cert is
     granted to the host holding the copied operator key; that copy is
     retired; old commits and manifests still verify; a fresh clone
@@ -1065,6 +1147,45 @@ in the repo, tests, or CI.
     revoked writer; and history depending on a retired recovery key
     with no checkpoint is refused with a diagnostic naming the
     missing checkpoint and the retired key id.
+28. **Causal ordered validation / offline catch-up across cert
+    renewal (spec §14):** an offline reader fetching legitimate
+    sequential commits signed under cert `seq = 1` and then under
+    renewed cert `seq = 2` accepts both as new (the first link is
+    judged against the high-water at that link, not the later
+    maximum); a link signed under `seq = 1` after `seq = 2` was
+    accepted in the same chain is refused; the same holds for a
+    fresh clone with no checkpoint and no attestation seed; a
+    merge whose parents were validated independently from the
+    shared seed is accepted with the merge commit checked against
+    the maximum of the parents' high-waters; a candidate head
+    signed under a working-tree cert older than the high-water
+    resulting from its ancestry walk is refused; a link signed
+    under a cert expired at acceptance time and above the seed is
+    refused even if it was valid when written; and the same walk
+    above an attestation seed starts from the attestation
+    high-waters and advances link by link.
+29. **Acceptance attestation, proposal (spec §14, NOT settled):**
+    a fresh clone of a vault with a 60-day-old writer commit under
+    a later root-signed attestation verifies the commit as
+    history; a backdated forged ancestor above the newest
+    attestation is refused as new acceptance; fresh-device
+    recovery across a rotation verifies through the recovery
+    checkpoint acting as seed; an older attestation replayed
+    while a newer verified attestation is present in the same
+    ancestry changes nothing (dominant candidate / set maximum
+    wins); an attestation below an existing off-vault checkpoint
+    is ignored and never moves the checkpoint backwards; a
+    writer-signed attestation is refused as a seed; an
+    attestation whose tip is on an unmerged branch does not
+    seed another head; a root-forked `seq` (same `seq`,
+    different bytes, both validly signed) fails closed until a
+    higher chained attestation resolves it; a chain above a
+    seed tip containing a manifest `seq` below the seed
+    high-water is refused; and with no verifying attestation
+    or checkpoint, the whole chain is new acceptance with a
+    diagnostic naming the missing attestation. These tests
+    define what the proposal must prove on review; they do
+    not approve it.
 
 ## 13. What changes in the spec
 
@@ -1097,6 +1218,16 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   domain `confidant-recovery-checkpoint-v1`, a minor-format addition
   in the same minor bump. The acceptance checkpoint is off-vault
   reader state next to `trust.toml`, not a vault format change.
+- **Fix round 2, attestation proposal (spec §14, 2026-10-30,
+  NOT settled)**: acceptance attestations — proposed new
+  `keys/acceptance-attestations/` tree and domain
+  `confidant-acceptance-attestation-v1`, in the same minor bump
+  if approved. Readers that do not implement the proposal ignore
+  attestation files entirely and keep the pre-proposal
+  behaviour (whole introduced chain is new acceptance), so the
+  proposal adds a seed, never a weakening. Causal ordered
+  validation and ledger affected-clients classification are
+  normative rule changes with no new file type.
 
 These are documented here; the normative spec 0.1 edits land in a
 follow-up after crypto review (issue #85).
@@ -1494,3 +1625,64 @@ spec §14 unless noted:
    allowance, and writer-signed merge commits checked against each
    parent rather than refused outright. The §2 `[crypto]` one-line
    follow-up and the open implementation items above are unchanged.
+
+**Fix round 2, 2026-10-30 (Silas's re-review of `7f9493f` plus
+Frank's and Silas's 13:58 UTC findings, PR #786).** Silas closed
+five of the six fix-round items and raised one new blocking
+problem — a fresh clone cannot verify writer history older than
+30 days — with a root-signed attestation sketch as the fix, plus
+one required small fix (record pre/post-image). Frank added two
+blocking findings in the same revision: offline catch-up across
+a cert renewal, and ledger affected clients. All are addressed
+in this revision, in spec §14 unless noted:
+
+1. **Acceptance attestation, as a proposal (not settled).**
+   Developed with the same rigour as the rest of the design, at
+   Frank's direction: the sketch is not approved on its own.
+   Format, domain `confidant-acceptance-attestation-v1`,
+   signer eligibility (operator/recovery only, never writers,
+   anchor-at-commit for retired signers), precise selection
+   (ancestry scan, candidate verification, applicability by
+   tip ancestry, "newest" by dominance or set-maximum on
+   forks, root-fork fail-closed unless resolved by a higher
+   chained attestation), rollback prevention (monotone
+   floors, older-replay inert, checkpoint combination by
+   maximum, no silent fallback, chain conflicts refused,
+   force-push limit stated), writer/cadence rules, and
+   recovery checkpoints counting as seeds. Four open
+   questions are flagged in the spec for review
+   (`attested_at`, recovery-key signatures alone,
+   on-acceptance vs cadence, fork fail-closed vs set-max).
+   §12 item 29 is the test plan the proposal must prove.
+   Decision (a) is further qualified: the read/write split
+   holds for checkpoint- *or* attestation-covered ancestry.
+2. **Causal ordered validation (supersedes decision (e)).**
+   The highest-cert-`seq`-across-tree-and-history rule is
+   replaced for newly introduced ancestry by a causal walk
+   with a per-writer high-water advancing only on link
+   acceptance, starting from the seed (checkpoint and/or
+   attestation, combined by maximum). Offline catch-up
+   across a renewal is accepted; a stale link after a
+   renewal in the same chain is refused; merges validate
+   sides independently from the shared seed and check the
+   merge commit against the maximum of the parents'
+   high-waters; revoked/expired mid-chain behaviour is
+   specified. §12 item 28. The "Decisions I made" bullet
+   (e) in the PR body is updated to match.
+3. **Ledger affected clients.** Semantic classification of
+   every affected client per verb (core table, id-shaped
+   tokens always references, pack declaration requirement,
+   unclassifiable fails closed for writers). §12 item 24
+   gains the scoped-A/unscoped-B merge refusal, the
+   both-scoped acceptance, and the unclassifiable pack
+   verb refusal.
+4. **Record pre/post-image.** Both images must classify to
+   the same scoped client and type; an id change between
+   images is a deletion plus an addition and is refused.
+   §12 item 24 gains both cases.
+   Agreed choices recorded: no clock-skew allowance with a
+   `doctor` hint naming a wrong system clock near a 00:00
+   UTC boundary, and writers should rebase rather than
+   merge. This revision does not approve the attestation
+   design — approval is Frank's/Silas's on re-review — and
+   #731 still needs outside audit before public launch.
