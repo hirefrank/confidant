@@ -108,29 +108,36 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 
 # preflight the host (issue #722): spec check, model-hub reachability, and
 # cold + warm timed smoke queries per mode, with a recommended default
-# mode. qmd-index.py runs preflight automatically with --persist at the
-# end of setup (unless --skip-preflight), so setup itself records the
-# recommendation; running it standalone with --persist is the same check.
-# --persist records the recommendation ([qmd] default_mode, and
-# [qmd] offline when the hub is unreachable or a hybrid smoke run proves
-# the models are cached) in the VAULT-LOCAL preflight file,
+# mode. qmd-index.py runs preflight automatically with --persist
+# --chained at the end of setup (unless --skip-preflight), so setup
+# itself records the offline decision; the chained run never writes
+# default_mode, whatever the probe returns (#778 fix round) — a mode
+# change needs a standalone run with an explicit --query (a term
+# known to hit the corpus), because the default query can return
+# hits through the semantic modes even when the literal phrase is
+# absent. --persist records ([qmd] default_mode, and [qmd] offline
+# when the hub is unreachable or a hybrid smoke run proves the models
+# are cached) in the VAULT-LOCAL preflight file,
 # <vault>/.confidant/qmd-preflight.toml, where qmd-query.py honors it
 # first, falling back to the global ~/.config/confidant/config.toml
 # [qmd] table for vaults with no per-vault file — so a recommendation
 # measured on one vault never leaks into another vault on the same
 # host, while single-vault setups keep working unchanged. --persist
 # never touches the global file: values an old --persist wrote there
-# stay honored as fallback. It also clears stale values an earlier
-# preflight run wrote to the vault-local file that fresh evidence no
-# longer supports, and leaves hand-set values alone (saying so). A warm-run failure downgrades the
-# mode to that failure — the cold sample is never reused. A smoke run
-# that answers with zero hits is reported as ok-empty, never
-# recommended. Worst case is ~18 minutes at the default 180s per-mode
-# timeout (cold + warm x 3 modes) plus the hub probe; pass
-# --query-timeout to bound it. Exit 0 is NOT a gate:
-# read the report (or --json) — a LOW DISK / unreachable-hub /
-# no-mode-recommended outcome still exits 0.
-"$(confidant which --skills-dir)"/qmd-search/bin/qmd-preflight.py --vault /path/to/vault --persist
+# stay honored as fallback. It also clears a stale preflight-written
+# offline value the fresh evidence no longer supports, and leaves
+# hand-set values alone (saying so). A persisted default_mode is
+# kept, never cleared, when an explicit --query probe yields no
+# hit-bearing mode (#778): an empty probe is not evidence against
+# the old mode. A warm-run failure downgrades the mode to that
+# failure — the cold sample is never reused. A smoke run that
+# answers with zero hits is reported as ok-empty, never recommended.
+# Worst case is ~18 minutes at the default 180s per-mode timeout
+# (cold + warm x 3 modes) plus the hub probe; pass --query-timeout
+# to bound it. Exit 0 is NOT a gate: read the report (or --json) —
+# a LOW DISK / unreachable-hub / no-mode-recommended outcome still
+# exits 0.
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-preflight.py --vault /path/to/vault --persist --query coaching
 ```
 
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the
@@ -260,12 +267,20 @@ value once its own preflight persists a per-vault value.
   hub cannot turn preflight itself into a silent fallback, and
   progress lines go to stderr per run; worst case is ~18 minutes at
   the default 180s per-mode timeout, bound it with `--query-timeout`.
-  `--persist` writes `[qmd] default_mode` and, when the hub is
-  unreachable or the hybrid cache proof holds, `[qmd] offline =
-  true` to the vault-local `<vault>/.confidant/qmd-preflight.toml`
-  (local, gitignored), preserving every other key in that file, and
-  clears stale preflight-written keys the fresh evidence no longer
-  supports (hand-set values are left alone and reported). It never
+  `--persist` writes `[qmd] offline = true` (when the hub is
+  unreachable or the hybrid cache proof holds) to the vault-local
+  `<vault>/.confidant/qmd-preflight.toml` (local, gitignored),
+  preserving every other key in that file, and clears a stale
+  preflight-written `offline` the fresh evidence no longer supports
+  (hand-set values are left alone and reported); it writes `[qmd]
+  default_mode` only on a run with an explicit `--query` whose
+  probe yields a hit-bearing recommendation — a chained run
+  (`--chained`) or a run with the default query never changes a
+  persisted mode, whatever the probe returns, because the default
+  query can hit through the semantic modes (#778 fix round). A
+  persisted `default_mode` is kept, never cleared, when an
+  explicit --query probe yields no hit-bearing mode — an empty
+  probe is not evidence against it (#778). It never
   touches the global user config: values an old `--persist` wrote
   there (including the #723 disk-election key) stay honored as
   fallback for vaults with no per-vault file. Exit 0 whenever the

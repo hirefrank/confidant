@@ -614,21 +614,24 @@ def run_qmd(args, env, check=True):
 def run_setup_preflight(preflight, vault):
     """Run preflight as the last setup step, recording via --persist.
 
-    The recommendation must land in the vault-local [qmd] preflight
+    The offline decision must land in the vault-local [qmd] preflight
     file during setup itself (issue #722 item 3): a report-only
-    auto-run would leave the
-    operator to rerun preflight with --persist by hand before the
-    query wrapper honored anything. Returns the preflight exit code;
+    auto-run would leave the operator to rerun preflight with
+    --persist by hand before the query wrapper honored anything.
+    The run passes --chained, so it never writes default_mode,
+    whatever the probe returns (#778 fix round): a mode change
+    needs an explicit --query preflight run, and the settled
+    fallback applies until then. Returns the preflight exit code;
     a nonzero code is reported as a rerun note, never a setup failure
     — the index build above already succeeded.
     """
     p = subprocess.run([sys.executable, preflight, "--vault", vault,
-                        "--persist"], capture_output=False)
+                        "--persist", "--chained"], capture_output=False)
     if p.returncode != 0:
         print("note: qmd-preflight.py did not complete (exit "
               f"{p.returncode}); the index above is still built — rerun "
               "bin/qmd-preflight.py --vault " + vault + " --persist "
-              "on its own")
+              "--query <term> on its own to record a default mode")
     return p.returncode
 
 
@@ -704,27 +707,31 @@ def main():
     # operator who runs only this script must not meet the old
     # first-query timeout as their first impression, and must not
     # need a second command before the query wrapper honors the
-    # recommendation — hence --persist. The preflight report is
+    # offline decision — hence --persist (chained: offline only,
+    # never default_mode — a mode change needs an explicit --query
+    # run). The preflight report is
     # printed in full; its exit code is never a gate (it is 0 whenever
     # the report completes), and a preflight failure never fails the
     # index build that just succeeded.
     if args.skip_preflight:
         print("note: preflight skipped (--skip-preflight); run "
               "bin/qmd-preflight.py --vault " + vault + " --persist "
-              "before relying on hybrid/vector search")
+              "--query <term> before relying on hybrid/vector search")
         return
     preflight = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "qmd-preflight.py")
     if not os.path.isfile(preflight):
         print("REQUIRED SETUP STEP (preflight script not found beside "
               "this script): run qmd-preflight.py --vault " + vault +
-              " --persist to check the host, hub reachability, and "
-              "per-mode timings, and record the recommendation, "
-              "before the first real query (issue #722)")
+              " --persist --query <term> to check the host, hub "
+              "reachability, and per-mode timings, and record the "
+              "recommendation, before the first real query (issue #722)")
         return
-    print("running qmd-preflight.py --persist (issue #722) — spec, hub, "
-          "and cold/warm smoke per mode; this is part of setup, its "
-          "recommendation is recorded in [qmd] config, and its report "
+    print("running qmd-preflight.py --persist --chained (issue #722) "
+          "— spec, hub, and cold/warm smoke per mode; this is part "
+          "of setup, its offline decision is recorded in [qmd] "
+          "config (a default_mode change needs an explicit --query "
+          "run), and its report "
           "(not its exit code) is the result to read. Worst case is "
           "~18 minutes at the default 180s per-mode timeout; progress "
           "lines go to stderr:")

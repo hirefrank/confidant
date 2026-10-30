@@ -363,6 +363,8 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
     def test_setup_preflight_passes_persist(self):
         # Round-2 N2: setup's automatic preflight run must record the
         # recommendation itself — the stub records the argv it got.
+        # Fix round: the chained run passes --chained, so --persist
+        # updates the offline decision only and never writes a mode.
         seen = self.home / "preflight-argv.json"
         stub = self.home / "stub-preflight.py"
         stub.write_text(
@@ -374,6 +376,7 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
         self.assertEqual(code, 0)
         argv = json.loads(seen.read_text(encoding="utf-8"))
         self.assertIn("--persist", argv)
+        self.assertIn("--chained", argv)
         self.assertEqual(argv[argv.index("--vault") + 1], "/vault")
 
 
@@ -1140,8 +1143,11 @@ class QmdPreflightTest(unittest.TestCase):
     def test_persist_sets_recommendation_and_offline(self):
         vault = self._fake_vault()
         stub = self._stub("stub-hits2.py", [{"path": "x.md", "score": 1.0}])
+        # An explicit --query is required for --persist to write a
+        # mode (fix round: default-query runs never write one).
         report = self._run_main(vault, stub, self._closed_port_url(),
-                                extra=("--persist",))
+                                extra=("--persist", "--query",
+                                       "coaching"))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertTrue(report["offline_recommended"])
         self.assertTrue(report["hybrid_cache_complete"])
@@ -1258,7 +1264,8 @@ class QmdPreflightTest(unittest.TestCase):
             self.assertNotIn("default_mode",
                              cfg.read_text(encoding="utf-8"))
 
-    def test_persist_clears_stale_preflight_keys(self):
+    def test_persist_keeps_default_mode_on_empty_probe_clears_offline(
+            self):
         import http.server
         import threading
 
@@ -1278,8 +1285,12 @@ class QmdPreflightTest(unittest.TestCase):
             hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
             vault = self._fake_vault()
             # Per-vault scoping: the stale marked keys live in the
-            # vault-local file now, and that file is what --persist
-            # clears. The global config is not created at all.
+            # vault-local file now. #778 splits their fates on an empty
+            # probe: a reachable hub IS fresh evidence against a marked
+            # offline=true, so it is still cleared — but the empty
+            # probe says nothing about the persisted default_mode, so
+            # it is kept, not cleared. The global config is not created
+            # at all.
             cfg = vault / ".confidant" / "qmd-preflight.toml"
             cfg.write_text(
                 "[qmd]\ndefault_mode = \"vector\"\n"
@@ -1291,11 +1302,12 @@ class QmdPreflightTest(unittest.TestCase):
                                     extra=("--persist",))
             self.assertIsNone(report["recommended_mode"])
             self.assertFalse(report["offline_recommended"])
-            self.assertEqual(report["persisted"]["default_mode_cleared"],
+            self.assertEqual(report["persisted"]["default_mode_kept"],
                              "vector")
             self.assertTrue(report["persisted"]["offline_cleared"])
             text = cfg.read_text(encoding="utf-8")
-            self.assertNotIn("default_mode", text)
+            self.assertIn('default_mode = "vector"', text)
+            self.assertIn('default_mode_source = "preflight"', text)
             self.assertNotIn("offline", text)
             self.assertFalse(
                 (self.root / ".config" / "confidant" / "config.toml")
@@ -1303,6 +1315,163 @@ class QmdPreflightTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_persist_keeps_default_mode_on_chained_empty_probe(self):
+        # #778, the field case: the chained qmd-index run probes
+        # with the default query ("preflight smoke test"). The old
+        # --persist cleared the persisted default_mode on an empty
+        # probe (default_mode="vector", offline=true in, only
+        # offline=true out). An empty probe is not evidence against
+        # the old mode, so it is kept. offline stays true here on hub
+        # evidence (hub unreachable), not on the empty probe. (The
+        # default query can in fact hit via semantic modes — see the
+        # hit-bearing chained test — which is why the chained run
+        # never writes a mode at all.)
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n"
+            "offline = true\noffline_source = \"preflight\"\n",
+            encoding="utf-8")
+        stub = self._stub("stub-empty-778.py", [])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertIsNone(report["recommended_mode"])
+        self.assertEqual(report["persisted"]["default_mode_kept"], "bm25")
+        self.assertTrue(report["persisted"]["offline"])
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+        self.assertIn("offline = true", text)
+
+    def test_chained_run_with_hits_keeps_default_mode(self):
+        # Fix round (review of b689b87): the default query CAN hit
+        # via vector/hybrid semantic search, so a hit-bearing
+        # chained run used to take the recommendation branch of
+        # persist_preflight and overwrite the settled mode. The
+        # chained run must never write default_mode, whatever the
+        # probe returns; the offline decision still updates.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n"
+            "offline = true\noffline_source = \"preflight\"\n",
+            encoding="utf-8")
+        stub = self._stub("stub-hits-chained.py",
+                          [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist", "--chained"))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertEqual(report["persisted"]["default_mode_kept"], "bm25")
+        self.assertNotIn("default_mode", report["persisted"])
+        self.assertTrue(report["persisted"]["offline"])
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+        self.assertIn("offline = true", text)
+
+    def test_default_query_run_with_hits_keeps_default_mode(self):
+        # Same rule without --chained: no explicit --query was
+        # supplied, so this run is a measurement only. A
+        # default-query run must not write a mode even when the
+        # semantic modes return hits for it.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n"
+            "offline = true\noffline_source = \"preflight\"\n",
+            encoding="utf-8")
+        stub = self._stub("stub-hits-default-query.py",
+                          [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertEqual(report["persisted"]["default_mode_kept"], "bm25")
+        self.assertNotIn("default_mode", report["persisted"])
+        self.assertTrue(report["persisted"]["offline"])
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+
+    def test_explicit_query_run_with_hits_replaces_default_mode(self):
+        # Paired test: an explicit user-supplied --query with hits
+        # still replaces the persisted mode.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n"
+            "offline = true\noffline_source = \"preflight\"\n",
+            encoding="utf-8")
+        stub = self._stub("stub-hits-explicit.py",
+                          [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist", "--query", "coaching"))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertEqual(report["persisted"]["default_mode"], "hybrid")
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "hybrid"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+
+    def test_chained_run_without_existing_mode_writes_no_default_mode(
+            self):
+        # No pre-existing file: a chained hit-bearing run writes
+        # the offline decision only; it must not invent a
+        # default_mode, kept or otherwise.
+        vault = self._fake_vault()
+        stub = self._stub("stub-hits-chained-fresh.py",
+                          [{"path": "x.md", "score": 1.0}])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist", "--chained"))
+        self.assertEqual(report["recommended_mode"], "hybrid")
+        self.assertNotIn("default_mode", report["persisted"])
+        self.assertNotIn("default_mode_kept", report["persisted"])
+        self.assertTrue(report["persisted"]["offline"])
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        text = cfg.read_text(encoding="utf-8")
+        self.assertNotIn("default_mode", text)
+        self.assertIn("offline = true", text)
+
+    def test_persist_preflight_keeps_default_mode_without_recommendation(
+            self):
+        # #778, unit level: persist_preflight with no recommendation
+        # keeps a marked default_mode byte-for-byte (value and marker),
+        # instead of clearing it as stale.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n",
+            encoding="utf-8")
+        persisted = self.preflight.persist_preflight(str(vault), None, False)
+        self.assertEqual(persisted["default_mode_kept"], "bm25")
+        self.assertNotIn("default_mode_cleared", persisted)
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+
+    def test_persist_preflight_chained_ignores_recommendation(self):
+        # Unit level: allow_default_mode=False keeps a marked mode
+        # byte-for-byte despite a fresh recommendation, and still
+        # writes the offline decision.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n",
+            encoding="utf-8")
+        persisted = self.preflight.persist_preflight(
+            str(vault), "hybrid", True, allow_default_mode=False)
+        self.assertEqual(persisted["default_mode_kept"], "bm25")
+        self.assertNotIn("default_mode", persisted)
+        self.assertTrue(persisted["offline"])
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+        self.assertIn("offline = true", text)
 
     def test_persist_leaves_global_keys_untouched(self):
         # Per-vault scoping replaces the old global legacy migration
@@ -1370,7 +1539,8 @@ class QmdPreflightTest(unittest.TestCase):
         stub = self._stub("stub-hits-legacy.py",
                           [{"path": "x.md", "score": 1.0}])
         report = self._run_main(vault, stub, self._closed_port_url(),
-                                extra=("--persist",))
+                                extra=("--persist", "--query",
+                                       "coaching"))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         self.assertTrue(report["persisted"]["offline"])
@@ -1432,7 +1602,10 @@ class QmdPreflightTest(unittest.TestCase):
             stub = self._stub("stub-empty3.py", [])
             report = self._run_main(vault, stub, hub_url,
                                     extra=("--persist",))
-            self.assertEqual(report["persisted"]["default_mode_left"],
+            # #778 unified the default_mode report: marked or hand-set,
+            # an empty probe keeps the value (reported as kept), while
+            # the hand-set offline value keeps its own left key.
+            self.assertEqual(report["persisted"]["default_mode_kept"],
                              "bm25")
             self.assertTrue(report["persisted"]["offline_left"])
             text = cfg.read_text(encoding="utf-8")
@@ -1454,6 +1627,7 @@ class QmdPreflightTest(unittest.TestCase):
         bindir = self._fake_qmd_on_path()
         argv = ["--vault", str(vault),
                 "--query-script", str(stub),
+                "--query", "coaching",
                 "--hub-url", self._closed_port_url(), "--json", "--persist"]
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.dict(os.environ, {

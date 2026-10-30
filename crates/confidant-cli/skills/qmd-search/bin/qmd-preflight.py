@@ -61,11 +61,20 @@ Reports, in order:
    is NOT touched by `--persist`: its values remain as fallback, and
    clearing a global value from a per-vault run could clobber a
    fallback another vault still relies on. `--persist` also clears
-   stale preflight-written keys in the vault-local file (a
-   `default_mode` with no hit-bearing mode behind it, an `offline`
-   written by an earlier preflight run when the hub has recovered),
-   and says so explicitly; values not marked as preflight-written are
-   left alone and reported. (The global file keeps its own older
+   a stale preflight-written `offline` when the hub has recovered,
+   and says so explicitly. A `default_mode` change needs an explicit,
+   user-supplied `--query` (#778 fix round): the default smoke query
+   ("preflight smoke test") can return hits through the semantic
+   modes even though the literal phrase appears nowhere, so a run
+   without an explicit query — and the chained `qmd-index` run,
+   which passes `--chained` — never writes `default_mode`, whatever
+   the probe returns; it updates `offline` only and reports any
+   persisted value as kept. Only a fresh hit-bearing recommendation
+   from an explicit-`--query` run replaces a persisted mode, and
+   an empty explicit-query probe keeps it: an empty probe is not
+   evidence against the old mode.
+   Values not marked as preflight-written are left alone and
+   reported. (The global file keeps its own older
    scheme — provenance markers plus the one-time
    `preflight_legacy_migrated` stamp — for values an old `--persist`
    wrote there; those values are read-only fallback now and are never
@@ -114,6 +123,11 @@ MIN_RAM_GB = 8
 MODES = ("hybrid", "vector", "bm25")
 DEFAULT_BUDGET_S = 60
 DEFAULT_QUERY_TIMEOUT_S = 180  # mirrors qmd-query.py's qmd timeout
+# Smoke query when --query is not supplied. The literal phrase
+# appears in no vault, but vector/hybrid semantic search can still
+# return neighbours for it — so a default-query run is a measurement
+# only and must never write default_mode (see persist_preflight).
+DEFAULT_QUERY = "preflight smoke test"
 DEFAULT_HUB_URL = "https://huggingface.co"
 DEFAULT_HUB_TIMEOUT_S = 10
 # Provenance markers --persist writes next to the keys it owns, so a
@@ -593,36 +607,49 @@ def remove_vault_qmd_config_value(vault, key):
     return True
 
 
-def persist_preflight(vault, recommendation, offline_recommended):
+def persist_preflight(vault, recommendation, offline_recommended,
+                      allow_default_mode=True):
     """Write the preflight recommendation to the vault-local file.
 
     Per-vault (issue #722 remainder): the file is
     `<vault>/.confidant/qmd-preflight.toml`, never the global user
     config — the global file's [qmd] values remain as fallback for
     vaults with no per-vault file and are never rewritten here.
-    Marked values the fresh evidence no longer supports are cleared
+    A marked `offline` the fresh evidence no longer supports is cleared
     and reported distinctly; unmarked (hand-set) values are left
-    alone and reported. The vault-local file is new, so it has no
-    legacy-migration branch: every value it carries was either
-    written with a marker by this function or added by hand.
+    alone and reported. A persisted `default_mode` is NEVER cleared
+    when the probe yields no hit-bearing mode (#778): an empty probe
+    is absence of evidence about the old mode, not evidence against
+    it — the value is kept and reported as kept, whether marked or
+    hand-set. Only a fresh hit-bearing recommendation replaces it,
+    and only when `allow_default_mode` is true: a chained run
+    (`--chained`) or a run without an explicit `--query` never
+    writes `default_mode`, whatever the probe returns — the default
+    query can hit through the semantic modes, so its hits are not
+    a user-chosen measurement. Such a run still updates `offline`
+    and reports any persisted mode as kept. The vault-local file
+    is new, so it has no legacy-migration branch: every value it
+    carries was either written with a marker by this function or
+    added by hand.
     Returns the persisted dict (including the path written).
     """
     persisted = {}
     config = read_vault_qmd_config(vault)
-    if recommendation is not None:
+    if recommendation is not None and allow_default_mode:
         set_vault_qmd_config_value(vault, "default_mode",
                                    json.dumps(recommendation))
         set_vault_qmd_config_value(vault, "default_mode" + SOURCE_SUFFIX,
                                    json.dumps(SOURCE_VALUE))
         persisted["default_mode"] = recommendation
     elif "default_mode" in config:
-        if config.get("default_mode" + SOURCE_SUFFIX) == SOURCE_VALUE:
-            old = config["default_mode"]
-            remove_vault_qmd_config_value(vault, "default_mode")
-            remove_vault_qmd_config_value(vault, "default_mode" + SOURCE_SUFFIX)
-            persisted["default_mode_cleared"] = old
-        else:
-            persisted["default_mode_left"] = config["default_mode"]
+        # #778: this run does not replace the persisted mode — either
+        # no hit-bearing mode ran, so the probe says nothing about
+        # it (an empty probe is not evidence against it), or mode
+        # writing is not allowed on this run (chained / no explicit
+        # --query) and a hit-bearing probe must not overwrite the
+        # settled mode. Keep the value, marked or hand-set, and
+        # report it as kept.
+        persisted["default_mode_kept"] = config["default_mode"]
     if offline_recommended:
         set_vault_qmd_config_value(vault, "offline", "true")
         set_vault_qmd_config_value(vault, "offline" + SOURCE_SUFFIX,
@@ -928,11 +955,17 @@ def _progress_printer(mode, phase, result):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--vault", default=None)
-    ap.add_argument("--query", default="preflight smoke test",
-                    help="query text for the per-mode smoke runs; a "
-                         "zero-hit answer is reported as ok-empty, not "
+    ap.add_argument("--query", default=None,
+                    help="query text for the per-mode smoke runs "
+                         f"(default {DEFAULT_QUERY!r}); a zero-hit "
+                         "answer is reported as ok-empty, not "
                          "recommended — pass a term known to hit the "
-                         "corpus for a hit-bearing measurement")
+                         "corpus for a hit-bearing measurement. A "
+                         "default_mode change under --persist needs "
+                         "an explicit --query: the semantic modes can "
+                         "return neighbours for the default query "
+                         "even when the literal phrase is absent, so "
+                         "a run without one never writes default_mode")
     ap.add_argument("--query-timeout", type=int,
                     default=DEFAULT_QUERY_TIMEOUT_S,
                     help="per-mode smoke timeout in seconds "
@@ -951,9 +984,20 @@ def main(argv=None):
                          "[qmd] offline when recommended) to the "
                          "vault-local per-vault file "
                          "(<vault>/.confidant/qmd-preflight.toml), never "
-                         "the global user config; also clears stale "
-                         "preflight-written keys the fresh evidence no "
-                         "longer supports")
+                         "the global user config; also clears a stale "
+                         "preflight-written offline the fresh evidence no "
+                         "longer supports, and never clears a persisted "
+                         "default_mode when no hit-bearing mode ran. A "
+                         "default_mode change needs an explicit "
+                         "--query: a chained run (--chained) or a run "
+                         "with the default query updates offline only "
+                         "and never changes a persisted default_mode")
+    ap.add_argument("--chained", action="store_true",
+                    help="chained qmd-index.py run: with --persist, "
+                         "update [qmd] offline only and never write "
+                         "default_mode, whatever the probe returns "
+                         "(qmd-index.py passes this; a default_mode "
+                         "change needs an explicit --query run instead)")
     ap.add_argument("--json", action="store_true",
                     help="print the report as JSON instead of text")
     ap.add_argument("--query-script", default=None,
@@ -992,7 +1036,14 @@ def main(argv=None):
     corpus_present = os.path.isdir(os.path.join(vault, CORPUS_REL))
     query_script = args.query_script or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "qmd-query.py")
-    results = run_smoke(query_script, vault, args.query, args.query_timeout,
+    # A default_mode change needs an explicit, user-supplied query:
+    # the default query can hit through the semantic modes, so a
+    # run without one — and any --chained run — is a measurement
+    # only and must never write a mode (#778 fix round). The
+    # recommendation is still computed and reported either way.
+    query_text = args.query if args.query is not None else DEFAULT_QUERY
+    allow_default_mode = args.query is not None and not args.chained
+    results = run_smoke(query_script, vault, query_text, args.query_timeout,
                         smoke_env, qmd_present, corpus_present,
                         progress=_progress_printer)
 
@@ -1020,8 +1071,9 @@ def main(argv=None):
         # clearing them from a per-vault run could clobber a fallback
         # another vault still relies on.
         try:
-            persisted = persist_preflight(vault, recommendation,
-                                          offline_recommended)
+            persisted = persist_preflight(
+                vault, recommendation, offline_recommended,
+                allow_default_mode=allow_default_mode)
         except OSError as e:
             # Report the failure with the report, not a traceback: the
             # diagnosis is still delivered even when the write failed.
@@ -1136,19 +1188,21 @@ def main(argv=None):
             print(f"  persisted to: {persisted['path']} (per-vault; the "
                   "global [qmd] config is left untouched and remains "
                   "the fallback for vaults with no per-vault file)")
-        if "default_mode_cleared" in persisted:
-            print(f"  note: cleared stale default_mode "
-                  f"({persisted['default_mode_cleared']!r}) from the "
-                  "vault-local file — no hit-bearing mode ran")
+        if "default_mode_kept" in persisted:
+            print(f"  note: kept persisted default_mode "
+                  f"({persisted['default_mode_kept']!r}) in the "
+                  "vault-local file — this run did not replace it "
+                  "(#778: only an explicit --query run replaces a "
+                  "persisted mode)")
         if "offline_cleared" in persisted:
             print("  note: cleared stale preflight-written offline = true "
                   "from the vault-local file — fresh evidence no longer "
                   "supports it")
-        if "default_mode_left" in persisted or "offline_left" in persisted:
-            print("  note: a [qmd] value set by hand in the vault-local "
-                  "file (not marked as preflight-written) was left "
-                  "alone despite fresh evidence; edit it yourself if "
-                  "it is stale")
+        if "offline_left" in persisted:
+            print("  note: a [qmd] offline value set by hand in the "
+                  "vault-local file (not marked as preflight-written) "
+                  "was left alone despite fresh evidence; edit it "
+                  "yourself if it is stale")
     if persist_error is not None:
         print(f"  error: persist failed: {persist_error}")
     if warnings:
