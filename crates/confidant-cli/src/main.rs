@@ -713,7 +713,9 @@ enum AliasAction {
     /// output, errors, or logs. One commit; check-gated. When the value
     /// appears nowhere in searchable plaintext, the add succeeds with a
     /// warning that `find` cannot surface it — retrieve it with
-    /// `alias resolve <kind>` (#767).
+    /// `alias resolve <kind>` (#767). For a `no-ai: true` person the
+    /// warning says so plainly instead: agent paths do not surface
+    /// that person at all.
     Add {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
@@ -7688,7 +7690,9 @@ fn alias_resolve_error(
 /// still succeeds with exit 0, but carries a warning: alias values are
 /// HMAC-only, so `find` scans plaintext and cannot surface a value that
 /// appears nowhere in searchable plaintext — only `alias resolve <kind>`
-/// retrieves it. The warning never echoes the value.
+/// retrieves it. The warning never echoes the value. For a `no-ai: true`
+/// person the warning says so plainly instead of recommending
+/// `alias resolve`, which also excludes that person by design.
 fn cmd_alias_add(
     cli: &Cli,
     root: &Path,
@@ -7705,7 +7709,7 @@ fn cmd_alias_add(
     let date = parse_date_arg(&date_raw)?;
 
     let value = read_alias_value(value_file)?;
-    let unfindable = alias_value_unfindable(root, value.trim());
+    let warning = alias_add_warning(root, &person.id, value.trim(), kind);
     let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
     let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
 
@@ -7740,26 +7744,21 @@ fn cmd_alias_add(
     // The warning rides only outcomes where the add landed or was previewed:
     // a check-blocked write added nothing to warn about, and an idempotent
     // re-add of an identical alias line changes nothing either.
-    if unfindable
-        && matches!(
-            outcome,
-            WriteOutcome::Applied { .. } | WriteOutcome::DryRun { .. } | WriteOutcome::Unchanged
-        )
-    {
-        let warning = format!(
-            "warning: this alias value appears nowhere in searchable plaintext, so `find` \
-             cannot surface it (unless the value later appears in plaintext); retrieve it \
-             with `alias resolve {kind}`"
-        );
-        extra["warnings"] = serde_json::json!([warning]);
-        if !cli.json {
-            let _ = writeln!(io::stderr(), "{warning}");
+    if matches!(
+        outcome,
+        WriteOutcome::Applied { .. } | WriteOutcome::DryRun { .. } | WriteOutcome::Unchanged
+    ) {
+        if let Some(warning) = warning {
+            extra["warnings"] = serde_json::json!([warning]);
+            if !cli.json {
+                let _ = writeln!(io::stderr(), "{warning}");
+            }
         }
     }
     finish_write(cli, root, "alias-add", outcome, extra)
 }
 
-/// #767: does the agent `find` path return anything for `query`?
+/// #767: the add-time warning for `query`, if any.
 ///
 /// Runs the same search `find` runs by default (agent allowlist, no
 /// operator mode, `PackScope::All`) against the `for_reads` vault, so
@@ -7767,19 +7766,64 @@ fn cmd_alias_add(
 /// keyless shells. Best-effort and fail-silent: any load or search error,
 /// or any skipped/refused encrypted record (an incomplete search cannot
 /// prove absence), means "no warning" — the advisory must never block or
-/// mislead an add. Returns `false` for an empty query, which `find`
+/// mislead an add. Returns `None` for an empty query, which `find`
 /// rejects outright and search treats as no search at all.
-fn alias_value_unfindable(root: &Path, query: &str) -> bool {
+///
+/// Fix round: a `no-ai: true` person is outside the §12 cleared set, so
+/// the `find` probe is meaningless for them and `alias resolve` would
+/// return the same generic not-found — the warning says plainly that
+/// agent paths do not surface the person, and never recommends the
+/// resolve path. Positive evidence only: the loaded record must carry
+/// `no-ai: true`; absence from the cleared set for any other reason
+/// (tainted, malformed, or otherwise unloaded) says nothing about
+/// `no-ai` and stays silent rather than misdiagnosing. An
+/// `E_UNREADABLE` load finding (a record file or directory that failed
+/// to load, which may contain the value) likewise suppresses the
+/// absence warning — the search findings carry the code, never the
+/// path or content. Other finding codes do not suppress: they do not
+/// by themselves mean content went unsearched.
+fn alias_add_warning(root: &Path, person_id: &RecordId, query: &str, kind: &str) -> Option<String> {
     if query.is_empty() {
-        return false;
+        return None;
     }
     let Ok(read_vault) = load_read_vault(root) else {
-        return false;
+        return None;
     };
+    if !confidant_core::cleared_record_ids(&read_vault).contains(person_id) {
+        if read_vault
+            .records
+            .get(person_id)
+            .is_some_and(|record| record.no_ai())
+        {
+            return Some(
+                "warning: this person is `no-ai: true`, so `find` and other agent paths \
+                 do not surface this person or this alias; the alias is stored, but only \
+                 operator reads can use it"
+                    .to_owned(),
+            );
+        }
+        return None;
+    }
     let Ok(result) = search(&read_vault, query, &PackScope::All) else {
-        return false;
+        return None;
     };
-    result.hits.is_empty() && result.skipped_encrypted == 0 && result.refused_envelopes == 0
+    let unreadable = result
+        .findings
+        .iter()
+        .any(|finding| finding.code == confidant_core::check::FindingCode::Unreadable);
+    if result.hits.is_empty()
+        && result.skipped_encrypted == 0
+        && result.refused_envelopes == 0
+        && !unreadable
+    {
+        Some(format!(
+            "warning: this alias value appears nowhere in searchable plaintext, so `find` \
+             cannot surface it (unless the value later appears in plaintext); retrieve it \
+             with `alias resolve {kind}`"
+        ))
+    } else {
+        None
+    }
 }
 
 /// `confidant alias resolve <kind>` (#537 phase 3b): resolve a `kind` + value

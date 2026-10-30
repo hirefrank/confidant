@@ -7924,6 +7924,156 @@ fn alias_add_stays_silent_when_value_is_searchable() {
 }
 
 #[test]
+fn alias_add_on_no_ai_person_never_recommends_alias_resolve() {
+    // #767 fix round: for a `no-ai: true` person, `alias resolve` also
+    // excludes the person (generic not-found), so a warning recommending
+    // it would point at a path that cannot work, and the `find` probe is
+    // meaningless (the person's content is excluded by design). The add
+    // must say plainly the person is `no-ai` instead, never echo the
+    // value, and leave `alias resolve` returning generic not-found.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "no-ai: true\n")
+            .status
+            .success()
+    );
+
+    // JSON apply, addressed by opaque id: one plain `no-ai` warning.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "cam-hidden@example.com",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("no-ai"), "{warning}");
+    assert!(
+        !warning.contains("alias resolve"),
+        "warning recommends a path that cannot work: {warning}"
+    );
+    assert!(
+        !stdout(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+    assert!(
+        !stderr(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+
+    // Human apply: the same plain warning on stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@cam-hidden-handle",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    assert!(stderr(&out).contains("no-ai"), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("alias resolve"),
+        "warning recommends a path that cannot work: {}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@cam-hidden-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@cam-hidden-handle"), "value leaked");
+
+    // `alias resolve` for the added value still returns generic not-found.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        "cam-hidden@example.com",
+    );
+    assert!(
+        !out.status.success(),
+        "resolve unexpectedly succeeded: {}",
+        stdout(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND", "{v}");
+    assert!(
+        !stdout(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+    assert!(!stdout(&out).contains("Ada Example"), "hidden name leaked");
+}
+
+#[test]
+fn alias_add_dry_run_stays_silent_when_a_record_is_unreadable() {
+    // #767 fix round, second finding: an unreadable record may contain
+    // the value, so an absence claim is unproven. `--dry-run` bypasses
+    // the write check gate, so the probe must suppress the warning
+    // itself when loading was incomplete. The unreadable record here is
+    // a person profile with invalid UTF-8 bytes, which load reports as
+    // `E_UNREADABLE` without depending on file permissions.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    let unreadable_dir = h.vault.join(format!("people/{PERSON2}"));
+    std::fs::create_dir_all(&unreadable_dir).unwrap();
+    std::fs::write(
+        unreadable_dir.join("profile.md"),
+        [0xff_u8, 0xfe, 0xfd, 0x0a],
+    )
+    .unwrap();
+
+    // The fixture really does surface the load failure to `find`.
+    let out = h
+        .cmd(&["find", "Ada Dryname", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let codes: Vec<_> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"E_UNREADABLE"), "{codes:?}");
+
+    // Dry run: no absence warning, and nothing is written.
+    let head_before = git_head(&h.vault);
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ],
+        "Ada Dryname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert!(v.get("warnings").is_none(), "{v}");
+    assert_eq!(git_head(&h.vault), head_before, "dry run moved HEAD");
+}
+
+#[test]
 fn alias_resolve_ambiguous_value_fails_closed() {
     // One value on two cleared people: fail closed rather than guess, with
     // opaque candidate ids.
