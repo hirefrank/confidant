@@ -1384,6 +1384,24 @@ class QmdPreflightTest(unittest.TestCase):
         self.assertNotIn("default_mode_source", global_text)
         self.assertNotIn("offline_source", global_text)
 
+    def test_help_says_persist_writes_vault_local_file(self):
+        # #777: the --help string used to say --persist writes "to the
+        # user config"; the implementation writes the vault-local
+        # per-vault file and never touches the global file.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as caught:
+                self.preflight.main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        # Rejoin a filename argparse may hyphen-wrap across lines
+        # before collapsing whitespace, so the check is width-free.
+        help_text = " ".join(
+            re.sub(r"-\n\s*", "-", out.getvalue()).split())
+        self.assertIn("vault-local per-vault file", help_text)
+        self.assertIn("qmd-preflight.toml", help_text)
+        self.assertIn("never the global user config", help_text)
+        self.assertNotIn("to the user config", help_text)
+
     def test_persist_leaves_hand_set_values_alone(self):
         import http.server
         import threading

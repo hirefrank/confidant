@@ -948,9 +948,12 @@ def main(argv=None):
                          f"(default {DEFAULT_HUB_TIMEOUT_S})")
     ap.add_argument("--persist", action="store_true",
                     help="write the recommendation ([qmd] default_mode, and "
-                         "[qmd] offline when recommended) to the user "
-                         "config; also clears stale preflight-written "
-                         "keys the fresh evidence no longer supports")
+                         "[qmd] offline when recommended) to the "
+                         "vault-local per-vault file "
+                         "(<vault>/.confidant/qmd-preflight.toml), never "
+                         "the global user config; also clears stale "
+                         "preflight-written keys the fresh evidence no "
+                         "longer supports")
     ap.add_argument("--json", action="store_true",
                     help="print the report as JSON instead of text")
     ap.add_argument("--query-script", default=None,
