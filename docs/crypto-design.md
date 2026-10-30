@@ -584,7 +584,15 @@ What the review settled, and where it lives in the spec:
   (principal `writer_id`, `valid-before` from cert `expires`, revoked
   writers dropped). Commits need no new signed bytes — only a new
   verification source, and never a committed allowed-signers file in
-  the vault, which push access could forge.
+  the vault, which push access could forge. Two qualifications from
+  the fix round (normative in spec §14): `valid-before` is defense
+  in depth, not the boundary — git checks it against the
+  signer-controlled committer date, so new-commit/new-head
+  acceptance checks expiry against the verifier's clock, and a
+  backdated post-expiry commit is refused as a new head; and every
+  writer-signed commit, manifest-free or not, runs the single
+  commit authorization rule, so signature verification identifies
+  the writer but never by itself authorizes a commit.
 - **Q5 — revocation freshness on stale clones: offline, 30-day
   lifetimes, no online check.** Certs live at most 30 days; `doctor`
   warns when the last fetch is older than 30 days (the same window, so
@@ -602,7 +610,11 @@ What the review settled, and where it lives in the spec:
   cert is pinned; pre-rotation history keeps verifying through the
   anchor-at-commit chain (the operator cert at a historical commit
   verifies against the unchanged recovery key), or every rotation
-  would break history verification.
+  would break history verification. That chain holds only while the
+  recovery key is unchanged: across a recovery rotation (`recover`,
+  `keys shred`), history verifies through the recovery checkpoint
+  chain in spec §14, and without a checkpoint the affected history
+  fails closed rather than silently losing its anchor.
 - **Q7 — scope naming and versioning: new type and domain.**
   `confidant-writer-cert-v1`, not a `confidant-scope-v2` bump: the
   agent scope's capabilities mean content access, and conflating them
@@ -632,6 +644,55 @@ The two blockers, stated as the design's load-bearing ideas:
    The off-vault revocation high-water (file `seq`, updated on sync)
    covers rollback of the revocation file itself.
 
+What the fix round added, because the first revision left the gaps
+open (normative in spec §14):
+
+- **Commit authorization is one rule for every writer-signed
+  commit.** The manifest-scope sentence in the first revision lived
+  only in the manifest path, so a manifest-free commit never met a
+  scope check. Now signature verification identifies the writer and
+  a single rule authorizes the commit: every changed path is
+  classified (adds, modifications, deletions, renames, mode
+  changes), allowed only as a scoped record addition/modification, a
+  scoped append-only ledger append, or the field-level manifest
+  re-sign itself, and everything else — unclassified paths, `keys/`
+  material, `confidant.toml`, spec/config files — fails closed.
+  Merge commits are checked against each parent. History uses the
+  same rule with the cert pinned at the commit.
+- **New acceptance is partitioned by an acceptance checkpoint.**
+  "Tip is new, ancestors are history" is true only once a checkpoint
+  exists. A reader records its accepted tip and high-waters
+  off-vault, only after a chain verifies in full; ancestry reachable
+  from that tip is history, and everything newly introduced — tip,
+  commits above it, or side ancestry from a merge — is new
+  acceptance with the full wall-clock and high-water checks. A fresh
+  clone has no checkpoint, so its whole introduced chain is new
+  acceptance. The step-7 manifest high-water is likewise scoped to
+  the candidate head: historical links in a chain verify without it,
+  so a chain can be reopened and advanced after a higher `seq` is
+  accepted.
+- **Cert dates are an ordered interval, not just a lifetime cap.**
+  `issued_at < expires` with a 30-day maximum is well-formedness and
+  fails verification outright, including in history; the window
+  `issued_at <= now < expires` against the verifier's clock, with no
+  skew allowance, gates new acceptance only. A future-issued cert
+  cannot authorize before its window, and a reversed interval cannot
+  slip through history replay.
+- **Recovery rotation has a checkpoint chain.** Each rotation must
+  commit a checkpoint, signed by the new or retiring recovery key,
+  binding the old recovery pubkey to a tip commit and per-client
+  manifest `seq` range, chaining to the previous checkpoint and
+  carrying revocation and cert `seq` high-waters forward. History
+  signed under the retired key verifies through that chain; a
+  fresh-device reader trusts only checkpoints signed by the
+  phrase-derived new recovery key; with no checkpoint, verification
+  of the affected history fails closed with a diagnostic naming the
+  missing checkpoint. The per-writer cert `seq` high-water is
+  recorded off-vault as part of the acceptance checkpoint (the
+  non-blocking suggestion in the first review, adopted here rather
+  than left to the implementation PR), so a force-push cannot drop
+  history and resurrect a superseded cert version.
+
 Concurrency and format, also from the review: the first pushed commit
 wins a `seq` race, the loser re-signs on top, and an equal `seq` with
 different bytes is a fork, never auto-merged. The change is a minor
@@ -645,12 +706,20 @@ its first writer-signed manifest as tampering.
 Decisions in this revision that Silas still needs to confirm (also
 listed in §26): expiry is enforced for new-head acceptance but not
 re-checked when re-verifying already-accepted history for read/decrypt
-(otherwise history dies every 30 days); the review's "old-root certs
-stop verifying once the new operator cert is pinned" is read as a
-new-acceptance rule, with history preserved via the anchor-at-commit
-chain; writer scope has no `"all"` client wildcard (unlike agent
-scopes — enumerate, because a writer touching every client is
-root-equivalent in breadth).
+(otherwise history dies every 30 days) — now qualified by the
+acceptance checkpoint: the split holds only for ancestry already
+covered by a recorded checkpoint, and a fresh clone checks the whole
+introduced chain; the review's "old-root certs stop verifying once
+the new operator cert is pinned" is read as a new-acceptance rule,
+with history preserved via the anchor-at-commit chain while the
+recovery key is unchanged and via the recovery checkpoint chain
+across a recovery rotation; writer scope has no `"all"` client
+wildcard (unlike agent scopes — enumerate, because a writer touching
+every client is root-equivalent in breadth). Two further choices
+made in the fix round, for Silas to confirm with the rest: there is
+no clock-skew allowance (the verifier's clock is authoritative, and
+a wrong clock fails closed), and writer-signed merge commits are
+checked against each parent rather than refused outright.
 
 ## 9. Recovery (ADR-15)
 
@@ -914,6 +983,13 @@ in the repo, tests, or CI.
     fails; a forged cert fails; a cert with an unknown verb, unknown
     type, malformed client id, or lifetime over 30 days fails as a
     whole (never ignored); a missing `signer` verifies as operator.
+    Cert-date ordering is well-formedness: a future-issued cert
+    (`issued_at` after the verifier's clock) fails new acceptance; a
+    reversed interval (`issued_at >= expires`) and an
+    `issued_at == expires` cert fail verification outright, including
+    history re-verification; a cert with `issued_at < expires` and a
+    lifetime within 30 days passes the ordering check (the window
+    check itself applies to new acceptance only).
 21. **Writer field-level rule (the worked example, spec §14):** previous
     verified manifest `seq = 4`, recipients `{laptop, phone}`,
     commitments for epoch 3. A writer-signed candidate at `seq = 5`
@@ -937,12 +1013,21 @@ in the repo, tests, or CI.
     (`E_MANIFEST_FORK`), and the loser re-signing on top at a higher
     `seq` against the new head is accepted. An equal-`seq`,
     byte-identical re-push is accepted as idempotent.
-24. **Writer SSH commit signing:** allowed signers derived from
-    verified in-vault certs accept a commit signed by an active
-    writer's key (principal `writer_id`, within its validity window)
-    and reject a commit signed by a revoked or expired writer's key
-    and one signed by an unknown key; a committed allowed-signers file
-    in the vault is never used as authority. Migration: an existing
+24. **Writer SSH commit signing and commit authorization:** allowed
+    signers derived from verified in-vault certs accept a commit
+    signed by an active writer's key (principal `writer_id`, within
+    its validity window) and reject a commit signed by a revoked or
+    expired writer's key and one signed by an unknown key; a committed
+    allowed-signers file in the vault is never used as authority.
+    Backdated expiry: a commit signed after expiry but backdated
+    inside the cert window is refused as a new head (the verifier's
+    clock, not `valid-before`, is the boundary). Commit
+    authorization: a validly signed commit with no manifest change
+    holding an out-of-scope record change is refused; a permitted
+    ledger-only commit is accepted; a ledger commit that rewrites an
+    existing line is refused; a writer commit touching
+    `keys/writers/` is refused; a writer-signed merge commit is
+    checked against each parent. Migration: an existing
     operator-signed vault still verifies; the first writer cert is
     granted to the host holding the copied operator key; that copy is
     retired; old commits and manifests still verify; a fresh clone
@@ -955,6 +1040,31 @@ in the repo, tests, or CI.
     also demonstrate that a pre-gate binary refuses a writer-capable
     vault via `E_SPEC_UNSUPPORTED` before meeting a writer-signed
     manifest.
+26. **Acceptance checkpoint and high-water scoping (spec §14):**
+    reopening a chain already accepted up to `seq = 12` verifies its
+    `seq = 11` link as history and advances to a new `seq = 13`
+    head, while a fresh candidate at `seq = 11` offered as a new
+    head after `seq = 12` is refused as a rollback. Newly introduced
+    ancestry: on a fresh clone, a chain whose tip is signed by a
+    valid narrow-scope writer but whose ancestor is a backdated
+    broad-scope commit signed after expiry is refused in full (the
+    ancestor is new acceptance, not history); the same chain, once
+    accepted and checkpointed, re-verifies its ancestors as history
+    without re-checking the expiry window. A lost checkpoint forces
+    a fresh-introduction check of the whole chain, with a diagnostic
+    naming the missing checkpoint.
+27. **Recovery-rotation checkpoint (spec §14):** writer-signed
+    history still verifies after operator rotation, after `recover`,
+    after `keys shred`, and after fresh-device recovery, through the
+    checkpoint chain; a writer cert signed only by the retired
+    recovery key is refused for new acceptance; a forged checkpoint
+    (bad signature, wrong domain, broken chain, or a history range
+    that does not cover the commits it is used for) is refused; a
+    post-rotation revocation file with lower high-waters than the
+    checkpoint records is refused, so a recovery cannot reset a
+    revoked writer; and history depending on a retired recovery key
+    with no checkpoint is refused with a diagnostic naming the
+    missing checkpoint and the retired key id.
 
 ## 13. What changes in the spec
 
@@ -980,6 +1090,13 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   `confidant.toml` `[crypto]` key, `minimum_reader_version`. The
   manifest signature domain stays `confidant-manifest-v2`. Operator-
   and recovery-signed manifests verify unchanged.
+- **Fix round (spec §14, 2026-10-30)**: the commit authorization
+  rule for every writer-signed commit (normative, no new file
+  type); ordered cert-date interval rules (no new file type);
+  recovery checkpoints — new `keys/recovery-checkpoints/` tree and
+  domain `confidant-recovery-checkpoint-v1`, a minor-format addition
+  in the same minor bump. The acceptance checkpoint is off-vault
+  reader state next to `trust.toml`, not a vault format change.
 
 These are documented here; the normative spec 0.1 edits land in a
 follow-up after crypto review (issue #85).
@@ -1343,3 +1460,37 @@ PR does not have to re-derive it.
   `[crypto]` table gains `minimum_reader_version` when the spec minor
   carrying this section is cut — a one-line follow-up for that PR,
   not edited here, to keep this revision to spec §14 and this doc.
+
+**Fix round, 2026-10-30 (Silas's and Frank's findings on `eba9ee6`,
+PR #786).** Silas's conditional sign-off was withdrawn until six
+items were addressed; all six are addressed in this revision, in
+spec §14 unless noted:
+
+1. Backdated-expiry wording: verifier-clock expiry for new-commit
+   and new-head acceptance, `valid-before` as defense in depth,
+   backdated post-expiry commit refused as a new head, fresh-clone
+   tip as new acceptance, expiry-limits-new-writes / revocation-only
+   -for-history corollary.
+2. Commit authorization: a single rule on every writer-signed
+   commit, manifest-free or not; signature identifies, the rule
+   authorizes; step 6 points to it; per-parent merge-commit checks.
+3. Newly introduced ancestry: acceptance checkpoint partitioning
+   previously accepted history from newly introduced ancestry;
+   fresh clone checks the whole chain; decision (a) narrowed to
+   checkpoint-covered ancestry.
+4. High-water scoping: step-7 check applies to the candidate head
+   only; historical links verify without it; chain reopen/advance
+   test added (§12 item 26).
+5. Cert dates: ordered interval, no skew allowance, ordering
+   malformed fails outright including history, window gates new
+   acceptance only (§12 item 20).
+6. Recovery rotation: checkpoint chain binding the old recovery
+   pubkey to a history range, fresh-device rule, no-checkpoint
+   fail-closed, high-waters survive (§12 item 27).
+   Non-blocking suggestion (e), adopted: the per-writer cert `seq`
+   high-water is recorded off-vault as part of the acceptance
+   checkpoint, rather than left to the implementation PR. New
+   choices for Silas/Frank to confirm in this round: no clock-skew
+   allowance, and writer-signed merge commits checked against each
+   parent rather than refused outright. The §2 `[crypto]` one-line
+   follow-up and the open implementation items above are unchanged.
