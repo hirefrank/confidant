@@ -24,3 +24,9 @@ install-updater = false
 # install). dist's freshness check would fail on those edits, so it is
 # scoped off for CI scripts only.
 allow-dirty = ["ci"]
+
+# macOS 14 runners are retired on 2026-11-02 and fail during the
+# scheduled brownouts before then (actions/runner-images#13518).
+# Build Apple Silicon on the current macOS 15 image.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
