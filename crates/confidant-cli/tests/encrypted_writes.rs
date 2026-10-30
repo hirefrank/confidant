@@ -7811,6 +7811,284 @@ fn alias_add_name_then_resolve_round_trips() {
 }
 
 #[test]
+fn alias_add_warns_when_value_nowhere_in_searchable_plaintext() {
+    // #767: a former name that appears nowhere in plaintext cannot be
+    // surfaced by `find` (plaintext scan; alias lines are HMAC-only), so
+    // `alias add` warns at add time — the only moment the value is in
+    // hand — while still succeeding with exit 0 and never echoing it.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+
+    // JSON apply: the warning rides a `warnings` array.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "Ada Oldname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("`find`"), "{warning}");
+    assert!(warning.contains("alias resolve name"), "{warning}");
+    assert!(!stdout(&out).contains("Ada Oldname"), "value leaked");
+    assert!(!stderr(&out).contains("Ada Oldname"), "value leaked");
+
+    // Human apply: the same warning goes to stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@ada-old-handle",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    assert!(stderr(&out).contains("warning"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("alias resolve handle"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@ada-old-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@ada-old-handle"), "value leaked");
+
+    // Dry run: previewing the add warns too, and writes nothing.
+    let head_before = git_head(&h.vault);
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ],
+        "Ada Dryname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    assert!(warnings[0].as_str().unwrap().contains("alias resolve name"));
+    assert_eq!(git_head(&h.vault), head_before, "dry run moved HEAD");
+}
+
+#[test]
+fn alias_add_stays_silent_when_value_is_searchable() {
+    // #767, other side: a value already in cleared plaintext (here the
+    // person's own display name) is surfaced by `find`, so no warning.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "Ada Example",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    assert!(v.get("warnings").is_none(), "{v}");
+}
+
+#[test]
+fn alias_add_on_no_ai_person_never_recommends_alias_resolve() {
+    // #767 fix round: for a `no-ai: true` person, `alias resolve` also
+    // excludes the person (generic not-found), so a warning recommending
+    // it would point at a path that cannot work, and the `find` probe is
+    // meaningless (the person's content is excluded by design). The add
+    // must say plainly the person is `no-ai`, describe the lookup paths
+    // accurately (fix round 2: no lookup by alias value returns the
+    // person — the alias is stored only as an HMAC — and the person
+    // remains addressable only by their `p-<ULID>`), never echo the
+    // value, and leave `alias resolve` returning generic not-found.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "no-ai: true\n")
+            .status
+            .success()
+    );
+
+    // JSON apply, addressed by opaque id: one plain `no-ai` warning.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "email",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "cam-hidden@example.com",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("no-ai"), "{warning}");
+    // Fix round 2: the warning may name `alias resolve` only to say it
+    // will not return this person. It must not recommend the path, and
+    // it must describe the lookup paths accurately: HMAC-only storage,
+    // addressable only by `p-<ULID>`.
+    assert!(warning.contains("will not return this person"), "{warning}");
+    assert!(warning.contains("HMAC"), "{warning}");
+    assert!(warning.contains("p-<ULID>"), "{warning}");
+    assert!(
+        !warning.contains("retrieve it with"),
+        "warning recommends a path that cannot work: {warning}"
+    );
+    assert!(
+        !stdout(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+    assert!(
+        !stderr(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+
+    // Human apply: the same plain warning on stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@cam-hidden-handle",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    assert!(stderr(&out).contains("no-ai"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("will not return this person"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("retrieve it with"),
+        "warning recommends a path that cannot work: {}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@cam-hidden-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@cam-hidden-handle"), "value leaked");
+
+    // `alias resolve` for the added value still returns generic not-found.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "email", "--json", "--no-input"],
+        "cam-hidden@example.com",
+    );
+    assert!(
+        !out.status.success(),
+        "resolve unexpectedly succeeded: {}",
+        stdout(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND", "{v}");
+    assert!(
+        !stdout(&out).contains("cam-hidden@example.com"),
+        "value leaked"
+    );
+    assert!(!stdout(&out).contains("Ada Example"), "hidden name leaked");
+}
+
+#[test]
+fn alias_add_dry_run_stays_silent_when_a_record_is_unreadable() {
+    // #767 fix round, second finding: an unreadable record may contain
+    // the value, so an absence claim is unproven. `--dry-run` bypasses
+    // the write check gate, so the probe must suppress the warning
+    // itself when loading was incomplete. The unreadable record here is
+    // a person profile with invalid UTF-8 bytes, which load reports as
+    // `E_UNREADABLE` without depending on file permissions.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    let unreadable_dir = h.vault.join(format!("people/{PERSON2}"));
+    std::fs::create_dir_all(&unreadable_dir).unwrap();
+    std::fs::write(
+        unreadable_dir.join("profile.md"),
+        [0xff_u8, 0xfe, 0xfd, 0x0a],
+    )
+    .unwrap();
+
+    // The fixture really does surface the load failure to `find`.
+    let out = h
+        .cmd(&["find", "Ada Dryname", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let codes: Vec<_> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"E_UNREADABLE"), "{codes:?}");
+
+    // Dry run: no absence warning, and nothing is written.
+    let head_before = git_head(&h.vault);
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ],
+        "Ada Dryname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert!(v.get("warnings").is_none(), "{v}");
+    assert_eq!(git_head(&h.vault), head_before, "dry run moved HEAD");
+}
+
+#[test]
 fn alias_resolve_ambiguous_value_fails_closed() {
     // One value on two cleared people: fail closed rather than guess, with
     // opaque candidate ids.
@@ -7857,6 +8135,311 @@ fn alias_resolve_ambiguous_value_fails_closed() {
     // The raw alias value must never appear in the error.
     assert!(!msg.contains("@shared-handle"), "{msg}");
     assert!(!stdout(&out).contains("@shared-handle"));
+}
+
+#[test]
+fn alias_add_second_add_of_shared_value_warns_ambiguous_not_retrievable() {
+    // #767 fix round 2 (Frank + Silas re-review of 9cd0871): two cleared
+    // people can hold the same kind/value, and `alias resolve` then
+    // fails closed with `E_AMBIGUOUS_PERSON`. The second add must not
+    // promise retrieval through `alias resolve`; it must say the value
+    // is shared and resolve will report it as ambiguous, without echoing
+    // the value or either person.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "")
+            .status
+            .success(),
+        "person 1"
+    );
+    assert!(
+        add_person_record(&h, PERSON2, "Bea Demo", "")
+            .status
+            .success(),
+        "person 2"
+    );
+
+    // First add: no other holder, so the warning may point at
+    // `alias resolve` — and must not claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@shared-handle",
+    );
+    assert!(
+        out.status.success(),
+        "first alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("alias resolve handle"), "{warning}");
+    assert!(!warning.contains("ambiguous"), "{warning}");
+
+    // Second add (JSON): shared warning, no retrieval promise.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@shared-handle",
+    );
+    assert!(
+        out.status.success(),
+        "second alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("ambiguous"), "{warning}");
+    assert!(
+        !warning.contains("retrieve it with"),
+        "unqualified retrieval promise: {warning}"
+    );
+    assert!(!warning.contains(PERSON), "other person leaked: {warning}");
+    assert!(!warning.contains(PERSON2), "other person leaked: {warning}");
+    assert!(!stdout(&out).contains("@shared-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@shared-handle"), "value leaked");
+
+    // `alias resolve` for the shared value now fails closed, with both
+    // opaque candidate ids and no value leak.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "handle", "--json", "--no-input"],
+        "@shared-handle",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_AMBIGUOUS_PERSON");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains(PERSON), "{msg}");
+    assert!(msg.contains(PERSON2), "{msg}");
+    assert!(!msg.contains("@shared-handle"), "{msg}");
+    assert!(!stdout(&out).contains("@shared-handle"));
+
+    // Human second add of a second shared value: the same shared
+    // warning on stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@shared-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "first add (2) failed: {}",
+        stderr(&out)
+    );
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@shared-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "second add (2) failed: {}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("ambiguous"), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("retrieve it with"),
+        "unqualified retrieval promise: {}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@shared-handle-two"), "value leaked");
+    assert!(!stderr(&out).contains("@shared-handle-two"), "value leaked");
+}
+
+#[test]
+fn alias_add_to_merged_away_member_of_alias_holder_does_not_warn_ambiguous() {
+    // #767 fix round 3 (Frank + Silas re-review of eebad4f): the round-2
+    // probe compared `resolve_alias`'s canonical id to the raw person
+    // id, so an alias added to a merged-away member whose canonical
+    // person already held the same kind/value warned that `alias
+    // resolve` would report it as ambiguous. But `resolve_alias`
+    // deduplicates both entries to the single canonical id and
+    // succeeds, so the warning stated as certain something false. The
+    // probe must compare canonical id to canonical id: the member add
+    // is the same canonical person, not a second holder.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "")
+            .status
+            .success(),
+        "person 1 (merged-away member)"
+    );
+    assert!(
+        add_person_record(&h, PERSON2, "Bea Demo", "")
+            .status
+            .success(),
+        "person 2 (canonical)"
+    );
+
+    // Merge PERSON into PERSON2, dated before the alias adds.
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 merge {PERSON} into {PERSON2}\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "merge"]);
+
+    // First add to the canonical person (JSON): the warning may point
+    // at `alias resolve` and must not claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@merged-handle",
+    );
+    assert!(
+        out.status.success(),
+        "first alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("alias resolve handle"), "{warning}");
+    assert!(!warning.contains("ambiguous"), "{warning}");
+
+    // Second add, to the merged-away member (JSON): same canonical
+    // person, so the warning must NOT claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@merged-handle",
+    );
+    assert!(
+        out.status.success(),
+        "second alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(
+        !warning.contains("ambiguous"),
+        "merged-away member warned as ambiguous: {warning}"
+    );
+    assert!(warning.contains("retrieve it with"), "{warning}");
+    assert!(!warning.contains(PERSON), "person leaked: {warning}");
+    assert!(!warning.contains(PERSON2), "person leaked: {warning}");
+    assert!(!stdout(&out).contains("@merged-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@merged-handle"), "value leaked");
+
+    // `alias resolve` for the value succeeds, deduplicated to the
+    // single canonical person — it does not fail closed.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "handle", "--json", "--no-input"],
+        "@merged-handle",
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON2, "{v}");
+    assert_eq!(v["person"]["name"], "Bea Demo", "{v}");
+    assert!(!stdout(&out).contains("@merged-handle"));
+
+    // Human adds of a second value follow the same shape: the
+    // merged-away member's add warns with retrieval advice, never
+    // with an ambiguity claim.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@merged-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "first add (2) failed: {}",
+        stderr(&out)
+    );
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@merged-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "second add (2) failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("ambiguous"),
+        "merged-away member warned as ambiguous: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("retrieve it with"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@merged-handle-two"), "value leaked");
+    assert!(!stderr(&out).contains("@merged-handle-two"), "value leaked");
 }
 
 #[test]
