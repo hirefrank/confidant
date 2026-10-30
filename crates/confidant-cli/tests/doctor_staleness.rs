@@ -274,10 +274,12 @@ fn doctor_cli_ahead_is_ok() {
 }
 
 #[test]
-fn doctor_offline_degrades_to_ok_unknown() {
+fn doctor_offline_degrades_to_unknown() {
+    // #709: a fetch the check cannot complete is `unknown`, never `ok`.
+    // Still warning-tier: it must not flip doctor's overall ok/exit code.
     let v = run_doctor(Some(&unreachable_url()));
     let c = check(&v, "cli-staleness").expect("cli-staleness check missing");
-    assert_eq!(c["status"], "ok", "{v}");
+    assert_eq!(c["status"], "unknown", "{v}");
     assert_eq!(
         c["message"], "staleness unknown (could not reach github releases)",
         "{c}"

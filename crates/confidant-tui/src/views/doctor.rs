@@ -18,12 +18,13 @@ pub struct DoctorViewState {
     pub selected: usize,
 }
 
-/// Status tag for a doctor check: red for errors, yellow for warnings,
-/// green otherwise.
+/// Status tag for a doctor check: red for errors, yellow for warnings
+/// and for `unknown` checks (#709: undetermined is warning-tier, never
+/// a green pass), green otherwise.
 fn status_tag(status: &str) -> Span<'_> {
     let style = match status {
         "error" => Style::default().fg(palette::ERROR).bold(),
-        "warning" => Style::default().fg(palette::WARNING).bold(),
+        "warning" | "unknown" => Style::default().fg(palette::WARNING).bold(),
         _ => Style::default().fg(palette::SUCCESS),
     };
     Span::styled(format!("[{status}]"), style)
