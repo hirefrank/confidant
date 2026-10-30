@@ -7793,6 +7793,11 @@ fn cmd_alias_add(
 /// cleared person already holds the same (kind, HMAC). If so, the
 /// warning says the value is shared and `alias resolve` will report
 /// it as ambiguous, instead of the unqualified retrieve advice.
+///
+/// Fix round 3: the shared check compares canonical ids (see
+/// `alias_shared_with_another_person`), so a merged-away member
+/// whose canonical person already holds the alias is not reported
+/// as shared.
 fn alias_add_warning(
     root: &Path,
     person_id: &RecordId,
@@ -7853,21 +7858,25 @@ fn alias_add_warning(
 }
 
 /// Whether the pre-add vault already holds `(kind, hmac)` for a
-/// different cleared person than `person_id`, so adding it here would
+/// different canonical person than `person_id`, so adding it here would
 /// make `alias resolve` fail closed as ambiguous. Reuses
 /// `resolve_alias` itself — the same cleared-set,
 /// merge-canonicalized path resolve takes — on the vault as loaded
-/// before this add lands: an existing single holder who is not this
-/// person, or an already-ambiguous set, both mean shared.
-/// `CannotSearch` (person records unread) is unknown, not shared:
-/// claiming sharing on an incomplete person set would mislead, so it
-/// falls through to the ordinary warning gates. Residual:
-/// `resolve_alias` returns canonical ids, compared here against the
-/// raw `person_id` (core's canonicalization is not a public API); an
-/// alias added to a merged-away member whose canonical already holds
-/// the alias reads as shared even though resolution would still
-/// return the single canonical. Advisory-only — the add still
-/// succeeds — and rare.
+/// before this add lands: an existing single holder whose canonical
+/// id differs from this person's canonical id, or an already-ambiguous
+/// set, both mean shared. `CannotSearch` (person records unread) is
+/// unknown, not shared: claiming sharing on an incomplete person set
+/// would mislead, so it falls through to the ordinary warning gates.
+///
+/// Fix round 3: the comparison is canonical to canonical. The
+/// canonical id comes from core's `canonical_person_id` query — the
+/// merge map itself stays `pub(crate)` in core, and no existing
+/// CLI-reachable lookup returns a target's canonical id
+/// (`resolve_person` by id deliberately does not canonicalize, and a
+/// name lookup needs a unique display name). An alias added to a
+/// merged-away member whose canonical already holds the alias is
+/// therefore the same canonical person, not a second holder, and
+/// does not warn as ambiguous.
 fn alias_shared_with_another_person(
     vault: &confidant_core::Vault,
     kind: &str,
@@ -7875,8 +7884,9 @@ fn alias_shared_with_another_person(
     person_id: &RecordId,
 ) -> bool {
     use confidant_core::resolve::PersonResolveError;
+    let target_canonical = confidant_core::resolve::canonical_person_id(vault, person_id);
     match confidant_core::resolve::resolve_alias(vault, kind, hmac_hex) {
-        Ok(m) => m.id != *person_id,
+        Ok(m) => m.id != target_canonical,
         Err(PersonResolveError::Ambiguous { .. }) => true,
         Err(_) => false,
     }

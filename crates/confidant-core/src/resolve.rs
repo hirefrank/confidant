@@ -263,6 +263,26 @@ pub fn resolve_alias(
     }
 }
 
+/// The merge-canonical person id for `id` as of the vault's resolution
+/// date: the id itself when no `merge` line applies to it, otherwise
+/// the canonical person its merge group resolves to (the same walk
+/// [`resolve_alias`] uses, so the two can be compared canonical to
+/// canonical). This is deliberately the only canonicalization query
+/// exposed outside this module: callers that must tell "the same
+/// canonical person" from "a different person" — the `alias add`
+/// ambiguity probe — need the canonical id, and no other lookup
+/// returns it (`resolve_person` by id deliberately does not
+/// canonicalize, and a name lookup needs a unique display name).
+/// It exposes no merge map and no canonicalization machinery.
+pub fn canonical_person_id(vault: &Vault, id: &RecordId) -> RecordId {
+    let as_of = resolve_as_of_date(vault);
+    let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
+    let mut merge_findings = Vec::new();
+    let merges = check_aliases_and_merges(vault, &known_ids, as_of, &mut merge_findings);
+    drop(merge_findings);
+    canonical_on(id, &merges, as_of)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{resolve_alias, resolve_person, PersonMatch, PersonResolveError};
@@ -488,6 +508,31 @@ mod tests {
                 id: RecordId::parse(BEA).unwrap(),
                 matched_by_name: true,
             })
+        );
+    }
+
+    #[test]
+    fn canonical_person_id_follows_merge() {
+        // #767 fix round 3: the alias-add probe must compare canonical
+        // to canonical, so it needs the target's canonical id.
+        let (_tmp, root) = vault("merged-canonical", |root| {
+            person(root, ADA, Some("Ada Old"), None);
+            person(root, BEA, Some("Bea New"), None);
+            std::fs::create_dir_all(root.join("ledger/2026")).unwrap();
+            std::fs::write(
+                root.join("ledger/2026/10.cfd"),
+                format!("2026-10-01 merge {ADA} into {BEA}\n"),
+            )
+            .unwrap();
+        });
+        let vault = load(&root);
+        assert_eq!(
+            super::canonical_person_id(&vault, &RecordId::parse(ADA).unwrap()),
+            RecordId::parse(BEA).unwrap()
+        );
+        assert_eq!(
+            super::canonical_person_id(&vault, &RecordId::parse(BEA).unwrap()),
+            RecordId::parse(BEA).unwrap()
         );
     }
 

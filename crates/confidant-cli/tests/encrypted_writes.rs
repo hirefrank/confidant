@@ -8282,6 +8282,167 @@ fn alias_add_second_add_of_shared_value_warns_ambiguous_not_retrievable() {
 }
 
 #[test]
+fn alias_add_to_merged_away_member_of_alias_holder_does_not_warn_ambiguous() {
+    // #767 fix round 3 (Frank + Silas re-review of eebad4f): the round-2
+    // probe compared `resolve_alias`'s canonical id to the raw person
+    // id, so an alias added to a merged-away member whose canonical
+    // person already held the same kind/value warned that `alias
+    // resolve` would report it as ambiguous. But `resolve_alias`
+    // deduplicates both entries to the single canonical id and
+    // succeeds, so the warning stated as certain something false. The
+    // probe must compare canonical id to canonical id: the member add
+    // is the same canonical person, not a second holder.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "")
+            .status
+            .success(),
+        "person 1 (merged-away member)"
+    );
+    assert!(
+        add_person_record(&h, PERSON2, "Bea Demo", "")
+            .status
+            .success(),
+        "person 2 (canonical)"
+    );
+
+    // Merge PERSON into PERSON2, dated before the alias adds.
+    let ledger_dir = h.vault.join("ledger/2026");
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    std::fs::write(
+        ledger_dir.join("10.cfd"),
+        format!("2026-10-01 merge {PERSON} into {PERSON2}\n"),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "merge"]);
+
+    // First add to the canonical person (JSON): the warning may point
+    // at `alias resolve` and must not claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@merged-handle",
+    );
+    assert!(
+        out.status.success(),
+        "first alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("alias resolve handle"), "{warning}");
+    assert!(!warning.contains("ambiguous"), "{warning}");
+
+    // Second add, to the merged-away member (JSON): same canonical
+    // person, so the warning must NOT claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@merged-handle",
+    );
+    assert!(
+        out.status.success(),
+        "second alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(
+        !warning.contains("ambiguous"),
+        "merged-away member warned as ambiguous: {warning}"
+    );
+    assert!(warning.contains("retrieve it with"), "{warning}");
+    assert!(!warning.contains(PERSON), "person leaked: {warning}");
+    assert!(!warning.contains(PERSON2), "person leaked: {warning}");
+    assert!(!stdout(&out).contains("@merged-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@merged-handle"), "value leaked");
+
+    // `alias resolve` for the value succeeds, deduplicated to the
+    // single canonical person — it does not fail closed.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "handle", "--json", "--no-input"],
+        "@merged-handle",
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["person"]["id"], PERSON2, "{v}");
+    assert_eq!(v["person"]["name"], "Bea Demo", "{v}");
+    assert!(!stdout(&out).contains("@merged-handle"));
+
+    // Human adds of a second value follow the same shape: the
+    // merged-away member's add warns with retrieval advice, never
+    // with an ambiguity claim.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@merged-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "first add (2) failed: {}",
+        stderr(&out)
+    );
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@merged-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "second add (2) failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("ambiguous"),
+        "merged-away member warned as ambiguous: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("retrieve it with"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@merged-handle-two"), "value leaked");
+    assert!(!stderr(&out).contains("@merged-handle-two"), "value leaked");
+}
+
+#[test]
 fn alias_value_never_appears_in_output_or_errors() {
     // The value is PII: not in success output, not in a not-found error, not
     // in a bad-kind usage error, in human or `--json` form.
