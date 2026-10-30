@@ -722,14 +722,15 @@ no clock-skew allowance (the verifier's clock is authoritative, and
 a wrong clock fails closed), and writer-signed merge commits are
 checked against each parent rather than refused outright.
 
-What fix round 2 added (normative in spec §14, except the
-attestation, which is a proposal):
+What fix round 2 added (normative in spec §14, including the
+attestation, settled in fix round 3):
 
 - **Causal, ordered validation replaces the global-maximum cert
   resolution.** Cert versions in newly introduced ancestry are
   resolved in causal order, with a per-writer high-water that
-  starts from the seed (checkpoint and/or attestation, combined
-  by maximum) and advances only as each link is accepted, so
+  starts from the seed (checkpoint and/or attestation, floors
+  combined by maximum and revocation state combined
+  conservatively) and advances only as each link is accepted, so
   offline catch-up across a cert renewal validates both the
   `seq = 1` and the `seq = 2` links while a `seq = 1` link
   after `seq = 2` in the same chain is still refused. Merges
@@ -741,7 +742,7 @@ attestation, which is a proposal):
   and-history rule no longer exists for newly introduced
   ancestry; its force-push protection now comes from seed
   floors, and a seedless fresh clone has no such floor (a
-  limit the attestation proposal states plainly). Revoked
+  limit the attestation subsection states plainly). Revoked
   and expired certs mid-chain are handled in the walk: the
   revocation seq rule preserves already-accepted history but
   never authorizes new acceptance by a revoked writer, and
@@ -763,25 +764,37 @@ attestation, which is a proposal):
   a record between clients or types under a modification.
   An id change between images is a deletion plus an
   addition, and the deletion refuses it.
-- **Acceptance attestation, as a proposal for review (not
-  settled).** A root-signed in-vault attestation over an
-  accepted tip and its high-waters would let a fresh reader
-  seed its checkpoint without prior state, preserving
-  legitimate history older than 30 days without admitting
-  forged ancestry above the attested tip. The proposal
-  defines format, domain separation, signer eligibility
-  (operator/recovery only, never writers), precise
-  selection ("newest" by ancestry dominance, set-maximum
-  seeding on forks, inapplicable tips ignored), and
-  rollback rules (monotone floors, no silent fallback to
-  an older seed, checkpoint combination by maximum, chain
-  conflicts refused, force-push limit stated). Four open
-  questions are flagged in the spec for Silas/Frank: the
-  `attested_at` field, recovery-key signatures alone,
-  mandatory on-acceptance writing vs a cadence bound, and
-  whether forked attestations should fail closed outright.
-  No implementation may build on the attestation until
-  those are answered and the subsection is approved.
+- **Acceptance attestation, settled in fix round 3.** A
+  root-signed in-vault attestation over an accepted tip
+  and its high-waters lets a fresh reader seed its
+  checkpoint without prior state, preserving legitimate
+  history older than 30 days without admitting forged
+  ancestry above the attested tip. The design defines
+  format (two kinds of state: monotone floors and a
+  revocation-state deny set, combined differently),
+  domain separation, signer eligibility
+  (current-anchor-only seeding: operator/recovery only,
+  never writers; a retired-key attestation seeds only
+  when covered by a current-anchor seed, otherwise it
+  is inert), precise selection ("newest" by ancestry
+  dominance, set combination on forks, inapplicable
+  tips ignored), and rollback rules (monotone floors,
+  conservative revocation combination, no silent
+  fallback to an older seed except for validly
+  root-signed inconsistencies, checkpoint combination
+  by kind, chain conflicts refused, force-push limit
+  and the seedless pre-rotation-fork limit stated
+  plainly, with `doctor`'s `anchor-mismatch`
+  diagnostic). Silas's four answers are folded in: no
+  `attested_at` field; recovery-key-only signatures
+  allowed; best-effort cadence (attest when the newest
+  attestation is over 24h old, or the range contains a
+  cert issue/renewal or a revocation, with a `doctor`
+  warning at 14 days); set-maximum for floors on forks,
+  fail closed only on a same-`seq` root fork. The
+  subsection awaits Silas's re-review and Frank's
+  explicit approval at merge; #731 still needs outside
+  audit.
 - **Agreed choices recorded:** no clock-skew allowance,
   with a `doctor`/diagnostic hint that a wrong system
   clock is the likely cause of a window failure near a
@@ -1164,28 +1177,51 @@ in the repo, tests, or CI.
     refused even if it was valid when written; and the same walk
     above an attestation seed starts from the attestation
     high-waters and advances link by link.
-29. **Acceptance attestation, proposal (spec §14, NOT settled):**
-    a fresh clone of a vault with a 60-day-old writer commit under
-    a later root-signed attestation verifies the commit as
-    history; a backdated forged ancestor above the newest
+29. **Acceptance attestation (spec §14):** a fresh clone of
+    a vault with a 60-day-old writer commit under a later
+    root-signed attestation verifies the commit as history;
+    a backdated forged ancestor above the newest
     attestation is refused as new acceptance; fresh-device
     recovery across a rotation verifies through the recovery
     checkpoint acting as seed; an older attestation replayed
-    while a newer verified attestation is present in the same
-    ancestry changes nothing (dominant candidate / set maximum
-    wins); an attestation below an existing off-vault checkpoint
-    is ignored and never moves the checkpoint backwards; a
-    writer-signed attestation is refused as a seed; an
-    attestation whose tip is on an unmerged branch does not
-    seed another head; a root-forked `seq` (same `seq`,
-    different bytes, both validly signed) fails closed until a
-    higher chained attestation resolves it; a chain above a
-    seed tip containing a manifest `seq` below the seed
-    high-water is refused; and with no verifying attestation
-    or checkpoint, the whole chain is new acceptance with a
-    diagnostic naming the missing attestation. These tests
-    define what the proposal must prove on review; they do
-    not approve it.
+    while a newer verified attestation is present in the
+    same ancestry changes nothing (dominant candidate /
+    combined set state wins); an attestation below an
+    existing off-vault checkpoint is ignored and never
+    moves the checkpoint backwards; a writer-signed
+    attestation is refused as a seed; an attestation whose
+    tip is on an unmerged branch does not seed another
+    head; a root-forked `seq` (same `seq`, different
+    bytes, both validly signed) fails closed until a
+    higher chained attestation resolves it; a chain above
+    a seed tip containing a manifest `seq` below the seed
+    floor is refused; and with no verifying attestation
+    or checkpoint, the whole chain is new acceptance with
+    a diagnostic naming the missing attestation.
+    Revocation split: divergent attestations with
+    revocation cutoffs 12 and 50 refuse a `seq` 13
+    manifest; checkpoint vs attestation with differing
+    cutoffs combine to the minimum in both orders; a
+    writer revoked in one input and unrevoked in the
+    other stays revoked with the revoking input's
+    cutoffs; a client absent from a revoked writer's map
+    has cutoff 0. Retired-key trust: a fabricated
+    pre-rotation branch carrying a retired-operator-signed
+    attestation plus an active scoped writer link below
+    it does not seed, and the writer link gets full
+    new-acceptance checks; a retired-key attestation
+    covered by a later current-anchor attestation still
+    seeds; a retired-key attestation with an artificially
+    high floor raises no floor and causes no fail-closed
+    unless covered. Rule 4: a bad-signature attestation
+    is ignored without failing the head, while a validly
+    root-signed `seq` gap or unresolved root fork fails
+    closed. Cadence and diagnostics: an attestation is
+    written at a cert renewal; `doctor` warns when
+    writer-signed commits above the newest attestation
+    are older than 14 days; `doctor`'s `anchor-mismatch`
+    diagnostic flags a head whose operator anchor differs
+    from a locally known one.
 
 ## 13. What changes in the spec
 
@@ -1218,8 +1254,8 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   domain `confidant-recovery-checkpoint-v1`, a minor-format addition
   in the same minor bump. The acceptance checkpoint is off-vault
   reader state next to `trust.toml`, not a vault format change.
-- **Fix round 2, attestation proposal (spec §14, 2026-10-30,
-  NOT settled)**: acceptance attestations — proposed new
+- **Fix round 2, attestation proposal (spec §14, 2026-10-30)**:
+  acceptance attestations — proposed new
   `keys/acceptance-attestations/` tree and domain
   `confidant-acceptance-attestation-v1`, in the same minor bump
   if approved. Readers that do not implement the proposal ignore
@@ -1228,6 +1264,17 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   proposal adds a seed, never a weakening. Causal ordered
   validation and ledger affected-clients classification are
   normative rule changes with no new file type.
+- **Fix round 3, attestation settled (spec §14, 2026-10-30)**:
+  the attestation subsection is settled per Silas's answers
+  and the two blocking findings on the proposal: the format
+  splits monotone floors from revocation state (deny set,
+  combined conservatively), seeding is current-anchor-only
+  (a retired-key attestation is inert unless covered by a
+  current-anchor seed), rollback rule 4 is limited to
+  validly root-signed inconsistencies, and the residual
+  seedless pre-rotation-fork limit is stated with
+  `doctor`'s `anchor-mismatch` diagnostic. No new file
+  type beyond fix round 2's.
 
 These are documented here; the normative spec 0.1 edits land in a
 follow-up after crypto review (issue #85).
@@ -1686,3 +1733,63 @@ in this revision, in spec §14 unless noted:
    merge. This revision does not approve the attestation
    design — approval is Frank's/Silas's on re-review — and
    #731 still needs outside audit before public launch.
+
+**Fix round 3, 2026-10-30 (Silas's re-review of `78adde4`
+plus Frank's and Silas's 14:21–14:22 UTC blocking comments,
+PR #786).** Silas closed causal ordered validation, ledger
+affected clients, record pre/post-image, and the agreed
+choices, and answered the attestation's four open
+questions, but withdrew his conditional sign-off over two
+new blocking findings and one wording contradiction. All
+are addressed in this revision, in spec §14 unless noted:
+
+1. **Rollback rule 4 wording.** Rule 4 contradicted
+   selection step 2. Step 2 is the right call: a file
+   failing candidate verification (bad signature, broken
+   chain, unresolvable signer, wrong domain, unparsable
+   format, missing tip) is ignored and cannot fail the
+   head. Rule 4 is limited to validly root-signed
+   inconsistencies (a `seq` gap in a signed chain, or an
+   unresolved root fork); "bad signature" is removed as
+   a trigger.
+2. **Attestation settled per Silas's answers.** No
+   `attested_at` field; recovery-key-only signatures
+   allowed; best-effort cadence (attest when the newest
+   attestation is over 24h old, or the range contains a
+   cert issue/renewal or a revocation, with a `doctor`
+   warning when writer-signed commits above the newest
+   attestation are older than 14 days, including the
+   renewal rationale); set-maximum for floors on forks,
+   fail closed only on a same-`seq` root fork, with the
+   B-side liveness sentence. The PROPOSAL status and
+   banner are removed. Approval is still Silas's
+   re-review plus Frank's explicit OK.
+3. **Revocation ceilings vs floors.** The format and
+   every combination rule now split monotone floors
+   (combine by maximum) from revocation state (a deny
+   set: revoked set is the union, per-client cutoff is
+   the minimum across inputs listing that writer, a
+   client absent from a revoked writer's map has
+   cutoff 0). The "safe in every component" sentence
+   and the checkpoint re-record rule are fixed to
+   match. §12 item 29 gains the divergent-attestation,
+   both-orders, revoked-in-one, and absent-client
+   tests.
+4. **Retired-key attestation trust (current-anchor-only
+   seeding, Silas's preferred option 1).** An
+   attestation seeds only if it verifies under an
+   anchor in force at the candidate head as verified
+   from the reader's own trust root, or its containing
+   commit is an ancestor of a covering seed's tip; an
+   uncovered retired-key attestation is inert (neither
+   seed nor floor, no fail-closed by itself). The
+   residual limit is stated plainly (a seedless reader
+   trusting only the recovery phrase cannot tell a
+   full pre-rotation fork from real history when the
+   attacker controls the remote and holds the retired
+   key; readers holding the current operator key or
+   an off-vault checkpoint must require the head chain
+   to reach it), with `doctor`'s `anchor-mismatch`
+   diagnostic named. §12 item 29 gains the three
+   retired-key tests. #731 still needs outside audit
+   before public launch.
