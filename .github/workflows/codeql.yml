@@ -31,7 +31,7 @@ jobs:
     # unanalysed; the `ready_for_review` trigger gives the final head its run.
     # The SAST score reads merged PR heads only, so this skips no score.
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
