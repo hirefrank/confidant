@@ -1126,6 +1126,17 @@ fn find_nonempty_with_skips_carries_partial_warning() {
     assert_eq!(warning["severity"], "warning", "{warning}");
     let msg = warning["message"].as_str().unwrap();
     assert!(msg.contains("may be incomplete"), "{msg}");
+    // #790 blocker 3: the original message carried a literal backslash,
+    // a newline, and indentation. Pin the single-line shape here too.
+    assert!(!msg.contains('\n'), "message must be single-line: {msg:?}");
+    assert!(
+        !msg.contains('\\'),
+        "message must carry no backslash: {msg:?}"
+    );
+    assert!(
+        msg.ends_with("build the search corpus with `reindex`."),
+        "message must end with the remedy: {msg}"
+    );
     assert!(
         !msg.contains("plaintextmarker"),
         "warning must not leak content: {msg}"
@@ -1162,6 +1173,92 @@ fn find_nonempty_with_skips_carries_partial_warning() {
     assert!(
         stderr(&out).contains("may be incomplete"),
         "text mode must repeat the warning on stderr, got: {}",
+        stderr(&out)
+    );
+}
+
+/// #790 blocker 4: the partial warning is selected from the matches
+/// actually displayed. `--limit 0` over real hits empties the displayed
+/// list, so the result must carry neither warning: `W_PARTIAL_RESULTS`
+/// would describe "these matches" for zero displayed matches, and the
+/// absence warning is not substituted for a limit-emptied result. The
+/// skip count is still reported.
+#[test]
+fn find_limit_zero_empties_displayed_matches_and_carries_no_warning() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+    let plain_id = "p-01J9Z3K4QH0000000000000000";
+    let dir = h.vault.join("people").join(plain_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("profile.md"),
+        person_md(plain_id, "Bo Example", "Bio with plaintextmarker."),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "plaintext person"]);
+
+    // Control: without a limit the same query carries the partial warning.
+    let out = h
+        .cmd_no_device_key(&["find", "plaintextmarker", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "W_PARTIAL_RESULTS"),
+        "control run must carry W_PARTIAL_RESULTS: {v}"
+    );
+
+    // `--limit 0`: zero displayed matches, neither warning, counts kept.
+    let out = h
+        .cmd_no_device_key(&[
+            "find",
+            "plaintextmarker",
+            "--limit",
+            "0",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v["skipped_encrypted"].as_u64().unwrap() >= 1, "{v}");
+    let codes: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        !codes.contains(&"W_PARTIAL_RESULTS"),
+        "limit-emptied result must not carry W_PARTIAL_RESULTS: {v}"
+    );
+    assert!(
+        !codes.contains(&"W_SKIPPED_ENCRYPTED"),
+        "limit-emptied result must not carry W_SKIPPED_ENCRYPTED: {v}"
+    );
+
+    // Text mode agrees: "0 matches" with the count, no warning anywhere.
+    let out = h
+        .cmd_no_device_key(&["find", "plaintextmarker", "--limit", "0", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("0 matches"), "{text}");
+    assert!(text.contains("skipped_encrypted:"), "{text}");
+    assert!(!text.contains("W_PARTIAL_RESULTS"), "{text}");
+    assert!(!text.contains("W_SKIPPED_ENCRYPTED"), "{text}");
+    assert!(
+        !stderr(&out).contains("may be incomplete"),
+        "{}",
         stderr(&out)
     );
 }

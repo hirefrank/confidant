@@ -373,16 +373,32 @@ fn search_exact_zero_matches_with_skips_renders_warning() {
         "warning finding must carry through"
     );
 
-    // Wider buffer so the full warning line survives on one row.
-    let rendered = render_to_string_at(&app, 160, 24);
+    // #790 blocker 1: render at an ordinary 80-column width. The
+    // warning wraps inside the status block, so the full message —
+    // including the remedy at its end — must still render.
+    let rendered = render_to_string_at(&app, 80, 24);
     assert!(rendered.contains("0 matches"), "{rendered}");
     assert!(
         rendered.contains("W_SKIPPED_ENCRYPTED"),
         "warning code must render in the status block:\n{rendered}"
     );
+    // The wrapped message spans rows, so assert its phrases on the
+    // newline-flattened rendering; the code assertion above already
+    // proves the warning is in the status block.
+    // Strip the block borders row by row before flattening: a wrapped
+    // phrase is split across rows with a `│` border between the words.
+    let flat: String = rendered
+        .lines()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        rendered.contains("does not establish absence"),
+        flat.contains("does not establish absence"),
         "warning message must render:\n{rendered}"
+    );
+    assert!(
+        flat.contains("reindex"),
+        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
     );
 }
 
@@ -425,15 +441,28 @@ fn search_exact_nonempty_with_skips_renders_partial_warning() {
         "non-empty result must not carry the absence warning"
     );
 
-    // Wider buffer so the full warning line survives on one row.
-    let rendered = render_to_string_at(&app, 160, 24);
+    // #790 blocker 1: render at an ordinary 80-column width. The
+    // warning wraps inside the status block, so the full message —
+    // including the remedy at its end — must still render.
+    let rendered = render_to_string_at(&app, 80, 24);
     assert!(
         rendered.contains("W_PARTIAL_RESULTS"),
         "warning code must render in the status block:\n{rendered}"
     );
+    // Strip the block borders row by row before flattening: a wrapped
+    // phrase is split across rows with a `│` border between the words.
+    let flat: String = rendered
+        .lines()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        rendered.contains("may be incomplete"),
+        flat.contains("may be incomplete"),
         "warning message must render:\n{rendered}"
+    );
+    assert!(
+        flat.contains("reindex"),
+        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
     );
 }
 

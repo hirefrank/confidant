@@ -1141,11 +1141,15 @@ fn with_partial_results_warning(
         let qualifier = if scoped { " (vault-wide count)" } else { "" };
         let message = if skipped_encrypted == 1 {
             format!(
-                "1 encrypted record was not searched{qualifier}; these matches may be \\\n                 incomplete — try `resolve`/`context`, or build the search corpus \\\n                 with `reindex`.",
+                "1 encrypted record was not searched{qualifier}; these matches may be \
+                 incomplete — try `resolve`/`context`, or build the search corpus \
+                 with `reindex`."
             )
         } else {
             format!(
-                "{skipped_encrypted} encrypted records were not searched{qualifier}; \\\n                 these matches may be incomplete — try `resolve`/`context`, or \\\n                 build the search corpus with `reindex`.",
+                "{skipped_encrypted} encrypted records were not searched{qualifier}; \
+                 these matches may be incomplete — try `resolve`/`context`, or \
+                 build the search corpus with `reindex`."
             )
         };
         findings.push(Finding::new(
@@ -1353,7 +1357,9 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, excerpt, pkg_open_lines, still_cleared, Allowlist};
+    use super::{
+        case_fold, excerpt, pkg_open_lines, still_cleared, with_partial_results_warning, Allowlist,
+    };
     use crate::{
         cleared_ledger_line_owners, cleared_record_owners, search, search_for_operator, OwnerKey,
         PackScope,
@@ -1670,6 +1676,55 @@ mod tests {
             "empty query must not warn: {:?}",
             result.findings
         );
+    }
+
+    #[test]
+    fn partial_results_warning_message_is_exact_and_single_line() {
+        // #790 blocker 3: the original `format!` literals used `\\\n`
+        // escapes, so the message carried a literal backslash, a newline,
+        // and indentation. Pin the exact text in all four shapes, and
+        // assert no newline or stray backslash survives in any of them.
+        use crate::check::{FindingCode, Severity};
+        let singular = "1 encrypted record was not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let plural = "2 encrypted records were not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let singular_scoped = "1 encrypted record was not searched (vault-wide count); these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let plural_scoped = "2 encrypted records were not searched (vault-wide count); these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        for (skipped, scoped, expected) in [
+            (1, false, singular),
+            (2, false, plural),
+            (1, true, singular_scoped),
+            (2, true, plural_scoped),
+        ] {
+            let findings = with_partial_results_warning(Vec::new(), false, skipped, scoped);
+            assert_eq!(
+                findings.len(),
+                1,
+                "one warning for skipped={skipped} scoped={scoped}"
+            );
+            let warning = &findings[0];
+            assert_eq!(warning.code, FindingCode::PartialResults);
+            assert_eq!(warning.severity, Severity::Warning);
+            assert_eq!(
+                warning.message, expected,
+                "exact message for skipped={skipped} scoped={scoped}"
+            );
+            assert!(
+                !warning.message.contains('\n'),
+                "no newline: {}",
+                warning.message
+            );
+            assert!(
+                !warning.message.contains('\\'),
+                "no backslash: {}",
+                warning.message
+            );
+        }
+        // The plural shape above is the 2-skip message; keep it pinned too.
+        let findings = with_partial_results_warning(Vec::new(), false, 2, false);
+        assert_eq!(findings[0].message, plural);
+        // Empty results and zero skips carry no partial warning.
+        assert!(with_partial_results_warning(Vec::new(), true, 2, false).is_empty());
+        assert!(with_partial_results_warning(Vec::new(), false, 0, false).is_empty());
     }
 
     #[test]

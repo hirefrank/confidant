@@ -21,18 +21,16 @@ use crate::theme::palette;
 
 /// Pure renderer for the Search view.
 pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
-    // #718/#769: the status block grows by one row when it carries a
-    // skipped-encrypted or partial-results warning, so the warning is
-    // never clipped; every other result keeps the previous layout.
-    // (At most one of the two fires per search — they are empty-only
-    // and non-empty-only respectively — so one extra row always suffices.)
-    let warns_coverage = state.result.as_ref().is_some_and(|res| {
-        res.result
-            .findings
-            .iter()
-            .any(|f| f.code == "W_SKIPPED_ENCRYPTED" || f.code == "W_PARTIAL_RESULTS")
-    });
-    let status_len = if warns_coverage { 5 } else { 4 };
+    // #790: size the status block from the wrapped line count at the
+    // actual width, so a wrapped warning is never clipped. The count
+    // includes the block borders; the inner width subtracts the borders
+    // and the block's horizontal padding (1 each side).
+    let lines = status_lines(state.result.as_ref());
+    let inner_width = area.width.saturating_sub(4).max(1);
+    let status_len: u16 = 2 + lines
+        .iter()
+        .map(|line| wrapped_line_count(line, inner_width))
+        .sum::<u16>();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -78,18 +76,59 @@ pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
     render_detail(state, frame, chunks[3]);
 }
 
-/// Fallback banner, drop counts, and mode line.
-fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, area: Rect) {
-    let block = theme::block(" Status ");
+/// Number of visual rows a status line occupies once wrapped at
+/// `inner_width` with `Wrap { trim: true }`.
+///
+/// Greedy word wrap over the line's plain text. The `line_count` API
+/// would compute this exactly, but it needs ratatui's unstable
+/// `rendered-line-info` feature, which this crate does not enable; the
+/// greedy count matches it for the short, single-spaced prose these
+/// status lines carry, and the 80x24 tests prove the full warning
+/// renders. Overlong words spill onto further rows rather than
+/// overflowing the block.
+fn wrapped_line_count(line: &Line<'_>, inner_width: u16) -> u16 {
+    let width = inner_width.max(1) as usize;
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let mut rows = 1usize;
+    let mut current = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = Line::from(word.to_owned()).width();
+        if word_width == 0 {
+            continue;
+        }
+        if current == 0 {
+            rows += word_width.saturating_sub(1) / width;
+            current = word_width % width;
+            if current == 0 {
+                current = width;
+            }
+        } else if current + 1 + word_width <= width {
+            current += 1 + word_width;
+        } else {
+            rows += 1;
+            rows += word_width.saturating_sub(1) / width;
+            current = word_width % width;
+            if current == 0 {
+                current = width;
+            }
+        }
+    }
+    rows as u16
+}
+
+/// The status block's lines: fallback banner, drop counts, mode line,
+/// and any in-band coverage warning. Shared by `render` (for sizing)
+/// and `render_status` (for drawing) so the height always matches the
+/// wrapped content.
+fn status_lines(result: Option<&FilteredSearchResult>) -> Vec<Line<'static>> {
     let Some(res) = result else {
-        frame.render_widget(
-            Paragraph::new(Line::from(
-                "No search run yet. Press / to enter a query.".fg(palette::MUTED),
-            ))
-            .block(block),
-            area,
-        );
-        return;
+        return vec![Line::from(
+            "No search run yet. Press / to enter a query.".fg(palette::MUTED),
+        )];
     };
 
     let mut lines = Vec::new();
@@ -147,7 +186,17 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
             ]));
         }
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    lines
+}
+
+/// Fallback banner, drop counts, and mode line.
+fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, area: Rect) {
+    let block = theme::block(" Status ");
+    let lines = status_lines(result);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
 }
 
 fn render_matches(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
