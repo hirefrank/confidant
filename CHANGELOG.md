@@ -8,6 +8,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Added
+- `alias add` warns when the added value appears nowhere in searchable plaintext under the §12 agent `find` allowlist, so the operator learns at add time that the alias is retrievable only via `alias resolve <kind>` unless the value later appears in plaintext; the add still succeeds with exit 0, and the warning never echoes the value (#767).
+
 ## [0.7.1] - 2026-10-25
 
 ### Added

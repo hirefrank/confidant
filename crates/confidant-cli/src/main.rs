@@ -710,7 +710,10 @@ enum AliasAction {
     ///
     /// The raw value (email, phone, handle, or name) is read from stdin or
     /// `--value-file` only — never an argument — and is never echoed in
-    /// output, errors, or logs. One commit; check-gated.
+    /// output, errors, or logs. One commit; check-gated. When the value
+    /// appears nowhere in searchable plaintext, the add succeeds with a
+    /// warning that `find` cannot surface it — retrieve it with
+    /// `alias resolve <kind>` (#767).
     Add {
         /// Opaque person id (p-…) or an exact display name (cleared people
         /// only; see `confidant resolve`).
@@ -7677,6 +7680,15 @@ fn alias_resolve_error(
 /// The value arrives via stdin or `--value-file` only. The line carries the
 /// HMAC, never the value; the same is true of `--json` output, errors, and
 /// `--dry-run` previews.
+///
+/// #767: at add time — the only moment the plaintext value is in hand —
+/// the command checks whether the agent `find` path (spec §12 allowlist,
+/// `PackScope::All`, the default `find` scope) returns anything for the
+/// value. When it returns nothing and the search ran completely, the add
+/// still succeeds with exit 0, but carries a warning: alias values are
+/// HMAC-only, so `find` scans plaintext and cannot surface a value that
+/// appears nowhere in searchable plaintext — only `alias resolve <kind>`
+/// retrieves it. The warning never echoes the value.
 fn cmd_alias_add(
     cli: &Cli,
     root: &Path,
@@ -7693,6 +7705,7 @@ fn cmd_alias_add(
     let date = parse_date_arg(&date_raw)?;
 
     let value = read_alias_value(value_file)?;
+    let unfindable = alias_value_unfindable(root, value.trim());
     let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
     let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
 
@@ -7724,7 +7737,49 @@ fn cmd_alias_add(
     if let Some(echo) = person.echo_json() {
         extra["person"] = echo;
     }
+    // The warning rides only outcomes where the add landed or was previewed:
+    // a check-blocked write added nothing to warn about, and an idempotent
+    // re-add of an identical alias line changes nothing either.
+    if unfindable
+        && matches!(
+            outcome,
+            WriteOutcome::Applied { .. } | WriteOutcome::DryRun { .. } | WriteOutcome::Unchanged
+        )
+    {
+        let warning = format!(
+            "warning: this alias value appears nowhere in searchable plaintext, so `find` \
+             cannot surface it (unless the value later appears in plaintext); retrieve it \
+             with `alias resolve {kind}`"
+        );
+        extra["warnings"] = serde_json::json!([warning]);
+        if !cli.json {
+            let _ = writeln!(io::stderr(), "{warning}");
+        }
+    }
     finish_write(cli, root, "alias-add", outcome, extra)
+}
+
+/// #767: does the agent `find` path return anything for `query`?
+///
+/// Runs the same search `find` runs by default (agent allowlist, no
+/// operator mode, `PackScope::All`) against the `for_reads` vault, so
+/// encrypted vaults are judged on decrypted cleared content, not on
+/// keyless shells. Best-effort and fail-silent: any load or search error,
+/// or any skipped/refused encrypted record (an incomplete search cannot
+/// prove absence), means "no warning" — the advisory must never block or
+/// mislead an add. Returns `false` for an empty query, which `find`
+/// rejects outright and search treats as no search at all.
+fn alias_value_unfindable(root: &Path, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let Ok(read_vault) = load_read_vault(root) else {
+        return false;
+    };
+    let Ok(result) = search(&read_vault, query, &PackScope::All) else {
+        return false;
+    };
+    result.hits.is_empty() && result.skipped_encrypted == 0 && result.refused_envelopes == 0
 }
 
 /// `confidant alias resolve <kind>` (#537 phase 3b): resolve a `kind` + value

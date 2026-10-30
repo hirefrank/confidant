@@ -7811,6 +7811,119 @@ fn alias_add_name_then_resolve_round_trips() {
 }
 
 #[test]
+fn alias_add_warns_when_value_nowhere_in_searchable_plaintext() {
+    // #767: a former name that appears nowhere in plaintext cannot be
+    // surfaced by `find` (plaintext scan; alias lines are HMAC-only), so
+    // `alias add` warns at add time — the only moment the value is in
+    // hand — while still succeeding with exit 0 and never echoing it.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+
+    // JSON apply: the warning rides a `warnings` array.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "Ada Oldname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("`find`"), "{warning}");
+    assert!(warning.contains("alias resolve name"), "{warning}");
+    assert!(!stdout(&out).contains("Ada Oldname"), "value leaked");
+    assert!(!stderr(&out).contains("Ada Oldname"), "value leaked");
+
+    // Human apply: the same warning goes to stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@ada-old-handle",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    assert!(stderr(&out).contains("warning"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("alias resolve handle"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@ada-old-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@ada-old-handle"), "value leaked");
+
+    // Dry run: previewing the add warns too, and writes nothing.
+    let head_before = git_head(&h.vault);
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ],
+        "Ada Dryname",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["dry_run"], true);
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    assert!(warnings[0].as_str().unwrap().contains("alias resolve name"));
+    assert_eq!(git_head(&h.vault), head_before, "dry run moved HEAD");
+}
+
+#[test]
+fn alias_add_stays_silent_when_value_is_searchable() {
+    // #767, other side: a value already in cleared plaintext (here the
+    // person's own display name) is surfaced by `find`, so no warning.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(add_person_record(&h, PERSON, "Ada Example", "")
+        .status
+        .success());
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "name",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "Ada Example",
+    );
+    assert!(out.status.success(), "alias add failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "alias-add");
+    assert!(v.get("warnings").is_none(), "{v}");
+}
+
+#[test]
 fn alias_resolve_ambiguous_value_fails_closed() {
     // One value on two cleared people: fail closed rather than guess, with
     // opaque candidate ids.
