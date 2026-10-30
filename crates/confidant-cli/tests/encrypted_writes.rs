@@ -7929,7 +7929,10 @@ fn alias_add_on_no_ai_person_never_recommends_alias_resolve() {
     // excludes the person (generic not-found), so a warning recommending
     // it would point at a path that cannot work, and the `find` probe is
     // meaningless (the person's content is excluded by design). The add
-    // must say plainly the person is `no-ai` instead, never echo the
+    // must say plainly the person is `no-ai`, describe the lookup paths
+    // accurately (fix round 2: no lookup by alias value returns the
+    // person — the alias is stored only as an HMAC — and the person
+    // remains addressable only by their `p-<ULID>`), never echo the
     // value, and leave `alias resolve` returning generic not-found.
     let h = Harness::new();
     h.keyed(PERSON);
@@ -7959,8 +7962,15 @@ fn alias_add_on_no_ai_person_never_recommends_alias_resolve() {
     assert_eq!(warnings.len(), 1, "{v}");
     let warning = warnings[0].as_str().unwrap();
     assert!(warning.contains("no-ai"), "{warning}");
+    // Fix round 2: the warning may name `alias resolve` only to say it
+    // will not return this person. It must not recommend the path, and
+    // it must describe the lookup paths accurately: HMAC-only storage,
+    // addressable only by `p-<ULID>`.
+    assert!(warning.contains("will not return this person"), "{warning}");
+    assert!(warning.contains("HMAC"), "{warning}");
+    assert!(warning.contains("p-<ULID>"), "{warning}");
     assert!(
-        !warning.contains("alias resolve"),
+        !warning.contains("retrieve it with"),
         "warning recommends a path that cannot work: {warning}"
     );
     assert!(
@@ -7988,7 +7998,12 @@ fn alias_add_on_no_ai_person_never_recommends_alias_resolve() {
     assert!(out.status.success(), "alias add failed: {}", stderr(&out));
     assert!(stderr(&out).contains("no-ai"), "{}", stderr(&out));
     assert!(
-        !stderr(&out).contains("alias resolve"),
+        stderr(&out).contains("will not return this person"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("retrieve it with"),
         "warning recommends a path that cannot work: {}",
         stderr(&out)
     );
@@ -8120,6 +8135,150 @@ fn alias_resolve_ambiguous_value_fails_closed() {
     // The raw alias value must never appear in the error.
     assert!(!msg.contains("@shared-handle"), "{msg}");
     assert!(!stdout(&out).contains("@shared-handle"));
+}
+
+#[test]
+fn alias_add_second_add_of_shared_value_warns_ambiguous_not_retrievable() {
+    // #767 fix round 2 (Frank + Silas re-review of 9cd0871): two cleared
+    // people can hold the same kind/value, and `alias resolve` then
+    // fails closed with `E_AMBIGUOUS_PERSON`. The second add must not
+    // promise retrieval through `alias resolve`; it must say the value
+    // is shared and resolve will report it as ambiguous, without echoing
+    // the value or either person.
+    let h = Harness::new();
+    h.keyed(PERSON);
+    assert!(
+        add_person_record(&h, PERSON, "Ada Example", "")
+            .status
+            .success(),
+        "person 1"
+    );
+    assert!(
+        add_person_record(&h, PERSON2, "Bea Demo", "")
+            .status
+            .success(),
+        "person 2"
+    );
+
+    // First add: no other holder, so the warning may point at
+    // `alias resolve` — and must not claim ambiguity.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@shared-handle",
+    );
+    assert!(
+        out.status.success(),
+        "first alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("alias resolve handle"), "{warning}");
+    assert!(!warning.contains("ambiguous"), "{warning}");
+
+    // Second add (JSON): shared warning, no retrieval promise.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--json",
+            "--no-input",
+        ],
+        "@shared-handle",
+    );
+    assert!(
+        out.status.success(),
+        "second alias add failed: {}",
+        stderr(&out)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "{v}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("ambiguous"), "{warning}");
+    assert!(
+        !warning.contains("retrieve it with"),
+        "unqualified retrieval promise: {warning}"
+    );
+    assert!(!warning.contains(PERSON), "other person leaked: {warning}");
+    assert!(!warning.contains(PERSON2), "other person leaked: {warning}");
+    assert!(!stdout(&out).contains("@shared-handle"), "value leaked");
+    assert!(!stderr(&out).contains("@shared-handle"), "value leaked");
+
+    // `alias resolve` for the shared value now fails closed, with both
+    // opaque candidate ids and no value leak.
+    let out = h.cmd_stdin(
+        &["alias", "resolve", "handle", "--json", "--no-input"],
+        "@shared-handle",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_AMBIGUOUS_PERSON");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains(PERSON), "{msg}");
+    assert!(msg.contains(PERSON2), "{msg}");
+    assert!(!msg.contains("@shared-handle"), "{msg}");
+    assert!(!stdout(&out).contains("@shared-handle"));
+
+    // Human second add of a second shared value: the same shared
+    // warning on stderr, exit still 0.
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@shared-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "first add (2) failed: {}",
+        stderr(&out)
+    );
+    let out = h.cmd_stdin(
+        &[
+            "alias",
+            "add",
+            PERSON2,
+            "handle",
+            "--date",
+            ALIAS_DATE,
+            "--no-input",
+        ],
+        "@shared-handle-two",
+    );
+    assert!(
+        out.status.success(),
+        "second add (2) failed: {}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains("ambiguous"), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("retrieve it with"),
+        "unqualified retrieval promise: {}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("@shared-handle-two"), "value leaked");
+    assert!(!stderr(&out).contains("@shared-handle-two"), "value leaked");
 }
 
 #[test]

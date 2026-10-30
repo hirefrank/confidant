@@ -7690,9 +7690,13 @@ fn alias_resolve_error(
 /// still succeeds with exit 0, but carries a warning: alias values are
 /// HMAC-only, so `find` scans plaintext and cannot surface a value that
 /// appears nowhere in searchable plaintext — only `alias resolve <kind>`
-/// retrieves it. The warning never echoes the value. For a `no-ai: true`
-/// person the warning says so plainly instead of recommending
-/// `alias resolve`, which also excludes that person by design.
+/// retrieves it, unless the same kind/value is already held by another
+/// cleared person, in which case the warning says the value is shared
+/// and `alias resolve` will report it as ambiguous. The warning never
+/// echoes the value. For a `no-ai: true` person the warning says so
+/// plainly instead of recommending `alias resolve`, which also excludes
+/// that person by design: the alias is stored only as an HMAC, and the
+/// person remains addressable only by their `p-<ULID>`.
 fn cmd_alias_add(
     cli: &Cli,
     root: &Path,
@@ -7709,9 +7713,9 @@ fn cmd_alias_add(
     let date = parse_date_arg(&date_raw)?;
 
     let value = read_alias_value(value_file)?;
-    let warning = alias_add_warning(root, &person.id, value.trim(), kind);
     let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
     let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
+    let warning = alias_add_warning(root, &person.id, value.trim(), kind, &hmac);
 
     let line = format!("{date} alias {} {kind} hmac:{hmac}", person.id);
     let canonical = format!(
@@ -7772,17 +7776,30 @@ fn cmd_alias_add(
 /// Fix round: a `no-ai: true` person is outside the §12 cleared set, so
 /// the `find` probe is meaningless for them and `alias resolve` would
 /// return the same generic not-found — the warning says plainly that
-/// agent paths do not surface the person, and never recommends the
-/// resolve path. Positive evidence only: the loaded record must carry
-/// `no-ai: true`; absence from the cleared set for any other reason
-/// (tainted, malformed, or otherwise unloaded) says nothing about
-/// `no-ai` and stays silent rather than misdiagnosing. An
-/// `E_UNREADABLE` load finding (a record file or directory that failed
-/// to load, which may contain the value) likewise suppresses the
-/// absence warning — the search findings carry the code, never the
-/// path or content. Other finding codes do not suppress: they do not
-/// by themselves mean content went unsearched.
-fn alias_add_warning(root: &Path, person_id: &RecordId, query: &str, kind: &str) -> Option<String> {
+/// no lookup by alias value returns the person (the alias is stored
+/// only as an HMAC) and that the person remains addressable only by
+/// their `p-<ULID>`; it never recommends the resolve path. Positive
+/// evidence only: the loaded record must carry `no-ai: true`; absence
+/// from the cleared set for any other reason (tainted, malformed, or
+/// otherwise unloaded) says nothing about `no-ai` and stays silent
+/// rather than misdiagnosing. An `E_UNREADABLE` load finding (a record
+/// file or directory that failed to load, which may contain the value)
+/// likewise suppresses the absence warning — the search findings carry
+/// the code, never the path or content. Other finding codes do not
+/// suppress: they do not by themselves mean content went unsearched.
+///
+/// Fix round 2: before promising retrieval, the absence branch reuses
+/// `resolve_alias` on the pre-add vault to check whether another
+/// cleared person already holds the same (kind, HMAC). If so, the
+/// warning says the value is shared and `alias resolve` will report
+/// it as ambiguous, instead of the unqualified retrieve advice.
+fn alias_add_warning(
+    root: &Path,
+    person_id: &RecordId,
+    query: &str,
+    kind: &str,
+    hmac_hex: &str,
+) -> Option<String> {
     if query.is_empty() {
         return None;
     }
@@ -7797,8 +7814,10 @@ fn alias_add_warning(root: &Path, person_id: &RecordId, query: &str, kind: &str)
         {
             return Some(
                 "warning: this person is `no-ai: true`, so `find` and other agent paths \
-                 do not surface this person or this alias; the alias is stored, but only \
-                 operator reads can use it"
+                 do not surface this person or this alias, and `alias resolve` will not \
+                 return this person for this alias either; the alias is stored only as an \
+                 HMAC, which no command can turn back into the value, and the person \
+                 remains addressable only by their `p-<ULID>`"
                     .to_owned(),
             );
         }
@@ -7816,6 +7835,13 @@ fn alias_add_warning(root: &Path, person_id: &RecordId, query: &str, kind: &str)
         && result.refused_envelopes == 0
         && !unreadable
     {
+        if alias_shared_with_another_person(&read_vault, kind, hmac_hex, person_id) {
+            return Some(format!(
+                "warning: this alias value appears nowhere in searchable plaintext, and it \
+                 is already held by another person for the same kind, so `alias resolve \
+                 {kind}` will report it as ambiguous rather than returning a single person"
+            ));
+        }
         Some(format!(
             "warning: this alias value appears nowhere in searchable plaintext, so `find` \
              cannot surface it (unless the value later appears in plaintext); retrieve it \
@@ -7823,6 +7849,36 @@ fn alias_add_warning(root: &Path, person_id: &RecordId, query: &str, kind: &str)
         ))
     } else {
         None
+    }
+}
+
+/// Whether the pre-add vault already holds `(kind, hmac)` for a
+/// different cleared person than `person_id`, so adding it here would
+/// make `alias resolve` fail closed as ambiguous. Reuses
+/// `resolve_alias` itself — the same cleared-set,
+/// merge-canonicalized path resolve takes — on the vault as loaded
+/// before this add lands: an existing single holder who is not this
+/// person, or an already-ambiguous set, both mean shared.
+/// `CannotSearch` (person records unread) is unknown, not shared:
+/// claiming sharing on an incomplete person set would mislead, so it
+/// falls through to the ordinary warning gates. Residual:
+/// `resolve_alias` returns canonical ids, compared here against the
+/// raw `person_id` (core's canonicalization is not a public API); an
+/// alias added to a merged-away member whose canonical already holds
+/// the alias reads as shared even though resolution would still
+/// return the single canonical. Advisory-only — the add still
+/// succeeds — and rare.
+fn alias_shared_with_another_person(
+    vault: &confidant_core::Vault,
+    kind: &str,
+    hmac_hex: &str,
+    person_id: &RecordId,
+) -> bool {
+    use confidant_core::resolve::PersonResolveError;
+    match confidant_core::resolve::resolve_alias(vault, kind, hmac_hex) {
+        Ok(m) => m.id != *person_id,
+        Err(PersonResolveError::Ambiguous { .. }) => true,
+        Err(_) => false,
     }
 }
 
