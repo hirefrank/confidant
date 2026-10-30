@@ -77,7 +77,7 @@ cargo audit
 python3 .github/scripts/check-crate-paths.py   # crate path check job
 ```
 
-CI runs the test job on both `ubuntu-latest` and `macos-latest` for every
+CI runs the test job on both `ubuntu-24.04` and `macos-latest` for every
 event, pull requests included. macOS used to be main-push-only, and all
 three main-red incidents in one stretch were platform-only failures it
 found after merge (#560, #564, #581), so a portability break now fails the

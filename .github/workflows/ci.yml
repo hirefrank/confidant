@@ -26,7 +26,7 @@ env:
 jobs:
   changes:
     name: detect changed files
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
       qa_relevant: ${{ steps.detect.outputs.qa_relevant }}
@@ -145,7 +145,7 @@ jobs:
 
   msrv:
     name: msrv (1.88)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -175,7 +175,7 @@ jobs:
       # platform-only failure it found after merge: #560 and #564 (CLI tests)
       # and #581 (a TUI snapshot that embedded a TMPDIR-dependent path).
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
@@ -203,7 +203,7 @@ jobs:
 
   skills-smoke:
     name: skills smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -228,7 +228,7 @@ jobs:
 
   qa-smoke:
     name: qa smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     # Nightly, manual, and push-to-main; on a pull request only when the change
     # can affect it (fixtures, pack content, the smoke script, or this
@@ -289,7 +289,7 @@ jobs:
 
   deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -303,7 +303,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -326,7 +326,7 @@ jobs:
 
   package-paths:
     name: crate path check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: self-test crate path check
