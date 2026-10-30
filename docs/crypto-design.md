@@ -536,6 +536,122 @@ vault-wide keypair:
    device means a mandatory inbox rotation. Revoking other devices doesn't
    touch it.
 
+## 8b. Delegated writer keys (issue #779, design revision)
+
+Rationale in one paragraph: today the operator Ed25519 key is the sole
+signing authority, and the agent — the primary actor for creating and
+updating content — works only by holding a copy of it (#729). One
+compromised agent host then holds total authority, and every additional
+agent needs another copy of the root. The fix is delegation, not
+duplication: the operator key becomes a root that signs per-writer
+certificates, each writer signs with its own Ed25519 key, and revoking
+one writer touches nothing else. The normative contract is spec §14
+("Writer certificates"); this section keeps the rationale, the answers
+to the open questions, and what the implementation must prove. This
+section is design only, answering Silas's review of 2026-10-27 (signed
+— Silas) on issue #779, the design gate for #731. No crypto code lands
+under it until #779 is answered, Frank gives explicit OK at merge, and
+the implementation states **needs outside audit before public launch**.
+
+What the review settled, and where it lives in the spec:
+
+- **Architecture: approved with conditions.** Operator as root,
+  per-writer certs in the vault, a new domain
+  (`confidant-writer-cert-v1`), separate sign and encrypt keys, and
+  root-only device, writer, recovery, and shred verbs. The conditions
+  are the field-level rule, seq-keyed revocation, and Q4 in scope —
+  each is normative in spec §14.
+- **Q1 — where the cert lives: in the vault** (`keys/writers/`).
+  Readers must verify writer signatures from a fresh clone, so the
+  agent-scope precedent (scope lives only with the agent, §7) does not
+  apply to a signer whose artifacts are in the vault.
+- **Q2 — signer binding: inside the signed manifest TOML.**
+  `signer = "writer:<id>"` plus the cert's `seq` and SHA-256 digest,
+  all inside the already-signed `recipients.toml` bytes. A missing
+  `signer` means operator. Binding more than a label matters: without
+  the cert `seq`/digest, a re-issued cert with a wider scope could be
+  swapped under an old signature.
+- **Q3 — separate keys: yes.** The cert binds an Ed25519 signing key
+  and, optionally, an X25519 age recipient. Signing authority and
+  decryption capability stay independent: the cert alone never unwraps
+  a data key.
+- **Q4 — which artifacts writers sign: manifests AND git commits, in
+  this design.** Manifests-only would leave the agent host needing the
+  operator key for trusted commits, so #729's copied root could not be
+  retired and the compromise math would not hold. The writer's Ed25519
+  key doubles as its SSH commit-signing key; allowed signers are
+  derived at verification time from verified in-vault certs
+  (principal `writer_id`, `valid-before` from cert `expires`, revoked
+  writers dropped). Commits need no new signed bytes — only a new
+  verification source, and never a committed allowed-signers file in
+  the vault, which push access could forge.
+- **Q5 — revocation freshness on stale clones: offline, 30-day
+  lifetimes, no online check.** Certs live at most 30 days; `doctor`
+  warns when the last fetch is older than 30 days (the same window, so
+  a reader that has not fetched in longer than a cert can live says so
+  rather than verifying quietly); the off-vault revocation high-water
+  is updated on sync. Staleness is bounded by the lifetime, not
+  eliminated — that is the accepted offline trade-off.
+- **Q6 — recovery/root rotation: re-issue on rotation, short
+  overlap.** The recovery key can revoke writers and rotate the root.
+  Rotation re-issues every writer cert under the new operator key with
+  scope preserved exactly (a scope change is a separate grant, never
+  smuggled inside a rotation); the overlap from first new cert to
+  pinned new operator cert is at most one cert lifetime. Old-root
+  certs stop verifying for **new acceptance** once the new operator
+  cert is pinned; pre-rotation history keeps verifying through the
+  anchor-at-commit chain (the operator cert at a historical commit
+  verifies against the unchanged recovery key), or every rotation
+  would break history verification.
+- **Q7 — scope naming and versioning: new type and domain.**
+  `confidant-writer-cert-v1`, not a `confidant-scope-v2` bump: the
+  agent scope's capabilities mean content access, and conflating them
+  with signing authority would make both harder to audit. The verb
+  list is a closed set (`record.add`, `record.update`,
+  `ledger.append`); an unknown verb fails verification instead of
+  being ignored. `keys.init_client` is deliberately excluded: a first
+  manifest has no previous verified manifest for the field rule to
+  check against, so first-manifest signing is root-only.
+
+The two blockers, stated as the design's load-bearing ideas:
+
+1. **A writer re-signs an otherwise-identical manifest.** Recipients,
+   commitments, epoch, vault, and client must match the previous
+   verified manifest exactly; only `seq` and the signer fields may
+   move. Anything else is device enrollment wearing a writer
+   signature, and the field rule refuses it before the signature even
+   matters. The carrying commit's content changes must also be inside
+   the writer's scope — scope is checked on the commit, not just on
+   the manifest.
+2. **Revocation is keyed to manifest `seq`, not time.** The
+   root-signed `revoked.toml` entry records, per client, the highest
+   writer-signed manifest `seq` the revoker had observed. Artifacts
+   above that `seq` are rejected; at or below it keep verifying.
+   Time-based cutoffs fail both ways — invalidating all history, or
+   letting a compromised host backdate — and `seq` fails neither way.
+   The off-vault revocation high-water (file `seq`, updated on sync)
+   covers rollback of the revocation file itself.
+
+Concurrency and format, also from the review: the first pushed commit
+wins a `seq` race, the loser re-signs on top, and an equal `seq` with
+different bytes is a fork, never auto-merged. The change is a minor
+format bump, not a patch, with a vault minimum-reader-version gate
+(`confidant.toml` `[crypto] minimum_reader_version`, checked before
+any manifest verification, reserved refusal `E_READER_TOO_OLD`) plus
+the spec-minor gate for pre-gate readers (`E_SPEC_UNSUPPORTED`), so an
+old binary refuses a writer-capable vault clearly instead of reading
+its first writer-signed manifest as tampering.
+
+Decisions in this revision that Silas still needs to confirm (also
+listed in §26): expiry is enforced for new-head acceptance but not
+re-checked when re-verifying already-accepted history for read/decrypt
+(otherwise history dies every 30 days); the review's "old-root certs
+stop verifying once the new operator cert is pinned" is read as a
+new-acceptance rule, with history preserved via the anchor-at-commit
+chain; writer scope has no `"all"` client wildcard (unlike agent
+scopes — enumerate, because a writer touching every client is
+root-equivalent in breadth).
+
 ## 9. Recovery (ADR-15)
 
 - At `confidant init`, generate the recovery identity. Display the 24-word
@@ -793,6 +909,52 @@ in the repo, tests, or CI.
     recorded in `keys/recovery-recipients.toml`; a device-add request that
     reuses a retired recipient is refused, and stays refused even after a
     later commit erases the entry (the union spans git history).
+20. **Writer cert verification (design §8b, spec §14):** a writer cert
+    verifies against the anchor; a cert transplanted from another vault
+    fails; a forged cert fails; a cert with an unknown verb, unknown
+    type, malformed client id, or lifetime over 30 days fails as a
+    whole (never ignored); a missing `signer` verifies as operator.
+21. **Writer field-level rule (the worked example, spec §14):** previous
+    verified manifest `seq = 4`, recipients `{laptop, phone}`,
+    commitments for epoch 3. A writer-signed candidate at `seq = 5`
+    that adds a recipient is **refused before its signature matters**,
+    even though the signature verifies under a valid writer cert.
+    Variants refused the same way: a changed commitment hex, a dropped
+    recipient, an edited `label`/`scope_ref`, a moved epoch, and a
+    writer-signed manifest with no previous verified manifest (first
+    manifest). The positive control — identical recipients and
+    commitments, `seq = 5`, matching signer binding — is accepted
+    (subject to the remaining checks).
+22. **Writer revocation by sequence:** revoke a writer at manifest
+    high-water 12 for a client; a writer-signed manifest at `seq = 12`
+    or below for that client keeps verifying, one at `seq = 13` is
+    rejected; a revocation signed by the operator and one signed by
+    the recovery key are both accepted, one signed by any other key is
+    refused; restoring a pre-revocation `revoked.toml` (file `seq`
+    below the off-vault mark) is refused.
+23. **Writer concurrency:** two writers sign different manifests at the
+    same `seq`; the first pushed wins, the second is refused as a fork
+    (`E_MANIFEST_FORK`), and the loser re-signing on top at a higher
+    `seq` against the new head is accepted. An equal-`seq`,
+    byte-identical re-push is accepted as idempotent.
+24. **Writer SSH commit signing:** allowed signers derived from
+    verified in-vault certs accept a commit signed by an active
+    writer's key (principal `writer_id`, within its validity window)
+    and reject a commit signed by a revoked or expired writer's key
+    and one signed by an unknown key; a committed allowed-signers file
+    in the vault is never used as authority. Migration: an existing
+    operator-signed vault still verifies; the first writer cert is
+    granted to the host holding the copied operator key; that copy is
+    retired; old commits and manifests still verify; a fresh clone
+    verifies a writer-signed manifest with only the off-vault anchor
+    and the in-vault cert.
+25. **Reader gate:** a vault above the reader's CLI version
+    (`minimum_reader_version`) is refused with `E_READER_TOO_OLD`
+    before any manifest verification, naming required vs actual
+    version — never reported as tampering. The implementation must
+    also demonstrate that a pre-gate binary refuses a writer-capable
+    vault via `E_SPEC_UNSUPPORTED` before meeting a writer-signed
+    manifest.
 
 ## 13. What changes in the spec
 
@@ -810,6 +972,14 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   §2); the AAD binds both record ULID and client id; duplicate header keys
   are rejected (§5).
 - **AAD**: adds a `client_id` component after `ulid` (§5).
+- **Writer certificates (§8b, spec §14, issue #779)**: a minor format
+  change, not a patch — new `keys/writers/` tree and cert domain
+  `confidant-writer-cert-v1`, new optional signer fields in
+  `recipients.toml`, new root-signed `keys/writers/revoked.toml`
+  (domain `confidant-writer-revoked-v1`), and a new defined
+  `confidant.toml` `[crypto]` key, `minimum_reader_version`. The
+  manifest signature domain stays `confidant-manifest-v2`. Operator-
+  and recovery-signed manifests verify unchanged.
 
 These are documented here; the normative spec 0.1 edits land in a
 follow-up after crypto review (issue #85).
@@ -1105,3 +1275,71 @@ Closes the non-blocking follow-ups on #153 plus the `recover` anchor file
 - **Deferred:** a real-`keys shred` path through the shredded-only-pubkey
   test (#153 nit 2) needs scoped recipients (#138); tracked separately.
 
+## 26. Delegated writer keys: Silas's review round (2026-10-27, issue #779)
+
+Design-only revision answering the crypto-review on #779, the gate for
+#731. No code, no key handling, no envelope/AAD changes in this
+revision. Normative text is spec §14 ("Writer certificates"); the
+rationale is §8b above. This section records what changed from the
+#779 proposal and what still needs a decision, so the implementation
+PR does not have to re-derive it.
+
+- **Blocker 1, closed in design:** the field-level rule is now
+  normative (spec §14): a writer-signed manifest must match the
+  previous verified manifest on recipients, commitments, epoch, vault,
+  and client, with only `seq` and the signer fields moving, checked
+  before the signature matters — plus the worked refusal example (a
+  writer-signed manifest adding a recipient is refused despite a valid
+  signature) and its variants. The carrying commit's content changes
+  must also be in the writer's scope.
+- **Blocker 2, closed in design:** revocation is keyed to manifest
+  `seq`, not time: `revoked.toml` entries carry a per-client manifest
+  `seq` high-water, signable by the operator or the recovery key, with
+  an off-vault revocation file-`seq` high-water covering rollback.
+  At/below the high-water keeps verifying; above it is rejected.
+- **Q4, brought into scope:** the writer's Ed25519 key doubles as its
+  SSH commit-signing key, allowed signers derived at verification time
+  from verified in-vault certs (principal `writer_id`,
+  `valid-before` from cert `expires`, revoked writers dropped). This
+  is what lets #729's copied operator key be retired.
+- **Other answers incorporated:** Q1 in-vault; Q2
+  `signer = "writer:<id>"` plus cert `seq`/digest inside the signed
+  TOML (missing signer = operator); Q3 separate sign/encrypt keys; Q5
+  offline 30-day lifetimes + `doctor` warning when the last fetch is
+  older + off-vault high-water on sync; Q6 re-issue on root rotation
+  with a short overlap (at most one cert lifetime); Q7 new type and
+  domain `confidant-writer-cert-v1` with a closed verb set (unknown
+  verb fails verification).
+- **Concurrency and format:** first pushed wins, loser re-signs,
+  equal `seq` with different bytes is a fork (`E_MANIFEST_FORK`);
+  equal `seq` byte-identical is an idempotent re-push. Minor bump, not
+  a patch, with a vault minimum-reader-version gate
+  (`E_READER_TOO_OLD`, checked before manifest verification) plus the
+  spec-minor gate for pre-gate readers (`E_SPEC_UNSUPPORTED`).
+- **Decisions made in this revision, for Silas/Frank to confirm:**
+  (a) expiry gates new-head acceptance but is not re-checked when
+  re-verifying already-accepted history for read/decrypt — otherwise
+  history dies every 30 days; (b) "old-root certs stop verifying once
+  the new operator cert is pinned" is read as a new-acceptance rule,
+  with pre-rotation history preserved via the anchor-at-commit chain
+  (operator cert at a historical commit verifies against the unchanged
+  recovery key) — otherwise every rotation breaks history; (c) writer
+  scope has no `"all"` client wildcard (unlike agent scopes); clients
+  are enumerated; (d) `keys.init_client` is not a writer verb, because
+  a first manifest has no previous verified manifest for the field
+  rule to check; (e) cert-version resolution for new acceptance uses
+  the highest cert `seq` across working tree and git history; (f) the
+  manifest signature domain stays `confidant-manifest-v2` (the signer
+  fields ride inside the already-signed TOML bytes).
+- **Still open for the implementation PR (not decided here):** how the
+  implementation enumerates changed entries from a commit diff for
+  the commit-scope check; the exact CLI version string for the first
+  `minimum_reader_version` value; and the demonstration (test 25)
+  that a pre-gate binary refuses a writer-capable vault via
+  `E_SPEC_UNSUPPORTED` before meeting a writer-signed manifest.
+- **Explicitly not decided here:** no change to envelope, AAD, key
+  wrapping, or the #711 custody model (referenced, not revised); no
+  writer private-key handling; no implementation of #731. The §2
+  `[crypto]` table gains `minimum_reader_version` when the spec minor
+  carrying this section is cut — a one-line follow-up for that PR,
+  not edited here, to keep this revision to spec §14 and this doc.
