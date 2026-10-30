@@ -120,9 +120,12 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 # measured on one vault never leaks into another vault on the same
 # host, while single-vault setups keep working unchanged. --persist
 # never touches the global file: values an old --persist wrote there
-# stay honored as fallback. It also clears stale values an earlier
-# preflight run wrote to the vault-local file that fresh evidence no
-# longer supports, and leaves hand-set values alone (saying so). A warm-run failure downgrades the
+# stay honored as fallback. It also clears a stale preflight-written
+# offline value the fresh evidence no longer supports, and leaves
+# hand-set values alone (saying so). It never clears a persisted
+# default_mode when no hit-bearing mode ran (#778): an empty probe is
+# not evidence against the old mode — only a fresh hit-bearing
+# recommendation replaces it. A warm-run failure downgrades the
 # mode to that failure — the cold sample is never reused. A smoke run
 # that answers with zero hits is reported as ok-empty, never
 # recommended. Worst case is ~18 minutes at the default 180s per-mode
@@ -264,8 +267,11 @@ value once its own preflight persists a per-vault value.
   unreachable or the hybrid cache proof holds, `[qmd] offline =
   true` to the vault-local `<vault>/.confidant/qmd-preflight.toml`
   (local, gitignored), preserving every other key in that file, and
-  clears stale preflight-written keys the fresh evidence no longer
-  supports (hand-set values are left alone and reported). It never
+  clears a stale preflight-written `offline` the fresh evidence no
+  longer supports (hand-set values are left alone and reported); a
+  persisted `default_mode` is kept, never cleared, when no
+  hit-bearing mode ran — an empty probe is not evidence against it
+  (#778). It never
   touches the global user config: values an old `--persist` wrote
   there (including the #723 disk-election key) stay honored as
   fallback for vaults with no per-vault file. Exit 0 whenever the

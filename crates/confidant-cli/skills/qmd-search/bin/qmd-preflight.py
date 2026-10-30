@@ -61,11 +61,13 @@ Reports, in order:
    is NOT touched by `--persist`: its values remain as fallback, and
    clearing a global value from a per-vault run could clobber a
    fallback another vault still relies on. `--persist` also clears
-   stale preflight-written keys in the vault-local file (a
-   `default_mode` with no hit-bearing mode behind it, an `offline`
-   written by an earlier preflight run when the hub has recovered),
-   and says so explicitly; values not marked as preflight-written are
-   left alone and reported. (The global file keeps its own older
+   a stale preflight-written `offline` when the hub has recovered,
+   and says so explicitly. It never clears a persisted `default_mode`
+   when no hit-bearing mode ran (#778): an empty probe is not
+   evidence against the old mode, so the value is kept and reported
+   as kept; only a fresh hit-bearing recommendation replaces it.
+   Values not marked as preflight-written are left alone and
+   reported. (The global file keeps its own older
    scheme — provenance markers plus the one-time
    `preflight_legacy_migrated` stamp — for values an old `--persist`
    wrote there; those values are read-only fallback now and are never
@@ -600,9 +602,14 @@ def persist_preflight(vault, recommendation, offline_recommended):
     `<vault>/.confidant/qmd-preflight.toml`, never the global user
     config — the global file's [qmd] values remain as fallback for
     vaults with no per-vault file and are never rewritten here.
-    Marked values the fresh evidence no longer supports are cleared
+    A marked `offline` the fresh evidence no longer supports is cleared
     and reported distinctly; unmarked (hand-set) values are left
-    alone and reported. The vault-local file is new, so it has no
+    alone and reported. A persisted `default_mode` is NEVER cleared
+    when the probe yields no hit-bearing mode (#778): an empty probe
+    is absence of evidence about the old mode, not evidence against
+    it — the value is kept and reported as kept, whether marked or
+    hand-set. Only a fresh hit-bearing recommendation (the branch
+    above) replaces it. The vault-local file is new, so it has no
     legacy-migration branch: every value it carries was either
     written with a marker by this function or added by hand.
     Returns the persisted dict (including the path written).
@@ -616,13 +623,15 @@ def persist_preflight(vault, recommendation, offline_recommended):
                                    json.dumps(SOURCE_VALUE))
         persisted["default_mode"] = recommendation
     elif "default_mode" in config:
-        if config.get("default_mode" + SOURCE_SUFFIX) == SOURCE_VALUE:
-            old = config["default_mode"]
-            remove_vault_qmd_config_value(vault, "default_mode")
-            remove_vault_qmd_config_value(vault, "default_mode" + SOURCE_SUFFIX)
-            persisted["default_mode_cleared"] = old
-        else:
-            persisted["default_mode_left"] = config["default_mode"]
+        # #778: no hit-bearing mode ran, so this probe says nothing
+        # about the persisted mode — an empty probe (ok-empty, skipped,
+        # or failed smoke runs) is not evidence against it, and the
+        # chained qmd-index run always probes empty (its default query
+        # can never hit). Clearing here silently dropped the settled
+        # default on every re-index. Keep the value, marked or
+        # hand-set, and report it as kept; only a fresh hit-bearing
+        # recommendation replaces it.
+        persisted["default_mode_kept"] = config["default_mode"]
     if offline_recommended:
         set_vault_qmd_config_value(vault, "offline", "true")
         set_vault_qmd_config_value(vault, "offline" + SOURCE_SUFFIX,
@@ -948,12 +957,11 @@ def main(argv=None):
                          f"(default {DEFAULT_HUB_TIMEOUT_S})")
     ap.add_argument("--persist", action="store_true",
                     help="write the recommendation ([qmd] default_mode, and "
-                         "[qmd] offline when recommended) to the "
-                         "vault-local per-vault file "
-                         "(<vault>/.confidant/qmd-preflight.toml), never "
-                         "the global user config; also clears stale "
-                         "preflight-written keys the fresh evidence no "
-                         "longer supports")
+                         "[qmd] offline when recommended) to the user "
+                         "config; also clears a stale preflight-written "
+                         "offline key the fresh evidence no longer "
+                         "supports, but never clears a persisted "
+                         "default_mode when no hit-bearing mode ran")
     ap.add_argument("--json", action="store_true",
                     help="print the report as JSON instead of text")
     ap.add_argument("--query-script", default=None,
@@ -1136,19 +1144,20 @@ def main(argv=None):
             print(f"  persisted to: {persisted['path']} (per-vault; the "
                   "global [qmd] config is left untouched and remains "
                   "the fallback for vaults with no per-vault file)")
-        if "default_mode_cleared" in persisted:
-            print(f"  note: cleared stale default_mode "
-                  f"({persisted['default_mode_cleared']!r}) from the "
-                  "vault-local file — no hit-bearing mode ran")
+        if "default_mode_kept" in persisted:
+            print(f"  note: kept persisted default_mode "
+                  f"({persisted['default_mode_kept']!r}) in the "
+                  "vault-local file — no hit-bearing mode ran, so "
+                  "an empty probe is not evidence against it (#778)")
         if "offline_cleared" in persisted:
             print("  note: cleared stale preflight-written offline = true "
                   "from the vault-local file — fresh evidence no longer "
                   "supports it")
-        if "default_mode_left" in persisted or "offline_left" in persisted:
-            print("  note: a [qmd] value set by hand in the vault-local "
-                  "file (not marked as preflight-written) was left "
-                  "alone despite fresh evidence; edit it yourself if "
-                  "it is stale")
+        if "offline_left" in persisted:
+            print("  note: a [qmd] offline value set by hand in the "
+                  "vault-local file (not marked as preflight-written) "
+                  "was left alone despite fresh evidence; edit it "
+                  "yourself if it is stale")
     if persist_error is not None:
         print(f"  error: persist failed: {persist_error}")
     if warnings:

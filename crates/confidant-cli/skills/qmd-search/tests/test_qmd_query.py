@@ -1258,7 +1258,8 @@ class QmdPreflightTest(unittest.TestCase):
             self.assertNotIn("default_mode",
                              cfg.read_text(encoding="utf-8"))
 
-    def test_persist_clears_stale_preflight_keys(self):
+    def test_persist_keeps_default_mode_on_empty_probe_clears_offline(
+            self):
         import http.server
         import threading
 
@@ -1278,8 +1279,12 @@ class QmdPreflightTest(unittest.TestCase):
             hub_url = f"http://127.0.0.1:{server.server_address[1]}/"
             vault = self._fake_vault()
             # Per-vault scoping: the stale marked keys live in the
-            # vault-local file now, and that file is what --persist
-            # clears. The global config is not created at all.
+            # vault-local file now. #778 splits their fates on an empty
+            # probe: a reachable hub IS fresh evidence against a marked
+            # offline=true, so it is still cleared — but the empty
+            # probe says nothing about the persisted default_mode, so
+            # it is kept, not cleared. The global config is not created
+            # at all.
             cfg = vault / ".confidant" / "qmd-preflight.toml"
             cfg.write_text(
                 "[qmd]\ndefault_mode = \"vector\"\n"
@@ -1291,11 +1296,12 @@ class QmdPreflightTest(unittest.TestCase):
                                     extra=("--persist",))
             self.assertIsNone(report["recommended_mode"])
             self.assertFalse(report["offline_recommended"])
-            self.assertEqual(report["persisted"]["default_mode_cleared"],
+            self.assertEqual(report["persisted"]["default_mode_kept"],
                              "vector")
             self.assertTrue(report["persisted"]["offline_cleared"])
             text = cfg.read_text(encoding="utf-8")
-            self.assertNotIn("default_mode", text)
+            self.assertIn('default_mode = "vector"', text)
+            self.assertIn('default_mode_source = "preflight"', text)
             self.assertNotIn("offline", text)
             self.assertFalse(
                 (self.root / ".config" / "confidant" / "config.toml")
@@ -1303,6 +1309,51 @@ class QmdPreflightTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_persist_keeps_default_mode_on_chained_empty_probe(self):
+        # #778, the field case: the chained qmd-index run probes with
+        # the default query ("preflight smoke test"), which can never
+        # hit, so every chained re-index is an empty probe — and the
+        # old --persist cleared the persisted default_mode on exactly
+        # that probe (default_mode="vector", offline=true in, only
+        # offline=true out). An empty probe is not evidence against
+        # the old mode, so it is kept. offline stays true here on hub
+        # evidence (hub unreachable), not on the empty probe.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n"
+            "offline = true\noffline_source = \"preflight\"\n",
+            encoding="utf-8")
+        stub = self._stub("stub-empty-778.py", [])
+        report = self._run_main(vault, stub, self._closed_port_url(),
+                                extra=("--persist",))
+        self.assertIsNone(report["recommended_mode"])
+        self.assertEqual(report["persisted"]["default_mode_kept"], "bm25")
+        self.assertTrue(report["persisted"]["offline"])
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
+        self.assertIn("offline = true", text)
+
+    def test_persist_preflight_keeps_default_mode_without_recommendation(
+            self):
+        # #778, unit level: persist_preflight with no recommendation
+        # keeps a marked default_mode byte-for-byte (value and marker),
+        # instead of clearing it as stale.
+        vault = self._fake_vault()
+        cfg = vault / ".confidant" / "qmd-preflight.toml"
+        cfg.write_text(
+            "[qmd]\ndefault_mode = \"bm25\"\n"
+            "default_mode_source = \"preflight\"\n",
+            encoding="utf-8")
+        persisted = self.preflight.persist_preflight(str(vault), None, False)
+        self.assertEqual(persisted["default_mode_kept"], "bm25")
+        self.assertNotIn("default_mode_cleared", persisted)
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn('default_mode = "bm25"', text)
+        self.assertIn('default_mode_source = "preflight"', text)
 
     def test_persist_leaves_global_keys_untouched(self):
         # Per-vault scoping replaces the old global legacy migration
@@ -1432,7 +1483,10 @@ class QmdPreflightTest(unittest.TestCase):
             stub = self._stub("stub-empty3.py", [])
             report = self._run_main(vault, stub, hub_url,
                                     extra=("--persist",))
-            self.assertEqual(report["persisted"]["default_mode_left"],
+            # #778 unified the default_mode report: marked or hand-set,
+            # an empty probe keeps the value (reported as kept), while
+            # the hand-set offline value keeps its own left key.
+            self.assertEqual(report["persisted"]["default_mode_kept"],
                              "bm25")
             self.assertTrue(report["persisted"]["offline_left"])
             text = cfg.read_text(encoding="utf-8")
