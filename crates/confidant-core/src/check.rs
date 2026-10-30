@@ -123,6 +123,9 @@ pub enum FindingCode {
     CadenceOverdue,
     DateUpcoming,
     SkippedEncrypted,
+    /// #769: non-empty `find` over skipped encrypted records — the matches
+    /// shown may be incomplete. Find-only; `check` does not emit it.
+    PartialResults,
     DuplicateTouch,
     DuplicateSession,
     Pack(&'static str),
@@ -180,6 +183,7 @@ impl FindingCode {
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
             Self::SkippedEncrypted => "W_SKIPPED_ENCRYPTED",
+            Self::PartialResults => "W_PARTIAL_RESULTS",
             Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
             Self::DuplicateSession => "W_DUPLICATE_SESSION",
             Self::Pack(code) => code,
@@ -238,6 +242,7 @@ impl FindingCode {
         "W_CADENCE_OVERDUE",
         "W_DATE_UPCOMING",
         "W_SKIPPED_ENCRYPTED",
+        "W_PARTIAL_RESULTS",
         "W_DUPLICATE_TOUCH",
         "W_DUPLICATE_SESSION",
     ];
@@ -366,6 +371,7 @@ impl FindingCode {
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
             "W_SKIPPED_ENCRYPTED" => Self::SkippedEncrypted,
+            "W_PARTIAL_RESULTS" => Self::PartialResults,
             "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
             "W_DUPLICATE_SESSION" => Self::DuplicateSession,
             _ => return None,
@@ -2233,6 +2239,7 @@ mod tests {
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
             FindingCode::SkippedEncrypted,
+            FindingCode::PartialResults,
             FindingCode::DuplicateTouch,
             FindingCode::DuplicateSession,
         ];
@@ -2286,7 +2293,8 @@ mod tests {
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
                 | FindingCode::DateUpcoming
-                | FindingCode::SkippedEncrypted => {}
+                | FindingCode::SkippedEncrypted
+                | FindingCode::PartialResults => {}
                 FindingCode::DuplicateTouch => {}
                 FindingCode::DuplicateSession => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),

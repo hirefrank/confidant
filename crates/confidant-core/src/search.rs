@@ -194,9 +194,14 @@ fn search_with(
     // scope — skipped records' pack ownership is unknowable without
     // decrypting them — so a scoped warning says so.
     let scoped = matches!(scope, PackScope::Only(_));
+    // #769: the two warnings are mutually exclusive by construction —
+    // the absence warning fires only on empty results, the partial
+    // warning only on non-empty ones — so chaining them cannot double-warn.
+    let findings = with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted, scoped);
+    let findings = with_partial_results_warning(findings, empty, vault.skipped_encrypted, scoped);
     Ok(SearchResult {
         hits,
-        findings: with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted, scoped),
+        findings,
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
     })
@@ -1097,6 +1102,54 @@ fn with_skipped_encrypted_warning(
         };
         findings.push(Finding::new(
             FindingCode::SkippedEncrypted,
+            Severity::Warning,
+            message,
+        ));
+        sort_findings(&mut findings);
+    }
+    findings
+}
+
+/// #769: the complement of the #718 absence warning. A non-empty `find`
+/// over a vault with skipped encrypted records found something, so it
+/// makes no absence claim — but the matches shown may be incomplete:
+/// more matches may hide in the records that were not searched. Without
+/// an in-band warning, a non-empty result reads as the complete answer
+/// just as a zero-match result used to read as absence. Same shape as
+/// the #718 warning, deliberately a distinct code: callers branch on
+/// code (ADR-7), the absence message would be wrong for a non-empty
+/// result, and the existing control test pins non-empty results as
+/// carrying no `W_SKIPPED_ENCRYPTED`. Same exclusions as #718: refused
+/// (tampered) envelopes are not folded in — tampering has a different
+/// remedy (investigate/repair, and `reindex` refuses while any envelope
+/// is refused), so folding it in would misdirect the remedy; refused
+/// envelopes stay counted separately in `refused_envelopes`. Records
+/// hidden by `no-ai` are not warned about either: their exclusion is
+/// the privacy model, not a coverage gap, and even a count would reveal
+/// hidden records to an agent path. Under a pack scope the count stays
+/// vault-wide and the message says so, for the same reason as #718.
+/// No vault content goes into the message: only the count. An empty
+/// query runs no search and carries no warning (the early return passes
+/// `findings` through unmodified, before this helper runs).
+fn with_partial_results_warning(
+    mut findings: Vec<Finding>,
+    empty: bool,
+    skipped_encrypted: u32,
+    scoped: bool,
+) -> Vec<Finding> {
+    if !empty && skipped_encrypted > 0 {
+        let qualifier = if scoped { " (vault-wide count)" } else { "" };
+        let message = if skipped_encrypted == 1 {
+            format!(
+                "1 encrypted record was not searched{qualifier}; these matches may be \\\n                 incomplete — try `resolve`/`context`, or build the search corpus \\\n                 with `reindex`.",
+            )
+        } else {
+            format!(
+                "{skipped_encrypted} encrypted records were not searched{qualifier}; \\\n                 these matches may be incomplete — try `resolve`/`context`, or \\\n                 build the search corpus with `reindex`.",
+            )
+        };
+        findings.push(Finding::new(
+            FindingCode::PartialResults,
             Severity::Warning,
             message,
         ));

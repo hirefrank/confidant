@@ -386,6 +386,57 @@ fn search_exact_zero_matches_with_skips_renders_warning() {
     );
 }
 
+/// #769: a non-empty exact search over skipped encrypted records must
+/// render the partial-results warning in the Search status block, not
+/// just the match list — the TUI half of the #718 warning's complement.
+#[test]
+fn search_exact_nonempty_with_skips_renders_partial_warning() {
+    let find_json = r#"{
+        "ok": true, "schema_version": "1", "vault": "/fake/v",
+        "query": "plaintextmarker", "matches": [
+            {"id": "p-01J9Z3K4QH0000000000000000", "path": "people/p-01J9Z3K4QH0000000000000000/profile.md", "line": 3, "excerpt": "Bio with plaintextmarker."}
+        ],
+        "findings": [{"code": "W_PARTIAL_RESULTS", "severity": "warning",
+          "message": "2 encrypted records were not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`."}],
+        "skipped_encrypted": 2, "refused_envelopes": 0, "scope": []
+    }"#;
+    let fake = FakeRunner::new().with_response("find", 0, find_json);
+    let mut app = App::new(fake);
+    app.active_view = ActiveView::Search;
+    app.search.exact = true;
+    app.run_search("plaintextmarker");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert!(!res.kept.is_empty(), "non-empty matches expected");
+    assert_eq!(res.result.skipped_encrypted, 2);
+    assert!(
+        res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_PARTIAL_RESULTS"),
+        "partial warning finding must carry through"
+    );
+    assert!(
+        !res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_SKIPPED_ENCRYPTED"),
+        "non-empty result must not carry the absence warning"
+    );
+
+    // Wider buffer so the full warning line survives on one row.
+    let rendered = render_to_string_at(&app, 160, 24);
+    assert!(
+        rendered.contains("W_PARTIAL_RESULTS"),
+        "warning code must render in the status block:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("may be incomplete"),
+        "warning message must render:\n{rendered}"
+    );
+}
+
 #[test]
 fn error_alert_and_usage_error_alert_snapshots() {
     let err_json = r#"{

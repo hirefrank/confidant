@@ -3327,12 +3327,13 @@ fn cmd_find(
         if let Some(hint) = qmd_hint.as_deref() {
             eprintln!("{hint}");
         }
-        // #718: the warning finding above already prints on stdout; repeat
-        // it on stderr too, so a human skimming a "0 matches" result sees
-        // it even if they miss the findings block. JSON mode carries the
-        // finding in-band and stays stderr-clean.
+        // #718/#769: the warning finding above already prints on stdout;
+        // repeat it on stderr too, so a human skimming a "0 matches" — or
+        // a non-empty match list — sees it even if they miss the findings
+        // block. JSON mode carries the finding in-band and stays
+        // stderr-clean.
         for f in &result.findings {
-            if f.code.as_str() == "W_SKIPPED_ENCRYPTED" {
+            if f.code.as_str() == "W_SKIPPED_ENCRYPTED" || f.code.as_str() == "W_PARTIAL_RESULTS" {
                 eprintln!("warning: {}", f.message);
             }
         }

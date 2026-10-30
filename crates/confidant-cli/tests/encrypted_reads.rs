@@ -1089,6 +1089,83 @@ fn find_nonempty_with_skips_carries_no_absence_warning() {
     );
 }
 
+/// #769: the complement of the #718 absence warning. A non-empty result
+/// over a vault that also skipped encrypted records carries
+/// `W_PARTIAL_RESULTS` — the matches shown may be incomplete — but no
+/// `W_SKIPPED_ENCRYPTED`, which stays empty-only.
+#[test]
+fn find_nonempty_with_skips_carries_partial_warning() {
+    let h = keyed_vault_with_records("quantum baking", "sourdough starter");
+    // One plaintext person alongside the encrypted records: searchable
+    // without a device key, while the encrypted records still skip.
+    let plain_id = "p-01J9Z3K4QH0000000000000000";
+    let dir = h.vault.join("people").join(plain_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("profile.md"),
+        person_md(plain_id, "Bo Example", "Bio with plaintextmarker."),
+    )
+    .unwrap();
+    git(&h.vault, &["add", "-A"]);
+    git(&h.vault, &["commit", "-qm", "plaintext person"]);
+
+    let out = h
+        .cmd_no_device_key(&["find", "plaintextmarker", "--json", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "find failed: {}", stderr(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!v["matches"].as_array().unwrap().is_empty(), "{v}");
+    assert!(v["skipped_encrypted"].as_u64().unwrap() >= 1, "{v}");
+    let warning = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "W_PARTIAL_RESULTS")
+        .expect("non-empty find over skipped records must carry W_PARTIAL_RESULTS");
+    assert_eq!(warning["severity"], "warning", "{warning}");
+    let msg = warning["message"].as_str().unwrap();
+    assert!(msg.contains("may be incomplete"), "{msg}");
+    assert!(
+        !msg.contains("plaintextmarker"),
+        "warning must not leak content: {msg}"
+    );
+    assert!(
+        !msg.contains("Bo Example"),
+        "warning must not leak content: {msg}"
+    );
+    assert!(
+        !msg.contains("quantum"),
+        "warning must not leak content: {msg}"
+    );
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "W_SKIPPED_ENCRYPTED"),
+        "non-empty result must not carry the absence warning: {v}"
+    );
+    assert!(
+        !stderr(&out).contains("W_PARTIAL_RESULTS"),
+        "JSON mode carries the warning in-band and stays stderr-clean"
+    );
+
+    let out = h
+        .cmd_no_device_key(&["find", "plaintextmarker", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("W_PARTIAL_RESULTS"), "{text}");
+    assert!(text.contains("may be incomplete"), "{text}");
+    assert!(
+        stderr(&out).contains("may be incomplete"),
+        "text mode must repeat the warning on stderr, got: {}",
+        stderr(&out)
+    );
+}
+
 /// #718 fix wave: the singular branch. One encrypted record and no note
 /// means exactly one skip, and the warning reads "1 encrypted record".
 #[test]

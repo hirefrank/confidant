@@ -5,7 +5,9 @@
 //! skill fell back to `confidant find`, and drop counts are always visible.
 //! A `W_SKIPPED_ENCRYPTED` warning finding (#718) renders in the status
 //! block, so a zero-match exact search over skipped records does not read
-//! as absence in the TUI either.
+//! as absence in the TUI either, and a `W_PARTIAL_RESULTS` finding (#769)
+//! renders the same way, so a non-empty exact search over skipped records
+//! does not read as the complete answer.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -19,16 +21,18 @@ use crate::theme::palette;
 
 /// Pure renderer for the Search view.
 pub fn render(state: &SearchViewState, frame: &mut Frame<'_>, area: Rect) {
-    // #718: the status block grows by one row when it carries the
-    // skipped-encrypted warning, so the warning is never clipped; every
-    // other result keeps the previous layout.
-    let warns_skipped = state.result.as_ref().is_some_and(|res| {
+    // #718/#769: the status block grows by one row when it carries a
+    // skipped-encrypted or partial-results warning, so the warning is
+    // never clipped; every other result keeps the previous layout.
+    // (At most one of the two fires per search — they are empty-only
+    // and non-empty-only respectively — so one extra row always suffices.)
+    let warns_coverage = state.result.as_ref().is_some_and(|res| {
         res.result
             .findings
             .iter()
-            .any(|f| f.code == "W_SKIPPED_ENCRYPTED")
+            .any(|f| f.code == "W_SKIPPED_ENCRYPTED" || f.code == "W_PARTIAL_RESULTS")
     });
-    let status_len = if warns_skipped { 5 } else { 4 };
+    let status_len = if warns_coverage { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -125,16 +129,18 @@ fn render_status(result: Option<&FilteredSearchResult>, frame: &mut Frame<'_>, a
         count_spans.push(theme::label(")"));
     }
     lines.push(Line::from(count_spans));
-    // #718: the in-band warning from `confidant find` (carried through
-    // `find_result_to_search`) renders here, not just in the counts:
-    // a bare "0 matches" over skipped records must not read as absence.
-    // Only the warning code renders — other findings keep their existing
-    // (non-)rendering, and the message itself carries only the count.
+    // #718/#769: the in-band warning from `confidant find` (carried
+    // through `find_result_to_search`) renders here, not just in the
+    // counts: a bare "0 matches" over skipped records must not read as
+    // absence, and a non-empty match list over skipped records must not
+    // read as the complete answer. Only the two warning codes render —
+    // other findings keep their existing (non-)rendering, and the
+    // message itself carries only the count.
     for finding in &res.result.findings {
-        if finding.code == "W_SKIPPED_ENCRYPTED" {
+        if finding.code == "W_SKIPPED_ENCRYPTED" || finding.code == "W_PARTIAL_RESULTS" {
             lines.push(Line::from(vec![
                 Span::styled(
-                    "W_SKIPPED_ENCRYPTED: ",
+                    format!("{}: ", finding.code),
                     Style::default().fg(palette::WARNING).bold(),
                 ),
                 Span::styled(finding.message.clone(), palette::TEXT),
