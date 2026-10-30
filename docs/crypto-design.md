@@ -776,25 +776,37 @@ attestation, settled in fix round 3):
   (current-anchor-only seeding: operator/recovery only,
   never writers; a retired-key attestation seeds only
   when covered by a current-anchor seed, otherwise it
-  is inert), precise selection ("newest" by ancestry
-  dominance, set combination on forks, inapplicable
-  tips ignored), and rollback rules (monotone floors,
-  conservative revocation combination, no silent
+  is inert), precise selection (eligibility and chain
+  consistency judged separately, with the root-signed
+  inconsistency rule applied between them; dominance
+  decides history only, while the seed state combines
+  every applicable candidate by kind — floors by
+  maximum, revocation state conservatively — including
+  both variants of a fork resolved for tip-choosing;
+  inapplicable tips ignored), and rollback rules
+  (monotone floors, conservative revocation
+  combination, older attestations combined rather
+  than assumed covered, no silent
   fallback to an older seed except for validly
   root-signed inconsistencies, checkpoint combination
   by kind, chain conflicts refused, force-push limit
   and the seedless pre-rotation-fork limit stated
   plainly, with `doctor`'s `anchor-mismatch`
-  diagnostic). Silas's four answers are folded in: no
+  diagnostic and a diagnostic when the dominant
+  candidate is less strict than an ancestor). Silas's four answers are folded in: no
   `attested_at` field; recovery-key-only signatures
   allowed; best-effort cadence (attest when the newest
   attestation is over 24h old, or the range contains a
-  cert issue/renewal or a revocation, with a `doctor`
+  cert issue/renewal, a revocation, or an operator or
+  recovery rotation — the rotating device attests
+  right after the rotation commit — with a `doctor`
   warning at 14 days); set-maximum for floors on forks,
   fail closed only on a same-`seq` root fork. The
   subsection awaits Silas's re-review and Frank's
   explicit approval at merge; #731 still needs outside
-  audit.
+  audit. Fix round 4 (spec §14) folds in the
+  fork-resolution, linear-monotonic, and sequence-gap
+  findings on this revision.
 - **Agreed choices recorded:** no clock-skew allowance,
   with a `doctor`/diagnostic hint that a wrong system
   clock is the likely cause of a window failure near a
@@ -1185,19 +1197,39 @@ in the repo, tests, or CI.
     recovery across a rotation verifies through the recovery
     checkpoint acting as seed; an older attestation replayed
     while a newer verified attestation is present in the
-    same ancestry changes nothing (dominant candidate /
-    combined set state wins); an attestation below an
-    existing off-vault checkpoint is ignored and never
-    moves the checkpoint backwards; a writer-signed
+    same ancestry changes nothing (the older
+    attestation's state is combined in, not discarded);
+    an attestation below an
+    existing off-vault checkpoint contributes its state
+    to the combined seed state and never moves the
+    checkpoint backwards; a writer-signed
     attestation is refused as a seed; an attestation whose
     tip is on an unmerged branch does not seed another
     head; a root-forked `seq` (same `seq`, different
     bytes, both validly signed) fails closed until a
-    higher chained attestation resolves it; a chain above
+    higher chained attestation resolves it — and the
+    resolution folds in both variants' state, so a
+    writer revoked at cutoff 12 only on the unchained
+    variant still refuses a `seq` 13 link, and a client
+    omitted from that variant's revocation gets cutoff
+    0; a chain above
     a seed tip containing a manifest `seq` below the seed
     floor is refused; and with no verifying attestation
     or checkpoint, the whole chain is new acceptance with
     a diagnostic naming the missing attestation.
+    Linear monotonic preservation: an ancestor revoking
+    a writer is not overridden by a later dominant
+    attestation omitting the writer; an ancestor cutoff
+    12 holds against a dominant cutoff 50; a dominant
+    attestation with a lower floor than an ancestor does
+    not lower the floor; and the `doctor` diagnostic
+    naming both attestations fires in each case.
+    Sequence-gap ordering: a root-signed `seq = 5` with
+    `seq = 4` missing and a valid `seq = 3` present
+    fails closed without seeding from 3; an unsigned or
+    bad-signature `seq = 5` in the same position is
+    ignored and seeds from 3; and a shallow clone falls
+    back to fresh-introduction checks without failing.
     Revocation split: divergent attestations with
     revocation cutoffs 12 and 50 refuse a `seq` 13
     manifest; checkpoint vs attestation with differing
@@ -1215,9 +1247,11 @@ in the repo, tests, or CI.
     high floor raises no floor and causes no fail-closed
     unless covered. Rule 4: a bad-signature attestation
     is ignored without failing the head, while a validly
-    root-signed `seq` gap or unresolved root fork fails
-    closed. Cadence and diagnostics: an attestation is
-    written at a cert renewal; `doctor` warns when
+    root-signed `seq` gap or unresolved root fork among
+    eligibility-passing files fails closed between
+    eligibility and chain-consistency checks. Cadence and diagnostics: an attestation is
+    written at a cert renewal and right after an
+    operator or recovery rotation commit; `doctor` warns when
     writer-signed commits above the newest attestation
     are older than 14 days; `doctor`'s `anchor-mismatch`
     diagnostic flags a head whose operator anchor differs
@@ -1275,6 +1309,21 @@ This is the milestone 2 implementation PR. Format changes from spec 0.1
   seedless pre-rotation-fork limit is stated with
   `doctor`'s `anchor-mismatch` diagnostic. No new file
   type beyond fix round 2's.
+- **Fix round 4, selection-state combination (spec §14,
+  2026-10-30)**: no new file type. Selection splits
+  eligibility from chain consistency, with the
+  root-signed inconsistency rule applied between them
+  (shallow-clone truncation falls back without
+  failing); dominance decides history only, while the
+  seed state combines every applicable candidate by
+  kind — including both variants of a fork resolved
+  for tip-choosing, and older attestations in linear
+  history — with a `doctor` diagnostic when the
+  dominant candidate is less strict than an ancestor
+  and a writer refusal to write a less-strict
+  attestation; rotation joins the attestation cadence
+  triggers, with an attestation right after the
+  rotation commit.
 
 These are documented here; the normative spec 0.1 edits land in a
 follow-up after crypto review (issue #85).
@@ -1793,3 +1842,62 @@ are addressed in this revision, in spec §14 unless noted:
    diagnostic named. §12 item 29 gains the three
    retired-key tests. #731 still needs outside audit
    before public launch.
+
+**Fix round 4, 2026-10-30 (Frank's and Silas's 15:19–15:21 UTC
+blocking comments on `039281c`, plus Silas's non-blocking
+items from his 14:59 UTC re-review, PR #786).** Silas had
+signed off on `039281c` once CI was green, then withdrew
+it over three findings about how the revised revocation
+and coverage rules interact with attestation selection.
+All are addressed in this revision, in spec §14 unless
+noted:
+
+1. **Fork resolution folds in both variants.** A higher
+   attestation chained to one variant of a same-`seq`
+   root fork supersedes the fork for tip-choosing only;
+   the seed state folds in the resolving attestation
+   and both variants (floors by maximum, revocation
+   state conservatively across all three), so a
+   revocation recorded only on the unchained variant
+   is never dropped. Rollback rule 4's closing
+   exception is updated to match. §12 item 29 gains
+   the variant-B cutoff-12 and omitted-client tests.
+2. **Linear monotonic preservation.** The seed state
+   combines every applicable candidate by kind, not
+   just the dominant one: floors by maximum,
+   revocation state conservatively, with dominance
+   deciding only which commits count as history.
+   Rollback rule 2 is rewritten so older attestations
+   are combined, not assumed covered; a dominant
+   candidate less strict than an ancestor triggers a
+   `doctor` diagnostic naming both attestations, and
+   a writer refuses to write a less-strict
+   attestation. §12 item 29 gains the omitted-writer,
+   raised-cutoff, lower-floor, and diagnostic tests.
+   The same combination applies to recovery
+   checkpoints as seeds and to the post-walk
+   checkpoint re-record.
+3. **Sequence-gap ordering (eligibility/chain split).**
+   Selection step 2 splits into (a) eligibility
+   (signature, domain/`vault_id`, format, tip) and
+   (b) chain consistency over eligibility-passing
+   files only, with rollback rule 4 applied between
+   them for a `seq` gap or unresolved fork among
+   passed files; chains broken only by files that
+   failed (a) are ignored, and a known-truncated
+   shallow-clone ancestry falls back to
+   fresh-introduction checks without failing. §12
+   item 29 pins the ordering (root-signed gap fails
+   closed without seeding from `seq = 3`; unsigned
+   or bad-signature gap ignored with seeding from 3;
+   shallow-clone fallback).
+4. **Rotation cadence and banner.** Operator and
+   recovery rotation join the attestation cadence
+   triggers, and the rotating device writes a
+   current-anchor attestation right after the
+   rotation commit; the spec subsection banner now
+   reads settled, pending Frank's explicit approval
+   at merge. The §13 "Fix round 2, attestation
+   proposal" bullet is left as a historical record,
+   per Silas. #731 still needs outside audit before
+   public launch.
