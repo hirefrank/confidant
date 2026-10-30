@@ -7808,9 +7808,11 @@ fn releases_url() -> String {
     }
 }
 
-/// `ok` message whenever staleness cannot be determined: offline, DNS
-/// failure, timeout, non-200, or malformed JSON. Staleness is
-/// informational, so `doctor` must never error or warn an offline user.
+/// Message whenever staleness cannot be determined: offline, DNS
+/// failure, timeout, non-200, or malformed JSON. The check reports
+/// status `unknown` for it (#709): an undetermined check never renders
+/// `ok`. `unknown` is warning-tier — it never fails `doctor` — so an
+/// offline user still passes, just not with a green line.
 const STALENESS_UNKNOWN: &str = "staleness unknown (could not reach github releases)";
 
 /// `ok` message when the operator disables the staleness checks outright
@@ -7866,16 +7868,18 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Build the CLI staleness check given the latest release tag (or `None`
-/// when it could not be fetched). Warning-only; ahead and equal are `ok`.
-/// With `offline`, the fetch was skipped and the check reports `ok`
-/// "disabled".
+/// when it could not be fetched). Never an error: behind is `warning`,
+/// ahead and equal are `ok`, and undetermined (no tag, or an unparseable
+/// tag) is `unknown` (#709). With `offline`, the fetch was skipped by
+/// operator choice — a determined state, not an undetermined one — so
+/// the check reports `ok` "disabled".
 fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
     let local = env!("CARGO_PKG_VERSION");
     let (status, message) = if offline {
         ("ok", STALENESS_DISABLED.to_owned())
     } else {
         match latest {
-            None => ("ok", STALENESS_UNKNOWN.to_owned()),
+            None => (DOCTOR_STATUS_UNKNOWN, STALENESS_UNKNOWN.to_owned()),
             Some(tag) => match (parse_release_version(local), parse_release_version(&tag)) {
                 (Some(local_v), Some(latest_v)) if local_v < latest_v => (
                     "warning",
@@ -7894,7 +7898,7 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
                     "ok",
                     format!("confidant-cli {local} matches the latest release {tag}"),
                 ),
-                _ => ("ok", STALENESS_UNKNOWN.to_owned()),
+                _ => (DOCTOR_STATUS_UNKNOWN, STALENESS_UNKNOWN.to_owned()),
             },
         }
     };
@@ -7944,9 +7948,11 @@ fn parse_git_version(output: &str) -> Option<(u64, u64, u64)> {
 /// signers: below the floor that means signature verification is in use
 /// and the check is an `error`; with no signers configured it is a
 /// `warning`, since nothing verifies signatures today. `None` (git
-/// missing or unparseable output) is a `warning`: the `git-repo` check
-/// already errors when the vault is not a git repository, and an
-/// unparseable version string is an odd environment, not a known-bad git.
+/// missing or unparseable output) is `unknown` (#709, following the
+/// #174 precedent it generalizes): the `git-repo` check already errors
+/// when the vault is not a git repository, and an unparseable version
+/// string is an odd environment, not a known-bad git. `unknown` is
+/// warning-tier, so it never fails `doctor`.
 fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -> DoctorCheck {
     let floor = format!(
         "{}.{}.{}",
@@ -7973,7 +7979,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
         },
         None => DoctorCheck {
             id: "git-version",
-            status: "warning",
+            status: DOCTOR_STATUS_UNKNOWN,
             message: format!(
                 "could not determine git version; SSH-signed inbox commits need git >= {floor}"
             ),
@@ -9201,8 +9207,9 @@ fn parse_findmnt_source(output: &str) -> Option<String> {
 }
 
 /// True when `lsblk -s -no TYPE` output lists a `crypt` device in the
-/// root device's ancestry (LUKS/dm-crypt).
-#[cfg(target_os = "linux")]
+/// root device's ancestry (LUKS/dm-crypt). Pure string logic, so it is
+/// shared by the Linux probe and the platform-independent decision below
+/// (and its unit tests) rather than gated on Linux.
 fn lsblk_types_include_crypt(output: &str) -> bool {
     output
         .lines()
@@ -9210,40 +9217,44 @@ fn lsblk_types_include_crypt(output: &str) -> bool {
         .any(|line| line.eq_ignore_ascii_case("crypt"))
 }
 
-/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
-/// advisory: a missing tool, an unparseable source, or a non-block root
-/// all report `ok` "could not determine", so this can never fail doctor.
-/// It never prompts and never leaves the machine.
-#[cfg(target_os = "linux")]
-fn disk_encryption_check() -> DoctorCheck {
+/// Doctor status vocabulary (#709): `ok` means the check ran and passed,
+/// `warning` means it ran and found something to act on, `error` means
+/// it ran and found something blocking, and `unknown` means it could
+/// not run to a determination at all. `unknown` is warning-tier: it
+/// never fails `doctor` (only `error` does, in `cmd_doctor`), but it
+/// never renders `ok` either — an undetermined check is not a pass.
+/// Callers branch on this status string, never on message text (ADR-7):
+/// `unknown` is a stable fourth value, alongside the existing three.
+const DOCTOR_STATUS_UNKNOWN: &str = "unknown";
+
+/// Pure decision for the `disk-encryption` check (#653(d), #709).
+/// `source` is the parsed `findmnt` root source, or `None` when
+/// `findmnt` failed, is missing, or the root is not on a block device;
+/// `types` is the `lsblk` TYPE output, or `None` when `lsblk` failed or
+/// is missing. `unknown_detail` names the probe failure for the
+/// undetermined cases, and is only consulted when `source` or `types`
+/// is `None`; an empty TYPE list is its own undetermined case.
+/// Determined outcomes are unchanged: encrypted is `ok`, a readable
+/// non-encrypted ancestry is `warning`.
+fn disk_encryption_check_from(
+    source: Option<&str>,
+    types: Option<&str>,
+    unknown_detail: &str,
+) -> DoctorCheck {
     const ID: &str = "disk-encryption";
     let unknown = |detail: &str| DoctorCheck {
         id: ID,
-        status: "ok",
+        status: DOCTOR_STATUS_UNKNOWN,
         message: format!("could not determine disk encryption ({detail})"),
         fix: None,
     };
-    let findmnt = match std::process::Command::new("findmnt")
-        .args(["-no", "SOURCE", "/"])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => return unknown("findmnt could not resolve the root filesystem"),
-        Err(_) => return unknown("findmnt is not available"),
+    let Some(_source) = source else {
+        return unknown(unknown_detail);
     };
-    let Some(source) = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout)) else {
-        return unknown("root filesystem is not on a block device");
+    let Some(types) = types else {
+        return unknown(unknown_detail);
     };
-    let lsblk = match std::process::Command::new("lsblk")
-        .args(["-sno", "TYPE", &source])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => return unknown("lsblk could not read the root device"),
-        Err(_) => return unknown("lsblk is not available"),
-    };
-    let types = String::from_utf8_lossy(&lsblk.stdout);
-    if lsblk_types_include_crypt(&types) {
+    if lsblk_types_include_crypt(types) {
         DoctorCheck {
             id: ID,
             status: "ok",
@@ -9267,16 +9278,59 @@ fn disk_encryption_check() -> DoctorCheck {
     }
 }
 
+/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
+/// advisory: a missing tool, an unparseable source, or a non-block root
+/// all report `unknown` "could not determine" (#709), so this can never
+/// fail doctor — but also never passes it. It never prompts and never
+/// leaves the machine.
+#[cfg(target_os = "linux")]
+fn disk_encryption_check() -> DoctorCheck {
+    let findmnt = match std::process::Command::new("findmnt")
+        .args(["-no", "SOURCE", "/"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => {
+            return disk_encryption_check_from(
+                None,
+                None,
+                "findmnt could not resolve the root filesystem",
+            );
+        }
+        Err(_) => {
+            return disk_encryption_check_from(None, None, "findmnt is not available");
+        }
+    };
+    let source = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout));
+    let Some(source) = source else {
+        return disk_encryption_check_from(None, None, "root filesystem is not on a block device");
+    };
+    let lsblk = match std::process::Command::new("lsblk")
+        .args(["-sno", "TYPE", &source])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) => {
+            return disk_encryption_check_from(
+                Some(&source),
+                None,
+                "lsblk could not read the root device",
+            );
+        }
+        Err(_) => {
+            return disk_encryption_check_from(Some(&source), None, "lsblk is not available");
+        }
+    };
+    let types = String::from_utf8_lossy(&lsblk.stdout);
+    disk_encryption_check_from(Some(&source), Some(&types), "lsblk is not available")
+}
+
 /// Non-Linux platforms have no `findmnt`/`lsblk`; macOS FileVault is not
-/// probed here. Report `ok` "could not determine" so doctor still passes.
+/// probed here. Report `unknown` "could not determine" (#709) so doctor
+/// still passes, without claiming a pass.
 #[cfg(not(target_os = "linux"))]
 fn disk_encryption_check() -> DoctorCheck {
-    DoctorCheck {
-        id: "disk-encryption",
-        status: "ok",
-        message: "could not determine disk encryption (unsupported platform)".to_owned(),
-        fix: None,
-    }
+    disk_encryption_check_from(None, None, "unsupported platform")
 }
 
 fn cmd_doctor(
@@ -9567,7 +9621,8 @@ fn cmd_doctor(
     }
 
     // #653(d): best-effort encrypted-disk check. Advisory only: a missing
-    // tool or an unknown platform is `ok`, so doctor never fails on it.
+    // tool or an unknown platform is `unknown` (#709), so doctor never
+    // fails on it — and never passes on it either.
     checks.push(disk_encryption_check());
 
     // #541: keychain reachability and device enrollment. Headless hosts
@@ -9620,8 +9675,9 @@ fn cmd_doctor(
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale
     // install is never an error, so exit-code semantics are unchanged. Any
-    // network failure degrades to `ok` "unknown" (offline-first):
-    // staleness is informational, so `doctor` must not punish offline users.
+    // network failure degrades to `unknown` "unknown" (#709, offline-first):
+    // staleness is informational, so `doctor` must not punish offline users
+    // — but an undetermined check is not a pass either.
     //
     // `CONFIDANT_OFFLINE=1` opts out entirely: the fetch is skipped before
     // any request is made and the check reports `ok` "disabled". See the
@@ -16458,7 +16514,7 @@ backup\tgit@host.example:org/repo.git (push)
 
     /// #653(d): `findmnt` output is a device path with an optional btrfs
     /// subvolume suffix; non-block sources cannot be traced through
-    /// `lsblk` and must report "unknown", never a warning.
+    /// `lsblk` and must report status "unknown" (#709), never `ok`.
     #[cfg(target_os = "linux")]
     #[test]
     fn findmnt_source_parser() {
@@ -16476,8 +16532,56 @@ backup\tgit@host.example:org/repo.git (push)
         assert_eq!(parse_findmnt_source("\n"), None);
     }
 
+    /// #709: the `disk-encryption` decision for every probe shape.
+    /// Undetermined shapes (no source, no TYPE list, empty TYPE list)
+    /// are `unknown`, never `ok`; only a readable ancestry decides
+    /// between `ok` (crypt present) and `warning` (no crypt).
+    #[test]
+    fn disk_encryption_check_status_rules() {
+        use super::disk_encryption_check_from;
+        // No source: findmnt missing, failed, or a non-block root
+        // (e.g. overlay on a VM/container) — the issue's shape.
+        let c = disk_encryption_check_from(None, None, "root filesystem is not on a block device");
+        assert_eq!(c.status, "unknown");
+        assert!(c.message.contains("could not determine disk encryption"));
+        assert!(c.message.contains("not on a block device"));
+        assert!(c.fix.is_none());
+        // A device but no TYPE list: lsblk missing or failed.
+        let c = disk_encryption_check_from(Some("/dev/sda2"), None, "lsblk is not available");
+        assert_eq!(c.status, "unknown");
+        assert!(c.message.contains("lsblk is not available"));
+        // A device with an empty TYPE list: lsblk ran, said nothing.
+        let c = disk_encryption_check_from(Some("/dev/sda2"), Some(""), "lsblk is not available");
+        assert_eq!(c.status, "unknown");
+        assert!(c.message.contains("lsblk returned no device types"));
+        // Determined outcomes are unchanged.
+        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("crypt\npart\ndisk\n"), "");
+        assert_eq!(c.status, "ok");
+        assert!(c.message.contains("encrypted device"));
+        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("part\ndisk\n"), "");
+        assert_eq!(c.status, "warning");
+        assert!(c.message.contains("not on an encrypted disk"));
+        assert!(c.fix.is_some());
+    }
+
+    /// #709: staleness the fetch cannot determine is `unknown`, not
+    /// `ok`; an operator opt-out is the only `ok` non-determination.
+    #[test]
+    fn cli_staleness_check_unknown_rules() {
+        use super::cli_staleness_check;
+        let c = cli_staleness_check(None, false);
+        assert_eq!(c.status, "unknown");
+        assert!(c.message.contains("staleness unknown"));
+        // An unparseable tag is undetermined the same way a failed
+        // fetch is: neither proves the install is current.
+        let c = cli_staleness_check(Some("not-a-version".to_owned()), false);
+        assert_eq!(c.status, "unknown");
+        let c = cli_staleness_check(None, true);
+        assert_eq!(c.status, "ok");
+        assert!(c.message.contains("disabled"));
+    }
+
     /// #653(d): only a `crypt` ancestor means the root disk is encrypted.
-    #[cfg(target_os = "linux")]
     #[test]
     fn lsblk_types_detect_crypt() {
         use super::lsblk_types_include_crypt;
@@ -16633,9 +16737,10 @@ backup\tgit@host.example:org/repo.git (push)
         assert_eq!(c.status, "warning");
         assert!(c.message.contains("upgrade git to >= 2.34.0"));
 
-        // Undetermined version is a warning, never an error.
+        // Undetermined version is `unknown` (#709), warning-tier, never
+        // an error and never `ok`.
         let c = git_version_check_from(None, true);
-        assert_eq!(c.status, "warning");
+        assert_eq!(c.status, "unknown");
     }
 
     /// Snapshot a directory tree as sorted (relative path, bytes) pairs,

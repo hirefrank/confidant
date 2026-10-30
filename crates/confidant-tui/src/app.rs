@@ -2345,10 +2345,13 @@ impl<R: Runner> App<R> {
             .iter()
             .filter(|check| check.status == "error")
             .count();
+        // #709: an `unknown` check is warning-tier, not a pass — it
+        // counts here alongside warnings so the label never reads `ok`
+        // over an undetermined check.
         let warnings = report
             .checks
             .iter()
-            .filter(|check| check.status == "warning")
+            .filter(|check| check.status == "warning" || check.status == "unknown")
             .count();
         if errors > 0 {
             format!("{errors} error(s)")
@@ -2367,7 +2370,11 @@ impl<R: Runner> App<R> {
         };
         if report.checks.iter().any(|check| check.status == "error") {
             theme::Tone::Error
-        } else if report.checks.iter().any(|check| check.status == "warning") {
+        } else if report
+            .checks
+            .iter()
+            .any(|check| check.status == "warning" || check.status == "unknown")
+        {
             theme::Tone::Warn
         } else {
             theme::Tone::Ok
@@ -3969,6 +3976,10 @@ mod tests {
         assert_eq!(app.doctor_tone(), theme::Tone::Ok);
 
         app.doctor.report.as_mut().unwrap().checks[0].status = "warning".to_owned();
+        assert_eq!(app.doctor_tone(), theme::Tone::Warn);
+
+        // #709: an `unknown` check is warning-tier, never a green pass.
+        app.doctor.report.as_mut().unwrap().checks[0].status = "unknown".to_owned();
         assert_eq!(app.doctor_tone(), theme::Tone::Warn);
 
         app.doctor.report.as_mut().unwrap().checks[0].status = "error".to_owned();
