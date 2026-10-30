@@ -194,9 +194,14 @@ fn search_with(
     // scope — skipped records' pack ownership is unknowable without
     // decrypting them — so a scoped warning says so.
     let scoped = matches!(scope, PackScope::Only(_));
+    // #769: the two warnings are mutually exclusive by construction —
+    // the absence warning fires only on empty results, the partial
+    // warning only on non-empty ones — so chaining them cannot double-warn.
+    let findings = with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted, scoped);
+    let findings = with_partial_results_warning(findings, empty, vault.skipped_encrypted, scoped);
     Ok(SearchResult {
         hits,
-        findings: with_skipped_encrypted_warning(findings, empty, vault.skipped_encrypted, scoped),
+        findings,
         skipped_encrypted: vault.skipped_encrypted,
         refused_envelopes: vault.refused_envelopes,
     })
@@ -1105,6 +1110,58 @@ fn with_skipped_encrypted_warning(
     findings
 }
 
+/// #769: the complement of the #718 absence warning. A non-empty `find`
+/// over a vault with skipped encrypted records found something, so it
+/// makes no absence claim — but the matches shown may be incomplete:
+/// more matches may hide in the records that were not searched. Without
+/// an in-band warning, a non-empty result reads as the complete answer
+/// just as a zero-match result used to read as absence. Same shape as
+/// the #718 warning, deliberately a distinct code: callers branch on
+/// code (ADR-7), the absence message would be wrong for a non-empty
+/// result, and the existing control test pins non-empty results as
+/// carrying no `W_SKIPPED_ENCRYPTED`. Same exclusions as #718: refused
+/// (tampered) envelopes are not folded in — tampering has a different
+/// remedy (investigate/repair, and `reindex` refuses while any envelope
+/// is refused), so folding it in would misdirect the remedy; refused
+/// envelopes stay counted separately in `refused_envelopes`. Records
+/// hidden by `no-ai` are not warned about either: their exclusion is
+/// the privacy model, not a coverage gap, and even a count would reveal
+/// hidden records to an agent path. Under a pack scope the count stays
+/// vault-wide and the message says so, for the same reason as #718.
+/// No vault content goes into the message: only the count. An empty
+/// query runs no search and carries no warning (the early return passes
+/// `findings` through unmodified, before this helper runs).
+fn with_partial_results_warning(
+    mut findings: Vec<Finding>,
+    empty: bool,
+    skipped_encrypted: u32,
+    scoped: bool,
+) -> Vec<Finding> {
+    if !empty && skipped_encrypted > 0 {
+        let qualifier = if scoped { " (vault-wide count)" } else { "" };
+        let message = if skipped_encrypted == 1 {
+            format!(
+                "1 encrypted record was not searched{qualifier}; these matches may be \
+                 incomplete — try `resolve`/`context`, or build the search corpus \
+                 with `reindex`."
+            )
+        } else {
+            format!(
+                "{skipped_encrypted} encrypted records were not searched{qualifier}; \
+                 these matches may be incomplete — try `resolve`/`context`, or \
+                 build the search corpus with `reindex`."
+            )
+        };
+        findings.push(Finding::new(
+            FindingCode::PartialResults,
+            Severity::Warning,
+            message,
+        ));
+        sort_findings(&mut findings);
+    }
+    findings
+}
+
 fn findings_for_find(allow: &Allowlist<'_>) -> Vec<Finding> {
     let mut kept = Vec::new();
     let mut redacted: BTreeMap<FindingCode, (Severity, usize)> = BTreeMap::new();
@@ -1300,7 +1357,9 @@ fn excerpt(line: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{case_fold, excerpt, pkg_open_lines, still_cleared, Allowlist};
+    use super::{
+        case_fold, excerpt, pkg_open_lines, still_cleared, with_partial_results_warning, Allowlist,
+    };
     use crate::{
         cleared_ledger_line_owners, cleared_record_owners, search, search_for_operator, OwnerKey,
         PackScope,
@@ -1617,6 +1676,55 @@ mod tests {
             "empty query must not warn: {:?}",
             result.findings
         );
+    }
+
+    #[test]
+    fn partial_results_warning_message_is_exact_and_single_line() {
+        // #790 blocker 3: the original `format!` literals used `\\\n`
+        // escapes, so the message carried a literal backslash, a newline,
+        // and indentation. Pin the exact text in all four shapes, and
+        // assert no newline or stray backslash survives in any of them.
+        use crate::check::{FindingCode, Severity};
+        let singular = "1 encrypted record was not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let plural = "2 encrypted records were not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let singular_scoped = "1 encrypted record was not searched (vault-wide count); these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        let plural_scoped = "2 encrypted records were not searched (vault-wide count); these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`.";
+        for (skipped, scoped, expected) in [
+            (1, false, singular),
+            (2, false, plural),
+            (1, true, singular_scoped),
+            (2, true, plural_scoped),
+        ] {
+            let findings = with_partial_results_warning(Vec::new(), false, skipped, scoped);
+            assert_eq!(
+                findings.len(),
+                1,
+                "one warning for skipped={skipped} scoped={scoped}"
+            );
+            let warning = &findings[0];
+            assert_eq!(warning.code, FindingCode::PartialResults);
+            assert_eq!(warning.severity, Severity::Warning);
+            assert_eq!(
+                warning.message, expected,
+                "exact message for skipped={skipped} scoped={scoped}"
+            );
+            assert!(
+                !warning.message.contains('\n'),
+                "no newline: {}",
+                warning.message
+            );
+            assert!(
+                !warning.message.contains('\\'),
+                "no backslash: {}",
+                warning.message
+            );
+        }
+        // The plural shape above is the 2-skip message; keep it pinned too.
+        let findings = with_partial_results_warning(Vec::new(), false, 2, false);
+        assert_eq!(findings[0].message, plural);
+        // Empty results and zero skips carry no partial warning.
+        assert!(with_partial_results_warning(Vec::new(), true, 2, false).is_empty());
+        assert!(with_partial_results_warning(Vec::new(), false, 0, false).is_empty());
     }
 
     #[test]

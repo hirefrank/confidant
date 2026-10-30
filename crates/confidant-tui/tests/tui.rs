@@ -105,6 +105,33 @@ fn render_to_string_at<R: Runner>(app: &App<R>, width: u16, height: u16) -> Stri
     lines.join("\n") + "\n"
 }
 
+/// Flatten only the Search view's Status block from a rendering, so a
+/// warning assertion cannot pass on a `reindex` mention in another
+/// block. The block starts at the row whose border carries the
+/// ` Status ` title and ends at its bottom border (or the next
+/// block's title row); border characters are stripped row by row
+/// before joining, so a phrase wrapped across rows is reconstructed.
+/// Panics if no Status block is found, so a layout change fails
+/// loudly instead of silently asserting on an empty string.
+fn status_block_flat(rendered: &str) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let start = lines
+        .iter()
+        .position(|row| row.contains("Status"))
+        .expect("Status block title must render");
+    let mut rows: Vec<&str> = Vec::new();
+    for row in &lines[start + 1..] {
+        if row.starts_with('└') || row.starts_with('╰') || row.contains("Matches") {
+            break;
+        }
+        rows.push(row);
+    }
+    rows.iter()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn assert_snapshot(name: &str, actual: &str) {
     let path = snapshot_path(name);
     if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
@@ -373,16 +400,114 @@ fn search_exact_zero_matches_with_skips_renders_warning() {
         "warning finding must carry through"
     );
 
-    // Wider buffer so the full warning line survives on one row.
-    let rendered = render_to_string_at(&app, 160, 24);
+    // #790 blocker 1: render at an ordinary 80-column width. The
+    // warning wraps inside the status block, so the full message —
+    // including the remedy at its end — must still render.
+    let rendered = render_to_string_at(&app, 80, 24);
     assert!(rendered.contains("0 matches"), "{rendered}");
     assert!(
         rendered.contains("W_SKIPPED_ENCRYPTED"),
         "warning code must render in the status block:\n{rendered}"
     );
+    // The wrapped message spans rows, so assert its phrases on the
+    // newline-flattened rendering; the code assertion above already
+    // proves the warning is in the status block.
+    // Strip the block borders row by row before flattening: a wrapped
+    // phrase is split across rows with a `│` border between the words.
+    let flat: String = rendered
+        .lines()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        rendered.contains("does not establish absence"),
+        flat.contains("does not establish absence"),
         "warning message must render:\n{rendered}"
+    );
+    assert!(
+        flat.contains("reindex"),
+        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
+    );
+    // #790 fix round 2: scope the remedy assertion to the Status
+    // block and assert the warning's last phrase verbatim, so a
+    // `reindex` mention elsewhere on screen cannot mask a clipped
+    // warning.
+    let status = status_block_flat(&rendered);
+    assert!(
+        status.contains("search corpus with `reindex`"),
+        "warning's last phrase must render inside the Status block:\n{rendered}"
+    );
+}
+
+/// #769: a non-empty exact search over skipped encrypted records must
+/// render the partial-results warning in the Search status block, not
+/// just the match list — the TUI half of the #718 warning's complement.
+#[test]
+fn search_exact_nonempty_with_skips_renders_partial_warning() {
+    let find_json = r#"{
+        "ok": true, "schema_version": "1", "vault": "/fake/v",
+        "query": "plaintextmarker", "matches": [
+            {"id": "p-01J9Z3K4QH0000000000000000", "path": "people/p-01J9Z3K4QH0000000000000000/profile.md", "line": 3, "excerpt": "Bio with plaintextmarker."}
+        ],
+        "findings": [{"code": "W_PARTIAL_RESULTS", "severity": "warning",
+          "message": "2 encrypted records were not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`."}],
+        "skipped_encrypted": 2, "refused_envelopes": 0, "scope": []
+    }"#;
+    let fake = FakeRunner::new().with_response("find", 0, find_json);
+    let mut app = App::new(fake);
+    app.active_view = ActiveView::Search;
+    app.search.exact = true;
+    app.run_search("plaintextmarker");
+
+    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
+    let res = app.search.result.as_ref().expect("search result populated");
+    assert!(!res.kept.is_empty(), "non-empty matches expected");
+    assert_eq!(res.result.skipped_encrypted, 2);
+    assert!(
+        res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_PARTIAL_RESULTS"),
+        "partial warning finding must carry through"
+    );
+    assert!(
+        !res.result
+            .findings
+            .iter()
+            .any(|f| f.code == "W_SKIPPED_ENCRYPTED"),
+        "non-empty result must not carry the absence warning"
+    );
+
+    // #790 blocker 1: render at an ordinary 80-column width. The
+    // warning wraps inside the status block, so the full message —
+    // including the remedy at its end — must still render.
+    let rendered = render_to_string_at(&app, 80, 24);
+    assert!(
+        rendered.contains("W_PARTIAL_RESULTS"),
+        "warning code must render in the status block:\n{rendered}"
+    );
+    // Strip the block borders row by row before flattening: a wrapped
+    // phrase is split across rows with a `│` border between the words.
+    let flat: String = rendered
+        .lines()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("may be incomplete"),
+        "warning message must render:\n{rendered}"
+    );
+    assert!(
+        flat.contains("reindex"),
+        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
+    );
+    // #790 fix round 2: scope the remedy assertion to the Status
+    // block and assert the warning's last phrase verbatim, so a
+    // `reindex` mention elsewhere on screen cannot mask a clipped
+    // warning.
+    let status = status_block_flat(&rendered);
+    assert!(
+        status.contains("search corpus with `reindex`"),
+        "warning's last phrase must render inside the Status block:\n{rendered}"
     );
 }
 

@@ -3262,7 +3262,23 @@ fn cmd_find(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
+    // #769 fix wave: the warnings are selected in `search_with` from the
+    // pre-limit hit count, but `--limit` truncates the displayed list
+    // afterwards. A limit that empties the displayed list (e.g.
+    // `--limit 0` over real hits) must not carry `W_PARTIAL_RESULTS`,
+    // whose wording ("these matches") assumes a non-empty displayed
+    // result. Reconcile from the displayed count: a limit-emptied result
+    // carries neither warning — the absence warning is not substituted
+    // either, since the emptiness is the operator's cap, not an absence
+    // claim (whether it should fire is an open line in the
+    // finding-codes-review issue). The skip/refuse counts are still
+    // reported alongside, as before.
+    let total_hits = result.hits.len();
     let hits: Vec<_> = result.hits.into_iter().take(limit).collect();
+    let mut findings = result.findings;
+    if hits.is_empty() && total_hits > 0 {
+        findings.retain(|f| f.code.as_str() != "W_PARTIAL_RESULTS");
+    }
     // #386: optional ranked-search hint. Present only when qmd is on PATH
     // and the corpus exists; never changes matches, ordering, or exit status.
     let qmd_hint = qmd_hint_for_find(&vault.root);
@@ -3270,7 +3286,7 @@ fn cmd_find(
         let mut data = serde_json::json!({
                 "query": query,
                 "matches": hits,
-                "findings": result.findings,
+                "findings": findings,
                 "skipped_encrypted": result.skipped_encrypted,
                 "refused_envelopes": result.refused_envelopes,
                 "scope": scope_names,
@@ -3293,7 +3309,7 @@ fn cmd_find(
         if for_operator {
             writeln!(io::stdout(), "{OPERATOR_MODE_BANNER}")?;
         }
-        for f in &result.findings {
+        for f in &findings {
             writeln!(
                 io::stdout(),
                 "{:<7}  {}  {}",
@@ -3332,12 +3348,13 @@ fn cmd_find(
         if let Some(hint) = qmd_hint.as_deref() {
             eprintln!("{hint}");
         }
-        // #718: the warning finding above already prints on stdout; repeat
-        // it on stderr too, so a human skimming a "0 matches" result sees
-        // it even if they miss the findings block. JSON mode carries the
-        // finding in-band and stays stderr-clean.
-        for f in &result.findings {
-            if f.code.as_str() == "W_SKIPPED_ENCRYPTED" {
+        // #718/#769: the warning finding above already prints on stdout;
+        // repeat it on stderr too, so a human skimming a "0 matches" — or
+        // a non-empty match list — sees it even if they miss the findings
+        // block. JSON mode carries the finding in-band and stays
+        // stderr-clean.
+        for f in &findings {
+            if f.code.as_str() == "W_SKIPPED_ENCRYPTED" || f.code.as_str() == "W_PARTIAL_RESULTS" {
                 eprintln!("warning: {}", f.message);
             }
         }
