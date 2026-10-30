@@ -739,6 +739,40 @@ def _kill_process_group(proc):
             pass
 
 
+def _reap_smoke_child(proc):
+    """Kill the smoke child's group and reap it, closing its pipes.
+
+    Shared by the timeout path and the interruption path in
+    `_run_one_smoke`: either way the child may still be running with
+    a live qmd grandchild, and leaving it behind recreates the #775
+    orphan. The group kill is best-effort (a child that already
+    exited is not an error); the wait reaps the child so it cannot
+    linger as a zombie; closing the pipe ends (which `communicate`
+    never returned, having raised) keeps the run from leaking file
+    descriptors. This helper must not raise: callers in the
+    exception paths re-raise the original exception.
+    """
+    _kill_process_group(proc)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # The pipes were never consumed (communicate raised before
+        # returning them): close our ends, or the run leaks file
+        # descriptors and trips ResourceWarnings in the test suite.
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except (OSError, ValueError):
+                pass
+
+
 def _run_one_smoke(query_script, vault, query, timeout, env, mode):
     """One timed qmd-query.py run; classifies its outcome precisely.
 
@@ -753,6 +787,12 @@ def _run_one_smoke(query_script, vault, query, timeout, env, mode):
     start_new_session for the qmd child), so a group kill reaps the
     wrapper and its qmd child together. subprocess.run's timeout
     killed only the wrapper and leaked the qmd child as an orphan.
+    The same group kill runs on interruption: the wrapper's new
+    session puts it outside the terminal's foreground process group,
+    so Ctrl-C reaches only preflight and `KeyboardInterrupt` (or
+    `SystemExit`, or any other exception) out of `communicate` must
+    still reap the group before propagating, or an ordinary cancel
+    recreates the orphan.
     """
     start = time.monotonic()
     try:
@@ -768,23 +808,18 @@ def _run_one_smoke(query_script, vault, query, timeout, env, mode):
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            # The pipes were never consumed (communicate raised before
-            # returning them): close our ends, or the run leaks file
-            # descriptors and trips ResourceWarnings in the test suite.
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
+        _reap_smoke_child(proc)
         return {"status": "timeout",
                 "reason": f"no answer within {timeout}s",
                 "seconds": round(time.monotonic() - start, 2),
                 "matches": None}
+    except BaseException:
+        # KeyboardInterrupt, SystemExit, or any unexpected exception:
+        # the child is still alive in its own session, outside the
+        # terminal's foreground process group, so only this cleanup
+        # reaps it. Re-raise the original exception afterwards.
+        _reap_smoke_child(proc)
+        raise
     elapsed = round(time.monotonic() - start, 2)
     try:
         data = json.loads(stdout) if stdout.strip() else None

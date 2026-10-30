@@ -883,6 +883,84 @@ class QmdPreflightTest(unittest.TestCase):
                                 ValueError):
                             pass
 
+    def test_smoke_interrupt_kills_wrapper_and_its_child(self):
+        # #775 follow-up (Frank/Silas review of #785): a Ctrl-C while
+        # communicate() waits must reap the smoke group too. The
+        # wrapper runs in its own session, outside the terminal's
+        # foreground process group, so SIGINT reaches only preflight
+        # and KeyboardInterrupt bypasses the TimeoutExpired handler;
+        # without the BaseException cleanup the wrapper and its qmd
+        # grandchild survive as orphans. The stub is the wrapper: it
+        # records its own pid and its grandchild's pid, then sleeps.
+        # The patched communicate waits until both are live (as a
+        # real blocked communicate would be), then raises
+        # KeyboardInterrupt, exactly the interruption shape under
+        # test. The interrupt must propagate, and both processes
+        # must be dead afterwards. Any survivor is killed by the
+        # test itself, so a regression cannot leak a sleeper.
+        wrapper_marker = self.root / "wrapper-pids.txt"
+        grandchild_marker = self.root / "grandchild-pids-int.txt"
+        stub = self.root / "stub-grandchild-int.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, subprocess, time\n"
+            "child = subprocess.Popen(['sleep', '60'])\n"
+            f"with open({str(wrapper_marker)!r}, 'w') as f:\n"
+            "    f.write(str(os.getpid()) + '\\n')\n"
+            f"with open({str(grandchild_marker)!r}, 'w') as f:\n"
+            "    f.write(str(child.pid) + '\\n')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8")
+        env = dict(os.environ)
+
+        def _interrupt_once(*args, **kwargs):
+            # Wait until the wrapper and grandchild are both live,
+            # then deliver the interrupt from inside communicate().
+            deadline = time.time() + 5
+            while not (wrapper_marker.exists()
+                       and grandchild_marker.exists()):
+                if time.time() > deadline:
+                    break
+                time.sleep(0.05)
+            raise KeyboardInterrupt
+
+        try:
+            with unittest.mock.patch.object(
+                    subprocess.Popen, "communicate",
+                    side_effect=_interrupt_once):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.preflight._run_one_smoke(
+                        str(stub), "/vault", "preflight", timeout=30,
+                        env=env, mode="bm25")
+            pids = []
+            for marker in (wrapper_marker, grandchild_marker):
+                self.assertTrue(marker.exists(), marker)
+                pids.extend(int(ln) for ln in marker.read_text(
+                    encoding="utf-8").splitlines() if ln.strip())
+            self.assertEqual(len(pids), 2, pids)
+            deadline = time.time() + 5
+            for pid in pids:
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break  # dead and reaped: the cleanup worked
+                    if time.time() > deadline:
+                        self.fail(f"process {pid} survived the smoke "
+                                  "interruption")
+                    time.sleep(0.1)
+        finally:
+            for marker in (wrapper_marker, grandchild_marker):
+                if marker.exists():
+                    for ln in marker.read_text(
+                            encoding="utf-8").splitlines():
+                        if ln.strip():
+                            try:
+                                os.kill(int(ln), signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError,
+                                    ValueError):
+                                pass
+
     def test_smoke_skips_when_qmd_missing(self):
         results = self.preflight.run_smoke(
             "/nonexistent/qmd-query.py", "/vault", "preflight", timeout=30,
