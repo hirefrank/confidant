@@ -105,6 +105,33 @@ fn render_to_string_at<R: Runner>(app: &App<R>, width: u16, height: u16) -> Stri
     lines.join("\n") + "\n"
 }
 
+/// Flatten only the Search view's Status block from a rendering, so a
+/// warning assertion cannot pass on a `reindex` mention in another
+/// block. The block starts at the row whose border carries the
+/// ` Status ` title and ends at its bottom border (or the next
+/// block's title row); border characters are stripped row by row
+/// before joining, so a phrase wrapped across rows is reconstructed.
+/// Panics if no Status block is found, so a layout change fails
+/// loudly instead of silently asserting on an empty string.
+fn status_block_flat(rendered: &str) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    let start = lines
+        .iter()
+        .position(|row| row.contains("Status"))
+        .expect("Status block title must render");
+    let mut rows: Vec<&str> = Vec::new();
+    for row in &lines[start + 1..] {
+        if row.starts_with('└') || row.starts_with('╰') || row.contains("Matches") {
+            break;
+        }
+        rows.push(row);
+    }
+    rows.iter()
+        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn assert_snapshot(name: &str, actual: &str) {
     let path = snapshot_path(name);
     if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
@@ -400,6 +427,15 @@ fn search_exact_zero_matches_with_skips_renders_warning() {
         flat.contains("reindex"),
         "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
     );
+    // #790 fix round 2: scope the remedy assertion to the Status
+    // block and assert the warning's last phrase verbatim, so a
+    // `reindex` mention elsewhere on screen cannot mask a clipped
+    // warning.
+    let status = status_block_flat(&rendered);
+    assert!(
+        status.contains("search corpus with `reindex`"),
+        "warning's last phrase must render inside the Status block:\n{rendered}"
+    );
 }
 
 /// #769: a non-empty exact search over skipped encrypted records must
@@ -463,6 +499,15 @@ fn search_exact_nonempty_with_skips_renders_partial_warning() {
     assert!(
         flat.contains("reindex"),
         "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
+    );
+    // #790 fix round 2: scope the remedy assertion to the Status
+    // block and assert the warning's last phrase verbatim, so a
+    // `reindex` mention elsewhere on screen cannot mask a clipped
+    // warning.
+    let status = status_block_flat(&rendered);
+    assert!(
+        status.contains("search corpus with `reindex`"),
+        "warning's last phrase must render inside the Status block:\n{rendered}"
     );
 }
 
