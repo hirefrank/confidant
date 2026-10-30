@@ -89,6 +89,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -713,6 +714,31 @@ def tradeoff_note(results, recommendation):
     return None
 
 
+def _kill_process_group(proc):
+    """SIGKILL the whole process group of a smoke child (issue #775).
+
+    Smoke children run with start_new_session, so the child is its own
+    group leader and the group holds exactly the wrapper plus whatever
+    it spawned (its qmd child, and anything qmd spawned). The old
+    subprocess.run timeout killed only the wrapper process: the qmd
+    child survived as an orphan burning CPU for 9-12+ minutes after
+    its smoke run timed out. Killing the group is what reaps it.
+    A child that already exited is not an error. Off POSIX there is
+    no process group to kill, so this falls back to killing the child
+    alone (native Windows is unsupported anyway — WSL2 only).
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _run_one_smoke(query_script, vault, query, timeout, env, mode):
     """One timed qmd-query.py run; classifies its outcome precisely.
 
@@ -720,32 +746,55 @@ def _run_one_smoke(query_script, vault, query, timeout, env, mode):
     distinct from ok: it proves timing, not a usable mode), "skipped",
     "timeout", "failed", "fallback". Only "ok" ever feeds a
     recommendation or a cache-completeness claim.
+
+    The run uses Popen (not subprocess.run) so that on timeout it can
+    kill the child's whole process group (#775): the wrapper spawns
+    qmd in its own group (qmd-query.py deliberately never calls
+    start_new_session for the qmd child), so a group kill reaps the
+    wrapper and its qmd child together. subprocess.run's timeout
+    killed only the wrapper and leaked the qmd child as an orphan.
     """
     start = time.monotonic()
     try:
-        p = subprocess.run([sys.executable, query_script,
-                            "--vault", vault, "--mode", mode, query],
-                           capture_output=True, text=True,
-                           timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout",
-                "reason": f"no answer within {timeout}s",
-                "seconds": round(time.monotonic() - start, 2),
-                "matches": None}
+        proc = subprocess.Popen(
+            [sys.executable, query_script,
+             "--vault", vault, "--mode", mode, query],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env, start_new_session=(os.name == "posix"))
     except OSError as e:
         return {"status": "failed", "reason": str(e),
                 "seconds": round(time.monotonic() - start, 2),
                 "matches": None}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            # The pipes were never consumed (communicate raised before
+            # returning them): close our ends, or the run leaks file
+            # descriptors and trips ResourceWarnings in the test suite.
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+        return {"status": "timeout",
+                "reason": f"no answer within {timeout}s",
+                "seconds": round(time.monotonic() - start, 2),
+                "matches": None}
     elapsed = round(time.monotonic() - start, 2)
     try:
-        data = json.loads(p.stdout) if p.stdout.strip() else None
+        data = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         data = None
-    if p.returncode != 0 and "needs embeddings" in (p.stderr or ""):
+    if proc.returncode != 0 and "needs embeddings" in (stderr or ""):
         return {"status": "skipped",
                 "reason": "no embeddings (run qmd-index.py --embed)",
                 "seconds": elapsed, "matches": None}
-    if p.returncode == 0 and isinstance(data, dict) \
+    if proc.returncode == 0 and isinstance(data, dict) \
             and data.get("mode") == mode:
         matches = data.get("matches")
         count = len(matches) if isinstance(matches, list) else None
@@ -757,14 +806,14 @@ def _run_one_smoke(query_script, vault, query, timeout, env, mode):
                     "seconds": elapsed, "matches": 0}
         return {"status": "ok", "reason": "", "seconds": elapsed,
                 "matches": count}
-    if p.returncode == 0 and isinstance(data, dict) \
+    if proc.returncode == 0 and isinstance(data, dict) \
             and data.get("mode") == "find-fallback":
         return {"status": "fallback",
                 "reason": data.get("fallback", "qmd unavailable"),
                 "seconds": elapsed, "matches": None}
-    detail = (p.stderr or "").strip().splitlines()
+    detail = (stderr or "").strip().splitlines()
     return {"status": "failed",
-            "reason": detail[-1] if detail else f"exit {p.returncode}",
+            "reason": detail[-1] if detail else f"exit {proc.returncode}",
             "seconds": elapsed, "matches": None}
 
 

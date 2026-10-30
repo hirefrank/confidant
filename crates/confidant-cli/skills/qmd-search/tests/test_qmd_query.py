@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -826,6 +827,61 @@ class QmdPreflightTest(unittest.TestCase):
             self.assertEqual(results[mode]["status"], "fallback", results[mode])
         self.assertFalse(
             self.preflight.offline_recommended_for(hub, results))
+
+    def test_smoke_timeout_kills_wrapper_and_its_child(self):
+        # #775: a timed-out smoke run must leave no orphaned qmd child.
+        # The stub is the wrapper: it spawns a grandchild (the qmd
+        # stand-in, in the stub's own process group — exactly the qmd
+        # shape) and then sleeps past the timeout. The old
+        # subprocess.run timeout killed only the stub; the grandchild
+        # survived as an orphan burning CPU. The group kill must reap
+        # both, for every mode. Any survivor is killed by the test
+        # itself, so a regression cannot leak a sleeper onto the host.
+        marker = self.root / "grandchild-pids.txt"
+        stub = self.root / "stub-grandchild.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, subprocess, time\n"
+            "child = subprocess.Popen(['sleep', '60'])\n"
+            f"with open({str(marker)!r}, 'a') as f:\n"
+            "    f.write(str(child.pid) + '\\n')\n"
+            "time.sleep(60)\n",
+            encoding="utf-8")
+        env = dict(os.environ)
+        try:
+            results = self.preflight.run_smoke(
+                str(stub), "/vault", "preflight", timeout=1,
+                env=env, qmd_present=True, corpus_present=True)
+            for mode in ("hybrid", "vector", "bm25"):
+                self.assertEqual(results[mode]["status"], "timeout",
+                                 results[mode])
+                self.assertEqual(results[mode]["warm"]["status"],
+                                 "not-measured")
+            pids = [int(ln) for ln in marker.read_text(
+                encoding="utf-8").splitlines() if ln.strip()]
+            # One grandchild per mode (cold runs only; a timed-out cold
+            # run gets no warm rerun).
+            self.assertEqual(len(pids), 3, pids)
+            deadline = time.time() + 5
+            for pid in pids:
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break  # dead and reaped: the group kill worked
+                    if time.time() > deadline:
+                        self.fail(f"orphaned grandchild {pid} survived "
+                                  "the smoke timeout")
+                    time.sleep(0.1)
+        finally:
+            if marker.exists():
+                for ln in marker.read_text(encoding="utf-8").splitlines():
+                    if ln.strip():
+                        try:
+                            os.kill(int(ln), signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError,
+                                ValueError):
+                            pass
 
     def test_smoke_skips_when_qmd_missing(self):
         results = self.preflight.run_smoke(

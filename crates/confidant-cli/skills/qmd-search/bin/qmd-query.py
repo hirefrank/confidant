@@ -403,7 +403,13 @@ def qmd_runtime_env(vault, vault_config, global_config):
 
 
 def vectors_available(qmd, env):
-    """True if the qmd index has any embedded vectors (hybrid/vector need them)."""
+    """True if the qmd index has any embedded vectors (hybrid/vector need them).
+
+    Deliberately no start_new_session here (#775): qmd-preflight.py's
+    smoke timeout kills the wrapper's whole process group to reap the
+    qmd child, and a separate session would put this qmd outside that
+    group. subprocess.run's own timeout kills this direct child.
+    """
     try:
         p = subprocess.run([qmd, "status"], capture_output=True, text=True,
                            timeout=30, env=env)
@@ -478,6 +484,12 @@ def main():
                  f"first (downloads models on first run), or use --mode bm25")
 
     sub = {"hybrid": "query", "bm25": "search", "vector": "vsearch"}[mode]
+    # No start_new_session here, on purpose (#775): qmd-preflight.py's
+    # smoke timeout kills the wrapper's whole process group, and that
+    # group kill is what reaps this qmd child when the wrapper itself
+    # is killed. A separate session for qmd would put it outside the
+    # group and re-create the orphan leak. This run's own timeout
+    # kills the direct qmd child via subprocess.run.
     try:
         p = subprocess.run([qmd, sub, query, "--json", "-n", str(args.n),
                             "-c", COLLECTION],
