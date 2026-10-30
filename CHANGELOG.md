@@ -8,8 +8,21 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-30
+
 ### Added
 - `alias add` warns when the added value appears nowhere in searchable plaintext under the §12 agent `find` allowlist, so the operator learns at add time that the alias is retrievable only via `alias resolve <kind>` unless the value later appears in plaintext; when the same kind/value is already held by another cleared person the warning says the value is shared and `alias resolve` will report it as ambiguous rather than promising retrieval (holders compared after merge canonicalization, so an alias held by the canonical person of a merged-away member is not reported as shared when added to the member); for a `no-ai: true` person the warning says plainly that no lookup by alias value returns the person (the alias is stored only as an HMAC, which no command can turn back into the value) and the person remains addressable only by their `p-<ULID>`, instead of recommending `alias resolve`, and no warning is given when an unreadable record makes the search incomplete; the add still succeeds with exit 0, and the warning never echoes the value (#767).
+- `doctor` gains a fourth status, `unknown`, for checks that could not run to a determination. `disk-encryption` (missing or failing probes, a root filesystem that is not a block device, the non-Linux path), `cli-staleness` (unreachable releases, an unparseable tag), and `git-version` (an undetermined version) now report `unknown` instead of `ok`. It is warning-tier: only `error` fails `doctor`, so an offline or VM-host operator still passes, but the line is never green; the TUI renders `unknown` as warning-tier in its doctor pill, tone, and status tag. `CONFIDANT_OFFLINE` stays `ok`, since a check skipped by operator choice is determined rather than undetermined (#709).
+
+### Changed
+- `find` warns when a non-empty result is partial: a search that returned matches while `skipped_encrypted > 0` now carries the new `W_PARTIAL_RESULTS` warning, the non-empty companion to `W_SKIPPED_ENCRYPTED`. Empty results still carry the absence warning instead, so a search never carries both; the warning is reconciled from the matches actually displayed after `--limit`, and `--limit 0` carries neither warning. The message carries only the skip count and the remedy, never vault content (#769).
+- Spec §14 and `docs/crypto-design.md` carry the revised delegated writer-key design from crypto-review: writer certificates, signer binding, the field-level manifest rule, sequence-keyed revocation, SSH commit signing, and the minor-bump reader gate. This is design only, with no implementation; #731 still needs an outside audit before public launch (#779).
+- `ureq` bumped 3.4.2 to 3.5.0 (#782).
+
+### Fixed
+- `qmd-preflight --help` now says `--persist` writes the vault-local `<vault>/.confidant/qmd-preflight.toml`, never the global user config, matching what `persist_preflight` actually does (#777).
+- QMD preflight never clears a persisted `default_mode` on an empty probe, and chained or default-query runs update `offline` only: changing the mode requires an explicit `--query` (#778).
+- QMD preflight smoke runs kill the whole process group on timeout and on interruption, so a timed-out or Ctrl-C'd smoke no longer leaves an orphaned qmd worker burning CPU (#775).
 
 ## [0.7.1] - 2026-10-25
 
@@ -715,7 +728,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/hirefrank/confidant/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/hirefrank/confidant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/hirefrank/confidant/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/hirefrank/confidant/compare/v0.6.1...v0.6.2
