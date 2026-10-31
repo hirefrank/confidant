@@ -173,7 +173,6 @@ fn dry_run_reports_ahead_and_never_contacts_the_remote() {
     assert_eq!(v["remote"], "origin", "{v}");
     assert_eq!(v["branch"], "main", "{v}");
     assert_eq!(v["upstream"], "origin/main", "{v}");
-    assert_eq!(v["crypto_mode"], "plaintext", "{v}");
     assert_eq!(v["fetched"], false, "{v}");
     assert_eq!(v["dry_run"], true, "{v}");
     assert_eq!(v["applied"], false, "{v}");
@@ -406,7 +405,6 @@ fn plaintext_vault_syncs_against_any_remote() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["crypto_mode"], "plaintext", "{v}");
     assert_eq!(v["remote"], "origin", "{v}");
 
     // And a real push succeeds.

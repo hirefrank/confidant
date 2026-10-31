@@ -11,8 +11,8 @@
 //! The flag is operator-only by construction, the same mechanism as
 //! `record show --for-edit`: `crates/confidant-cli/src/mcp.rs` maps a fixed
 //! tool whitelist to argv and `record list` is not in it, so no agent
-//! connection can reach the command, and the `--for-operator` decrypt path
-//! (`RecordDecryptor::for_edit`) is never selected by an agent-facing read.
+//! connection can reach the command, and the `--for-operator` read path
+//! is never selected by an agent-facing read.
 
 use serde::Serialize;
 

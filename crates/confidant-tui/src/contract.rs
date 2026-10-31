@@ -178,10 +178,6 @@ pub struct FindResult {
     #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default)]
-    pub skipped_encrypted: u32,
-    #[serde(default)]
-    pub refused_envelopes: u32,
-    #[serde(default)]
     pub scope: Vec<String>,
     /// Optional ranked-search hint (#386): present only when qmd is on
     /// PATH and the corpus exists. Absent otherwise; readers must accept
@@ -221,10 +217,6 @@ pub struct SearchResult {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub dropped_uncleared: u32,
-    #[serde(default)]
-    pub skipped_encrypted: u32,
-    #[serde(default)]
-    pub refused_envelopes: u32,
 }
 
 /// One search match inside a [`SearchResult`].
@@ -261,10 +253,6 @@ pub struct Context {
     pub packs: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub aliases: Vec<String>,
-    #[serde(default)]
-    pub skipped_encrypted: u32,
-    #[serde(default)]
-    pub refused_envelopes: u32,
     #[serde(default)]
     pub scope: Vec<String>,
     /// Present (`true`) only when the operator path answered
@@ -339,7 +327,7 @@ pub struct TouchpointView {
 /// The TUI calls the roster without `--for-operator` unless operator mode is
 /// on; without it this is the section 12 cleared set, so a `no-ai: true`
 /// person is absent (never present with a nulled name). With the operator
-/// flag the decrypt path is the operator one and entries carry the tri-state
+/// flag the operator read path is used and entries carry the tri-state
 /// `no_ai` the #559 ruling specifies.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct Roster {
@@ -351,10 +339,6 @@ pub struct Roster {
     pub records: Vec<RosterEntry>,
     #[serde(default)]
     pub scope: Vec<String>,
-    #[serde(default)]
-    pub skipped_encrypted: u32,
-    #[serde(default)]
-    pub refused_envelopes: u32,
 }
 
 /// One roster entry inside a [`Roster`].
@@ -374,8 +358,8 @@ pub struct RosterEntry {
 /// (#216) and `confidant note show <n-id> --for-edit --json --no-input`
 /// (#557), the two operator-only reads that prepare an edit.
 ///
-/// `text` is decrypted plaintext (a `no-ai` record is decrypted in full
-/// here), so the manual [`std::fmt::Debug`] impl redacts it: plaintext must
+/// `text` is the record's plain text (a `no-ai` record is shown in full
+/// here), so the manual [`std::fmt::Debug`] impl redacts it: text must
 /// never reach logs or panic messages.
 #[derive(Clone, Default, Deserialize, PartialEq)]
 pub struct EditSource {
@@ -425,8 +409,8 @@ pub struct DoctorCheck {
 /// Output of `confidant sync --dry-run --json --no-input` (#665).
 ///
 /// Read-only: `--dry-run` reports the last-fetched upstream state without
-/// contacting the remote. Only an encrypted vault with a remote reaches this
-/// shape; otherwise the CLI returns a stable error code (see
+/// contacting the remote. Only a vault with a remote reaches this shape;
+/// otherwise the CLI returns a stable error code (see
 /// [`ErrorBody::code`]).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct SyncReport {
@@ -440,66 +424,12 @@ pub struct SyncReport {
     pub branch: String,
     #[serde(default)]
     pub upstream: String,
-    #[serde(default)]
-    pub crypto_mode: String,
 }
 
-/// One item in an `inbox --dry-run` report.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct InboxItem {
-    #[serde(default)]
-    pub name: String,
-    /// `"ledger"` or `"record"`.
-    #[serde(default)]
-    pub kind: String,
-    /// Vault-relative merge target.
-    #[serde(default)]
-    pub target: String,
-    /// `"merge"` or `"skip"` (already present / idempotent no-op).
-    #[serde(default)]
-    pub action: String,
-}
-
-/// One operator-deferred item in an `inbox --dry-run` report (`--skip`).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct InboxSkipped {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub target: String,
-}
-
-/// Output of `confidant inbox --dry-run --json --no-input`.
-///
-/// The same envelope shape is returned by the real (applying) run, with
-/// `dry_run: false`.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-pub struct InboxReport {
-    #[serde(default)]
-    pub branch: String,
-    #[serde(default)]
-    pub dry_run: bool,
-    /// True when there is no inbox branch: nothing to do.
-    #[serde(default)]
-    pub empty: bool,
-    #[serde(default)]
-    pub merged: usize,
-    #[serde(default)]
-    pub cleared: usize,
-    #[serde(default)]
-    pub items: Vec<InboxItem>,
-    #[serde(default)]
-    pub skipped: Vec<InboxSkipped>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
-
-/// One decrypted side of a conflicted record
+/// One side of a conflicted record
 /// (`confidant record resolve <id> --show --json --no-input`, #453).
 ///
-/// `text` holds decrypted plaintext: the manual [`std::fmt::Debug`] impl
+/// `text` holds record text: the manual [`std::fmt::Debug`] impl
 /// redacts it so plaintext never reaches logs or panic messages.
 #[derive(Clone, Default, Deserialize, PartialEq)]
 pub struct ResolveSide {

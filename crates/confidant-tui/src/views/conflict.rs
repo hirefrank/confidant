@@ -1,7 +1,7 @@
 //! Merge-conflict resolution view (#456).
 //!
-//! Lists conflicted encrypted records (from `check --json`
-//! `E_MERGE_CONFLICT` findings) and shows both decrypted sides on screen
+//! Lists conflicted records (from `check --json`
+//! `E_MERGE_CONFLICT` findings) and shows both sides on screen
 //! so the operator can pick one side or hand the record to the CLI
 //! hand-merge. Plaintext lives in memory only: this view never writes it
 //! to disk, never logs it, and its `Debug` impl redacts it.
@@ -62,7 +62,7 @@ impl ConflictAction {
     }
 }
 
-/// State for the conflicts tab. `detail` holds decrypted plaintext in
+/// State for the conflicts tab. `detail` holds record text in
 /// memory only; the manual `Debug` impl redacts it.
 #[derive(Clone, Default, PartialEq)]
 pub struct ConflictViewState {
@@ -70,7 +70,7 @@ pub struct ConflictViewState {
     pub entries: Vec<ConflictListEntry>,
     /// Selected row in the list.
     pub selected: usize,
-    /// Decrypted sides for the open record, if a detail is loaded.
+    /// Both sides of the open record, if a detail is loaded.
     pub detail: Option<ResolveShow>,
     /// The record id the loaded detail belongs to.
     pub detail_id: Option<String>,
@@ -171,7 +171,7 @@ pub fn render(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-/// Pure renderer for the conflict detail screen: both decrypted sides,
+/// Pure renderer for the conflict detail screen: both sides,
 /// ours on top and theirs below, with the record id (opaque) in the
 /// header. Side labels come from git and are shown as-is; they are never
 /// treated as record names.
@@ -219,7 +219,7 @@ pub fn render_detail(state: &ConflictViewState, frame: &mut Frame<'_>, area: Rec
     );
 }
 
-/// One decrypted side pane.
+/// One side pane.
 fn render_side(frame: &mut Frame<'_>, area: Rect, title: &str, label: &str, text: &str) {
     let title = if label.is_empty() {
         title.to_string()

@@ -1,13 +1,13 @@
 //! `context <person>`: one JSON bundle of everything the vault knows about a
-//! person — profile, notes, interactions, coaching facts, aliases.
+//! person — profile, notes, interactions, pack-derived facts, aliases.
 //!
 //! Privacy: PII (name, profile body, note and interaction bodies) is shown
 //! only for records in the §12 cleared set ([`cleared_record_ids`]), exactly
 //! like `find`. A cleared person implies every member of its merge group is
 //! cleared (fixpoint invariant in `search.rs`), so merge-folded and
 //! duplicate-tainted records can never leak through `context`. `--exclude-private`
-//! strips PII regardless. Ledger-derived facts (sessions remaining, ICF hours,
-//! opaque alias hashes) are metadata, not content, and are kept.
+//! strips PII regardless. Ledger-derived facts (sessions remaining, ICF hours)
+//! are metadata, not content, and are kept.
 //! [`PersonView::no_ai`] always tells the caller which mode applied. With
 //! `for_operator` (#572) the operator cleared set is used instead, so
 //! `no-ai` records are included and each view carries the tri-state
@@ -28,9 +28,6 @@ use std::collections::HashSet;
 use serde::{Serialize, Serializer};
 
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
-use crate::context::ledger_sessions::{
-    owns_legacy_coaching_alias, LedgerSessionsView, LEDGER_SESSIONS_VIEW,
-};
 use crate::id::RecordId;
 use crate::record::RecordKind;
 use crate::scope::{
@@ -107,12 +104,9 @@ pub struct InteractionView {
     pub no_ai: Option<&'static str>,
 }
 
-// `LedgerSessionsView` lives in crate::context::ledger_sessions. Kept for
-// the agent contract (ADR-7): `context` output keeps the `coaching` field
-// with exactly this shape. Pack state is grouped by pack in
-// PersonContext::packs; `coaching` is the `ledger-sessions` provider's entry
-// in that map (the shipped external `coaching` pack), deserialized back
-// into this struct.
+// `LedgerSessionsView` lives in crate::context::ledger_sessions. Pack state
+// is grouped by pack in PersonContext::packs; a pack's `ledger-sessions`
+// view is that pack's entry in the map.
 
 /// The full bundle returned by `context`.
 #[derive(Clone, Debug, Serialize)]
@@ -124,12 +118,8 @@ pub struct PersonContext {
     /// ledger lines. Participants in a multi-person interaction see their
     /// touchpoint here, not the interaction content.
     pub touchpoints: Vec<TouchpointView>,
-    pub coaching: Option<LedgerSessionsView>,
     /// Pack state grouped by pack name (`"coaching@0.1"` today). Each pack
-    /// decides its own view shape via `Pack::context_view`. `coaching` above
-    /// duplicates the coaching pack's entry for contract stability; the
-    /// alias is tied to the pack named `coaching` (ADR-7), whatever origin it
-    /// came from.
+    /// decides its own view shape via `Pack::context_view`.
     pub packs: std::collections::BTreeMap<String, serde_json::Value>,
     /// The person's contact values (`emails`, `phones`, `handles`), shown
     /// only when private data is included. Empty under `--exclude-private`
@@ -164,7 +154,7 @@ fn is_false(value: &bool) -> bool {
 /// building the cleared set, so a `no-ai` person and their `no-ai` notes and
 /// interactions are included, and each view carries the tri-state `no_ai`
 /// string plus `for_operator: true`. The caller must have loaded the vault
-/// with the operator decryptor (same mechanism as `record show --for-edit`)
+/// with the operator read path (same mechanism as `record show --for-edit`)
 /// for the content to be present; an agent path passes `false`.
 pub fn build_context(
     vault: &Vault,
@@ -226,25 +216,8 @@ pub fn build_context(
             packs.insert(pack.name().to_string(), view);
         }
     }
-    // Legacy contract field: the coaching pack's entry, deserialized back.
-    // The alias is tied to the coaching pack (ADR-7), not to the view kind:
-    // any `[context]` pack can serve the `ledger-sessions` kind, but only the
-    // pack named `coaching` (the shipped external `coaching@0.1`) owns the
-    // legacy alias. Another
-    // pack serving the same kind must leave `coaching` null. The key is never
-    // hardcoded: the version comes from the enabled pack, matched by base
-    // name. `to_value` in the builder produced it from this struct, so this
-    // cannot fail unless the view shape drifts from the struct.
-    let coaching = snapshots.iter().find_map(|(pack, _)| {
-        if !owns_legacy_coaching_alias(pack.name())
-            || pack.context_view_kind() != Some(LEDGER_SESSIONS_VIEW)
-        {
-            return None;
-        }
-        packs
-            .get(pack.name())
-            .and_then(|v| serde_json::from_value::<LedgerSessionsView>(v.clone()).ok())
-    });
+    // Pack state is the whole story: each pack's `[context]` view is its
+    // entry in `packs` (ADR-7, #797).
 
     let person_dir = format!("people/{person}/notes/");
 
@@ -344,7 +317,6 @@ pub fn build_context(
         notes,
         interactions,
         touchpoints,
-        coaching,
         packs,
         aliases,
         scope: scope_names,
@@ -510,7 +482,7 @@ mod tests {
         assert_eq!(none.person.name.as_deref(), Some("Ada Example"));
     }
 
-    /// #572: the operator bundle decrypts a `no-ai: true` person, carries
+    /// #572: the operator bundle includes a `no-ai: true` person, carries
     /// the tri-state `no_ai`, and includes the note that inherits hidden.
     /// The agent bundle is unchanged: name withheld, note absent, boolean.
     #[test]

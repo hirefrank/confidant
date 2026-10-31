@@ -137,7 +137,7 @@ fn run_doctor_env(releases_url: Option<&str>, env: &DoctorEnv<'_>) -> Value {
         cmd.env("CONFIDANT_TEST_RELEASES_URL", url);
     }
     // A hermetic HOME: Windows CI runners don't set HOME, and without it
-    // the crypto-manifests check errors (config dir unknown) and flips `ok`.
+    // the config-dir checks error and flip `ok`.
     let _tmp_home;
     if let Some(home) = env.home {
         cmd.env("HOME", home);

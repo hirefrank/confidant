@@ -96,8 +96,6 @@ pub enum FindingCode {
     LedgerPath,
     LedgerDate,
     BalanceMismatch,
-    AliasPlaintext,
-    AliasCollision,
     UnresolvedMerge,
     SelfMerge,
     MergeCycle,
@@ -115,17 +113,12 @@ pub enum FindingCode {
     DuplicateSrc,
     SessionUntagged,
     SessionTags,
-    InboxKeyMismatch,
     SelfEdge,
     DuplicateEdge,
     UnknownEdgeKind,
     TouchMalformed,
     CadenceOverdue,
     DateUpcoming,
-    SkippedEncrypted,
-    /// #769: non-empty `find` over skipped encrypted records — the matches
-    /// shown may be incomplete. Find-only; `check` does not emit it.
-    PartialResults,
     DuplicateTouch,
     DuplicateSession,
     Pack(&'static str),
@@ -156,8 +149,6 @@ impl FindingCode {
             Self::LedgerPath => "E_LEDGER_PATH",
             Self::LedgerDate => "E_LEDGER_DATE",
             Self::BalanceMismatch => "E_BALANCE_MISMATCH",
-            Self::AliasPlaintext => "E_ALIAS_PLAINTEXT",
-            Self::AliasCollision => "E_ALIAS_COLLISION",
             Self::UnresolvedMerge => "E_UNRESOLVED_MERGE",
             Self::SelfMerge => "E_SELF_MERGE",
             Self::MergeCycle => "E_MERGE_CYCLE",
@@ -175,15 +166,12 @@ impl FindingCode {
             Self::DuplicateSrc => "E_DUPLICATE_SRC",
             Self::SessionUntagged => "W_SESSION_UNTAGGED",
             Self::SessionTags => "E_SESSION_TAGS",
-            Self::InboxKeyMismatch => "E_INBOX_KEY_MISMATCH",
             Self::SelfEdge => "E_SELF_EDGE",
             Self::DuplicateEdge => "E_DUPLICATE_EDGE",
             Self::UnknownEdgeKind => "E_UNKNOWN_EDGE_KIND",
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
-            Self::SkippedEncrypted => "W_SKIPPED_ENCRYPTED",
-            Self::PartialResults => "W_PARTIAL_RESULTS",
             Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
             Self::DuplicateSession => "W_DUPLICATE_SESSION",
             Self::Pack(code) => code,
@@ -247,10 +235,12 @@ impl FindingCode {
         "W_DUPLICATE_SESSION",
     ];
 
-    /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
-    /// builtin names that nothing emits in 0.1 and that no pack may reuse
-    /// for a new meaning. They stay in [`Self::ALL_BUILTIN_STRS`] so a
-    /// pack-declared code cannot shadow them.
+    /// Codes retired by the #449 cutover and the #795 crypto removal
+    /// (`spec/findings.md`): reserved builtin names that nothing emits and
+    /// that no pack may reuse for a new meaning. They stay in
+    /// [`Self::ALL_BUILTIN_STRS`] so a pack-declared code cannot shadow
+    /// them; the crypto-era variants were deleted outright, and the older
+    /// retired names keep their (unconstructed) variants.
     pub const RETIRED_CODES: &[&str] = &[
         "E_BALANCE_MISMATCH",
         "E_NEGATIVE_BALANCE",
@@ -260,6 +250,11 @@ impl FindingCode {
         "W_SESSION_UNTAGGED",
         "E_SESSION_WITHOUT_NOTES",
         "E_PAID_SESSION_GAP",
+        "E_ALIAS_PLAINTEXT",
+        "E_ALIAS_COLLISION",
+        "E_INBOX_KEY_MISMATCH",
+        "W_SKIPPED_ENCRYPTED",
+        "W_PARTIAL_RESULTS",
     ];
 
     /// Whether `s` is the string of a builtin enum variant (not a `Pack` code).
@@ -344,8 +339,6 @@ impl FindingCode {
             "E_LEDGER_PATH" => Self::LedgerPath,
             "E_LEDGER_DATE" => Self::LedgerDate,
             "E_BALANCE_MISMATCH" => Self::BalanceMismatch,
-            "E_ALIAS_PLAINTEXT" => Self::AliasPlaintext,
-            "E_ALIAS_COLLISION" => Self::AliasCollision,
             "E_UNRESOLVED_MERGE" => Self::UnresolvedMerge,
             "E_SELF_MERGE" => Self::SelfMerge,
             "E_MERGE_CYCLE" => Self::MergeCycle,
@@ -363,15 +356,12 @@ impl FindingCode {
             "E_DUPLICATE_SRC" => Self::DuplicateSrc,
             "W_SESSION_UNTAGGED" => Self::SessionUntagged,
             "E_SESSION_TAGS" => Self::SessionTags,
-            "E_INBOX_KEY_MISMATCH" => Self::InboxKeyMismatch,
             "E_SELF_EDGE" => Self::SelfEdge,
             "E_DUPLICATE_EDGE" => Self::DuplicateEdge,
             "E_UNKNOWN_EDGE_KIND" => Self::UnknownEdgeKind,
             "E_TOUCH_MALFORMED" => Self::TouchMalformed,
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
-            "W_SKIPPED_ENCRYPTED" => Self::SkippedEncrypted,
-            "W_PARTIAL_RESULTS" => Self::PartialResults,
             "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
             "W_DUPLICATE_SESSION" => Self::DuplicateSession,
             _ => return None,
@@ -1415,9 +1405,9 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
     }
 }
 
-/// Edge rules (#179). Runs on records `check` can read: in an encrypted
-/// vault an edge is an envelope, so these rules do not run there — the
-/// same visibility limit as every other record rule. Kind symmetry is
+/// Edge rules (#179). Runs on every edge record: with plaintext records the
+/// `a` / `b` / `kind` fields are always readable.
+/// Kind symmetry is
 /// looked up over enabled packs, core, and all registered packs (a kind
 /// owned by a disabled pack is still a known kind for duplicate
 /// detection; the edge itself warns as `W_PACK_ORPHAN`).
@@ -1450,13 +1440,6 @@ fn check_edges(
         HashMap::new();
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Edge {
-            continue;
-        }
-        // Envelope shells (`enc:` present) carry no inner fields
-        // keylessly: `a` / `b` / `kind` sit inside the ciphertext, so
-        // the missing-field rules would false-positive on every edge
-        // envelope. Edge rules run on visible records only.
-        if rec.field("enc").is_some() {
             continue;
         }
         let mut ends: Vec<RecordId> = Vec::new();
@@ -1643,10 +1626,8 @@ fn check_edges(
     }
 }
 
-/// `with:` rules (#179) on interactions. Existence is a keyed check: it
-/// runs on records `check` can read. In an encrypted vault the interaction
-/// is an envelope with `with:` inside the ciphertext, so these rules do
-/// not run there.
+/// `with:` rules (#179) on interactions. Existence is a keyed check on the
+/// interaction's plaintext `with:` front matter.
 fn check_with_lists(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut Vec<Finding>) {
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Interaction {
@@ -2064,8 +2045,6 @@ mod tests {
             FindingCode::LedgerPath,
             FindingCode::LedgerDate,
             FindingCode::BalanceMismatch,
-            FindingCode::AliasPlaintext,
-            FindingCode::AliasCollision,
             FindingCode::UnresolvedMerge,
             FindingCode::SelfMerge,
             FindingCode::MergeCycle,
@@ -2083,15 +2062,12 @@ mod tests {
             FindingCode::DuplicateSrc,
             FindingCode::SessionUntagged,
             FindingCode::SessionTags,
-            FindingCode::InboxKeyMismatch,
             FindingCode::SelfEdge,
             FindingCode::DuplicateEdge,
             FindingCode::UnknownEdgeKind,
             FindingCode::TouchMalformed,
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
-            FindingCode::SkippedEncrypted,
-            FindingCode::PartialResults,
             FindingCode::DuplicateTouch,
             FindingCode::DuplicateSession,
         ];
@@ -2119,8 +2095,6 @@ mod tests {
                 | FindingCode::LedgerPath
                 | FindingCode::LedgerDate
                 | FindingCode::BalanceMismatch
-                | FindingCode::AliasPlaintext
-                | FindingCode::AliasCollision
                 | FindingCode::UnresolvedMerge
                 | FindingCode::SelfMerge
                 | FindingCode::MergeCycle
@@ -2138,30 +2112,45 @@ mod tests {
                 | FindingCode::DuplicateSrc
                 | FindingCode::SessionUntagged
                 | FindingCode::SessionTags
-                | FindingCode::InboxKeyMismatch
                 | FindingCode::SelfEdge
                 | FindingCode::DuplicateEdge
                 | FindingCode::UnknownEdgeKind
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
                 | FindingCode::DateUpcoming
-                | FindingCode::SkippedEncrypted
-                | FindingCode::PartialResults => {}
-                FindingCode::DuplicateTouch => {}
+                | FindingCode::DuplicateTouch => {}
                 FindingCode::DuplicateSession => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }
-        // The str→builtin mapping covers every builtin, both ways (#441).
+        // The str→builtin mapping covers every builtin that still has a
+        // variant (#441); a retired code whose variant was deleted has no
+        // mapping but stays reserved in ALL_BUILTIN_STRS.
         for s in FindingCode::ALL_BUILTIN_STRS {
-            let code = FindingCode::builtin_from_str(s)
-                .unwrap_or_else(|| panic!("builtin_from_str misses {s}"));
-            assert_eq!(code.as_str(), *s, "builtin_from_str roundtrip: {s}");
+            match FindingCode::builtin_from_str(s) {
+                Some(code) => assert_eq!(code.as_str(), *s, "builtin_from_str roundtrip: {s}"),
+                None => assert!(
+                    FindingCode::is_retired_code(s),
+                    "{s} has no variant and is not retired"
+                ),
+            }
         }
+        // Every non-retired builtin appears as a variant, in declaration
+        // order. Retired codes keep their slot in ALL_BUILTIN_STRS even when
+        // their variant was deleted.
+        let variants: Vec<&str> = variants
+            .iter()
+            .map(|c| c.as_str())
+            .filter(|s| !FindingCode::is_retired_code(s))
+            .collect();
+        let builtins: Vec<&str> = FindingCode::ALL_BUILTIN_STRS
+            .iter()
+            .copied()
+            .filter(|s| !FindingCode::is_retired_code(s))
+            .collect();
         assert_eq!(
-            variants.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            FindingCode::ALL_BUILTIN_STRS.to_vec(),
-            "ALL_BUILTIN_STRS must list every builtin variant, in declaration order"
+            variants, builtins,
+            "ALL_BUILTIN_STRS must list every live builtin variant, in declaration order"
         );
     }
 }

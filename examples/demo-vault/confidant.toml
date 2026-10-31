@@ -7,6 +7,3 @@ as_of = "2026-10-08"
 personal.cadence_overdue = "warning"
 personal.date_upcoming = "warning"
 personal.date_upcoming_days = 7
-
-[crypto]
-mode = "plaintext"

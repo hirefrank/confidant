@@ -3739,10 +3739,9 @@ fn check_ledger_merge_conflict_does_not_leak_name() {
     );
 }
 
-/// #391 (part of #219): a git conflict on an encrypted record — an `enc:`
-/// envelope — is detected from the raw bytes, before anything tries to
-/// decrypt it. Both devices rewrote the envelope, so the conflict spans
-/// the outer front matter (the `nonce:` line) as well as the body, which
+/// #391 (part of #219): a git conflict on a record is detected from the
+/// raw bytes, before the file is parsed. Both devices rewrote the record,
+/// so the conflict spans the front matter as well as the body, which
 /// is the case that makes the markers unparseable by `parse_record`.
 #[test]
 fn conflicted_plaintext_record_keeps_generic_message() {
@@ -4450,9 +4449,8 @@ fn edge_no_ai_is_rejected() {
 #[test]
 fn edge_extra_front_matter_key_is_rejected() {
     // #390: an edge carries only ids, kind, and dates. An extra front-matter
-    // key is the same shared-key residue as a body — the value would be
-    // encrypted under `vault:shared` and survive a shred — so it is rejected
-    // rather than silently ignored like unknown keys elsewhere (spec §4).
+    // key is not part of that closed shape, so it is rejected rather than
+    // silently ignored like unknown keys elsewhere (spec §4).
     let dir = tempfile::tempdir().unwrap();
     two_people(dir.path());
     for (key, value) in [

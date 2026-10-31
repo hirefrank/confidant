@@ -1,4 +1,4 @@
-//! `confidant` — local-first, git-backed, encrypted relationship memory.
+//! `confidant` — local-first, git-backed, plaintext relationship memory.
 //!
 //! Read commands (`check`, `find`, `context`, `doctor`, `schema`, `help`)
 //! never mutate the vault. Write commands (`log session`, `import`,
@@ -133,8 +133,8 @@ enum Command {
         /// Max hits to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
     },
@@ -204,8 +204,8 @@ enum Command {
         /// `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
     },
@@ -503,19 +503,19 @@ enum RecordAction {
     /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
     /// stays in the JSON envelope (ADR-7).
     List {
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
         /// Record kind to list.
         #[arg(long, value_enum, default_value_t = RosterKind::Person)]
         kind: RosterKind,
     },
-    /// Print one record's decrypted text, to prepare an edit.
+    /// Print one record's text, to prepare an edit.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
     /// a fixed tool whitelist), and `--for-edit` is required so a bare
-    /// invocation cannot print a decrypted record body.
+    /// invocation cannot print a record body.
     Show {
         /// Opaque record id (p-…, o-…, d-…, i-…, e-…).
         id: String,
@@ -611,12 +611,12 @@ enum NoteAction {
         #[arg(long)]
         body_file: PathBuf,
     },
-    /// Print one note's decrypted text, to prepare an edit.
+    /// Print one note's text, to prepare an edit.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
     /// a fixed tool whitelist), and `--for-edit` is required so a bare
-    /// invocation cannot print a decrypted note body. Notes are where
-    /// `no-ai` prose lives, so `no-ai` notes are decrypted in full here
+    /// invocation cannot print a note body. Notes are where
+    /// `no-ai` prose lives, so `no-ai` notes are printed in full here
     /// (same operator path as `record show --for-edit`).
     Show {
         /// Opaque note id (n-…).
@@ -630,10 +630,9 @@ enum NoteAction {
     /// Operator-only (never exposed over MCP). Exactly one source is
     /// required: `--file` reads the new note from a markdown file, `--edit`
     /// opens $VISUAL/$EDITOR on 0600 scratch under `.confidant/` (the #455
-    /// convention). The write goes through the normal pipeline, so in an
-    /// encrypted vault it re-encrypts, runs `check` before the commit, and
-    /// makes one commit; identical bytes report `unchanged` and commit
-    /// nothing.
+    /// convention). The write goes through the normal pipeline, so it runs
+    /// `check` before the commit and makes one commit; identical bytes report
+    /// `unchanged` and commit nothing.
     #[command(group(
         clap::ArgGroup::new("note_edit_source").required(true).multiple(false)
     ))]
@@ -825,8 +824,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
-            // Spec 4: the allowlist is a read path — decrypted records
-            // participate, skipped ones are excluded by omission.
+            // Spec 4: the allowlist is a read path — records participate,
+            // uncleared ones are excluded by omission.
             let vault = match load_vault_for_reads(&root, json, false) {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
@@ -2627,10 +2626,9 @@ fn cmd_find(
             "find requires a non-empty query",
         )));
     }
-    // Operator mode (#572) loads through the operator decrypt path (the
-    // same mechanism as `record show --for-edit`); the default stays the
-    // agent read path (`no-ai` records come back as keyless shells and are
-    // then excluded by the §12 allowlist).
+    // Operator mode (#572) loads through the operator read path (the same
+    // mechanism as `record show --for-edit`); the default stays the agent
+    // read path (`no-ai` records are then excluded by the §12 allowlist).
     let vault = match load_vault_for_reads(root, json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -2786,10 +2784,13 @@ pub(crate) fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
     if ignored {
         Ok(())
     } else {
-        Err(DomainError::reindex_not_ignored(
-            &[".confidant/".to_string()],
-            &root.display().to_string(),
-        ))
+        Err(DomainError::config(
+            "refusing to write under `.confidant/`: not git-ignored in this vault",
+        )
+        .with_fix(format!(
+            "Add `.confidant/` to the vault's .gitignore, e.g.: (cd {} && echo '.confidant/' >> .gitignore), then retry",
+            root.display()
+        )))
     }
 }
 
@@ -2978,9 +2979,9 @@ fn person_resolve_error(
 }
 
 /// Resolve a `--person` / positional person argument: a `p-<ULID>` against
-/// the already-loaded write vault (its id and type sit in the plaintext
-/// envelope header, so a `no-ai: true` person stays addressable by id without
-/// decrypting), or an exact display name against the `for_reads` cleared set.
+/// the already-loaded write vault (its id and type come from plaintext front
+/// matter, so a `no-ai: true` person stays addressable by id), or an exact
+/// display name against the `for_reads` cleared set.
 ///
 /// An id miss in the write vault is not a confident not-found: the id
 /// could belong to a record the read path could not search, so the miss
@@ -3098,12 +3099,10 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
 /// the existing line's vault-relative file and line number when an
 /// identical line is already in the ledger, so the refusal can point at
 /// it. The caller runs this after building the canonical request but
-/// before applying or queueing anything, so a refusal writes nothing and
-/// queues nothing. `note:` and `src:` never make a line distinct — a
+/// before applying anything, so a refusal writes nothing.
+/// `note:` and `src:` never make a line distinct — a
 /// backfill that re-adds the same contact with a fresh note or
-/// provenance is still the same touchpoint. Lines already queued to the
-/// inbox are not visible here (they are encrypted to the inbox key);
-/// the drain skips them instead (see `plan_item`'s semantic check).
+/// provenance is still the same touchpoint.
 fn find_duplicate_touch(
     vault: &confidant_core::Vault,
     person: &RecordId,
@@ -3861,8 +3860,7 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
     let id = parse_note_id(id_raw, "note show")?;
     let Some(rec) = vault.records.get(&id) else {
         // A file that is on disk but did not load is a problem with that
-        // file. Only claim a decryption failure when the file really is an
-        // envelope (as `record show` does).
+        // file (as `record show` treats it).
         if let Some(rel) = note_path_for(root, &id) {
             if let Ok(bytes) = std::fs::read(root.join(&rel)) {
                 return Err(note_unreadable_error(id_raw, &rel, &bytes));
@@ -3896,15 +3894,13 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
 
 /// #557: replace an existing note's file from `--file` or the editor.
 ///
-/// The write goes through [`apply_record_write`], so in an encrypted vault
-/// it re-encrypts with a fresh nonce, runs `check` before the commit, and
-/// makes one commit — exactly like `record edit`; an unchanged body reuses
-/// the existing ciphertext and reports `unchanged` with no commit. The
+/// The write goes through [`apply_record_write`], so it runs `check` before
+/// the commit and makes one commit — exactly like `record edit`; an
+/// unchanged body reports `unchanged` with no commit. The
 /// target path is the note's existing location, never a path the caller or
 /// the edited text chose: a note's `person:` must keep matching its
-/// directory (a change re-routes the client key and, in an encrypted
-/// vault, is invisible to the post-write `check`, so it is refused before
-/// encryption).
+/// directory (a change would silently re-home the note, so it is refused
+/// before the write).
 fn cmd_note_edit(
     cli: &Cli,
     root: &Path,
@@ -4222,8 +4218,8 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
 /// Without `--for-operator` the vault loads through the agent read path and
 /// the roster is the §12 cleared set, so `no-ai: true` records are absent
 /// (never present with a nulled name). With `--for-operator` the operator
-/// decrypt path is used (`RecordDecryptor::for_edit`, the same mechanism as
-/// `record show --for-edit`) and entries carry the tri-state `no_ai`
+/// read path is used (the same mechanism as `record show --for-edit`) and
+/// entries carry the tri-state `no_ai`
 /// (`"true"` | `"notes"` | `"false"`) the #559 ruling specifies.
 fn cmd_record_list(
     cli: &Cli,
@@ -4427,10 +4423,10 @@ fn cmd_record_resolve(
     }
     if let Some(side) = take {
         // #454: install one side byte for byte, stage it, print the next
-        // git step. Both sides were decrypted by `load_sides`, so the
+        // git step. Both sides were read by `load_sides`, so the
         // operator has seen what they discard (CD7).
         let sides = load_sides(root, &id)?;
-        // #465: `--dry-run` verifies both sides are decryptable (same
+        // #465: `--dry-run` verifies both sides are readable (same
         // CD7 read the real write needs) but writes nothing.
         if cli.dry_run {
             return print_resolve_dry_run(
@@ -4475,7 +4471,7 @@ fn cmd_record_resolve(
     // interface does not change when they land.
     if let Some(merged_path) = merged_file {
         // #455: hand-merge from a file outside the vault. The operator's
-        // file is validated like `record edit --file` and re-encrypted
+        // file is validated like `record edit --file` and written
         // through the same path; it is staged, never committed (CD6).
         let sides = load_sides(root, &id)?;
         // CD5: refuse ANY path inside the vault tree, no `.confidant/`
@@ -4488,7 +4484,7 @@ fn cmd_record_resolve(
                 canonical.display()
             )))
         })?;
-        // #473: refuse an unfinished merge before it is re-encrypted.
+        // #473: refuse an unfinished merge before it is written.
         refuse_merged_conflict_markers(&text, &format!("the merged file {}", canonical.display()))
             .map_err(anyhow::Error::new)?;
         let provisional = canonical
@@ -4516,9 +4512,8 @@ fn cmd_record_resolve(
                 sides.path.display()
             ))));
         }
-        let rekeyed: Option<(String, String)> = None;
         // #465: `--dry-run` runs the full read-only validation above but
-        // stops before the re-encrypt/install step.
+        // stops before the install step.
         if cli.dry_run {
             return print_resolve_dry_run(
                 cli,
@@ -4534,11 +4529,11 @@ fn cmd_record_resolve(
             );
         }
         let outcome = apply_merge(root, cli.no_input, &prepared)?;
-        return print_merge_result(cli, root, &id, &outcome, rekeyed);
+        return print_merge_result(cli, root, &id, &outcome);
     }
     if edit {
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
-        // `load_sides` is the same decrypt check the real edit would do.
+        // `load_sides` is the same conflict read the real edit would do.
         if cli.dry_run {
             let sides = load_sides(root, &id)?;
             return print_resolve_dry_run(
@@ -4567,10 +4562,9 @@ fn print_merge_result(
     root: &Path,
     id: &RecordId,
     outcome: &MergeOutcome,
-    rekeyed: Option<(String, String)>,
 ) -> anyhow::Result<ExitCode> {
     if cli.json {
-        let mut obj = serde_json::json!({
+        let obj = serde_json::json!({
             "command": "record-resolve",
             "action": "merge",
             "id": id.to_string(),
@@ -4578,15 +4572,9 @@ fn print_merge_result(
             "staged": true,
             "next": outcome.next,
         });
-        if let Some((from, to)) = &rekeyed {
-            obj["rekeyed"] = serde_json::json!({ "from": from, "to": to });
-        }
         print_json(&ok_envelope(Some(root), obj))?;
     } else {
         println!("Merged {} ({}); staged.", id, outcome.path.display());
-        if let Some((from, to)) = &rekeyed {
-            println!("rekeyed {id}: {from} -> {to}");
-        }
         println!("Next: {}", outcome.next);
     }
     Ok(ExitCode::SUCCESS)
@@ -4598,8 +4586,8 @@ fn print_merge_result(
 /// Callers reach this only after read-only validation (`load_sides`,
 /// `refuse_vault_path`, reading `--merged-file`, `prepare_record_write`):
 /// the dry run fails the same way the real run would, and by this point
-/// nothing has been written — no vault file, no index entry, no scratch,
-/// no inbox change (CD6: stage only, never commit — here not even that).
+/// nothing has been written — no vault file, no index entry, no scratch
+/// (CD6: stage only, never commit — here not even that).
 struct ResolveDryRunDetail<'a> {
     /// `--take <side>`: the side spelling as printed elsewhere.
     side: Option<&'a str>,
@@ -4683,10 +4671,10 @@ fn print_resolve_dry_run(
 /// #455: `record resolve <id> --edit` — hand-merge in the operator's
 /// editor with 0600 scratch files under `.confidant/conflicts/<id>/`.
 ///
-/// Both sides are decrypted to scratch (CD7 already held by `load_sides`);
-/// `merged.md` is pre-filled with the ours plaintext. After the editor
-/// exits, the merged text goes through the shared validate → re-encrypt →
-/// stage path. Scratch is zero-overwritten and removed on every exit path
+/// Both sides are copied to scratch (CD7 already held by `load_sides`);
+/// `merged.md` is pre-filled with the ours text. After the editor
+/// exits, the merged text goes through the shared validate → stage path.
+/// Scratch is zero-overwritten and removed on every exit path
 /// via `ScratchGuard` (explicit on success, drop on error).
 fn cmd_resolve_edit(
     cli: &Cli,
@@ -4708,7 +4696,7 @@ fn cmd_resolve_edit(
             merged_path.display()
         )))
     })?;
-    // #473: refuse an unfinished merge before it is re-encrypted. The
+    // #473: refuse an unfinished merge before it is installed. The
     // guard is dropped by the `?`, cleaning the scratch up.
     refuse_merged_conflict_markers(
         &text,
@@ -4734,11 +4722,10 @@ fn cmd_resolve_edit(
             sides.path.display()
         ))));
     }
-    let rekeyed: Option<(String, String)> = None;
     let outcome = apply_merge(root, cli.no_input, &prepared)?;
     // Explicit cleanup on the success path (drop after is a no-op).
     guard.cleanup();
-    print_merge_result(cli, root, id, &outcome, rekeyed)
+    print_merge_result(cli, root, id, &outcome)
 }
 
 /// Parameters for [`prepare_record_write`], bundled to keep the
@@ -4769,7 +4756,7 @@ pub(crate) struct PrepareSpec<'a> {
 /// `pending` holds the `WriteFile` changes (the record itself, plus #410
 /// child re-stamps for a person whose `no-ai` mode changed). The caller
 /// applies it: `cmd_record_edit` via [`apply_record_write_inner`] (which
-/// commits), the resolve path by encrypting and staging each change
+/// commits), the resolve path by staging each change
 /// without committing (CD6).
 pub(crate) struct PreparedWrite {
     /// The write to apply.
@@ -4789,9 +4776,9 @@ pub(crate) struct PreparedWrite {
 ///
 /// Does not read the existing file and does not apply the write. The
 /// caller does its own fail-closed checks on the stored bytes first:
-/// `cmd_record_edit`'s ladder (conflict markers, envelope identity,
-/// rekeyed detection, decrypt), or the resolve path's `load_sides`
-/// (which already verified the conflict and decrypted both sides, CD7).
+/// `cmd_record_edit`'s ladder (conflict markers, front-matter identity),
+/// or the resolve path's `load_sides`
+/// (which already verified the conflict and read both sides, CD7).
 ///
 /// `provisional` is the filename used in parse error messages;
 /// `summary` and `canonical_prefix` label the planned write (e.g.
@@ -4814,11 +4801,10 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
                 .with_fix("Edit the record the file names, or fix `id:` in the file"),
         ));
     }
-    // `record add` validates `with:` shape before encrypting, and an edit
-    // must too: in an encrypted vault the post-write `check` cannot see
-    // inside the envelope, so a malformed list would be committed and later
-    // block `keys shred` (which refuses when an interaction's `with:` will
-    // not parse). Touchpoints are not mirrored on an edit — see the PR notes.
+    // `record add` validates `with:` shape before writing, and an edit
+    // must too: a malformed list would be committed and later
+    // block downstream reads. Touchpoints are not mirrored on an edit — see
+    // the PR notes.
     if rec.kind == RecordKind::Interaction {
         if let Some(raw) = rec.field("with") {
             let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
@@ -4898,9 +4884,9 @@ fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<Pr
 
 /// #216: replace an existing main record's file from a markdown file.
 ///
-/// The write goes through [`apply_record_write`], so in an encrypted vault
-/// it encrypts, runs `check` before the commit, and makes one commit —
-/// exactly like `record add`. The target path is derived from the record's
+/// The write goes through [`apply_record_write`], so it runs `check` before
+/// the commit and makes one commit — exactly like `record add`. The target
+/// path is derived from the record's
 /// id, never from the path the caller passed, and the file's own `id:` must
 /// match the id argument so a wrong file cannot silently clobber a record.
 fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
@@ -4926,7 +4912,7 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         .unwrap_or_else(|| "record.md".to_owned());
     // Shared validation + write planning (#455). The fail-closed ladder
     // below is edit-specific: the resolve path already verified the
-    // conflict and decrypted both sides via `load_sides` (CD7).
+    // conflict and read both sides via `load_sides` (CD7).
     let prepared = prepare_record_write(
         root,
         PrepareSpec {
@@ -4957,9 +4943,9 @@ fn cmd_context(
     include_private: bool,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
-    // Operator mode (#572) loads through the operator decrypt path (the
-    // same mechanism as `record show --for-edit`); the default stays the
-    // agent read path.
+    // Operator mode (#572) loads through the operator read path (the same
+    // mechanism as `record show --for-edit`); the default stays the agent
+    // read path.
     let vault = match load_vault_for_reads(root, cli.json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -5018,10 +5004,6 @@ fn cmd_context(
         // mistaken for the whole record.
         if !bundle.scope.is_empty() && matches!(scope, PackScope::Only(_)) {
             println!("scope: {}", bundle.scope.join(", "));
-        }
-        if let Some(c) = &bundle.coaching {
-            println!("sessions remaining: {}", c.sessions_remaining);
-            println!("icf hours: {:.2}", c.icf_hours);
         }
         println!(
             "notes: {}, interactions: {}, touchpoints: {}",
@@ -5303,16 +5285,14 @@ fn parse_git_version(output: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Build the `git-version` doctor check from a parsed `git --version`
-/// result. `has_signers` is whether the user config lists `[trust]`
-/// signers: below the floor that means signature verification is in use
-/// and the check is an `error`; with no signers configured it is a
-/// `warning`, since nothing verifies signatures today. `None` (git
-/// missing or unparseable output) is `unknown` (#709, following the
-/// #174 precedent it generalizes): the `git-repo` check already errors
-/// when the vault is not a git repository, and an unparseable version
-/// string is an odd environment, not a known-bad git. `unknown` is
-/// warning-tier, so it never fails `doctor`.
-fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -> DoctorCheck {
+/// result. Below the floor the check is a `warning`: nothing verifies
+/// signatures today, so an old git is a portability nudge, not a vault
+/// defect. `None` (git missing or unparseable output) is `unknown` (#709,
+/// following the #174 precedent it generalizes): the `git-repo` check
+/// already errors when the vault is not a git repository, and an
+/// unparseable version string is an odd environment, not a known-bad git.
+/// `unknown` is warning-tier, so it never fails `doctor`.
+fn git_version_check_from(version: Option<(u64, u64, u64)>) -> DoctorCheck {
     let floor = format!(
         "{}.{}.{}",
         MIN_GIT_VERSION.0, MIN_GIT_VERSION.1, MIN_GIT_VERSION.2
@@ -5326,7 +5306,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
         },
         Some(v) => DoctorCheck {
             id: "git-version",
-            status: if has_signers { "error" } else { "warning" },
+            status: "warning",
             message: format!(
                 "git {}.{}.{} is below the minimum {floor}; upgrade git to >= {floor}",
                 v.0, v.1, v.2
@@ -5345,14 +5325,14 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
 /// The `git-version` doctor check: runs `git --version` and compares
 /// against `MIN_GIT_VERSION`. See `git_version_check_from` for the
 /// status rules.
-fn git_version_check(has_signers: bool) -> DoctorCheck {
+fn git_version_check() -> DoctorCheck {
     let version = std::process::Command::new("git")
         .arg("--version")
         .output()
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| parse_git_version(&String::from_utf8_lossy(&out.stdout)));
-    git_version_check_from(version, has_signers)
+    git_version_check_from(version)
 }
 
 fn skills_links_check() -> DoctorCheck {
@@ -6261,7 +6241,6 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
                 "upstream": upstream,
                 "ahead": state.ahead,
                 "behind": state.behind,
-                "crypto_mode": "plaintext",
                 "fetched": fetched,
                 "dry_run": cli.dry_run,
                 "action": action,
@@ -6372,7 +6351,7 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
 
     // #174: minimum git version. Confidant shells out to git, so a very
     // old client is reported.
-    checks.push(git_version_check(false));
+    checks.push(git_version_check());
 
     // #660: remote visibility. Read-only and offline.
     checks.push(git_remote_check(root, cli.no_input));
@@ -8885,25 +8864,22 @@ origin\tssh://git@host.example/org/repo.git (push)
     #[test]
     fn git_version_check_status_rules() {
         // At or above the floor is ok either way.
-        let c = git_version_check_from(Some(MIN_GIT_VERSION), true);
+        let c = git_version_check_from(Some(MIN_GIT_VERSION));
         assert_eq!(c.status, "ok");
         assert!(c.message.contains("2.34.0"));
-        let c = git_version_check_from(Some((2, 50, 0)), false);
+        let c = git_version_check_from(Some((2, 50, 0)));
         assert_eq!(c.status, "ok");
 
-        // Below the floor: error with signers (signature verification in
-        // use), warning without (nothing verifies signatures).
-        let c = git_version_check_from(Some((2, 33, 0)), true);
-        assert_eq!(c.status, "error");
-        assert!(c.message.contains("upgrade git to >= 2.34.0"));
-        assert!(c.message.contains("upgrade git to >="));
-        let c = git_version_check_from(Some((2, 33, 0)), false);
+        // Below the floor: a warning, never an error (nothing here verifies
+        // signatures).
+        let c = git_version_check_from(Some((2, 33, 0)));
         assert_eq!(c.status, "warning");
         assert!(c.message.contains("upgrade git to >= 2.34.0"));
+        assert!(c.message.contains("upgrade git to >="));
 
         // Undetermined version is `unknown` (#709), warning-tier, never
         // an error and never `ok`.
-        let c = git_version_check_from(None, true);
+        let c = git_version_check_from(None);
         assert_eq!(c.status, "unknown");
     }
 

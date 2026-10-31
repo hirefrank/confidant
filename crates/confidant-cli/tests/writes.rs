@@ -83,11 +83,9 @@ fn commits(root: &Path) -> usize {
 }
 
 fn run_json(args: &[&str]) -> (bool, Value) {
-    // Hermetic HOME: Windows CI runners don't set HOME, and doctor's
-    // crypto-manifests check errors without a config dir. A fresh tempdir
-    // per call is fine — no test here persists anchor state across calls.
-    // The keychain is disabled too (#541): `doctor` probes it for device
-    // enrollment, and these plaintext fixtures never need real keys.
+    // Hermetic HOME: Windows CI runners don't set HOME, and `doctor` needs
+    // a config dir. A fresh tempdir per call is fine — no test here
+    // persists state across calls.
     let tmp_home = tempfile::tempdir().unwrap();
     let out = Command::new(bin())
         .args(args)
@@ -116,7 +114,6 @@ fn run_raw(args: &[&str]) -> (bool, String, String) {
     let out = Command::new(bin())
         .args(args)
         .env("HOME", tmp_home.path())
-        // #541: doctor probes the keychain; keep the suite off the real one.
         .output()
         .unwrap();
     (
@@ -210,7 +207,7 @@ fn log_session_dry_run_touches_nothing() {
     assert_eq!(commits(root), 1, "no commit on dry run");
     let after = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
     assert_eq!(before, after, "no file change on dry run");
-    // The logical change is shown, never ciphertext.
+    // The logical change is shown as plaintext record text.
     let content = v["changes"][0]["content"].as_str().unwrap();
     assert!(content.contains(&format!("session {PERSON} 60m paid")));
 }
@@ -1248,9 +1245,8 @@ fn note_edit_check_failure_rolls_back_and_commits_nothing() {
 
 #[test]
 fn note_edit_refuses_a_person_that_does_not_match_the_path() {
-    // A person change would re-route the note to another client key and,
-    // in an encrypted vault, is invisible to the post-write check. Refuse
-    // before encrypting.
+    // A person change would silently re-home the note away from the
+    // directory its path promises. Refuse before writing.
     let dir = make_vault();
     let root = dir.path();
     let vroot = vault_arg(root);

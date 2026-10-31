@@ -26,12 +26,10 @@ pub struct Entry {
 
 /// The command catalog, in browse order (used verbatim for an empty query).
 ///
-/// Every write-ish entry (`person.new`, `capture.*`, `record.edit`,
-/// `inbox.apply`) routes through a flow that previews with `--dry-run` and
-/// waits for an explicit `y`. `inbox.apply` re-runs the dry run and opens the
-/// confirm only when it succeeded, so a palette launch is never staler than
-/// pressing `a` on the tab. `record.edit` is refused outside People and the
-/// Context view, where the operator can see the context it would edit.
+/// Every write-ish entry (`person.new`, `capture.*`, `record.edit`) routes
+/// through a flow that previews with `--dry-run` and waits for an explicit
+/// `y`. `record.edit` is refused outside People and the Context view, where
+/// the operator can see the context it would edit.
 pub const ENTRIES: &[Entry] = &[
     Entry {
         id: "workspace.people",
@@ -51,11 +49,6 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         id: "view.proposals",
         label: "Proposals",
-        group: "Go",
-    },
-    Entry {
-        id: "view.inbox",
-        label: "Inbox",
         group: "Go",
     },
     Entry {
@@ -106,11 +99,6 @@ pub const ENTRIES: &[Entry] = &[
     Entry {
         id: "record.edit",
         label: "Edit the selected record or note",
-        group: "Write",
-    },
-    Entry {
-        id: "inbox.apply",
-        label: "Apply inbox (dry run, then y)",
         group: "Write",
     },
     Entry {
@@ -328,11 +316,11 @@ mod tests {
         let labels: Vec<&str> = filtered("session").iter().map(|entry| entry.id).collect();
         assert!(labels.contains(&"capture.session"));
 
-        let ids: Vec<&str> = filtered("view.inbox")
+        let ids: Vec<&str> = filtered("view.conflicts")
             .iter()
             .map(|entry| entry.id)
             .collect();
-        assert_eq!(ids.first(), Some(&"view.inbox"));
+        assert_eq!(ids.first(), Some(&"view.conflicts"));
 
         let groups: Vec<&str> = filtered("write").iter().map(|entry| entry.id).collect();
         assert!(groups.contains(&"capture.note"));

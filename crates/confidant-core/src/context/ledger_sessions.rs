@@ -37,7 +37,7 @@
 //!
 //! The view reads **only** ledger metadata: verbs, dates, opaque ids and the
 //! pack's own balance metrics. There is no record field, no profile, no
-//! note/interaction body and no decrypted content in it. That is why the
+//! note/interaction body and no record content in it. That is why the
 //! `no-ai` §12 cleared set does not gate it and why `--exclude-private`
 //! leaves it byte-identical: there is nothing in it for either to remove.
 //! Spec §13.9 pins `[context]` to exactly this freedom; a future builder
@@ -65,21 +65,6 @@ use crate::vault::Vault;
 /// The one core view kind a `[context]` table may name today (spec §13.9).
 pub const LEDGER_SESSIONS_VIEW: &str = "ledger-sessions";
 
-/// The pack whose row is the legacy top-level `coaching` alias (ADR-7).
-///
-/// The shipped external `coaching@0.1` pack since #449 owns the alias. Any
-/// other `[context]` pack serves its own `packs` entry only — a different
-/// pack that happens to serve the same `ledger-sessions` kind must **not**
-/// populate the legacy alias.
-pub(crate) const LEGACY_COACHING_PACK: &str = "coaching";
-
-/// Whether a pack's `name@version` is the coaching pack that owns the legacy
-/// `coaching` alias. Keyed on the base name only; origin and version do not
-/// matter (see [`LEGACY_COACHING_PACK`]).
-pub(crate) fn owns_legacy_coaching_alias(name: &str) -> bool {
-    name.split('@').next() == Some(LEGACY_COACHING_PACK)
-}
-
 /// How many recent sessions the view keeps when `[context].recent_limit` is
 /// omitted.
 pub(crate) const DEFAULT_RECENT_LIMIT: usize = 10;
@@ -94,9 +79,8 @@ pub struct RecentSession {
 
 /// Merge-aware coaching facts for the person.
 ///
-/// This is the agent-contract shape of the legacy `coaching` field and the
-/// `[context]` pack's `packs` entry (ADR-7): declaration order here is the
-/// serialization order of the `PersonContext::coaching` field.
+/// This is the `[context]` pack's `packs` entry (ADR-7): declaration order
+/// here is the serialization order of that entry.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LedgerSessionsView {
     pub sessions_remaining: i64,
@@ -267,24 +251,4 @@ fn billing_tag(entry: &LedgerEntry) -> Option<String> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::owns_legacy_coaching_alias;
-
-    /// #594: the legacy `coaching` alias is keyed on the pack's base name, so
-    /// a `[context]` pack under any other name (e.g. the `coaching-ext`
-    /// fixture) can never own it, and a future coaching pack at any version
-    /// or origin does.
-    #[test]
-    fn legacy_coaching_alias_is_keyed_on_the_base_name() {
-        assert!(owns_legacy_coaching_alias("coaching@0.1"));
-        assert!(owns_legacy_coaching_alias("coaching@2.0"));
-        assert!(owns_legacy_coaching_alias("coaching"));
-        assert!(!owns_legacy_coaching_alias("coaching-ext@0.1"));
-        assert!(!owns_legacy_coaching_alias("coachingext@0.1"));
-        assert!(!owns_legacy_coaching_alias("personal@0.2"));
-        assert!(!owns_legacy_coaching_alias(""));
-    }
 }

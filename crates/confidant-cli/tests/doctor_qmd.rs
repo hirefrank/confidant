@@ -45,7 +45,7 @@ fn give_child_git_identity(cmd: &mut Command) {
 /// (no network).
 fn run_doctor(vault: &Path, path: &std::ffi::OsStr, extra_env: &[(&str, &str)]) -> Value {
     // A hermetic HOME: Windows CI runners don't set HOME, and without it
-    // the crypto-manifests check errors (config dir unknown).
+    // the config-dir checks error.
     let tmp_home = tempfile::tempdir().unwrap();
     run_doctor_home(vault, path, extra_env, tmp_home.path())
 }

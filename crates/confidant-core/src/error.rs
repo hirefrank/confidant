@@ -39,32 +39,6 @@ pub enum ErrorKind {
     Usage,
     /// An idempotency key was reused with different content.
     IdempotencyConflict,
-    /// `confidant inbox` refused: the working tree is not clean.
-    InboxDirty,
-    /// `confidant inbox` refused: the inbox branch tip is not signed by a
-    /// trusted signer.
-    InboxUntrusted,
-    /// `confidant inbox` refused: an inbox item is malformed or undecryptable.
-    InboxItem,
-    /// `confidant inbox` refused: an item targets a path that already exists
-    /// with different content.
-    InboxConflict,
-    /// `confidant inbox` refused: the merged content fails `check`.
-    InboxCheckFailed,
-    /// `confidant inbox` cannot decrypt: milestone 2 crypto is a stub.
-    InboxCrypto,
-    /// `confidant inbox` refused: the inbox branch moved between reading
-    /// items and clearing them (TOCTOU).
-    InboxRace,
-    /// `confidant inbox` refused: a `--skip` name is not on the inbox
-    /// branch tip. Fail closed on typos rather than merging an item the
-    /// operator meant to defer.
-    InboxSkip,
-    /// `confidant reindex` refused to build the search corpus: encrypted
-    /// records this device cannot read, or the corpus path is not
-    /// git-ignored. A corpus that silently omits records is worse than no
-    /// corpus, so this fails closed instead of building a partial one.
-    ReindexRefused,
     /// `confidant sync` found no remote or no upstream branch to compare
     /// with. Local-only is a valid setup, so this is not a vault defect.
     NoRemote,
@@ -79,27 +53,10 @@ pub enum ErrorKind {
     /// `--person` / `resolve` matched more than one cleared person by exact
     /// display name. Fail closed: the caller must disambiguate.
     AmbiguousPerson,
-    /// A person lookup could not search the vault: encrypted records went
-    /// unread (no usable key material) or envelopes were refused. A miss
-    /// against that partial set must never be reported as `NotFound` (#717).
+    /// A person lookup could not search the vault: person record files were
+    /// unreadable. A miss against that partial set must never be reported as
+    /// `NotFound` (#717).
     CannotSearch,
-    /// `keys verify-recovery` found a phrase that a later `recover` or
-    /// `keys shred` replaced. The derived recipient is in the vault's
-    /// append-only recovery history but is not the anchor's current one.
-    /// It still opens history; the operator must destroy that copy.
-    RecoveryRetired,
-    /// `keys verify-recovery` found a phrase that does not match the trust
-    /// anchor or the operator certificate.
-    RecoveryMismatch,
-    /// `keys verify-recovery` could not parse the 24-word phrase (wrong
-    /// word count, a word outside the BIP39 list, or a bad checksum). The
-    /// word-position hint stays on stderr; the JSON message never carries
-    /// it.
-    RecoveryMalformed,
-    /// `keys verify-recovery` matched the pinned public halves but could
-    /// not trial-unwrap a current data key through the phrase identity
-    /// (missing or tampered wrapping, or a commitment mismatch).
-    RecoveryUnwrap,
     /// Unclassified failure. Reserved; never match on its message.
     Internal,
 }
@@ -118,33 +75,14 @@ impl ErrorKind {
             Self::LedgerUnreadable => "E_LEDGER_UNREADABLE",
             Self::Usage => "usage_error",
             Self::IdempotencyConflict => "E_IDEMPOTENCY_CONFLICT",
-            Self::InboxDirty => "E_INBOX_DIRTY",
-            Self::InboxUntrusted => "E_INBOX_UNTRUSTED",
-            Self::InboxItem => "E_INBOX_ITEM",
-            Self::InboxConflict => "E_INBOX_CONFLICT",
-            Self::InboxCheckFailed => "E_INBOX_CHECK_FAILED",
-            Self::InboxCrypto => "E_INBOX_CRYPTO",
-            Self::InboxRace => "E_INBOX_RACE",
-            Self::InboxSkip => "E_INBOX_SKIP",
-            Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::NoRemote => "E_NO_REMOTE",
             Self::NotFastForward => "E_NOT_FAST_FORWARD",
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
             Self::CannotSearch => "E_CANNOT_SEARCH",
-            Self::RecoveryRetired => "E_RECOVERY_RETIRED",
-            Self::RecoveryMismatch => "E_RECOVERY_MISMATCH",
-            Self::RecoveryMalformed => "E_RECOVERY_MALFORMED",
-            Self::RecoveryUnwrap => "E_RECOVERY_UNWRAP",
             Self::Internal => "internal_error",
         }
     }
-}
-
-/// First 12 hex chars of a commit SHA for error messages (unambiguous,
-/// still readable).
-fn short_sha(sha: &str) -> &str {
-    &sha[..sha.len().min(12)]
 }
 
 /// A classified failure with optional file, line, and fix (ADR-7).
@@ -243,54 +181,36 @@ impl DomainError {
     }
 
     /// A person lookup miss against a vault that did not load in full
-    /// (#717). The message names the cause and the counts, and states
+    /// (#717). The message names the cause and the count, and states
     /// plainly that the miss does not establish absence; it never claims
-    /// the person is not in the vault. The fix names the actual remedy
-    /// for each cause: missing key material (trust anchor / device key)
-    /// for skips, git-history restore (or a backup, for a vault without
-    /// git history) for refused envelopes. It deliberately does not
-    /// suggest `recover`: recovery is only for when every enrolled
-    /// device is lost, and it rotates keys — the field case (#713) was
-    /// a device whose anchor was simply absent.
+    /// the person is not in the vault. The fix names the actual remedy:
+    /// restore the affected record from git history (or a backup, for a
+    /// vault without git history).
+    ///
+    /// `skipped` and `refused` are the record-reading counters callers
+    /// already carry; both mean "this person record file could not be
+    /// read", so the message reports their sum.
     pub fn cannot_search(skipped: u32, refused: u32) -> Self {
-        let mut parts = Vec::new();
-        let mut fixes = Vec::new();
-        if skipped > 0 {
-            parts.push(format!(
-                "{skipped} encrypted record(s) could not be decrypted on this device"
-            ));
-            fixes.push(
-                "check this device's key material: the trust anchor (trust.toml) \
-                 and device key (CONFIDANT_DEVICE_KEY) must both be present for \
-                 this vault, or re-establish them from an enrolled device",
-            );
-        }
-        if refused > 0 {
-            parts.push(format!(
-                "{refused} envelope(s) were refused as tampered or corrupt"
-            ));
-            fixes.push(
-                "an envelope failed authentication (tampered or corrupt); restore \
-                 the affected record from git history, or from a backup if the \
-                 vault has no git history",
-            );
-        }
-        if parts.is_empty() {
+        let unreadable = skipped.saturating_add(refused);
+        let cause = if unreadable > 0 {
+            format!("{unreadable} person record file(s) unreadable")
+        } else {
             // The constructor is public, so a (0, 0) call can happen even
             // though every real caller passes a nonzero count; never
-            // render an empty cause list or a fix of "; then retry".
-            parts.push("the vault could not be fully searched".to_owned());
-            fixes.push("check this device's key material and restore any unread records");
-        }
+            // render an empty cause list.
+            "the vault could not be fully searched".to_owned()
+        };
         Self::new(
             ErrorKind::CannotSearch,
             format!(
-                "cannot search the vault: {}; a miss against a partially unread \
-                 vault does not mean the person is absent",
-                parts.join(", ")
+                "cannot search the vault: {cause}; a miss against a partially unread \
+                 vault does not mean the person is absent"
             ),
         )
-        .with_fix(format!("{}; then retry", fixes.join("; ")))
+        .with_fix(
+            "Restore the affected record from git history, or from a backup if the \
+             vault has no git history; then retry",
+        )
     }
 
     pub fn vault_not_found() -> Self {
@@ -303,57 +223,6 @@ impl DomainError {
             .with_fix(
                 "Fix permissions or replace the unreadable ledger file, then run `confidant check` to locate it",
             )
-    }
-
-    /// `confidant reindex` refused: encrypted records this device cannot
-    /// decrypt would be silently omitted from the corpus (worse than no
-    /// corpus, because search would look complete).
-    pub fn reindex_unreadable(skipped: u32, refused: u32) -> Self {
-        let mut parts = Vec::new();
-        let mut fixes = Vec::new();
-        if skipped > 0 {
-            parts.push(format!(
-                "{skipped} encrypted record(s) could not be decrypted"
-            ));
-            fixes.push(
-                "run `confidant init` (new vault), clone this vault and `confidant keys \
-                 device-add` (another device), or `confidant recover` only if every \
-                 enrolled device is lost",
-            );
-        }
-        if refused > 0 {
-            parts.push(format!(
-                "{refused} envelope(s) were refused as tampered or corrupt"
-            ));
-            fixes.push(
-                "an envelope failed authentication (tampered or corrupt); restore \
-                 the affected record from git history, or from a backup if the \
-                 vault has no git history",
-            );
-        }
-        Self::new(
-            ErrorKind::ReindexRefused,
-            format!("refusing to build the search corpus: {}", parts.join(", ")),
-        )
-        .with_fix(format!(
-            "{}; then re-run `confidant reindex`",
-            fixes.join("; ")
-        ))
-    }
-
-    /// `confidant reindex` refused: the corpus path is not git-ignored in
-    /// the vault's repo, so one `git add -A` could commit a plaintext mirror.
-    pub fn reindex_not_ignored(paths: &[String], vault: &str) -> Self {
-        Self::new(
-            ErrorKind::ReindexRefused,
-            format!(
-                "refusing to build the search corpus: not git-ignored in this vault: {}",
-                paths.join(", ")
-            ),
-        )
-        .with_fix(format!(
-            "Add `.confidant/` to the vault's .gitignore, e.g.: (cd {vault} && echo '.confidant/' >> .gitignore), then re-run `confidant reindex`"
-        ))
     }
 
     /// `confidant sync` has nothing to compare against: no remote, or a
@@ -379,83 +248,6 @@ impl DomainError {
         .with_fix(
             "Merge or rebase the branch explicitly, then re-run `confidant sync`; \
              auto-merge and forced pushes are never used",
-        )
-    }
-
-    pub fn inbox_dirty() -> Self {
-        Self::new(
-            ErrorKind::InboxDirty,
-            "working tree is not clean; `confidant inbox` refuses to merge",
-        )
-        .with_fix("Commit or stash your changes, then run `confidant inbox` again")
-    }
-
-    pub fn inbox_untrusted(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InboxUntrusted, detail.into()).with_fix(
-            "Push the inbox branch from a device whose signing key is in [trust] signers, or add the signer",
-        )
-    }
-
-    pub fn inbox_item(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InboxItem, detail.into()).with_fix(
-            "Fix or remove the item on the inbox branch, then run `confidant inbox` again",
-        )
-    }
-
-    pub fn inbox_conflict(path: impl Into<String>) -> Self {
-        Self::new(
-            ErrorKind::InboxConflict,
-            format!("inbox item targets '{}' which already exists with different content", path.into()),
-        )
-        .with_fix("Resolve the conflict manually (merge the two versions), then run `confidant inbox` again")
-    }
-
-    pub fn inbox_check_failed(summary: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InboxCheckFailed, summary.into()).with_fix(
-            "Fix the inbox items so `confidant check` passes, then run `confidant inbox` again",
-        )
-    }
-
-    pub fn inbox_crypto(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InboxCrypto, detail.into()).with_fix(
-            "Inbox decryption needs the milestone 2 crypto implementation; until then the inbox cannot be merged",
-        )
-    }
-
-    pub fn inbox_race(expected_tip: &str, actual_tip: &str) -> Self {
-        Self::new(
-            ErrorKind::InboxRace,
-            format!(
-                "inbox branch moved during the run (tip {} -> {}); refusing to clear",
-                short_sha(expected_tip),
-                short_sha(actual_tip),
-            ),
-        )
-        .with_fix(
-            "Re-run `confidant inbox`; the new items will be picked up and already-merged items are idempotent",
-        )
-    }
-
-    pub fn inbox_signing_unconfigured() -> Self {
-        Self::new(
-            ErrorKind::InboxUntrusted,
-            "`confidant inbox` will not create unsigned merge/clear commits: commit signing is not configured (ADR-10)",
-        )
-        .with_fix(
-            "Configure commit signing (`git config commit.gpgsign true` and a `user.signingkey`), then run `confidant inbox` again",
-        )
-    }
-
-    pub fn inbox_skip(name: impl Into<String>) -> Self {
-        Self::new(
-            ErrorKind::InboxSkip,
-            format!(
-                "unknown --skip name '{}': not on the inbox branch tip; refusing rather than merging an item the operator meant to defer",
-                name.into()
-            ),
-        )
-        .with_fix(
-            "List the inbox branch tip and pass exact item stems to --skip",
         )
     }
 
@@ -624,14 +416,6 @@ mod tests {
         );
         assert_eq!(DomainError::vault_not_found().code(), "E_VAULT_NOT_FOUND");
         assert_eq!(DomainError::vault_not_found().exit_code(), 1);
-        assert_eq!(
-            DomainError::reindex_unreadable(3, 1).code(),
-            "E_REINDEX_REFUSED"
-        );
-        assert_eq!(DomainError::reindex_unreadable(3, 1).exit_code(), 1);
-        assert!(DomainError::reindex_unreadable(3, 1)
-            .message()
-            .contains("3 encrypted record(s)"));
         assert_eq!(DomainError::no_remote("x").code(), "E_NO_REMOTE");
         assert_eq!(
             DomainError::not_fast_forward(1, 2).code(),
@@ -640,12 +424,6 @@ mod tests {
         assert!(DomainError::not_fast_forward(1, 2)
             .message()
             .contains("1 local commit(s)"));
-        // A tampered-only refusal gets a fix that does not suggest
-        // init/recover (re-enrolling the device cannot fix a corrupt
-        // envelope).
-        let refused_only = DomainError::reindex_unreadable(0, 2);
-        assert!(!refused_only.fix().unwrap_or("").contains("init"));
-        assert!(refused_only.fix().unwrap_or("").contains("tampered"));
         assert_eq!(
             DomainError::of(&usage("bad flag")).map(DomainError::exit_code),
             Some(2)
@@ -656,41 +434,6 @@ mod tests {
         );
         assert_eq!(DomainError::config("bad toml").code(), "E_CONFIG");
         assert_eq!(DomainError::conflict("busy").code(), "E_CONFLICT");
-        assert_eq!(DomainError::inbox_dirty().code(), "E_INBOX_DIRTY");
-        assert_eq!(
-            DomainError::inbox_untrusted("x").code(),
-            "E_INBOX_UNTRUSTED"
-        );
-        assert_eq!(DomainError::inbox_item("x").code(), "E_INBOX_ITEM");
-        assert_eq!(DomainError::inbox_conflict("p").code(), "E_INBOX_CONFLICT");
-        assert_eq!(
-            DomainError::inbox_check_failed("x").code(),
-            "E_INBOX_CHECK_FAILED"
-        );
-        assert_eq!(DomainError::inbox_crypto("x").code(), "E_INBOX_CRYPTO");
-        assert_eq!(
-            DomainError::inbox_race(
-                "0123456789abcdef0123456789abcdef01234567",
-                "89abcdef0123456789abcdef0123456789abcdef"
-            )
-            .code(),
-            "E_INBOX_RACE"
-        );
-        assert!(DomainError::inbox_race("aaa", "bbb")
-            .message()
-            .contains("refusing to clear"));
-        assert_eq!(
-            DomainError::inbox_signing_unconfigured().code(),
-            "E_INBOX_UNTRUSTED"
-        );
-        assert_eq!(DomainError::inbox_skip("01NOPE").code(), "E_INBOX_SKIP");
-        assert!(DomainError::inbox_skip("01NOPE")
-            .message()
-            .contains("refusing rather than merging"));
-        assert!(DomainError::inbox_signing_unconfigured()
-            .fix()
-            .unwrap()
-            .contains("commit.gpgsign"));
         assert_eq!(
             DomainError::spec_unsupported("9.9").code(),
             "E_SPEC_UNSUPPORTED"
@@ -706,15 +449,23 @@ mod tests {
         let unsearchable = DomainError::cannot_search(19, 0);
         assert_eq!(unsearchable.code(), "E_CANNOT_SEARCH");
         assert_eq!(unsearchable.exit_code(), 1);
-        assert!(unsearchable.message().contains("19 encrypted record(s)"));
+        assert!(unsearchable
+            .message()
+            .contains("19 person record file(s) unreadable"));
         assert!(unsearchable.message().contains("does not mean"));
         assert!(!unsearchable.message().contains("no person matches"));
-        assert!(unsearchable.fix().unwrap().contains("trust.toml"));
-        assert!(unsearchable.fix().unwrap().contains("CONFIDANT_DEVICE_KEY"));
-        assert!(!unsearchable.fix().unwrap_or("").contains("recover"));
+        assert!(unsearchable.fix().unwrap().contains("git history"));
+        assert!(unsearchable.fix().unwrap().contains("backup"));
+        assert!(!unsearchable.fix().unwrap_or("").contains("trust.toml"));
+        assert!(!unsearchable
+            .fix()
+            .unwrap_or("")
+            .contains("CONFIDANT_DEVICE_KEY"));
         let refused_only = DomainError::cannot_search(0, 2);
         assert_eq!(refused_only.code(), "E_CANNOT_SEARCH");
-        assert!(refused_only.message().contains("2 envelope(s)"));
+        assert!(refused_only
+            .message()
+            .contains("2 person record file(s) unreadable"));
         assert!(refused_only.fix().unwrap().contains("git history"));
         assert!(refused_only.fix().unwrap().contains("backup"));
         assert!(!refused_only.fix().unwrap_or("").contains("trust.toml"));

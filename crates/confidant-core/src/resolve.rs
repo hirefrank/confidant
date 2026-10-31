@@ -71,20 +71,16 @@ impl std::fmt::Display for PersonResolveError {
                 write!(formatter, "{} people matched", candidates.len())
             }
             Self::CannotSearch { skipped, refused } => {
-                let mut parts = Vec::new();
-                if *skipped > 0 {
-                    parts.push(format!("{skipped} encrypted record(s) unreadable"));
-                }
-                if *refused > 0 {
-                    parts.push(format!("{refused} envelope(s) refused"));
-                }
-                if parts.is_empty() {
+                let unreadable = skipped.saturating_add(*refused);
+                let cause = if unreadable > 0 {
+                    format!("{unreadable} person record file(s) unreadable")
+                } else {
                     // The constructor is public, so a (0, 0) value can
                     // exist even though `miss()` never builds one; never
                     // render an empty cause list.
-                    parts.push("the vault could not be fully searched".to_owned());
-                }
-                write!(formatter, "cannot search the vault: {}", parts.join(", "))
+                    "the vault could not be fully searched".to_owned()
+                };
+                write!(formatter, "cannot search the vault: {cause}")
             }
         }
     }
@@ -418,7 +414,8 @@ mod tests {
             resolve_person(&vault, "Hidden Person"),
             Err(PersonResolveError::NotFound)
         );
-        // The id still resolves (id indexes without decrypting).
+        // The id still resolves (an id lookup never consults the display
+        // name or the cleared set).
         assert_eq!(
             resolve_person(&vault, ADA),
             Ok(PersonMatch {

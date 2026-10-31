@@ -76,8 +76,8 @@ fn run_event_loop(
     // TUI never fetches, pulls, or pushes on launch; `confidant sync` is the
     // explicit network command.
     app.load_sync();
-    // Populate the Review Queue badge from launch so a queued proposal, inbox
-    // item, or conflict is visible from any workspace (#556 phase 3).
+    // Populate the Review Queue badge from launch so a queued proposal or
+    // conflict is visible from any workspace (#556 phase 3).
     app.prime_review_queue();
 
     loop {

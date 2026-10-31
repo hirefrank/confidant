@@ -81,7 +81,7 @@ struct Allowlist<'a> {
     scope: PackScope,
     /// Operator mode (#572): compute the cleared set as if `no-ai` did not
     /// exist, so an operator-only read can surface `no-ai` records. This is
-    /// the same decrypt path as `record show --for-edit` (spec §12). Never
+    /// the same operator read path as `record show --for-edit` (spec §12). Never
     /// set on an agent path; `false` is the §12 allowlist.
     operator: bool,
     /// Operator mode only (#572): ids the agent allowlist hides but the

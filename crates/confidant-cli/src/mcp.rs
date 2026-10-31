@@ -480,8 +480,8 @@ mod tests {
 
     #[test]
     fn tools_list_never_exposes_the_operator_only_record_reads() {
-        // #389 Q5 / #216: `record show --for-edit` decrypts no-ai records,
-        // and `record edit` rewrites records. Neither may be reachable from
+        // #389 Q5 / #216: `record show --for-edit` prints no-ai records in
+        // full, and `record edit` rewrites records. Neither may be reachable from
         // an agent connection, so neither appears in the tool whitelist —
         // which is the only way MCP can invoke the CLI (`call_tool` maps
         // known names to argv and rejects everything else).

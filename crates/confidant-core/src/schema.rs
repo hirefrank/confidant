@@ -186,7 +186,7 @@ pub fn contract_schema() -> Value {
                     },
                     "changes": {
                         "type": "array",
-                        "description": "Dry-run only: the logical change (ledger lines / plaintext). Never ciphertext.",
+                        "description": "Dry-run only: the logical change (ledger lines / plaintext record text).",
                         "items": {
                             "type": "object",
                             "required": ["path", "action", "content"],
@@ -203,7 +203,7 @@ pub fn contract_schema() -> Value {
                 "title": "context --json",
                 "description": "Everything the vault knows about one person. PII fields (name/profile/bodies) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions are omitted entirely, never nulled. --exclude-private strips PII regardless; ledger facts are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain.",
                 "type": "object",
-                "required": ["ok", "schema_version", "vault", "person", "notes", "interactions", "coaching", "packs", "aliases"],
+                "required": ["ok", "schema_version", "vault", "person", "notes", "interactions", "packs", "aliases"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
@@ -243,28 +243,9 @@ pub fn contract_schema() -> Value {
                             }
                         }
                     },
-                    "coaching": {
-                        "type": ["object", "null"],
-                        "properties": {
-                            "sessions_remaining": {"type": "integer"},
-                            "icf_hours": {"type": "number"},
-                            "recent_sessions": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "required": ["date"],
-                                    "properties": {
-                                        "date": {"type": "string"},
-                                        "duration_minutes": {"type": ["integer", "null"]},
-                                        "tag": {"type": ["string", "null"], "enum": ["paid", "pps", "comp", null]}
-                                    }
-                                }
-                            }
-                        }
-                    },
                     "packs": {
                         "type": "object",
-                        "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
+                        "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
@@ -296,7 +277,7 @@ pub fn contract_schema() -> Value {
                 "title": "sync --json",
                 "description": "Ahead/behind counts after the fetch (or from the last fetch with --dry-run). Only a vault with a remote and upstream reaches this shape; otherwise the error envelope carries E_NO_REMOTE or E_NOT_FAST_FORWARD.",
                 "type": "object",
-                "required": ["ok", "schema_version", "vault", "remote", "branch", "upstream", "ahead", "behind", "crypto_mode", "fetched", "dry_run", "action", "applied"],
+                "required": ["ok", "schema_version", "vault", "remote", "branch", "upstream", "ahead", "behind", "fetched", "dry_run", "action", "applied"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
@@ -306,7 +287,6 @@ pub fn contract_schema() -> Value {
                     "upstream": {"type": "string"},
                     "ahead": {"type": "integer", "minimum": 0},
                     "behind": {"type": "integer", "minimum": 0},
-                    "crypto_mode": {"type": "string", "const": "plaintext"},
                     "fetched": {"type": "boolean", "description": "False when --dry-run skipped the fetch."},
                     "dry_run": {"type": "boolean"},
                     "action": {"type": "string", "enum": ["none", "pull", "push"]},

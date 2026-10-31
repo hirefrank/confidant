@@ -85,7 +85,7 @@
 //! cadence the person asked never to have.
 //!
 //! Ledger-derived touch metadata (dates and kinds) is not record content and
-//! is kept, exactly as the `context` module documents; no decrypted content
+//! is kept, exactly as the `context` module documents; no record content
 //! is added to any of it.
 
 use std::collections::{BTreeMap, HashSet};

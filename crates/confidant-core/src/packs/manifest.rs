@@ -202,7 +202,7 @@ pub struct EdgeKindDecl {
 /// core-built `context` view. The manifest *names* the view and supplies
 /// its parameters through the pack's `ledger-balance` rule (PD1); core
 /// implements the view. `[context]` is scope-limited to derived ledger
-/// metadata — no record fields, no PII, no decrypted content — so it does
+/// metadata — no record fields, no PII, no record content — so it does
 /// not widen the §12 allowlist and needs no `private_context_fields`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
