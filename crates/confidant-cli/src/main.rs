@@ -237,21 +237,25 @@ enum Command {
     /// Create or scaffold a plaintext vault.
     ///
     /// With `--create`, an empty or absent vault directory is scaffolded:
-    /// the directory is created, `git init` runs when needed and the branch
-    /// is set to `main`, `.gitignore` gains `.confidant/`, and a minimal
-    /// `confidant.toml` is written (its `packs` list comes from the global
-    /// `--packs` flag, defaulting to `[]`) and committed. `--remote <url>`
-    /// then adds `origin` (it does not push). Only packs built into this
-    /// binary (today the implicit `personal@0.2`) may be listed: an external
-    /// pack is vendored into an existing vault by `confidant pack add`, so
-    /// install it after `init`.
+    /// the directory is created, `git init -b main` runs when needed,
+    /// `.gitignore` gains `.confidant/`, the collection directories
+    /// (`people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/`,
+    /// `ledger/`) are created, and a minimal `confidant.toml` is written
+    /// (its `packs` list comes from the global `--packs` flag, defaulting
+    /// to `[]`) and committed. When git has no identity at all, a
+    /// repo-local fallback identity is set so the skeleton commit works.
+    /// `--remote <url>` then adds `origin` (it does not push). Only packs
+    /// built into this binary (today the implicit `personal@0.2`) may be
+    /// listed: an external pack is vendored into an existing vault by
+    /// `confidant pack add`, so install it after `init`.
     ///
     /// `--dry-run` runs every preflight check and reports the plan without
     /// creating a directory, writing a file, making a commit, or adding a
     /// remote.
     Init {
-        /// Scaffold the vault directory (create, `git init`, `.gitignore`,
-        /// `confidant.toml`, committed skeleton).
+        /// Scaffold the vault directory (create, `git init -b main`,
+        /// `.gitignore`, `confidant.toml`, collection directories,
+        /// committed skeleton).
         #[arg(long)]
         create: bool,
         /// Add `git remote origin URL` after scaffolding. Does not push
@@ -710,8 +714,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
-    // `device-add --initiate` runs on a brand-new device that has no vault
-    // yet; everything else needs one.
     // `setup` / `update` / `agents` / `which` / `routing` / `tui` manage the
     // installed skills and never touch a vault.
     let needs_vault = !matches!(
@@ -3050,7 +3052,7 @@ fn resolve_person_arg(
 /// Id writes print nothing extra; under `--json` the envelope carries it.
 ///
 /// The line is printed before the remaining validation (bad duration, bad
-/// touch kind, keychain/inbox fallback), so it says "resolving to" rather
+/// touch kind), so it says "resolving to" rather
 /// than claiming a completed write: the human may still see an error and no
 /// commit after it (#537 review).
 fn announce_resolved_person(cli: &Cli, person: &ResolvedPersonArg) {
@@ -5779,9 +5781,73 @@ fn parse_git_remotes(output: &str) -> Vec<String> {
     names
 }
 
+/// One configured remote URL from `git remote -v`, paired with its remote
+/// name. Fetch and push URLs can differ, so both are kept. URLs are never
+/// printed: they may carry credentials.
+fn parse_git_remote_urls(output: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name.is_empty() || entries.iter().any(|(n, u)| n == name && u == url) {
+            continue;
+        }
+        entries.push((name.to_owned(), url.to_owned()));
+    }
+    entries
+}
+
+/// How a configured remote URL carries vault content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteTransport {
+    /// Encrypted in transit (`https://`, `ssh://`, scp-like `git@host:path`)
+    /// or local (`file://`, a filesystem path), which never leaves the
+    /// machine.
+    Safe,
+    /// A cleartext network transport; record bodies would cross the wire
+    /// readable.
+    Cleartext(&'static str),
+    /// A scheme this check cannot vouch for.
+    Unverified,
+}
+
+/// Classify a git remote URL without contacting it. Credentials in the URL
+/// never affect the answer.
+fn remote_transport(url: &str) -> RemoteTransport {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("ssh://") || lower.starts_with("file://")
+    {
+        return RemoteTransport::Safe;
+    }
+    if lower.starts_with("http://") {
+        return RemoteTransport::Cleartext("http");
+    }
+    if lower.starts_with("git://") {
+        return RemoteTransport::Cleartext("git");
+    }
+    if lower.contains("://") {
+        return RemoteTransport::Unverified;
+    }
+    // The scp-like `user@host:path` (or `host:path`) form: git speaks ssh.
+    if let Some((authority, path)) = url.split_once(':') {
+        if !authority.is_empty() && !authority.contains('/') && !path.is_empty() {
+            return RemoteTransport::Safe;
+        }
+    }
+    // Anything else is a local filesystem path (`/srv/vault.git`,
+    // `../remote.git`), which never leaves the machine.
+    RemoteTransport::Safe
+}
+
 /// #660: `git-remote` doctor check. Read-only and offline: it never
 /// fetches, pushes, or contacts a remote. It reports the configured
-/// remotes by name; transport safety is the operator's choice of host.
+/// remotes by name and warns when one would carry plaintext record bodies
+/// over an unencrypted transport (`http://`, `git://`) or a scheme this
+/// check cannot vouch for. `https://`, `ssh://`, scp-like `git@host:path`
+/// and local paths are safe.
 ///
 /// `root` is the resolved vault. When it is not a directory (doctor never
 /// reaches this today), the check stays `ok`: a missing vault is not a
@@ -5823,10 +5889,49 @@ fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
         };
     }
     let named = remotes.join(", ");
+    let entries = parse_git_remote_urls(&output);
+    let cleartext: Vec<(&str, &'static str)> = entries
+        .iter()
+        .filter_map(|(name, url)| match remote_transport(url) {
+            RemoteTransport::Cleartext(scheme) => Some((name.as_str(), scheme)),
+            _ => None,
+        })
+        .collect();
+    if let Some((name, scheme)) = cleartext.first() {
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "git remote configured ({named}) over an unencrypted {scheme} transport; \
+                 record bodies are readable in transit"
+            ),
+            fix: Some(format!(
+                "Use an https:// or ssh:// URL, or remove the remote (`git remote remove {name}`)"
+            )),
+        };
+    }
+    let unverified: Vec<&str> = entries
+        .iter()
+        .filter(|(_, url)| remote_transport(url) == RemoteTransport::Unverified)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if let Some(name) = unverified.first() {
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "git remote configured ({named}) with a transport this check cannot verify; \
+                 record bodies may be readable in transit"
+            ),
+            fix: Some(format!(
+                "Use an https:// or ssh:// URL, or remove the remote (`git remote remove {name}`)"
+            )),
+        };
+    }
     DoctorCheck {
         id: ID,
         status: "ok",
-        message: format!("git remote configured ({named})"),
+        message: format!("git remote configured ({named}); transport is encrypted or local"),
         fix: None,
     }
 }
@@ -6245,32 +6350,6 @@ fn confirm_sync_write(cli: &Cli, yes: bool, question: &str) -> anyhow::Result<bo
     confirm_yn(question, false, false)
 }
 
-/// Parse `findmnt -no SOURCE /` output into a device path. `findmnt` can
-/// append a subvolume suffix (`/dev/sda2[/@root]`); strip it. Returns
-/// `None` for a non-device source (overlay, tmpfs, `UUID=…`), where the
-/// `lsblk` ancestry cannot be resolved.
-#[cfg(target_os = "linux")]
-fn parse_findmnt_source(output: &str) -> Option<String> {
-    let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let source = line.split('[').next().unwrap_or(line).trim();
-    if source.starts_with("/dev/") {
-        Some(source.to_owned())
-    } else {
-        None
-    }
-}
-
-/// True when `lsblk -s -no TYPE` output lists a `crypt` device in the
-/// root device's ancestry (LUKS/dm-crypt). Pure string logic, so it is
-/// shared by the Linux probe and the platform-independent decision below
-/// (and its unit tests) rather than gated on Linux.
-fn lsblk_types_include_crypt(output: &str) -> bool {
-    output
-        .lines()
-        .map(str::trim)
-        .any(|line| line.eq_ignore_ascii_case("crypt"))
-}
-
 /// Doctor status vocabulary (#709): `ok` means the check ran and passed,
 /// `warning` means it ran and found something to act on, `error` means
 /// it ran and found something blocking, and `unknown` means it could
@@ -6280,112 +6359,6 @@ fn lsblk_types_include_crypt(output: &str) -> bool {
 /// Callers branch on this status string, never on message text (ADR-7):
 /// `unknown` is a stable fourth value, alongside the existing three.
 const DOCTOR_STATUS_UNKNOWN: &str = "unknown";
-
-/// Pure decision for the `disk-encryption` check (#653(d), #709).
-/// `source` is the parsed `findmnt` root source, or `None` when
-/// `findmnt` failed, is missing, or the root is not on a block device;
-/// `types` is the `lsblk` TYPE output, or `None` when `lsblk` failed or
-/// is missing. `unknown_detail` names the probe failure for the
-/// undetermined cases, and is only consulted when `source` or `types`
-/// is `None`; an empty TYPE list is its own undetermined case.
-/// Determined outcomes are unchanged: encrypted is `ok`, a readable
-/// non-encrypted ancestry is `warning`.
-fn disk_encryption_check_from(
-    source: Option<&str>,
-    types: Option<&str>,
-    unknown_detail: &str,
-) -> DoctorCheck {
-    const ID: &str = "disk-encryption";
-    let unknown = |detail: &str| DoctorCheck {
-        id: ID,
-        status: DOCTOR_STATUS_UNKNOWN,
-        message: format!("could not determine disk encryption ({detail})"),
-        fix: None,
-    };
-    let Some(_source) = source else {
-        return unknown(unknown_detail);
-    };
-    let Some(types) = types else {
-        return unknown(unknown_detail);
-    };
-    if lsblk_types_include_crypt(types) {
-        DoctorCheck {
-            id: ID,
-            status: "ok",
-            message: "root filesystem is on an encrypted device".to_owned(),
-            fix: None,
-        }
-    } else if types.lines().any(|l| !l.trim().is_empty()) {
-        DoctorCheck {
-            id: ID,
-            status: "warning",
-            message: "root filesystem is not on an encrypted disk; keep real client data on an \
-                      encrypted disk"
-                .to_owned(),
-            fix: Some(
-                "Move the vault to a full-disk-encrypted volume before storing real client data"
-                    .to_owned(),
-            ),
-        }
-    } else {
-        unknown("lsblk returned no device types")
-    }
-}
-
-/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
-/// advisory: a missing tool, an unparseable source, or a non-block root
-/// all report `unknown` "could not determine" (#709), so this can never
-/// fail doctor — but also never passes it. It never prompts and never
-/// leaves the machine.
-#[cfg(target_os = "linux")]
-fn disk_encryption_check() -> DoctorCheck {
-    let findmnt = match std::process::Command::new("findmnt")
-        .args(["-no", "SOURCE", "/"])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => {
-            return disk_encryption_check_from(
-                None,
-                None,
-                "findmnt could not resolve the root filesystem",
-            );
-        }
-        Err(_) => {
-            return disk_encryption_check_from(None, None, "findmnt is not available");
-        }
-    };
-    let source = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout));
-    let Some(source) = source else {
-        return disk_encryption_check_from(None, None, "root filesystem is not on a block device");
-    };
-    let lsblk = match std::process::Command::new("lsblk")
-        .args(["-sno", "TYPE", &source])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => {
-            return disk_encryption_check_from(
-                Some(&source),
-                None,
-                "lsblk could not read the root device",
-            );
-        }
-        Err(_) => {
-            return disk_encryption_check_from(Some(&source), None, "lsblk is not available");
-        }
-    };
-    let types = String::from_utf8_lossy(&lsblk.stdout);
-    disk_encryption_check_from(Some(&source), Some(&types), "lsblk is not available")
-}
-
-/// Non-Linux platforms have no `findmnt`/`lsblk`; macOS FileVault is not
-/// probed here. Report `unknown` "could not determine" (#709) so doctor
-/// still passes, without claiming a pass.
-#[cfg(not(target_os = "linux"))]
-fn disk_encryption_check() -> DoctorCheck {
-    disk_encryption_check_from(None, None, "unsupported platform")
-}
 
 fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
@@ -6498,11 +6471,6 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
             fix: None,
         }),
     }
-
-    // #653(d): best-effort encrypted-disk check. Advisory only: a missing
-    // tool or an unknown platform is `unknown` (#709), so doctor never
-    // fails on it — and never passes on it either.
-    checks.push(disk_encryption_check());
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale
     // install is never an error, so exit-code semantics are unchanged. Any
@@ -6717,6 +6685,12 @@ impl Scaffold {
             let _ = std::fs::remove_file(self.root.join("confidant.toml"));
         }
         if self.created_root {
+            // Our own empty collection directories would otherwise keep the
+            // root alive. `remove_dir` refuses a non-empty directory, so any
+            // file the operator put there leaves the tree alone.
+            for dir in VAULT_DIRS {
+                let _ = std::fs::remove_dir(self.root.join(dir));
+            }
             // Only removes an empty directory: any user file leaves it alone.
             let _ = std::fs::remove_dir(&self.root);
         }
@@ -6727,6 +6701,65 @@ impl Drop for Scaffold {
     fn drop(&mut self) {
         self.rollback();
     }
+}
+
+/// The vault's on-disk shape: the record collections plus the ledger. Git
+/// does not track empty directories, so `init` creates these locally and a
+/// later clone (or the first write) recreates what it needs.
+const VAULT_DIRS: &[&str] = &[
+    "people",
+    "orgs",
+    "deals",
+    "interactions",
+    "notes",
+    "edges",
+    "ledger",
+];
+
+/// Repo-local fallback commit identity, used only when git cannot resolve
+/// any `user.name`/`user.email` (no global or environment config). Never
+/// overrides an operator's real identity.
+const FALLBACK_GIT_NAME: &str = "Confidant Operator";
+const FALLBACK_GIT_EMAIL: &str = "operator@confidant.local";
+
+/// True when git can resolve a commit identity for the repo at `root`.
+/// Works before the repo exists (`GIT_DIR`) and inside one (`-C`).
+fn git_identity_resolves(root: &Path, no_input: bool) -> bool {
+    let mut cmd = std::process::Command::new("git");
+    if is_git_repo_root(root, no_input) {
+        cmd.arg("-C").arg(root);
+    } else {
+        cmd.env("GIT_DIR", root.join(".git"));
+    }
+    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
+    if no_input {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    cmd.output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Create the collection directories and, when git has no identity at all,
+/// write the repo-local fallback identity into `<vault>/.git/config`. Both
+/// steps are idempotent and never overwrite existing data.
+fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
+    for dir in VAULT_DIRS {
+        std::fs::create_dir_all(root.join(dir)).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot create vault directory {dir}: {e}"
+            )))
+        })?;
+    }
+    if !git_identity_resolves(root, no_input) {
+        for (key, value) in [
+            ("user.name", FALLBACK_GIT_NAME),
+            ("user.email", FALLBACK_GIT_EMAIL),
+        ] {
+            confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
+        }
+    }
+    Ok(())
 }
 
 /// Result of the `init --create` bootstrap step.
@@ -6761,37 +6794,6 @@ fn planned_create_branch(root: &Path, no_input: bool) -> (String, Option<String>
     }
 }
 
-/// True when git can resolve a commit identity for the repo at `root`.
-/// Runs `git var` before `init --create` writes anything (#651), and avoids
-/// reading the *current* directory's repo config: a fresh target has no local
-/// config, so only global/system/env identity applies. `GIT_DIR` works even
-/// when that path does not exist yet.
-fn require_git_identity(root: &Path, no_input: bool) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new("git");
-    if is_git_repo_root(root, no_input) {
-        cmd.arg("-C").arg(root);
-    } else {
-        cmd.env("GIT_DIR", root.join(".git"));
-    }
-    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
-    if no_input {
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-    }
-    let ok = cmd
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-    if ok {
-        return Ok(());
-    }
-    Err(anyhow::Error::new(DomainError::invalid(
-        "git has no author identity, so init cannot commit the vault",
-    ))
-    .with_fix(
-        "Set a git identity, e.g. `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com`",
-    ))
-}
-
 /// The current branch name (works on an unborn branch), or `None` when git
 /// cannot report one.
 fn current_branch(root: &Path, no_input: bool) -> Option<String> {
@@ -6801,9 +6803,8 @@ fn current_branch(root: &Path, no_input: bool) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// #685/#686: second devices clone + `keys device-add`; `recover` burns the
-/// phrase. Shown after `init` (human and JSON) so a new-device operator is
-/// not sent to `init` or `recover`.
+/// #685/#686: a second device clones the vault with git. Shown after `init`
+/// (human and JSON) so a new-device operator is not sent back to `init`.
 const SECOND_DEVICE_HINT: &str = "to put this vault on another device, clone it with git";
 
 /// `--remote` on `init --create`, if present.
@@ -6930,7 +6931,16 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             println!("  note     {note}");
         }
         println!("  would    create the vault directory (when absent)");
-        println!("  would    run git init and commit .gitignore + confidant.toml");
+        println!(
+            "  would    create the collection directories ({})",
+            VAULT_DIRS.join(", ")
+        );
+        println!("  would    run git init -b main and commit .gitignore + confidant.toml");
+        if !git_identity_resolves(root, cli.no_input) {
+            println!(
+                "  would    set a repo-local fallback git identity ({FALLBACK_GIT_NAME} <{FALLBACK_GIT_EMAIL}>)"
+            );
+        }
         match remote {
             Some(url) => println!(
                 "  would    add git remote origin {} (not pushed)",
@@ -7008,12 +7018,10 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
         .unwrap_or_default();
     validate_init_packs(&packs)?;
 
-    // #651: require a commit identity before creating the directory or
-    // running `git init`. `git var` works outside a repo, so a refused run
-    // leaves an absent target absent instead of an empty `.git` that blocks
-    // the retry. This also covers the dry run so it reports the same refusal.
-    require_git_identity(&root, no_input)?;
-
+    // #651 is obsolete now that `init` writes a repo-local fallback
+    // identity when git has none: a machine with no global `user.name`
+    // still scaffolds. Everything else (packs, `--remote`) is still
+    // validated before the first write.
     let existing_repo = exists && is_git_repo_root(&root, no_input);
     if let Some(url) = init_remote_url(cli) {
         refuse_init_remote(&root, url, existing_repo, no_input)?;
@@ -7054,14 +7062,8 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
     })?;
 
     if scaffold.git_initialized {
-        confidant_core::write::git(&root, &["init"], no_input)?;
         // #661: create `main` explicitly, independent of init.defaultBranch.
-        // `symbolic-ref` is portable and works before the first commit.
-        confidant_core::write::git(
-            &root,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-            no_input,
-        )?;
+        confidant_core::write::git(&root, &["init", "-b", "main"], no_input)?;
     } else if existing_repo
         && confidant_core::write::git(&root, &["rev-parse", "--verify", "HEAD"], no_input).is_err()
     {
@@ -7075,8 +7077,13 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
         )?;
     }
 
+    // The vault's shape (`people/` … `ledger/`) and, on a machine with no
+    // git identity at all, the repo-local fallback identity the skeleton
+    // commit needs. An operator's real identity is never overridden.
+    initialize_vault_shape(&root, no_input)?;
+
     // `.confidant/` holds the plaintext search corpus and must never be
-    // committed (ADR-6); `reindex` refuses without this entry.
+    // committed (ADR-6).
     let gitignore = root.join(".gitignore");
     let mut text = std::fs::read_to_string(&gitignore).unwrap_or_default();
     let already_ignored = text
@@ -7157,7 +7164,10 @@ fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
 ///
 /// Records are plaintext, so there is no key, keychain, anchor, or recovery
 /// step. With `--create` the skeleton is already written and committed by
-/// [`bootstrap_vault`]; this validates the result and reports the plan.
+/// [`bootstrap_vault`], including the collection directories and a
+/// repo-local fallback git identity when the machine has none; this
+/// validates the result and reports the plan. Without `--create` the same
+/// idempotent shape step runs on the existing vault.
 fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Result<ExitCode> {
     let json = cli.json;
     let no_input = cli.no_input;
@@ -7197,8 +7207,12 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(mut scaffold) = scaffold {
-        scaffold.disarm();
+    match scaffold {
+        Some(mut scaffold) => scaffold.disarm(),
+        // `--create` on an existing vault, or `init` on a hand-written one:
+        // make the on-disk shape match what a fresh scaffold produces.
+        // Idempotent, and it never overwrites an existing identity.
+        None => initialize_vault_shape(root, no_input)?,
     }
     if json {
         print_json(&ok_envelope(
@@ -8666,6 +8680,65 @@ backup\tgit@host.example:org/repo.git (push)
         assert!(parse_git_remotes("").is_empty());
     }
 
+    /// #660: transport classification decides whether a vault's content
+    /// crosses the network readable. Encrypted and local transports are
+    /// safe; `http://` and `git://` are cleartext; an unknown scheme is
+    /// left unverified.
+    #[test]
+    fn git_remote_transport_classification() {
+        use super::{remote_transport, RemoteTransport};
+        for url in [
+            "https://host.example/org/repo.git",
+            "HTTPS://host.example/org/repo.git",
+            "ssh://git@host.example/org/repo.git",
+            "git@host.example:org/repo.git",
+            "host.example:org/repo.git",
+            "file:///srv/remote.git",
+            "/srv/remote.git",
+            "../remote.git",
+            "remote.git",
+        ] {
+            assert_eq!(remote_transport(url), RemoteTransport::Safe, "{url}");
+        }
+        assert_eq!(
+            remote_transport("http://host.example/org/repo.git"),
+            RemoteTransport::Cleartext("http")
+        );
+        assert_eq!(
+            remote_transport("git://host.example/org/repo.git"),
+            RemoteTransport::Cleartext("git")
+        );
+        assert_eq!(
+            remote_transport("ftp://host.example/org/repo.git"),
+            RemoteTransport::Unverified
+        );
+    }
+
+    /// `git remote -v` can list distinct fetch and push URLs; both survive
+    /// parsing under the remote's name.
+    #[test]
+    fn git_remote_urls_keep_fetch_and_push() {
+        use super::parse_git_remote_urls;
+        let out = "\
+origin\thttps://host.example/org/repo.git (fetch)
+origin\tssh://git@host.example/org/repo.git (push)
+";
+        assert_eq!(
+            parse_git_remote_urls(out),
+            vec![
+                (
+                    "origin".to_owned(),
+                    "https://host.example/org/repo.git".to_owned()
+                ),
+                (
+                    "origin".to_owned(),
+                    "ssh://git@host.example/org/repo.git".to_owned()
+                ),
+            ]
+        );
+        assert!(parse_git_remote_urls("").is_empty());
+    }
+
     /// #665: `git rev-list --left-right --count @{u}...HEAD` prints
     /// `<behind>\t<ahead>`; the right column is ahead, not behind.
     #[test]
@@ -8709,58 +8782,6 @@ backup\tgit@host.example:org/repo.git (push)
         assert_eq!(sync_push_refspec("origin", "origin/"), None);
     }
 
-    /// #653(d): `findmnt` output is a device path with an optional btrfs
-    /// subvolume suffix; non-block sources cannot be traced through
-    /// `lsblk` and must report status "unknown" (#709), never `ok`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn findmnt_source_parser() {
-        use super::parse_findmnt_source;
-        assert_eq!(
-            parse_findmnt_source("/dev/nvme0n1p2\n"),
-            Some("/dev/nvme0n1p2".to_owned())
-        );
-        assert_eq!(
-            parse_findmnt_source("/dev/sda2[/@root]\n"),
-            Some("/dev/sda2".to_owned())
-        );
-        assert_eq!(parse_findmnt_source("overlay\n"), None);
-        assert_eq!(parse_findmnt_source("UUID=abcd-1234\n"), None);
-        assert_eq!(parse_findmnt_source("\n"), None);
-    }
-
-    /// #709: the `disk-encryption` decision for every probe shape.
-    /// Undetermined shapes (no source, no TYPE list, empty TYPE list)
-    /// are `unknown`, never `ok`; only a readable ancestry decides
-    /// between `ok` (crypt present) and `warning` (no crypt).
-    #[test]
-    fn disk_encryption_check_status_rules() {
-        use super::disk_encryption_check_from;
-        // No source: findmnt missing, failed, or a non-block root
-        // (e.g. overlay on a VM/container) — the issue's shape.
-        let c = disk_encryption_check_from(None, None, "root filesystem is not on a block device");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("could not determine disk encryption"));
-        assert!(c.message.contains("not on a block device"));
-        assert!(c.fix.is_none());
-        // A device but no TYPE list: lsblk missing or failed.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), None, "lsblk is not available");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("lsblk is not available"));
-        // A device with an empty TYPE list: lsblk ran, said nothing.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some(""), "lsblk is not available");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("lsblk returned no device types"));
-        // Determined outcomes are unchanged.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("crypt\npart\ndisk\n"), "");
-        assert_eq!(c.status, "ok");
-        assert!(c.message.contains("encrypted device"));
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("part\ndisk\n"), "");
-        assert_eq!(c.status, "warning");
-        assert!(c.message.contains("not on an encrypted disk"));
-        assert!(c.fix.is_some());
-    }
-
     /// #709: staleness the fetch cannot determine is `unknown`, not
     /// `ok`; an operator opt-out is the only `ok` non-determination.
     #[test]
@@ -8776,16 +8797,6 @@ backup\tgit@host.example:org/repo.git (push)
         let c = cli_staleness_check(None, true);
         assert_eq!(c.status, "ok");
         assert!(c.message.contains("disabled"));
-    }
-
-    /// #653(d): only a `crypt` ancestor means the root disk is encrypted.
-    #[test]
-    fn lsblk_types_detect_crypt() {
-        use super::lsblk_types_include_crypt;
-        assert!(lsblk_types_include_crypt("lvm\ncrypt\npart\ndisk\n"));
-        assert!(lsblk_types_include_crypt("crypt\n"));
-        assert!(!lsblk_types_include_crypt("lvm\npart\ndisk\n"));
-        assert!(!lsblk_types_include_crypt(""));
     }
 
     /// #542: a `confidant <command>` hint in `reject_unsupported_prefix`

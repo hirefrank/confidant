@@ -187,6 +187,75 @@ fn git_remote_without_a_repo_is_advisory_not_error() {
     assert!(msg.contains("could not read git remotes"), "{msg}");
 }
 
+#[cfg(unix)]
+#[test]
+fn git_remote_https_ssh_and_local_paths_are_ok() {
+    for url in [
+        "https://example.com/fake/vault.git",
+        "ssh://git@example.com/fake/vault.git",
+        "git@example.com:fake/vault.git",
+        "file:///tmp/fake/vault.git",
+        "/tmp/fake/vault.git",
+    ] {
+        let v = bootstrap_vault();
+        git(&v.vault, &["remote", "add", "origin", url]);
+
+        let out = run_doctor(&v.vault, &v.home);
+        let c = check(&out, "git-remote").expect("git-remote check missing");
+        assert_eq!(c["status"], "ok", "{url}: {out}");
+        assert!(c.get("fix").is_none(), "{url}: healthy check must omit fix");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_remote_over_http_warns_and_never_echoes_the_url() {
+    let v = bootstrap_vault();
+    git(
+        &v.vault,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "http://user:secret@example.com/fake/vault.git",
+        ],
+    );
+
+    let out = run_doctor(&v.vault, &v.home);
+    let c = check(&out, "git-remote").expect("git-remote check missing");
+    assert_eq!(c["status"], "warning", "{out}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("origin"), "{msg}");
+    assert!(msg.contains("unencrypted http transport"), "{msg}");
+    assert!(!msg.contains("secret"), "credentials leaked: {msg}");
+    assert!(!msg.contains("http://"), "URL echoed: {msg}");
+    let fix = c["fix"].as_str().expect("fix field missing");
+    assert!(fix.contains("https:// or ssh://"), "{fix}");
+    assert!(fix.contains("git remote remove origin"), "{fix}");
+}
+
+#[cfg(unix)]
+#[test]
+fn git_remote_over_git_scheme_warns() {
+    let v = bootstrap_vault();
+    git(
+        &v.vault,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git://example.com/fake/vault.git",
+        ],
+    );
+
+    let out = run_doctor(&v.vault, &v.home);
+    let c = check(&out, "git-remote").expect("git-remote check missing");
+    assert_eq!(c["status"], "warning", "{out}");
+    let msg = c["message"].as_str().unwrap();
+    assert!(msg.contains("unencrypted git transport"), "{msg}");
+    assert!(!msg.contains("git://"), "URL echoed: {msg}");
+}
+
 // #665: offline ahead/behind visibility in doctor.
 
 /// A plaintext git vault with a committed tree and a local bare remote on

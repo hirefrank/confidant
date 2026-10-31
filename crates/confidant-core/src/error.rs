@@ -68,10 +68,6 @@ pub enum ErrorKind {
     /// `confidant sync` found no remote or no upstream branch to compare
     /// with. Local-only is a valid setup, so this is not a vault defect.
     NoRemote,
-    /// `confidant sync` refused a structurally plaintext vault. Remote
-    /// access must never carry plaintext record bodies, so syncing is
-    /// fail-closed on a plaintext vault even for a read-only report.
-    PlaintextRemote,
     /// `confidant sync` refused a diverged branch (local and remote have
     /// commits the other does not). The operator must merge or rebase
     /// explicitly; auto-merge is never offered.
@@ -132,7 +128,6 @@ impl ErrorKind {
             Self::InboxSkip => "E_INBOX_SKIP",
             Self::ReindexRefused => "E_REINDEX_REFUSED",
             Self::NoRemote => "E_NO_REMOTE",
-            Self::PlaintextRemote => "E_PLAINTEXT_REMOTE",
             Self::NotFastForward => "E_NOT_FAST_FORWARD",
             Self::PackInvalid => "E_PACK_INVALID",
             Self::AmbiguousPerson => "E_AMBIGUOUS_PERSON",
@@ -368,22 +363,6 @@ impl DomainError {
         Self::new(ErrorKind::NoRemote, detail.to_string()).with_fix(
             "Add a remote with `git remote add origin <url>` and set an upstream \
              (`git push -u origin <branch>`), then re-run `confidant sync`",
-        )
-    }
-
-    /// `confidant sync` refused a structurally plaintext vault. A remote
-    /// would expose every record body, so the command fails closed even for
-    /// a read-only report. The fix repeats the two safe options: encrypt
-    /// the vault, or keep it local-only.
-    pub fn plaintext_remote() -> Self {
-        Self::new(
-            ErrorKind::PlaintextRemote,
-            "refusing to sync a plaintext vault: record bodies are readable by \
-             anyone with access to the remote",
-        )
-        .with_fix(
-            "Run `confidant init` to encrypt the vault, or remove the remote and \
-             keep this vault local-only (`git remote remove <name>`)",
         )
     }
 
@@ -654,7 +633,6 @@ mod tests {
             .message()
             .contains("3 encrypted record(s)"));
         assert_eq!(DomainError::no_remote("x").code(), "E_NO_REMOTE");
-        assert_eq!(DomainError::plaintext_remote().code(), "E_PLAINTEXT_REMOTE");
         assert_eq!(
             DomainError::not_fast_forward(1, 2).code(),
             "E_NOT_FAST_FORWARD"

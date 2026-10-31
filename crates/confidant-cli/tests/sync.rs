@@ -364,8 +364,8 @@ fn diverged_branch_refuses_push_and_pull_with_a_stable_code() {
 #[cfg(unix)]
 #[test]
 fn plaintext_vault_syncs_against_any_remote() {
-    // A plaintext vault is the only kind now, so `sync` must work against a
-    // configured `origin` rather than refusing with `E_PLAINTEXT_REMOTE`.
+    // A plaintext vault is the only kind now, so `sync` must work against
+    // any configured `origin`.
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
