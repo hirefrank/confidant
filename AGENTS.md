@@ -98,7 +98,7 @@ UPDATE_GOLDEN=1 cargo test -p confidant-core --test check_engine   # only after 
 python3 .github/scripts/sync-packs.py               # re-vendor pack skills/manifests after editing packs/
 python3 crates/confidant-cli/skills/qmd-search/tests/test_qmd_query.py --cli target/debug/confidant
                                                     # skill allowlist/verification tests (needs a built CLI; the "skills smoke" job)
-cargo build -p confidant-cli --locked --all-features   # qa-smoke needs the `test-overrides` feature
+cargo build -p confidant-cli --locked --all-features   # build the CLI for qa-smoke (same build as CI's test job)
 python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
                                                     # 22-step end-to-end smoke on a throwaway vault (.agents/skills/qa-sweep/SKILL.md)
 ```
