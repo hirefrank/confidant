@@ -7,22 +7,20 @@
 //!    domain-separated hash. Same canonical content → idempotent no-op.
 //!    Different content → [`ErrorKind::IdempotencyConflict`].
 //! 3. `--dry-run` shows the LOGICAL change (ledger lines / file content) and
-//!    stops. Ciphertext bytes are never shown (encryption is per-write fresh
-//!    nonces under PR B; there is nothing ciphertext to show in M3).
+//!    stops.
 //! 4. Files are applied atomically ([`crate::paths::write_replace`]); any file
 //!    containing merge-conflict markers fails closed with [`ErrorKind::Conflict`].
 //! 5. `check` runs after the change; a failing check rolls the files back and
 //!    blocks the commit. A pre-check also fails fast on an already-broken vault.
 //! 6. One `git add` + `git commit`. The message and trailers carry ONLY opaque
-//!    IDs, verbs, and hashes. Free-text reasons/intent go under the client's
-//!    data key (PR B) or are omitted — never in the commit message.
+//!    IDs, verbs, and hashes. Free-text reasons/intent are never in the
+//!    commit message.
 //!
 //! [`ErrorKind::IdempotencyConflict`]: crate::error::ErrorKind::IdempotencyConflict
 //! [`ErrorKind::Conflict`]: crate::error::ErrorKind::Conflict
 
 use std::path::{Path, PathBuf};
 
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::check::{run as check_vault, CheckOptions, CheckReport};
@@ -35,7 +33,7 @@ pub struct WriteOptions {
     pub dry_run: bool,
     /// Never prompt; pass `GIT_TERMINAL_PROMPT=0` to git.
     pub no_input: bool,
-    /// Client-supplied idempotency key (HMAC idempotency, ADR-7).
+    /// Client-supplied idempotency key (ADR-7).
     pub request_id: Option<String>,
     /// Opaque agent identity for the `Agent:` commit trailer (#49).
     pub agent_id: Option<String>,
@@ -72,7 +70,7 @@ impl FileChange {
 /// A fully computed write: what to change, and how the commit reads.
 ///
 /// `summary` is the commit's first line: opaque IDs, verbs, hashes only.
-/// `canonical_request` is the exact string the idempotency HMAC binds to; two
+/// `canonical_request` is the exact string the idempotency hash binds to; two
 /// writes are "the same write" iff their canonical requests are byte-equal.
 #[derive(Clone, Debug)]
 pub struct PendingWrite {
@@ -94,8 +92,8 @@ pub struct DryRunFile {
 pub enum WriteOutcome {
     /// Files applied and committed. `commit` is the full SHA; `files`
     /// lists only the paths this write actually rewrote — a change whose
-    /// bytes already matched the file on disk (a reused envelope, #406)
-    /// is not listed, so the list and the commit diff agree (#425).
+    /// bytes already matched the file on disk is not listed, so the list and
+    /// the commit diff agree (#425).
     Applied { commit: String, files: Vec<String> },
     /// Nothing touched; the logical change is in `preview`.
     DryRun { preview: Vec<DryRunFile> },
@@ -105,8 +103,7 @@ pub enum WriteOutcome {
     /// was written and nothing was committed. Distinct from [`Self::Idempotent`],
     /// which reports the commit a replayed request already landed. Reachable
     /// only from a write whose content can repeat — today `record edit`
-    /// (#216 / #389 Q1), since `encrypt_file` reuses existing ciphertext for
-    /// an unchanged body and the other write commands always change a file.
+    /// (#216 / #389 Q1) — since the other write commands always change a file.
     Unchanged,
     /// `check` failed; nothing was committed (files were rolled back).
     CheckBlocked { report: CheckReport },
@@ -126,7 +123,8 @@ fn hex(bytes: &[u8]) -> String {
 /// ADR-7 idempotency digests.
 ///
 /// - `id_hash = SHA256("confidant-request-id/v1\x00" || request_id)`
-/// - `req_hash = HMAC-SHA256(key=request_id, msg=canonical_request)`
+/// - `req_hash = SHA256("confidant-request-hash/v1\x00" || request_id ||
+///   "\x00" || canonical_request)`
 ///
 /// Only the hashes are stored (as commit trailers); the raw id never is.
 pub fn idempotency_digests(request_id: &str, canonical_request: &str) -> (String, String) {
@@ -135,10 +133,12 @@ pub fn idempotency_digests(request_id: &str, canonical_request: &str) -> (String
     h.update(request_id.as_bytes());
     let id_hash = hex(&h.finalize());
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(request_id.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(canonical_request.as_bytes());
-    let req_hash = hex(&mac.finalize().into_bytes());
+    let mut h = Sha256::new();
+    h.update(b"confidant-request-hash/v1\x00");
+    h.update(request_id.as_bytes());
+    h.update(b"\x00");
+    h.update(canonical_request.as_bytes());
+    let req_hash = hex(&h.finalize());
     (id_hash, req_hash)
 }
 
@@ -347,21 +347,13 @@ pub fn new_ulid() -> String {
     crate::id::ulid_from_parts(now_ms, random_80())
 }
 
-/// Encrypts one record file's plaintext bytes into the bytes to write.
-///
-/// Called only for `FileChange::WriteFile` targets under record paths
-/// ([`crate::crypto_mode::is_record_path`]). The CLI supplies the real
-/// encryptor (spec 3); commands that do not write records pass no
-/// encryptor and keep today's behavior.
-pub type RecordEncryptor = dyn Fn(&Path, &[u8]) -> anyhow::Result<Vec<u8>>;
-
 /// Apply `pending` to the vault at `root` per the ADR-7 write pipeline.
 pub fn apply_write(
     root: &Path,
     pending: PendingWrite,
     opts: &WriteOptions,
 ) -> anyhow::Result<WriteOutcome> {
-    apply_write_inner(root, pending, opts, None, false)
+    apply_write_inner(root, pending, opts, false)
 }
 
 /// Like [`apply_write`], but a failing pre-check does not block the write:
@@ -379,24 +371,7 @@ pub fn apply_write_repairing(
     pending: PendingWrite,
     opts: &WriteOptions,
 ) -> anyhow::Result<WriteOutcome> {
-    apply_write_inner(root, pending, opts, None, true)
-}
-
-/// Like [`apply_write`], but record-file contents are transformed through
-/// `encrypt` before anything is written.
-///
-/// The transform runs **after** the dry-run preview (so `--dry-run` shows
-/// the inner plaintext, never ciphertext) and **before** the pre-check, so
-/// a failing encryption leaves the target file untouched and a failing
-/// check rolls back as usual. Ledger appends and non-record files are
-/// never transformed.
-pub fn apply_write_with_encryptor(
-    root: &Path,
-    pending: PendingWrite,
-    opts: &WriteOptions,
-    encrypt: &RecordEncryptor,
-) -> anyhow::Result<WriteOutcome> {
-    apply_write_inner(root, pending, opts, Some(encrypt), false)
+    apply_write_inner(root, pending, opts, true)
 }
 
 /// Apply the step-5 change list in order. A failure here is an unexpected I/O
@@ -502,9 +477,8 @@ fn apply_failure_due(index: usize) -> bool {
 
 fn apply_write_inner(
     root: &Path,
-    mut pending: PendingWrite,
+    pending: PendingWrite,
     opts: &WriteOptions,
-    encrypt: Option<&RecordEncryptor>,
     repairing: bool,
 ) -> anyhow::Result<WriteOutcome> {
     if let Some(rid) = &opts.request_id {
@@ -513,11 +487,8 @@ fn apply_write_inner(
                 "--request-id must not be empty",
             )));
         }
-        // The Request-Hash trailer HMACs the canonical request with the raw id
-        // as key, and trailers are permanent (crypto-shredding can't reach
-        // them, ADR-7). A guessable id lets anyone with repo read access
-        // confirm guesses about note contents offline — even after shredding.
-        // 22 chars is the unguessability floor; ULIDs and UUIDv4s
+        // Trailers are permanent, so a short id makes accidental reuse common
+        // and clutters the history. 22 chars is the floor; ULIDs and UUIDv4s
         // clear it comfortably.
         if rid.chars().count() < 22 {
             return Err(anyhow::Error::new(
@@ -554,9 +525,6 @@ fn apply_write_inner(
     }
 
     // 2. Dry run: show the logical change, touch nothing.
-    // The preview is built from the pending contents as given — i.e. the
-    // inner plaintext — because the record-encryption transform below has
-    // not run yet. Dry-run never shows ciphertext (spec 3 B5).
     if opts.dry_run {
         let preview = pending
             .changes
@@ -587,29 +555,6 @@ fn apply_write_inner(
         return Ok(WriteOutcome::DryRun { preview });
     }
 
-    // 2b. Record-encryption transform (spec 3). Only WriteFile changes
-    // under record paths go through the encryptor; ledger appends and
-    // non-record files are untouched. Any failure refuses the whole
-    // write before anything is applied: the target file is left
-    // untouched and no plaintext fallback is written.
-    if let Some(encrypt) = encrypt {
-        for change in &mut pending.changes {
-            if let FileChange::WriteFile { path, contents } = change {
-                if crate::crypto_mode::is_record_path(path) {
-                    // Use context (not format-interpolation) so the
-                    // DomainError chain — code and fix — survives.
-                    let out = encrypt(path, contents.as_bytes()).map_err(|e| {
-                        let path = path.display().to_string();
-                        e.context(format!("cannot encrypt {path}"))
-                    })?;
-                    *contents = String::from_utf8(out).map_err(|_| {
-                        anyhow::anyhow!("encryptor returned non-UTF-8 bytes for {}", path.display())
-                    })?;
-                }
-            }
-        }
-    }
-
     // 3. Pre-check: fail fast on an already-broken vault. A repairing write
     // skips this gate because it exists to fix the reported problem; the
     // post-check below still refuses to commit an unclean result.
@@ -619,9 +564,7 @@ fn apply_write_inner(
         return Ok(WriteOutcome::CheckBlocked { report: pre });
     }
 
-    // 3b. Nothing to do: every change already matches the file on disk. The
-    // encryptor transform above has already run, so an encrypted record whose
-    // body is unchanged lands here too (it reused the existing ciphertext).
+    // 3b. Nothing to do: every change already matches the file on disk.
     // This has to be its own outcome: step 7 cannot commit an empty changeset,
     // and `git commit` on nothing staged fails with an empty message.
     let unchanged = pending.changes.iter().all(|change| match change {
@@ -640,8 +583,7 @@ fn apply_write_inner(
     }
 
     // 4. Fail closed on conflict markers; snapshot for rollback. Along the
-    // way, record which files this changeset actually rewrites (#425): a
-    // reused envelope (#406) keeps its ciphertext byte-for-byte, and the
+    // way, record which files this changeset actually rewrites (#425): the
     // `files` list names only real rewrites, so the JSON `files` and the
     // commit diff (`git show --stat`) agree.
     let mut snapshots: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
@@ -839,7 +781,7 @@ mod tests {
         let (h3, _) = idempotency_digests("abd", "canonical");
         assert_ne!(h1, h3, "different ids hash differently");
         let (_, r4) = idempotency_digests("abc", "canonical2");
-        assert_ne!(r1, r4, "different content HMACs differently");
+        assert_ne!(r1, r4, "different content hashes differently");
         assert_eq!(h1.len(), 64);
         assert_eq!(r1.len(), 64);
         // Domain separation: the id hash must not equal a bare SHA256 of the id.
@@ -975,7 +917,7 @@ mod tests {
     fn mid_apply_failure_rolls_back_and_returns_the_original_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        // A minimal check-clean vault (same shape as the inbox e2e fixture).
+        // A minimal check-clean vault.
         std::fs::write(
             root.join("confidant.toml"),
             "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG000000000000\"\n",

@@ -1,4 +1,4 @@
-//! `confidant` — local-first, git-backed, encrypted relationship memory.
+//! `confidant` — local-first, git-backed, plaintext relationship memory.
 //!
 //! Read commands (`check`, `find`, `context`, `doctor`, `schema`, `help`)
 //! never mutate the vault. Write commands (`log session`, `import`,
@@ -10,22 +10,12 @@
 //! [`write`]: confidant_core::write
 
 mod embedded;
-mod keys_anchor;
 mod mcp;
 mod pack_fetch;
 mod pack_init;
-mod record_crypto;
-mod record_decrypt;
-mod record_resolve;
 mod setup;
 
-use crate::keys_anchor::{
-    device_enrollment_coverage, device_key_id, map_unwrap_failure, partial_complete_error,
-    partial_enrollment_error, probe_keystore, trial_unwrap_coverage, trial_unwrap_first_client,
-    verify_anchor_cert, write_anchor_out_file, AnchorChecks,
-};
-
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(feature = "test-overrides"))]
 use std::io::IsTerminal;
 use std::io::{self, Write};
@@ -38,7 +28,7 @@ use confidant_core::config::parse_iso_date;
 use confidant_core::config::UserConfig;
 use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
-use confidant_core::error::{DomainError, ErrorKind};
+use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
 use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
 use confidant_core::packs::dir::read_pack_dir;
@@ -47,13 +37,11 @@ use confidant_core::record::{main_record_path, Record, RecordKind};
 use confidant_core::schema::contract_schema;
 use confidant_core::scope::{owner_labels, parse_pack_list, resolve_scope, PackScope};
 use confidant_core::write::{
-    apply_write, apply_write_repairing, apply_write_with_encryptor, require_git_repo, FileChange,
-    PendingWrite, WriteOptions, WriteOutcome,
+    apply_write, apply_write_repairing, require_git_repo, FileChange, PendingWrite, WriteOptions,
+    WriteOutcome,
 };
 use confidant_core::{check_vault, load_vault, search, search_for_operator, CheckOptions};
-use confidant_core::{ContentHook, ContentOutcome};
 use serde_json::Value;
-use zeroize::Zeroizing;
 
 /// Attach a `DomainError` fix hint to an `anyhow::Error`.
 ///
@@ -145,8 +133,8 @@ enum Command {
         /// Max hits to print.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
     },
@@ -167,63 +155,13 @@ enum Command {
         /// A `p-<ULID>` or an exact display name (cleared records only).
         query: String,
     },
-    /// Add or resolve person aliases (email/phone/handle/name → keyed HMAC).
+    /// Resolve a person by a contact value (email/phone/handle/name).
     ///
-    /// The raw alias value is PII: it is read from stdin or `--value-file`
-    /// only, never an argument, and never echoed in output or errors.
-    /// Operator-only.
+    /// Aliases are plain front-matter contact fields, matched
+    /// case-insensitively as whole strings. Operator-only.
     Alias {
         #[command(subcommand)]
         action: AliasAction,
-    },
-    /// Rebuild the local search corpus under `<vault>/.confidant/qmd-corpus/`.
-    ///
-    /// Cleared records are decrypted through the read path, so `no-ai`
-    /// records stay out by construction. Refuses (writes nothing) when an
-    /// encrypted record cannot be decrypted, or when the corpus path is not
-    /// git-ignored — a corpus that silently omits records is worse than none.
-    Reindex,
-    /// Merge the encrypted `inbox` git branch into the current branch.
-    ///
-    /// Outside tools push age-encrypted items to the `inbox` branch; this
-    /// decrypts them, runs `check` on the merged vault, commits the merge,
-    /// and clears the inbox. Requires a clean tree; every commit that adds
-    /// or changes an item must be signed by a `[trust]` signer, and the run
-    /// refuses without signers unless `--allow-unsigned` is passed.
-    /// No webhooks, no CI keys.
-    Inbox {
-        /// Decrypt and plan, but commit nothing and clear nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Proceed without verifying inbox branch signatures. Only for
-        /// setups that have not configured `[trust] signers` yet.
-        #[arg(long)]
-        allow_unsigned: bool,
-        /// Defer items by stem (repeatable): merge everything except these.
-        /// Skipped items stay on the `inbox` branch for the next run.
-        /// Refused during `inbox rotate`.
-        #[arg(long)]
-        skip: Vec<String>,
-        /// Process semantic duplicates instead of skipping them (#747):
-        /// a queued ledger line whose touch/session identity is already
-        /// in the ledger still merges. A forced repeat queued via
-        /// `--fallback-inbox` carries its own per-item marker and needs
-        /// no drain flag; this flag is for unmarked duplicates (queued
-        /// by an outside tool, or before the marker existed). `src:` /
-        /// exact-text idempotency still applies. Refused during
-        /// `inbox rotate` (a rotate drain never forces).
-        #[arg(long)]
-        force: bool,
-        /// Discard items by stem (repeatable) without merging them: remove
-        /// them from the `inbox` branch in one signed commit. For an item
-        /// the operator chose not to apply after `record resolve
-        /// --from-inbox`. Unknown stems fail closed (`E_INBOX_SKIP`); a
-        /// moved tip refuses (`E_INBOX_RACE`).
-        #[arg(long)]
-        discard: Vec<String>,
-        /// Rotate the inbox encryption key (drain-then-destroy).
-        #[command(subcommand)]
-        action: Option<InboxAction>,
     },
     /// Append to the ledger (one commit per write).
     Log {
@@ -266,27 +204,21 @@ enum Command {
         /// `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
     },
-    /// Vault health checks (the crypto check reports encryption availability).
-    Doctor {
-        /// Clear the pending inbox-rotation reminder (written by `keys shred`
-        /// on a non-inbox device). Requires confirmation unless --no-input.
-        #[arg(long)]
-        clear_pending_inbox_rotation: bool,
-    },
+    /// Vault health checks.
+    Doctor,
     /// Show how the vault compares with its git upstream (fetch, report).
     ///
     /// Read-only by default: fetch the upstream remote, report ahead/behind
     /// from the refreshed state, and exit non-zero when the branch diverged.
     /// `--pull` fast-forwards the local branch and `--push` pushes local
     /// commits; both are explicit, confirmed network writes and never run
-    /// automatically. Refuses a structurally plaintext vault
-    /// (`E_PLAINTEXT_REMOTE`), a vault with no remote or upstream
-    /// (`E_NO_REMOTE`), and a diverged branch (`E_NOT_FAST_FORWARD`).
+    /// automatically. Refuses a vault with no remote or upstream
+    /// (`E_NO_REMOTE`) and a diverged branch (`E_NOT_FAST_FORWARD`).
     ///
     /// The global `--dry-run` reports state from the last fetch without
     /// touching the network, so it is safe on metered or offline hosts.
@@ -302,100 +234,34 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Clear this machine's Confidant state so a new vault starts clean.
+    /// Create or scaffold a plaintext vault.
     ///
-    /// Machine state only: this command never reads, writes, or deletes
-    /// anything inside a vault. It removes `trust.toml`, `manifest-seq.toml`
-    /// and `inbox-rotation-pending.toml` from `~/.config/confidant/`, the
-    /// `default_vault`, `[vaults]`, `[trust].signers` and `[inbox].pubkey`
-    /// entries from `config.toml`, and this machine's device, operator and
-    /// inbox keys from the OS keychain.
-    ///
-    /// It refuses when any resolvable vault has a `keys/` tree, because
-    /// removing the anchor and keys would break it. It checks `--vault`,
-    /// `CONFIDANT_VAULT` (a path or a `[vaults]` name), a walk-up from the
-    /// current directory, `default_vault`, and every `[vaults]` entry — even
-    /// when discovery itself would fail — and names every initialized vault
-    /// in the error. `--force` overrides the guard only for vaults you have
-    /// retired. Use the global `--dry-run` to see the plan; `--yes` (or an
-    /// interactive `y`) is required to remove anything. JSON always reports
-    /// `"vault": null`: this command is machine state, not vault-scoped.
-    Reset {
-        /// Machine state only. Required: there is no vault-scoped reset.
-        #[arg(long, required = true)]
-        machine_state: bool,
-        /// Remove without asking. Required with --no-input or --json.
-        #[arg(long)]
-        yes: bool,
-        /// Proceed even when a resolvable vault has a keys/ tree.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Initialize the vault's trust anchor and keys (first device).
-    ///
-    /// Generates the operator key, a 24-word recovery phrase (shown once on
-    /// stderr, or written to `--phrase-out`), and this device's key; writes
-    /// the trust anchor to ~/.config/confidant/trust.toml; creates the vault
-    /// lookup key and the vault:shared client. Requires a git repo with a
-    /// clean tree. This is for a *new* vault. To put an existing vault on
-    /// another device, clone it and run `keys device-add` (not `init`;
-    /// `recover` only if every enrolled device is lost).
-    ///
-    /// With `--create`, an empty or absent vault directory is scaffolded
-    /// first: the directory is created, `git init` runs when needed and the
-    /// branch is set to `main`, `.gitignore` gains `.confidant/`, and a
-    /// minimal `confidant.toml` is written (its `packs` list comes from the
-    /// global `--packs` flag, defaulting to `[]`) and committed. `--remote
-    /// <url>` then adds `origin` (it does not push). Only packs built into
-    /// this binary (today the implicit `personal@0.2`) may be listed: an
-    /// external pack is vendored into an existing vault by `confidant pack
-    /// add`, so install it after `init`. The key steps then run unchanged.
+    /// With `--create`, an empty or absent vault directory is scaffolded:
+    /// the directory is created, `git init -b main` runs when needed,
+    /// `.gitignore` gains `.confidant/`, the collection directories
+    /// (`people/`, `orgs/`, `deals/`, `interactions/`, `notes/`, `edges/`,
+    /// `ledger/`) are created, and a minimal `confidant.toml` is written
+    /// (its `packs` list comes from the global `--packs` flag, defaulting
+    /// to `[]`) and committed. When git has no identity at all, a
+    /// repo-local fallback identity is set so the skeleton commit works.
+    /// `--remote <url>` then adds `origin` (it does not push). Only packs
+    /// built into this binary (today the implicit `personal@0.2`) may be
+    /// listed: an external pack is vendored into an existing vault by
+    /// `confidant pack add`, so install it after `init`.
     ///
     /// `--dry-run` runs every preflight check and reports the plan without
-    /// creating a directory, writing a file, making a commit, generating
-    /// keys, adding a remote, or touching the keychain.
+    /// creating a directory, writing a file, making a commit, or adding a
+    /// remote.
     Init {
-        /// Replace an existing trust anchor after initialization succeeds.
-        /// Never re-initializes an existing `keys/` tree (that is refused).
-        #[arg(long)]
-        force: bool,
-        /// Scaffold the vault directory (create, `git init`, `.gitignore`,
-        /// `confidant.toml`, committed skeleton) before initializing keys.
+        /// Scaffold the vault directory (create, `git init -b main`,
+        /// `.gitignore`, `confidant.toml`, collection directories,
+        /// committed skeleton).
         #[arg(long)]
         create: bool,
-        /// Write the 24-word recovery phrase to this new file (mode 0600)
-        /// instead of printing it. Refuses to overwrite. The phrase never
-        /// appears on stdout, stderr, or in JSON; move the file offline and
-        /// delete it after writing the phrase down.
-        #[arg(long, value_name = "PATH")]
-        phrase_out: Option<PathBuf>,
         /// Add `git remote origin URL` after scaffolding. Does not push
         /// (credentials and host keys stay yours). Requires `--create`.
         #[arg(long, value_name = "URL", requires = "create")]
         remote: Option<String>,
-    },
-    /// Recover the vault after every enrolled device is lost.
-    ///
-    /// The phrase arrives via stdin or --phrase-file only (never as an
-    /// argument). Requires a fresh device (no device key enrolled yet).
-    /// Rotates to a new recovery phrase and drops other devices' wrappings.
-    /// To add a second device while one is still enrolled, clone the vault
-    /// and run `keys device-add` instead.
-    Recover {
-        /// File containing the 24-word recovery phrase (alternative to stdin).
-        #[arg(long)]
-        phrase_file: Option<PathBuf>,
-        /// Explicit trust-anchor file to load (outside the vault) instead of
-        /// `~/.config/confidant/trust.toml` or the `keys/`-tree rebuild. The
-        /// phrase must still match the anchor's recovery key. Validated
-        /// before anything is written to the config dir.
-        #[arg(long, value_name = "FILE")]
-        anchor_file: Option<PathBuf>,
-    },
-    /// Manage per-client encryption keys (init-client, rotate, revoke, shred).
-    Keys {
-        #[command(subcommand)]
-        action: KeysAction,
     },
     /// Print the agent-contract JSON Schema.
     Schema,
@@ -474,173 +340,6 @@ enum Command {
         /// Write a touch-heavy ledger (#188).
         #[arg(long)]
         touch: bool,
-        /// Encrypt every record so find/check measure the decrypt path (#188).
-        #[arg(long)]
-        encrypted: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum KeysAction {
-    /// Initialize a client's key tree (first epoch, current recipients).
-    InitClient {
-        /// Client id (e.g. a person id, or `vault:shared`).
-        client_id: String,
-    },
-    /// Rotate a client's data key (new epoch, re-wrap to current recipients).
-    Rotate {
-        /// Client id.
-        client_id: String,
-    },
-    /// Revoke recipients from a client (removes wrappings across all epochs).
-    Revoke {
-        /// Client id.
-        client_id: String,
-        /// Recipient key ids to revoke.
-        key_ids: Vec<String>,
-    },
-    /// Crypto-shred a client: destroy its key tree, re-wrap all remaining
-    /// clients to fresh recipients, rotate recovery. The anchor is re-pinned
-    /// before any other key operation.
-    Shred {
-        /// Client id to shred.
-        client_id: String,
-    },
-    /// Verify a saved recovery phrase against this vault (read-only).
-    ///
-    /// The phrase arrives via stdin or `--phrase-file` only (never as an
-    /// argument). Works on an enrolled device and on a fresh device: it
-    /// needs no device key and writes nothing (no config dir, no `keys/`,
-    /// no git, no keychain). Exits 0 only when the phrase matches the
-    /// pinned public halves and opens every current client's wrapping.
-    VerifyRecovery {
-        /// File containing the 24-word recovery phrase (alternative to stdin).
-        #[arg(long)]
-        phrase_file: Option<PathBuf>,
-    },
-    /// Manage this device's trust anchor (off-vault public-key material).
-    ///
-    /// `keys anchor export` writes this device's `trust.toml` to a file
-    /// for transfer to a new device — the standalone form of
-    /// `device-add --from-request --anchor-out`, for when the new device's
-    /// request file is not at hand. No enrollment, no commit, no device
-    /// key: the anchor is already installed on this device.
-    Anchor {
-        #[command(subcommand)]
-        action: AnchorAction,
-    },
-    /// Add a new device: three-step ceremony (#713).
-    ///
-    /// On the new device, `keys device-add --initiate` emits a request
-    /// carrying only the public key + a label — the private key never
-    /// leaves the device. With an OS keychain it generates and stores the
-    /// keypair. On a headless host, set `CONFIDANT_DEVICE_KEY` to this
-    /// device's age identity first; `--initiate` uses that value and does
-    /// not write a keychain. On an already-enrolled device,
-    /// `keys device-add --from-request <file>` verifies the fingerprint
-    /// out of band, re-wraps every client's every retained epoch plus the
-    /// vault lookup key to the new device, and commits. Enrollment alone
-    /// does not let the new device decrypt: after pulling, the new device
-    /// must also establish its trust anchor with
-    /// `keys device-add --complete --anchor-file <file>`, where the file
-    /// is this device's `trust.toml` as emitted by `--from-request
-    /// --anchor-out <file>` (or, as an unverified fallback, copied from
-    /// the enrolled device). The anchor is verified against the vault
-    /// before it is installed, and installation is refused when
-    /// verification fails. A device enrolled before `--anchor-out`
-    /// existed holds wrapped keys but no anchor; re-running
-    /// `--from-request` for it fails (it is already enrolled), so
-    /// `--re-emit-anchor` re-emits just the anchor for such a device
-    /// without a new enrollment commit.
-    DeviceAdd {
-        /// Generate a device-add request on this (new) device. The request
-        /// carries only the public key + label. Needs no vault.
-        #[arg(long)]
-        initiate: bool,
-        /// Add the device described by the request file (on an enrolled
-        /// device). The request's fingerprint must be verified out of band:
-        /// interactive confirmation, or --fingerprint-verified with
-        /// --no-input.
-        #[arg(long, value_name = "FILE")]
-        from_request: Option<PathBuf>,
-        /// Finish enrollment on this (new) device: verify the trust anchor
-        /// in --anchor-file against the pulled vault and install it.
-        /// Needs the vault (after pull) and this device's identity.
-        #[arg(long)]
-        complete: bool,
-        /// Trust-anchor file to install (with --complete): a `trust.toml`
-        /// from an enrolled device, e.g. as written by
-        /// `--from-request --anchor-out`. Never a path inside the vault.
-        #[arg(long, value_name = "FILE")]
-        anchor_file: Option<PathBuf>,
-        /// Write this device's trust anchor to FILE (with --from-request),
-        /// for transfer to the new device. The file holds public-key
-        /// material only; it is written 0600 on Unix and never overwritten.
-        /// Never a path inside the vault.
-        #[arg(long, value_name = "FILE")]
-        anchor_out: Option<PathBuf>,
-        /// Re-emit the trust anchor for an already-enrolled device
-        /// (with --from-request --anchor-out): no new enrollment, no
-        /// commit. For a device added before --anchor-out existed, whose
-        /// wrapped keys work but which holds no anchor.
-        #[arg(long)]
-        re_emit_anchor: bool,
-        /// Human label for the new device (with --initiate).
-        #[arg(long)]
-        label: Option<String>,
-        /// Write the TOML request to FILE (with --initiate). The file
-        /// always holds TOML whatever the suffix. Refuses to overwrite
-        /// an existing file and refuses to follow a symlink. Without
-        /// --json this replaces the stdout document; with --json the
-        /// file is written in addition to the JSON envelope.
-        #[arg(long, value_name = "FILE")]
-        output: Option<PathBuf>,
-        /// Confirm the request fingerprint was verified out of band.
-        /// Required with --no-input (with --from-request).
-        #[arg(long)]
-        fingerprint_verified: bool,
-        /// Overwrite an already-enrolled device key (with --initiate).
-        /// Without this, --initiate refuses if a device key exists.
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum AnchorAction {
-    /// Write this device's trust anchor to a file for transfer to a new
-    /// device (#713). The file holds public-key material only; it is
-    /// written 0600 on Unix and create-new (never overwritten). Refused
-    /// inside the vault.
-    Export {
-        /// Destination file (never a path inside the vault).
-        #[arg(long, value_name = "FILE")]
-        out: PathBuf,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum InboxAction {
-    /// Rotate the inbox encryption key (drain-then-destroy).
-    ///
-    /// Drains the inbox with a normal run, generates a new X25519 keypair
-    /// in the OS keychain, and updates `confidant.toml [inbox].pubkey` and
-    /// the user-config pin. Re-pin every outside tool to the new key, then
-    /// run `inbox rotate --finish` to destroy the old private key.
-    ///
-    /// When the old key is unavailable (lost, compromised, or revoked
-    /// inbox device), the drain is skipped and there is no `--finish` to
-    /// run: old-key items fail closed with `E_INBOX_CRYPTO` and the tools
-    /// drop them again from source.
-    Rotate {
-        /// Finish a pending rotation: drain anything still encrypted to
-        /// the old key, then destroy the old private key from the keychain.
-        /// After this, items sent to the old key fail with `E_INBOX_CRYPTO`.
-        #[arg(long)]
-        finish: bool,
-        /// Proceed without verifying inbox branch signatures during the drain.
-        #[arg(long)]
-        allow_unsigned: bool,
     },
 }
 
@@ -664,13 +363,6 @@ enum LogAction {
         /// Source token, stored as src:<value>.
         #[arg(long)]
         src: Option<String>,
-        /// On keychain failure with --note, encrypt the note to the
-        /// pinned inbox pubkey and queue it to the `inbox` branch
-        /// instead of failing closed. Without the flag the
-        /// command prompts, unless --no-input/--json (then it fails
-        /// closed).
-        #[arg(long)]
-        fallback_inbox: bool,
         /// Log even when an identical session (same person, date,
         /// duration, tag) is already in the ledger (#747).
         #[arg(long)]
@@ -692,11 +384,6 @@ enum LogAction {
         /// Source token, stored as src:<value>.
         #[arg(long)]
         src: Option<String>,
-        /// On keychain failure with --note, encrypt the note to the
-        /// pinned inbox pubkey and queue it to the `inbox` branch
-        /// instead of failing closed.
-        #[arg(long)]
-        fallback_inbox: bool,
         /// Log even when an identical touch (same person, date, kind)
         /// is already in the ledger (#747).
         #[arg(long)]
@@ -706,40 +393,18 @@ enum LogAction {
 
 #[derive(Subcommand, Debug)]
 enum AliasAction {
-    /// Append an alias ledger line: `DATE alias <p-ULID> KIND hmac:HEX`.
-    ///
-    /// The raw value (email, phone, handle, or name) is read from stdin or
-    /// `--value-file` only — never an argument — and is never echoed in
-    /// output, errors, or logs. One commit; check-gated. When the value
-    /// appears nowhere in searchable plaintext, the add succeeds with a
-    /// warning that `find` cannot surface it — retrieve it with
-    /// `alias resolve <kind>` (#767). For a `no-ai: true` person the
-    /// warning says so plainly instead: agent paths do not surface
-    /// that person at all.
-    Add {
-        /// Opaque person id (p-…) or an exact display name (cleared people
-        /// only; see `confidant resolve`).
-        person: String,
-        /// Alias kind: email, phone, handle, or name.
-        kind: String,
-        /// File holding the alias value (alternative to stdin).
-        #[arg(long, value_name = "FILE")]
-        value_file: Option<PathBuf>,
-        /// Alias date YYYY-MM-DD (default today).
-        #[arg(long)]
-        date: Option<String>,
-    },
     /// Resolve a `kind` + value alias to the canonical person (read-only).
     ///
-    /// The raw value is read from stdin or `--value-file` only — never an
-    /// argument. Honors `no-ai` like other reads: an alias on a `no-ai: true`
-    /// person is not surfaced.
+    /// `kind` is email, phone, handle, or name; the value is matched
+    /// case-insensitively against the person's `personal@0.2` front-matter
+    /// `emails`/`phones`/`handles` (or the value half of a `links` entry),
+    /// or their display name for `name`. Honors `no-ai` like other reads:
+    /// a `no-ai: true` person is not surfaced.
     Resolve {
         /// Alias kind: email, phone, handle, or name.
         kind: String,
-        /// File holding the alias value (alternative to stdin).
-        #[arg(long, value_name = "FILE")]
-        value_file: Option<PathBuf>,
+        /// The value to look up.
+        value: String,
     },
 }
 
@@ -838,19 +503,19 @@ enum RecordAction {
     /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
     /// stays in the JSON envelope (ADR-7).
     List {
-        /// Include `no-ai` records, decrypted through the operator read
-        /// path (the same mechanism as `record show --for-edit`).
+        /// Include `no-ai` records, read through the operator path (the same
+        /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
         /// Record kind to list.
         #[arg(long, value_enum, default_value_t = RosterKind::Person)]
         kind: RosterKind,
     },
-    /// Print one record's decrypted text, to prepare an edit.
+    /// Print one record's text, to prepare an edit.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
     /// a fixed tool whitelist), and `--for-edit` is required so a bare
-    /// invocation cannot print a decrypted record body.
+    /// invocation cannot print a record body.
     Show {
         /// Opaque record id (p-…, o-…, d-…, i-…, e-…).
         id: String,
@@ -866,22 +531,13 @@ enum RecordAction {
     /// `--take` keeps one side byte for byte (#454); `--merged-file` and
     /// `--edit` land in #455.
     ///
-    /// `--from-inbox <stem>` switches the conflict source from git conflict
-    /// markers to an inbox item (#457): `ours` is the current record on
-    /// main, `theirs` is the inbox item's plaintext. The actions are the
-    /// same; `--take theirs` encrypts the item through the `record edit`
-    /// path (there is no envelope to keep byte for byte).
     #[command(group(
         clap::ArgGroup::new("resolve_action").required(true).multiple(false)
     ))]
     Resolve {
         /// Opaque record id (p-…, o-…, d-…, e-…).
         id: String,
-        /// Resolve against an inbox item instead of git conflict markers.
-        /// The stem is the item's file stem on the `inbox` branch.
-        #[arg(long)]
-        from_inbox: Option<String>,
-        /// Print both decrypted versions to stdout.
+        /// Print both versions to stdout.
         #[arg(long, group = "resolve_action")]
         show: bool,
         /// Keep one side's version byte for byte, staged but not committed.
@@ -893,10 +549,6 @@ enum RecordAction {
         /// Hand-merge in $VISUAL/$EDITOR with 0600 scratch files (see #455).
         #[arg(long, group = "resolve_action")]
         edit: bool,
-        /// Skip inbox signature verification for `--from-inbox` write
-        /// actions (same escape hatch as `inbox --allow-unsigned`).
-        #[arg(long, requires = "from_inbox")]
-        allow_unsigned: bool,
     },
 }
 
@@ -959,12 +611,12 @@ enum NoteAction {
         #[arg(long)]
         body_file: PathBuf,
     },
-    /// Print one note's decrypted text, to prepare an edit.
+    /// Print one note's text, to prepare an edit.
     ///
     /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
     /// a fixed tool whitelist), and `--for-edit` is required so a bare
-    /// invocation cannot print a decrypted note body. Notes are where
-    /// `no-ai` prose lives, so `no-ai` notes are decrypted in full here
+    /// invocation cannot print a note body. Notes are where
+    /// `no-ai` prose lives, so `no-ai` notes are printed in full here
     /// (same operator path as `record show --for-edit`).
     Show {
         /// Opaque note id (n-…).
@@ -978,10 +630,9 @@ enum NoteAction {
     /// Operator-only (never exposed over MCP). Exactly one source is
     /// required: `--file` reads the new note from a markdown file, `--edit`
     /// opens $VISUAL/$EDITOR on 0600 scratch under `.confidant/` (the #455
-    /// convention). The write goes through the normal pipeline, so in an
-    /// encrypted vault it re-encrypts, runs `check` before the commit, and
-    /// makes one commit; identical bytes report `unchanged` and commit
-    /// nothing.
+    /// convention). The write goes through the normal pipeline, so it runs
+    /// `check` before the commit and makes one commit; identical bytes report
+    /// `unchanged` and commit nothing.
     #[command(group(
         clap::ArgGroup::new("note_edit_source").required(true).multiple(false)
     ))]
@@ -1053,7 +704,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // created. #649: with `--dry-run` the guard is never created because
     // bootstrap writes nothing and returns `DryRun` instead.
     let mut scaffold = match &cli.command {
-        Command::Init { force, create, .. } => match bootstrap_vault(&cli, *create, *force)? {
+        Command::Init { create, .. } => match bootstrap_vault(&cli, *create)? {
             BootstrapPlan::DryRun => return Ok(ExitCode::SUCCESS),
             BootstrapPlan::Continue(scaffold) => scaffold,
         },
@@ -1062,8 +713,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
     // `schema` and `help` work without a vault; everything else needs one.
     // Every JSON response still carries the resolved vault (possibly null).
-    // `device-add --initiate` runs on a brand-new device that has no vault
-    // yet; everything else needs one.
     // `setup` / `update` / `agents` / `which` / `routing` / `tui` manage the
     // installed skills and never touch a vault.
     let needs_vault = !matches!(
@@ -1077,26 +726,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Routing
             | Command::Tui { .. }
             | Command::BenchGen { .. }
-            | Command::Reset { .. }
             | Command::Pack { .. }
-            | Command::Keys {
-                action: KeysAction::DeviceAdd { initiate: true, .. },
-            }
     );
-    let vault_root: Option<PathBuf>;
-    let user_config: Option<UserConfig>;
-    match discover(cli.vault.as_deref()) {
-        Ok((root, user)) => {
-            vault_root = Some(root);
-            user_config = user;
-        }
+    let vault_root: Option<PathBuf> = match discover(cli.vault.as_deref()) {
+        Ok((root, _user)) => Some(root),
         Err(err) => {
             if needs_vault {
                 print_error(json, None, &err)?;
                 return Ok(ExitCode::from(err.exit_code() as u8));
             }
-            vault_root = None;
-            user_config = None;
+            None
         }
     };
 
@@ -1107,14 +746,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             notes,
             cjk,
             touch,
-            encrypted,
         } => {
             let (unique, common) = confidant_core::bench::generate_realistic_vault(
                 dir, *people, *notes, *cjk, *touch,
             )?;
-            if *encrypted {
-                encrypt_bench_vault(dir)?;
-            }
             if json {
                 print_json(&ok_envelope(
                     Some(dir),
@@ -1144,13 +779,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 })?),
             };
             let vault = vault_or!(&root, json);
-            let pinned_inbox_pubkey = user_config.as_ref().and_then(|u| u.inbox.pubkey.clone());
             let report = check_vault(
                 &vault,
                 &CheckOptions {
                     as_of,
                     fail_on: Some(fail_on),
-                    pinned_inbox_pubkey,
                 },
             );
             if json {
@@ -1186,28 +819,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Alias { action } => {
             let root = vault_root.unwrap();
             match action {
-                AliasAction::Add {
-                    person,
-                    kind,
-                    value_file,
-                    date,
-                } => cmd_alias_add(
-                    &cli,
-                    &root,
-                    person,
-                    kind,
-                    value_file.as_deref(),
-                    date.clone(),
-                ),
-                AliasAction::Resolve { kind, value_file } => {
-                    cmd_alias_resolve(&cli, &root, kind, value_file.as_deref())
-                }
+                AliasAction::Resolve { kind, value } => cmd_alias_resolve(&cli, &root, kind, value),
             }
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
-            // Spec 4: the allowlist is a read path — decrypted records
-            // participate, skipped ones are excluded by omission.
+            // Spec 4: the allowlist is a read path — records participate,
+            // uncleared ones are excluded by omission.
             let vault = match load_vault_for_reads(&root, json, false) {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
@@ -1299,65 +917,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Reindex => {
-            let root = vault_root.unwrap();
-            cmd_reindex(json, &root)
-        }
-        Command::Inbox {
-            dry_run,
-            allow_unsigned,
-            skip,
-            force,
-            discard,
-            action,
-        } => {
-            let root = vault_root.unwrap();
-            // #457: `--discard` removes items without merging. It does not
-            // combine with the drain or with rotate.
-            if *force && action.is_some() {
-                return Err(anyhow::Error::new(DomainError::usage(
-                    "`inbox --force` does not combine with `inbox rotate`: a rotate drain never forces duplicates",
-                )));
-            }
-            if *force && !discard.is_empty() {
-                return Err(anyhow::Error::new(DomainError::usage(
-                    "`inbox --force` does not combine with `inbox --discard`",
-                )));
-            }
-            if !discard.is_empty() {
-                if action.is_some() {
-                    return Err(anyhow::Error::new(DomainError::usage(
-                        "`inbox --discard` does not combine with `inbox rotate`",
-                    )));
-                }
-                return cmd_inbox_discard(json, &root, discard);
-            }
-            match action {
-                Some(InboxAction::Rotate {
-                    finish,
-                    allow_unsigned: rotate_unsigned,
-                }) => {
-                    // #318: `--skip` is refused during a rotate drain —
-                    // leftovers encrypted to the old key must not survive
-                    // `--finish` (§8a.3).
-                    if !skip.is_empty() {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--skip is refused during `inbox rotate`: finish or drop old-key items before rotating",
-                        )));
-                    }
-                    cmd_inbox_rotate(&root, user_config.as_ref(), json, *finish, *rotate_unsigned)
-                }
-                None => cmd_inbox(
-                    json,
-                    &root,
-                    user_config.as_ref(),
-                    *dry_run,
-                    *allow_unsigned,
-                    skip,
-                    *force,
-                ),
-            }
-        }
         Command::Log { action } => {
             let root = vault_root.unwrap();
             match action {
@@ -1368,19 +927,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     date,
                     note,
                     src,
-                    fallback_inbox,
                     force,
                 } => cmd_log_session(
                     &cli,
                     &root,
-                    user_config.as_ref(),
                     person,
                     duration,
                     tag.clone(),
                     date.clone(),
                     note.clone(),
                     src.clone(),
-                    *fallback_inbox,
                     *force,
                 ),
                 LogAction::Touch {
@@ -1389,18 +945,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     date,
                     note,
                     src,
-                    fallback_inbox,
                     force,
                 } => cmd_log_touch(
                     &cli,
                     &root,
-                    user_config.as_ref(),
                     person,
                     kind,
                     date.clone(),
                     note.clone(),
                     src.clone(),
-                    *fallback_inbox,
                     *force,
                 ),
             }
@@ -1489,24 +1042,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 RecordAction::Show { id, for_edit } => cmd_record_show(&cli, &root, id, *for_edit),
                 RecordAction::Resolve {
                     id,
-                    from_inbox,
                     show,
                     take,
                     merged_file,
                     edit,
-                    allow_unsigned,
-                } => cmd_record_resolve(
-                    &cli,
-                    &root,
-                    user_config.as_ref(),
-                    id,
-                    from_inbox.as_deref(),
-                    *show,
-                    *take,
-                    merged_file.as_deref(),
-                    *edit,
-                    *allow_unsigned,
-                ),
+                } => {
+                    cmd_record_resolve(&cli, &root, id, *show, *take, merged_file.as_deref(), *edit)
+                }
             }
         }
         Command::Context {
@@ -1517,134 +1059,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             cmd_context(&cli, &root, person, !exclude_private, *for_operator)
         }
-        Command::Doctor {
-            clear_pending_inbox_rotation,
-        } => {
+        Command::Doctor => {
             let root = vault_root.unwrap();
-            cmd_doctor(
-                &cli,
-                &root,
-                user_config.as_ref(),
-                *clear_pending_inbox_rotation,
-            )
+            cmd_doctor(&cli, &root)
         }
         Command::Sync { pull, push, yes } => {
             let root = vault_root.unwrap();
             cmd_sync(&cli, &root, *pull, *push, *yes)
         }
-        Command::Reset { yes, force, .. } => cmd_reset_machine_state(&cli, *yes, *force),
-        Command::Init {
-            force, phrase_out, ..
-        } => {
+        Command::Init { .. } => {
             let root = vault_root.unwrap();
-            cmd_init(&cli, &root, *force, scaffold.take(), phrase_out.as_deref())
-        }
-        Command::Recover {
-            phrase_file,
-            anchor_file,
-        } => {
-            let root = vault_root.unwrap();
-            cmd_recover(&cli, &root, phrase_file.as_deref(), anchor_file.as_deref())
-        }
-        Command::Keys { action } => {
-            match action {
-                // --initiate runs on a new device with no vault; every other
-                // keys action needs the vault.
-                KeysAction::DeviceAdd {
-                    initiate,
-                    from_request,
-                    complete,
-                    anchor_file,
-                    anchor_out,
-                    re_emit_anchor,
-                    label,
-                    output,
-                    fingerprint_verified,
-                    force,
-                } => {
-                    // B6: flag combinations are usage errors (exit 2).
-                    let modes = [*initiate, from_request.is_some(), *complete]
-                        .iter()
-                        .filter(|m| **m)
-                        .count();
-                    if modes != 1 {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "keys device-add needs exactly one of --initiate, --from-request <file>, or --complete",
-                        )));
-                    }
-                    if !initiate && (label.is_some() || output.is_some()) {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--label and --output only make sense with --initiate",
-                        )));
-                    }
-                    if anchor_file.is_some() && !complete {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--anchor-file only makes sense with --complete",
-                        )));
-                    }
-                    if anchor_out.is_some() && from_request.is_none() {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--anchor-out only makes sense with --from-request",
-                        )));
-                    }
-                    if *re_emit_anchor && from_request.is_none() {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--re-emit-anchor only makes sense with --from-request",
-                        )));
-                    }
-                    if *re_emit_anchor && anchor_out.is_none() {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--re-emit-anchor requires --anchor-out <file> to write the anchor to",
-                        )));
-                    }
-                    if *complete && *fingerprint_verified {
-                        return Err(anyhow::Error::new(DomainError::usage(
-                            "--fingerprint-verified only makes sense with --from-request",
-                        )));
-                    }
-                    if *initiate {
-                        cmd_keys_device_add_initiate(
-                            &cli,
-                            label.as_deref(),
-                            output.as_deref(),
-                            *force,
-                        )
-                    } else if *complete {
-                        let root = vault_root.unwrap();
-                        cmd_keys_device_add_complete(&cli, &root, anchor_file.as_deref())
-                    } else {
-                        let root = vault_root.unwrap();
-                        cmd_keys_device_add_from_request(
-                            &cli,
-                            &root,
-                            from_request.as_deref(),
-                            *fingerprint_verified,
-                            anchor_out.as_deref(),
-                            *re_emit_anchor,
-                        )
-                    }
-                }
-                _ => {
-                    let root = vault_root.unwrap();
-                    match action {
-                        KeysAction::InitClient { client_id } => {
-                            cmd_keys_init_client(&cli, &root, client_id)
-                        }
-                        KeysAction::Rotate { client_id } => cmd_keys_rotate(&cli, &root, client_id),
-                        KeysAction::Revoke { client_id, key_ids } => {
-                            cmd_keys_revoke(&cli, &root, client_id, key_ids)
-                        }
-                        KeysAction::Shred { client_id } => cmd_keys_shred(&cli, &root, client_id),
-                        KeysAction::VerifyRecovery { phrase_file } => {
-                            cmd_keys_verify_recovery(&cli, &root, phrase_file.as_deref())
-                        }
-                        KeysAction::Anchor { action } => cmd_keys_anchor(&cli, &root, action),
-                        KeysAction::DeviceAdd { .. } => {
-                            unreachable!("handled by the outer match arm")
-                        }
-                    }
-                }
-            }
+            cmd_init(&cli, &root, scaffold.take())
         }
         Command::Schema => cmd_schema(&cli, vault_root.as_deref()),
         Command::Help { topic } => cmd_help(&cli, vault_root.as_deref(), topic.clone()),
@@ -1698,33 +1123,18 @@ fn resolve_cli_scope(
     Ok((scope, names))
 }
 
-/// Load the vault for a read command (`find`/`context`, spec 4). Two-phase:
-/// phase 1 loads without the hook to get the vault id for AAD; phase 2
-/// reloads with the decryptor hook so envelopes decrypt (or skip + count).
-/// Reads never fail for a missing key — that is a per-record skip (⚠2).
-/// Load the vault for a read command, decrypting record envelopes.
+/// Load the vault for a read command (`find`/`context`).
 ///
-/// `operator` selects the reader mode: `false` is the agent read path
-/// (`no-ai` records come back as keyless shells), `true` is the operator
-/// edit path, used only by `record show --for-edit` (#216).
+/// Records are plaintext on disk, so every read parses the same bytes; the
+/// `no-ai` gate is applied on the parsed front matter by the search
+/// allowlist. `operator` is accepted for call-site symmetry with the
+/// operator-only reads and has no effect on loading.
 fn load_vault_for_reads(
     root: &Path,
     json: bool,
-    operator: bool,
+    _operator: bool,
 ) -> Result<confidant_core::Vault, ExitCode> {
-    let probe = match load_vault(root) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = print_error(json, Some(&root.display().to_string()), &err);
-            return Err(ExitCode::from(err.exit_code() as u8));
-        }
-    };
-    let decryptor = std::sync::Arc::new(if operator {
-        record_decrypt::RecordDecryptor::for_edit(root, &probe.config.vault_id)
-    } else {
-        record_decrypt::RecordDecryptor::for_reads(root, &probe.config.vault_id)
-    });
-    match confidant_core::load_vault_with_hook(root, Some(decryptor.hook())) {
+    match load_vault(root) {
         Ok(v) => Ok(v),
         Err(err) => {
             let _ = print_error(json, Some(&root.display().to_string()), &err);
@@ -3201,17 +2611,6 @@ fn ok_envelope(root: Option<&Path>, extra: Value) -> Value {
     Value::Object(map)
 }
 
-fn fail_command(json: bool, vault: Option<&str>, err: &anyhow::Error) -> anyhow::Result<ExitCode> {
-    let domain = DomainError::of(err)
-        .cloned()
-        .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-    print_error(json, vault, &domain)?;
-    Ok(ExitCode::from(domain.exit_code() as u8))
-}
-
-/// Human-output banner for `--for-operator` (#572). Operator mode must be
-/// unmistakable so a screen share cannot silently show data the agent view
-/// hides. JSON carries `for_operator: true` instead.
 const OPERATOR_MODE_BANNER: &str = "OPERATOR MODE: no-ai records included (--for-operator)";
 
 fn cmd_find(
@@ -3227,10 +2626,9 @@ fn cmd_find(
             "find requires a non-empty query",
         )));
     }
-    // Operator mode (#572) loads through the operator decrypt path (the
-    // same mechanism as `record show --for-edit`); the default stays the
-    // agent read path (`no-ai` records come back as keyless shells and are
-    // then excluded by the §12 allowlist).
+    // Operator mode (#572) loads through the operator read path (the same
+    // mechanism as `record show --for-edit`); the default stays the agent
+    // read path (`no-ai` records are then excluded by the §12 allowlist).
     let vault = match load_vault_for_reads(root, json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -3262,23 +2660,8 @@ fn cmd_find(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    // #769 fix wave: the warnings are selected in `search_with` from the
-    // pre-limit hit count, but `--limit` truncates the displayed list
-    // afterwards. A limit that empties the displayed list (e.g.
-    // `--limit 0` over real hits) must not carry `W_PARTIAL_RESULTS`,
-    // whose wording ("these matches") assumes a non-empty displayed
-    // result. Reconcile from the displayed count: a limit-emptied result
-    // carries neither warning — the absence warning is not substituted
-    // either, since the emptiness is the operator's cap, not an absence
-    // claim (whether it should fire is an open line in the
-    // finding-codes-review issue). The skip/refuse counts are still
-    // reported alongside, as before.
-    let total_hits = result.hits.len();
     let hits: Vec<_> = result.hits.into_iter().take(limit).collect();
-    let mut findings = result.findings;
-    if hits.is_empty() && total_hits > 0 {
-        findings.retain(|f| f.code.as_str() != "W_PARTIAL_RESULTS");
-    }
+    let findings = result.findings;
     // #386: optional ranked-search hint. Present only when qmd is on PATH
     // and the corpus exists; never changes matches, ordering, or exit status.
     let qmd_hint = qmd_hint_for_find(&vault.root);
@@ -3287,8 +2670,6 @@ fn cmd_find(
                 "query": query,
                 "matches": hits,
                 "findings": findings,
-                "skipped_encrypted": result.skipped_encrypted,
-                "refused_envelopes": result.refused_envelopes,
                 "scope": scope_names,
         });
         if let (Some(hint), Some(obj)) = (qmd_hint.as_deref(), data.as_object_mut()) {
@@ -3329,34 +2710,8 @@ fn cmd_find(
             )?;
         }
         writeln!(io::stdout(), "{} matches", hits.len())?;
-        // ⚠2a: never silently empty — the skip/refuse counts are always
-        // visible when nonzero.
-        if result.skipped_encrypted > 0 {
-            writeln!(
-                io::stdout(),
-                "skipped_encrypted: {}",
-                result.skipped_encrypted
-            )?;
-        }
-        if result.refused_envelopes > 0 {
-            writeln!(
-                io::stdout(),
-                "refused_envelopes: {}",
-                result.refused_envelopes
-            )?;
-        }
         if let Some(hint) = qmd_hint.as_deref() {
             eprintln!("{hint}");
-        }
-        // #718/#769: the warning finding above already prints on stdout;
-        // repeat it on stderr too, so a human skimming a "0 matches" — or
-        // a non-empty match list — sees it even if they miss the findings
-        // block. JSON mode carries the finding in-band and stays
-        // stderr-clean.
-        for f in &findings {
-            if f.code.as_str() == "W_SKIPPED_ENCRYPTED" || f.code.as_str() == "W_PARTIAL_RESULTS" {
-                eprintln!("warning: {}", f.message);
-            }
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -3389,120 +2744,8 @@ fn qmd_setup_note() -> Option<String> {
 
 /// `<vault>/.confidant/qmd-corpus/` — the QMD search corpus (ADR-6).
 const QMD_CORPUS_REL: &str = ".confidant/qmd-corpus";
-/// Sibling temp dir the corpus is built into before an atomic rename into
-/// [`QMD_CORPUS_REL`], so a failed build never leaves a partial corpus.
-const QMD_CORPUS_TMP_REL: &str = ".confidant/qmd-corpus.tmp";
-/// `<vault>/.confidant/qmd/` — the skill's QMD store (index.sqlite holds the
-/// plaintext FTS chunks + embeddings). The CLI does not build it, but `keys
-/// shred` deletes it alongside the corpus so shredded plaintext cannot linger.
 const QMD_STORE_REL: &str = ".confidant/qmd";
 
-/// `confidant reindex` (ADR-6): rebuild the local search corpus from the
-/// §12 cleared set, decrypting through the read path.
-///
-/// The corpus is a plaintext mirror of cleared vault content, so this fails
-/// closed twice: an encrypted record this device cannot decrypt aborts the
-/// whole build (a corpus that silently omits records is worse than none),
-/// and the corpus must be git-ignored in the vault's repo.
-fn cmd_reindex(json: bool, root: &Path) -> anyhow::Result<ExitCode> {
-    let vault = match load_vault_for_reads(root, json, false) {
-        Ok(v) => v,
-        Err(code) => return Ok(code),
-    };
-    let vault_path = vault.root.display().to_string();
-    if vault.config.spec != confidant_core::SPEC_VERSION {
-        print_error(
-            json,
-            Some(&vault_path),
-            &DomainError::spec_unsupported(&vault.config.spec),
-        )?;
-        return Ok(ExitCode::from(1));
-    }
-    if vault.ledger_unread_count > 0 {
-        let err = DomainError::ledger_unreadable(vault.ledger_unread_count);
-        print_error(json, Some(&vault_path), &err)?;
-        return Ok(ExitCode::from(err.exit_code() as u8));
-    }
-
-    // B1/B4: refuse rather than build a corpus that silently omits encrypted
-    // records. `find` skips and counts; a corpus cannot afford to.
-    let skipped = vault.skipped_encrypted;
-    let refused = vault.refused_envelopes;
-    if skipped > 0 || refused > 0 {
-        let err = DomainError::reindex_unreadable(skipped, refused);
-        return refuse_reindex(json, &vault_path, &err, skipped, refused);
-    }
-    if let Err(err) = ensure_corpus_gitignored(&vault.root) {
-        return refuse_reindex(json, &vault_path, &err, 0, 0);
-    }
-
-    let stats = match build_reindex_corpus(&vault) {
-        Ok(stats) => stats,
-        Err(err) => return fail_command(json, Some(&vault_path), &err),
-    };
-    let corpus = vault.root.join(QMD_CORPUS_REL);
-    if json {
-        print_json(&ok_envelope(
-            Some(&vault.root),
-            serde_json::json!({
-                "corpus": corpus.display().to_string(),
-                "files_copied": stats.files_copied,
-                "records_copied": stats.records_copied,
-                "records_decrypted": stats.records_decrypted,
-                "ledger_lines_kept": stats.ledger_lines_kept,
-                // Reuse find's count vocabulary so an agent can tell "0
-                // decrypted because refused" from "0 decrypted because
-                // empty" (ADR-7). Both are always zero on success.
-                "skipped_encrypted": 0,
-                "refused_envelopes": 0,
-            }),
-        ))?;
-    } else {
-        println!(
-            "corpus: {} ({} file(s))",
-            corpus.display(),
-            stats.files_copied
-        );
-        println!(
-            "records: {} copied, {} decrypted",
-            stats.records_copied, stats.records_decrypted
-        );
-        println!("ledger lines kept: {}", stats.ledger_lines_kept);
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Print a reindex refusal. JSON keeps the ADR-7 error envelope and adds the
-/// skip/refuse counts so a caller never has to parse the message.
-fn refuse_reindex(
-    json: bool,
-    vault: &str,
-    err: &DomainError,
-    skipped: u32,
-    refused: u32,
-) -> anyhow::Result<ExitCode> {
-    if json {
-        print_json(&serde_json::json!({
-            "ok": false,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": vault,
-            "error": err.to_json(),
-            "skipped_encrypted": skipped,
-            "refused_envelopes": refused,
-        }))?;
-    } else {
-        writeln!(io::stderr(), "error: {} ({})", err.message(), err.code())?;
-        if let Some(fix) = err.fix() {
-            writeln!(io::stderr(), "  fix: {fix}")?;
-        }
-    }
-    Ok(ExitCode::from(err.exit_code() as u8))
-}
-
-/// Port of the skill's gitignore guardrail (`qmd-index.py`): refuse unless
-/// `.confidant/` is git-ignored (it holds the corpus, the QMD store, and the
-/// build temp dir). git absent or the vault not being a repo is a note, not
-/// a refusal (there is nothing to commit with), matching the skill.
 pub(crate) fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
     let git_dir = std::process::Command::new("git")
         .arg("-C")
@@ -3541,346 +2784,15 @@ pub(crate) fn ensure_corpus_gitignored(root: &Path) -> Result<(), DomainError> {
     if ignored {
         Ok(())
     } else {
-        Err(DomainError::reindex_not_ignored(
-            &[".confidant/".to_string()],
-            &root.display().to_string(),
-        ))
+        Err(DomainError::config(
+            "refusing to write under `.confidant/`: not git-ignored in this vault",
+        )
+        .with_fix(format!(
+            "Add `.confidant/` to the vault's .gitignore, e.g.: (cd {} && echo '.confidant/' >> .gitignore), then retry",
+            root.display()
+        )))
     }
 }
-
-/// Corpus build statistics for `reindex --json`.
-struct ReindexStats {
-    files_copied: usize,
-    records_copied: usize,
-    records_decrypted: usize,
-    ledger_lines_kept: usize,
-}
-
-/// Rebuild `<vault>/.confidant/qmd-corpus/` from the §12 cleared set. The
-/// allowlist comes from `cleared_record_paths` / `cleared_ledger_lines`
-/// (never reimplemented here), so `no-ai` records are excluded by
-/// construction. Built into a temp dir and renamed into place atomically.
-fn build_reindex_corpus(vault: &confidant_core::Vault) -> anyhow::Result<ReindexStats> {
-    let corpus = vault.root.join(QMD_CORPUS_REL);
-    // Build into a sibling temp dir on the same filesystem, then rename into
-    // place: the old corpus survives until the rename succeeds, so a failed
-    // build never leaves a partial corpus behind.
-    let tmp = vault.root.join(QMD_CORPUS_TMP_REL);
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
-    std::fs::create_dir_all(&tmp)?;
-    // The corpus dir is 0700 from the start (not only after the build), so
-    // plaintext never exists in a world-readable directory.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))?;
-    }
-
-    let cleared_records = confidant_core::cleared_record_paths(vault);
-    let cleared_ledger = confidant_core::cleared_ledger_lines(vault);
-
-    let mut stats = ReindexStats {
-        files_copied: 0,
-        records_copied: 0,
-        records_decrypted: 0,
-        ledger_lines_kept: 0,
-    };
-
-    for rec in vault.records.values() {
-        if !cleared_records.contains(&rec.path) {
-            continue;
-        }
-        let dst = tmp.join(&rec.path);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_corpus_file(&dst, rec.source.as_bytes())?;
-        stats.files_copied += 1;
-        stats.records_copied += 1;
-        if record_file_is_envelope(&vault.root, &rec.path) {
-            stats.records_decrypted += 1;
-        }
-    }
-
-    for (file, lines) in &cleared_ledger {
-        let text = std::fs::read_to_string(vault.root.join(file)).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot read ledger file for the corpus: {e}"
-            )))
-        })?;
-        let keep: std::collections::HashSet<u32> = lines.iter().copied().collect();
-        let mut kept = String::new();
-        for (idx, line) in text.split_inclusive('\n').enumerate() {
-            if keep.contains(&(idx as u32 + 1)) {
-                kept.push_str(line);
-                stats.ledger_lines_kept += 1;
-            }
-        }
-        let dst = tmp.join(file);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_corpus_file(&dst, kept.as_bytes())?;
-        stats.files_copied += 1;
-        // QMD collections match `**/*.md` only, so mirror each `.cfd` as a
-        // sibling `.cfd.md` (as the skill did). The query script maps hits
-        // back to the real `.cfd` path for verification.
-        let mirror = tmp.join(format!("{file}.md"));
-        write_corpus_file(&mirror, kept.as_bytes())?;
-        stats.files_copied += 1;
-    }
-
-    harden_corpus_permissions(&tmp)?;
-    if corpus.exists() {
-        std::fs::remove_dir_all(&corpus)?;
-    }
-    std::fs::rename(&tmp, &corpus)?;
-    Ok(stats)
-}
-
-/// True when the on-disk record file is a §14 envelope (i.e. its corpus
-/// entry came from decrypting through the CLI).
-fn record_file_is_envelope(root: &Path, rel: &str) -> bool {
-    let mut head = [0u8; 4096];
-    let Ok(mut file) = std::fs::File::open(root.join(rel)) else {
-        return false;
-    };
-    use std::io::Read;
-    let n = file.read(&mut head).unwrap_or(0);
-    confidant_core::crypto_mode::is_envelope_bytes(&head[..n])
-}
-
-/// Write a corpus file with mode `0600` from the start, so plaintext never
-/// exists with default (world-readable) permissions.
-fn write_corpus_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(contents)?;
-    Ok(())
-}
-
-/// Corpus dirs `0700`, files `0600` (B3). Applied recursively after the
-/// build as a final sweep over every nested directory created for record
-/// paths (the corpus root and files are already created with their final
-/// mode; this re-asserts it).
-fn harden_corpus_permissions(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            harden_corpus_permissions(&entry.path())?;
-        } else if file_type.is_file() {
-            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete this device's local search index (the QMD corpus, the QMD store,
-/// and any leftover build temp dir). Called by `keys shred`: the corpus is a
-/// plaintext mirror that may hold the shredded client's content, and it is
-/// now stale. Best-effort — returns a warning per path that could not be
-/// removed (empty when everything was absent or deleted).
-fn delete_search_index(root: &Path) -> Vec<String> {
-    let mut warnings = Vec::new();
-    for rel in [QMD_CORPUS_REL, QMD_CORPUS_TMP_REL, QMD_STORE_REL] {
-        let path = root.join(rel);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warnings.push(format!(
-                "could not delete the local search index at {rel}: {e}; \
-                 delete it manually (it may hold the shredded client's plaintext)"
-            )),
-        }
-    }
-    warnings
-}
-
-fn cmd_inbox(
-    json: bool,
-    root: &Path,
-    user_config: Option<&UserConfig>,
-    dry_run: bool,
-    allow_unsigned: bool,
-    skip: &[String],
-    force: bool,
-) -> anyhow::Result<ExitCode> {
-    let vault_path = root.display().to_string();
-    let trusted_signers = user_config
-        .map(|u| u.trust.signers.clone())
-        .unwrap_or_default();
-    let pinned_pubkey = user_config.and_then(|u| u.inbox.pubkey.clone());
-    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
-        match confidant_core::InboxKeys::load_opt() {
-            Ok(keys) => keys.map(std::sync::Arc::new),
-            Err(err) => return fail_command(json, Some(&vault_path), &err),
-        };
-    let decrypt = {
-        let keys = inbox_keys.clone();
-        move |ciphertext: &[u8]| match &keys {
-            Some(k) => k.decrypt(ciphertext),
-            None => Err(anyhow::Error::new(DomainError::inbox_crypto(
-                "no inbox key enrolled".to_string(),
-            ))),
-        }
-    };
-    // Lazily built on the first RecordWrite into an encrypted vault, so
-    // ledger-only drains still work without the device key (#213). The
-    // encryptor is cached across items in one run. The closure is `move`
-    // (owns its captures) because `EncryptFn` is `dyn Fn + 'static`.
-    let encryptor: std::cell::RefCell<Option<record_crypto::RecordEncryptor>> =
-        std::cell::RefCell::new(None);
-    let root_owned = root.to_path_buf();
-    let encrypt = move |path: &std::path::Path, plaintext: &[u8]| -> anyhow::Result<Vec<u8>> {
-        let mut slot = encryptor.borrow_mut();
-        if slot.is_none() {
-            let vault = confidant_core::load_vault(&root_owned)?;
-            *slot = match record_crypto::RecordEncryptor::for_vault(&root_owned, &vault)? {
-                Some(enc) => Some(enc),
-                None => {
-                    return Err(anyhow::Error::new(DomainError::invalid(
-                        "vault declares plaintext, but the drain expected a record encryptor",
-                    )));
-                }
-            };
-        }
-        slot.as_ref()
-            .expect("record encryptor initialised above")
-            .encrypt_file(path, plaintext)
-    };
-    // Same lazy construction for the retry idempotency check (#213
-    // follow-up): the decryptor is only built when a record path already
-    // exists on an encrypted vault, so the common path never touches the
-    // device key. Decrypted bytes are compared in core, never logged
-    // (AGENTS.md rule 4).
-    let decryptor: std::cell::RefCell<Option<record_crypto::RecordEncryptor>> =
-        std::cell::RefCell::new(None);
-    let root_owned_for_decrypt = root.to_path_buf();
-    let decrypt_existing = move |path: &std::path::Path,
-                                 envelope: &[u8]|
-          -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        let mut slot = decryptor.borrow_mut();
-        if slot.is_none() {
-            let vault = confidant_core::load_vault(&root_owned_for_decrypt)?;
-            *slot =
-                match record_crypto::RecordEncryptor::for_vault(&root_owned_for_decrypt, &vault)? {
-                    Some(enc) => Some(enc),
-                    None => {
-                        return Err(anyhow::Error::new(DomainError::invalid(
-                            "vault holds an encrypted record, but no record encryptor is available",
-                        )));
-                    }
-                };
-        }
-        let plaintext = slot
-            .as_ref()
-            .expect("record encryptor initialised above")
-            .decrypt_existing(path, envelope)?;
-        Ok(Zeroizing::new(plaintext))
-    };
-    let report = match confidant_core::run_inbox(
-        root,
-        &confidant_core::InboxOptions {
-            dry_run,
-            trusted_signers,
-            allow_unsigned,
-            pinned_pubkey,
-            skip: skip.to_vec(),
-            is_rotate_drain: false,
-            force,
-        },
-        &decrypt,
-        inbox_keys.as_deref(),
-        Some(&encrypt),
-        Some(&decrypt_existing),
-    ) {
-        Ok(report) => report,
-        Err(err) => return fail_command(json, Some(&vault_path), &err),
-    };
-    if json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "branch": report.branch,
-                "dry_run": report.dry_run,
-                "empty": report.empty,
-                "merged": report.merged,
-                "cleared": report.cleared,
-                "items": report.items.iter().map(|i| serde_json::json!({
-                    "name": i.name,
-                    "kind": i.kind,
-                    "target": i.target,
-                    "action": i.action,
-                    "semantic_skipped": i.semantic_skipped,
-                })).collect::<Vec<_>>(),
-                "skipped": report.skipped.iter().map(|s| serde_json::json!({
-                    "name": s.name,
-                    "kind": s.kind,
-                    "target": s.target,
-                })).collect::<Vec<_>>(),
-                "warnings": report.warnings,
-            }),
-        ))?;
-    } else {
-        if report.empty {
-            println!("inbox: nothing to do (no inbox branch)");
-        } else if report.dry_run {
-            println!(
-                "inbox: dry run — {} item(s) would merge, {} already present, {} deferred (--skip)",
-                report.merged,
-                report.items.len() - report.merged,
-                report.skipped.len()
-            );
-        } else {
-            println!(
-                "inbox: {} item(s) merged into {}, {} cleared, {} deferred (--skip)",
-                report.merged,
-                report.branch,
-                report.cleared,
-                report.skipped.len()
-            );
-        }
-        for i in &report.items {
-            if i.semantic_skipped > 0 {
-                println!(
-                    "  {}  {:<6}  {}  {}  ({} semantic duplicate line(s) dropped)",
-                    i.name, i.kind, i.target, i.action, i.semantic_skipped
-                );
-            } else {
-                println!("  {}  {:<6}  {}  {}", i.name, i.kind, i.target, i.action);
-            }
-        }
-        let total_semantic_skipped: usize = report.items.iter().map(|i| i.semantic_skipped).sum();
-        if total_semantic_skipped > 0 {
-            println!(
-                "inbox: {total_semantic_skipped} semantic duplicate line(s) dropped \
-                 (a forced repeat needs `inbox --force`, or a per-item force marker)"
-            );
-        }
-        for s in &report.skipped {
-            println!("  {}  {:<6}  {}  deferred", s.name, s.kind, s.target);
-        }
-        for w in &report.warnings {
-            println!("warning: {w}");
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-// ---------------------------------------------------------------------------
-// Write commands
-// ---------------------------------------------------------------------------
 
 fn write_options(cli: &Cli) -> WriteOptions {
     WriteOptions {
@@ -3894,190 +2806,20 @@ fn write_options(cli: &Cli) -> WriteOptions {
     }
 }
 
-/// #180: when a pending write creates `person` records in an encrypted
-/// vault, create each missing client key in the same commit.
+/// Apply a record write through the plaintext write pipeline.
 ///
-/// The key is created with the exact `keys init-client` logic (union of
-/// current recipients, #160 unchanged) via [`staged_keys_mutation`], then
-/// `git add`ed so the record write's commit sweeps it in — `apply_write`
-/// only adds its own pending files. Returns the client ids whose keys
-/// were created, so the caller can roll them back on failure and report
-/// them on success.
-///
-/// Skips are deliberate, and each preserves the pre-#180 error:
-/// - dry run: no mutation at all (the preview shows plaintext, and the
-///   encryptor never runs, so no key is needed);
-/// - unparseable change or routing failure: the encryptor reports the
-///   canonical error later;
-/// - epoch file already exists: the key is there (a re-add, a repair, or
-///   a complete dir left by a crashed earlier attempt — the staged swap
-///   only ever moves whole trees), so nothing is created.
-fn ensure_person_client_keys(
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    pending: &PendingWrite,
-    opts: &WriteOptions,
-) -> anyhow::Result<Vec<String>> {
-    if opts.dry_run {
-        return Ok(Vec::new());
-    }
-    let mut wanted: Vec<String> = Vec::new();
-    for change in &pending.changes {
-        let FileChange::WriteFile { path, contents } = change else {
-            continue;
-        };
-        if !confidant_core::crypto_mode::is_record_path(path) {
-            continue;
-        }
-        let provisional = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("record.md");
-        let Ok(rec) = confidant_core::record::parse_record(contents, provisional) else {
-            continue;
-        };
-        if rec.kind != RecordKind::Person {
-            continue;
-        }
-        let id = rec.id.to_string();
-        let Ok(client_id) = confidant_crypt::client_id_for_record("person", Some(id.as_str()))
-        else {
-            continue;
-        };
-        if !wanted.contains(&client_id) {
-            wanted.push(client_id);
-        }
-    }
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    // Loaded lazily: a write whose keys already exist must not fail for
-    // want of an operator key (the encryptor path needs only the device
-    // key).
-    let mut key_material: Option<(confidant_crypt::anchor::Anchor, ed25519_dalek::SigningKey)> =
-        None;
-    let mut created = Vec::new();
-    for client_id in wanted {
-        if root.join("keys").join(&client_id).join("epoch").exists() {
-            continue;
-        }
-        if key_material.is_none() {
-            let (anchor, _warnings) =
-                confidant_crypt::anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-            let operator_sk = load_operator_sk(&anchor)?;
-            key_material = Some((anchor, operator_sk));
-        }
-        let (anchor, operator_sk) = key_material.as_ref().unwrap();
-        staged_keys_mutation(root, vault, &config_dir, |store| {
-            let recipients = keys_current_recipients(store, anchor)?;
-            store
-                .init_client(&client_id, &recipients, anchor, operator_sk)
-                .map_err(anyhow::Error::new)
-        })?;
-        // Stage the new tree so the record write's commit (which only
-        // `git add`s its pending files) sweeps it into the same commit.
-        let keys_rel = format!("keys/{client_id}");
-        if let Err(e) = confidant_core::write::git(root, &["add", "--", &keys_rel], opts.no_input) {
-            let _ = std::fs::remove_dir_all(root.join("keys").join(&client_id));
-            return Err(e);
-        }
-        created.push(client_id);
-    }
-    Ok(created)
-}
-
-/// Roll back key dirs created by [`ensure_person_client_keys`] after a
-/// failed write: unstage, then remove. Best-effort — cleanup must not
-/// mask the original failure. Only ever touches dirs this write created
-/// (brand-new client ids), never pre-existing keys.
-fn rollback_created_keys(root: &Path, created: &[String], opts: &WriteOptions) {
-    for client_id in created {
-        let keys_rel = format!("keys/{client_id}");
-        let _ = confidant_core::write::git(root, &["reset", "--", &keys_rel], opts.no_input);
-        let _ = std::fs::remove_dir_all(root.join("keys").join(client_id));
-    }
-}
-
-/// Apply a record write through the encryption transform (spec 3).
-///
-/// Builds the [`record_crypto::RecordEncryptor`] for this vault: on an
-/// encrypted vault the record `WriteFile`s become §14 envelopes; on a
-/// `mode = "plaintext"` vault this is plain [`apply_write`]. Any
-/// fail-closed mode error (unkeyed vault, `[crypto]` contradiction, key
-/// failure) surfaces here, before anything is applied.
-///
-/// Returns the outcome plus the client ids whose keys were auto-created
-/// for new `person` records (#180); the second element is empty unless
-/// a key was created.
-///
-/// Ledger-only writes (no `WriteFile` changes) skip the encryptor
-/// entirely: ledger lines stay plaintext by design, so no key is ever
-/// needed for them. That keeps a broken keychain from blocking
-/// `log session` with no `--note` (#176). Any write carrying a record
-/// file goes through the encryptor as before.
+/// Records are written as YAML front matter plus a Markdown body, atomically
+/// (`temp file + rename` via `confidant_core::paths::write_replace`), and
+/// gated by the pre/post `check` exactly as before.
 fn apply_record_write(
     root: &Path,
-    vault: &confidant_core::vault::Vault,
+    _vault: &confidant_core::vault::Vault,
     pending: PendingWrite,
     opts: &WriteOptions,
-) -> anyhow::Result<(WriteOutcome, Vec<String>)> {
-    apply_record_write_inner(root, vault, pending, opts, HashMap::new())
+) -> anyhow::Result<WriteOutcome> {
+    apply_write(root, pending, opts)
 }
 
-/// #410: like [`apply_record_write`], but the encryptor is built with
-/// `mode_overrides` — the no-ai modes this changeset is about to give to
-/// person records — so children encrypted in the same commit are stamped
-/// from the person's new mode. Only `record edit` on a person whose mode
-/// changes supplies a non-empty map.
-fn apply_record_write_inner(
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    pending: PendingWrite,
-    opts: &WriteOptions,
-    mode_overrides: HashMap<String, confidant_crypt::envelope::NoAi>,
-) -> anyhow::Result<(WriteOutcome, Vec<String>)> {
-    let needs_encryptor = pending
-        .changes
-        .iter()
-        .any(|c| matches!(c, FileChange::WriteFile { .. }));
-    if !needs_encryptor {
-        return Ok((apply_write(root, pending, opts)?, Vec::new()));
-    }
-    match record_crypto::RecordEncryptor::for_vault(root, vault)?
-        .map(|enc| enc.with_mode_overrides(mode_overrides))
-    {
-        Some(enc) => {
-            // #180: create a missing person key in the same commit as
-            // the person record. On any non-Applied outcome the created
-            // key dirs are rolled back, so a failed write keeps nothing:
-            // no orphan keys/<id>/, no person without a key.
-            let created = ensure_person_client_keys(root, vault, &pending, opts)?;
-            let result = apply_write_with_encryptor(root, pending, opts, &move |p, b| {
-                enc.encrypt_file(p, b)
-            });
-            match result {
-                Ok(outcome) if matches!(outcome, WriteOutcome::Applied { .. }) => {
-                    Ok((outcome, created))
-                }
-                Ok(outcome) => {
-                    rollback_created_keys(root, &created, opts);
-                    Ok((outcome, Vec::new()))
-                }
-                Err(e) => {
-                    rollback_created_keys(root, &created, opts);
-                    Err(e)
-                }
-            }
-        }
-        None => Ok((apply_write(root, pending, opts)?, Vec::new())),
-    }
-}
-
-/// Print a [`WriteOutcome`] and return the exit code.
-/// A check-blocked write prints the check report (exit 1): the caller sees
-/// exactly why the commit did not happen.
 fn finish_write(
     cli: &Cli,
     root: &Path,
@@ -4201,18 +2943,12 @@ impl ResolvedPersonArg {
     }
 }
 
-/// The vault loaded through the agent read path (`operator: false`), so
-/// cleared people's names decrypt. Unlike [`load_vault_for_reads`] this
-/// returns the classified error instead of printing it: the write commands
-/// resolve names *in addition to* loading their own (un-hooked) vault, and
-/// the error must reach the top-level handler once.
+/// The vault loaded for name resolution in a write command. Unlike
+/// [`load_vault_for_reads`] this returns the classified error instead of
+/// printing it: the write commands resolve names *in addition to* loading
+/// their own vault, and the error must reach the top-level handler once.
 fn load_read_vault(root: &Path) -> anyhow::Result<confidant_core::Vault> {
-    let probe = confidant_core::load_vault(root).map_err(anyhow::Error::new)?;
-    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
-        root,
-        &probe.config.vault_id,
-    ));
-    confidant_core::load_vault_with_hook(root, Some(decryptor.hook())).map_err(anyhow::Error::new)
+    confidant_core::load_vault(root).map_err(anyhow::Error::new)
 }
 
 /// Map a failed name resolution to the command-error layer. The not-found
@@ -4243,9 +2979,9 @@ fn person_resolve_error(
 }
 
 /// Resolve a `--person` / positional person argument: a `p-<ULID>` against
-/// the already-loaded write vault (its id and type sit in the plaintext
-/// envelope header, so a `no-ai: true` person stays addressable by id without
-/// decrypting), or an exact display name against the `for_reads` cleared set.
+/// the already-loaded write vault (its id and type come from plaintext front
+/// matter, so a `no-ai: true` person stays addressable by id), or an exact
+/// display name against the `for_reads` cleared set.
 ///
 /// An id miss in the write vault is not a confident not-found: the id
 /// could belong to a record the read path could not search, so the miss
@@ -4317,7 +3053,7 @@ fn resolve_person_arg(
 /// Id writes print nothing extra; under `--json` the envelope carries it.
 ///
 /// The line is printed before the remaining validation (bad duration, bad
-/// touch kind, keychain/inbox fallback), so it says "resolving to" rather
+/// touch kind), so it says "resolving to" rather
 /// than claiming a completed write: the human may still see an error and no
 /// commit after it (#537 review).
 fn announce_resolved_person(cli: &Cli, person: &ResolvedPersonArg) {
@@ -4342,132 +3078,6 @@ fn month_path(date: &chrono::NaiveDate) -> PathBuf {
     PathBuf::from(format!("ledger/{}/{:02}.cfd", date.year(), date.month()))
 }
 
-/// #457: `confidant inbox --discard <stem>...` — remove items from the
-/// `inbox` branch without merging them.
-///
-/// For an item the operator chose not to apply (e.g. after `record
-/// resolve <id> --from-inbox <stem> --take ours`). Exactly one signed
-/// commit (`inbox: discard N item(s)`); the main worktree is never
-/// touched. Fails closed on unknown stems (`E_INBOX_SKIP`), a moved tip
-/// (`E_INBOX_RACE`), and missing signing config (`E_INBOX_UNTRUSTED`).
-fn cmd_inbox_discard(json: bool, root: &Path, discard: &[String]) -> anyhow::Result<ExitCode> {
-    let vault_path = root.display().to_string();
-    let new_tip = match confidant_core::inbox::discard_inbox_items(root, discard) {
-        Ok(tip) => tip,
-        Err(err) => return fail_command(json, Some(&vault_path), &err),
-    };
-    if json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "command": "inbox-discard",
-                "discarded": discard.len(),
-                "stems": discard,
-                "tip": new_tip,
-            }),
-        ))?;
-    } else {
-        println!("inbox: discarded {} item(s)", discard.len(),);
-        for s in discard {
-            println!("  {s}");
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-#[allow(clippy::too_many_arguments)]
-/// `confidant inbox rotate [--finish]` (drain-then-destroy, §8a.3).
-///
-/// The inbox private key lives in the OS keychain (never a file); rotation
-/// is a keychain operation, so the keychain's own refusals surface here
-/// directly: it refuses while `CONFIDANT_INBOX_KEY` / `_PREVIOUS` are set
-/// (unset them first) and while a previous key is still present (run
-/// `--finish` first).
-fn cmd_inbox_rotate(
-    root: &Path,
-    user_config: Option<&UserConfig>,
-    json: bool,
-    finish: bool,
-    allow_unsigned: bool,
-) -> anyhow::Result<ExitCode> {
-    use confidant_core::inbox::{run_inbox_rotate, InboxRotateOptions};
-
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        DomainError::usage("inbox rotate needs $HOME to update the user-config pin")
-    })?;
-    let user_config_path = home.join(".config/confidant/config.toml");
-    let vault_config_path = root.join("confidant.toml");
-
-    let backend = keychain_backend();
-    let outcome = match run_inbox_rotate(
-        root,
-        &*backend,
-        None,
-        &vault_config_path,
-        &user_config_path,
-        &InboxRotateOptions {
-            finish,
-            allow_unsigned,
-            trusted_signers: user_config
-                .map(|u| u.trust.signers.clone())
-                .unwrap_or_default(),
-            pinned_pubkey: user_config.and_then(|u| u.inbox.pubkey.clone()),
-        },
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            let domain = DomainError::of(&err)
-                .cloned()
-                .unwrap_or_else(|| DomainError::internal(format!("{err:#}")));
-            print_error(json, Some(&root.display().to_string()), &domain)?;
-            return Ok(ExitCode::from(domain.exit_code() as u8));
-        }
-    };
-
-    if json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "finish": finish,
-                "drained": outcome.drain.as_ref().map(|d| d.merged),
-                "new_recipient": outcome.new_recipient,
-                "old_key_destroyed": outcome.old_key_destroyed,
-                "lost_key": outcome.lost_key,
-            }),
-        ))?;
-    } else if finish {
-        if outcome.old_key_destroyed {
-            let merged = outcome.drain.as_ref().map(|d| d.merged).unwrap_or(0);
-            println!(
-                "inbox: rotation finished — {merged} leftover item(s) drained, old private key destroyed"
-            );
-            println!("inbox: items sent to the old key now fail with E_INBOX_CRYPTO");
-        } else {
-            println!("inbox: nothing to finish (no previous inbox key)");
-        }
-    } else if outcome.lost_key {
-        println!(
-            "inbox: rotated to {} (no old key found — drain skipped, no --finish needed)",
-            outcome.new_recipient.as_deref().unwrap_or("?")
-        );
-        println!("inbox: re-pin every outside tool to the new key; old-key items fail with E_INBOX_CRYPTO");
-    } else {
-        println!(
-            "inbox: rotated to {}",
-            outcome.new_recipient.as_deref().unwrap_or("?")
-        );
-        println!("inbox: re-pin every outside tool to the new key, then run `confidant inbox rotate --finish`");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// #732: refuse a `log` verb up front when the vault cannot accept it,
-/// so `--dry-run` refuses with `E_INVALID` before any check runs
-/// instead of reporting `ok:true` for a write apply's post-check would
-/// block with `E_UNKNOWN_VERB`. Runs before person resolution and
-/// before the `--fallback-inbox` queueing path: a line the vault will
-/// reject must not be queued either. The fix mirrors the check
-/// finding's own fix.
 fn refuse_unknown_verb(verb: &str) -> anyhow::Error {
     // Deliberate echo, unlike `check_verbs_and_refs`' bare "unknown
     // verb": a verb is a command name the operator typed, not vault
@@ -4489,12 +3099,10 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
 /// the existing line's vault-relative file and line number when an
 /// identical line is already in the ledger, so the refusal can point at
 /// it. The caller runs this after building the canonical request but
-/// before applying or queueing anything, so a refusal writes nothing and
-/// queues nothing. `note:` and `src:` never make a line distinct — a
+/// before applying anything, so a refusal writes nothing.
+/// `note:` and `src:` never make a line distinct — a
 /// backfill that re-adds the same contact with a fresh note or
-/// provenance is still the same touchpoint. Lines already queued to the
-/// inbox are not visible here (they are encrypted to the inbox key);
-/// the drain skips them instead (see `plan_item`'s semantic check).
+/// provenance is still the same touchpoint.
 fn find_duplicate_touch(
     vault: &confidant_core::Vault,
     person: &RecordId,
@@ -4546,14 +3154,12 @@ fn defer_to_write_path(root: &Path, cli: &Cli, canonical: &str) -> anyhow::Resul
 fn cmd_log_session(
     cli: &Cli,
     root: &Path,
-    user_config: Option<&UserConfig>,
     person_raw: &str,
     duration: &str,
     tag: Option<String>,
     date_raw: Option<String>,
     note: Option<String>,
     src: Option<String>,
-    fallback_inbox: bool,
     force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
@@ -4591,7 +3197,6 @@ fn cmd_log_session(
     let mut changes = Vec::new();
     let mut note_arg: Option<String> = None;
     let mut note_body: Option<String> = None;
-    let mut note_write: Option<(PathBuf, String)> = None;
     if let Some(text) = note {
         let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
@@ -4611,8 +3216,6 @@ fn cmd_log_session(
             field_lines: BTreeMap::new(),
         };
         let contents = confidant_core::format_record(&rec);
-        // The #213 fallback queues this same pair as an inbox record item.
-        note_write = Some((rel.clone(), contents.clone()));
         changes.push(FileChange::WriteFile {
             path: rel,
             contents,
@@ -4680,50 +3283,7 @@ fn cmd_log_session(
             }
         }
     }
-    // #176: a session WITH a note needs the device key (the note record
-    // is encrypted). Probe the key early so a keychain failure fails
-    // closed here with a note-specific fix, instead of surfacing the
-    // generic encryptor error ("no device key enrolled") from
-    // `apply_record_write`. The probe is read-only; the encryptor loads
-    // the key again on the normal path. Gated on encrypted vaults: a
-    // plaintext vault needs no key for the note either.
-    //
-    // #213: on probe failure the note can go to the inbox instead — the
-    // drain now encrypts record items. `--fallback-inbox` queues it
-    // without asking; interactively the command prompts; under
-    // --no-input/--json it fails closed with a fix pointing at the flag.
-    if note_body.is_some() {
-        let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
-            .map_err(anyhow::Error::new)?;
-        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted)
-            && device_key_bech32().is_err()
-        {
-            let queue = if fallback_inbox {
-                true
-            } else if cli.no_input || cli.json {
-                false
-            } else {
-                prompt_fallback_inbox()?
-            };
-            if queue {
-                let (note_rel, note_contents) =
-                    note_write.expect("note write present when a note was given");
-                return queue_session_note_to_inbox(
-                    cli,
-                    root,
-                    &vault,
-                    user_config,
-                    &line,
-                    &note_rel,
-                    &note_contents,
-                    &person,
-                    force,
-                );
-            }
-            return Err(note_keychain_error());
-        }
-    }
-    let (outcome, _) = apply_record_write(
+    let outcome = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -4744,13 +3304,11 @@ fn cmd_log_session(
 fn cmd_log_touch(
     cli: &Cli,
     root: &Path,
-    user_config: Option<&UserConfig>,
     person_raw: &str,
     kind: &str,
     date_raw: Option<String>,
     note: Option<String>,
     src: Option<String>,
-    fallback_inbox: bool,
     force: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
@@ -4774,7 +3332,6 @@ fn cmd_log_touch(
     let mut changes = Vec::new();
     let mut note_arg: Option<String> = None;
     let mut note_body: Option<String> = None;
-    let mut note_write: Option<(PathBuf, String)> = None;
     if let Some(text) = note {
         let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
             .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
@@ -4794,7 +3351,6 @@ fn cmd_log_touch(
             field_lines: BTreeMap::new(),
         };
         let contents = confidant_core::format_record(&rec);
-        note_write = Some((rel.clone(), contents.clone()));
         changes.push(FileChange::WriteFile {
             path: rel,
             contents,
@@ -4846,38 +3402,7 @@ fn cmd_log_touch(
             }
         }
     }
-    if note_body.is_some() {
-        let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
-            .map_err(anyhow::Error::new)?;
-        if matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted)
-            && device_key_bech32().is_err()
-        {
-            let queue = if fallback_inbox {
-                true
-            } else if cli.no_input || cli.json {
-                false
-            } else {
-                prompt_fallback_inbox()?
-            };
-            if queue {
-                let (note_rel, note_contents) =
-                    note_write.expect("note write present when a note was given");
-                return queue_session_note_to_inbox(
-                    cli,
-                    root,
-                    &vault,
-                    user_config,
-                    &line,
-                    &note_rel,
-                    &note_contents,
-                    &person,
-                    force,
-                );
-            }
-            return Err(note_keychain_error());
-        }
-    }
-    let (outcome, _) = apply_record_write(
+    let outcome = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -4894,32 +3419,7 @@ fn cmd_log_touch(
     finish_write(cli, root, "log-touch", outcome, extra)
 }
 
-/// Interactive prompt for the #213 fallback: queue the note to the inbox
-/// instead of failing closed. Only an explicit `y`/`yes` queues; anything
-/// else (including EOF) fails closed.
-fn prompt_fallback_inbox() -> anyhow::Result<bool> {
-    use std::io::Write as _;
-    eprint!(
-        "The device key cannot be loaded, so the note cannot be encrypted. \
-         Queue the session (ledger line + note) to the inbox instead? \
-         It will merge once the keychain is back. [y/N] "
-    );
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
-}
-
-// ---------------------------------------------------------------------------
-// #376: `update` / `setup` offers — install-method detection, shared y/N
-// prompt, and an injectable command runner.
-// ---------------------------------------------------------------------------
-
-/// How this binary was installed, for the `confidant update` offer (#376).
-/// Only install methods with a reliable, testable signal are detected;
-/// anything else is `Unknown` and falls back to the generic upgrade
-/// wording (no offer to run anything).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallMethod {
     /// The binary lives in `<cargo-home>/bin`. This covers `cargo install`;
     /// the cargo-dist shell installer also targets `CARGO_HOME`, so an
@@ -5064,194 +3564,6 @@ fn run_offered_command(
     } else {
         anyhow::bail!("`{display}` exited with status {status}")
     }
-}
-
-/// Queue a session's ledger line + note record to the `inbox` branch
-/// (#213 fallback): both items are age-encrypted to the pinned inbox
-/// pubkey and committed with a signed commit. Nothing is written to
-/// main, so no plaintext ever lands on the main branch.
-///
-/// The ledger line carries `src:fallback/<ulid>` as its provenance
-/// token (in addition to any operator `--src`), so the drain's
-/// idempotency skips it on re-import. The note record item carries the
-/// exact bytes a normal write would have produced, so the drained
-/// result matches a normal write. When `force` is true, the ledger
-/// item also carries a `force: true` header so the drain processes a
-/// deliberately repeated line instead of semantically skipping it
-/// (#747 round 3).
-#[allow(clippy::too_many_arguments)]
-fn queue_session_note_to_inbox(
-    cli: &Cli,
-    root: &Path,
-    vault: &confidant_core::Vault,
-    user_config: Option<&UserConfig>,
-    line: &str,
-    note_rel: &Path,
-    note_contents: &str,
-    person: &ResolvedPersonArg,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
-    use confidant_core::QueueItem;
-    // The pin is the verification: the fallback encrypts to the pinned
-    // key, never to the vault-advertised copy alone. A missing pin, or a
-    // mismatch, refuses (E_INBOX_UNTRUSTED) — stricter than the drain,
-    // which only warns on a missing pin.
-    let pinned = user_config
-        .and_then(|u| u.inbox.pubkey.clone())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
-    let vault_pubkey = vault
-        .config
-        .inbox
-        .pubkey
-        .clone()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let recipient = match pinned {
-        None => {
-            return Err(anyhow::Error::new(
-                DomainError::inbox_untrusted(
-                    "no [inbox].pubkey pinned in ~/.config/confidant/config.toml; \
-                     the fallback cannot verify which key it would encrypt to",
-                )
-                .with_fix(
-                    "Pin the vault's inbox key in ~/.config/confidant/config.toml \
-                     [inbox] pubkey, then re-run with --fallback-inbox",
-                ),
-            ));
-        }
-        Some(pinned) if pinned == vault_pubkey => pinned,
-        Some(_) => {
-            return Err(anyhow::Error::new(
-                DomainError::inbox_untrusted(
-                    "vault [inbox].pubkey does not match the pinned key in user config; \
-                     refusing — possible key substitution",
-                )
-                .with_fix(
-                    "Check which key is right (the pin in ~/.config/confidant/config.toml \
-                     is the operator's out-of-band copy), fix the wrong one, then re-run \
-                     with --fallback-inbox",
-                ),
-            ));
-        }
-    };
-
-    let batch = confidant_core::write::new_ulid();
-    let ledger_line = format!("{line} src:fallback/{batch}");
-    // #747 round 3: a forced repeat carries its force through the queue
-    // as a `force: true` item header, so the drain processes it instead
-    // of applying the semantic duplicate skip — without it, `--force`
-    // + `--note` + key-unavailable + `--fallback-inbox` silently lost
-    // the ledger line at drain while its note still merged, leaving a
-    // note without its session. The header is on the ledger item only;
-    // the note record item merges by path as usual.
-    let ledger_header = if force {
-        "confidant-inbox/1\nkind: ledger\nforce: true\n"
-    } else {
-        "confidant-inbox/1\nkind: ledger\n"
-    };
-    let items = vec![
-        QueueItem {
-            stem: batch.clone(),
-            plaintext: format!("{ledger_header}---\n{ledger_line}\n"),
-        },
-        QueueItem {
-            stem: format!("{batch}-note"),
-            plaintext: format!(
-                "confidant-inbox/1\nkind: record\npath: {}\n---\n{note_contents}",
-                note_rel.display()
-            ),
-        },
-    ];
-    let stems: Vec<&str> = items.iter().map(|i| i.stem.as_str()).collect();
-
-    if cli.dry_run {
-        // The real run refuses without commit signing configured
-        // (E_INBOX_UNTRUSTED from the queue gate); the dry run must
-        // report the same refusal rather than a `would queue` the real
-        // run could never satisfy.
-        if !confidant_core::inbox::queue_signing_configured(root)? {
-            return Err(anyhow::Error::new(
-                DomainError::inbox_signing_unconfigured().with_fix(
-                    "Configure commit signing (`git config commit.gpgsign true` and a \
-                     `user.signingkey`), then re-run with --fallback-inbox",
-                ),
-            ));
-        }
-        if cli.json {
-            let mut obj = serde_json::json!({
-                "dry_run": true,
-                "queued": false,
-                "fallback_inbox": true,
-                "items": stems,
-            });
-            if let Some(echo) = person.echo_json() {
-                obj["person"] = echo;
-            }
-            print_json(&ok_envelope(Some(root), obj))?;
-        } else {
-            println!(
-                "dry run — would queue {} item(s) to inbox: {}",
-                items.len(),
-                stems.join(", ")
-            );
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let tip = match confidant_core::queue_items(root, &items, &recipient) {
-        Ok(tip) => tip,
-        Err(err) if DomainError::of(&err).map(|d| d.code()) == Some("E_INBOX_UNTRUSTED") => {
-            // The only E_INBOX_UNTRUSTED `queue_items` produces is the
-            // commit-signing gate; re-point its fix at this command.
-            return Err(anyhow::Error::new(
-                DomainError::inbox_signing_unconfigured().with_fix(
-                    "Configure commit signing (`git config commit.gpgsign true` and a \
-                     `user.signingkey`), then re-run with --fallback-inbox",
-                ),
-            ));
-        }
-        Err(err) => return Err(err),
-    };
-    if cli.json {
-        let mut obj = serde_json::json!({
-            "queued": true,
-            "fallback_inbox": true,
-            "items": stems,
-            "tip": tip,
-        });
-        if let Some(echo) = person.echo_json() {
-            obj["person"] = echo;
-        }
-        print_json(&ok_envelope(Some(root), obj))?;
-    } else {
-        println!("queued to inbox; run `confidant inbox` when the keychain is back");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Fail-closed error for `log session --note` when the device key cannot
-/// load. The generic encryptor error ("no device key enrolled") misleads
-/// when the keychain is merely broken, so the note case names the real
-/// situation and the way out: log the session without the note now (the
-/// ledger line needs no key), then add the note once the keychain is
-/// back. Nothing was written.
-fn note_keychain_error() -> anyhow::Error {
-    anyhow::Error::new(
-        DomainError::invalid(
-            "cannot load the device key, so the note cannot be encrypted; nothing was written \
-             (the keychain may be unavailable, or this device may not be enrolled)",
-        )
-        .with_fix(
-            "Re-run with --fallback-inbox to queue the note to the inbox (it drains once \
-             the keychain is back), or re-run without --note to log the session now (the \
-             ledger line needs no key), then add the note with `confidant note add` once \
-             the keychain is back. If this device was never enrolled, run \
-             `confidant init` (new vault), clone this vault and `confidant keys device-add`, \
-             or `confidant recover` only if every enrolled device is lost.",
-        ),
-    )
 }
 
 fn cmd_import(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCode> {
@@ -5419,7 +3731,7 @@ fn cmd_note_add(
     if forced_id.is_some() {
         ensure_note_target_free(root, &rel, &nid, cli, &canonical_request)?;
     }
-    let (outcome, _) = apply_record_write(
+    let outcome = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -5510,87 +3822,26 @@ fn note_path_for(root: &Path, id: &RecordId) -> Option<PathBuf> {
 }
 
 /// Fail-closed error for a note id whose file exists on disk but did not
-/// load: an envelope this device cannot decrypt, or a file that is not a
-/// readable note. Mirrors `record show`'s ladder; never names the body.
-fn note_unreadable_error(id_raw: &str, rel: &Path, bytes: &[u8]) -> anyhow::Error {
-    if confidant_core::crypto_mode::is_envelope_bytes(bytes) {
-        anyhow::Error::new(
-            DomainError::invalid(format!(
-                "cannot read {id_raw}: this device cannot decrypt it"
-            ))
-            .with_fix(
-                "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-            ),
-        )
-    } else {
-        anyhow::Error::new(
-            DomainError::invalid(format!(
-                "cannot read {id_raw}: {} is not a readable note",
-                rel.display()
-            ))
-            .with_fix("Run `confidant check` for the finding on that file"),
-        )
-    }
+/// load. Mirrors `record show`'s ladder; never names the body.
+fn note_unreadable_error(id_raw: &str, rel: &Path, _bytes: &[u8]) -> anyhow::Error {
+    anyhow::Error::new(
+        DomainError::invalid(format!(
+            "cannot read {id_raw}: {} is not a readable note",
+            rel.display()
+        ))
+        .with_fix("Run `confidant check` for the finding on that file"),
+    )
 }
 
-/// The decrypted plaintext of one note file, through the operator read
-/// path (`RecordDecryptor::for_edit`), for the editor round trip. Fail
-/// closed per outcome; never logs the body.
-fn note_plaintext(root: &Path, vault_id: &str, rel: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(root.join(rel)).map_err(|e| {
+fn note_plaintext(root: &Path, _vault_id: &str, rel: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(root.join(rel)).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
             rel.display()
         )))
-    })?;
-    if !confidant_core::crypto_mode::is_envelope_bytes(&bytes) {
-        return String::from_utf8(bytes).map_err(|_| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "{} is not valid UTF-8",
-                rel.display()
-            )))
-        });
-    }
-    match record_decrypt::RecordDecryptor::for_edit(root, vault_id)
-        .decrypt_bytes(&rel.to_string_lossy(), &bytes)
-    {
-        ContentOutcome::Content(plaintext) => String::from_utf8(plaintext).map_err(|_| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "{} does not decrypt to valid UTF-8",
-                rel.display()
-            )))
-        }),
-        ContentOutcome::NoAiShell { .. } => Err(anyhow::Error::new(DomainError::internal(
-            "operator decryptor returned a no-ai shell for a note",
-        ))),
-        ContentOutcome::Skipped => Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "cannot edit {}: this device cannot decrypt the note",
-                rel.display()
-            ))
-            .with_fix(
-                "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-            ),
-        )),
-        ContentOutcome::Refused => Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "cannot edit {}: the envelope failed authentication",
-                rel.display()
-            ))
-            .with_fix("The envelope is tampered or corrupt; restore it from git history"),
-        )),
-    }
+    })
 }
 
-/// #557: print one note's decrypted text so the operator can edit it.
-///
-/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
-/// argv and this command is not in it, so no agent connection can reach
-/// it. `--for-edit` is required rather than optional so a bare invocation
-/// can never print a decrypted note body. Unlike the agent read path,
-/// `no-ai` notes are decrypted in full (`RecordDecryptor::for_edit`):
-/// notes are where `no-ai` prose lives, and the operator's tooling is the
-/// only window onto it (spec §12 is unchanged for agents).
 fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow::Result<ExitCode> {
     if !for_edit {
         return Err(anyhow::Error::new(DomainError::usage(
@@ -5609,8 +3860,7 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
     let id = parse_note_id(id_raw, "note show")?;
     let Some(rec) = vault.records.get(&id) else {
         // A file that is on disk but did not load is a problem with that
-        // file. Only claim a decryption failure when the file really is an
-        // envelope (as `record show` does).
+        // file (as `record show` treats it).
         if let Some(rel) = note_path_for(root, &id) {
             if let Ok(bytes) = std::fs::read(root.join(&rel)) {
                 return Err(note_unreadable_error(id_raw, &rel, &bytes));
@@ -5644,15 +3894,13 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
 
 /// #557: replace an existing note's file from `--file` or the editor.
 ///
-/// The write goes through [`apply_record_write`], so in an encrypted vault
-/// it re-encrypts with a fresh nonce, runs `check` before the commit, and
-/// makes one commit — exactly like `record edit`; an unchanged body reuses
-/// the existing ciphertext and reports `unchanged` with no commit. The
+/// The write goes through [`apply_record_write`], so it runs `check` before
+/// the commit and makes one commit — exactly like `record edit`; an
+/// unchanged body reports `unchanged` with no commit. The
 /// target path is the note's existing location, never a path the caller or
 /// the edited text chose: a note's `person:` must keep matching its
-/// directory (a change re-routes the client key and, in an encrypted
-/// vault, is invisible to the post-write `check`, so it is refused before
-/// encryption).
+/// directory (a change would silently re-home the note, so it is refused
+/// before the write).
 fn cmd_note_edit(
     cli: &Cli,
     root: &Path,
@@ -5670,7 +3918,7 @@ fn cmd_note_edit(
     // Sweep stale `--edit` scratch from a crashed earlier run (#455
     // convention). Harmless for a `--file` edit and for a dry run: it only
     // zero-overwrites and removes `.confidant/notes/`.
-    record_resolve::sweep_stale_note_scratch(root);
+    sweep_stale_note_scratch(root);
     // Pin the existing file first: the edit can never move the note. A note
     // that is on disk but did not load is reported for what it is rather
     // than as missing.
@@ -5724,9 +3972,9 @@ fn cmd_note_edit(
         // plaintext scratch exists.
         debug_assert!(edit, "clap requires --file or --edit");
         let current = note_plaintext(root, &vault.config.vault_id, &rel)?;
-        record_resolve::resolve_editor()?;
-        let (mut guard, scratch) = record_resolve::setup_note_edit_scratch(root, &id, &current)?;
-        let result = record_resolve::run_note_editor(&scratch).and_then(|()| {
+        resolve_editor()?;
+        let (mut guard, scratch) = setup_note_edit_scratch(root, &id, &current)?;
+        let result = run_note_editor(&scratch).and_then(|()| {
             std::fs::read_to_string(&scratch).map_err(|e| {
                 anyhow::Error::new(DomainError::invalid(format!(
                     "cannot read {}: {e}",
@@ -5752,20 +4000,8 @@ fn cmd_note_edit(
                 .with_fix("Edit the note the file names, or fix `id:` in the file"),
         ));
     }
-    // An envelope is ciphertext, not note plaintext: re-encrypting it would
-    // bury a second layer. Point at the operator read instead.
-    if rec.field("enc").is_some() {
-        return Err(anyhow::Error::new(
-            DomainError::invalid("the file is an encrypted note envelope, not note text")
-                .with_fix(
-                    "Use `confidant note show <id> --for-edit` to get the text, edit that, then re-run `note edit`",
-                ),
-        ));
-    }
-    // Fail closed before encrypting (#412-style). The post-write `check`
-    // runs against the envelope in an encrypted vault, so a note whose
-    // `person:` no longer matches its directory would otherwise be
-    // committed and only surface on decrypt.
+    // Fail closed before writing (#412-style): a note whose `person:` no
+    // longer matches its directory must not be committed.
     if rec.person().as_ref() != Some(&owner) {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!(
@@ -5776,24 +4012,7 @@ fn cmd_note_edit(
         ));
     }
     let contents = confidant_core::format_record(&rec);
-    // Fail closed when the stored file is an envelope this device cannot
-    // decrypt, naming the real cause instead of re-encrypting over it.
-    let existing = std::fs::read(root.join(&rel)).unwrap_or_default();
-    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
-        if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
-            enc.decrypt_existing(&rel, &existing).map_err(|_| {
-                anyhow::Error::new(
-                    DomainError::invalid(format!(
-                        "cannot edit {id_raw}: this device cannot decrypt the note"
-                    ))
-                    .with_fix(
-                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                    ),
-                )
-            })?;
-        }
-    }
-    let (outcome, _created) = apply_record_write(
+    let outcome = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -5929,7 +4148,7 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
     if let Some(change) = touch_change {
         changes.push(change);
     }
-    let (outcome, created_keys) = apply_record_write(
+    let outcome = apply_record_write(
         root,
         &vault,
         PendingWrite {
@@ -5939,28 +4158,16 @@ fn cmd_record_add(cli: &Cli, root: &Path, file: &Path) -> anyhow::Result<ExitCod
         },
         &write_options(cli),
     )?;
-    // #180: surface the auto-created key. JSON carries it (only when
-    // non-empty, so existing output is unchanged otherwise); human
-    // output prints the notice after the commit line.
     let mut extra = serde_json::json!({
         "id": id,
         "path": rel.display().to_string(),
     });
-    if !created_keys.is_empty() {
-        extra["created_keys"] = serde_json::json!(created_keys);
-    }
     // #179/#505: the mirrored touchpoints (primary first, then `with:`
     // participants), only when any were written.
     if !touch_lines.is_empty() {
         extra["touchpoints"] = serde_json::json!(touch_lines);
     }
-    let result = finish_write(cli, root, "record-add", outcome, extra);
-    if !cli.json {
-        for key in &created_keys {
-            println!("created key for {key}");
-        }
-    }
-    result
+    finish_write(cli, root, "record-add", outcome, extra)
 }
 
 /// Vault-relative main file path for a record id, derived from its prefix.
@@ -6011,8 +4218,8 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
 /// Without `--for-operator` the vault loads through the agent read path and
 /// the roster is the §12 cleared set, so `no-ai: true` records are absent
 /// (never present with a nulled name). With `--for-operator` the operator
-/// decrypt path is used (`RecordDecryptor::for_edit`, the same mechanism as
-/// `record show --for-edit`) and entries carry the tri-state `no_ai`
+/// read path is used (the same mechanism as `record show --for-edit`) and
+/// entries carry the tri-state `no_ai`
 /// (`"true"` | `"notes"` | `"false"`) the #559 ruling specifies.
 fn cmd_record_list(
     cli: &Cli,
@@ -6080,25 +4287,9 @@ fn cmd_record_list(
             roster.records.len(),
             kind.as_str()
         )?;
-        // ⚠2: never silently empty — the skip/refuse counts are always
-        // visible when nonzero, and a scoped call names the scope that
-        // applied (like `context`).
+        // A scoped call names the scope that applied (like `context`).
         if matches!(scope, PackScope::Only(_)) && !scope_names.is_empty() {
             writeln!(io::stdout(), "scope: {}", scope_names.join(", "))?;
-        }
-        if roster.skipped_encrypted > 0 {
-            writeln!(
-                io::stdout(),
-                "skipped_encrypted: {}",
-                roster.skipped_encrypted
-            )?;
-        }
-        if roster.refused_envelopes > 0 {
-            writeln!(
-                io::stdout(),
-                "refused_envelopes: {}",
-                roster.refused_envelopes
-            )?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -6108,15 +4299,13 @@ fn cmd_record_list(
 // record show (operator-only) / record edit (#216)
 // ---------------------------------------------------------------------------
 
-/// #216: print one record's decrypted text so the operator can edit it.
+/// #216: print one record's text so the operator can edit it.
 ///
 /// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
 /// argv and this command is not in it, so no agent connection can reach it.
 /// `--for-edit` is required rather than optional so that a bare invocation
-/// can never print a decrypted record body — the flag is the operator
-/// stating the intent to edit. Unlike the agent read path, `no-ai` records
-/// are decrypted in full (`RecordDecryptor::for_edit`), because the
-/// operator may edit them (spec §12 is unchanged for agents).
+/// can never print a record body — the flag is the operator stating the
+/// intent to edit.
 fn cmd_record_show(
     cli: &Cli,
     root: &Path,
@@ -6145,21 +4334,9 @@ fn cmd_record_show(
     reject_unsupported_prefix(&id)?;
     let Some(rec) = vault.records.get(&id) else {
         // A file that is on disk but did not load is a problem with that
-        // file. Only claim a decryption failure when the file really is an
-        // envelope: a plaintext record that failed to parse is a different
-        // error, and `check` already reports it (⚠2b, as in `context`).
+        // file; `check` already reports it.
         if let Some(rel) = main_path_for(&id) {
-            if let Ok(bytes) = std::fs::read(root.join(&rel)) {
-                if confidant_core::crypto_mode::is_envelope_bytes(&bytes) {
-                    return Err(anyhow::Error::new(
-                        DomainError::invalid(format!(
-                            "cannot read {id_raw}: this device cannot decrypt it"
-                        ))
-                        .with_fix(
-                            "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                        ),
-                    ));
-                }
+            if std::fs::read(root.join(&rel)).is_ok() {
                 return Err(anyhow::Error::new(
                     DomainError::invalid(format!(
                         "cannot read {id_raw}: {} is not a readable record",
@@ -6195,31 +4372,14 @@ fn cmd_record_show(
     Ok(ExitCode::SUCCESS)
 }
 
-// ---------------------------------------------------------------------------
-// record resolve (operator-only) (#453, part of #219)
-// ---------------------------------------------------------------------------
-
-/// #453: print both decrypted versions of a conflicted record so the
-/// operator can resolve a merge conflict.
-///
-/// Operator-only by construction: `mcp.rs` maps a fixed tool whitelist to
-/// argv and this command is not in it. Decryption runs through the operator
-/// decryptor (`RecordDecryptor::for_edit`), so `no-ai` records are shown in
-/// full; plaintext goes to stdout only, never to logs or error messages.
-/// The read half of resolution: `--take`, `--merged-file` and `--edit`
-/// land in #454/#455.
-#[allow(clippy::too_many_arguments)]
 fn cmd_record_resolve(
     cli: &Cli,
     root: &Path,
-    user_config: Option<&UserConfig>,
     id_raw: &str,
-    from_inbox: Option<&str>,
     show: bool,
     take: Option<Side>,
     merged_file: Option<&Path>,
     edit: bool,
-    allow_unsigned: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
     if vault.config.spec != confidant_core::SPEC_VERSION {
@@ -6238,25 +4398,9 @@ fn cmd_record_resolve(
     // behind by a previous crashed run is recovery of this command's own
     // local state, not a vault write, and `--dry-run` promises the vault
     // stays untouched, not the scratch dir. (#487 item 1.)
-    record_resolve::sweep_stale_scratch(root);
-    if let Some(stem) = from_inbox {
-        return cmd_record_resolve_from_inbox(
-            cli,
-            root,
-            &vault,
-            user_config,
-            &id,
-            id_raw,
-            stem,
-            show,
-            take,
-            merged_file,
-            edit,
-            allow_unsigned,
-        );
-    }
+    sweep_stale_scratch(root);
     if show {
-        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        let sides = load_sides(root, &id)?;
         let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
         let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
         if cli.json {
@@ -6279,10 +4423,10 @@ fn cmd_record_resolve(
     }
     if let Some(side) = take {
         // #454: install one side byte for byte, stage it, print the next
-        // git step. Both sides were decrypted by `load_sides`, so the
+        // git step. Both sides were read by `load_sides`, so the
         // operator has seen what they discard (CD7).
-        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
-        // #465: `--dry-run` verifies both sides are decryptable (same
+        let sides = load_sides(root, &id)?;
+        // #465: `--dry-run` verifies both sides are readable (same
         // CD7 read the real write needs) but writes nothing.
         if cli.dry_run {
             return print_resolve_dry_run(
@@ -6294,12 +4438,11 @@ fn cmd_record_resolve(
                 ResolveDryRunDetail {
                     side: Some(side.name()),
                     merged_file: None,
-                    from_inbox: None,
                     next: None,
                 },
             );
         }
-        let outcome = record_resolve::take_side(root, cli.no_input, &sides, side)?;
+        let outcome = take_side(root, cli.no_input, &sides, side)?;
         if cli.json {
             print_json(&ok_envelope(
                 Some(root),
@@ -6328,32 +4471,28 @@ fn cmd_record_resolve(
     // interface does not change when they land.
     if let Some(merged_path) = merged_file {
         // #455: hand-merge from a file outside the vault. The operator's
-        // file is validated like `record edit --file` and re-encrypted
+        // file is validated like `record edit --file` and written
         // through the same path; it is staged, never committed (CD6).
-        let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+        let sides = load_sides(root, &id)?;
         // CD5: refuse ANY path inside the vault tree, no `.confidant/`
         // exception, so a plaintext merge file cannot be committed by
         // accident.
-        let canonical = record_resolve::refuse_vault_path(root, merged_path)?;
+        let canonical = refuse_vault_path(root, merged_path)?;
         let text = std::fs::read_to_string(&canonical).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "cannot read {}: {e}",
                 canonical.display()
             )))
         })?;
-        // #473: refuse an unfinished merge before it is re-encrypted.
-        record_resolve::refuse_merged_conflict_markers(
-            &text,
-            &format!("the merged file {}", canonical.display()),
-        )
-        .map_err(anyhow::Error::new)?;
+        // #473: refuse an unfinished merge before it is written.
+        refuse_merged_conflict_markers(&text, &format!("the merged file {}", canonical.display()))
+            .map_err(anyhow::Error::new)?;
         let provisional = canonical
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "record.md".to_owned());
         let prepared = prepare_record_write(
             root,
-            &vault,
             PrepareSpec {
                 id: &id,
                 id_raw,
@@ -6373,9 +4512,8 @@ fn cmd_record_resolve(
                 sides.path.display()
             ))));
         }
-        let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
         // #465: `--dry-run` runs the full read-only validation above but
-        // stops before the re-encrypt/install step.
+        // stops before the install step.
         if cli.dry_run {
             return print_resolve_dry_run(
                 cli,
@@ -6386,19 +4524,18 @@ fn cmd_record_resolve(
                 ResolveDryRunDetail {
                     side: None,
                     merged_file: Some(&canonical),
-                    from_inbox: None,
                     next: None,
                 },
             );
         }
-        let outcome = record_resolve::apply_merge(root, cli.no_input, &vault, &prepared)?;
-        return print_merge_result(cli, root, &id, &outcome, rekeyed);
+        let outcome = apply_merge(root, cli.no_input, &prepared)?;
+        return print_merge_result(cli, root, &id, &outcome);
     }
     if edit {
         // #465: `--dry-run --edit` creates no scratch and installs nothing;
-        // `load_sides` is the same decrypt check the real edit would do.
+        // `load_sides` is the same conflict read the real edit would do.
         if cli.dry_run {
-            let sides = record_resolve::load_sides(root, &vault.config.vault_id, &id)?;
+            let sides = load_sides(root, &id)?;
             return print_resolve_dry_run(
                 cli,
                 root,
@@ -6408,7 +4545,6 @@ fn cmd_record_resolve(
                 ResolveDryRunDetail {
                     side: None,
                     merged_file: None,
-                    from_inbox: None,
                     next: None,
                 },
             );
@@ -6421,338 +4557,14 @@ fn cmd_record_resolve(
     )))
 }
 
-/// Build the inbox-item decrypt closure (same key path the drain uses).
-///
-/// Used by `record resolve --from-inbox` to decrypt the named item.
-fn inbox_decrypt_closure() -> anyhow::Result<impl Fn(&[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>>> {
-    let keys = confidant_core::InboxKeys::load_opt()?;
-    let inbox_keys: Option<std::sync::Arc<confidant_core::InboxKeys>> =
-        keys.map(std::sync::Arc::new);
-    Ok(move |ciphertext: &[u8]| match &inbox_keys {
-        Some(k) => k.decrypt(ciphertext),
-        None => Err(anyhow::Error::new(DomainError::inbox_crypto(
-            "no inbox key enrolled".to_string(),
-        ))),
-    })
-}
-
-/// #457: `record resolve <id> --from-inbox <stem> <action>` — resolve a
-/// record against a conflicting inbox item.
-///
-/// `ours` is the current record on main (decrypted with the operator key);
-/// `theirs` is the inbox item's plaintext. The actions mirror the markers
-/// source: `--show` prints both; `--take ours` keeps the file and prints
-/// the `inbox --discard` hint; `--take theirs` encrypts the item's
-/// plaintext through the `record edit` encryptor (#455's apply path — there
-/// is no envelope to keep byte for byte); `--merged-file` / `--edit` run
-/// the #455 hand-merge with the inbox sides.
-#[allow(clippy::too_many_arguments)]
-fn cmd_record_resolve_from_inbox(
-    cli: &Cli,
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    user_config: Option<&UserConfig>,
-    id: &RecordId,
-    id_raw: &str,
-    stem: &str,
-    show: bool,
-    take: Option<Side>,
-    merged_file: Option<&Path>,
-    edit: bool,
-    allow_unsigned: bool,
-) -> anyhow::Result<ExitCode> {
-    let decrypt = inbox_decrypt_closure()?;
-    let sides =
-        record_resolve::load_sides_from_inbox(root, &vault.config.vault_id, id, stem, &decrypt)?;
-    if show {
-        let ours_text = String::from_utf8_lossy(&sides.ours_bytes);
-        let theirs_text = String::from_utf8_lossy(&sides.theirs_bytes);
-        if cli.json {
-            print_json(&ok_envelope(
-                Some(root),
-                serde_json::json!({
-                    "id": id.to_string(),
-                    "path": sides.path,
-                    "from_inbox": stem,
-                    "ours": { "label": sides.ours_label, "text": ours_text },
-                    "theirs": { "label": sides.theirs_label, "text": theirs_text },
-                }),
-            ))?;
-        } else {
-            println!("== ours ({}) ==", sides.ours_label);
-            println!("{ours_text}");
-            println!("== theirs ({}) ==", sides.theirs_label);
-            println!("{theirs_text}");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    // Write actions run the drain's signed-tip trust check (#457): the
-    // inbox item's content is about to land in the encrypted record, and
-    // these actions can run without `--show` first. `--show` stays
-    // read-only above. Honors `--allow-unsigned` like the drain.
-    //
-    // The tip pinned by the read is what gets verified, and the branch must
-    // still point there: verifying one commit while writing another's bytes
-    // is exactly the gap the drain closes with `E_INBOX_RACE` (#457 review).
-    let trusted_signers = user_config
-        .map(|u| u.trust.signers.clone())
-        .unwrap_or_default();
-    let tip = sides.inbox_tip.as_deref().ok_or_else(|| {
-        anyhow::Error::new(DomainError::internal(
-            "inbox-sourced resolve is missing the tip it read the item at",
-        ))
-    })?;
-    confidant_core::verify_inbox_trust(root, &trusted_signers, allow_unsigned, tip)?;
-    if allow_unsigned {
-        eprintln!("warning: {}", confidant_core::ALLOW_UNSIGNED_WARNING);
-    }
-    if let Some(side) = take {
-        match side {
-            Side::Ours => {
-                // The file is already the ours side: nothing to write and
-                // nothing to stage. Point at `inbox --discard` — otherwise
-                // the item would conflict forever.
-                if cli.dry_run {
-                    // #465: even this no-write action reports `dry_run`
-                    // rather than implying the item was consumed.
-                    return print_resolve_dry_run(
-                        cli,
-                        root,
-                        id,
-                        "take",
-                        &sides.path,
-                        ResolveDryRunDetail {
-                            side: Some("ours"),
-                            merged_file: None,
-                            from_inbox: Some(stem),
-                            next: Some(&format!("confidant inbox --discard {stem}")),
-                        },
-                    );
-                }
-                if cli.json {
-                    print_json(&ok_envelope(
-                        Some(root),
-                        serde_json::json!({
-                            "command": "record-resolve",
-                            "action": "take",
-                            "side": "ours",
-                            "id": id.to_string(),
-                            "path": sides.path,
-                            "staged": false,
-                            "next": format!("confidant inbox --discard {stem}"),
-                        }),
-                    ))?;
-                } else {
-                    println!(
-                        "Kept the current version of {} ({}); nothing staged.",
-                        id,
-                        sides.path.display()
-                    );
-                    println!("Next: confidant inbox --discard {stem}");
-                }
-                return Ok(ExitCode::SUCCESS);
-            }
-            Side::Theirs => {
-                // No envelope to keep byte for byte: encrypt the item's
-                // plaintext through the `record edit` path (#455).
-                let text = String::from_utf8(sides.theirs_bytes.clone()).map_err(|_| {
-                    anyhow::Error::new(DomainError::internal(format!(
-                        "inbox item '{stem}' is not valid UTF-8"
-                    )))
-                })?;
-                let prepared = prepare_record_write(
-                    root,
-                    vault,
-                    PrepareSpec {
-                        id,
-                        id_raw,
-                        text: &text,
-                        provisional: &format!("{stem}.age"),
-                        summary: format!("record-resolve {id}"),
-                        canonical_prefix: "record-resolve/v1",
-                        allow_conflict: false,
-                    },
-                )?;
-                if prepared.rel != sides.path {
-                    return Err(anyhow::Error::new(DomainError::invalid(format!(
-                        "the inbox item belongs at {}, not {}",
-                        prepared.rel.display(),
-                        sides.path.display()
-                    ))));
-                }
-                let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
-                // #465: `--dry-run` runs the read-only validation above
-                // (including the trust gate) but writes and stages nothing.
-                if cli.dry_run {
-                    return print_resolve_dry_run(
-                        cli,
-                        root,
-                        id,
-                        "take",
-                        &sides.path,
-                        ResolveDryRunDetail {
-                            side: Some("theirs"),
-                            merged_file: None,
-                            from_inbox: Some(stem),
-                            next: None,
-                        },
-                    );
-                }
-                let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
-                return print_merge_result(cli, root, id, &outcome, rekeyed);
-            }
-        }
-    }
-    if let Some(merged_path) = merged_file {
-        // Same hand-merge as #455, but the scratch sides come from the
-        // inbox item rather than conflict markers.
-        let canonical = record_resolve::refuse_vault_path(root, merged_path)?;
-        let text = std::fs::read_to_string(&canonical).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot read {}: {e}",
-                canonical.display()
-            )))
-        })?;
-        // #473: refuse an unfinished merge before it is re-encrypted.
-        record_resolve::refuse_merged_conflict_markers(
-            &text,
-            &format!("the merged file {}", canonical.display()),
-        )
-        .map_err(anyhow::Error::new)?;
-        let provisional = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "record.md".to_owned());
-        let prepared = prepare_record_write(
-            root,
-            vault,
-            PrepareSpec {
-                id,
-                id_raw,
-                text: &text,
-                provisional: &provisional,
-                summary: format!("record-resolve {id}"),
-                canonical_prefix: "record-resolve/v1",
-                allow_conflict: false,
-            },
-        )?;
-        if prepared.rel != sides.path {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "the merged record belongs at {}, not {}",
-                prepared.rel.display(),
-                sides.path.display()
-            ))));
-        }
-        let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
-        // #465: `--dry-run` stops before the re-encrypt/install step; the
-        // validation above is read-only.
-        if cli.dry_run {
-            return print_resolve_dry_run(
-                cli,
-                root,
-                id,
-                "merged-file",
-                &sides.path,
-                ResolveDryRunDetail {
-                    side: None,
-                    merged_file: Some(&canonical),
-                    from_inbox: Some(stem),
-                    next: None,
-                },
-            );
-        }
-        let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
-        return print_merge_result(cli, root, id, &outcome, rekeyed);
-    }
-    if edit {
-        // #465: `--dry-run --edit` writes no scratch and installs nothing;
-        // the editor path is the same otherwise (#457).
-        if cli.dry_run {
-            return print_resolve_dry_run(
-                cli,
-                root,
-                id,
-                "edit",
-                &sides.path,
-                ResolveDryRunDetail {
-                    side: None,
-                    merged_file: None,
-                    from_inbox: Some(stem),
-                    next: None,
-                },
-            );
-        }
-        return cmd_resolve_edit_from_inbox(cli, root, vault, id, id_raw, &sides);
-    }
-    // Unreachable: clap's ArgGroup requires exactly one resolve action.
-    Err(anyhow::Error::new(DomainError::usage(
-        "choose one of --show, --take, --merged-file, --edit",
-    )))
-}
-
-/// #457: `record resolve <id> --from-inbox <stem> --edit` — hand-merge in
-/// the operator's editor, with the inbox item as the theirs side.
-///
-/// Reuses #455's scratch/edit/apply machinery; only the sides differ.
-fn cmd_resolve_edit_from_inbox(
-    cli: &Cli,
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    id: &RecordId,
-    id_raw: &str,
-    sides: &record_resolve::LoadedSides,
-) -> anyhow::Result<ExitCode> {
-    record_resolve::resolve_editor()?;
-    let (mut guard, merged_path) = record_resolve::setup_edit_scratch(root, id, sides)?;
-    record_resolve::run_editor(&merged_path)?;
-    let text = std::fs::read_to_string(&merged_path).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot read {}: {e}",
-            merged_path.display()
-        )))
-    })?;
-    // #473: refuse an unfinished merge before it is re-encrypted. The
-    // guard is dropped by the `?`, cleaning the scratch up.
-    record_resolve::refuse_merged_conflict_markers(
-        &text,
-        &format!("the merged record from {}", merged_path.display()),
-    )
-    .map_err(anyhow::Error::new)?;
-    let prepared = prepare_record_write(
-        root,
-        vault,
-        PrepareSpec {
-            id,
-            id_raw,
-            text: &text,
-            provisional: "merged.md",
-            summary: format!("record-resolve {id}"),
-            canonical_prefix: "record-resolve/v1",
-            allow_conflict: false,
-        },
-    )?;
-    if prepared.rel != sides.path {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "the merged record belongs at {}, not {}",
-            prepared.rel.display(),
-            sides.path.display()
-        ))));
-    }
-    let rekeyed = record_resolve::rekeyed_for_merge(sides, &prepared.rec);
-    let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
-    guard.cleanup();
-    print_merge_result(cli, root, id, &outcome, rekeyed)
-}
-
 fn print_merge_result(
     cli: &Cli,
     root: &Path,
     id: &RecordId,
-    outcome: &record_resolve::MergeOutcome,
-    rekeyed: Option<(String, String)>,
+    outcome: &MergeOutcome,
 ) -> anyhow::Result<ExitCode> {
     if cli.json {
-        let mut obj = serde_json::json!({
+        let obj = serde_json::json!({
             "command": "record-resolve",
             "action": "merge",
             "id": id.to_string(),
@@ -6760,15 +4572,9 @@ fn print_merge_result(
             "staged": true,
             "next": outcome.next,
         });
-        if let Some((from, to)) = &rekeyed {
-            obj["rekeyed"] = serde_json::json!({ "from": from, "to": to });
-        }
         print_json(&ok_envelope(Some(root), obj))?;
     } else {
         println!("Merged {} ({}); staged.", id, outcome.path.display());
-        if let Some((from, to)) = &rekeyed {
-            println!("rekeyed {id}: {from} -> {to}");
-        }
         println!("Next: {}", outcome.next);
     }
     Ok(ExitCode::SUCCESS)
@@ -6780,15 +4586,13 @@ fn print_merge_result(
 /// Callers reach this only after read-only validation (`load_sides`,
 /// `refuse_vault_path`, reading `--merged-file`, `prepare_record_write`):
 /// the dry run fails the same way the real run would, and by this point
-/// nothing has been written — no vault file, no index entry, no scratch,
-/// no inbox change (CD6: stage only, never commit — here not even that).
+/// nothing has been written — no vault file, no index entry, no scratch
+/// (CD6: stage only, never commit — here not even that).
 struct ResolveDryRunDetail<'a> {
     /// `--take <side>`: the side spelling as printed elsewhere.
     side: Option<&'a str>,
     /// `--merged-file`: the operator's local file (outside the vault).
     merged_file: Option<&'a Path>,
-    /// `--from-inbox <stem>`: the item stem, for `inbox --discard` hints.
-    from_inbox: Option<&'a str>,
     /// A follow-up command the real run would suggest.
     next: Option<&'a str>,
 }
@@ -6819,9 +4623,6 @@ fn print_resolve_dry_run(
                 "merged_file".into(),
                 serde_json::json!(merged_file.display().to_string()),
             );
-        }
-        if let Some(stem) = detail.from_inbox {
-            o.insert("from_inbox".into(), serde_json::json!(stem));
         }
         if let Some(next) = detail.next {
             o.insert("next".into(), serde_json::json!(next));
@@ -6870,41 +4671,40 @@ fn print_resolve_dry_run(
 /// #455: `record resolve <id> --edit` — hand-merge in the operator's
 /// editor with 0600 scratch files under `.confidant/conflicts/<id>/`.
 ///
-/// Both sides are decrypted to scratch (CD7 already held by `load_sides`);
-/// `merged.md` is pre-filled with the ours plaintext. After the editor
-/// exits, the merged text goes through the shared validate → re-encrypt →
-/// stage path. Scratch is zero-overwritten and removed on every exit path
+/// Both sides are copied to scratch (CD7 already held by `load_sides`);
+/// `merged.md` is pre-filled with the ours text. After the editor
+/// exits, the merged text goes through the shared validate → stage path.
+/// Scratch is zero-overwritten and removed on every exit path
 /// via `ScratchGuard` (explicit on success, drop on error).
 fn cmd_resolve_edit(
     cli: &Cli,
     root: &Path,
-    vault: &confidant_core::vault::Vault,
+    _vault: &confidant_core::vault::Vault,
     id: &RecordId,
     id_raw: &str,
 ) -> anyhow::Result<ExitCode> {
-    let sides = record_resolve::load_sides(root, &vault.config.vault_id, id)?;
+    let sides = load_sides(root, id)?;
     // Fail fast if no editor is configured, before creating any scratch
     // files (which would hold plaintext).
-    record_resolve::resolve_editor()?;
-    let (mut guard, merged_path) = record_resolve::setup_edit_scratch(root, id, &sides)?;
+    resolve_editor()?;
+    let (mut guard, merged_path) = setup_edit_scratch(root, id, &sides)?;
     // An editor failure returns here; the guard drops and cleans up.
-    record_resolve::run_editor(&merged_path)?;
+    run_editor(&merged_path)?;
     let text = std::fs::read_to_string(&merged_path).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
             "cannot read {}: {e}",
             merged_path.display()
         )))
     })?;
-    // #473: refuse an unfinished merge before it is re-encrypted. The
+    // #473: refuse an unfinished merge before it is installed. The
     // guard is dropped by the `?`, cleaning the scratch up.
-    record_resolve::refuse_merged_conflict_markers(
+    refuse_merged_conflict_markers(
         &text,
         &format!("the merged record from {}", merged_path.display()),
     )
     .map_err(anyhow::Error::new)?;
     let prepared = prepare_record_write(
         root,
-        vault,
         PrepareSpec {
             id,
             id_raw,
@@ -6922,11 +4722,10 @@ fn cmd_resolve_edit(
             sides.path.display()
         ))));
     }
-    let rekeyed = record_resolve::rekeyed_for_merge(&sides, &prepared.rec);
-    let outcome = record_resolve::apply_merge(root, cli.no_input, vault, &prepared)?;
+    let outcome = apply_merge(root, cli.no_input, &prepared)?;
     // Explicit cleanup on the success path (drop after is a no-op).
     guard.cleanup();
-    print_merge_result(cli, root, id, &outcome, rekeyed)
+    print_merge_result(cli, root, id, &outcome)
 }
 
 /// Parameters for [`prepare_record_write`], bundled to keep the
@@ -6957,17 +4756,15 @@ pub(crate) struct PrepareSpec<'a> {
 /// `pending` holds the `WriteFile` changes (the record itself, plus #410
 /// child re-stamps for a person whose `no-ai` mode changed). The caller
 /// applies it: `cmd_record_edit` via [`apply_record_write_inner`] (which
-/// commits), the resolve path by encrypting and staging each change
+/// commits), the resolve path by staging each change
 /// without committing (CD6).
 pub(crate) struct PreparedWrite {
     /// The write to apply.
     pub pending: PendingWrite,
     /// Vault-relative path of the record file.
     pub rel: PathBuf,
-    /// The parsed record (for rekeyed detection and reporting).
+    /// The parsed record.
     pub rec: Record,
-    /// Mode overrides for the encryptor (#410 no-ai re-stamp).
-    pub mode_overrides: HashMap<String, confidant_crypt::envelope::NoAi>,
 }
 
 /// Validate `text` as the new contents of record `id` and plan the write.
@@ -6979,18 +4776,14 @@ pub(crate) struct PreparedWrite {
 ///
 /// Does not read the existing file and does not apply the write. The
 /// caller does its own fail-closed checks on the stored bytes first:
-/// `cmd_record_edit`'s ladder (conflict markers, envelope identity,
-/// rekeyed detection, decrypt), or the resolve path's `load_sides`
-/// (which already verified the conflict and decrypted both sides, CD7).
+/// `cmd_record_edit`'s ladder (conflict markers, front-matter identity),
+/// or the resolve path's `load_sides`
+/// (which already verified the conflict and read both sides, CD7).
 ///
 /// `provisional` is the filename used in parse error messages;
 /// `summary` and `canonical_prefix` label the planned write (e.g.
 /// `"record {id}"` / `"record-edit/v1"` for edit).
-fn prepare_record_write(
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    spec: PrepareSpec<'_>,
-) -> anyhow::Result<PreparedWrite> {
+fn prepare_record_write(root: &Path, spec: PrepareSpec<'_>) -> anyhow::Result<PreparedWrite> {
     let PrepareSpec {
         id,
         id_raw,
@@ -7008,11 +4801,10 @@ fn prepare_record_write(
                 .with_fix("Edit the record the file names, or fix `id:` in the file"),
         ));
     }
-    // `record add` validates `with:` shape before encrypting, and an edit
-    // must too: in an encrypted vault the post-write `check` cannot see
-    // inside the envelope, so a malformed list would be committed and later
-    // block `keys shred` (which refuses when an interaction's `with:` will
-    // not parse). Touchpoints are not mirrored on an edit — see the PR notes.
+    // `record add` validates `with:` shape before writing, and an edit
+    // must too: a malformed list would be committed and later
+    // block downstream reads. Touchpoints are not mirrored on an edit — see
+    // the PR notes.
     if rec.kind == RecordKind::Interaction {
         if let Some(raw) = rec.field("with") {
             let with = confidant_core::record::parse_with_list(raw).ok_or_else(|| {
@@ -7056,19 +4848,16 @@ fn prepare_record_write(
                 .with_fix("Use `confidant record add --file` to create a new record"),
         ));
     }
-    // The conflict-marker guard must run before the no-ai restamp planning
-    // below, which cannot read a conflicted file (#412 Q6). `record edit`
-    // refuses; the resolve path expects a conflict and skips this.
+    // `record edit` refuses a conflicted file (it must be resolved first);
+    // the resolve path expects a conflict and skips this.
     if !allow_conflict {
-        let existing = std::fs::read(root.join(&rel)).map_err(|e| {
+        let existing = std::fs::read_to_string(root.join(&rel)).map_err(|e| {
             anyhow::Error::new(DomainError::invalid(format!(
                 "cannot read {}: {e}",
                 rel.display()
             )))
         })?;
-        if confidant_core::crypto_mode::is_envelope_bytes(&existing)
-            && confidant_core::record::has_conflict_markers(&String::from_utf8_lossy(&existing))
-        {
+        if confidant_core::record::has_conflict_markers(&existing) {
             return Err(anyhow::Error::new(
                 DomainError::invalid(format!(
                     "{} has unresolved merge conflicts; resolve them before editing",
@@ -7079,45 +4868,25 @@ fn prepare_record_write(
         }
     }
     let contents = confidant_core::format_record(&rec);
-    let mut changes = vec![FileChange::WriteFile {
-        path: rel.clone(),
-        contents,
-    }];
-    // #410: a person edit whose effective `no-ai` mode changes re-stamps
-    // that person's existing children in the same commit — the header the
-    // write-time stamp left behind moves with the person, in both
-    // directions. Refuses the whole edit (nothing committed) when a
-    // child cannot be read. See [`plan_no_ai_restamp`].
-    //
-    // Skipped for the resolve path (`allow_conflict`): the existing file
-    // is conflicted by definition, so its mode cannot be read. The
-    // operator can re-run an edit afterwards if a re-stamp is needed.
-    let id_str = rec.id.to_string();
-    let mode_overrides = if rec.kind == RecordKind::Person && !allow_conflict {
-        let (overrides, child_changes) =
-            plan_no_ai_restamp(root, vault, &id_str, record_crypto::person_own_mode(&rec))?;
-        changes.extend(child_changes);
-        overrides
-    } else {
-        HashMap::new()
-    };
     Ok(PreparedWrite {
         pending: PendingWrite {
-            changes,
+            changes: vec![FileChange::WriteFile {
+                path: rel.clone(),
+                contents,
+            }],
             summary,
             canonical_request: format!("{canonical_prefix}\npath={}\nbody={}", rel.display(), text),
         },
         rel,
         rec,
-        mode_overrides,
     })
 }
 
 /// #216: replace an existing main record's file from a markdown file.
 ///
-/// The write goes through [`apply_record_write`], so in an encrypted vault
-/// it encrypts, runs `check` before the commit, and makes one commit —
-/// exactly like `record add`. The target path is derived from the record's
+/// The write goes through [`apply_record_write`], so it runs `check` before
+/// the commit and makes one commit — exactly like `record add`. The target
+/// path is derived from the record's
 /// id, never from the path the caller passed, and the file's own `id:` must
 /// match the id argument so a wrong file cannot silently clobber a record.
 fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow::Result<ExitCode> {
@@ -7143,10 +4912,9 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
         .unwrap_or_else(|| "record.md".to_owned());
     // Shared validation + write planning (#455). The fail-closed ladder
     // below is edit-specific: the resolve path already verified the
-    // conflict and decrypted both sides via `load_sides` (CD7).
+    // conflict and read both sides via `load_sides` (CD7).
     let prepared = prepare_record_write(
         root,
-        &vault,
         PrepareSpec {
             id: &id,
             id_raw,
@@ -7160,245 +4928,13 @@ fn cmd_record_edit(cli: &Cli, root: &Path, id_raw: &str, file: &Path) -> anyhow:
     let rec = &prepared.rec;
     let rel = &prepared.rel;
     let id_str = rec.id.to_string();
-    // The path was checked above, so a read error here is a real failure and
-    // must not be swallowed by a fail-closed guard.
-    let existing = std::fs::read(root.join(rel)).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot read {}: {e}",
-            rel.display()
-        )))
-    })?;
-    // Fail closed before writing anything, naming the real cause. Each rung
-    // is a state the write layer would otherwise refuse later with a less
-    // specific error, or that the decrypt below would misreport as a key
-    // problem (#412).
-    let mut rekeyed: Option<(String, String)> = None;
-    if confidant_core::crypto_mode::is_envelope_bytes(&existing) {
-        // (Conflict markers were already refused by `prepare_record_write`
-        // above when `allow_conflict` is false.)
-        let env = confidant_crypt::envelope::parse(&existing).map_err(|e| {
-            anyhow::Error::new(
-                DomainError::invalid(format!("{} is not a readable envelope: {e}", rel.display()))
-                    .with_fix("Restore the file from git history, then re-run the edit"),
-            )
-        })?;
-        if env.id != id_str || env.record_type != rec.kind.as_str() {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "{} holds {} (type {}), not {id_str} (type {})",
-                    rel.display(),
-                    env.id,
-                    env.record_type,
-                    rec.kind.as_str()
-                ))
-                .with_fix(
-                    "The stored record and its path disagree; move the file back to the path for the record it holds (or restore this path from git history), then re-run the edit",
-                ),
-            ));
-        }
-        // Report a re-key rather than doing it silently: which client owns a
-        // record is a consequential difference, and `deal` edits move it.
-        // `envelope::parse` already validated the key id shape; failure here
-        // is unreachable, but fail closed rather than reporting a wrong client.
-        let from_client = confidant_crypt::envelope::key_id_client(&env.key_id).ok();
-        if let (Some(from), Ok(to)) = (from_client, record_client_id(rec)) {
-            if from != to {
-                rekeyed = Some((from, to));
-            }
-        }
-        // The only rung that needs the device key.
-        if let Some(enc) = record_crypto::RecordEncryptor::for_vault(root, &vault)? {
-            enc.decrypt_existing(rel, &existing).map_err(|_| {
-                anyhow::Error::new(
-                    DomainError::invalid(format!(
-                        "cannot edit {}: this device cannot decrypt the record",
-                        rel.display()
-                    ))
-                    .with_fix(
-                        "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`",
-                    ),
-                )
-            })?;
-        }
-    }
-    let (outcome, _created) = apply_record_write_inner(
-        root,
-        &vault,
-        prepared.pending,
-        &write_options(cli),
-        prepared.mode_overrides,
-    )?;
-    let mut extra = serde_json::json!({
+    let outcome = apply_record_write(root, &vault, prepared.pending, &write_options(cli))?;
+    let extra = serde_json::json!({
         "id": id_str,
         "path": rel.display().to_string(),
     });
-    if let Some((from, to)) = &rekeyed {
-        extra["rekeyed"] = serde_json::json!({ "from": from, "to": to });
-    }
-    let applied = matches!(&outcome, WriteOutcome::Applied { .. });
-    let result = finish_write(cli, root, "record-edit", outcome, extra);
-    if let (true, false, Some((from, to))) = (applied, cli.json, &rekeyed) {
-        println!("rekeyed {id_str}: {from} -> {to}");
-    }
-    result
+    finish_write(cli, root, "record-edit", outcome, extra)
 }
-
-/// #410: when a person's effective `no-ai` mode changes, plan the
-/// re-stamp of that person's existing children in the same commit as the
-/// person edit — the same shape as `keys shred`'s
-/// `delete_edges_naming` / `strip_participant_from_interactions`,
-/// including their fail-closed refusals.
-///
-/// Returns the encryptor mode overrides (this person's new mode) and one
-/// `WriteFile` change per referencing child. The child changes carry each
-/// child's *inner plaintext unchanged*; the write layer's encryptor
-/// re-derives the outer header — from the override, so it sees the new
-/// mode — and re-encrypts only where the header actually changed
-/// (`stability_decision` keeps an unchanged child's ciphertext
-/// byte-for-byte, so the commit diff names exactly the records that
-/// moved).
-///
-/// Fail-closed discovery: finding a person's children in an encrypted
-/// vault means decrypting records to read their references, through the
-/// operator read path (#216) so `no-ai`-hidden children decrypt too. Any
-/// record this device cannot decrypt — or refuses as tampered, or cannot
-/// parse — refuses the whole edit, naming every unreadable file, and
-/// nothing is committed; the operator fixes or shreds those records and
-/// retries. A plaintext child in an encrypted vault has no outer header
-/// to move (its visibility follows the person at read time) and `check`
-/// reports the mixed mode, so it is left alone. On a plaintext vault
-/// there are no headers at all and this returns empty.
-fn plan_no_ai_restamp(
-    root: &Path,
-    vault: &confidant_core::vault::Vault,
-    person_id: &str,
-    new_mode: confidant_crypt::envelope::NoAi,
-) -> anyhow::Result<(
-    HashMap<String, confidant_crypt::envelope::NoAi>,
-    Vec<FileChange>,
-)> {
-    let old_mode = record_crypto::person_no_ai_mode(root, person_id, None);
-    if old_mode == new_mode {
-        return Ok((HashMap::new(), Vec::new()));
-    }
-    // Plaintext vault: nothing carries an outer header, so nothing is
-    // stale. The read path re-derives visibility live.
-    let mode = confidant_core::crypto_mode::resolve_write_mode(root, &vault.config)
-        .map_err(anyhow::Error::new)?;
-    if !matches!(mode, confidant_core::crypto_mode::WriteMode::Encrypted) {
-        return Ok((HashMap::new(), Vec::new()));
-    }
-
-    // DISCOVER: decrypt every record through the operator read path and
-    // collect the ones this device cannot read. Any unreadable record
-    // could reference this person, so an unreadable one refuses the whole
-    // edit rather than leaving exactly those records with the stale
-    // header this re-stamp exists to remove.
-    let probe = load_vault(root)?;
-    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_edit(
-        root,
-        &probe.config.vault_id,
-    ));
-    let unreadable = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let inner = decryptor.hook();
-    let hook: ContentHook = std::sync::Arc::new({
-        let unreadable = std::sync::Arc::clone(&unreadable);
-        move |path: &str, bytes: &[u8]| {
-            let outcome = inner(path, bytes);
-            // Operator mode never returns the keyless `no-ai` shell, so
-            // anything that is not decrypted content is unreadable here:
-            // skipped (this device cannot decrypt it) or refused (tampered
-            // or corrupt).
-            if !matches!(outcome, ContentOutcome::Content(_)) {
-                unreadable.lock().unwrap().push(path.to_string());
-            }
-            outcome
-        }
-    });
-    let scanned =
-        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
-    let mut unreadable = unreadable.lock().unwrap().clone();
-    // A load finding on a record file means it could not be parsed — its
-    // references are unknown, same as an undecryptable envelope. Findings
-    // on other files (ledger, `confidant.toml`, stray top-level entries)
-    // say nothing about who references this person, so they stay out of
-    // the refusal list (#424): naming them under "record file(s)" would
-    // be misleading, and the write path's own pre-check still fails
-    // closed on any error-severity finding. `check` reports them all.
-    for finding in &scanned.load_findings {
-        if let Some(path) = &finding.file {
-            if confidant_core::crypto_mode::is_record_path(std::path::Path::new(path)) {
-                unreadable.push(path.clone());
-            }
-        }
-    }
-    if !unreadable.is_empty() {
-        unreadable.sort();
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot edit {person_id}: {} record file(s) could not be read to determine whether they reference this person: {}",
-            unreadable.len(),
-            unreadable.join(", ")
-        ))
-        .with_fix(
-            "Re-stamping must reach every child or the stale header survives on the records it skipped. Resolve the unreadable files on a device that can decrypt them (check reports them), or shred them, then re-run the edit",
-        )));
-    }
-
-    // PLAN: one change per referencing child, in the same reference set
-    // the write-time stamp uses.
-    let changes: Vec<FileChange> = scanned
-        .records
-        .values()
-        .filter(|rec| rec.id.to_string() != person_id)
-        .filter(|rec| references_person(&rec.fields, person_id))
-        .filter(|rec| {
-            // Only an envelope child has an outer header to re-stamp.
-            std::fs::read(root.join(&rec.path))
-                .map(|bytes| confidant_core::crypto_mode::is_envelope_bytes(&bytes))
-                .unwrap_or(false)
-        })
-        .map(|rec| FileChange::WriteFile {
-            path: std::path::PathBuf::from(&rec.path),
-            contents: rec.source.clone(),
-        })
-        .collect();
-    Ok((HashMap::from([(person_id.to_owned(), new_mode)]), changes))
-}
-
-/// #410: whether a record's front matter references `person`, using the
-/// same field scan `record_crypto::inherited_no_ai_mode` applies at stamp
-/// time — the `person:` field plus every other ID-valued or ID-list
-/// field. If the two scans ever drift apart, a stale header comes back
-/// through whichever side the scan no longer covers.
-fn references_person(fields: &BTreeMap<String, String>, person: &str) -> bool {
-    use confidant_core::record::{parse_ref_id, parse_with_list, FrontmatterRef};
-    fields.iter().any(|(key, value)| {
-        if key == "no-ai" {
-            return false;
-        }
-        match parse_ref_id(value) {
-            FrontmatterRef::Id(id) => id.to_string() == person,
-            _ => parse_with_list(value)
-                .is_some_and(|ids| ids.iter().any(|id| id.to_string() == person)),
-        }
-    })
-}
-
-/// The client whose data key encrypts `rec`: its own id for a person, the
-/// `person` field otherwise. Mirrors the routing in
-/// `record_crypto::encrypt_file`; used to report a re-key on edit.
-pub(crate) fn record_client_id(rec: &Record) -> anyhow::Result<String> {
-    let routing_person = match rec.kind {
-        RecordKind::Person => Some(rec.id.to_string()),
-        _ => rec.field("person").map(str::to_owned),
-    };
-    confidant_crypt::client_id_for_record(rec.kind.as_str(), routing_person.as_deref())
-        .map_err(|e| anyhow::anyhow!("cannot route record to a client key: {e}"))
-}
-
-// ---------------------------------------------------------------------------
-// context
-// ---------------------------------------------------------------------------
 
 fn cmd_context(
     cli: &Cli,
@@ -7407,9 +4943,9 @@ fn cmd_context(
     include_private: bool,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
-    // Operator mode (#572) loads through the operator decrypt path (the
-    // same mechanism as `record show --for-edit`); the default stays the
-    // agent read path.
+    // Operator mode (#572) loads through the operator read path (the same
+    // mechanism as `record show --for-edit`); the default stays the agent
+    // read path.
     let vault = match load_vault_for_reads(root, cli.json, for_operator) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -7437,45 +4973,6 @@ fn cmd_context(
     let bundle = match build_context(&vault, &person, include_private, &scope, for_operator) {
         Some(b) => b,
         None => {
-            // #717: a missing bundle against a vault with unread person
-            // records is a cannot-search, not a confident not-found —
-            // and not the E_INVALID recovery remedy below, which is
-            // exactly the wrong fix when the anchor is simply absent.
-            // The person may be in an unread record, so absence cannot
-            // be established.
-            if vault.skipped_person_records > 0 || vault.refused_person_records > 0 {
-                return Err(anyhow::Error::new(DomainError::cannot_search(
-                    vault.skipped_person_records,
-                    vault.refused_person_records,
-                )));
-            }
-            // ⚠2b: the person's key is absent (their record is an envelope
-            // this device cannot read) is a hard error, not "not found".
-            if record_decrypt::person_has_envelope(&vault.root, &person.to_string()) {
-                // #713: a missing trust anchor is the common just-added
-                // case, and neither suggested fix below applies to it
-                // (device-add already happened; `recover` rotates the
-                // phrase and drops other wrappings). Point at --complete.
-                let anchor_missing = confidant_config_dir()
-                    .is_none_or(|dir| confidant_crypt::anchor::load(&dir, &vault.root).is_err());
-                let fix = if anchor_missing {
-                    "This device's trust anchor is missing or unreadable: get it from an enrolled device \
-                     (`confidant keys device-add --from-request <file> --anchor-out <anchor-file>` \
-                     there; copying its trust.toml is an unverified fallback) and run \
-                     `confidant keys device-add --complete --anchor-file <anchor-file>` after pulling; \
-                     if this device was already added before, ask an enrolled device to re-emit \
-                     the anchor with `--from-request <file> --anchor-out <anchor-file> --re-emit-anchor`; \
-                     run `confidant doctor` to confirm"
-                } else {
-                    "Run `confidant recover` on this device, or ask an enrolled device to add it via `confidant keys device-add`"
-                };
-                return Err(anyhow::Error::new(
-                    DomainError::invalid(format!(
-                        "cannot decrypt records for {person_raw}: this device has no key for them"
-                    ))
-                    .with_fix(fix),
-                ));
-            }
             return Err(anyhow::Error::new(DomainError::not_found(format!(
                 "no person with id {person_raw}"
             )))
@@ -7508,10 +5005,6 @@ fn cmd_context(
         if !bundle.scope.is_empty() && matches!(scope, PackScope::Only(_)) {
             println!("scope: {}", bundle.scope.join(", "));
         }
-        if let Some(c) = &bundle.coaching {
-            println!("sessions remaining: {}", c.sessions_remaining);
-            println!("icf hours: {:.2}", c.icf_hours);
-        }
         println!(
             "notes: {}, interactions: {}, touchpoints: {}",
             bundle.notes.len(),
@@ -7522,12 +5015,6 @@ fn cmd_context(
             println!("aliases: {}", bundle.aliases.join(", "));
         }
         // ⚠2: the bundle carries what was skipped, never silent.
-        if bundle.skipped_encrypted > 0 {
-            println!("skipped_encrypted: {}", bundle.skipped_encrypted);
-        }
-        if bundle.refused_envelopes > 0 {
-            println!("refused_envelopes: {}", bundle.refused_envelopes);
-        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -7585,44 +5072,6 @@ fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// Read an alias value (email/phone/handle/name) from `--value-file` or stdin.
-///
-/// B7/#547: the raw value is PII and never arrives as an argument or leaves
-/// this process in output, errors, or `Debug`. Wrapped in [`Zeroizing`] so
-/// the plaintext copy is wiped on drop. An empty (or whitespace-only) value
-/// is refused: it normalizes to the empty string, which would alias every
-/// such value together.
-fn read_alias_value(value_file: Option<&Path>) -> anyhow::Result<Zeroizing<String>> {
-    let value = if let Some(path) = value_file {
-        Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "--value-file {} unreadable: {e}",
-                path.display()
-            )))
-        })?)
-    } else {
-        let mut buf = String::new();
-        use std::io::Read;
-        io::stdin().read_to_string(&mut buf).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "cannot read alias value from stdin: {e}"
-            )))
-        })?;
-        Zeroizing::new(buf)
-    };
-    if value.trim().is_empty() {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "alias value is required via stdin or --value-file",
-        )));
-    }
-    Ok(value)
-}
-
-/// Alias kinds are fixed by spec §6 (#748 adds `name`: a former/married
-/// name, nickname, or preferred name — resolved by the same HMAC mechanism
-/// as the other kinds; it never changes the record's display name). A bad
-/// kind is a usage error (exit 2), refused before any key is touched or
-/// anything is read from stdin.
 fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
     if matches!(kind, "email" | "phone" | "handle" | "name") {
         Ok(())
@@ -7633,305 +5082,22 @@ fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Read the vault lookup key through the verified `KeyStore::read_lookup_key`
-/// path (#547): the `vault:lookup` manifest is verified against the anchor and
-/// the key commitment checked before the key is returned. No new crypt API.
+/// `confidant alias resolve <kind> <value>` (#537 phase 3b): resolve a
+/// `kind` + value alias to the canonical person. Read-only.
 ///
-/// Needs an enrolled device key, a `keys/` tree, and the trust anchor; any of
-/// those missing fails closed (no key is returned).
-fn read_vault_lookup_key(
-    root: &Path,
-    vault_id: &str,
-) -> anyhow::Result<confidant_crypt::keys::LookupKey> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let identity = keys_device_identity()?;
-    let keys_dir = root.join("keys");
-    if !keys_dir.exists() {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "this vault has no keys/ tree, so alias HMACs cannot be computed; run `confidant init` first",
-        )));
-    }
-    let mut store =
-        KeyStore::with_config_dir(keys_dir, vault_id, &config_dir).map_err(anyhow::Error::new)?;
-    let (key, _commitments, _seq) =
-        store
-            .read_lookup_key(identity.as_ref(), &anchor)
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot read the vault lookup key: {e}"
-                )))
-            })?;
-    Ok(key)
-}
-
-/// Map a failed alias resolution to the command-error layer. The not-found
-/// fix is generic (no existence oracle): it must not confirm that a hidden
-/// `no-ai: true` person exists, and it never carries the alias value.
-fn alias_resolve_error(
-    kind: &str,
-    err: confidant_core::resolve::PersonResolveError,
-) -> anyhow::Error {
-    use confidant_core::resolve::PersonResolveError;
-    match err {
-        PersonResolveError::NotFound => anyhow::Error::new(
-            DomainError::not_found("no person matches this alias").with_fix(
-                "Check the alias kind and value; if this person is `no-ai: true`, pass their \
-                 p-<ULID>",
-            ),
-        ),
-        PersonResolveError::Ambiguous { candidates } => {
-            let ids: Vec<String> = candidates.iter().map(RecordId::to_string).collect();
-            anyhow::Error::new(DomainError::ambiguous_alias(kind, &ids))
-        }
-        // #717: same distinction as name resolution — an alias miss
-        // against a partially unread vault does not establish absence.
-        PersonResolveError::CannotSearch { skipped, refused } => {
-            anyhow::Error::new(DomainError::cannot_search(skipped, refused))
-        }
-    }
-}
-
-/// `confidant alias add <person> <kind>` (#537 phase 3b): append
-/// `DATE alias <p-ULID> KIND hmac:HEX` using the vault lookup key.
-///
-/// The value arrives via stdin or `--value-file` only. The line carries the
-/// HMAC, never the value; the same is true of `--json` output, errors, and
-/// `--dry-run` previews.
-///
-/// #767: at add time — the only moment the plaintext value is in hand —
-/// the command checks whether the agent `find` path (spec §12 allowlist,
-/// `PackScope::All`, the default `find` scope) returns anything for the
-/// value. When it returns nothing and the search ran completely, the add
-/// still succeeds with exit 0, but carries a warning: alias values are
-/// HMAC-only, so `find` scans plaintext and cannot surface a value that
-/// appears nowhere in searchable plaintext — only `alias resolve <kind>`
-/// retrieves it, unless the same kind/value is already held by another
-/// cleared person, in which case the warning says the value is shared
-/// and `alias resolve` will report it as ambiguous. The warning never
-/// echoes the value. For a `no-ai: true` person the warning says so
-/// plainly instead of recommending `alias resolve`, which also excludes
-/// that person by design: the alias is stored only as an HMAC, and the
-/// person remains addressable only by their `p-<ULID>`.
-fn cmd_alias_add(
-    cli: &Cli,
-    root: &Path,
-    person_raw: &str,
-    kind: &str,
-    value_file: Option<&Path>,
-    date_raw: Option<String>,
-) -> anyhow::Result<ExitCode> {
-    validate_alias_kind(kind)?;
-    let vault = vault_or!(root, cli.json);
-    // Refinement B: a by-name person echoes the resolved p-<ULID> (and name).
-    let person = resolve_person_arg(root, &vault, person_raw)?;
-    announce_resolved_person(cli, &person);
-    let date = parse_date_arg(&date_raw)?;
-
-    let value = read_alias_value(value_file)?;
-    let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
-    let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
-    let warning = alias_add_warning(root, &person.id, value.trim(), kind, &hmac);
-
-    let line = format!("{date} alias {} {kind} hmac:{hmac}", person.id);
-    let canonical = format!(
-        "alias-add/v1\nperson={}\ndate={date}\nkind={kind}\nhmac={hmac}\n",
-        person.id
-    );
-    let summary = format!("alias {} {kind}", person.id);
-    let changes = vec![FileChange::AppendLines {
-        path: month_path(&date),
-        lines: vec![line.clone()],
-    }];
-    let (outcome, _) = apply_record_write(
-        root,
-        &vault,
-        PendingWrite {
-            changes,
-            summary,
-            canonical_request: canonical,
-        },
-        &write_options(cli),
-    )?;
-    let mut extra = serde_json::json!({
-        "kind": kind,
-        "hmac": format!("hmac:{hmac}"),
-        "lines": [line],
-    });
-    if let Some(echo) = person.echo_json() {
-        extra["person"] = echo;
-    }
-    // The warning rides only outcomes where the add landed or was previewed:
-    // a check-blocked write added nothing to warn about, and an idempotent
-    // re-add of an identical alias line changes nothing either.
-    if matches!(
-        outcome,
-        WriteOutcome::Applied { .. } | WriteOutcome::DryRun { .. } | WriteOutcome::Unchanged
-    ) {
-        if let Some(warning) = warning {
-            extra["warnings"] = serde_json::json!([warning]);
-            if !cli.json {
-                let _ = writeln!(io::stderr(), "{warning}");
-            }
-        }
-    }
-    finish_write(cli, root, "alias-add", outcome, extra)
-}
-
-/// #767: the add-time warning for `query`, if any.
-///
-/// Runs the same search `find` runs by default (agent allowlist, no
-/// operator mode, `PackScope::All`) against the `for_reads` vault, so
-/// encrypted vaults are judged on decrypted cleared content, not on
-/// keyless shells. Best-effort and fail-silent: any load or search error,
-/// or any skipped/refused encrypted record (an incomplete search cannot
-/// prove absence), means "no warning" — the advisory must never block or
-/// mislead an add. Returns `None` for an empty query, which `find`
-/// rejects outright and search treats as no search at all.
-///
-/// Fix round: a `no-ai: true` person is outside the §12 cleared set, so
-/// the `find` probe is meaningless for them and `alias resolve` would
-/// return the same generic not-found — the warning says plainly that
-/// no lookup by alias value returns the person (the alias is stored
-/// only as an HMAC) and that the person remains addressable only by
-/// their `p-<ULID>`; it never recommends the resolve path. Positive
-/// evidence only: the loaded record must carry `no-ai: true`; absence
-/// from the cleared set for any other reason (tainted, malformed, or
-/// otherwise unloaded) says nothing about `no-ai` and stays silent
-/// rather than misdiagnosing. An `E_UNREADABLE` load finding (a record
-/// file or directory that failed to load, which may contain the value)
-/// likewise suppresses the absence warning — the search findings carry
-/// the code, never the path or content. Other finding codes do not
-/// suppress: they do not by themselves mean content went unsearched.
-///
-/// Fix round 2: before promising retrieval, the absence branch reuses
-/// `resolve_alias` on the pre-add vault to check whether another
-/// cleared person already holds the same (kind, HMAC). If so, the
-/// warning says the value is shared and `alias resolve` will report
-/// it as ambiguous, instead of the unqualified retrieve advice.
-///
-/// Fix round 3: the shared check compares canonical ids (see
-/// `alias_shared_with_another_person`), so a merged-away member
-/// whose canonical person already holds the alias is not reported
-/// as shared.
-fn alias_add_warning(
-    root: &Path,
-    person_id: &RecordId,
-    query: &str,
-    kind: &str,
-    hmac_hex: &str,
-) -> Option<String> {
-    if query.is_empty() {
-        return None;
-    }
-    let Ok(read_vault) = load_read_vault(root) else {
-        return None;
-    };
-    if !confidant_core::cleared_record_ids(&read_vault).contains(person_id) {
-        if read_vault
-            .records
-            .get(person_id)
-            .is_some_and(|record| record.no_ai())
-        {
-            return Some(
-                "warning: this person is `no-ai: true`, so `find` and other agent paths \
-                 do not surface this person or this alias, and `alias resolve` will not \
-                 return this person for this alias either; the alias is stored only as an \
-                 HMAC, which no command can turn back into the value, and the person \
-                 remains addressable only by their `p-<ULID>`"
-                    .to_owned(),
-            );
-        }
-        return None;
-    }
-    let Ok(result) = search(&read_vault, query, &PackScope::All) else {
-        return None;
-    };
-    let unreadable = result
-        .findings
-        .iter()
-        .any(|finding| finding.code == confidant_core::check::FindingCode::Unreadable);
-    if result.hits.is_empty()
-        && result.skipped_encrypted == 0
-        && result.refused_envelopes == 0
-        && !unreadable
-    {
-        if alias_shared_with_another_person(&read_vault, kind, hmac_hex, person_id) {
-            return Some(format!(
-                "warning: this alias value appears nowhere in searchable plaintext, and it \
-                 is already held by another person for the same kind, so `alias resolve \
-                 {kind}` will report it as ambiguous rather than returning a single person"
-            ));
-        }
-        Some(format!(
-            "warning: this alias value appears nowhere in searchable plaintext, so `find` \
-             cannot surface it (unless the value later appears in plaintext); retrieve it \
-             with `alias resolve {kind}`"
-        ))
-    } else {
-        None
-    }
-}
-
-/// Whether the pre-add vault already holds `(kind, hmac)` for a
-/// different canonical person than `person_id`, so adding it here would
-/// make `alias resolve` fail closed as ambiguous. Reuses
-/// `resolve_alias` itself — the same cleared-set,
-/// merge-canonicalized path resolve takes — on the vault as loaded
-/// before this add lands: an existing single holder whose canonical
-/// id differs from this person's canonical id, or an already-ambiguous
-/// set, both mean shared. `CannotSearch` (person records unread) is
-/// unknown, not shared: claiming sharing on an incomplete person set
-/// would mislead, so it falls through to the ordinary warning gates.
-///
-/// Fix round 3: the comparison is canonical to canonical. The
-/// canonical id comes from core's `canonical_person_id` query — the
-/// merge map itself stays `pub(crate)` in core, and no existing
-/// CLI-reachable lookup returns a target's canonical id
-/// (`resolve_person` by id deliberately does not canonicalize, and a
-/// name lookup needs a unique display name). An alias added to a
-/// merged-away member whose canonical already holds the alias is
-/// therefore the same canonical person, not a second holder, and
-/// does not warn as ambiguous.
-fn alias_shared_with_another_person(
-    vault: &confidant_core::Vault,
-    kind: &str,
-    hmac_hex: &str,
-    person_id: &RecordId,
-) -> bool {
-    use confidant_core::resolve::PersonResolveError;
-    let target_canonical = confidant_core::resolve::canonical_person_id(vault, person_id);
-    match confidant_core::resolve::resolve_alias(vault, kind, hmac_hex) {
-        Ok(m) => m.id != target_canonical,
-        Err(PersonResolveError::Ambiguous { .. }) => true,
-        Err(_) => false,
-    }
-}
-
-/// `confidant alias resolve <kind>` (#537 phase 3b): resolve a `kind` + value
-/// alias to the canonical person. Read-only.
-///
-/// Uses the `for_reads` cleared set, so an alias on a `no-ai: true` person is
-/// not surfaced (the same generic not-found as an unmatched alias). Two
-/// cleared people sharing an alias fail closed with `E_AMBIGUOUS_PERSON`.
-fn cmd_alias_resolve(
-    cli: &Cli,
-    root: &Path,
-    kind: &str,
-    value_file: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
+/// Aliases are plain `personal@0.2` front-matter contact values, matched
+/// case-insensitively as whole strings against the cleared set. A
+/// `no-ai: true` person is indistinguishable from an unmatched alias. Two
+/// cleared people sharing a value fail closed with `E_AMBIGUOUS_PERSON`.
+fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow::Result<ExitCode> {
     validate_alias_kind(kind)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    let value = read_alias_value(value_file)?;
-    let key = read_vault_lookup_key(root, &vault.config.vault_id)?;
-    let hmac = confidant_crypt::alias::alias_hmac(&key, &value);
-    let id = match confidant_core::resolve::resolve_alias(&vault, kind, &hmac) {
+    let id = match confidant_core::resolve::resolve_alias(&vault, kind, value) {
         Ok(m) => m.id,
-        Err(err) => return Err(alias_resolve_error(kind, err)),
+        Err(err) => return Err(person_resolve_error(value, err)),
     };
     // `resolve_alias` returns only cleared people, so the name is safe. The
     // mode is not content and stays visible (mirrors `cmd_resolve`).
@@ -7959,10 +5125,6 @@ fn cmd_alias_resolve(
     }
     Ok(ExitCode::SUCCESS)
 }
-
-// ---------------------------------------------------------------------------
-// doctor
-// ---------------------------------------------------------------------------
 
 struct DoctorCheck {
     id: &'static str,
@@ -8092,12 +5254,9 @@ fn cli_staleness_check(latest: Option<String>, offline: bool) -> DoctorCheck {
     }
 }
 
-/// Minimum git version Confidant relies on. SSH commit signing landed in
-/// git 2.34, and inbox signature checks read
-/// `git log --format=%G?/%GK`, so verifying signatures needs at least
-/// this version when signers are SSH keys. GPG signers work on older
-/// git, but the signer list holds opaque key IDs, so any configured
-/// signer is treated as possibly SSH (see `git_version_check`).
+/// Minimum git version Confidant relies on. Confidant shells out to git
+/// for every write, commit, and sync; older clients miss behavior the
+/// agent contract assumes.
 const MIN_GIT_VERSION: (u64, u64, u64) = (2, 34, 0);
 
 /// Parse `git --version` output into `(major, minor, patch)`. Handles
@@ -8126,16 +5285,14 @@ fn parse_git_version(output: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// Build the `git-version` doctor check from a parsed `git --version`
-/// result. `has_signers` is whether the user config lists `[trust]`
-/// signers: below the floor that means signature verification is in use
-/// and the check is an `error`; with no signers configured it is a
-/// `warning`, since nothing verifies signatures today. `None` (git
-/// missing or unparseable output) is `unknown` (#709, following the
-/// #174 precedent it generalizes): the `git-repo` check already errors
-/// when the vault is not a git repository, and an unparseable version
-/// string is an odd environment, not a known-bad git. `unknown` is
-/// warning-tier, so it never fails `doctor`.
-fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -> DoctorCheck {
+/// result. Below the floor the check is a `warning`: nothing verifies
+/// signatures today, so an old git is a portability nudge, not a vault
+/// defect. `None` (git missing or unparseable output) is `unknown` (#709,
+/// following the #174 precedent it generalizes): the `git-repo` check
+/// already errors when the vault is not a git repository, and an
+/// unparseable version string is an odd environment, not a known-bad git.
+/// `unknown` is warning-tier, so it never fails `doctor`.
+fn git_version_check_from(version: Option<(u64, u64, u64)>) -> DoctorCheck {
     let floor = format!(
         "{}.{}.{}",
         MIN_GIT_VERSION.0, MIN_GIT_VERSION.1, MIN_GIT_VERSION.2
@@ -8144,17 +5301,14 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
         Some(v) if v >= MIN_GIT_VERSION => DoctorCheck {
             id: "git-version",
             status: "ok",
-            message: format!(
-                "git {}.{}.{} (>= {floor}; SSH-signed inbox commits supported)",
-                v.0, v.1, v.2
-            ),
+            message: format!("git {}.{}.{} (>= {floor})", v.0, v.1, v.2),
             fix: None,
         },
         Some(v) => DoctorCheck {
             id: "git-version",
-            status: if has_signers { "error" } else { "warning" },
+            status: "warning",
             message: format!(
-                "git {}.{}.{} is below the minimum {floor}; upgrade git to >= {floor} for SSH-signed inbox commits",
+                "git {}.{}.{} is below the minimum {floor}; upgrade git to >= {floor}",
                 v.0, v.1, v.2
             ),
             fix: None,
@@ -8162,9 +5316,7 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
         None => DoctorCheck {
             id: "git-version",
             status: DOCTOR_STATUS_UNKNOWN,
-            message: format!(
-                "could not determine git version; SSH-signed inbox commits need git >= {floor}"
-            ),
+            message: format!("could not determine git version; Confidant needs git >= {floor}"),
             fix: None,
         },
     }
@@ -8173,296 +5325,16 @@ fn git_version_check_from(version: Option<(u64, u64, u64)>, has_signers: bool) -
 /// The `git-version` doctor check: runs `git --version` and compares
 /// against `MIN_GIT_VERSION`. See `git_version_check_from` for the
 /// status rules.
-fn git_version_check(has_signers: bool) -> DoctorCheck {
+fn git_version_check() -> DoctorCheck {
     let version = std::process::Command::new("git")
         .arg("--version")
         .output()
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| parse_git_version(&String::from_utf8_lossy(&out.stdout)));
-    git_version_check_from(version, has_signers)
+    git_version_check_from(version)
 }
 
-/// `keys-staging` doctor check (#175): leftover `.confidant/keys.stage`,
-/// `.confidant/keys.old`, or staged seq tracker from an interrupted or
-/// crashed keys operation. Leftovers with `keys/` intact are a warning
-/// (the next keys mutation repairs them); `keys/` missing is an error.
-fn keys_staging_check(root: &Path) -> DoctorCheck {
-    let keys_dir = root.join("keys");
-    let mut leftovers: Vec<&str> = Vec::new();
-    if keys_stage_dir(root).exists() {
-        leftovers.push("keys.stage");
-    }
-    if keys_old_dir(root).exists() {
-        leftovers.push("keys.old");
-    }
-    if let Some(config_dir) = confidant_config_dir() {
-        if keys_staged_tracker_path(&config_dir).exists() {
-            leftovers.push("manifest-seq.stage.toml");
-        }
-    }
-    if leftovers.is_empty() {
-        return DoctorCheck {
-            id: "keys-staging",
-            status: "ok",
-            message: "no leftover keys/ staging state".to_owned(),
-            fix: None,
-        };
-    }
-    let detail = leftovers.join(", ");
-    if keys_dir.exists() {
-        DoctorCheck {
-            id: "keys-staging",
-            status: "warning",
-            message: format!(
-                "leftover keys/ staging state ({detail}) from an interrupted operation; the next keys device-add or revoke repairs it"
-            ),
-            fix: None,
-        }
-    } else {
-        DoctorCheck {
-            id: "keys-staging",
-            status: "error",
-            message: format!(
-                "keys/ is missing with leftover staging state ({detail}); re-run the interrupted keys command — it repairs staging leftovers before starting"
-            ),
-            fix: None,
-        }
-    }
-}
-
-/// #541: device key / keychain state for headless hosts and agents.
-///
-/// Probes the same resolution order a real load uses (env, then the OS
-/// keychain) and reports the source plus the exact fix. Never returns or
-/// logs key material. Warning-only for a missing key: an unenrolled device
-/// is normal for a plaintext vault, and `doctor` must not fail on a host
-/// that simply has no keychain yet — the hint is the point.
-fn device_key_check() -> DoctorCheck {
-    use confidant_crypt::keychain::{self, DeviceKeyState, DEVICE_KEY_ENV, INBOX_KEY_ENV};
-
-    const ID: &str = "device-key";
-    let headless_fix = format!(
-        "On a host with no D-Bus Secret Service, set {DEVICE_KEY_ENV} to the device key \
-         (AGE-SECRET-KEY-1…) and {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed \
-         before running `confidant init`, e.g. `export {OPERATOR_KEY_ENV}=<64 hex characters>`. \
-         {INBOX_KEY_ENV} is only needed later, for inbox commands after the vault exists. \
-         To put an existing vault on another device, clone it and run \
-         `confidant keys device-add` (not `init`; `recover` only if every enrolled device \
-         is lost). Keys never live in files."
-    );
-    let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
-        id: ID,
-        status,
-        message,
-        fix,
-    };
-    match keychain::device_key_state() {
-        Ok(DeviceKeyState::Env) => check(
-            "ok",
-            format!("device key comes from {DEVICE_KEY_ENV} (headless/agent host)"),
-            None,
-        ),
-        Ok(DeviceKeyState::Keychain) => check(
-            "ok",
-            "device key is in the OS keychain (keychain reachable)".to_owned(),
-            None,
-        ),
-        Ok(DeviceKeyState::NotEnrolled) => check(
-            "warning",
-            "device key: not enrolled (the OS keychain holds no device key)".to_owned(),
-            Some(headless_fix),
-        ),
-        Ok(DeviceKeyState::KeychainUnreachable(detail)) => check(
-            "warning",
-            format!(
-                "device key: the OS keychain is unreachable ({detail}); this device cannot \
-                 unwrap client keys"
-            ),
-            Some(headless_fix),
-        ),
-        Err(e) => check(
-            "error",
-            format!("device key: {e}"),
-            Some(format!(
-                "Fix the device key source (the OS keychain, or {DEVICE_KEY_ENV} on a headless host), \
-                 then re-run `confidant doctor`"
-            )),
-        ),
-    }
-}
-
-/// #713: trust-anchor state for this device. Before this check, a device
-/// added via `device-add` that had never established its trust anchor
-/// passed `doctor` clean while being unable to decrypt a single record:
-/// the `device-key` check only verifies a key *source* exists. This check
-/// closes that gap for encrypted vaults: a missing/unreadable anchor is
-/// an error (with the `--complete` fix), a certificate mismatch is an
-/// error, and a trial unwrap of one client key proves the anchor matches
-/// this vault and this device. Read-only: the client trial never advances
-/// the seq tracker. Plaintext vaults, unkeyed vaults, and unreadable
-/// vaults stay `ok` — the anchor question does not apply to them, and
-/// their own checks already report their state.
-fn trust_anchor_check(root: &Path) -> DoctorCheck {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
-
-    const ID: &str = "trust-anchor";
-    let check = |status: &'static str, message: String, fix: Option<String>| DoctorCheck {
-        id: ID,
-        status,
-        message,
-        fix,
-    };
-    let vault = match load_vault(root) {
-        Ok(v) => v,
-        Err(_) => {
-            return check(
-                "ok",
-                "could not determine (vault unreadable; see vault-load check)".to_owned(),
-                None,
-            );
-        }
-    };
-    match confidant_core::crypto_mode::resolve_write_mode(root, &vault.config) {
-        Ok(confidant_core::crypto_mode::WriteMode::Plaintext) => {
-            return check(
-                "ok",
-                "plaintext vault; no trust anchor required".to_owned(),
-                None,
-            );
-        }
-        Ok(confidant_core::crypto_mode::WriteMode::Encrypted) => {}
-        Err(_) => {
-            return check(
-                "ok",
-                "vault not yet keyed; no trust anchor to check".to_owned(),
-                None,
-            );
-        }
-    }
-    let complete_fix = "On the new device, finish enrollment: get the trust anchor from an \
-         enrolled device (`confidant keys device-add --from-request <file> --anchor-out <anchor-file>` \
-         there; copying its trust.toml is an unverified fallback) and run \
-         `confidant keys device-add --complete --anchor-file <anchor-file>` after pulling. \
-         If this device was already added before (enrolled without an anchor), ask an enrolled \
-         device to re-emit it with `--from-request <file> --anchor-out <anchor-file> --re-emit-anchor`. \
-         Do not run `confidant recover` unless every enrolled device is lost.";
-    let config_dir = match confidant_config_dir() {
-        Some(d) => d,
-        None => {
-            return check(
-                "error",
-                "cannot locate the config dir (HOME unset); trust anchor cannot be checked"
-                    .to_owned(),
-                None,
-            );
-        }
-    };
-    let loaded = match anchor::load(&config_dir, root) {
-        Ok((a, _warnings)) => a,
-        Err(e) => {
-            return check(
-                "error",
-                format!("trust anchor missing or unreadable: {e}; agent reads cannot decrypt"),
-                Some(complete_fix.to_owned()),
-            );
-        }
-    };
-    if let Err(e) = verify_anchor_cert(root, &vault.config.vault_id, &loaded) {
-        let domain = DomainError::of(&e)
-            .cloned()
-            .unwrap_or_else(|| DomainError::internal(format!("{e:#}")));
-        return check(
-            "error",
-            domain.message().to_owned(),
-            domain.fix().map(str::to_owned),
-        );
-    }
-    // No device identity means no trial is possible; the anchor itself
-    // is present and certificate-clean, but an unproven device must not
-    // be blessed as "ok" (S4) — the `device-key` check only proves a key
-    // source exists, not that this device can decrypt.
-    let identity = match keys_device_identity() {
-        Ok(i) => i,
-        Err(_) => {
-            return check(
-                "warning",
-                "trust anchor present but could not be trial-verified: no device key available to trial-unwrap with"
-                    .to_owned(),
-                Some(
-                    "Ensure this device has a usable device key (see the device-key check), then re-run doctor"
-                        .to_owned(),
-                ),
-            );
-        }
-    };
-    let device_pubkey = match device_pubkey_string() {
-        Ok(p) => p,
-        Err(_) => {
-            return check(
-                "warning",
-                "trust anchor present but could not be trial-verified: no device key available to trial-unwrap with"
-                    .to_owned(),
-                Some(
-                    "Ensure this device has a usable device key (see the device-key check), then re-run doctor"
-                        .to_owned(),
-                ),
-            );
-        }
-    };
-    let store =
-        match KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir) {
-            Ok(s) => s,
-            Err(e) => {
-                return check(
-                    "error",
-                    format!("trust anchor present but the key store cannot be read: {e}"),
-                    None,
-                );
-            }
-        };
-    match trial_unwrap_first_client(&store, &loaded, identity.as_ref(), &device_pubkey) {
-        Ok(true) => check(
-            "ok",
-            "trust anchor present and verified (trial unwrap of a client key passed)".to_owned(),
-            None,
-        ),
-        Ok(false) => check(
-            "ok",
-            "trust anchor present; no client keys to trial-unwrap (certificate check only, not unwrap-proven)"
-                .to_owned(),
-            None,
-        ),
-        Err(confidant_crypt::error::Error::NoKey(_)) => check(
-            "warning",
-            "trust anchor present but this device is not enrolled in this vault's client keys"
-                .to_owned(),
-            Some(
-                "Ask an enrolled device to run `confidant keys device-add --from-request` \
-                 for this device, then pull and retry"
-                    .to_owned(),
-            ),
-        ),
-        Err(e) => {
-            let domain = map_unwrap_failure(e);
-            check(
-                "error",
-                domain.message().to_owned(),
-                domain.fix().map(str::to_owned),
-            )
-        }
-    }
-}
-
-/// Skills link health for `setup`-managed installs. Skills ship in the
-/// binary and are linked into agent skill dirs by `confidant setup`; there
-/// is no checkout to compare against a release tag. Warning-only: missing
-/// links never fail `doctor`.
-///
-/// Only agents `setup` actually targeted (dirs containing at least one
-/// confidant-owned entry) count toward the warning; detected-but-never-
-/// targeted agents are reported, not warned about. Entries sharing one dir
-/// (e.g. `muse`/`agents` both map to `.agents/skills`) are counted once.
 fn skills_links_check() -> DoctorCheck {
     let home = match setup::home_dir() {
         Ok(h) => h,
@@ -8535,51 +5407,13 @@ fn skills_links_check() -> DoctorCheck {
     }
 }
 
-/// #723: the persisted encrypted-disk election, as `doctor` reports it.
-///
-/// The `[qmd] assume_encrypted_disk` key is skill-side device policy, so
-/// `UserConfig` drops the table — read the raw TOML instead. `Some` only
-/// when the file itself asserts: the message names it an assertion, never
-/// a detection result (#709's rule — an assumption never masquerades as
-/// detection). A detected disk needs no report; there is no assumption
-/// to disclose. Anything unreadable or unparsable is not an assertion.
-/// A truthy value is a bool true, the integer 1, or a string in
-/// 1/true/yes/on — the same set the Python gate's TRUTHY accepts, so a
-/// hand-edited integer key is not silently invisible to `doctor`.
-fn qmd_disk_assertion_check() -> Option<DoctorCheck> {
-    let home = setup::home_dir().ok()?;
-    let text = std::fs::read_to_string(home.join(".config/confidant/config.toml")).ok()?;
-    let value: toml::Value = toml::from_str(&text).ok()?;
-    let asserted = value
-        .get("qmd")
-        .and_then(|q| q.get("assume_encrypted_disk"))
-        .is_some_and(|v| {
-            v.as_bool().unwrap_or(false)
-                || v.as_integer().is_some_and(|n| n == 1)
-                || v.as_str().is_some_and(|s| {
-                    matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-                })
-        });
-    if !asserted {
-        return None;
-    }
-    Some(DoctorCheck {
-        id: "qmd-disk",
-        status: "ok",
-        message: "disk encryption: asserted by operator (persisted [qmd] \
-                  assume_encrypted_disk; an assertion, not a detection)"
-            .to_owned(),
-        fix: None,
-    })
-}
-
 /// #386: informational `qmd` search-availability check. qmd is optional,
 /// so a missing qmd is `ok` — the same rule as the offline staleness check:
 /// it just means search falls back to `confidant find` (see
 /// `qmd-query.py`). A qmd that is installed but has no corpus is a
 /// `warning` (#657): the fallback still works, but the operator asked for
-/// semantic search and an initial `confidant reindex` is needed to enable
-/// it, so an `ok` badge on that message is easy to miss.
+/// semantic search and a corpus built by the `qmd-search` skill is needed
+/// to enable it, so an `ok` badge on that message is easy to miss.
 ///
 /// Reports, in order: qmd on PATH? corpus built? embeddings present?
 /// (BM25 keyword search is ready without embeddings; semantic/hybrid
@@ -8606,10 +5440,13 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
             id: ID,
             status: "warning",
             message: "qmd is on PATH but the search corpus is missing; \
-                 run `confidant reindex` to rebuild it \
+                 build it with the qmd-search skill \
                  (search falls back to `confidant find`)"
                 .to_owned(),
-            fix: Some("Run `confidant reindex` to build the search corpus".to_owned()),
+            fix: Some(
+                "Run `confidant setup` to install the qmd-search skill, then build the corpus"
+                    .to_owned(),
+            ),
         };
     }
     match qmd_embedded_vectors(root, &qmd) {
@@ -8629,8 +5466,7 @@ fn qmd_search_check(root: &Path) -> DoctorCheck {
             fix: Some(format!(
                 "Run \"$(confidant which --skills-dir)\"/qmd-search/bin/qmd-index.py \
                  --vault \"{}\" --embed to enable semantic/hybrid ranking \
-                 (the first run downloads multi-GB GGUF models, needs network, \
-                 and the disk must be encrypted)",
+                 (the first run downloads multi-GB GGUF models and needs network)",
                 root.display()
             )),
         },
@@ -8886,9 +5722,73 @@ fn parse_git_remotes(output: &str) -> Vec<String> {
     names
 }
 
+/// One configured remote URL from `git remote -v`, paired with its remote
+/// name. Fetch and push URLs can differ, so both are kept. URLs are never
+/// printed: they may carry credentials.
+fn parse_git_remote_urls(output: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if name.is_empty() || entries.iter().any(|(n, u)| n == name && u == url) {
+            continue;
+        }
+        entries.push((name.to_owned(), url.to_owned()));
+    }
+    entries
+}
+
+/// How a configured remote URL carries vault content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteTransport {
+    /// Encrypted in transit (`https://`, `ssh://`, scp-like `git@host:path`)
+    /// or local (`file://`, a filesystem path), which never leaves the
+    /// machine.
+    Safe,
+    /// A cleartext network transport; record bodies would cross the wire
+    /// readable.
+    Cleartext(&'static str),
+    /// A scheme this check cannot vouch for.
+    Unverified,
+}
+
+/// Classify a git remote URL without contacting it. Credentials in the URL
+/// never affect the answer.
+fn remote_transport(url: &str) -> RemoteTransport {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("ssh://") || lower.starts_with("file://")
+    {
+        return RemoteTransport::Safe;
+    }
+    if lower.starts_with("http://") {
+        return RemoteTransport::Cleartext("http");
+    }
+    if lower.starts_with("git://") {
+        return RemoteTransport::Cleartext("git");
+    }
+    if lower.contains("://") {
+        return RemoteTransport::Unverified;
+    }
+    // The scp-like `user@host:path` (or `host:path`) form: git speaks ssh.
+    if let Some((authority, path)) = url.split_once(':') {
+        if !authority.is_empty() && !authority.contains('/') && !path.is_empty() {
+            return RemoteTransport::Safe;
+        }
+    }
+    // Anything else is a local filesystem path (`/srv/vault.git`,
+    // `../remote.git`), which never leaves the machine.
+    RemoteTransport::Safe
+}
+
 /// #660: `git-remote` doctor check. Read-only and offline: it never
-/// fetches, pushes, or contacts a remote. A remote is safe only because
-/// the vault is encrypted, so a plaintext vault with a remote warns.
+/// fetches, pushes, or contacts a remote. It reports the configured
+/// remotes by name and warns when one would carry plaintext record bodies
+/// over an unencrypted transport (`http://`, `git://`) or a scheme this
+/// check cannot vouch for. `https://`, `ssh://`, scp-like `git@host:path`
+/// and local paths are safe.
 ///
 /// `root` is the resolved vault. When it is not a directory (doctor never
 /// reaches this today), the check stays `ok`: a missing vault is not a
@@ -8921,36 +5821,59 @@ fn git_remote_check(root: &Path, no_input: bool) -> DoctorCheck {
         return DoctorCheck {
             id: ID,
             status: "ok",
-            message: "local-only; add a remote for backup and second-device enrollment".to_owned(),
+            message: "local-only; add a remote for backup".to_owned(),
             fix: Some(
                 "Run `git remote add origin <url>` (or `confidant init --create --remote <url>` \
-                 on a new vault). Clone on another device, then `confidant keys device-add`; \
-                 `recover` only if every enrolled device is lost"
+                 on a new vault)"
                     .to_owned(),
             ),
         };
     }
     let named = remotes.join(", ");
-    if confidant_core::crypto_mode::is_structurally_encrypted(root) {
-        DoctorCheck {
-            id: ID,
-            status: "ok",
-            message: format!("git remote configured ({named}); vault is encrypted"),
-            fix: None,
-        }
-    } else {
-        DoctorCheck {
+    let entries = parse_git_remote_urls(&output);
+    let cleartext: Vec<(&str, &'static str)> = entries
+        .iter()
+        .filter_map(|(name, url)| match remote_transport(url) {
+            RemoteTransport::Cleartext(scheme) => Some((name.as_str(), scheme)),
+            _ => None,
+        })
+        .collect();
+    if let Some((name, scheme)) = cleartext.first() {
+        return DoctorCheck {
             id: ID,
             status: "warning",
             message: format!(
-                "git remote configured ({named}) but this vault is plaintext; record bodies \
-                 are readable by anyone with repo access"
+                "git remote configured ({named}) over an unencrypted {scheme} transport; \
+                 record bodies are readable in transit"
             ),
-            fix: Some(
-                "Remove the remote if the exposure is unintended; anything already pushed stays readable"
-                    .to_owned(),
+            fix: Some(format!(
+                "Use an https:// or ssh:// URL, or remove the remote (`git remote remove {name}`)"
+            )),
+        };
+    }
+    let unverified: Vec<&str> = entries
+        .iter()
+        .filter(|(_, url)| remote_transport(url) == RemoteTransport::Unverified)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if let Some(name) = unverified.first() {
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "git remote configured ({named}) with a transport this check cannot verify; \
+                 record bodies may be readable in transit"
             ),
-        }
+            fix: Some(format!(
+                "Use an https:// or ssh:// URL, or remove the remote (`git remote remove {name}`)"
+            )),
+        };
+    }
+    DoctorCheck {
+        id: ID,
+        status: "ok",
+        message: format!("git remote configured ({named}); transport is encrypted or local"),
+        fix: None,
     }
 }
 
@@ -9111,9 +6034,8 @@ fn local_commits_check(root: &Path, no_input: bool) -> DoctorCheck {
 }
 
 /// #665: `confidant sync`. Read-only by default (fetch, report ahead/behind);
-/// `--pull` and `--push` are explicit, confirmed network writes. Refuses a
-/// plaintext vault, no remote/upstream, or a diverged branch with stable
-/// codes. `--dry-run` never touches the network and reports the state from
+/// `--pull` and `--push` are explicit, confirmed network writes. Refuses no
+/// remote/upstream or a diverged branch with stable codes. `--dry-run` never touches the network and reports the state from
 /// the last fetch.
 ///
 /// #736: the default report names its own remedy. A report of "N commits
@@ -9129,8 +6051,8 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
     let no_input = cli.no_input;
     let git = |args: &[&str]| confidant_core::write::git(root, args, no_input);
 
-    // Fail closed on a missing repository, an empty remote list, or a
-    // plaintext vault before any git command that could reach the network.
+    // Fail closed on a missing repository or an empty remote list before
+    // any git command that could reach the network.
     confidant_core::write::require_git_repo(root, no_input)?;
     let remotes = git(&["remote", "-v"])
         .map(|out| parse_git_remotes(&out))
@@ -9139,9 +6061,6 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
         return Err(anyhow::Error::new(DomainError::no_remote(
             "no git remote is configured for this vault",
         )));
-    }
-    if !confidant_core::crypto_mode::is_structurally_encrypted(root) {
-        return Err(anyhow::Error::new(DomainError::plaintext_remote()));
     }
     let Some((branch, upstream)) = git_upstream(root, no_input) else {
         return Err(anyhow::Error::new(DomainError::no_remote(
@@ -9159,8 +6078,7 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
     }
 
     // `--dry-run` reports the last-fetched state and never contacts the
-    // remote, so it works offline and on a metered connection. Reads of the
-    // remote's ciphertext are still refused for plaintext vaults above.
+    // remote, so it works offline and on a metered connection.
     let mut fetched = false;
     if !cli.dry_run {
         git(&["fetch", "--quiet", &remote]).map_err(|_| {
@@ -9323,7 +6241,6 @@ fn cmd_sync(cli: &Cli, root: &Path, pull: bool, push: bool, yes: bool) -> anyhow
                 "upstream": upstream,
                 "ahead": state.ahead,
                 "behind": state.behind,
-                "crypto_mode": "encrypted",
                 "fetched": fetched,
                 "dry_run": cli.dry_run,
                 "action": action,
@@ -9373,32 +6290,6 @@ fn confirm_sync_write(cli: &Cli, yes: bool, question: &str) -> anyhow::Result<bo
     confirm_yn(question, false, false)
 }
 
-/// Parse `findmnt -no SOURCE /` output into a device path. `findmnt` can
-/// append a subvolume suffix (`/dev/sda2[/@root]`); strip it. Returns
-/// `None` for a non-device source (overlay, tmpfs, `UUID=…`), where the
-/// `lsblk` ancestry cannot be resolved.
-#[cfg(target_os = "linux")]
-fn parse_findmnt_source(output: &str) -> Option<String> {
-    let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let source = line.split('[').next().unwrap_or(line).trim();
-    if source.starts_with("/dev/") {
-        Some(source.to_owned())
-    } else {
-        None
-    }
-}
-
-/// True when `lsblk -s -no TYPE` output lists a `crypt` device in the
-/// root device's ancestry (LUKS/dm-crypt). Pure string logic, so it is
-/// shared by the Linux probe and the platform-independent decision below
-/// (and its unit tests) rather than gated on Linux.
-fn lsblk_types_include_crypt(output: &str) -> bool {
-    output
-        .lines()
-        .map(str::trim)
-        .any(|line| line.eq_ignore_ascii_case("crypt"))
-}
-
 /// Doctor status vocabulary (#709): `ok` means the check ran and passed,
 /// `warning` means it ran and found something to act on, `error` means
 /// it ran and found something blocking, and `unknown` means it could
@@ -9409,144 +6300,8 @@ fn lsblk_types_include_crypt(output: &str) -> bool {
 /// `unknown` is a stable fourth value, alongside the existing three.
 const DOCTOR_STATUS_UNKNOWN: &str = "unknown";
 
-/// Pure decision for the `disk-encryption` check (#653(d), #709).
-/// `source` is the parsed `findmnt` root source, or `None` when
-/// `findmnt` failed, is missing, or the root is not on a block device;
-/// `types` is the `lsblk` TYPE output, or `None` when `lsblk` failed or
-/// is missing. `unknown_detail` names the probe failure for the
-/// undetermined cases, and is only consulted when `source` or `types`
-/// is `None`; an empty TYPE list is its own undetermined case.
-/// Determined outcomes are unchanged: encrypted is `ok`, a readable
-/// non-encrypted ancestry is `warning`.
-fn disk_encryption_check_from(
-    source: Option<&str>,
-    types: Option<&str>,
-    unknown_detail: &str,
-) -> DoctorCheck {
-    const ID: &str = "disk-encryption";
-    let unknown = |detail: &str| DoctorCheck {
-        id: ID,
-        status: DOCTOR_STATUS_UNKNOWN,
-        message: format!("could not determine disk encryption ({detail})"),
-        fix: None,
-    };
-    let Some(_source) = source else {
-        return unknown(unknown_detail);
-    };
-    let Some(types) = types else {
-        return unknown(unknown_detail);
-    };
-    if lsblk_types_include_crypt(types) {
-        DoctorCheck {
-            id: ID,
-            status: "ok",
-            message: "root filesystem is on an encrypted device".to_owned(),
-            fix: None,
-        }
-    } else if types.lines().any(|l| !l.trim().is_empty()) {
-        DoctorCheck {
-            id: ID,
-            status: "warning",
-            message: "root filesystem is not on an encrypted disk; keep real client data on an \
-                      encrypted disk"
-                .to_owned(),
-            fix: Some(
-                "Move the vault to a full-disk-encrypted volume before storing real client data"
-                    .to_owned(),
-            ),
-        }
-    } else {
-        unknown("lsblk returned no device types")
-    }
-}
-
-/// #653(d): best-effort `disk-encryption` check. Linux-only and purely
-/// advisory: a missing tool, an unparseable source, or a non-block root
-/// all report `unknown` "could not determine" (#709), so this can never
-/// fail doctor — but also never passes it. It never prompts and never
-/// leaves the machine.
-#[cfg(target_os = "linux")]
-fn disk_encryption_check() -> DoctorCheck {
-    let findmnt = match std::process::Command::new("findmnt")
-        .args(["-no", "SOURCE", "/"])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => {
-            return disk_encryption_check_from(
-                None,
-                None,
-                "findmnt could not resolve the root filesystem",
-            );
-        }
-        Err(_) => {
-            return disk_encryption_check_from(None, None, "findmnt is not available");
-        }
-    };
-    let source = parse_findmnt_source(&String::from_utf8_lossy(&findmnt.stdout));
-    let Some(source) = source else {
-        return disk_encryption_check_from(None, None, "root filesystem is not on a block device");
-    };
-    let lsblk = match std::process::Command::new("lsblk")
-        .args(["-sno", "TYPE", &source])
-        .output()
-    {
-        Ok(out) if out.status.success() => out,
-        Ok(_) => {
-            return disk_encryption_check_from(
-                Some(&source),
-                None,
-                "lsblk could not read the root device",
-            );
-        }
-        Err(_) => {
-            return disk_encryption_check_from(Some(&source), None, "lsblk is not available");
-        }
-    };
-    let types = String::from_utf8_lossy(&lsblk.stdout);
-    disk_encryption_check_from(Some(&source), Some(&types), "lsblk is not available")
-}
-
-/// Non-Linux platforms have no `findmnt`/`lsblk`; macOS FileVault is not
-/// probed here. Report `unknown` "could not determine" (#709) so doctor
-/// still passes, without claiming a pass.
-#[cfg(not(target_os = "linux"))]
-fn disk_encryption_check() -> DoctorCheck {
-    disk_encryption_check_from(None, None, "unsupported platform")
-}
-
-fn cmd_doctor(
-    cli: &Cli,
-    root: &Path,
-    user_config: Option<&UserConfig>,
-    clear_pending_inbox_rotation: bool,
-) -> anyhow::Result<ExitCode> {
+fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
-
-    // #105: handle --clear-pending-inbox-rotation first (explicit operator action).
-    if clear_pending_inbox_rotation {
-        let path = pending_inbox_rotation_path()?;
-        if path.exists() {
-            if !cli.no_input {
-                // Require confirmation unless --no-input.
-                eprintln!(
-                    "Clear the pending inbox-rotation reminder at {}? [y/N]",
-                    path.display()
-                );
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    eprintln!("not cleared");
-                    return Ok(ExitCode::SUCCESS);
-                }
-            }
-            std::fs::remove_file(&path)?;
-            eprintln!("cleared pending inbox-rotation reminder");
-        } else {
-            eprintln!("no pending inbox-rotation reminder to clear");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
 
     checks.push(DoctorCheck {
         id: "vault-discovery",
@@ -9594,27 +6349,16 @@ fn cmd_doctor(
         });
     }
 
-    // #174: minimum git version. SSH signing landed in git 2.34, and
-    // inbox signature checks read `%G?`/`%GK`, so signature verification
-    // needs at least that version. Signers are opaque key IDs, so any
-    // configured signer counts as possibly SSH (error below the floor);
-    // with no signers configured nothing verifies signatures, so below
-    // the floor is a warning.
-    let has_signers = user_config
-        .map(|u| !u.trust.signers.is_empty())
-        .unwrap_or(false);
-    checks.push(git_version_check(has_signers));
+    // #174: minimum git version. Confidant shells out to git, so a very
+    // old client is reported.
+    checks.push(git_version_check());
 
-    // #660: remote visibility. Read-only and offline; warns when a
-    // plaintext vault has a remote, because that leaks record bodies.
+    // #660: remote visibility. Read-only and offline.
     checks.push(git_remote_check(root, cli.no_input));
 
     // #665: ahead/behind visibility from the last fetch. Offline and
     // advisory: no remote/upstream stays `ok`, and a real difference warns.
     checks.push(local_commits_check(root, cli.no_input));
-
-    // #175: leftover keys/ staging state from an interrupted swap.
-    checks.push(keys_staging_check(root));
 
     match load_vault(root) {
         Ok(vault) => {
@@ -9659,92 +6403,6 @@ fn cmd_doctor(
                     fix: None,
                 });
             }
-            // #73: key-manifest health. A corrupt recipients.toml used to
-            // read as seq 0, indistinguishable from "no manifest yet".
-            // Report corrupt manifests as errors naming the client; absent
-            // manifests (and a vault with no keys/ tree at all) are normal
-            // and stay quiet.
-            let keys_dir = root.join("keys");
-            if keys_dir.is_dir() {
-                // The seq tracker is mandatory (issue #134); resolve its
-                // conventional location from HOME. A tracker we cannot load
-                // is reported, not skipped: without it the replay check is
-                // a no-op.
-                match confidant_config_dir() {
-                    None => checks.push(DoctorCheck {
-                        id: "crypto-manifests",
-                        status: "error",
-                        message: "cannot locate the config dir (HOME unset); \
-                                  the manifest seq tracker cannot be checked"
-                            .to_owned(),
-                        fix: None,
-                    }),
-                    Some(config_dir) => {
-                        match confidant_crypt::lifecycle::KeyStore::with_config_dir(
-                            keys_dir,
-                            &vault.config.vault_id,
-                            &config_dir,
-                        ) {
-                            Err(e) => checks.push(DoctorCheck {
-                                id: "crypto-manifests",
-                                status: "error",
-                                message: format!("manifest seq tracker unreadable: {e}"),
-                                fix: None,
-                            }),
-                            Ok(store) => {
-                                let mut corrupt: Vec<String> = Vec::new();
-                                let mut valid = 0u64;
-                                for client_id in store.manifest_clients() {
-                                    match store.manifest_state(&client_id) {
-                                        confidant_crypt::lifecycle::ManifestState::Valid(_) => {
-                                            valid += 1
-                                        }
-                                        confidant_crypt::lifecycle::ManifestState::Corrupt(
-                                            reason,
-                                        ) => {
-                                            corrupt.push(format!("{client_id} ({reason})"));
-                                        }
-                                        confidant_crypt::lifecycle::ManifestState::Absent => {}
-                                    }
-                                }
-                                if corrupt.is_empty() {
-                                    checks.push(DoctorCheck {
-                                        id: "crypto-manifests",
-                                        status: "ok",
-                                        message: if valid == 0 {
-                                            "no key manifests yet".to_owned()
-                                        } else {
-                                            format!("{valid} key manifest(s) parse")
-                                        },
-                                        fix: None,
-                                    });
-                                } else {
-                                    checks.push(DoctorCheck {
-                                        id: "crypto-manifests",
-                                        status: "error",
-                                        message: format!(
-                                            "corrupt key manifest(s); fix or re-init before crypto operations: {}",
-                                            corrupt.join("; ")
-                                        ),
-                                        fix: None,
-                                    });
-                                }
-                                // #154 must-fix 4: surface degraded git history,
-                                // which makes the shredded-client / retired-recovery
-                                // checks fail open.
-                                if let Some(reason) = store.history_degraded_reason() {
-                                    checks.push(DoctorCheck {
-                                        id: "shred-history",
-                                        status: "warning",
-                                        message: reason,
-                                        fix: None,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
         Err(e) => checks.push(DoctorCheck {
             id: "vault-load",
@@ -9752,107 +6410,6 @@ fn cmd_doctor(
             message: format!("cannot load vault: {e}"),
             fix: None,
         }),
-    }
-
-    // PR B owns crypto (ADR-13). `is_available()` tells us whether this build
-    // can encrypt at all; `writes_encrypted()` tells us whether the CLI write
-    // path actually does. Since spec 3, record writes encrypt by default on
-    // encrypted vaults; `mode = "plaintext"` is a per-vault opt-out for
-    // vaults that hold no real data, and never re-flips this global flag.
-    // The check reports the effective mode so the opt-out is always visible.
-    if confidant_crypt::writes_encrypted() {
-        let mode_desc = match load_vault(root) {
-            Ok(vault) => {
-                match confidant_core::crypto_mode::resolve_write_mode(root, &vault.config) {
-                    Ok(confidant_core::crypto_mode::WriteMode::Encrypted) => {
-                        "record writes encrypt by default; this vault is encrypted"
-                    }
-                    Ok(confidant_core::crypto_mode::WriteMode::Plaintext) => {
-                        "record writes encrypt by default; this vault opts out (`mode = \"plaintext\"`)"
-                    }
-                    Err(_) => {
-                        "record writes encrypt by default; this vault is unkeyed (writes fail closed)"
-                    }
-                }
-            }
-            Err(_) => "record writes encrypt by default; vault unreadable",
-        };
-        checks.push(DoctorCheck {
-            id: "crypto",
-            status: "ok",
-            message: mode_desc.to_owned(),
-            fix: None,
-        });
-    } else if confidant_crypt::is_available() {
-        checks.push(DoctorCheck {
-            id: "crypto",
-            status: "warning",
-            message:
-                "crypto library present, CLI not wired yet, vault content is stored as plaintext"
-                    .to_owned(),
-            fix: None,
-        });
-    } else {
-        checks.push(DoctorCheck {
-            id: "crypto",
-            status: "warning",
-            message: "encryption not available in this build; vault content is stored as plaintext"
-                .to_owned(),
-            fix: None,
-        });
-    }
-
-    // #653(d): best-effort encrypted-disk check. Advisory only: a missing
-    // tool or an unknown platform is `unknown` (#709), so doctor never
-    // fails on it — and never passes on it either.
-    checks.push(disk_encryption_check());
-
-    // #541: keychain reachability and device enrollment. Headless hosts
-    // have no Secret Service, so the failure an agent hits is otherwise an
-    // opaque NoKey; this names the source and the env-var fix.
-    checks.push(device_key_check());
-
-    // #713: the anchor is what makes decryption possible; a device-key
-    // source alone proves nothing about it.
-    checks.push(trust_anchor_check(root));
-
-    // #105: report pending inbox rotation as a warning until explicitly cleared.
-    if let Ok(pending_path) = pending_inbox_rotation_path() {
-        if pending_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pending_path) {
-                // Extract shredded_client for the message (opaque id).
-                let client = content
-                    .lines()
-                    .find(|l| l.starts_with("shredded_client"))
-                    .and_then(|l| l.split('=').nth(1))
-                    .map(|s| s.trim().trim_matches('"').to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                checks.push(DoctorCheck {
-                    id: "inbox-rotation-pending",
-                    status: "warning",
-                    message: format!(
-                        "inbox rotation pending after `keys shred {client}` on a non-inbox device; \
-                         run `confidant inbox rotate --finish` on the inbox device, then \
-                         `confidant doctor --clear-pending-inbox-rotation`"
-                    ),
-                    fix: None,
-                });
-            }
-        }
-    }
-
-    // Spec 3 (⚠1, B6): report the plaintext vs encrypted record-file mix.
-    // Existing plaintext records are never encrypted in place, so a mix is
-    // expected during (and after) the transition — this is informational.
-    // Code + count only; never names or paths.
-    {
-        let (encrypted, plaintext) = confidant_core::crypto_mode::count_record_mix(root);
-        checks.push(DoctorCheck {
-            id: "record-encryption-mix",
-            status: "ok",
-            message: format!("{encrypted} encrypted, {plaintext} plaintext record files"),
-            fix: None,
-        });
     }
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale
@@ -9875,13 +6432,8 @@ fn cmd_doctor(
         // #659: the optional TUI must match the CLI's agent contract.
         checks.push(tui_version_check());
         // #386/#657: qmd search availability. Missing qmd is `ok`; an
-        // installed qmd without a corpus warns and points at `reindex`.
+        // installed qmd without a corpus warns and points at the skill.
         checks.push(qmd_search_check(root));
-        // #723: the persisted disk election, reported honestly forever
-        // after — present only when the operator asserted it.
-        if let Some(check) = qmd_disk_assertion_check() {
-            checks.push(check);
-        }
     }
 
     let ok = !checks.iter().any(|c| c.status == "error");
@@ -9922,858 +6474,6 @@ fn cmd_doctor(
     }
 }
 
-// ---------------------------------------------------------------------------
-// reset --machine-state (#638)
-// ---------------------------------------------------------------------------
-
-/// One keychain slot `reset --machine-state` clears. The service/account
-/// pairs come from the public `confidant-crypt` constants; this command
-/// only orchestrates, it does not introduce a new key path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MachineKeySlot {
-    Device,
-    Operator,
-    Inbox,
-    InboxPrevious,
-}
-
-impl MachineKeySlot {
-    const ALL: [Self; 4] = [
-        Self::Device,
-        Self::Operator,
-        Self::Inbox,
-        Self::InboxPrevious,
-    ];
-
-    fn service(self) -> &'static str {
-        match self {
-            Self::Device | Self::Operator => confidant_crypt::keychain::DEVICE_SERVICE,
-            Self::Inbox | Self::InboxPrevious => confidant_crypt::keychain::INBOX_SERVICE,
-        }
-    }
-
-    fn account(self) -> &'static str {
-        match self {
-            Self::Device => confidant_crypt::keychain::DEVICE_ACCOUNT,
-            Self::Operator => confidant_crypt::keychain::OPERATOR_ACCOUNT,
-            Self::Inbox => confidant_crypt::keychain::INBOX_ACCOUNT,
-            Self::InboxPrevious => confidant_crypt::keychain::INBOX_PREVIOUS_ACCOUNT,
-        }
-    }
-}
-
-/// One thing `reset --machine-state` can remove. `present` is `None` when
-/// the keychain could not be checked (for example on a headless host with
-/// no Secret Service); JSON reports `null` rather than guessing.
-struct ResetItem {
-    kind: &'static str,
-    /// File path, or `service/account` for a keychain item.
-    location: String,
-    key: Option<&'static str>,
-    slot: Option<MachineKeySlot>,
-    present: Option<bool>,
-}
-
-impl ResetItem {
-    fn file(path: PathBuf, present: bool) -> Self {
-        Self {
-            kind: "file",
-            location: path.display().to_string(),
-            key: None,
-            slot: None,
-            present: Some(present),
-        }
-    }
-
-    fn config_key(path: &Path, key: &'static str, present: bool) -> Self {
-        Self {
-            kind: "config-key",
-            location: path.display().to_string(),
-            key: Some(key),
-            slot: None,
-            present: Some(present),
-        }
-    }
-
-    fn keychain(slot: MachineKeySlot, present: Option<bool>) -> Self {
-        Self {
-            kind: "keychain",
-            location: format!("{}/{}", slot.service(), slot.account()),
-            key: None,
-            slot: Some(slot),
-            present,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let mut item = serde_json::json!({
-            "kind": self.kind,
-            "present": self.present,
-        });
-        match self.kind {
-            "config-key" => {
-                item["path"] = Value::String(self.location.clone());
-                item["key"] = Value::String(self.key.unwrap_or_default().to_owned());
-            }
-            "keychain" => {
-                let slot = self.slot.expect("keychain item has a slot");
-                item["service"] = Value::String(slot.service().to_owned());
-                item["account"] = Value::String(slot.account().to_owned());
-            }
-            _ => item["path"] = Value::String(self.location.clone()),
-        }
-        item
-    }
-
-    fn label(&self) -> String {
-        match self.kind {
-            "config-key" => format!("{}: {}", self.location, self.key.unwrap_or_default()),
-            _ => self.location.clone(),
-        }
-    }
-}
-
-/// Read `config.toml` for a rewrite. A missing file is an empty document;
-/// any other read error fails instead of replacing a file we could not
-/// read (matching `inbox rotate`'s pin rewrite).
-fn read_user_config_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "could not read {}: {e} — refusing to rewrite it",
-                path.display()
-            ))))
-        }
-    };
-    text.parse().map_err(|e| {
-        anyhow::Error::new(DomainError::config(format!(
-            "{} is not valid TOML: {e}",
-            path.display()
-        )))
-    })
-}
-
-/// Whether one of the four machine-state config entries is present. A
-/// `[vaults]`/`[trust]`/`[inbox]` value of the wrong shape fails closed:
-/// rewriting a file whose structure we do not understand could drop keys.
-fn config_key_present(
-    doc: &toml_edit::DocumentMut,
-    path: &Path,
-    key: &str,
-) -> anyhow::Result<bool> {
-    match key {
-        "default_vault" => Ok(doc.get("default_vault").is_some()),
-        "vaults" => Ok(match doc.get("vaults") {
-            None => false,
-            // `as_table_like` covers both `[vaults]` and the inline
-            // `vaults = { … }` form.
-            Some(item) if item.as_table_like().is_some() => true,
-            Some(_) => return Err(not_a_table(path, "vaults")),
-        }),
-        "trust.signers" => nested_config_key_present(doc, path, "trust", "signers"),
-        "inbox.pubkey" => nested_config_key_present(doc, path, "inbox", "pubkey"),
-        other => Err(anyhow::anyhow!("unknown machine-state config key {other}")),
-    }
-}
-
-fn nested_config_key_present(
-    doc: &toml_edit::DocumentMut,
-    path: &Path,
-    table: &str,
-    key: &str,
-) -> anyhow::Result<bool> {
-    match doc.get(table) {
-        None => Ok(false),
-        Some(item) if item.as_table_like().is_some() => {
-            Ok(item.as_table_like().and_then(|t| t.get(key)).is_some())
-        }
-        Some(_) => Err(not_a_table(path, table)),
-    }
-}
-
-fn not_a_table(path: &Path, table: &str) -> anyhow::Error {
-    anyhow::Error::new(DomainError::config(format!(
-        "{}: [{table}] is not a table — refusing to rewrite it",
-        path.display()
-    )))
-}
-
-/// Remove the four machine-state entries, preserving every unrelated key,
-/// comment and table. Returns whether the document changed. Empty
-/// `[trust]`/`[inbox]` tables left by the removal are dropped too.
-fn remove_config_entries(doc: &mut toml_edit::DocumentMut) -> bool {
-    let mut changed = false;
-    for key in ["default_vault", "vaults"] {
-        if doc.remove(key).is_some() {
-            changed = true;
-        }
-    }
-    for (table, key) in [("trust", "signers"), ("inbox", "pubkey")] {
-        let emptied = match doc.get_mut(table) {
-            Some(item) => match item.as_table_like_mut() {
-                Some(table_item) => {
-                    let removed = table_item.remove(key).is_some();
-                    changed |= removed;
-                    removed && table_item.is_empty()
-                }
-                None => false,
-            },
-            None => false,
-        };
-        if emptied {
-            doc.remove(table);
-        }
-    }
-    changed
-}
-
-/// Replace the config atomically, keeping the original permissions. A
-/// crash mid-write can never leave a truncated config.
-fn write_user_config_atomically(
-    path: &Path,
-    doc: &toml_edit::DocumentMut,
-    mode: Option<std::fs::Permissions>,
-) -> anyhow::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{file_name}.reset-{}", std::process::id()));
-    std::fs::write(&tmp, doc.to_string()).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "could not write {}: {e}",
-            tmp.display()
-        )))
-    })?;
-    if let Some(mode) = mode {
-        let _ = std::fs::set_permissions(&tmp, mode);
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::Error::new(DomainError::invalid(format!(
-            "could not replace {}: {e}",
-            path.display()
-        )))
-    })
-}
-
-/// Whether a keychain slot holds a key. `None` means "could not tell"
-/// (headless host, or the test-only `CONFIDANT_KEYCHAIN=off` switch):
-/// never reported as absent. Deletion still refuses under the kill switch.
-fn machine_key_present(slot: MachineKeySlot) -> anyhow::Result<Option<bool>> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        use confidant_crypt::keychain::KeychainBackend as _;
-        let present = if slot == MachineKeySlot::Device {
-            dir.join("device.key").is_file()
-        } else {
-            FileKeychain::new(dir)
-                .get_password(slot.service(), slot.account())
-                .ok()
-                .flatten()
-                .is_some()
-        };
-        return Ok(Some(present));
-    }
-    if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
-        == confidant_crypt::keychain::KeychainSwitch::Off
-    {
-        return Ok(None);
-    }
-    use confidant_crypt::keychain::KeychainBackend as _;
-    Ok(confidant_crypt::keychain::OsKeychain
-        .get_password(slot.service(), slot.account())
-        .ok()
-        .map(|value| value.is_some()))
-}
-
-/// Delete one slot through the existing `confidant-crypt` entry points.
-/// Test builds with `CONFIDANT_TEST_KEYCHAIN_DIR` use the same file-backed
-/// backend the inbox-rotation tests use, so CI never touches a real
-/// keychain (and the device key keeps its `device.key` test path).
-fn delete_machine_key(slot: MachineKeySlot) -> anyhow::Result<()> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        use confidant_crypt::keychain::KeychainBackend as _;
-        if slot == MachineKeySlot::Device {
-            let path = dir.join("device.key");
-            return match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot delete test keychain entry {}: {e}",
-                    path.display()
-                )))),
-            };
-        }
-        return FileKeychain::new(dir)
-            .delete_credential(slot.service(), slot.account())
-            .map_err(|e| anyhow::anyhow!("{e}"));
-    }
-    let result = match slot {
-        MachineKeySlot::Device => confidant_crypt::keychain::delete_device_key(),
-        MachineKeySlot::Operator => confidant_crypt::keychain::delete_operator_key(),
-        MachineKeySlot::Inbox => confidant_crypt::keychain::delete_inbox_key(),
-        MachineKeySlot::InboxPrevious => confidant_crypt::keychain::delete_inbox_key_previous(),
-    };
-    result.map_err(anyhow::Error::new)
-}
-
-/// A keychain failure is a dead end without a pointer to the manual path;
-/// the docs page keeps the platform commands as the fallback.
-fn keychain_delete_error(slot: MachineKeySlot, err: anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(
-        DomainError::invalid(format!(
-            "could not remove keychain entry {}/{}: {err:#}",
-            slot.service(),
-            slot.account()
-        ))
-        .with_fix(
-            "If this host has no reachable keychain, remove the entry with `secret-tool` (Linux) or `security` (macOS); see docs/starting-fresh.md, \"Clearing keychain entries\", then re-run",
-        ),
-    )
-}
-
-/// One vault path the reset guard checked. `sources` records every input
-/// that named it (`--vault`, `CONFIDANT_VAULT`, a walk-up, `default_vault`,
-/// or a `[vaults]` entry); `initialized` means the directory exists and has
-/// a `keys/` tree.
-struct VaultCandidate {
-    path: PathBuf,
-    sources: Vec<String>,
-    initialized: bool,
-}
-
-/// Expand the `~/` form used by `config.toml` values, matching
-/// `confidant_core::discover`'s `default_vault`/`[vaults]` handling.
-fn expand_config_path(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut path = PathBuf::from(home);
-            path.push(rest);
-            return path;
-        }
-    }
-    PathBuf::from(raw)
-}
-
-/// A display/dedupe path for a candidate: a `confidant.toml` argument
-/// becomes its parent (as discovery does), and an existing path is
-/// canonicalized (macOS `/var` → `/private/var`).
-fn normalize_vault_candidate(path: &Path) -> PathBuf {
-    let path = if path.is_file()
-        && path
-            .file_name()
-            .is_some_and(|name| name == "confidant.toml")
-    {
-        path.parent().unwrap_or(path)
-    } else {
-        path
-    };
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn push_vault_candidate(
-    candidates: &mut Vec<VaultCandidate>,
-    source: impl Into<String>,
-    path: PathBuf,
-) {
-    let path = normalize_vault_candidate(&path);
-    let source = source.into();
-    if let Some(existing) = candidates.iter_mut().find(|c| c.path == path) {
-        if !existing.sources.contains(&source) {
-            existing.sources.push(source);
-        }
-        return;
-    }
-    let initialized = path.join("keys").is_dir();
-    candidates.push(VaultCandidate {
-        path,
-        sources: vec![source],
-        initialized,
-    });
-}
-
-/// The nearest ancestor of `start` holding `confidant.toml`, matching
-/// discovery's walk-up. Never fails the guard when the directory cannot be
-/// canonicalized.
-fn walk_up_vault(start: &Path) -> Option<PathBuf> {
-    let mut dir = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
-    loop {
-        if dir.join("confidant.toml").is_file() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-fn config_string_value(
-    doc: &toml_edit::DocumentMut,
-    path: &Path,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
-    match doc.get(key) {
-        None => Ok(None),
-        Some(item) => match item.as_str() {
-            Some(value) => Ok(Some(value.to_owned())),
-            None => Err(anyhow::Error::new(DomainError::config(format!(
-                "{}: {key} is not a string — refusing to rewrite it",
-                path.display()
-            )))),
-        },
-    }
-}
-
-fn config_vault_entries(
-    doc: &toml_edit::DocumentMut,
-    path: &Path,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let Some(item) = doc.get("vaults") else {
-        return Ok(Vec::new());
-    };
-    let Some(table) = item.as_table_like() else {
-        return Err(not_a_table(path, "vaults"));
-    };
-    let mut entries = Vec::new();
-    for (name, item) in table.iter() {
-        let Some(value) = item.as_str() else {
-            return Err(anyhow::Error::new(DomainError::config(format!(
-                "{}: [vaults].{name} is not a string — refusing to rewrite it",
-                path.display()
-            ))));
-        };
-        entries.push((name.to_owned(), value.to_owned()));
-    }
-    Ok(entries)
-}
-
-/// Build the guard's candidate set from every way a vault can resolve. It
-/// deliberately does not use `discover()`: discovery stops at the first
-/// answer, and a bad `--vault` makes it fail, which would leave a live
-/// `default_vault` or `[vaults]` entry unchecked. Read-only.
-fn vault_guard_candidates(
-    cli: &Cli,
-    doc: &toml_edit::DocumentMut,
-    config_path: &Path,
-) -> anyhow::Result<Vec<VaultCandidate>> {
-    let mut candidates = Vec::new();
-
-    if let Some(flag) = &cli.vault {
-        push_vault_candidate(&mut candidates, "--vault", flag.clone());
-    }
-
-    let vault_entries = config_vault_entries(doc, config_path)?;
-    if let Some(env) = std::env::var("CONFIDANT_VAULT")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    {
-        // `CONFIDANT_VAULT` is a path unless it names a `[vaults]` entry,
-        // exactly as discovery treats it.
-        let path = vault_entries
-            .iter()
-            .find(|(name, _)| name == &env)
-            .map(|(_, raw)| expand_config_path(raw))
-            .unwrap_or_else(|| expand_config_path(&env));
-        push_vault_candidate(&mut candidates, "CONFIDANT_VAULT", path);
-    }
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if let Some(found) = walk_up_vault(&cwd) {
-        push_vault_candidate(&mut candidates, "walk-up", found);
-    }
-
-    if let Some(default) = config_string_value(doc, config_path, "default_vault")? {
-        push_vault_candidate(
-            &mut candidates,
-            "default_vault",
-            expand_config_path(&default),
-        );
-    }
-
-    for (name, raw) in vault_entries {
-        push_vault_candidate(
-            &mut candidates,
-            format!("[vaults] {name}"),
-            expand_config_path(&raw),
-        );
-    }
-
-    Ok(candidates)
-}
-
-fn vault_candidates_json(candidates: &[VaultCandidate], force: bool) -> Value {
-    let items: Vec<Value> = candidates
-        .iter()
-        .map(|candidate| {
-            serde_json::json!({
-                "path": candidate.path.display().to_string(),
-                "sources": candidate.sources,
-                "initialized": candidate.initialized,
-            })
-        })
-        .collect();
-    let initialized: Vec<Value> = candidates
-        .iter()
-        .filter(|candidate| candidate.initialized)
-        .map(|candidate| Value::String(candidate.path.display().to_string()))
-        .collect();
-    serde_json::json!({
-        "candidates": items,
-        "initialized": initialized,
-        "forced": force,
-    })
-}
-
-/// `confidant reset --machine-state` (#638): clear the state the machine
-/// keeps *outside* the vault so `init --create` starts clean. The vault is
-/// never opened for writing; a resolvable initialized vault only triggers
-/// the guard.
-fn cmd_reset_machine_state(cli: &Cli, yes: bool, force: bool) -> anyhow::Result<ExitCode> {
-    let dry_run = cli.dry_run;
-
-    if dry_run && yes {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "--dry-run changes nothing; drop --yes to preview, or drop --dry-run to remove",
-        )));
-    }
-    if !dry_run && !yes && (cli.no_input || cli.json) {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "`reset --machine-state` needs --yes with --no-input or --json (or --dry-run to preview)",
-        )));
-    }
-
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::usage(
-            "`reset --machine-state` needs $HOME to locate ~/.config/confidant",
-        ))
-    })?;
-    let config_path = config_dir.join("config.toml");
-
-    // Read the config once so presence, guard, and removal agree on one
-    // document.
-    let mut doc = read_user_config_document(&config_path)?;
-
-    // Guard: only an initialized vault (keys/ exists) can be broken by
-    // removing the anchor and keys. Check every way a vault can resolve,
-    // not just the one discovery would pick. Read-only.
-    let candidates = vault_guard_candidates(cli, &doc, &config_path)?;
-    let initialized: Vec<&VaultCandidate> = candidates
-        .iter()
-        .filter(|candidate| candidate.initialized)
-        .collect();
-    if !initialized.is_empty() {
-        let listed = initialized
-            .iter()
-            .map(|candidate| candidate.path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (subject, verb, object, possessive) = if initialized.len() == 1 {
-            ("vault", "looks", "it", "its")
-        } else {
-            ("vaults", "look", "them", "their")
-        };
-        if !force {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "refusing to clear machine state: {subject} {listed} {verb} initialized (keys/ exists), and removing the trust anchor and keys would break {object}"
-                ))
-                .with_fix(
-                    "Pass --force only after retiring every listed vault; otherwise run from outside them or unset CONFIDANT_VAULT",
-                ),
-            ));
-        }
-        if !cli.json {
-            eprintln!(
-                "warning: --force set; initialized {subject} {listed} will be left without {possessive} anchor or keys"
-            );
-        }
-    }
-
-    let mut items: Vec<ResetItem> = Vec::new();
-    for name in [
-        "trust.toml",
-        "manifest-seq.toml",
-        "inbox-rotation-pending.toml",
-    ] {
-        let path = config_dir.join(name);
-        let present = path.exists();
-        items.push(ResetItem::file(path, present));
-    }
-    for key in ["default_vault", "vaults", "trust.signers", "inbox.pubkey"] {
-        let present = config_key_present(&doc, &config_path, key)?;
-        items.push(ResetItem::config_key(&config_path, key, present));
-    }
-    for slot in MachineKeySlot::ALL {
-        items.push(ResetItem::keychain(slot, machine_key_present(slot)?));
-    }
-
-    let changed = items.iter().any(|item| item.present != Some(false));
-
-    // Nothing present: report the no-op without asking (there is nothing
-    // to confirm).
-    if !dry_run
-        && changed
-        && !yes
-        && !confirm_yn(
-            "Remove this machine's Confidant state? This never touches a vault.",
-            cli.no_input,
-            cli.json,
-        )?
-    {
-        println!("nothing removed");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    if !dry_run {
-        // Keychain first: a keychain failure (unreachable, or the
-        // CONFIDANT_KEYCHAIN=off test switch) must leave the files in
-        // place so a retry can finish the job.
-        for slot in MachineKeySlot::ALL {
-            let present = items
-                .iter()
-                .find(|item| item.slot == Some(slot))
-                .and_then(|item| item.present);
-            if present != Some(false) {
-                delete_machine_key(slot).map_err(|err| keychain_delete_error(slot, err))?;
-            }
-        }
-        if remove_config_entries(&mut doc) {
-            let mode = std::fs::metadata(&config_path)
-                .ok()
-                .map(|meta| meta.permissions());
-            write_user_config_atomically(&config_path, &doc, mode)?;
-        }
-        for name in [
-            "trust.toml",
-            "manifest-seq.toml",
-            "inbox-rotation-pending.toml",
-        ] {
-            let path = config_dir.join(name);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow::Error::new(DomainError::invalid(format!(
-                        "could not remove {}: {e}",
-                        path.display()
-                    ))))
-                }
-            }
-        }
-    }
-
-    if cli.json {
-        let mut extra = serde_json::Map::new();
-        extra.insert("command".to_owned(), Value::String("reset".to_owned()));
-        extra.insert(
-            "scope".to_owned(),
-            Value::String("machine-state".to_owned()),
-        );
-        extra.insert("dry_run".to_owned(), Value::Bool(dry_run));
-        extra.insert("changed".to_owned(), Value::Bool(changed));
-        extra.insert(
-            "items".to_owned(),
-            Value::Array(items.iter().map(ResetItem::to_json).collect()),
-        );
-        extra.insert(
-            "vault_guard".to_owned(),
-            vault_candidates_json(&candidates, force),
-        );
-        print_json(&ok_envelope(None, Value::Object(extra)))?;
-    } else if !changed {
-        println!("nothing to remove: machine state is already clear");
-    } else {
-        println!("{}:", if dry_run { "would remove" } else { "removed" });
-        for item in items.iter().filter(|item| item.present != Some(false)) {
-            println!("  {:<10} {}", item.kind, item.label());
-        }
-        if dry_run {
-            println!("dry run: nothing was changed");
-        } else {
-            println!(
-                "machine state cleared; `confidant init --create` in a new directory starts with no inherited anchor, config entries, or keys"
-            );
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-// ---------------------------------------------------------------------------
-// schema / help
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// init / recover (milestone 2 key ceremony)
-// ---------------------------------------------------------------------------
-
-/// Display the recovery phrase exactly once on stderr, per the channel
-/// rules (spec ⚠4): never on stdout, never in `--json` output. Prompts
-/// for confirmation unless `--no-input` (then prints a louder warning).
-fn display_phrase_once(no_input: bool, phrase: &zeroize::Zeroizing<String>) -> io::Result<()> {
-    eprintln!("=================================================================");
-    eprintln!("RECOVERY PHRASE — write it down now. It will not be shown again.");
-    eprintln!("=================================================================");
-    eprintln!("{}", phrase.as_str());
-    eprintln!("=================================================================");
-    if no_input {
-        eprintln!("WARNING: --no-input was passed, so this phrase was not confirmed.");
-        eprintln!("Store it somewhere safe (paper, password manager) before continuing.");
-    } else {
-        eprint!("Have you written down the recovery phrase? [y/N] ");
-        io::stderr().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
-            eprintln!("WARNING: phrase not confirmed. Store it safely before continuing.");
-        }
-    }
-    Ok(())
-}
-
-/// #662: create the recovery phrase file, mode 0600, refusing to overwrite
-/// and never following a symlink (`create_new` uses `O_EXCL`). Split from
-/// the write so a refusal leaves any existing file untouched and the caller
-/// marks the file as its own only after creation succeeds.
-fn create_phrase_file(path: &Path) -> anyhow::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts.open(path).map_err(|e| {
-        let fix = if e.kind() == io::ErrorKind::AlreadyExists {
-            "Choose a new path, or remove the existing file first"
-        } else {
-            "Choose a writable path in an existing directory"
-        };
-        anyhow::Error::new(DomainError::usage(format!(
-            "cannot create --phrase-out {}: {e}",
-            path.display()
-        )))
-        .with_fix(fix)
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot set mode 0600 on --phrase-out {}: {e}",
-                    path.display()
-                )))
-            })?;
-    }
-    Ok(file)
-}
-
-fn write_phrase_file(file: &mut std::fs::File, path: &Path, phrase: &str) -> anyhow::Result<()> {
-    file.write_all(phrase.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write --phrase-out {}: {e}",
-                path.display()
-            )))
-        })?;
-    Ok(())
-}
-
-/// Resolve the device key for init/recover: the `CONFIDANT_DEVICE_KEY`
-/// env var (tests) or a fresh keypair stored via the keychain module.
-/// Returns `(bech32_secret, recipient_string)`.
-///
-/// `CONFIDANT_TEST_DEVICE_KEY` (only with the `test-overrides` feature,
-/// which CI enables via --all-features and release builds never do)
-/// provides the key without counting as an enrollment for the B13
-/// fresh-device check.
-fn provision_device_key() -> anyhow::Result<(String, String)> {
-    use age::secrecy::ExposeSecret;
-    use std::str::FromStr;
-    // Test keychain dir (test builds only): read the device key from the
-    // file instead of generating/storing. Used by the shred rotation test.
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        let bech32 = std::fs::read_to_string(dir.join("device.key")).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot read test device key: {e}"
-            )))
-        })?;
-        let id = age::x25519::Identity::from_str(bech32.trim()).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!("bad test device key: {e}")))
-        })?;
-        let recipient = id.to_public().to_string();
-        return Ok((bech32.trim().to_string(), recipient));
-    }
-    // Test override: provides a key without enrolling (B13 ignores it).
-    // Feature-gated so production binaries never honor it.
-    #[cfg(feature = "test-overrides")]
-    if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
-        let trimmed = test_key.trim();
-        if !trimmed.is_empty() {
-            let id = age::x25519::Identity::from_str(trimmed).map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "CONFIDANT_TEST_DEVICE_KEY is not a valid age identity: {e}"
-                )))
-            })?;
-            let recipient = id.to_public().to_string();
-            return Ok((trimmed.to_string(), recipient));
-        }
-    }
-    if let Ok(env_key) = std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
-        let trimmed = env_key.trim();
-        if !trimmed.is_empty() {
-            // Test path: the env var IS the enrolled key; parse it for the
-            // recipient and skip the keychain write.
-            let id = age::x25519::Identity::from_str(trimmed).map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "{} is not a valid age identity: {e}",
-                    confidant_crypt::keychain::DEVICE_KEY_ENV
-                )))
-            })?;
-            let recipient = id.to_public().to_string();
-            return Ok((trimmed.to_string(), recipient));
-        }
-    }
-    // Production path: generate and enroll via the keychain module.
-    let id = age::x25519::Identity::generate();
-    let bech32 = id.to_string().expose_secret().to_owned();
-    confidant_crypt::keychain::store_device_key(&bech32).map_err(anyhow::Error::new)?;
-    let recipient = id.to_public().to_string();
-    Ok((bech32, recipient))
-}
-
-/// The B1 trust-anchor refusal, shared by the `--create` bootstrap preflight
-/// and [`cmd_init`] so the two paths can never drift. `init` never silently
-/// replaces an existing anchor: a re-initialization needs `--force`.
-fn refuse_existing_anchor(trust_path: &Path, force: bool) -> anyhow::Result<()> {
-    if trust_path.exists() && !force {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "trust anchor already exists at {}; refusing to overwrite (clone an existing \
-                 vault and run `confidant keys device-add`, or `confidant recover` only if \
-                 every enrolled device is lost, or pass --force)",
-                trust_path.display()
-            ))
-            .with_fix(
-                "To enroll this device on an existing vault, clone it and run `confidant keys \
-                 device-add`. `confidant recover` is only for when every enrolled device is \
-                 lost. Pass --force to replace this machine's trust anchor for a new vault",
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// The directory `init --create` should scaffold: resolved like discovery
-/// (`--vault`, then `CONFIDANT_VAULT`, then cwd), except that the path need
-/// not exist yet and a `confidant.toml` argument is reduced to its parent.
 fn bootstrap_target(cli: &Cli) -> PathBuf {
     fn lenient(p: &Path) -> PathBuf {
         if !p.is_dir() && p.file_name().is_some_and(|n| n == "confidant.toml") {
@@ -10875,6 +6575,11 @@ struct Scaffold {
 }
 
 impl Scaffold {
+    /// Keep the scaffold: the run is about to succeed.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
     /// Best-effort rollback. A repo this run created is removed entirely; a
     /// pre-existing repo is rewound to its previous HEAD (or its unborn
     /// state) and only this run's files are removed.
@@ -10915,6 +6620,12 @@ impl Scaffold {
             let _ = std::fs::remove_file(self.root.join("confidant.toml"));
         }
         if self.created_root {
+            // Our own empty collection directories would otherwise keep the
+            // root alive. `remove_dir` refuses a non-empty directory, so any
+            // file the operator put there leaves the tree alone.
+            for dir in VAULT_DIRS {
+                let _ = std::fs::remove_dir(self.root.join(dir));
+            }
             // Only removes an empty directory: any user file leaves it alone.
             let _ = std::fs::remove_dir(&self.root);
         }
@@ -10927,6 +6638,65 @@ impl Drop for Scaffold {
     }
 }
 
+/// The vault's on-disk shape: the record collections plus the ledger. Git
+/// does not track empty directories, so `init` creates these locally and a
+/// later clone (or the first write) recreates what it needs.
+const VAULT_DIRS: &[&str] = &[
+    "people",
+    "orgs",
+    "deals",
+    "interactions",
+    "notes",
+    "edges",
+    "ledger",
+];
+
+/// Repo-local fallback commit identity, used only when git cannot resolve
+/// any `user.name`/`user.email` (no global or environment config). Never
+/// overrides an operator's real identity.
+const FALLBACK_GIT_NAME: &str = "Confidant Operator";
+const FALLBACK_GIT_EMAIL: &str = "operator@confidant.local";
+
+/// True when git can resolve a commit identity for the repo at `root`.
+/// Works before the repo exists (`GIT_DIR`) and inside one (`-C`).
+fn git_identity_resolves(root: &Path, no_input: bool) -> bool {
+    let mut cmd = std::process::Command::new("git");
+    if is_git_repo_root(root, no_input) {
+        cmd.arg("-C").arg(root);
+    } else {
+        cmd.env("GIT_DIR", root.join(".git"));
+    }
+    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
+    if no_input {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    cmd.output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Create the collection directories and, when git has no identity at all,
+/// write the repo-local fallback identity into `<vault>/.git/config`. Both
+/// steps are idempotent and never overwrite existing data.
+fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
+    for dir in VAULT_DIRS {
+        std::fs::create_dir_all(root.join(dir)).map_err(|e| {
+            anyhow::Error::new(DomainError::invalid(format!(
+                "cannot create vault directory {dir}: {e}"
+            )))
+        })?;
+    }
+    if !git_identity_resolves(root, no_input) {
+        for (key, value) in [
+            ("user.name", FALLBACK_GIT_NAME),
+            ("user.email", FALLBACK_GIT_EMAIL),
+        ] {
+            confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
+        }
+    }
+    Ok(())
+}
+
 /// Result of the `init --create` bootstrap step.
 enum BootstrapPlan {
     /// Continue to discovery and `cmd_init`; `Some` when a skeleton was
@@ -10936,285 +6706,6 @@ enum BootstrapPlan {
     DryRun,
 }
 
-/// Rollback for the key steps of `init` (#651): removes a `keys/` tree this
-/// run created (never a pre-existing one), a `--phrase-out` file this run
-/// created, and the `init: trust anchor and vault keys` commit when the run
-/// fails after committing but before the anchor save. Then it lets an armed
-/// [`Scaffold`] roll the skeleton back on drop.
-struct InitRollback {
-    root: PathBuf,
-    scaffold: Option<Scaffold>,
-    keys_dir_preexisting: bool,
-    keys_started: bool,
-    /// HEAD immediately before the keys commit; `None` on an unborn branch.
-    head_before_keys: Option<String>,
-    /// True once `init: trust anchor and vault keys` succeeded.
-    keys_committed: bool,
-    phrase_out: Option<PathBuf>,
-    phrase_out_created: bool,
-    armed: bool,
-}
-
-impl InitRollback {
-    fn new(root: &Path, scaffold: Option<Scaffold>, phrase_out: Option<&Path>) -> Self {
-        InitRollback {
-            root: root.to_path_buf(),
-            scaffold,
-            keys_dir_preexisting: root.join("keys").exists(),
-            keys_started: false,
-            head_before_keys: None,
-            keys_committed: false,
-            phrase_out: phrase_out.map(Path::to_path_buf),
-            phrase_out_created: false,
-            armed: true,
-        }
-    }
-
-    /// Keep everything written so far (the run is about to succeed).
-    fn disarm(&mut self) {
-        self.armed = false;
-        if let Some(scaffold) = self.scaffold.as_mut() {
-            scaffold.armed = false;
-        }
-    }
-
-    /// Rewind the `init: trust anchor and vault keys` commit so the working
-    /// tree can be cleaned up. Returns false when git refuses.
-    fn rewind_keys_commit(&self) -> bool {
-        match &self.head_before_keys {
-            Some(prev) => {
-                confidant_core::write::git(&self.root, &["reset", "--mixed", prev], true).is_ok()
-            }
-            None => {
-                confidant_core::write::git(&self.root, &["update-ref", "-d", "HEAD"], true).is_ok()
-            }
-        }
-    }
-}
-
-impl Drop for InitRollback {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if self.keys_committed && !self.rewind_keys_commit() {
-            // Keep the keys tree, the phrase file, and the scaffold: the
-            // commit still references keys/, and deleting either side would
-            // lose data silently. Say exactly what is left and why.
-            if let Some(scaffold) = self.scaffold.as_mut() {
-                scaffold.armed = false;
-            }
-            let keys_path = self.root.join("keys");
-            eprintln!(
-                "warning: init failed after committing keys/ but could not rewind the commit; \
-                 keeping {} so the phrase still matches the committed keys",
-                keys_path.display()
-            );
-            if self.phrase_out_created {
-                if let Some(path) = &self.phrase_out {
-                    eprintln!(
-                        "warning: keeping the recovery phrase file at {}; write it down before \
-                         retrying",
-                        path.display()
-                    );
-                }
-            }
-            return;
-        }
-        if self.keys_started && !self.keys_dir_preexisting {
-            let _ = std::fs::remove_dir_all(self.root.join("keys"));
-        }
-        if self.phrase_out_created {
-            if let Some(path) = &self.phrase_out {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-        // `scaffold` (if still armed) rolls back when it drops next.
-    }
-}
-
-/// Env-var override for the operator Ed25519 signing seed at `init`
-/// (64 hex characters = a 32-byte seed). The load path
-/// (`confidant_crypt::keychain::operator_key`) already honors this variable;
-/// `init` accepts it so a host with no OS Secret Service can create an
-/// encrypted vault (#650).
-const OPERATOR_KEY_ENV: &str = "CONFIDANT_OPERATOR_KEY";
-
-/// Read and validate [`OPERATOR_KEY_ENV`] for `init` (#650). Returns `None`
-/// when unset. Never echoes the value: errors name the variable and the
-/// expected shape only.
-fn operator_key_from_env() -> anyhow::Result<Option<ed25519_dalek::SigningKey>> {
-    let raw = match std::env::var(OPERATOR_KEY_ENV) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(invalid_operator_key("it is not valid UTF-8"));
-        }
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(invalid_operator_key("it is empty"));
-    }
-    if trimmed.len() != 64 {
-        return Err(invalid_operator_key(&format!(
-            "it is {} characters, not 64",
-            trimmed.len()
-        )));
-    }
-    if !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(invalid_operator_key("it contains non-hex characters"));
-    }
-    let decoded = Zeroizing::new(
-        hex::decode(trimmed).map_err(|_| invalid_operator_key("it is not valid hex"))?,
-    );
-    let seed: [u8; 32] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| invalid_operator_key("it is not a 32-byte seed"))?;
-    Ok(Some(ed25519_dalek::SigningKey::from_bytes(&seed)))
-}
-
-fn invalid_operator_key(reason: &str) -> anyhow::Error {
-    anyhow::Error::new(DomainError::usage(format!(
-        "{OPERATOR_KEY_ENV} is invalid: {reason}; expected 64 hex characters \
-         (a 32-byte Ed25519 seed)"
-    )))
-    .with_fix(&format!(
-        "Set {OPERATOR_KEY_ENV} to 64 hex characters, or unset it to generate a key \
-         (the OS keychain must then be reachable)"
-    ))
-}
-
-/// True when this process already has a device identity that
-/// [`provision_device_key`] will use without writing the OS keychain:
-/// `CONFIDANT_DEVICE_KEY`, or (test-overrides only) a
-/// `CONFIDANT_TEST_KEYCHAIN_DIR` file / `CONFIDANT_TEST_DEVICE_KEY`.
-fn device_key_supplied_from_env() -> anyhow::Result<bool> {
-    use std::str::FromStr;
-    #[cfg(feature = "test-overrides")]
-    if test_keychain_dir().is_some_and(|dir| dir.join("device.key").is_file()) {
-        return Ok(true);
-    }
-    #[cfg(feature = "test-overrides")]
-    if let Ok(test_key) = std::env::var("CONFIDANT_TEST_DEVICE_KEY") {
-        let trimmed = test_key.trim();
-        if !trimmed.is_empty() {
-            age::x25519::Identity::from_str(trimmed).map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "CONFIDANT_TEST_DEVICE_KEY is not a valid age identity: {e}"
-                )))
-            })?;
-            return Ok(true);
-        }
-    }
-    match std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
-        Err(_) => Ok(false),
-        Ok(value) if value.trim().is_empty() => Ok(false),
-        Ok(value) => {
-            age::x25519::Identity::from_str(value.trim()).map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "{} is not a valid age identity: {e}",
-                    confidant_crypt::keychain::DEVICE_KEY_ENV
-                )))
-            })?;
-            Ok(true)
-        }
-    }
-}
-
-fn init_key_sources_error(detail: &str) -> anyhow::Error {
-    use confidant_crypt::keychain::DEVICE_KEY_ENV;
-    anyhow::Error::new(DomainError::invalid(format!(
-        "cannot init on this host: {detail}"
-    )))
-    .with_fix(&format!(
-        "On a host with no OS keychain, set {DEVICE_KEY_ENV} to an AGE-SECRET-KEY-1… identity \
-         and {OPERATOR_KEY_ENV} to a 64-character hex Ed25519 seed before `confidant init` \
-         (see docs/agent-setup.md, Headless hosts and agents)"
-    ))
-}
-
-/// Refuse `init` — including `--dry-run` — when this host cannot persist
-/// the device or operator key the same way a real run would (#682).
-///
-/// A reachable OS keychain is enough to generate both. A headless host
-/// (keychain unreachable, or the test-only `CONFIDANT_KEYCHAIN=off`
-/// switch) needs `CONFIDANT_DEVICE_KEY` (or, in test builds, a
-/// `CONFIDANT_TEST_KEYCHAIN_DIR` / `CONFIDANT_TEST_DEVICE_KEY` that
-/// [`provision_device_key`] would honor); it also needs
-/// `CONFIDANT_OPERATOR_KEY` unless the kill switch is on, matching the
-/// real init path that skips the operator keychain write in tests.
-fn require_init_key_sources() -> anyhow::Result<()> {
-    use confidant_crypt::keychain::{
-        self, DeviceKeyState, KeychainBackend, DEVICE_ACCOUNT, DEVICE_KEY_ENV, DEVICE_SERVICE,
-    };
-
-    // Same stand-in #688 uses in `device_key_store_available`: a test
-    // keychain dir is the file-backed store `provision_device_key` writes
-    // to under `--all-features`. Dir presence is enough; do not wait for
-    // `device.key` (shred-rotation fixtures set the dir and then init).
-    #[cfg(feature = "test-overrides")]
-    if test_keychain_dir().is_some() {
-        return Ok(());
-    }
-
-    let operator_from_env = operator_key_from_env()?.is_some();
-    let device_from_env = device_key_supplied_from_env()?;
-    if device_from_env && operator_from_env {
-        return Ok(());
-    }
-
-    if keychain::keychain_switch().map_err(anyhow::Error::new)? == keychain::KeychainSwitch::Off {
-        if !device_from_env {
-            return Err(init_key_sources_error(
-                "the OS keychain is not available to store a generated device key",
-            ));
-        }
-        // Real init skips the operator keychain write under the kill switch.
-        return Ok(());
-    }
-
-    let keychain_reachable = match keychain::device_key_state() {
-        Ok(DeviceKeyState::Keychain | DeviceKeyState::NotEnrolled) => true,
-        Ok(DeviceKeyState::Env) => {
-            if operator_from_env {
-                return Ok(());
-            }
-            // `DeviceKeyState::Env` means CONFIDANT_DEVICE_KEY is set, so
-            // `device_key_state` never opened the OS keychain. Probe it so
-            // a headless host still needs CONFIDANT_OPERATOR_KEY unless
-            // the keychain can persist one. `Error::Keychain` is
-            // "unreachable" (no Secret Service / no entry); any other
-            // error is a real backend failure and must not be treated as
-            // "no store".
-            match keychain::OsKeychain.get_password(DEVICE_SERVICE, DEVICE_ACCOUNT) {
-                Ok(_) => true,
-                Err(confidant_crypt::error::Error::Keychain(_)) => false,
-                Err(e) => return Err(anyhow::Error::new(e)),
-            }
-        }
-        Ok(DeviceKeyState::KeychainUnreachable(_)) => false,
-        Err(e) => return Err(anyhow::Error::new(e)),
-    };
-    if keychain_reachable {
-        return Ok(());
-    }
-
-    let mut missing = Vec::new();
-    if !device_from_env {
-        missing.push(DEVICE_KEY_ENV);
-    }
-    if !operator_from_env {
-        missing.push(OPERATOR_KEY_ENV);
-    }
-    Err(init_key_sources_error(&format!(
-        "the OS keychain is unreachable and {} is unset",
-        missing.join(" and ")
-    )))
-}
-
-/// Branch `--create` will use, plus a note when an existing repo is left
-/// on a name other than `main` (#682, #661).
 fn planned_create_branch(root: &Path, no_input: bool) -> (String, Option<String>) {
     if !root.is_dir() || !is_git_repo_root(root, no_input) {
         return ("main".to_owned(), None);
@@ -11238,37 +6729,6 @@ fn planned_create_branch(root: &Path, no_input: bool) -> (String, Option<String>
     }
 }
 
-/// True when git can resolve a commit identity for the repo at `root`.
-/// Runs `git var` before `init --create` writes anything (#651), and avoids
-/// reading the *current* directory's repo config: a fresh target has no local
-/// config, so only global/system/env identity applies. `GIT_DIR` works even
-/// when that path does not exist yet.
-fn require_git_identity(root: &Path, no_input: bool) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new("git");
-    if is_git_repo_root(root, no_input) {
-        cmd.arg("-C").arg(root);
-    } else {
-        cmd.env("GIT_DIR", root.join(".git"));
-    }
-    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
-    if no_input {
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-    }
-    let ok = cmd
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-    if ok {
-        return Ok(());
-    }
-    Err(anyhow::Error::new(DomainError::invalid(
-        "git has no author identity, so init cannot commit the vault",
-    ))
-    .with_fix(
-        "Set a git identity, e.g. `git config --global user.name \"Your Name\"` and `git config --global user.email you@example.com`",
-    ))
-}
-
 /// The current branch name (works on an unborn branch), or `None` when git
 /// cannot report one.
 fn current_branch(root: &Path, no_input: bool) -> Option<String> {
@@ -11278,10 +6738,9 @@ fn current_branch(root: &Path, no_input: bool) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// #685/#686: second devices clone + `keys device-add`; `recover` burns the
-/// phrase. Shown after `init` (human and JSON) so a new-device operator is
-/// not sent to `init` or `recover`.
-const SECOND_DEVICE_HINT: &str = "to put this vault on another device, clone it and run `confidant keys device-add` (not `init`; `recover` only if every enrolled device is lost)";
+/// #685/#686: a second device clones the vault with git. Shown after `init`
+/// (human and JSON) so a new-device operator is not sent back to `init`.
+const SECOND_DEVICE_HINT: &str = "to put this vault on another device, clone it with git";
 
 /// `--remote` on `init --create`, if present.
 fn init_remote_url(cli: &Cli) -> Option<&str> {
@@ -11407,7 +6866,16 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             println!("  note     {note}");
         }
         println!("  would    create the vault directory (when absent)");
-        println!("  would    run git init and commit .gitignore + confidant.toml");
+        println!(
+            "  would    create the collection directories ({})",
+            VAULT_DIRS.join(", ")
+        );
+        println!("  would    run git init -b main and commit .gitignore + confidant.toml");
+        if !git_identity_resolves(root, cli.no_input) {
+            println!(
+                "  would    set a repo-local fallback git identity ({FALLBACK_GIT_NAME} <{FALLBACK_GIT_EMAIL}>)"
+            );
+        }
         match remote {
             Some(url) => println!(
                 "  would    add git remote origin {} (not pushed)",
@@ -11415,13 +6883,6 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             ),
             None => println!("  would    not add a git remote"),
         }
-        if std::env::var_os(OPERATOR_KEY_ENV).is_some() {
-            println!("  would    use {OPERATOR_KEY_ENV} as the operator key");
-        } else {
-            println!("  would    generate the operator key");
-        }
-        println!("  would    generate the recovery phrase and device key");
-        println!("  would    commit keys/ and write the trust anchor");
         print_init_followup(packs_empty, remote, &branch);
     }
     Ok(())
@@ -11435,7 +6896,7 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
 /// `confidant.toml` (`packs` from the global `--packs`, default `[]`), and
 /// commits just those files. An existing vault is left to today's path; any
 /// other non-empty directory is refused with nothing written.
-fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<BootstrapPlan> {
+fn bootstrap_vault(cli: &Cli, create: bool) -> anyhow::Result<BootstrapPlan> {
     if !create {
         return Ok(BootstrapPlan::Continue(None));
     }
@@ -11457,15 +6918,6 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         }
         return Ok(BootstrapPlan::Continue(None));
     }
-
-    // B1 preflight: the very refusal `cmd_init` would produce, but before any
-    // file is written, so a refused init leaves no half-built skeleton.
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-    refuse_existing_anchor(&config_dir.join(confidant_crypt::anchor::TRUST_FILE), force)?;
 
     // #539: only an absent, empty, or skeleton-only directory is scaffolded.
     // A non-empty target — including a clean git repo — is refused so that
@@ -11501,21 +6953,10 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         .unwrap_or_default();
     validate_init_packs(&packs)?;
 
-    // #650: validate the operator-key override before the dry-run branch and
-    // before any write, so `--create --dry-run` reports a bad value too.
-    let _ = operator_key_from_env()?;
-
-    // #651: require a commit identity before creating the directory or
-    // running `git init`. `git var` works outside a repo, so a refused run
-    // leaves an absent target absent instead of an empty `.git` that blocks
-    // the retry. This also covers the dry run so it reports the same refusal.
-    require_git_identity(&root, no_input)?;
-
-    // #682: `--dry-run` "runs every preflight check" — including whether
-    // this host can persist keys. A keyless headless box must fail here
-    // the same way a real init would at `store_device_key`.
-    require_init_key_sources()?;
-
+    // #651 is obsolete now that `init` writes a repo-local fallback
+    // identity when git has none: a machine with no global `user.name`
+    // still scaffolds. Everything else (packs, `--remote`) is still
+    // validated before the first write.
     let existing_repo = exists && is_git_repo_root(&root, no_input);
     if let Some(url) = init_remote_url(cli) {
         refuse_init_remote(&root, url, existing_repo, no_input)?;
@@ -11556,14 +6997,8 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
     })?;
 
     if scaffold.git_initialized {
-        confidant_core::write::git(&root, &["init"], no_input)?;
         // #661: create `main` explicitly, independent of init.defaultBranch.
-        // `symbolic-ref` is portable and works before the first commit.
-        confidant_core::write::git(
-            &root,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-            no_input,
-        )?;
+        confidant_core::write::git(&root, &["init", "-b", "main"], no_input)?;
     } else if existing_repo
         && confidant_core::write::git(&root, &["rev-parse", "--verify", "HEAD"], no_input).is_err()
     {
@@ -11577,8 +7012,13 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
         )?;
     }
 
+    // The vault's shape (`people/` … `ledger/`) and, on a machine with no
+    // git identity at all, the repo-local fallback identity the skeleton
+    // commit needs. An operator's real identity is never overridden.
+    initialize_vault_shape(&root, no_input)?;
+
     // `.confidant/` holds the plaintext search corpus and must never be
-    // committed (ADR-6); `reindex` refuses without this entry.
+    // committed (ADR-6).
     let gitignore = root.join(".gitignore");
     let mut text = std::fs::read_to_string(&gitignore).unwrap_or_default();
     let already_ignored = text
@@ -11655,108 +7095,30 @@ fn bootstrap_vault(cli: &Cli, create: bool, force: bool) -> anyhow::Result<Boots
     Ok(BootstrapPlan::Continue(Some(scaffold)))
 }
 
-fn cmd_init(
-    cli: &Cli,
-    root: &Path,
-    force: bool,
-    scaffold: Option<Scaffold>,
-    phrase_out: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{
-        anchor, lifecycle::KeyStore, manifest::SHARED_CLIENT_ID, recovery::Recovery,
-    };
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-
+/// `confidant init`: validate a vault, or scaffold one with `--create`.
+///
+/// Records are plaintext, so there is no key, keychain, anchor, or recovery
+/// step. With `--create` the skeleton is already written and committed by
+/// [`bootstrap_vault`], including the collection directories and a
+/// repo-local fallback git identity when the machine has none; this
+/// validates the result and reports the plan. Without `--create` the same
+/// idempotent shape step runs on the existing vault.
+fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Result<ExitCode> {
     let json = cli.json;
     let no_input = cli.no_input;
 
-    // Config dir (off-vault, per design §4).
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-
-    // B1: refuse if the anchor already exists — it is a trust root and is
-    // never silently replaced. With --force the existing anchor is
-    // replaced, but only AFTER every check and key step succeeds (never
-    // deleted up front: a failed init must not leave the device
-    // anchorless).
-    let trust_path = config_dir.join(anchor::TRUST_FILE);
-    let trust_exists = trust_path.exists();
-    refuse_existing_anchor(&trust_path, force)?;
-
-    // Git repo + clean tree required.
     require_git_repo(root, no_input)?;
-    let status = confidant_core::write::git(root, &["status", "--porcelain"], no_input)?;
-    if !status.trim().is_empty() {
-        return Err(anyhow::Error::new(
-            DomainError::invalid("vault tree is not clean; commit or stash changes first")
-                .with_fix("Run `git status` in the vault and clean the tree"),
-        ));
-    }
-
-    // #640: `init` creates a first-device key tree; it never re-initializes
-    // one. `init_client` refuses once `keys/shared/epoch` exists, but only
-    // after `init_lookup_key` has already rewritten `keys/vault`. Check the
-    // same condition before any key material is generated, stored, or
-    // written, so a refused `--force` leaves the working tree
-    // byte-identical (and does not replace the keychain entries either).
-    let keys_dir = root.join("keys");
-    if keys_dir.join("shared").join("epoch").exists() {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(format!(
-                "vault keys already exist at {}; init creates a new key tree and never \
-                 re-initializes an existing one (--force only replaces a trust anchor)",
-                keys_dir.display()
-            ))
-            .with_fix(
-                "Start in a fresh directory for a new vault. To put this vault on another \
-                 device, clone it and run `confidant keys device-add` (not `init`; `recover` \
-                 only if every enrolled device is lost). Use `confidant keys rotate` to \
-                 rotate existing keys",
-            ),
-        ));
-    }
-
-    // #651: the key commit needs an identity too. Check before generating
-    // any key material (works inside an existing repo).
-    require_git_identity(root, no_input)?;
-
-    // #650: validate the operator-key override in the preflight so a bad
-    // value fails (including under --dry-run) before anything is generated
-    // or written. The same env var is already honored by the load path.
-    let env_operator_sk = operator_key_from_env()?;
-
-    // #682: same key-source preflight as `--create`, so `--dry-run` on a
-    // prepared vault also refuses a keyless headless host.
-    require_init_key_sources()?;
-
     let vault = load_vault(root)?;
-    // Spec 3 (§2.2): keys must never coexist with a plaintext declaration.
-    // `init` on a vault declaring `[crypto] mode = "plaintext"` is a hard
-    // error — the opt-out is a pre-`init` declaration only. Checked here so
-    // `--dry-run` reports the same refusal without generating keys.
-    if vault.config.crypto.mode.as_deref() == Some("plaintext") {
-        return Err(anyhow::Error::new(
-            DomainError::config(
-                "confidant.toml declares [crypto] mode = \"plaintext\", but `init` \
-                 creates vault keys; keys must never coexist with a plaintext declaration",
-            )
-            .with_fix(
-                "Remove the `[crypto] mode = \"plaintext\"` line, or run `init` in a fresh vault",
-            ),
-        ));
+    if vault.config.spec != confidant_core::SPEC_VERSION {
+        return Err(anyhow::Error::new(DomainError::spec_unsupported(
+            &vault.config.spec,
+        )));
     }
-
     let branch = current_branch(root, no_input);
     let packs_empty = vault.config.packs.is_empty();
-
-    // #649: every preflight above passed; report the plan and stop before
-    // key generation, keychain writes, keys/ commits, or the anchor save.
     let remote = init_remote_url(cli);
     let branch_name = branch.as_deref().unwrap_or("main");
+
     if cli.dry_run {
         if json {
             print_json(&ok_envelope(
@@ -11775,602 +7137,34 @@ fn cmd_init(
             if let Some(branch) = &branch {
                 println!("  branch   {branch}");
             }
-            if env_operator_sk.is_some() {
-                println!("  would    use {OPERATOR_KEY_ENV} as the operator key");
-            } else {
-                println!("  would    generate the operator key");
-            }
-            println!("  would    generate the recovery phrase and device key");
-            println!(
-                "  would    commit keys/ and write the trust anchor at {}",
-                trust_path.display()
-            );
             print_init_followup(packs_empty, remote, branch_name);
         }
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Everything from here on can write. The guard removes only what this
-    // run created: a `keys/` tree that did not exist, a `--phrase-out` file,
-    // and (with `--create`) the skeleton.
-    let mut rollback = InitRollback::new(root, scaffold, phrase_out);
-
-    // B2: generate operator key, recovery phrase, and device keypair.
-    // None of this material is ever written into the vault.
-    // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
-    // provides the hex seed and keeps precedence. Otherwise #650's
-    // CONFIDANT_OPERATOR_KEY (validated above) supplies the seed for
-    // headless hosts; with neither, generate a fresh key.
-    #[cfg(feature = "test-overrides")]
-    let test_operator_sk = test_operator_key();
-    #[cfg(not(feature = "test-overrides"))]
-    let test_operator_sk: Option<SigningKey> = None;
-    let operator_from_env = env_operator_sk.is_some();
-    let operator_sk = test_operator_sk
-        .or(env_operator_sk)
-        .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
-    let recovery = Recovery::generate();
-    let phrase = recovery.phrase();
-
-    // #662: write the phrase file before any key persistence. If the file
-    // cannot be created, abort with nothing persisted; the guard removes a
-    // partial file if the write itself fails, but never a pre-existing one.
-    if let Some(path) = phrase_out {
-        let mut file = create_phrase_file(path)?;
-        rollback.phrase_out_created = true;
-        write_phrase_file(&mut file, path, &phrase)?;
-    }
-
-    let (_device_bech32, device_recipient) = provision_device_key()?;
-
-    // Persist the operator signing key to the OS keychain (needed for
-    // `keys` commands to sign manifests). #650: when CONFIDANT_OPERATOR_KEY
-    // is set, the operator key is externally managed for this run — do not
-    // write it to the keychain, which would fail on a headless host or
-    // duplicate the secret. The test-override path is otherwise unchanged:
-    // in tests (CONFIDANT_KEYCHAIN=off) the keychain write is refused and
-    // the harness provides the key via CONFIDANT_TEST_OPERATOR_KEY instead.
-    if !operator_from_env {
-        if let Err(e) =
-            confidant_crypt::keychain::store_operator_key(&hex::encode(operator_sk.to_bytes()))
-        {
-            if confidant_crypt::keychain::keychain_switch().map_err(anyhow::Error::new)?
-                != confidant_crypt::keychain::KeychainSwitch::Off
-            {
-                return Err(anyhow::Error::new(e));
-            }
-            // Kill switch set: test mode; the harness provides the key via env.
-        }
-    }
-
-    // B3: build the anchor in memory. It is persisted atomically only
-    // after every fallible key step succeeds (below): if the KeyStore
-    // work fails, no anchor pins a recovery key whose phrase was never
-    // shown, and a retry is clean.
-    let anchor = anchor::Anchor {
-        operator: operator_sk.verifying_key(),
-        recovery: recovery.verifying_key(),
-        recovery_age: recovery.age_identity().to_recipient_string(),
-        source: trust_path.clone(),
-    };
-
-    // B4 + B6: KeyStore via with_config_dir (mandatory seq tracker).
-    // Initialize the vault lookup key and the vault:shared client (⚠6).
-    rollback.keys_started = true;
-    let mut store =
-        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-            .map_err(anyhow::Error::new)?;
-    store
-        .init_lookup_key(std::slice::from_ref(&device_recipient), &operator_sk)
-        .map_err(anyhow::Error::new)?;
-    let mut recipients = confidant_crypt::manifest::RecipientMap::new();
-    recipients.insert(
-        "device-0".to_string(),
-        confidant_crypt::manifest::RecipientEntry {
-            age_pubkey: device_recipient.clone(),
-            label: "device-0".to_string(),
-            scope_ref: String::new(),
-        },
-    );
-    store
-        .init_client(SHARED_CLIENT_ID, &recipients, &anchor, &operator_sk)
-        .map_err(anyhow::Error::new)?;
-
-    // Fresh-device recovery: write the operator-pubkey certificate
-    // (signed by the recovery key) so a device with no trust.toml can
-    // rebuild trust from the keys/ tree. Committed with the keys/ tree.
-    anchor::write_operator_cert(
-        &keys_dir,
-        &vault.config.vault_id,
-        &operator_sk.verifying_key(),
-        recovery.signing_key(),
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Commit the keys/ tree: check first (readers skip keys/, so it
-    // passes), one commit. The .age files are binary, so they go through
-    // the repo's git helper rather than the String-based FileChange.
-    let pre = check_vault(&vault, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing the keys/ tree; refusing to commit a broken vault",
-        )));
-    }
-
-    // #651: the phrase must be visible BEFORE the irreversible keys/ commit
-    // and anchor save, so a failed run can never leave keys whose phrase was
-    // never seen. With --phrase-out the file was written above; without it,
-    // display now. A display failure aborts before anything is committed.
-    if phrase_out.is_none() {
-        display_phrase_once(no_input, &phrase)?;
-    }
-
-    // #651 review: record the pre-keys HEAD so a failure after the keys
-    // commit (e.g. the anchor save) can rewind it before removing keys/.
-    rollback.head_before_keys = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
-
-    stage_keys(root, no_input)?;
-    confidant_core::write::git(
-        root,
-        &["commit", "-m", "init: trust anchor and vault keys"],
-        no_input,
-    )?;
-    rollback.keys_committed = true;
-    let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
-        .trim()
-        .to_owned();
-
-    // Test-only failpoint (never in release builds): a failure after the
-    // irreversible keys/ commit and before the anchor save exercises the
-    // rewind path. Not part of the agent contract.
-    #[cfg(feature = "test-overrides")]
-    if std::env::var("CONFIDANT_TEST_FAIL_AFTER_KEYS_COMMIT").as_deref() == Ok("1") {
-        return Err(anyhow::Error::new(DomainError::internal(
-            "test-only failpoint: failing after the keys/ commit",
-        )));
-    }
-
-    // Persist the anchor now that everything succeeded. Atomic
-    // temp-and-rename: a crash never leaves a half-written trust.toml.
-    // With --force this replaces the previous anchor.
-    if trust_exists {
-        anchor::replace(
-            &config_dir,
-            root,
-            &anchor.operator,
-            &anchor.recovery,
-            &anchor.recovery_age,
-        )
-        .map_err(anyhow::Error::new)?;
-    } else {
-        anchor::save(
-            &config_dir,
-            root,
-            &anchor.operator,
-            &anchor.recovery,
-            &anchor.recovery_age,
-        )
-        .map_err(anyhow::Error::new)?;
-    }
-
-    // The run succeeded: keep the skeleton, keys/, and phrase file.
-    rollback.disarm();
-
-    // B5: phrase exactly once on stderr (or only its path when
-    // --phrase-out was used); stdout JSON carries ok, vault, and opaque
-    // paths — no phrase, no key material.
-    if let Some(path) = phrase_out {
-        eprintln!("recovery phrase written to {}", path.display());
-        eprintln!("Move this file offline, then delete it.");
-    }
-
-    if json {
-        let mut extra = serde_json::json!({
-            "anchor": trust_path.display().to_string(),
-            "keys_dir": keys_dir.display().to_string(),
-            "commit": commit,
-            "branch": branch,
-            "remote": remote.map(display_remote_url),
-            "next_steps": init_next_steps(packs_empty, remote, branch_name),
-        });
-        if let Some(path) = phrase_out {
-            extra["phrase_out"] = Value::String(path.display().to_string());
-        }
-        print_json(&ok_envelope(Some(root), extra))?;
-    } else {
-        println!("initialized trust anchor at {}", trust_path.display());
-        if let Some(branch) = &branch {
-            println!("branch {branch}");
-        }
-        println!("committed keys/ tree ({})", &commit[..8.min(commit.len())]);
-        print_init_followup(packs_empty, remote, branch_name);
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Read a recovery phrase from stdin or `--phrase-file` (B7: never argv).
-///
-/// Both channels read straight into a [`Zeroizing<String>`]; the trimmed
-/// copy is zeroizing too, so neither the raw nor the trimmed buffer is ever
-/// dropped as a plain `String`. Empty input is a usage error.
-fn read_phrase(phrase_file: Option<&Path>) -> anyhow::Result<Zeroizing<String>> {
-    use std::io::Read;
-
-    let mut buf: Zeroizing<String> = Zeroizing::new(String::new());
-    if let Some(path) = phrase_file {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "--phrase-file {} unreadable: {e}",
-                path.display()
-            )))
-        })?;
-        *buf = text;
-    } else {
-        io::stdin().read_to_string(&mut buf).map_err(|e| {
-            anyhow::Error::new(DomainError::usage(format!(
-                "cannot read phrase from stdin: {e}"
-            )))
-        })?;
-    }
-
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "recovery phrase is required via stdin or --phrase-file",
-        )));
-    }
-    if trimmed.len() == buf.len() {
-        return Ok(buf);
-    }
-    // A separate zeroizing buffer, so dropping the untrimmed original does
-    // not leave the phrase bytes in a plain `String` (#663).
-    Ok(Zeroizing::new(trimmed.to_owned()))
-}
-
-/// Compare a phrase-derived recovery identity with a trust anchor: **both**
-/// halves must match (Ed25519 pubkey and X25519 age recipient). The two
-/// comparisons live here so `recover` and `keys verify-recovery` cannot
-/// drift apart (#663).
-fn recovery_matches_anchor(
-    anchor: &confidant_crypt::anchor::Anchor,
-    recovery: &confidant_crypt::recovery::Recovery,
-) -> (bool, bool) {
-    (
-        anchor.recovery == recovery.verifying_key(),
-        anchor.recovery_age == recovery.age_identity().to_recipient_string(),
-    )
-}
-
-/// Fail closed unless the phrase-derived recovery identity matches the
-/// anchor's Ed25519 pubkey and X25519 age recipient. Shared by `recover`
-/// and `keys verify-recovery`.
-fn check_recovery(
-    anchor: &confidant_crypt::anchor::Anchor,
-    recovery: &confidant_crypt::recovery::Recovery,
-) -> anyhow::Result<()> {
-    let (pubkey_matches, recipient_matches) = recovery_matches_anchor(anchor, recovery);
-    if !pubkey_matches {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "recovery phrase does not match this vault's trust anchor",
-        )));
-    }
-    // The X25519 recovery recipient is a separate HKDF branch of the
-    // phrase; it must match too, or a tampered anchor file could get a
-    // forged recipient recorded in the denylist and the real retired
-    // recipient missed (#154 must-fix 1).
-    if !recipient_matches {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "recovery phrase does not match this vault's trust anchor (recovery recipient)",
-        )));
-    }
-    Ok(())
-}
-
-fn cmd_recover(
-    cli: &Cli,
-    root: &Path,
-    phrase_file: Option<&Path>,
-    anchor_file: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{
-        anchor, keychain,
-        lifecycle::KeyStore,
-        manifest::{RecipientEntry, RecipientMap, RECOVERY_KEY_ID, VAULT_CLIENT_ID},
-        recovery::Recovery,
-    };
-
-    let json = cli.json;
-    let no_input = cli.no_input;
-
-    // B7: phrase via stdin or --phrase-file only — never argv. Both
-    // channels read into zeroizing buffers (shared `read_phrase`).
-    let phrase = read_phrase(phrase_file)?;
-
-    // B8: validate (typo-in-word-N errors; never echoes the word).
-    let old_recovery = Recovery::from_phrase(&phrase).map_err(anyhow::Error::new)?;
-    let old_identity = old_recovery.age_identity().to_age_identity().map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!("bad recovery identity: {e}")))
-    })?;
-
-    // B13: recover requires a fresh device. A device key available via
-    // the OS keychain or CONFIDANT_DEVICE_KEY means this device already
-    // went through init (the CONFIDANT_TEST_DEVICE_KEY override does not
-    // count — it is how tests provide the new key).
-    let device_enrolled = keychain::device_key().is_ok();
-    if device_enrolled {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(
-                "this device already has a device key enrolled; recover is for fresh devices",
-            )
-            .with_fix("To add this device to the vault, wait for #66 (device add)"),
-        ));
-    }
-
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-
-    require_git_repo(root, no_input)?;
-    let status = confidant_core::write::git(root, &["status", "--porcelain"], no_input)?;
-    if !status.trim().is_empty() {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "vault tree is not clean; commit or stash changes first",
-        )));
-    }
-
-    let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-
-    // Load the trust anchor. Three sources, in order of explicitness:
-    // 1. `--anchor-file <path>` (#152): load exactly this file; the phrase
-    //    must match its recovery key (fail closed). No keys/-tree fallback:
-    //    an explicit anchor that does not match is an error, never a cue to
-    //    rebuild from the vault.
-    // 2. The device's `~/.config/confidant/trust.toml`.
-    // 3. On a fresh device (no trust.toml, no config backup), rebuild it
-    //    from the vault's keys/ tree: the operator certificate (written at
-    //    init, signed by the recovery key) is verified against the
-    //    phrase-derived recovery pubkey. This is the lost-device path — the
-    //    phrase alone re-establishes trust.
-    //
-    // Nothing is written to the config dir until this succeeds.
-    let anchor = if let Some(path) = anchor_file {
-        let a = anchor::load_from(path, root).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "--anchor-file {} rejected: {e}",
-                path.display()
-            )))
-        })?;
-        check_recovery(&a, &old_recovery)?;
-        // #154 must-fix 3: the supplied operator key may only be accepted
-        // when the vault has no operator certificate (the pre-cert case the
-        // backup exists for). When a cert is present it must verify against
-        // the phrase-derived recovery key and name the same operator — so a
-        // tampered anchor backup can never get the recovery key to certify
-        // an attacker's operator key.
-        if keys_dir.join(anchor::OPERATOR_CERT_FILE).exists() {
-            let cert_operator = anchor::verify_operator_cert(
-                &keys_dir,
-                &vault.config.vault_id,
-                &old_recovery.verifying_key(),
-            )
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "operator certificate present but does not verify against the phrase; \
-                     refusing the supplied --anchor-file: {e}"
-                )))
-            })?;
-            if cert_operator != a.operator {
-                return Err(anyhow::Error::new(DomainError::invalid(
-                    "--anchor-file's operator key does not match this vault's operator \
-                     certificate; refusing",
-                )));
-            }
-        }
-        a
-    } else {
-        match anchor::load(&config_dir, root) {
-            Ok((a, _warnings)) => {
-                // The phrase must be for THIS vault: the recovery public key
-                // in the anchor must match the phrase-derived one.
-                check_recovery(&a, &old_recovery)?;
-                a
-            }
-            Err(_) => {
-                let operator_pubkey = anchor::verify_operator_cert(
-                    &keys_dir,
-                    &vault.config.vault_id,
-                    &old_recovery.verifying_key(),
-                )
-                .map_err(anyhow::Error::new)?;
-                anchor::Anchor {
-                    operator: operator_pubkey,
-                    recovery: old_recovery.verifying_key(),
-                    recovery_age: old_recovery.age_identity().to_recipient_string(),
-                    source: config_dir.join(anchor::TRUST_FILE),
-                }
-            }
-        }
-    };
-    let operator_pubkey = anchor.operator;
-    let mut store =
-        KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-            .map_err(anyhow::Error::new)?;
-
-    // B9: unwrap every initialized client's keys through their recovery
-    // wrappings. The vault lookup key is device-only (B12 handles it).
-    let mut clients: Vec<String> = store
-        .manifest_clients()
-        .into_iter()
-        .filter(|c| c != VAULT_CLIENT_ID)
-        .collect();
-    clients.sort();
-    let mut data_keys: Vec<(String, confidant_crypt::keys::DataKey)> = Vec::new();
-    for client_id in &clients {
-        let epoch = store.current_epoch(client_id).map_err(anyhow::Error::new)?;
-        let key = store
-            .unwrap_data_key(client_id, RECOVERY_KEY_ID, epoch, &old_identity, &anchor)
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot unwrap keys for client {client_id} via recovery: {e}"
-                )))
-            })?;
-        data_keys.push((client_id.clone(), key));
-    }
-
-    // B10: new device key, enrolled.
-    let (_new_bech32, new_recipient) = provision_device_key()?;
-    let mut new_recipients = RecipientMap::new();
-    new_recipients.insert(
-        "device-0".to_string(),
-        RecipientEntry {
-            age_pubkey: new_recipient.clone(),
-            label: "device-0".to_string(),
-            scope_ref: String::new(),
-        },
-    );
-
-    // B11: rotate the recovery identity, then re-pin the anchor BEFORE any
-    // other key operation (#99 ordering). The recovery Ed25519 key is a
-    // trust-anchor signing member, so it authorizes the re-signing.
-    let client_refs: Vec<&str> = clients.iter().map(|s| s.as_str()).collect();
-    let new_recovery = store
-        .rotate_recovery(
-            &client_refs,
-            old_recovery.signing_key(),
-            &anchor,
-            &old_identity,
-        )
-        .map_err(anyhow::Error::new)?;
-
-    // Show the new phrase BEFORE swapping the anchor: if anything below
-    // fails, the operator still holds the phrase for the rotated
-    // recovery. (B5 channel rules: stderr once, never in --json stdout.)
-    display_phrase_once(no_input, &new_recovery.phrase())?;
-
-    // Re-pin: atomically replace trust.toml with the new recovery halves
-    // (operator unchanged). Temp-file + rename: a crash never leaves a
-    // half-written or missing anchor.
-    let trust_path = config_dir.join(anchor::TRUST_FILE);
-    anchor::replace(
-        &config_dir,
-        root,
-        &operator_pubkey,
-        &new_recovery.verifying_key(),
-        &new_recovery.age_identity().to_recipient_string(),
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Re-sign the manifests with the new recovery key. `rotate_recovery`
-    // signed them with the OLD recovery key, but the re-pinned anchor
-    // only trusts the new one — without this, every subsequent
-    // verification fails. Verify against the OLD anchor (still valid
-    // for the old signatures).
-    for client_id in &clients {
-        store
-            .resign_manifest(client_id, &anchor, new_recovery.signing_key())
-            .map_err(anyhow::Error::new)?;
-    }
-
-    // Re-sign the operator certificate with the new recovery key. It was
-    // signed at init (or the previous recover) by the OLD recovery key;
-    // without this, the next fresh-device recover with the NEW phrase
-    // fails verify_operator_cert ("recovery phrase does not match this
-    // vault") — a silent lockout. The operator pubkey is unchanged.
-    anchor::write_operator_cert(
-        &keys_dir,
-        &vault.config.vault_id,
-        &operator_pubkey,
-        new_recovery.signing_key(),
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Authorize the new device on every client (same path #66 reuses):
-    // re-wrap each data key to the new device + new recovery.
-    // Note: this drops every OTHER device's wrappings — recover is the
-    // lost-device path, so only the new device is enrolled. Use
-    // `keys device-add` (#66) to enroll additional devices afterwards.
-    let (new_anchor, _) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    for (client_id, key) in &data_keys {
-        store
-            .rewrap_recipients(
-                client_id,
-                key,
-                &new_recipients,
-                &new_anchor,
-                new_recovery.signing_key(),
-            )
-            .map_err(anyhow::Error::new)?;
-    }
-
-    // B12: fresh lookup key (never restored, #142), re-wrapped to the new
-    // device; the alias index rebuilds from the decrypted alias values
-    // (design §10) — the local .confidant/ index is gitignored and
-    // rebuilt on demand.
-    store
-        .init_lookup_key(
-            std::slice::from_ref(&new_recipient),
-            new_recovery.signing_key(),
-        )
-        .map_err(anyhow::Error::new)?;
-
-    // Commit: check first, one commit.
-    let vault2 = load_vault(root)?;
-    let pre = check_vault(&vault2, &CheckOptions::default());
-    if !pre.ok {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing the recovered keys/ tree",
-        )));
-    }
-    stage_keys(root, no_input)?;
-    confidant_core::write::git(
-        root,
-        &[
-            "commit",
-            "-m",
-            "recover: re-wrap keys to new device, rotate recovery",
-        ],
-        no_input,
-    )?;
-    let commit = confidant_core::write::git(root, &["rev-parse", "HEAD"], no_input)?
-        .trim()
-        .to_owned();
-
-    // The new phrase was already displayed (once, on stderr) before the
-    // anchor swap above — it is not repeated here.
-    //
-    // #154 must-fix 4: warn — do not fail — when git history is degraded, so
-    // the operator knows the shredded-client / retired-recovery checks only
-    // saw the working tree.
-    let history_warning = store.history_degraded_reason();
-    let warnings: Vec<String> = history_warning.iter().cloned().collect();
-    if let Some(w) = &history_warning {
-        eprintln!("warning: {w}");
+    match scaffold {
+        Some(mut scaffold) => scaffold.disarm(),
+        // `--create` on an existing vault, or `init` on a hand-written one:
+        // make the on-disk shape match what a fresh scaffold produces.
+        // Idempotent, and it never overwrites an existing identity.
+        None => initialize_vault_shape(root, no_input)?,
     }
     if json {
         print_json(&ok_envelope(
             Some(root),
             serde_json::json!({
-                "anchor": trust_path.display().to_string(),
-                "keys_dir": keys_dir.display().to_string(),
-                "commit": commit,
-                "clients_recovered": clients,
-                "warnings": warnings,
-                "note": "only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery)",
+                "command": "init",
+                "branch": branch,
+                "remote": remote.map(display_remote_url),
+                "next_steps": init_next_steps(packs_empty, remote, branch_name),
             }),
         ))?;
     } else {
-        println!("recovered {} client(s); anchor re-pinned", clients.len());
-        println!("committed ({})", &commit[..8.min(commit.len())]);
-        println!("note: only this device is enrolled now; other devices' wrappings were dropped (lost-device recovery). Enroll more devices with `keys device-add`.");
-        println!(
-            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
-        );
+        println!("vault ready at {}", root.display());
+        if let Some(branch) = &branch {
+            println!("branch {branch}");
+        }
+        print_init_followup(packs_empty, remote, branch_name);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -13132,27 +7926,6 @@ fn display_remote_url(url: &str) -> String {
     url.to_owned()
 }
 
-/// Test-only operator key override (CONFIDANT_TEST_OPERATOR_KEY).
-/// Only compiled with the `test-overrides` feature — never in release
-/// builds. Returns None if the env var is unset or empty.
-#[cfg(feature = "test-overrides")]
-fn test_operator_key() -> Option<ed25519_dalek::SigningKey> {
-    let test_key = std::env::var("CONFIDANT_TEST_OPERATOR_KEY").ok()?;
-    let trimmed = test_key.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let seed = Zeroizing::new(hex::decode(trimmed).ok()?);
-    let seed_array: [u8; 32] = seed.as_slice().try_into().ok()?;
-    Some(ed25519_dalek::SigningKey::from_bytes(&seed_array))
-}
-
-/// `~/.config/confidant`: the operator config dir, where `trust.toml` and
-/// the manifest seq tracker live. `None` when `HOME` is unset.
-pub(crate) fn confidant_config_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("confidant"))
-}
-
 fn discover(flag: Option<&std::path::Path>) -> Result<(PathBuf, Option<UserConfig>), DomainError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let user_config = load_user_config(home.as_deref());
@@ -13200,3389 +7973,580 @@ fn print_check_human(report: &confidant_core::CheckReport) -> io::Result<()> {
     Ok(())
 }
 
-/// Load the operator Ed25519 signing key from the keychain.
-fn load_operator_sk(
-    _anchor: &confidant_crypt::anchor::Anchor,
-) -> anyhow::Result<ed25519_dalek::SigningKey> {
-    use confidant_crypt::keychain;
-    // Test override (test-overrides feature only): CONFIDANT_TEST_OPERATOR_KEY
-    // provides the hex seed directly.
-    #[cfg(feature = "test-overrides")]
-    if let Some(sk) = test_operator_key() {
-        return Ok(sk);
-    }
-    let seed_bytes = keychain::operator_key().map_err(|_| {
-        anyhow::Error::new(DomainError::invalid(
-            "no operator key enrolled; run `confidant init` first".to_string(),
-        ))
-    })?;
-    let seed_hex = Zeroizing::new(String::from_utf8_lossy(&seed_bytes).into_owned());
-    let seed =
-        Zeroizing::new(hex::decode(seed_hex.trim()).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!("bad operator key: {e}")))
-        })?);
-    let seed_array: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
-        anyhow::Error::new(DomainError::invalid("bad operator key length".to_string()))
-    })?;
-    let seed_array = Zeroizing::new(seed_array);
-    Ok(ed25519_dalek::SigningKey::from_bytes(&seed_array))
+// ---------------------------------------------------------------------------
+// merge-conflict resolution plumbing (plaintext)
+// ---------------------------------------------------------------------------
+
+/// Both sides of a conflicted record, reconstructed from the file's git
+/// conflict markers (#451).
+pub(crate) struct LoadedSides {
+    /// Vault-relative path of the conflicted file.
+    pub path: PathBuf,
+    /// The `<<<<<<<` side, byte-exact.
+    pub ours_bytes: Vec<u8>,
+    /// The `>>>>>>>` side, byte-exact.
+    pub theirs_bytes: Vec<u8>,
+    /// The conflicted file's bytes as read (for rollback).
+    pub raw: Vec<u8>,
+    /// Label from the first hunk's `<<<<<<<` line (e.g. `HEAD`).
+    pub ours_label: String,
+    /// Label from the first hunk's `>>>>>>>` line (e.g. `feature/x`).
+    pub theirs_label: String,
 }
 
-/// Validate a client id at the CLI boundary (B1). Malformed shape is a
-/// usage error (exit 2); reserved-id misuse is E_INVALID.
-fn validate_keys_client_id(client_id: &str) -> anyhow::Result<()> {
-    confidant_crypt::manifest::validate_client_id(client_id).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("reserved") {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "reserved client id {client_id:?}: {msg}"
-            )))
-        } else {
-            anyhow::Error::new(DomainError::usage(format!("bad client id: {msg}")))
-        }
+/// Load both sides of the conflicted record `id`.
+///
+/// The file path is derived from the id (never trusting a caller-supplied
+/// path). Both sides must parse as records naming `id` with equal `type`.
+fn load_sides(root: &Path, id: &RecordId) -> anyhow::Result<LoadedSides> {
+    reject_unsupported_prefix(id)?;
+    let rel = main_path_for(id).ok_or_else(|| {
+        anyhow::Error::new(DomainError::usage(format!(
+            "record resolve does not handle ids like {id}"
+        )))
+    })?;
+    let bytes = std::fs::read(root.join(&rel)).map_err(|_| {
+        anyhow::Error::new(DomainError::not_found(format!("no record with id {id}")))
+            .context("use `confidant find <name>` to look up the id")
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "{} is not valid UTF-8",
+            rel.display()
+        )))
+    })?;
+    if !confidant_core::record::has_conflict_markers(text) {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!("{} has no merge conflict", rel.display()))
+                .with_fix("Use `confidant record show --for-edit` to read it"),
+        ));
+    }
+    let sides = confidant_core::conflict::split_conflict_sides(text).map_err(|e| {
+        anyhow::Error::new(DomainError::invalid(format!(
+            "cannot split the conflict in {}: {e}",
+            rel.display()
+        )))
+    })?;
+    let ours = parse_side("ours", &sides.ours, &rel, id)?;
+    let theirs = parse_side("theirs", &sides.theirs, &rel, id)?;
+    if ours.kind != theirs.kind {
+        return Err(anyhow::Error::new(DomainError::invalid(format!(
+            "the two sides of {} have different record types",
+            rel.display()
+        ))));
+    }
+    Ok(LoadedSides {
+        path: rel,
+        ours_bytes: sides.ours.into_bytes(),
+        theirs_bytes: sides.theirs.into_bytes(),
+        raw: bytes,
+        ours_label: sides.ours_label,
+        theirs_label: sides.theirs_label,
     })
 }
 
-/// Load the device identity for `keys` commands (B7). Unkeyed runs fail
-/// closed with a message pointing at `init`/`recover`.
-pub(crate) fn keys_device_identity() -> anyhow::Result<Box<dyn age::Identity + Send>> {
-    let bech32 = device_key_bech32()?;
-    let identity: age::x25519::Identity = bech32
-        .trim()
-        .parse()
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}"))))?;
-    Ok(Box::new(identity))
-}
-
-/// This device's age recipient string (public key) from its identity.
-/// Public material only; used to derive the device key id for trial
-/// unwraps (#713).
-fn device_pubkey_string() -> anyhow::Result<String> {
-    let bech32 = device_key_bech32()?;
-    let identity: age::x25519::Identity = bech32
-        .trim()
-        .parse()
-        .map_err(|e| anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}"))))?;
-    Ok(identity.to_public().to_string())
-}
-
-/// Build the recipient map from the anchor + device keychain for `keys`
-/// commands. Currently the only recipient is this device; #66 adds more.
-/// Build the recipient map for `keys init-client`: the union of
-/// verified recipients from all initialized clients (every enrolled
-/// device), so a new client is usable from every device. Falls back to
-/// the local device when no client exists yet.
-fn keys_current_recipients(
-    store: &mut confidant_crypt::lifecycle::KeyStore,
-    anchor: &confidant_crypt::anchor::Anchor,
-) -> anyhow::Result<confidant_crypt::manifest::RecipientMap> {
-    use confidant_crypt::manifest::RecipientEntry;
-    let mut map = std::collections::BTreeMap::new();
-    for client in store.manifest_clients() {
-        let (_, recipients, _) = store
-            .verified_recipients(&client, anchor)
-            .map_err(anyhow::Error::new)?;
-        map.extend(recipients);
-    }
-    if map.is_empty() {
-        // No clients yet: the local device is device-0, matching init.
-        let device_bech32 = device_key_bech32()?;
-        let device_identity: age::x25519::Identity = device_bech32.trim().parse().map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!("bad device key: {e}")))
-        })?;
-        let device_recipient = device_identity.to_public().to_string();
-        map.insert(
-            "device-0".to_string(),
-            RecipientEntry {
-                age_pubkey: device_recipient,
-                label: "device-0".to_string(),
-                scope_ref: String::new(),
-            },
-        );
-    }
-    Ok(map)
-}
-
-/// Test-only keychain directory (with the `test-overrides` feature).
-/// When set, the shred device-key rotation reads/writes
-/// `$DIR/device.key` (0600) instead of the OS keychain, so the rotation
-/// is testable where no Secret Service exists. Never honored in release
-/// builds.
-#[cfg(feature = "test-overrides")]
-fn test_keychain_dir() -> Option<std::path::PathBuf> {
-    std::env::var("CONFIDANT_TEST_KEYCHAIN_DIR")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-/// True when `CONFIDANT_DEVICE_KEY` is set to a non-empty value. Headless
-/// `--initiate` uses this as the new device's identity (#684) and does not
-/// treat it as "already enrolled" in a keychain.
-fn device_key_env_set() -> bool {
-    std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-}
-
-/// Whether `--initiate` can persist a newly generated device key. The env
-/// identity path does not need this: it never writes the keychain.
-/// `CONFIDANT_KEYCHAIN=off` (tests) and an unreachable OS keychain both
-/// mean "no": generate-and-store would fail, so fail closed with the
-/// headless hint instead.
-fn device_key_store_available() -> anyhow::Result<bool> {
-    #[cfg(feature = "test-overrides")]
-    if test_keychain_dir().is_some() {
-        return Ok(true);
-    }
-    use confidant_crypt::keychain::{self, DeviceKeyState, KeychainSwitch};
-    match keychain::keychain_switch() {
-        Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot check device key: {e}"
-        )))),
-        Ok(KeychainSwitch::Off) => Ok(false),
-        Ok(KeychainSwitch::On) => match keychain::device_key_state() {
-            Ok(DeviceKeyState::KeychainUnreachable(_)) => Ok(false),
-            Ok(_) => Ok(true),
-            Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot check device key: {e}"
-            )))),
-        },
-    }
-}
-
-/// Whether a device key is enrolled on this device: the test keychain dir
-/// (test builds only, the stand-in for the OS keychain), the OS keychain,
-/// or — handled separately by the caller — `CONFIDANT_DEVICE_KEY`.
-/// `--initiate` uses this so the test keychain dir counts as enrolled,
-/// exactly like the OS keychain.
-fn device_key_enrolled() -> anyhow::Result<bool> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        return Ok(dir.join("device.key").is_file());
-    }
-    match confidant_crypt::keychain::device_key() {
-        Ok(_) => Ok(true),
-        Err(confidant_crypt::error::Error::NoKey(_)) => Ok(false),
-        Err(e) => Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot check device key: {e}"
-        )))),
-    }
-}
-
-/// Keychain backend for this process's key operations: the production OS
-/// keychain, or — in test builds with `CONFIDANT_TEST_KEYCHAIN_DIR` — a
-/// small file-backed backend so the inbox rotation can be exercised end to
-/// end (CI has no Secret Service). Never selected in release builds.
-fn keychain_backend() -> Box<dyn confidant_crypt::keychain::KeychainBackend> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        return Box::new(FileKeychain::new(dir));
-    }
-    Box::new(confidant_crypt::keychain::OsKeychain)
-}
-
-/// File-backed [`KeychainBackend`] for tests (`test-overrides` only): one
-/// file per `service.account`, mode 0600. The device key has its own fixed
-/// `device.key` path ([`device_key_bech32`]); this covers the inbox slots
-/// the rotation reads and writes.
-///
-/// [`KeychainBackend`]: confidant_crypt::keychain::KeychainBackend
-#[cfg(feature = "test-overrides")]
-struct FileKeychain {
-    dir: std::path::PathBuf,
-}
-
-#[cfg(feature = "test-overrides")]
-impl FileKeychain {
-    fn new(dir: std::path::PathBuf) -> Self {
-        FileKeychain { dir }
-    }
-
-    fn path(&self, service: &str, account: &str) -> std::path::PathBuf {
-        self.dir.join(format!("{service}.{account}"))
-    }
-}
-
-#[cfg(feature = "test-overrides")]
-impl confidant_crypt::keychain::KeychainBackend for FileKeychain {
-    fn get_password(
-        &self,
-        service: &str,
-        account: &str,
-    ) -> Result<Option<Zeroizing<String>>, confidant_crypt::error::Error> {
-        match std::fs::read_to_string(self.path(service, account)) {
-            Ok(s) => Ok(Some(Zeroizing::new(s))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(confidant_crypt::error::Error::Keychain(format!(
-                "cannot read test keychain entry {service}/{account}: {e}"
-            ))),
-        }
-    }
-
-    fn set_password(
-        &self,
-        service: &str,
-        account: &str,
-        password: &str,
-    ) -> Result<(), confidant_crypt::error::Error> {
-        let path = self.path(service, account);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                confidant_crypt::error::Error::Keychain(format!(
-                    "cannot create test keychain dir: {e}"
-                ))
-            })?;
-        }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        use std::io::Write;
-        opts.open(&path)
-            .and_then(|mut f| f.write_all(password.as_bytes()))
-            .map_err(|e| {
-                confidant_crypt::error::Error::Keychain(format!(
-                    "cannot write test keychain entry {service}/{account}: {e}"
-                ))
-            })
-    }
-
-    fn delete_credential(
-        &self,
-        service: &str,
-        account: &str,
-    ) -> Result<(), confidant_crypt::error::Error> {
-        match std::fs::remove_file(self.path(service, account)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(confidant_crypt::error::Error::Keychain(format!(
-                "cannot delete test keychain entry {service}/{account}: {e}"
-            ))),
-        }
-    }
-}
-
-/// This device's secret key (Bech32): `$DIR/device.key` when
-/// `CONFIDANT_TEST_KEYCHAIN_DIR` is set (test builds only), else the OS
-/// keychain. Single helper — every `keys` command goes through this so
-/// the test dir is never bypassed.
-pub(crate) fn device_key_bech32() -> anyhow::Result<Zeroizing<String>> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        let path = dir.join("device.key");
-        let bech32 = std::fs::read_to_string(&path).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot read test device key at {}: {e}",
-                path.display()
-            )))
-        })?;
-        return Ok(Zeroizing::new(bech32.trim().to_string()));
-    }
-    let bytes = confidant_crypt::keychain::device_key().map_err(|_| {
-        anyhow::Error::new(DomainError::invalid(
-            "no device key enrolled; run `confidant init` (new vault), clone this vault and `confidant keys device-add`, or `confidant recover` only if every enrolled device is lost".to_string(),
-        ))
-    })?;
-    Ok(Zeroizing::new(
-        String::from_utf8_lossy(&bytes).trim().to_owned(),
-    ))
-}
-
-/// Store the rotated device key: test keychain dir first (test builds
-/// only), then the OS keychain.
-fn store_rotated_device_key(bech32: &Zeroizing<String>) -> anyhow::Result<()> {
-    #[cfg(feature = "test-overrides")]
-    if let Some(dir) = test_keychain_dir() {
-        let path = dir.join("device.key");
-        // 0600; this is the test-only keychain stand-in, so overwrite the
-        // test device key outright (create + truncate).
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        use std::io::Write;
-        let mut f = opts.open(&path).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write test device key at {}: {e}",
-                path.display()
-            )))
-        })?;
-        f.write_all(bech32.as_bytes()).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write test device key: {e}"
-            )))
-        })?;
-        return Ok(());
-    }
-    confidant_crypt::keychain::store_device_key(bech32).map_err(anyhow::Error::new)
-}
-
-/// Build the recipient set for re-wrapping after shred: a FRESH keypair
-/// for this device only, generated in memory. Shred re-wraps to fresh
-/// keypairs (the strict pubkey-reuse check in `KeyStore::shred` forbids
-/// any historical pubkey): other devices are NOT carried over — they
-/// must re-enroll via `keys device-add` (surfaced in the output).
-///
-/// Returns the fresh private key (Bech32) alongside the recipient map.
-/// The caller stores it only AFTER `KeyStore::shred` returns Ok: a
-/// refused shred (verify-first) must leave this device's key unchanged.
-/// Fails closed when `CONFIDANT_DEVICE_KEY` is set — an env-var key
-/// cannot be rotated from here (the new private key would have nowhere
-/// to go), so the operator must use the OS keychain for shred.
-fn keys_shred_fresh_recipients(
-) -> anyhow::Result<(Zeroizing<String>, confidant_crypt::manifest::RecipientMap)> {
-    use age::secrecy::ExposeSecret;
-    use confidant_crypt::manifest::{RecipientEntry, RecipientMap};
-    if let Ok(v) = std::env::var(confidant_crypt::keychain::DEVICE_KEY_ENV) {
-        if !v.trim().is_empty() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "shred rotates this device's key, but CONFIDANT_DEVICE_KEY is set so the new key cannot be stored; unset it and enroll via the OS keychain first".to_string(),
-            ).with_fix("Unset CONFIDANT_DEVICE_KEY and run `confidant init` or `recover` to enroll this device in the OS keychain, then retry shred")));
-        }
-    }
-    let id = age::x25519::Identity::generate();
-    let bech32 = Zeroizing::new(id.to_string().expose_secret().to_owned());
-    let recipient = id.to_public().to_string();
-    let mut map = RecipientMap::new();
-    // One key-id scheme everywhere: the local device is always device-0,
-    // matching init.
-    map.insert(
-        "device-0".to_string(),
-        RecipientEntry {
-            age_pubkey: recipient,
-            label: "device-0".to_string(),
-            scope_ref: String::new(),
-        },
-    );
-    Ok((bech32, map))
-}
-
-fn cmd_keys_init_client(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::anchor;
-    validate_keys_client_id(client_id)?;
-    // B1: init-client accepts vault:shared (routes to keys/shared/).
-    // shred refuses both reserved ids (handled in cmd_keys_shred).
-
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let _identity = keys_device_identity()?;
-    let operator_sk = load_operator_sk(&anchor)?;
-
-    let vault = load_vault(root)?;
-    // #220: init-client runs against a staged copy of keys/; the
-    // pre-commit check runs inside staged_keys_mutation before the swap,
-    // so a failure leaves keys/ (and the seq tracker) exactly as they were.
-    staged_keys_mutation(root, &vault, &config_dir, |store| {
-        let recipients = keys_current_recipients(store, &anchor)?;
-        store
-            .init_client(client_id, &recipients, &anchor, &operator_sk)
-            .map_err(anyhow::Error::new)
-    })?;
-
-    // B2: one commit (check already ran before the swap).
-    let no_input = cli.no_input;
-    stage_keys(root, no_input)?;
-    confidant_core::write::git(
-        root,
-        &["commit", "-m", &format!("keys: init-client {client_id}")],
-        no_input,
-    )?;
-
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "client_id": client_id,
-            "epoch": 1,
-        }))?;
-    } else {
-        println!("initialized client {client_id} (epoch 1)");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn cmd_keys_rotate(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::anchor;
-    validate_keys_client_id(client_id)?;
-
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let _identity = keys_device_identity()?;
-    let operator_sk = load_operator_sk(&anchor)?;
-
-    let vault = load_vault(root)?;
-    // #220: rotate runs against a staged copy of keys/; the pre-commit
-    // check runs inside staged_keys_mutation before the swap, so a
-    // failure leaves keys/ (and the seq tracker) exactly as they were.
-    let new_epoch = staged_keys_mutation(root, &vault, &config_dir, |store| {
-        store
-            .rotate(client_id, &anchor, &operator_sk)
-            .map_err(anyhow::Error::new)?;
-        store.current_epoch(client_id).map_err(anyhow::Error::new)
-    })?;
-
-    // B2: one commit (check already ran before the swap).
-    let no_input = cli.no_input;
-    stage_keys(root, no_input)?;
-    confidant_core::write::git(
-        root,
-        &[
-            "commit",
-            "-m",
-            &format!("keys: rotate {client_id} to epoch {new_epoch}"),
-        ],
-        no_input,
-    )?;
-
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "client_id": client_id,
-            "epoch": new_epoch,
-        }))?;
-    } else {
-        println!("rotated client {client_id} to epoch {new_epoch}");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn cmd_keys_revoke(
-    cli: &Cli,
-    root: &Path,
-    client_id: &str,
-    key_ids: &[String],
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::anchor;
-    validate_keys_client_id(client_id)?;
-
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let _identity = keys_device_identity()?;
-    let operator_sk = load_operator_sk(&anchor)?;
-
-    let key_id_refs: Vec<&str> = key_ids.iter().map(|s| s.as_str()).collect();
-    let vault = load_vault(root)?;
-    // #175: revoke runs against a staged copy of keys/; the pre-commit
-    // check runs inside staged_keys_mutation before the swap, so a
-    // failure leaves keys/ (and the seq tracker) exactly as they were.
-    staged_keys_mutation(root, &vault, &config_dir, |store| {
-        store
-            .revoke(client_id, &key_id_refs, &operator_sk, &anchor)
-            .map_err(anyhow::Error::new)
-    })?;
-
-    // B2: one commit (check already ran before the swap).
-    let no_input = cli.no_input;
-    stage_keys(root, no_input)?;
-    confidant_core::write::git(
-        root,
-        &[
-            "commit",
-            "-m",
-            &format!("keys: revoke {} from {client_id}", key_ids.join(",")),
-        ],
-        no_input,
-    )?;
-
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "client_id": client_id,
-            "revoked": key_ids,
-        }))?;
-    } else {
-        println!("revoked {} from {client_id}", key_ids.join(", "));
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Version of the `keys device-add` request document.
-const DEVICE_ADD_REQUEST_VERSION: u32 = 1;
-
-/// A `keys device-add` request: public key + label only. The private key
-/// never leaves the new device, so this document is safe to transfer by
-/// file, paste, or QR (design §6).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DeviceAddRequest {
-    version: u32,
-    pubkey: String,
-    label: String,
-}
-
-/// `keys device-add --initiate`: run on the new device. Generates the
-/// keypair locally, enrolls the device key per the keychain rules, and
-/// emits the request (pubkey + label only). Touches nothing else — no
-/// vault. The fingerprint goes to stderr so the operator can verify it
-/// out of band; the request goes to stdout (or --output).
-/// Validate a device-add request label: restrict charset and length, reject
-/// control characters (it flows into the commit message, manifest, and
-/// stderr — a hand-edited request file must not inject terminal escapes).
-/// Used by both `--initiate` and `--from-request`.
-fn validate_device_label(raw: &str) -> anyhow::Result<String> {
-    // Reject control characters outright (including newlines/ESC) rather
-    // than stripping them (#153 nit 6): stripping silently turns a hostile
-    // label into a different one, so the operator never learns the request
-    // was tampered with.
-    if raw.chars().any(|c| c.is_control()) {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "label must not contain control characters",
-        )));
-    }
-    let cleaned = raw.trim();
-    if cleaned.is_empty() {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "label must not be empty",
-        )));
-    }
-    if cleaned.len() > 64 {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "label must be at most 64 characters",
-        )));
-    }
-    // ASCII only (#153 nit 6): labels travel into commit messages and the
-    // manifest, so keep them to a predictable, terminal-safe set.
-    if !cleaned
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || " -_.()".contains(c))
-    {
-        return Err(anyhow::Error::new(DomainError::usage(
-            "label may contain only ASCII letters, numbers, spaces, and -_.()",
-        )));
-    }
-    Ok(cleaned.to_string())
-}
-
-fn cmd_keys_device_add_initiate(
-    cli: &Cli,
-    label: Option<&str>,
-    output: Option<&Path>,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::keychain::DEVICE_KEY_ENV;
-
-    // Item 6: validate the label BEFORE any key-source probe or
-    // provisioning. A bad label must not store a key and then error —
-    // the retry would need --force to clean up the mess. (Shared
-    // validator with --from-request: a hand-edited request can inject
-    // controls into the commit message/manifest/stderr.)
-    let label = validate_device_label(label.unwrap_or("device"))?;
-
-    // #719 review SF1: preflight --output BEFORE any key-source probe or
-    // provisioning. A bad output path must not store a key and then
-    // error — the retry would need --force, and with --force the
-    // fingerprint the operator already saw changes. The write itself
-    // re-checks with `create_new`, so a race between preflight and
-    // write still fails closed instead of overwriting.
-    if let Some(path) = output {
-        preflight_device_add_output(path)?;
-    }
-
-    // #684: `CONFIDANT_DEVICE_KEY` is this new device's identity, the same
-    // way `init` uses it (#650). Do not generate a different key, do not
-    // write a keychain, and do not require --force: the env value is not
-    // "already enrolled in a keychain". `--from-request` still refuses a
-    // previously-seen pubkey, so re-using an already-enrolled identity
-    // fails on the approve side.
-    let using_env = device_key_env_set();
-    if !using_env {
-        // Probe persistence before enrollment: an unreachable keychain
-        // makes `device_key()` error, and generate-and-store would fail
-        // the same way. Fail closed with the headless hint instead.
-        if !device_key_store_available()? {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "cannot generate a device key: the OS keychain is unavailable and \
-                     {DEVICE_KEY_ENV} is not set"
-                ))
-                .with_fix(format!(
-                    "Generate this device's identity with `age-keygen`, export only the \
-                     AGE-SECRET-KEY-1… line as {DEVICE_KEY_ENV}, then retry \
-                     `confidant keys device-add --initiate`. Keys never live in files."
-                )),
-            ));
-        }
-        // Refuse to overwrite an already-enrolled keychain entry (same
-        // check as recover's B13). --force overrides the refusal, but not
-        // the confirmation below.
-        let already_enrolled = device_key_enrolled()?;
-        if already_enrolled && !force {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "a device key is already enrolled; refusing to overwrite (use --force to replace it)",
-            )));
-        }
-        if already_enrolled && force && !cli.no_input {
-            eprintln!("WARNING: a device key is already enrolled on this device.");
-            eprintln!("--force will replace it: the old key will no longer work from here.");
-            eprintln!(
-                "After a `keys shred` dropped this device, re-enrolling with a fresh key is \
-                 how it rejoins; the shredded client's history stays unopenable by the old key."
-            );
-            eprint!("Replace the enrolled device key? [y/N] ");
-            use std::io::Write;
-            std::io::stderr().flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                return Err(anyhow::Error::new(DomainError::invalid(
-                    "device key replacement not confirmed; refusing",
-                )));
-            }
-        }
-    }
-
-    let (_bech32, recipient) = provision_device_key()?;
-    let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&recipient);
-    let key_id = device_key_id(&recipient);
-    let key_source = if using_env { "env" } else { "keychain" };
-
-    let request = DeviceAddRequest {
-        version: DEVICE_ADD_REQUEST_VERSION,
-        pubkey: recipient.clone(),
-        label: label.clone(),
-    };
-    let toml_body = toml::to_string(&request).map_err(|e| {
-        anyhow::Error::new(DomainError::internal(format!(
-            "cannot serialize device-add request: {e}"
-        )))
-    })?;
-    let document =
-        format!("# confidant device-add request — public key only, safe to transfer\n{toml_body}");
-
-    // Fingerprint on stderr (human channel), always — it is what the
-    // operator compares against on the enrolled device.
-    eprintln!("new device key fingerprint: {fingerprint}");
-    eprintln!(
-        "show this fingerprint on the enrolled device and confirm it matches before approving"
-    );
-    if using_env {
-        eprintln!("using {DEVICE_KEY_ENV} as this device's identity (not stored in a keychain)");
-    }
-
-    // #719: --output must materialize the request file in every output
-    // mode. Previously the --json branch swallowed --output entirely:
-    // the file write lived in the `else if` arm, so `--json --output`
-    // printed the envelope and never wrote the file. Write (and verify)
-    // first, so a write failure exits non-zero before any success output.
-    if let Some(path) = output {
-        write_device_add_request(path, &document)?;
-        eprintln!("wrote device-add request to {}", path.display());
-    }
-
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": null,
-            "fingerprint": fingerprint,
-            "label": label,
-            "key_id": key_id,
-            "key_source": key_source,
-            "pubkey": recipient,
-            "request": document,
-            // display() is lossy for non-UTF-8 paths, as for every other
-            // path in this CLI's JSON output: a JSON string cannot carry
-            // non-UTF-8 exactly. The file itself is written via the Path,
-            // so only this reporting string is lossy, never the artifact.
-            "output": output.map(|p| p.display().to_string()),
-        }))?;
-    } else if output.is_none() {
-        print!("{document}");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Preflight a `keys device-add --initiate --output` destination before
-/// any key is provisioned. Refuses an existing path (a symlink counts as
-/// existing, dangling or not — never write through one), a missing or
-/// non-directory parent, and a read-only parent. A destination that
-/// passes here can still fail at write time (race, disk full); that
-/// residual failure carries a fix hint on the write error itself.
-fn preflight_device_add_output(path: &Path) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "refusing to overwrite existing device-add request path {}",
-                path.display()
-            )))
-            .with_fix("remove the existing file or choose a different --output path"));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot inspect device-add request path {}: {e}",
-                path.display()
-            ))));
-        }
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        match std::fs::metadata(parent) {
-            Ok(md) => {
-                if !md.is_dir() {
-                    return Err(anyhow::Error::new(DomainError::invalid(format!(
-                        "device-add request parent {} is not a directory",
-                        parent.display()
-                    ))));
-                }
-                if md.permissions().readonly() {
-                    return Err(anyhow::Error::new(DomainError::invalid(format!(
-                        "device-add request parent {} is not writable",
-                        parent.display()
-                    )))
-                    .with_fix("choose a writable --output directory"));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "device-add request parent directory {} does not exist",
-                    parent.display()
-                )))
-                .with_fix("create the directory first or choose a different --output path"));
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot inspect device-add request parent {}: {e}",
-                    parent.display()
-                ))));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write a device-add request document to `path` and verify the bytes
-/// landed by fsyncing and reading them back. A write or verification
-/// failure is an error, so the caller never reports success for a
-/// request file that does not exist. `create_new` refuses an existing
-/// file and never follows a symlink, so a typo'd --output cannot
-/// destroy an unrelated file; because only fresh files are ever
-/// written, the 0644 mode below always applies to the result. The
-/// request carries only the public key + label, safe to transfer.
-/// Deliberate, not a default.
-fn write_device_add_request(path: &Path, document: &str) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    // Residual failure after provisioning (preflight passed but the
-    // write still failed): the key is already stored, so say so — a
-    // retry replaces it and changes the fingerprint.
-    let write_fix = "a device key was already provisioned and a partial file may exist \
-        at this path: remove the file if present, then retry with --force to replace \
-        the key (the fingerprint will change)";
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(path)
-        .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write device-add request to {}: {e}",
-                path.display()
-            )))
-            .with_fix(write_fix)
-        })?;
-    f.write_all(document.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write device-add request to {}: {e}",
-                path.display()
-            )))
-            .with_fix(write_fix)
-        })?;
-    let written = std::fs::read_to_string(path).map_err(|e| {
-        anyhow::Error::new(DomainError::internal(format!(
-            "cannot verify device-add request at {}: {e}",
-            path.display()
-        )))
-    })?;
-    if written != document {
-        return Err(anyhow::Error::new(DomainError::internal(format!(
-            "device-add request at {} failed verification: written bytes differ",
-            path.display()
-        ))));
-    }
-    Ok(())
-}
-
-/// `keys device-add --from-request <file>`: run on an already-enrolled
-/// device. Verifies the fingerprint out of band, re-wraps every client's
-/// every retained epoch plus the vault lookup key to the new device, and
-/// commits (one commit, check first, signed by the operator key).
-fn cmd_keys_device_add_from_request(
-    cli: &Cli,
-    root: &Path,
-    from_request: Option<&Path>,
-    fingerprint_verified: bool,
-    anchor_out: Option<&Path>,
-    re_emit_anchor: bool,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, manifest::RecipientEntry};
-
-    // B6: exactly one mode; --from-request is required here.
-    let request_path = from_request.ok_or_else(|| {
-        anyhow::Error::new(DomainError::usage(
-            "keys device-add needs exactly one of --initiate or --from-request <file>",
-        ))
-    })?;
-
-    // Parse the request. Anything malformed is E_INVALID-class: fail
-    // closed, nothing mutated (B6).
-    let raw = std::fs::read_to_string(request_path).map_err(|e| {
+/// Parse one reconstructed side as a record naming `id`.
+fn parse_side(side: &str, text: &str, rel: &Path, id: &RecordId) -> anyhow::Result<Record> {
+    let rec = confidant_core::parse_record(text, &rel.display().to_string()).map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
-            "cannot read device-add request {}: {e}",
-            request_path.display()
+            "the {side} side of {} is not a readable record: {}",
+            rel.display(),
+            e.message
         )))
     })?;
-    let request: DeviceAddRequest = toml::from_str(&raw).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "malformed device-add request {}: {e}",
-            request_path.display()
-        )))
-    })?;
-    if request.version != DEVICE_ADD_REQUEST_VERSION {
+    if rec.id != *id {
         return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "unsupported device-add request version {} (want {})",
-            request.version, DEVICE_ADD_REQUEST_VERSION
+            "the {side} side of {} holds a different record ({})",
+            rel.display(),
+            rec.id
         ))));
     }
-    request
-        .pubkey
-        .parse::<age::x25519::Recipient>()
-        .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "device-add request has a bad pubkey: {e}"
-            )))
-        })?;
-    let key_id = device_key_id(&request.pubkey);
-    let fingerprint = confidant_crypt::keychain::pubkey_fingerprint(&request.pubkey);
-    // Validate the label too: the request file is hand-editable, and the
-    // label flows into the commit message, manifest, and stderr.
-    // Malformed labels are E_INVALID-class (B6): fail closed.
-    let label = validate_device_label(&request.label).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "device-add request has a bad label: {e}"
+    Ok(rec)
+}
+
+/// Outcome of `record resolve --take`.
+#[derive(Debug)]
+pub(crate) struct TakeOutcome {
+    /// The next git step for the operator, e.g. `git merge --continue`.
+    pub next: String,
+}
+
+/// Install one side byte for byte, verify the vault still checks clean for
+/// this path, stage the file, and return the next git step.
+pub(crate) fn take_side(
+    root: &Path,
+    no_input: bool,
+    sides: &LoadedSides,
+    side: Side,
+) -> anyhow::Result<TakeOutcome> {
+    let chosen: &[u8] = match side {
+        Side::Ours => &sides.ours_bytes,
+        Side::Theirs => &sides.theirs_bytes,
+    };
+    let rel = &sides.path;
+    confidant_core::paths::write_replace(root, rel, chosen).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "could not install the {} side of {}: {e}",
+            side.name(),
+            rel.display()
         )))
     })?;
 
-    // Fingerprint verification is mandatory (design §7): the operator
-    // must confirm the fingerprint matches what the new device showed.
-    // No silent trust of a transferred file.
-    if cli.no_input {
-        if !fingerprint_verified {
-            return Err(anyhow::Error::new(DomainError::usage(
-                "--from-request with --no-input requires --fingerprint-verified: \
-                 verify the request fingerprint out of band first",
-            )));
-        }
-    } else {
-        eprintln!("new device request:");
-        eprintln!("  label:       {label}");
-        eprintln!("  pubkey:      {}", request.pubkey);
-        eprintln!("  fingerprint: {fingerprint}");
-        eprint!("Does this fingerprint match the one shown on the new device? [y/N] ");
-        use std::io::Write;
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !answer.trim().eq_ignore_ascii_case("y") {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "fingerprint not confirmed; refusing to add the device",
-            )));
-        }
+    if let Err(failure) = check_path_clean(root, rel) {
+        let _ = confidant_core::paths::write_replace(root, rel, &sides.raw);
+        return Err(failure);
     }
 
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-
-    // #713 follow-up (B2): a device enrolled before --anchor-out
-    // existed cannot be re-enrolled — add_recipient refuses an
-    // already-enrolled key — so probe enrollment BEFORE writing
-    // anything. A plain re-run fails fast here (no orphaned anchor
-    // file, no misleading failure after a write); --re-emit-anchor
-    // emits just the anchor with no enrollment and no commit. The probe
-    // is side-effect-free (round-2 N5): it runs against a throwaway copy
-    // of the seq tracker, so even a failing re-run leaves the operator's
-    // real tracker untouched.
-    let vault = load_vault(root)?;
-    let coverage = match probe_keystore(root, &vault.config.vault_id, &config_dir) {
-        Some((mut probe_store, probe_tracker)) => {
-            let coverage =
-                device_enrollment_coverage(&mut probe_store, &anchor, &key_id, &request.pubkey);
-            drop(probe_store);
-            remove_path_best_effort(&probe_tracker);
-            coverage
-        }
-        None => None,
-    };
-    // Round-2 N1: partial enrollment fails closed in BOTH modes. The
-    // old fail-fast text ("needs only its trust anchor") asserted an
-    // anchor-only diagnosis on a single recipient-map hit; a device
-    // missing some clients' wrappings must never be routed down the
-    // anchor-only path, since --complete would then report success
-    // while those clients stay undecryptable.
-    if let Some(cov) = &coverage {
-        if !cov.enrolled.is_empty() && !cov.missing.is_empty() {
-            return Err(partial_enrollment_error(&key_id, &label, cov));
-        }
-    }
-    if let Some(cov) = &coverage {
-        if cov.missing.is_empty() && !re_emit_anchor {
-            return Err(anyhow::Error::new(
-                DomainError::invalid(format!(
-                    "device {key_id} ({label}) is already enrolled; refusing to enroll it again"
-                ))
-                .with_fix(
-                    "This device needs only its trust anchor: re-run with \
-                     `confidant keys device-add --from-request <file> --anchor-out <anchor-file> \
-                     --re-emit-anchor` (no new enrollment, no commit), then run \
-                     `confidant keys device-add --complete --anchor-file <anchor-file>` on the new device after pulling",
-                ),
-            ));
-        }
-    }
-    if re_emit_anchor {
-        match &coverage {
-            Some(cov) if cov.enrolled.is_empty() => {
-                return Err(anyhow::Error::new(
-                    DomainError::invalid(format!(
-                        "device {key_id} ({label}) is not already enrolled; --re-emit-anchor only re-emits an anchor for an enrolled device"
-                    ))
-                    .with_fix(
-                        "Run `confidant keys device-add --from-request <file>` (without \
-                         --re-emit-anchor) to enroll this device, then --complete on the new device",
-                    ),
-                ));
-            }
-            None => {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot verify whether device {key_id} ({label}) is already enrolled; refusing to re-emit its anchor"
-                )))
-                .with_fix(
-                    "Check the vault's key manifests (run `confidant doctor`), then retry; \
-                     a plain --from-request also verifies enrollment before mutating",
-                ));
-            }
-            // Full coverage: missing is empty (partial returned above).
-            Some(_) => {}
-        }
-        let path = anchor_out.ok_or_else(|| {
-            anyhow::Error::new(DomainError::usage(
-                "--re-emit-anchor requires --anchor-out <file>",
-            ))
-        })?;
-        write_anchor_out_file(&config_dir, root, path)?;
-        if cli.json {
-            print_json(&serde_json::json!({
-                "ok": true,
-                "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                "vault": root.to_string_lossy(),
-                "fingerprint": fingerprint,
-                "label": label,
-                "key_id": key_id,
-                "already_enrolled": true,
-                "anchor_out": path.display().to_string(),
-            }))?;
-        } else {
-            println!("device {key_id} ({label}) is already enrolled; no new enrollment was made");
-            println!(
-                "re-emitted trust anchor to {}; copy it to the new device and run \
-                 `confidant keys device-add --complete --anchor-file {}` there after pulling",
-                path.display(),
-                path.display()
-            );
-        }
-        return Ok(ExitCode::SUCCESS);
+    if let Err(e) =
+        confidant_core::write::git(root, &["add", "--", &rel.to_string_lossy()], no_input)
+    {
+        let _ = confidant_core::paths::write_replace(root, rel, &sides.raw);
+        return Err(anyhow::Error::new(DomainError::internal(format!(
+            "could not stage {}: {e}",
+            rel.display()
+        ))));
     }
 
-    // #713: emit the trust anchor for the new device BEFORE mutating
-    // anything. The anchor holds public-key material only and is
-    // unchanged by device-add, so a later failure here leaves a file the
-    // new device's --complete step verifies against the pulled vault
-    // (and refuses when enrollment did not land). Written 0600 on Unix,
-    // create-new: never silently overwrite an existing file.
-    let mut anchor_written = false;
-    if let Some(path) = anchor_out {
-        write_anchor_out_file(&config_dir, root, path)?;
-        anchor_written = true;
-    }
-    // #175: device-add runs against a staged copy of keys/; the
-    // pre-commit check runs inside staged_keys_mutation before the swap,
-    // so a failure leaves keys/ (and the seq tracker) exactly as they
-    // were. No more "restore with git checkout -- keys/" recovery hints.
-    // Enrollment + commit, wrapped so a failure after the anchor write
-    // says so plainly (B2): the leftover file is safe by design — the
-    // anchor is public-key material only, and --complete verifies it
-    // against the pulled vault and refuses when enrollment did not
-    // land — but the operator must not conclude nothing was emitted.
-    // The device-identity and operator-key loads live inside the wrapper
-    // too (round-2 N2): a failure there also follows a successful anchor
-    // write and must carry the same NOTE.
-    let enroll = || -> anyhow::Result<Vec<String>> {
-        let identity = keys_device_identity()?;
-        let operator_sk = load_operator_sk(&anchor)?;
-        let clients = staged_keys_mutation(root, &vault, &config_dir, |store| {
-            // #154 must-fix 4: the retired-recovery / shredded-client
-            // denylist is load-bearing here, so fail closed rather than warn
-            // when history is unreadable (shallow clone, missing git, git log
-            // failure).
-            if let Some(reason) = store.history_degraded_reason() {
-                return Err(anyhow::Error::new(DomainError::invalid(format!(
-                    "refusing device-add: {reason}; the retired-recipient denylist would be \
-                     incomplete and could re-open a shredded client"
-                ))));
-            }
-            let entry = RecipientEntry {
-                age_pubkey: request.pubkey.clone(),
-                label: label.clone(),
-                scope_ref: String::new(),
-            };
-            // B2: every initialized client's every retained epoch + the
-            // lookup key, all through KeyStore; verify-first inside
-            // add_recipient.
-            store
-                .add_recipient(&key_id, &entry, identity.as_ref(), &anchor, &operator_sk)
-                .map_err(|e| {
-                    anyhow::Error::new(DomainError::invalid(format!(
-                        "device-add failed; keys/ was not modified (nothing was committed): {e}"
-                    )))
-                })
-        })?;
-
-        // One commit, signed by the operator key (design §6). Check already
-        // ran inside staged_keys_mutation, before the swap.
-        let no_input = cli.no_input;
-        stage_keys(root, no_input)?;
-        confidant_core::write::git(
-            root,
-            &[
-                "commit",
-                "-m",
-                &format!("keys: device-add {key_id} ({label})"),
-            ],
-            no_input,
-        )?;
-        Ok(clients)
-    };
-    let clients = match enroll() {
-        Ok(clients) => clients,
-        Err(e) => {
-            if anchor_written {
-                if let Some(path) = anchor_out {
-                    eprintln!(
-                        "NOTE: the trust anchor was already written to {}; it holds public-key \
-                         material only and stays valid for `confidant keys device-add --complete \
-                         --anchor-file {}` once enrollment succeeds — nothing was committed",
-                        path.display(),
-                        path.display()
-                    );
-                }
-            }
-            return Err(e);
-        }
-    };
-
-    if cli.json {
-        let mut value = serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "fingerprint": fingerprint,
-            "label": label,
-            "key_id": key_id,
-            "clients": clients,
-            "client_count": clients.len(),
-        });
-        // B1: always present, so callers can branch on it: a null means
-        // the new device holds wrapped keys but no anchor yet.
-        value["anchor_out"] = match anchor_out {
-            Some(path) => serde_json::Value::String(path.display().to_string()),
-            None => serde_json::Value::Null,
-        };
-        print_json(&value)?;
-    } else {
-        println!(
-            "added device {key_id} ({label}) to {} client(s)",
-            clients.len()
-        );
-        if let Some(path) = anchor_out {
-            println!(
-                "wrote trust anchor to {}; copy it to the new device and run \
-                 `confidant keys device-add --complete --anchor-file {}` there after pulling",
-                path.display(),
-                path.display()
-            );
-        }
-    }
-    if anchor_out.is_none() {
-        // B1: the default ceremony is incomplete without an anchor —
-        // the new device cannot decrypt until --complete installs one.
-        // Say so loudly on stderr in both modes, not only in the docs
-        // (JSON callers branch on anchor_out: null above).
-        eprintln!(
-            "WARNING: no trust anchor was emitted for the new device. Until it runs \
-             `confidant keys device-add --complete --anchor-file <anchor-file>`, its agent \
-             reads cannot decrypt. Re-run on an enrolled device with \
-             `confidant keys device-add --from-request <file> --anchor-out <anchor-file> \
-             --re-emit-anchor` (or copy this device's trust.toml) and finish with \
-             --complete on the new device after pulling"
-        );
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(TakeOutcome {
+        next: next_git_step(root),
+    })
 }
 
-/// `keys device-add --complete` (#713): run on the new device after
-/// pulling the enrolled device's device-add commit. Verifies the trust
-/// anchor in `--anchor-file` against the pulled vault — operator
-/// certificate when present, vault lookup key, and EVERY client data key
-/// (round-2 N1: a single passing client no longer proves coverage) —
-/// and installs it as this device's `trust.toml`. Fails loudly, writing
-/// nothing, when any applicable check fails, when this device is not
-/// enrolled yet, when it is only partially enrolled, or when an anchor
-/// is already installed and differs. Re-running with the same anchor on
-/// a fully enrolled device is a verified no-op.
-fn cmd_keys_device_add_complete(
-    cli: &Cli,
-    root: &Path,
-    anchor_file: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
-
-    let anchor_path = anchor_file.ok_or_else(|| {
-        anyhow::Error::new(DomainError::usage(
-            "keys device-add --complete requires --anchor-file <file>",
-        ))
+/// Reload the vault and require no error finding on `rel`.
+fn check_path_clean(root: &Path, rel: &Path) -> anyhow::Result<()> {
+    let vault = confidant_core::load_vault(root).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "could not reload the vault after installing {}: {e}",
+            rel.display()
+        )))
     })?;
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-    // Parse + shape-validate the candidate first: `load_from` refuses an
-    // anchor file inside the vault (a vault copy is informational only
-    // and never trusted) and rejects malformed keys.
-    let candidate = anchor::load_from(anchor_path, root).map_err(anyhow::Error::new)?;
-
-    // An installed anchor is never silently replaced: identical is a
-    // verified no-op, different is a hard refusal (re-pin via `recover`).
-    let trust_path = config_dir.join(anchor::TRUST_FILE);
-    if trust_path.is_file() {
-        let (existing, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-        if existing.operator == candidate.operator
-            && existing.recovery == candidate.recovery
-            && existing.recovery_age == candidate.recovery_age
-        {
-            // Still verify: an identical-but-unusable anchor (wrong vault
-            // pulled under it) must not report success. The re-run path
-            // runs the same checks as a fresh install (S2) — certificate,
-            // lookup key, every client key — and reports the same JSON
-            // shape, so callers branching on `checks` see no difference.
-            let vault = load_vault(root)?;
-            let cert = verify_anchor_cert(root, &vault.config.vault_id, &candidate)?;
-            let identity = keys_device_identity()?;
-            let device_pubkey = device_pubkey_string()?;
-            let mut store =
-                KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir)
-                    .map_err(anyhow::Error::new)?;
-            let lookup = if root.join("keys/vault/lookup.age").is_file() {
-                match store.read_lookup_key(identity.as_ref(), &candidate) {
-                    Ok((key, _, _)) => {
-                        drop(key);
-                        "pass"
-                    }
-                    Err(e) => return Err(anyhow::Error::new(map_unwrap_failure(e))),
-                }
-            } else {
-                "absent"
-            };
-            let coverage =
-                trial_unwrap_coverage(&store, &candidate, identity.as_ref(), &device_pubkey)
-                    .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
-            let client_unwrap = !coverage.passed.is_empty();
-            if !coverage.missing.is_empty() {
-                if lookup == "pass" || client_unwrap {
-                    // Round-2 N1: enrolled somewhere but missing some
-                    // clients — fail closed, anchor left untouched.
-                    return Err(partial_complete_error(&coverage.missing, true));
-                }
-                // Enrolled nowhere for any client and no lookup proof:
-                // the old first-client trial failed here too.
-                return Err(anyhow::Error::new(map_unwrap_failure(
-                    confidant_crypt::error::Error::NoKey(format!(
-                        "this device holds no wrapping for {}",
-                        coverage.missing.join(", ")
-                    )),
-                )));
-            }
-            if cert == "absent" && lookup == "absent" && !client_unwrap {
-                // Round-2 N4: every check is "absent", so nothing
-                // positively proved this anchor. The old code printed
-                // "could not be verified" yet reported ok:true with a
-                // success exit — the fresh-install path errors in this
-                // same case, and so does the re-run now.
-                return Err(anyhow::Error::new(
-                    DomainError::invalid(
-                        "trust anchor already installed but could not be verified against this vault: \
-                         no operator certificate, lookup key, or client keys were available to check against",
-                    )
-                    .with_fix(
-                        "Ask an enrolled device to run `confidant keys device-add --from-request` \
-                         for this device, pull on this device, then retry --complete",
-                    ),
-                ));
-            }
-            let client_coverage: serde_json::Map<String, serde_json::Value> = coverage
-                .passed
-                .iter()
-                .map(|c| (c.clone(), serde_json::Value::String("pass".to_string())))
-                .collect();
-            if cli.json {
-                print_json(&serde_json::json!({
-                    "ok": true,
-                    "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-                    "vault": root.to_string_lossy(),
-                    "anchor": "already_present",
-                    "checks": {
-                        "cert": cert,
-                        "lookup": lookup,
-                        "client_unwrap": if client_unwrap { "pass" } else { "absent" },
-                    },
-                    "client_coverage": client_coverage,
-                }))?;
-            } else {
-                println!("trust anchor already installed and verified for this vault");
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
+    let report = confidant_core::check_vault(&vault, &CheckOptions::default());
+    let rel_str = rel.to_string_lossy();
+    if let Some(finding) = report.findings.iter().find(|f| {
+        f.severity == confidant_core::Severity::Error && f.file.as_deref() == Some(rel_str.as_ref())
+    }) {
         return Err(anyhow::Error::new(
             DomainError::invalid(format!(
-                "a different trust anchor is already installed at {}; refusing to replace it",
-                trust_path.display()
+                "installing the chosen side left {} with an error: {}",
+                rel.display(),
+                finding.message
             ))
-            .with_fix(
-                "If this device belongs to another vault, use that vault's config dir; \
-                 to re-pin this vault, run `confidant recover` (only when every enrolled device is lost)",
-            ),
+            .with_fix("The conflicted file was restored; fix the underlying problem and retry"),
         ));
-    }
-
-    let vault = load_vault(root)?;
-    let cert = verify_anchor_cert(root, &vault.config.vault_id, &candidate)?;
-    let identity = keys_device_identity()?;
-    let device_pubkey = device_pubkey_string()?;
-    let mut store =
-        KeyStore::with_config_dir(root.join("keys"), &vault.config.vault_id, &config_dir)
-            .map_err(anyhow::Error::new)?;
-
-    // The vault lookup key: device-add re-wraps it to every new device,
-    // so it is the enrollment proof even for a vault with no clients yet.
-    // `read_lookup_key` verifies the vault manifest against the candidate
-    // anchor and commitment-checks the unwrapped key. (It advances the
-    // off-vault seq tracker; that is fine for a setup command, and
-    // `doctor` uses only the read-only client trial instead.)
-    let lookup = if root.join("keys/vault/lookup.age").is_file() {
-        match store.read_lookup_key(identity.as_ref(), &candidate) {
-            Ok((key, _, _)) => {
-                drop(key);
-                "pass"
-            }
-            Err(e) => return Err(anyhow::Error::new(map_unwrap_failure(e))),
-        }
-    } else {
-        "absent"
-    };
-    let coverage = trial_unwrap_coverage(&store, &candidate, identity.as_ref(), &device_pubkey)
-        .map_err(|e| anyhow::Error::new(map_unwrap_failure(e)))?;
-    let client_unwrap = !coverage.passed.is_empty();
-    if !coverage.missing.is_empty() {
-        if lookup == "pass" || client_unwrap {
-            // Round-2 N1: enrolled somewhere but missing some clients —
-            // fail closed without installing, naming the missing coverage.
-            return Err(partial_complete_error(&coverage.missing, false));
-        }
-        // Enrolled nowhere for any client and no lookup proof: the old
-        // first-client trial failed here too.
-        return Err(anyhow::Error::new(map_unwrap_failure(
-            confidant_crypt::error::Error::NoKey(format!(
-                "this device holds no wrapping for {}",
-                coverage.missing.join(", ")
-            )),
-        )));
-    }
-    if lookup == "absent" && !client_unwrap {
-        return Err(anyhow::Error::new(
-            DomainError::invalid(
-                "cannot verify the trust anchor: this vault has no lookup key and no client keys to trial-unwrap",
-            )
-            .with_fix(
-                "Ask an enrolled device to run `confidant keys device-add --from-request` \
-                 for this device, pull on this device, then retry --complete",
-            ),
-        ));
-    }
-
-    anchor::save(
-        &config_dir,
-        root,
-        &candidate.operator,
-        &candidate.recovery,
-        &candidate.recovery_age,
-    )
-    .map_err(anyhow::Error::new)?;
-
-    let checks = AnchorChecks {
-        cert,
-        lookup,
-        client_unwrap: if client_unwrap { "pass" } else { "absent" },
-    };
-    let client_coverage: serde_json::Map<String, serde_json::Value> = coverage
-        .passed
-        .iter()
-        .map(|c| (c.clone(), serde_json::Value::String("pass".to_string())))
-        .collect();
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "anchor": "installed",
-            "checks": {
-                "cert": checks.cert,
-                "lookup": checks.lookup,
-                "client_unwrap": checks.client_unwrap,
-            },
-            "client_coverage": client_coverage,
-        }))?;
-    } else {
-        println!("trust anchor installed for this vault");
-        // `checks.cert` is a verification status (`pass`/`absent`), not
-        // certificate material. CodeQL's cleartext-logging heuristic treats
-        // any value named `cert` as sensitive, so derive a boolean first and
-        // log a label rather than passing the status to the format arguments.
-        let operator_verified = checks.cert == "pass";
-        println!(
-            "  certificate   {}",
-            if operator_verified {
-                "verified"
-            } else {
-                "not present"
-            }
-        );
-        println!("  lookup key    {}", checks.lookup);
-        println!("  client key    {}", checks.client_unwrap);
-        println!(
-            "agent reads on this device should now decrypt; run `confidant doctor` to confirm"
-        );
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `keys anchor` subcommand dispatch.
-fn cmd_keys_anchor(cli: &Cli, root: &Path, action: &AnchorAction) -> anyhow::Result<ExitCode> {
-    match action {
-        AnchorAction::Export { out } => cmd_keys_anchor_export(cli, root, out),
-    }
-}
-
-/// `keys anchor export --out <file>` (#713): write this device's trust
-/// anchor (`trust.toml`) to a file for transfer to a new device. The
-/// standalone form of `device-add --from-request --anchor-out`, for when
-/// the new device's request file is no longer at hand. No enrollment, no
-/// commit, no device key — the anchor is already installed on this
-/// device, so there is nothing to verify here; the new device's
-/// `device-add --complete` verifies the file against the vault before
-/// installing it. Public-key material only, written 0600 on Unix and
-/// create-new (never overwritten), refused inside the vault.
-fn cmd_keys_anchor_export(cli: &Cli, root: &Path, out: &Path) -> anyhow::Result<ExitCode> {
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-    write_anchor_out_file(&config_dir, root, out)?;
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "anchor_out": out.display().to_string(),
-        }))?;
-    } else {
-        println!(
-            "wrote trust anchor to {}; copy it to the new device and run \
-             `confidant keys device-add --complete --anchor-file {}` there after pulling",
-            out.display(),
-            out.display()
-        );
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Staging paths for the atomic `keys/` swap (#175). All scratch lives
-/// under the git-ignored `.confidant/` dir (keys staging) or the config
-/// dir (seq-tracker staging), so a leftover is never committed and never
-/// mistaken for vault content.
-fn keys_stage_dir(root: &Path) -> PathBuf {
-    root.join(".confidant").join("keys.stage")
-}
-
-fn keys_old_dir(root: &Path) -> PathBuf {
-    root.join(".confidant").join("keys.old")
-}
-
-/// Staged copy of the seq tracker: same directory as the real tracker,
-/// so the success-path rename is atomic (same filesystem). The staged
-/// tracker holds the marks for ALL vaults (copied through), not just
-/// this one.
-fn keys_staged_tracker_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("manifest-seq.stage.toml")
-}
-
-/// Remove a file or directory, best-effort. Used for staging cleanup,
-/// where a leftover is repaired on the next run anyway.
-pub(crate) fn remove_path_best_effort(path: &Path) {
-    if path.is_dir() {
-        let _ = std::fs::remove_dir_all(path);
-    } else {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Copy a directory tree: files via `fs::copy`, subdirectories
-/// recursively. Symlinks are refused (keys/ is CLI-managed and must not
-/// contain them) — fail closed rather than follow or silently drop one.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &target)?;
-        } else {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "unexpected symlink in keys/ tree at {}",
-                entry.path().display()
-            ))));
-        }
     }
     Ok(())
 }
 
-/// Durable marker for a keys shred operation that finished staging and
-/// check. See issue 220 and Frank's roll-forward decision on issue 290.
-///
-/// Written to git-ignored `.confidant/shred.marker` after `check` passes
-/// (it stays there across the swap — the swap only renames `keys/` and the
-/// stage). Presence means "roll forward, never back": the swap and the
-/// out-of-tree promotions (anchor re-pin, device key) must complete before
-/// any other key operation runs.
-///
-/// The marker carries the new anchor material and the new device private key
-/// so `repair_keys_staging` can finish the promotions after a crash. It is
-/// written with 0600 permissions, fsynced before the swap, lives outside
-/// git-tracked `keys/`, and is removed before the shred commit, so the
-/// private key is never committed. Rolling back after a crash would restore
-/// the destroyed keys and undo the shred — hence roll-forward.
-const SHRED_MARKER_FILE: &str = "shred.marker";
-const SHRED_MARKER_VERSION: u32 = 1;
-
-/// Path of the shred marker: git-ignored `.confidant/` (never inside
-/// git-tracked `keys/`). Repair keys off its contents to decide whether
-/// the swap happened yet (via `keys.old`).
-fn shred_marker_path(root: &Path) -> PathBuf {
-    root.join(".confidant").join(SHRED_MARKER_FILE)
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ShredStageMarker {
-    version: u32,
-    /// New recovery verifying key (hex) for the anchor re-pin.
-    recovery_verifying_key_hex: String,
-    /// New recovery age recipient for the anchor re-pin.
-    recovery_age_recipient: String,
-    /// Fresh device private key (bech32) to promote to the keychain.
-    /// Sensitive: 0600 file, git-ignored, removed before commit.
-    /// Zeroized on drop (see `Drop` impl below).
-    device_key_bech32: String,
-}
-
-impl Drop for ShredStageMarker {
-    fn drop(&mut self) {
-        // The device private key must not linger in memory.
-        use zeroize::Zeroize;
-        self.device_key_bech32.zeroize();
+/// The next git step for the operator: `git merge --continue` while a merge
+/// is in progress, `git rebase --continue` while a rebase is.
+fn next_git_step(root: &Path) -> String {
+    let git_dir = confidant_core::write::git(root, &["rev-parse", "--git-dir"], true)
+        .map(|s| root.join(s.trim()))
+        .unwrap_or_else(|_| root.join(".git"));
+    if git_dir.join("MERGE_HEAD").exists() {
+        "git merge --continue".to_owned()
+    } else if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        "git rebase --continue".to_owned()
+    } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        "git cherry-pick --continue".to_owned()
+    } else {
+        "git commit".to_owned()
     }
 }
 
-/// Write the shred marker with 0600 permissions (it holds a private key),
-/// fsynced for crash durability: a torn write would block every key op
-/// until hand-fixed. Uses write-to-temp + rename + fsync so the marker
-/// is never observed partial.
-fn write_shred_marker(path: &Path, marker: &ShredStageMarker) -> anyhow::Result<()> {
-    let text = toml::to_string(marker).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot serialize shred marker: {e}"
-        )))
-    })?;
-    let dir = path.parent().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "shred marker path has no parent: {}",
-            path.display()
-        )))
-    })?;
-    std::fs::create_dir_all(dir).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot create shred marker dir at {}: {e}",
-            dir.display()
-        )))
-    })?;
-    // Write to a temp file in the same directory, fsync, then rename.
-    let tmp = dir.join(".shred.marker.tmp");
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
+/// Outcome of `record resolve --merged-file` / `--edit`.
+#[derive(Debug)]
+pub(crate) struct MergeOutcome {
+    /// The next git step for the operator.
+    pub next: String,
+    /// Vault-relative path of the resolved record.
+    pub path: PathBuf,
+}
+
+/// Guard for `--edit` scratch files (#455).
+///
+/// Zero-overwrites each file (same length), syncs, removes the files and
+/// the directory on drop. [`ScratchGuard::cleanup`] can also be called
+/// explicitly on the success path (after which drop is a no-op).
+#[cfg(unix)]
+pub(crate) struct ScratchGuard {
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+impl ScratchGuard {
+    pub(crate) fn new(dir: PathBuf, files: Vec<PathBuf>) -> Self {
+        ScratchGuard { dir, files }
+    }
+
+    /// Zero-overwrite, sync, and remove every file, then remove the dir.
+    pub(crate) fn cleanup(&mut self) {
         use std::io::Write;
-        let mut f = opts.open(&tmp).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write shred marker at {}: {e}",
-                tmp.display()
-            )))
-        })?;
-        f.write_all(text.as_bytes()).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write shred marker: {e}"
-            )))
-        })?;
-        // Fsync the file before the rename so the content is durable.
-        f.sync_all().map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot fsync shred marker: {e}"
-            )))
-        })?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot install shred marker at {}: {e}",
-            path.display()
-        )))
-    })?;
-    // Fsync the directory so the rename itself is durable (best-effort
-    // on non-unix; the file fsync above is the critical part).
-    #[cfg(unix)]
-    {
-        if let Ok(dir_f) = std::fs::File::open(dir) {
-            let _ = dir_f.sync_all();
+        for file in &self.files {
+            if let Ok(len) = std::fs::metadata(file).map(|m| m.len()) {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(file) {
+                    let zeros = vec![0u8; len as usize];
+                    let _ = f.write_all(&zeros);
+                    let _ = f.sync_all();
+                }
+            }
+            let _ = std::fs::remove_file(file);
         }
+        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some(parent) = self.dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+        self.files.clear();
     }
-    Ok(())
 }
 
-fn read_shred_marker(path: &Path) -> anyhow::Result<ShredStageMarker> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot read shred marker at {}: {e}",
-            path.display()
-        )))
-    })?;
-    // NOTE: the toml parse error is deliberately NOT included: it can
-    // quote the offending line, which may be the device private key.
-    let marker: ShredStageMarker = toml::from_str(&text).map_err(|_| {
-        anyhow::Error::new(DomainError::invalid(
-            "bad shred marker: refusing to parse (fail closed; inspect .confidant/shred.marker by hand)",
+#[cfg(unix)]
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Refuse to install merged text that still contains conflict markers.
+///
+/// The error names the first offending marker and its line number, never
+/// the line's content: the merged text is operator plaintext and must not
+/// reach logs or error output (rule 4).
+pub(crate) fn refuse_merged_conflict_markers(text: &str, source: &str) -> Result<(), DomainError> {
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let marker = if trimmed.starts_with("<<<<<<<") {
+            "<<<<<<<"
+        } else if trimmed.starts_with(">>>>>>>") {
+            ">>>>>>>"
+        } else if trimmed == "=======" {
+            "======="
+        } else {
+            continue;
+        };
+        return Err(DomainError::usage(format!(
+            "{source} still contains a conflict marker ({marker} at line {})",
+            n + 1
         ))
-    })?;
-    if marker.version != SHRED_MARKER_VERSION {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "unsupported shred marker version {}",
-            marker.version
-        ))));
+        .with_fix(
+            "Remove the conflict markers — keep the text you merged — then re-run the command",
+        ));
     }
-    Ok(marker)
-}
-
-/// Repair leftover staging state from a crashed or failed keys operation
-/// (#175). Runs before every staged keys mutation. The swap order makes
-/// every window unambiguous:
-///
-/// - `keys.old` + `keys/` both present: the swap completed, `keys/` is the
-///   new tree — delete the old tree.
-/// - `keys.old` present + `keys/` missing: crash mid-swap, before the
-///   stage was renamed in — restore the old tree.
-/// - No `keys.old`: any stage / staged tracker is a leftover from a
-///   failed op (keys/ was never touched) — delete it.
-/// - `keys/` missing + stage present + no `keys.old`: inconsistent (the
-///   copy never deletes keys/) — refuse to guess.
-///
-/// A shred marker (`#220`) takes precedence over all of the above: it
-/// means the stage passed `check` and the operation must roll forward.
-fn repair_keys_staging(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    let keys_dir = root.join("keys");
-    let old = keys_old_dir(root);
-    let stage = keys_stage_dir(root);
-    let staged_tracker = keys_staged_tracker_path(config_dir);
-    // #220: shred roll-forward marker. A marker means the stage passed
-    // `check`; the shred must roll forward to completion (swap, re-pin,
-    // device-key promotion), never roll back — rolling back would restore
-    // the destroyed keys and undo the shred.
-    if shred_marker_path(root).exists() {
-        return repair_shred_marker(root, config_dir);
-    }
-    if old.exists() {
-        if keys_dir.exists() {
-            remove_path_best_effort(&old);
-        } else {
-            std::fs::rename(&old, &keys_dir)?;
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Ok(());
-        }
-    } else if !keys_dir.exists() && stage.exists() {
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "keys/ is missing but a staging copy exists with no backup; refusing to guess which tree is canonical — inspect .confidant/keys.stage/ and restore keys/ by hand",
-        )));
-    }
-    remove_path_best_effort(&stage);
-    remove_path_best_effort(&staged_tracker);
     Ok(())
 }
 
-/// Roll a crashed `keys shred` forward from its durable marker (#220).
-/// The marker lives at git-ignored `.confidant/shred.marker` (never inside
-/// git-tracked `keys/`). Every step is idempotent, so a second crash
-/// mid-repair is safe to retry.
-///
-/// Crash-point behavior (Frank's decision on #290), inferred from `keys.old`:
-/// - No `keys.old`, stage present: pre-swap crash. Do the swap now.
-/// - `keys.old` present, `keys/` missing: mid-swap crash. Complete the swap.
-/// - `keys.old` present, `keys/` present: post-swap crash. Finish the
-///   re-pin and device-key promotion from the marker's material.
-///   Then clear the marker. Any other combination fails closed.
-fn repair_shred_marker(root: &Path, config_dir: &Path) -> anyhow::Result<()> {
-    use confidant_crypt::anchor;
-    let keys_dir = root.join("keys");
-    let old = keys_old_dir(root);
-    let stage = keys_stage_dir(root);
-    let staged_tracker = keys_staged_tracker_path(config_dir);
-    let real_tracker = confidant_crypt::manifest::seq_tracker_path(config_dir);
-    let marker_path = shred_marker_path(root);
-
-    // Fail closed on a corrupt marker: never print key material (the toml
-    // error text is already stripped by read_shred_marker).
-    let marker = read_shred_marker(&marker_path)?;
-
-    // Ensure the swap is complete, inferring the crash point.
-    if !old.exists() {
-        // No backup: the swap never started (pre-swap crash). The stage
-        // holds the new tree; keys/ holds the old tree.
-        if !stage.exists() || !keys_dir.exists() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "shred marker exists but the swap never started and the stage or keys/ is missing; refusing to guess — inspect .confidant/ and restore by hand",
-            )));
-        }
-        std::fs::rename(&keys_dir, &old).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot stage old keys/ aside during shred repair: {e}"
-            )))
-        })?;
-        std::fs::rename(&stage, &keys_dir).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot complete interrupted keys/ swap during shred repair: {e}"
-            )))
-        })?;
-    } else if !keys_dir.exists() {
-        // Mid-swap: keys/ -> keys.old happened, stage -> keys/ did not.
-        if !stage.exists() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "shred marker exists, keys/ is missing, but the stage is gone too; refusing to guess — inspect .confidant/ and restore by hand",
-            )));
-        }
-        std::fs::rename(&stage, &keys_dir).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot complete interrupted keys/ swap during shred repair: {e}"
-            )))
-        })?;
-    }
-    // keys/ now holds the new tree. The old tree is shred's destroy
-    // target; remove it best-effort.
-    remove_path_best_effort(&old);
-
-    // Promote the staged seq tracker (same-directory rename, atomic).
-    if staged_tracker.exists() {
-        std::fs::rename(&staged_tracker, &real_tracker).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot promote staged seq tracker during shred repair: {e}"
-            )))
-        })?;
-    }
-
-    // Re-pin the trust anchor from the marker's material (idempotent:
-    // temp-and-rename with the same bytes is a no-op in effect).
-    let (anchor, _warnings) = anchor::load(config_dir, root).map_err(anyhow::Error::new)?;
-    let recovery_vk_bytes = hex::decode(&marker.recovery_verifying_key_hex).map_err(|e| {
+/// The operator's merged file must live outside the vault so a plaintext
+/// merge file cannot be committed by accident.
+pub(crate) fn refuse_vault_path(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = path.canonicalize().map_err(|e| {
         anyhow::Error::new(DomainError::invalid(format!(
-            "bad recovery key in shred marker: {e}"
+            "cannot read {}: {e}",
+            path.display()
         )))
     })?;
-    let recovery_vk =
-        ed25519_dalek::VerifyingKey::from_bytes(&recovery_vk_bytes.try_into().map_err(|_| {
-            anyhow::Error::new(DomainError::invalid(
-                "bad recovery key length in shred marker",
+    let canonical_root = root.canonicalize().map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot resolve vault root {}: {e}",
+            root.display()
+        )))
+    })?;
+    if canonical.starts_with(&canonical_root) {
+        return Err(anyhow::Error::new(
+            DomainError::invalid(format!(
+                "refusing to read a merge file inside the vault: {}",
+                path.display()
             ))
-        })?)
-        .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "bad recovery key in shred marker: {e}"
-            )))
-        })?;
-    anchor::replace(
-        config_dir,
-        root,
-        &anchor.operator,
-        &recovery_vk,
-        &marker.recovery_age_recipient,
-    )
-    .map_err(anyhow::Error::new)?;
-
-    // Promote the fresh device key from the marker (idempotent: overwrites
-    // the keychain entry with the same bytes).
-    store_rotated_device_key(&zeroize::Zeroizing::new(marker.device_key_bech32.clone())).map_err(
-        |e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot promote device key during shred repair: {e}"
-            )))
-        },
-    )?;
-
-    // All promotions done: clear the marker.
-    std::fs::remove_file(&marker_path).map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!(
-            "cannot clear shred marker at {}: {e}",
-            marker_path.display()
-        )))
-    })?;
-    // Tell the operator what to commit: the working-tree deletions from
-    // the shred were left uncommitted by the crash. Also remind them the
-    // phrase was already shown: a Ctrl-C at the phrase prompt lands here
-    // via the next key op, and the shred is complete either way.
-    eprintln!(
-        "shred repair complete: a shred you started was completed; use the recovery phrase it showed. Review and commit the working-tree changes (deleted edges, re-encrypted interactions) in a separate commit"
-    );
-    Ok(())
+            .with_fix("Put the merged file outside the vault tree"),
+        ));
+    }
+    Ok(canonical)
 }
 
-/// Run a `keys shred` through the staged path with roll-forward (#220,
-/// Frank's decision on #290). Operation order:
-/// 1. Stage `keys/` and mutate the copy (re-wrap remaining clients to
-///    fresh recipients, rotate recovery wrapping, re-sign operator cert
-///    into the stage).
-/// 2. Reload the vault and run `check` on the post-mutation state.
-/// 3. Record a durable marker at `.confidant/shred.marker` (complete +
-///    checked, with the new anchor material and the new device key).
-/// 4. Atomically swap the staged `keys/` into place, then disarm the
-///    working-tree guard: post-swap failures roll forward, never back.
-/// 5. Re-pin the trust anchor and promote the device key from the marker.
-/// 6. Remove the marker.
-///
-/// Why roll forward: shred exists to destroy the old keys; rolling back
-/// after a crash would restore them and undo the shred. The marker makes
-/// every crash point recoverable via `repair_keys_staging`.
-///
-/// The recovery phrase is displayed BEFORE the swap (step 3.5): once the
-/// swap lands, the tree is wrapped to that phrase, so a crash before
-/// display would lose it. If the swap then fails before anything moves
-/// (the first rename), the error says to ignore the shown phrase — the
-/// old phrase is still current. Once `keys/` has moved, the shown phrase
-/// is the new recovery phrase, and the error says so.
-#[allow(clippy::too_many_arguments)]
-fn staged_shred_mutation(
+/// Remove a stale `.confidant/conflicts/` dir left by a crashed
+/// `resolve --edit`.
+pub(crate) fn sweep_stale_scratch(root: &Path) {
+    sweep_stale_scratch_under(&root.join(".confidant").join("conflicts"));
+}
+
+/// Remove a stale `.confidant/notes/` dir left by a crashed
+/// `note edit --edit`.
+pub(crate) fn sweep_stale_note_scratch(root: &Path) {
+    sweep_stale_scratch_under(&root.join(".confidant").join("notes"));
+}
+
+/// Zero-overwrite every file under `dir`, then remove the tree. Best-effort.
+fn sweep_stale_scratch_under(dir: &Path) {
+    use std::io::Write;
+    if !dir.exists() {
+        return;
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(len) = std::fs::metadata(&p).map(|m| m.len()) {
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&p) {
+                    let zeros = vec![0u8; len as usize];
+                    let _ = f.write_all(&zeros);
+                    let _ = f.sync_all();
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Apply a merged record (#455): write each planned change atomically,
+/// verify no error finding on any changed path (rolling everything back on
+/// failure), then stage every changed path.
+pub(crate) fn apply_merge(
     root: &Path,
-    vault: &confidant_core::Vault,
-    config_dir: &Path,
-    anchor: &confidant_crypt::anchor::Anchor,
-    operator_sk: &ed25519_dalek::SigningKey,
-    identity: &dyn age::Identity,
-    client_id: &str,
-    all_refs: &[&str],
-    new_recipients: &confidant_crypt::manifest::RecipientMap,
-    fresh_device_key: &zeroize::Zeroizing<String>,
-    deleted_edges: usize,
-    stripped_interactions: usize,
     no_input: bool,
-    guard: &mut ShredTreeGuard,
-) -> anyhow::Result<confidant_crypt::lifecycle::ShredOutcome> {
-    use confidant_crypt::{
-        anchor,
-        lifecycle::KeyStore,
-        manifest::{self, SeqTracker},
-    };
-    repair_keys_staging(root, config_dir)?;
-    let keys_dir = root.join("keys");
-    let stage = keys_stage_dir(root);
-    let old = keys_old_dir(root);
-    let staged_tracker = keys_staged_tracker_path(config_dir);
-    let real_tracker = manifest::seq_tracker_path(config_dir);
-
-    // Step 1: stage the tree and the seq tracker (same as staged_keys_mutation).
-    let mut store = match (|| -> anyhow::Result<KeyStore> {
-        if keys_dir.exists() {
-            copy_dir_recursive(&keys_dir, &stage)?;
-        } else {
-            std::fs::create_dir_all(&stage)?;
-        }
-        if real_tracker.exists() {
-            std::fs::copy(&real_tracker, &staged_tracker)?;
-        }
-        let seq = SeqTracker::load(&staged_tracker).map_err(anyhow::Error::new)?;
-        Ok(KeyStore::new(stage.clone(), &vault.config.vault_id, seq)
-            .with_committed_keys_dir(keys_dir.clone()))
-    })() {
-        Ok(s) => s,
-        Err(e) => {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Err(e);
-        }
-    };
-
-    // Mutate the stage: re-wrap remaining clients, rotate recovery.
-    // On failure the stage is discarded; keys/ and the anchor untouched.
-    let outcome = match store.shred(
-        client_id,
-        all_refs,
-        new_recipients,
-        operator_sk,
-        anchor,
-        identity,
-        deleted_edges,
-        stripped_interactions,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Err(anyhow::Error::new(e));
-        }
-    };
-
-    // Re-sign the operator cert into the STAGE (not the live keys_dir):
-    // it was signed by the OLD recovery key, and the new tree must carry
-    // a cert the NEW recovery key verifies.
-    let new_recovery = outcome.new_recovery();
-    if let Err(e) = anchor::write_operator_cert(
-        &stage,
-        &vault.config.vault_id,
-        &anchor.operator,
-        new_recovery.signing_key(),
-    ) {
-        remove_path_best_effort(&stage);
-        remove_path_best_effort(&staged_tracker);
-        return Err(anyhow::Error::new(e));
+    prepared: &PreparedWrite,
+) -> anyhow::Result<MergeOutcome> {
+    let mut originals: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for change in &prepared.pending.changes {
+        let FileChange::WriteFile { path, .. } = change else {
+            continue;
+        };
+        let bytes = std::fs::read(root.join(path)).unwrap_or_default();
+        originals.push((path.clone(), bytes));
     }
 
-    // Step 2: check before the swap. The caller reloads the vault after
-    // the working-tree changes (edge deletions, interaction strips) and
-    // passes it in, so the check sees the post-shred record state. (See
-    // the #209 note in staged_keys_mutation: check reads keys/ only for
-    // crypto-mode detection.)
-    let pre = check_vault(vault, &CheckOptions::default());
-    if !pre.ok {
-        remove_path_best_effort(&stage);
-        remove_path_best_effort(&staged_tracker);
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree; nothing was committed and keys/ was not modified",
-        )));
+    for change in &prepared.pending.changes {
+        let FileChange::WriteFile { path, contents } = change else {
+            continue;
+        };
+        confidant_core::paths::write_replace(root, path, contents.as_bytes()).map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not write {}: {e}",
+                path.display()
+            )))
+        })?;
     }
 
-    // Step 3: durable marker (complete + checked), with the new anchor
-    // material and the new device key for the post-swap promotions.
-    // Lives at git-ignored .confidant/shred.marker (never in keys/).
-    let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let marker = ShredStageMarker {
-        version: SHRED_MARKER_VERSION,
-        recovery_verifying_key_hex: hex(new_recovery.verifying_key().as_bytes()),
-        recovery_age_recipient: new_recovery.age_identity().to_recipient_string(),
-        device_key_bech32: fresh_device_key.as_str().to_owned(),
-    };
-    let marker_path = shred_marker_path(root);
-    if let Err(e) = write_shred_marker(&marker_path, &marker) {
-        remove_path_best_effort(&stage);
-        remove_path_best_effort(&staged_tracker);
+    let mut failed: Option<anyhow::Error> = None;
+    for (path, _) in &originals {
+        if let Err(e) = check_path_clean(root, path) {
+            failed = Some(e);
+            break;
+        }
+    }
+    if let Some(e) = failed {
+        for (path, bytes) in &originals {
+            let _ = confidant_core::paths::write_replace(root, path, bytes);
+        }
         return Err(e);
     }
 
-    // Step 3.5: show the phrase BEFORE the swap. Once the swap lands the
-    // tree is wrapped to this phrase; a crash before display would lose it.
-    // If the first rename fails (before anything moved), the error tells
-    // the operator to ignore the shown phrase — the old phrase is still
-    // current. After it succeeds, the shown phrase is the new recovery
-    // phrase.
-    let phrase = outcome.recovery_phrase_for_display();
-    if let Err(e) = display_phrase_once(no_input, &phrase) {
-        remove_path_best_effort(&stage);
-        remove_path_best_effort(&staged_tracker);
-        remove_path_best_effort(&marker_path);
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot display recovery phrase: {e}"
-        ))));
-    }
-
-    // Step 4: swap (keys/ -> keys.old, stage -> keys/).
-    // NOTE: the recovery phrase was already shown at step 3.5. If the
-    // first rename fails (before anything moved), the shown phrase
-    // matches nothing — the old phrase is still current. Once keys/
-    // has moved, the shown phrase is the new recovery phrase.
-    if keys_dir.exists() {
-        if let Err(e) = std::fs::rename(&keys_dir, &old) {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            remove_path_best_effort(&marker_path);
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "keys/ swap failed before anything moved ({e}); keys/ was not modified — ignore the phrase shown above; your old phrase is still current"
-            ))));
-        }
-        // Point of no return: keys/ has moved to keys.old and the marker
-        // exists, so repair will roll forward from here (finish the swap,
-        // re-pin, promote, clear). Disarm the working-tree guard NOW,
-        // before stage -> keys/ — a failure from this point on must NOT
-        // restore the deleted edges / stripped interactions (the privacy
-        // leak #320 closed, and the roll-back-after-roll-forward mix #290
-        // rules out).
-        guard.disarm();
-    } else {
-        // Safety net: disarm() is idempotent. If keys/ did not exist, the
-        // point-of-no-return disarm above was skipped — but the swap is
-        // about to land, so disarm NOW, before stage -> keys/. If the
-        // rename fails, the error branch below returns early, so a disarm
-        // after it would never run. Unreachable today (shred stages from
-        // keys/), but safe even if that ever changes.
-        guard.disarm();
-    }
-    if let Err(e) = std::fs::rename(&stage, &keys_dir) {
-        let _ = repair_keys_staging(root, config_dir);
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "keys/ swap failed mid-swap ({e}); shred is finishing, re-run to complete; the phrase shown above is your new recovery phrase"
-        ))));
-    }
-
-    // Promote the staged seq tracker (same-directory rename, atomic).
-    // Post-swap: on failure, repair rolls forward; report re-run.
-    if staged_tracker.exists() {
-        if let Err(e) = std::fs::rename(&staged_tracker, &real_tracker) {
-            let _ = repair_keys_staging(root, config_dir);
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "seq tracker promotion failed ({e}); shred is finishing, re-run to complete"
+    for (path, _) in &originals {
+        if let Err(e) =
+            confidant_core::write::git(root, &["add", "--", &path.to_string_lossy()], no_input)
+        {
+            for (p, b) in &originals {
+                let _ = confidant_core::paths::write_replace(root, p, b);
+            }
+            return Err(anyhow::Error::new(DomainError::internal(format!(
+                "could not stage {}: {e}",
+                path.display()
             ))));
         }
     }
 
-    // Step 5: re-pin the anchor and promote the device key from the marker.
-    // Both are idempotent, so a crash here is safe to retry via repair.
-    // Post-swap: on failure, repair rolls forward; report re-run.
-    if let Err(e) = anchor::replace(
-        config_dir,
-        root,
-        &anchor.operator,
-        &new_recovery.verifying_key(),
-        &new_recovery.age_identity().to_recipient_string(),
-    ) {
-        let _ = repair_keys_staging(root, config_dir);
-        return Err(anyhow::Error::new(e).context("shred is finishing, re-run to complete"));
-    }
-    if let Err(e) = store_rotated_device_key(fresh_device_key) {
-        let _ = repair_keys_staging(root, config_dir);
-        return Err(e.context("shred is finishing, re-run to complete"));
-    }
-
-    // Step 6: remove the marker. Post-swap: on failure, repair clears it;
-    // report re-run.
-    if marker_path.exists() {
-        if let Err(e) = std::fs::remove_file(&marker_path) {
-            let _ = repair_keys_staging(root, config_dir);
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot clear shred marker at {} ({e}); shred is finishing, re-run to complete",
-                marker_path.display()
-            ))));
-        }
-    }
-
-    // Cleanup of the old tree is best-effort; the next run repairs a leftover.
-    remove_path_best_effort(&old);
-    Ok(outcome)
+    Ok(MergeOutcome {
+        next: next_git_step(root),
+        path: prepared.rel.clone(),
+    })
 }
 
-/// Run a `keys/` mutation atomically (#175): stage the tree aside,
-/// mutate the stage, check, then swap the stage into place. A failure
-/// at any point before the swap leaves `keys/` (and the seq tracker)
-/// exactly as they were; on failure only the staging copies are deleted.
-///
-/// The staged `KeyStore` reads git history from the COMMITTED tree
-/// (`with_committed_keys_dir`), so the shredded-pubkey denylist sees the
-/// same history as the unstaged path.
-///
-/// Ordering matters: the keys swap runs BEFORE the tracker rename. A
-/// crash between them leaves the new tree with the old tracker, which is
-/// consistent (manifest seqs are >= the old high-water marks, so the
-/// next operation just picks higher seqs). The reverse order would leave
-/// the old tree with a new tracker, and verification would refuse the
-/// old manifests as stale.
-///
-/// `vault` is the already-loaded vault: `check` runs against it before
-/// the swap. Check never reads `keys/` contents (only whether the tree
-/// exists), so no vault view over the stage is needed.
-fn staged_keys_mutation<T>(
+/// Set up `--edit` scratch files (unix only).
+#[cfg(unix)]
+pub(crate) fn setup_edit_scratch(
     root: &Path,
-    vault: &confidant_core::Vault,
-    config_dir: &Path,
-    mutate: impl FnOnce(&mut confidant_crypt::lifecycle::KeyStore) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    use confidant_crypt::{
-        lifecycle::KeyStore,
-        manifest::{self, SeqTracker},
-    };
-    repair_keys_staging(root, config_dir)?;
-    let keys_dir = root.join("keys");
-    let stage = keys_stage_dir(root);
-    let old = keys_old_dir(root);
-    let staged_tracker = keys_staged_tracker_path(config_dir);
-    let real_tracker = manifest::seq_tracker_path(config_dir);
+    id: &RecordId,
+    sides: &LoadedSides,
+) -> anyhow::Result<(ScratchGuard, PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    // Stage the tree (full copy, including any uncommitted operator work)
-    // and the seq tracker. The tracker is staged in the config dir so
-    // the success-path rename is atomic. Any failure here cleans up the
-    // partial stage, so a failed setup leaves no leftovers.
-    let mut store = match (|| -> anyhow::Result<KeyStore> {
-        if keys_dir.exists() {
-            copy_dir_recursive(&keys_dir, &stage)?;
-        } else {
-            std::fs::create_dir_all(&stage)?;
-        }
-        if real_tracker.exists() {
-            std::fs::copy(&real_tracker, &staged_tracker)?;
-        }
-        let seq = SeqTracker::load(&staged_tracker).map_err(anyhow::Error::new)?;
-        Ok(KeyStore::new(stage.clone(), &vault.config.vault_id, seq)
-            .with_committed_keys_dir(keys_dir.clone()))
-    })() {
-        Ok(s) => s,
-        Err(e) => {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Err(e);
-        }
-    };
+    ensure_corpus_gitignored(root).map_err(anyhow::Error::new)?;
 
-    // Mutate the stage. On failure the stage + staged tracker are deleted
-    // and keys/ + the real tracker are untouched.
-    let result = match mutate(&mut store) {
-        Ok(v) => v,
-        Err(e) => {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Err(e);
-        }
-    };
+    let dir = root
+        .join(".confidant")
+        .join("conflicts")
+        .join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot create scratch dir {}: {e}",
+            dir.display()
+        )))
+    })?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot set permissions on {}: {e}",
+            dir.display()
+        )))
+    })?;
 
-    // Pre-commit check before the swap, so a failing check also leaves
-    // keys/ untouched.
-    //
-    // #209: this check runs against the pre-loaded `vault`, which reflects
-    // the LIVE keys/ tree, not the staged copy. That is correct today
-    // because `check` reads keys/ only for crypto-mode detection — whether
-    // keys/ *exists* (`crypto_mode::is_structurally_encrypted`), which a
-    // staged swap never changes (it replaces keys/ contents, not its
-    // presence). If `check` ever starts reading the *contents* of keys/
-    // (manifests, the seq tracker, wrapping files), it must be re-pointed
-    // at the staged tree here so a bad staged tree fails the check before
-    // the swap. Do not "fix" this today by making `check` read the stage:
-    // there is nothing for it to read there yet.
-    let pre = check_vault(vault, &CheckOptions::default());
-    if !pre.ok {
-        remove_path_best_effort(&stage);
-        remove_path_best_effort(&staged_tracker);
-        return Err(anyhow::Error::new(DomainError::invalid(
-            "check failed before committing keys/ tree; nothing was committed and keys/ was not modified",
-        )));
+    let ours_path = dir.join("ours.md");
+    let theirs_path = dir.join("theirs.md");
+    let merged_path = dir.join("merged.md");
+    for (path, bytes) in [
+        (&ours_path, sides.ours_bytes.as_slice()),
+        (&theirs_path, sides.theirs_bytes.as_slice()),
+        (&merged_path, sides.ours_bytes.as_slice()),
+    ] {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| {
+                anyhow::Error::new(DomainError::internal(format!(
+                    "cannot write scratch file {}: {e}",
+                    path.display()
+                )))
+            })?;
+        f.write_all(bytes).map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot write scratch file {}: {e}",
+                path.display()
+            )))
+        })?;
+        f.sync_all().map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot sync scratch file {}: {e}",
+                path.display()
+            )))
+        })?;
     }
 
-    // Swap: keys/ -> keys.old, stage -> keys/.
-    if keys_dir.exists() {
-        if let Err(e) = std::fs::rename(&keys_dir, &old) {
-            remove_path_best_effort(&stage);
-            remove_path_best_effort(&staged_tracker);
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "keys/ swap failed before anything moved ({e}); keys/ was not modified"
-            ))));
-        }
-    }
-    if let Err(e) = std::fs::rename(&stage, &keys_dir) {
-        // Mid-swap: repair restores keys.old -> keys/.
-        let _ = repair_keys_staging(root, config_dir);
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "keys/ swap failed mid-swap ({e}); staging leftovers were repaired, keys/ was restored"
-        ))));
-    }
-
-    // Tracker rename (same directory, atomic). Keys-swap-first: new tree +
-    // old tracker is consistent (and self-healing — the next operation
-    // re-derives high-water marks from the manifests), so even a failure
-    // here cannot brick the vault. Best-effort rollback, then repair.
-    if staged_tracker.exists() {
-        if let Err(e) = std::fs::rename(&staged_tracker, &real_tracker) {
-            remove_path_best_effort(&keys_dir);
-            if std::fs::rename(&old, &keys_dir).is_ok() {
-                remove_path_best_effort(&staged_tracker);
-            }
-            let _ = repair_keys_staging(root, config_dir);
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "seq tracker update failed ({e}); keys/ was rolled back and nothing was committed"
-            ))));
-        }
-    }
-
-    // Cleanup of the old tree is best-effort; the next run repairs a leftover.
-    remove_path_best_effort(&old);
-    Ok(result)
+    let guard = ScratchGuard::new(dir, vec![ours_path, theirs_path, merged_path.clone()]);
+    Ok((guard, merged_path))
 }
 
-/// Remove leftover `keys/.confidant-tmp-*` files from a crashed atomic
-/// write, then stage the `keys/` tree. The recovery-recipients denylist is
-/// written via temp-and-rename; a hard crash can leave the temp behind, and
-/// a bare `git add -- keys` would commit it (#156 nit 1).
-fn stage_keys(root: &Path, no_input: bool) -> anyhow::Result<()> {
-    let keys_dir = root.join("keys");
-    if let Ok(entries) = std::fs::read_dir(&keys_dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".confidant-tmp-")
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+/// Resolve the operator's editor: `$VISUAL`, then `$EDITOR`.
+#[cfg(unix)]
+pub(crate) fn resolve_editor() -> anyhow::Result<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::Error::new(
+                DomainError::usage("no editor configured")
+                    .with_fix("Set $EDITOR or use --merged-file"),
+            )
+        })
+}
+
+/// Run the operator's editor on `path`.
+#[cfg(unix)]
+pub(crate) fn run_editor(path: &Path) -> anyhow::Result<()> {
+    let editor = resolve_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(path)
+        .status()
+        .map_err(|e| {
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not run editor '{editor}': {e}"
+            )))
+        })?;
+    if !status.success() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("editor exited with an error; the merge was not applied")
+                .with_fix("Fix the merge and retry, or use --merged-file"),
+        ));
     }
-    confidant_core::write::git(root, &["add", "--", "keys"], no_input)?;
     Ok(())
 }
 
-/// Path to the pending inbox-rotation reminder file (#105, ⚠5).
-fn pending_inbox_rotation_path() -> anyhow::Result<std::path::PathBuf> {
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-    Ok(config_dir.join("inbox-rotation-pending.toml"))
-}
+/// Set up `note edit --edit` scratch (unix only).
+#[cfg(unix)]
+pub(crate) fn setup_note_edit_scratch(
+    root: &Path,
+    id: &RecordId,
+    text: &str,
+) -> anyhow::Result<(ScratchGuard, PathBuf)> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-/// Write the pending-rotation reminder (device-local, never in the vault).
-fn write_pending_inbox_rotation(vault_id: &str, shredded_client: &str) -> anyhow::Result<()> {
-    let path = pending_inbox_rotation_path()?;
-    let recorded_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let content = format!(
-        "# Inbox rotation pending after `keys shred {shredded_client}`.\n\
-         # The inbox key was NOT rotated on this device (it does not hold the inbox key).\n\
-         # Run `confidant inbox rotate --finish` ON THE INBOX DEVICE, then clear this\n\
-         # reminder with `confidant doctor --clear-pending-inbox-rotation`.\n\
-         vault_id = {vault_id:?}\n\
-         shredded_client = {shredded_client:?}\n\
-         recorded_at = {recorded_at:?}\n"
-    );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // 0600 from creation: it names the shredded client (opaque id, but still).
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    ensure_corpus_gitignored(root).map_err(anyhow::Error::new)?;
+
+    let dir = root.join(".confidant").join("notes").join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot create scratch dir {}: {e}",
+            dir.display()
+        )))
+    })?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot set permissions on {}: {e}",
+            dir.display()
+        )))
+    })?;
+
+    let note_path = dir.join("note.md");
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&path)?
-        .write_all(content.as_bytes())?;
-    Ok(())
-}
-
-/// Working-tree rollback for `keys shred` (#320).
-///
-/// Edge deletions and interaction rewrites mutate the working tree BEFORE
-/// `KeyStore::shred` runs. If any later step refuses, the mutations must be
-/// undone: a re-run cannot rediscover them (e.g. a deleted edge no longer
-/// names the shredded person, so the `ls-files` stage step is skipped and
-/// the edge stays in HEAD under `vault:shared` — a privacy leak, not just
-/// a dirty tree).
-///
-/// The guard records `(vault-relative path, pre-mutation bytes)` for every
-/// mutation. While armed, dropping the guard restores every recorded file
-/// best-effort. Call `disarm()` once the shred succeeds (the mutations are
-/// then intentional). `restore()` restores immediately and returns the paths
-/// that could not be restored, so the caller can tell the operator to
-/// `git checkout` them before re-running.
-struct ShredTreeGuard<'a> {
-    root: &'a Path,
-    snapshots: Vec<(String, Vec<u8>)>,
-    armed: bool,
-}
-
-impl<'a> ShredTreeGuard<'a> {
-    fn new(root: &'a Path) -> Self {
-        ShredTreeGuard {
-            root,
-            snapshots: Vec::new(),
-            armed: true,
-        }
-    }
-
-    /// Record a mutation. Call for every working-tree write/delete between
-    /// creation and `disarm()`, BEFORE the mutation happens.
-    fn record(&mut self, path: String, before: Vec<u8>) {
-        if self.armed {
-            self.snapshots.push((path, before));
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.snapshots.clear();
-    }
-
-    /// Whether the guard is still armed. After the keys/ swap lands,
-    /// `staged_shred_mutation` disarms it: post-swap failures roll forward
-    /// via the shred marker, never back via restore.
-    fn is_armed(&self) -> bool {
-        self.armed
-    }
-
-    /// Restore all recorded files now. Returns vault-relative paths that
-    /// could not be restored. Disarms the guard (drop becomes a no-op).
-    fn restore(&mut self) -> Vec<String> {
-        let mut failed = Vec::new();
-        for (path, bytes) in &self.snapshots {
-            let full = self.root.join(path);
-            let ok = full
-                .parent()
-                .map(|p| std::fs::create_dir_all(p).is_ok())
-                .unwrap_or(true)
-                && std::fs::write(&full, bytes).is_ok();
-            if !ok {
-                failed.push(path.clone());
-            }
-        }
-        self.disarm();
-        failed
-    }
-}
-
-impl Drop for ShredTreeGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.restore();
-        }
-    }
-}
-
-/// Restore the working tree after a refused shred step. When the restore
-/// itself was incomplete, the operator is told exactly which paths need a
-/// manual `git checkout` before re-running.
-fn shred_restore(guard: &mut ShredTreeGuard, err: anyhow::Error) -> anyhow::Error {
-    let unrestored = guard.restore();
-    if unrestored.is_empty() {
-        err
-    } else {
-        err.context(format!(
-            "working tree could not be fully restored: {}; run `git checkout -- <path>` for each listed path before re-running",
-            unrestored.join(", ")
-        ))
-    }
-}
-
-/// Delete every edge record naming `client_id` from the working tree
-/// (#179). Runs BEFORE `KeyStore::shred` destroys keys: edge discovery
-/// needs decryption (edges live under `vault:shared`, so `a` / `b` sit
-/// inside the ciphertext in encrypted vaults), and a failure here must
-/// abort before any irreversible key destruction. Returns the deleted
-/// vault-relative paths, for staging into the same signed shred commit.
-///
-/// Plan-then-apply (#320): every refusal check and every read happens
-/// before the first deletion; each deletion is recorded in `guard` so a
-/// later refusal rolls the tree back.
-///
-/// Fail-closed, edge-scoped: refuses when any *edge's* ends cannot be
-/// determined — an undecryptable or tampered edge envelope, a `no-ai`
-/// shell, a malformed edge file, or an edge with a missing/malformed
-/// end — because an unseen edge might name the shredded person.
-/// Skipped or refused envelopes *outside* `edges/` do not block shred:
-/// after `keys shred` of person A, A's leftover envelopes stay in the
-/// tree and become undecryptable, and shredding B must still proceed
-/// when every edge reads fine.
-fn delete_edges_naming(
-    root: &Path,
-    client_id: &str,
-    guard: &mut ShredTreeGuard,
-) -> anyhow::Result<Vec<String>> {
-    // Keyed load: decrypts edge envelopes via the current device key.
-    // (Same probe-then-keyed pattern as `load_vault_for_reads`.)
-    let probe = load_vault(root)?;
-    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
-        root,
-        &probe.config.vault_id,
-    ));
-    // Wrap the decrypt hook to record per-path outcomes under `edges/`.
-    // Record files load on worker threads, hence the mutexes.
-    let edge_skipped = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let edge_refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let inner = decryptor.hook();
-    let hook: ContentHook = std::sync::Arc::new({
-        let edge_skipped = std::sync::Arc::clone(&edge_skipped);
-        let edge_refused = std::sync::Arc::clone(&edge_refused);
-        move |path: &str, bytes: &[u8]| {
-            let outcome = inner(path, bytes);
-            if path.starts_with("edges/") {
-                match outcome {
-                    ContentOutcome::Skipped => {
-                        edge_skipped.lock().unwrap().push(path.to_string());
-                    }
-                    ContentOutcome::Refused => {
-                        edge_refused.lock().unwrap().push(path.to_string());
-                    }
-                    _ => {}
-                }
-            }
-            outcome
-        }
-    });
-    let vault =
-        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
-    let edge_skipped = edge_skipped.lock().unwrap();
-    if !edge_skipped.is_empty() {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every edge naming {client_id}: {} edge envelope(s) could not be decrypted on this device; refusing to shred",
-            edge_skipped.len()
-        )).with_fix(
-            "Run shred from a device that can decrypt every edge, or resolve the undecryptable edge files first",
-        )));
-    }
-    let edge_refused = edge_refused.lock().unwrap();
-    if !edge_refused.is_empty() {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every edge naming {client_id}: {} edge envelope(s) were refused as tampered or corrupt; refusing to shred",
-            edge_refused.len()
-        )).with_fix(
-            "Resolve the refused edge envelopes first (check reports them as unreadable)",
-        )));
-    }
-    // A load finding on an edge file means an edge record could not be
-    // parsed — its ends are unknown.
-    if let Some(bad) = vault
-        .load_findings
-        .iter()
-        .find(|f| f.file.as_deref().is_some_and(|p| p.starts_with("edges/")))
-    {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every edge naming {client_id}: an edge file could not be parsed ({}); refusing to shred",
-            bad.file.as_deref().unwrap_or("edges/")
-        )).with_fix(
-            "Fix or remove the unparseable edge file, then re-run shred",
-        )));
-    }
-    // PLAN (#320): collect every edge naming `client_id` — with its bytes —
-    // before touching the tree. The malformed-end refusal lives here, so a
-    // refusal leaves the tree untouched.
-    let mut plan: Vec<(String, Vec<u8>)> = Vec::new();
-    for rec in vault.records.values() {
-        if rec.kind != RecordKind::Edge {
-            continue;
-        }
-        let (Some(a), Some(b)) = (rec.edge_end("a"), rec.edge_end("b")) else {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot determine every edge naming {client_id}: edge {} has a missing or malformed end; refusing to shred",
-                rec.id
-            )).with_fix(
-                "Fix the edge's a/b ends, then re-run shred",
-            )));
-        };
-        if a.to_string() == client_id || b.to_string() == client_id {
-            let path = root.join(&rec.path);
-            let bytes = std::fs::read(&path).map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot read edge file {}: {e}",
-                    rec.path
-                )))
-            })?;
-            plan.push((rec.path.clone(), bytes));
-        }
-    }
-    // APPLY: nothing above can refuse any more. Record each deletion in the
-    // guard BEFORE it happens, so a mid-loop IO error still rolls back.
-    let mut deleted = Vec::new();
-    for (path, bytes) in plan {
-        let full = root.join(&path);
-        guard.record(path.clone(), bytes);
-        std::fs::remove_file(&full).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot delete edge file {path}: {e}"
-            )))
-        })?;
-        // Best-effort: drop the now-empty edge directory.
-        if let Some(parent) = full.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
-        deleted.push(path);
-    }
-    Ok(deleted)
-}
-
-/// #258: remove a shredded person from every interaction's `with:` list,
-/// re-encrypting each affected interaction through the normal write path
-/// (`record_crypto`), before any key destruction. Returns the rewritten
-/// vault-relative paths, for staging into the same signed shred commit.
-///
-/// Plan-then-apply (#320): every refusal check, every `with:` parse, every
-/// encryption, and every pre-rewrite read happens before the first write;
-/// each write is recorded in `guard` so a later refusal rolls the tree
-/// back.
-///
-/// Mirrors [`delete_edges_naming`]: discovery decrypts with the pre-shred
-/// device key, and a tampered / unparseable / genuinely-undecryptable
-/// interaction fails closed before shred touches a key. The rewritten
-/// envelopes stage into the same signed shred commit (their paths are
-/// already tracked).
-///
-/// An interaction envelope that is `Skipped` (this device can't unwrap its
-/// data key) is treated one of two ways: if its primary is still a live
-/// client, that is a real failure and shred refuses; if the primary was
-/// shredded earlier, its `with:` list is unreachable and nothing is lost by
-/// skipping it (the history-residue warning already covers it). This keeps a
-/// later shred from being blocked by a previous shred's leftovers (#259's
-/// edge fix, applied to interactions). A skipped envelope whose bytes
-/// cannot be read or parsed, or whose key id does not name a determinable
-/// client, fails closed: an unseen primary might be live.
-fn strip_participant_from_interactions(
-    root: &Path,
-    client_id: &str,
-    live_clients: &HashSet<String>,
-    guard: &mut ShredTreeGuard,
-) -> anyhow::Result<Vec<String>> {
-    // Keyed load: decrypts interaction envelopes via the current device key.
-    let probe = load_vault(root)?;
-    let decryptor = std::sync::Arc::new(record_decrypt::RecordDecryptor::for_reads(
-        root,
-        &probe.config.vault_id,
-    ));
-    let ixn_skipped = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let ixn_refused = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let inner = decryptor.hook();
-    let hook: ContentHook = std::sync::Arc::new({
-        let ixn_skipped = std::sync::Arc::clone(&ixn_skipped);
-        let ixn_refused = std::sync::Arc::clone(&ixn_refused);
-        move |path: &str, bytes: &[u8]| {
-            let outcome = inner(path, bytes);
-            if path.starts_with("interactions/") {
-                match outcome {
-                    ContentOutcome::Skipped => {
-                        ixn_skipped.lock().unwrap().push(path.to_string());
-                    }
-                    ContentOutcome::Refused => {
-                        ixn_refused.lock().unwrap().push(path.to_string());
-                    }
-                    _ => {}
-                }
-            }
-            outcome
-        }
-    });
-    let vault =
-        confidant_core::load_vault_with_hook(root, Some(hook)).map_err(anyhow::Error::new)?;
-    // A `Skipped` interaction whose primary is still live is a real failure:
-    // this device should be able to decrypt every live client (the strand
-    // check below enforces it), so a live-but-undecryptable interaction means
-    // we cannot tell whether its `with:` names `client_id`. A `Skipped`
-    // interaction whose primary was already shredded is unreachable — skip.
-    // Anything we cannot read or parse fails closed (#320): an unseen
-    // primary might be live, and silently skipping would risk leaving a
-    // `with:` entry naming the shredded person behind.
-    let ixn_skipped = ixn_skipped.lock().unwrap();
-    let mut live_undecryptable: Vec<String> = Vec::new();
-    for path in ixn_skipped.iter() {
-        let bytes = std::fs::read(root.join(path)).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot determine every interaction naming {client_id}: cannot re-read skipped envelope {path}: {e}"
-            )))
-        })?;
-        let env = confidant_crypt::envelope::parse(&bytes).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot determine every interaction naming {client_id}: skipped envelope {path} does not parse: {e}"
-            )))
-        })?;
-        // `envelope::parse` already validated the key id shape
-        // (`<client>/e<epoch>`); failure here is unreachable, but fail
-        // closed rather than silently defaulting to an empty client.
-        let client =
-            confidant_crypt::envelope::key_id_client(&env.key_id).map_err(|_| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot determine every interaction naming {client_id}: skipped envelope {path} has an undeterminable client"
-                )))
-            })?;
-        if live_clients.contains(client.as_str()) {
-            live_undecryptable.push(path.clone());
-        }
-    }
-    if !live_undecryptable.is_empty() {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) under a live primary could not be decrypted on this device; refusing to shred",
-            live_undecryptable.len()
-        )).with_fix(
-            "Run shred from a device enrolled for every live client, or resolve the undecryptable interaction files first",
-        )));
-    }
-    let ixn_refused = ixn_refused.lock().unwrap();
-    if !ixn_refused.is_empty() {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every interaction naming {client_id}: {} interaction envelope(s) were refused as tampered or corrupt; refusing to shred",
-            ixn_refused.len()
-        )).with_fix(
-            "Resolve the refused interaction envelopes first (check reports them as unreadable)",
-        )));
-    }
-    if let Some(bad) = vault.load_findings.iter().find(|f| {
-        f.file
-            .as_deref()
-            .is_some_and(|p| p.starts_with("interactions/"))
-    }) {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "cannot determine every interaction naming {client_id}: an interaction file could not be parsed ({}); refusing to shred",
-            bad.file.as_deref().unwrap_or("interactions/")
-        )).with_fix(
-            "Fix or remove the unparseable interaction file, then re-run shred",
-        )));
-    }
-
-    // Shred requires a keyed vault; the encryptor is the same write path an
-    // ordinary `record edit` uses (epoch selection + outer no-ai stamping).
-    let encryptor = record_crypto::RecordEncryptor::for_vault(root, &vault)?.ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid("shred requires an encrypted vault"))
-    })?;
-
-    // PLAN (#320): parse every `with:`, encrypt every rewrite, and read
-    // every original BEFORE touching the tree. Any refusal or encryption
-    // failure happens here, with the tree untouched.
-    struct PlannedRewrite {
-        path: String,
-        original: Vec<u8>,
-        envelope: Vec<u8>,
-    }
-    let mut plan: Vec<PlannedRewrite> = Vec::new();
-    for rec in vault.records.values() {
-        if rec.kind != RecordKind::Interaction {
-            continue;
-        }
-        let Some(raw_with) = rec.field("with") else {
-            continue;
-        };
-        let Some(mut with) = confidant_core::record::parse_with_list(raw_with) else {
-            return Err(anyhow::Error::new(DomainError::invalid(format!(
-                "cannot determine whether interaction {} names {client_id}: its `with:` list is malformed; refusing to shred",
-                rec.id
-            )).with_fix(
-                "Fix the interaction's `with:` list, then re-run shred",
-            )));
-        };
-        let before = with.len();
-        with.retain(|id| id.to_string() != client_id);
-        if with.len() == before {
-            continue;
-        }
-        let mut edited = rec.clone();
-        edited
-            .fields
-            .insert("with".to_owned(), format_with_list(&with));
-        let plaintext = confidant_core::format_record(&edited);
-        let envelope = encryptor
-            .encrypt_file(std::path::Path::new(&rec.path), plaintext.as_bytes())
-            .map_err(|e| {
-                anyhow::Error::new(DomainError::invalid(format!(
-                    "cannot re-encrypt interaction {}: {e}",
-                    rec.id
-                )))
-            })?;
-        let full_path = root.join(&rec.path);
-        let original = std::fs::read(&full_path).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot re-read interaction {} before rewrite: {e}",
-                rec.id
-            )))
-        })?;
-        plan.push(PlannedRewrite {
-            path: rec.path.clone(),
-            original,
-            envelope,
-        });
-    }
-    // APPLY: nothing above can refuse any more. Record each rewrite in the
-    // guard BEFORE it happens, so a mid-loop IO error still rolls back.
-    let mut rewritten = Vec::new();
-    for r in plan {
-        let full = root.join(&r.path);
-        guard.record(r.path.clone(), r.original);
-        std::fs::write(&full, &r.envelope).map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot write re-encrypted interaction {}: {e}",
-                r.path
-            )))
-        })?;
-        rewritten.push(r.path);
-    }
-    Ok(rewritten)
-}
-
-/// Serialize a participant list as a `with:` value (`[p-A, p-B]`).
-fn format_with_list(ids: &[confidant_core::id::RecordId]) -> String {
-    let inner = ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{inner}]")
-}
-
-/// #188: encrypt every record in a freshly generated plaintext bench vault,
-/// so the benchmark measures the decrypt path. Uses the test-overrides key
-/// sources (`CONFIDANT_DEVICE_KEY` + `CONFIDANT_TEST_OPERATOR_KEY` +
-/// `CONFIDANT_KEYCHAIN=off`), so it needs the `--all-features` build and no
-/// OS keychain. The plaintext is deleted before re-encrypting (the production
-/// `encrypt_file` refuses to rewrite plaintext in place, ⚠1) — fine for a
-/// throwaway bench vault that is never committed.
-fn encrypt_bench_vault(root: &Path) -> anyhow::Result<()> {
-    use age::secrecy::ExposeSecret;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
-
-    // Throwaway device + operator keys, injected via env (no OS keychain).
-    let device = age::x25519::Identity::generate();
-    let device_secret = device.to_string().expose_secret().to_owned();
-    let operator = SigningKey::generate(&mut OsRng);
-    let operator_hex = hex::encode(operator.to_bytes());
-    std::env::set_var(confidant_crypt::keychain::DEVICE_KEY_ENV, &device_secret);
-    std::env::set_var("CONFIDANT_TEST_OPERATOR_KEY", &operator_hex);
-    std::env::set_var("CONFIDANT_KEYCHAIN", "off");
-
-    // Isolate the operator config dir: `init` writes trust.toml under
-    // `$HOME/.config/confidant`, which must never touch the operator's real
-    // config during a benchmark. Point HOME at a throwaway dir OUTSIDE the
-    // vault (the anchor module refuses a trust anchor inside the vault, by
-    // design §4) and record its path in the vault so measuring later just
-    // re-exports the same HOME (see the hint at the end of this function).
-    // Both the subprocesses below and the in-process encryptor use it.
-    let bench_home = std::env::temp_dir().join(format!(
-        "confidant-bench-home-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&bench_home)?;
-    std::env::set_var("HOME", &bench_home);
-
-    let exe = std::env::current_exe()?;
-    let run = |args: &[&str], root: &Path| -> anyhow::Result<()> {
-        let out = std::process::Command::new(&exe)
-            .args(args)
-            .arg("--vault")
-            .arg(root)
-            .output()?;
-        anyhow::ensure!(
-            out.status.success(),
-            "{} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        Ok(())
-    };
-
-    // `bench-gen` writes files but no git repo; `init` needs one (and an
-    // identity) for its commit-per-write.
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["init", "-q"])
-        .output()?;
-    anyhow::ensure!(out.status.success(), "git init failed");
-    for (key, value) in [("user.email", "bench@example.com"), ("user.name", "Bench")] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["config", key, value])
-            .output()?;
-        anyhow::ensure!(out.status.success(), "git config {key} failed");
-    }
-    // Commit the generated files so `init` sees a clean tree.
-    for args in [&["add", "-A"][..], &["commit", "-qm", "bench vault"][..]] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()?;
-        anyhow::ensure!(out.status.success(), "git {} failed", args.join(" "));
-    }
-
-    // init: operator cert, device key, shared + lookup clients, anchor.
-    run(&["init", "--no-input"], root)?;
-
-    // The vault is now structurally encrypted (keys/ exists) but records are
-    // still plaintext; load it to enumerate person ids and record paths.
-    let vault = confidant_core::load_vault(root).map_err(anyhow::Error::new)?;
-    let persons: Vec<String> = vault
-        .records
-        .values()
-        .filter(|r| r.kind == RecordKind::Person)
-        .map(|r| r.id.to_string())
-        .collect();
-    for pid in &persons {
-        run(&["keys", "init-client", pid, "--no-input"], root)?;
-    }
-
-    // Encrypt each record in place: delete the plaintext first so the
-    // production `encrypt_file` (⚠1) treats it as a fresh write.
-    let encryptor = record_crypto::RecordEncryptor::for_vault(root, &vault)?
-        .ok_or_else(|| anyhow::anyhow!("bench vault is not encrypted after init"))?;
-    for rec in vault.records.values() {
-        let path = root.join(&rec.path);
-        let content = std::fs::read(&path)?;
-        std::fs::remove_file(&path)?;
-        let envelope = encryptor
-            .encrypt_file(std::path::Path::new(&rec.path), &content)
-            .map_err(|e| anyhow::anyhow!("encrypt {}: {e}", rec.path))?;
-        std::fs::write(&path, &envelope)?;
-    }
-    // Leave the throwaway device key beside the vault (0600, never
-    // committed — written after the last git commit above) so the benchmark
-    // can actually decrypt when measuring. The secret itself is never
-    // printed; only file paths are. Reads also need the throwaway trust
-    // anchor, which lives in the throwaway bench HOME whose path is
-    // recorded beside the vault (likewise uncommitted, and not a secret).
-    let key_path = root.join(".bench-device-key");
-    write_corpus_file(&key_path, device_secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("write bench device key: {e}"))?;
-    let home_path = root.join(".bench-home-path");
-    std::fs::write(&home_path, bench_home.to_string_lossy().as_bytes())
-        .map_err(|e| anyhow::anyhow!("write bench home path: {e}"))?;
-    eprintln!(
-        "bench vault encrypted; measure with HOME=$(cat {}) CONFIDANT_DEVICE_KEY=$(cat {})",
-        home_path.display(),
-        key_path.display()
-    );
-    Ok(())
-}
-
-fn cmd_keys_shred(cli: &Cli, root: &Path, client_id: &str) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{anchor, lifecycle::KeyStore};
-    validate_keys_client_id(client_id)?;
-    // B1: shred refuses both reserved ids.
-    if client_id == confidant_crypt::manifest::VAULT_CLIENT_ID
-        || client_id == confidant_crypt::manifest::SHARED_CLIENT_ID
-    {
-        return Err(anyhow::Error::new(DomainError::invalid(format!(
-            "refusing to shred reserved client id {client_id:?}"
-        ))));
-    }
-
-    let config_dir = confidant_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-
-    // #105 B4: load the inbox keypair once, through the same backend the
-    // rotation below will use, and refuse while the rotation window is
-    // already open. Fail closed on keychain errors; `NoKey` just means no
-    // inbox key on this device (the window is not open, and shred records
-    // the device-local reminder instead).
-    let backend = keychain_backend();
-    let inbox_keys = confidant_core::inbox::InboxKeys::load_opt_with(&*backend, Some(&config_dir))
+        .open(&note_path)
         .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!(
-                "cannot check inbox rotation window: {e}"
+            anyhow::Error::new(DomainError::internal(format!(
+                "cannot write scratch file {}: {e}",
+                note_path.display()
             )))
         })?;
-    if let Some(keys) = &inbox_keys {
-        if keys.has_previous() {
-            return Err(anyhow::Error::new(DomainError::invalid(
-                "inbox rotation window is already open (previous inbox key present); run `confidant inbox rotate --finish` first".to_string(),
-            )));
-        }
-    }
+    f.write_all(text.as_bytes()).map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot write scratch file {}: {e}",
+            note_path.display()
+        )))
+    })?;
+    f.sync_all().map_err(|e| {
+        anyhow::Error::new(DomainError::internal(format!(
+            "cannot sync scratch file {}: {e}",
+            note_path.display()
+        )))
+    })?;
 
-    let (anchor, _warnings) = anchor::load(&config_dir, root).map_err(anyhow::Error::new)?;
-    let identity = keys_device_identity()?;
-    let operator_sk = load_operator_sk(&anchor)?;
+    let guard = ScratchGuard::new(dir, vec![note_path.clone()]);
+    Ok((guard, note_path))
+}
 
-    // Collect all initialized clients for the strand check via
-    // manifest_clients() (not read_dir): it maps keys/shared to
-    // vault:shared correctly and only lists verified manifests.
-    // Skip vault:lookup (keys/vault) — shred handles it separately.
-    let vault = load_vault(root)?;
-    let keys_dir = root.join("keys");
-    let store = KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-    // Live clients (for the interaction-with: check below): every client
-    // whose key still exists, minus the reserved lookup id. An interaction
-    // under a client NOT in this set was shredded earlier and is skipped.
-    let all_clients: Vec<String> = store
-        .manifest_clients()
-        .into_iter()
-        .filter(|c| c != confidant_crypt::manifest::VAULT_CLIENT_ID)
-        .collect();
-    let live_clients: std::collections::HashSet<String> = all_clients.iter().cloned().collect();
-    // #179: delete edges naming the shredded person BEFORE destroying
-    // keys — discovery needs decryption, and a failure must abort before
-    // any irreversible key destruction. The deletions stage into the same
-    // signed shred commit below.
-    // #320: the edge deletions and interaction rewrites below mutate the
-    // working tree BEFORE `KeyStore::shred` runs. The guard records every
-    // mutation and rolls the tree back if ANY later step refuses — a strip
-    // refusal after the edges are gone, a mid-loop IO error, a
-    // `keys_shred_fresh_recipients` failure, or a `store.shred` refusal.
-    // Without this, a re-run cannot rediscover the mutations (a deleted
-    // edge no longer names the shredded person), and the edge stays in
-    // HEAD under `vault:shared`: a privacy leak, not just a dirty tree.
-    // Disarmed once shred succeeds, when the mutations become intentional.
-    let mut guard = ShredTreeGuard::new(root);
-    let deleted_edges = match delete_edges_naming(root, client_id, &mut guard) {
-        Ok(v) => v,
-        Err(e) => return Err(shred_restore(&mut guard, e)),
-    };
-    // #258: strip the shredded person from every interaction `with:` list
-    // the same way — before key destruction, through the normal write path,
-    // staged into the same shred commit.
-    let stripped_interactions =
-        match strip_participant_from_interactions(root, client_id, &live_clients, &mut guard) {
-            Ok(v) => v,
-            Err(e) => return Err(shred_restore(&mut guard, e)),
-        };
-    let all_refs: Vec<&str> = all_clients.iter().map(|s| s.as_str()).collect();
-
-    // Fresh recipients for the re-wrap: a fresh keypair for THIS device
-    // only, generated in memory. The fresh private key is NOT stored yet:
-    // it is stored only after `KeyStore::shred` returns Ok. A refused
-    // shred (verify-first) must leave this device's key unchanged, or the
-    // device is locked out of the still-unshredded vault.
-    // Other devices are NOT carried over — their old pubkeys would keep
-    // the shredded history openable (strict pubkey-reuse check in
-    // KeyStore::shred). They must re-enroll via `keys device-add`.
-    let (fresh_device_key, new_recipients) = match keys_shred_fresh_recipients() {
-        Ok(v) => v,
-        Err(e) => return Err(shred_restore(&mut guard, e)),
-    };
-
-    // #220: shred runs against a staged copy of keys/ with roll-forward
-    // (Frank's decision on #290). The mutation, check, marker, swap,
-    // anchor re-pin and device-key promotion all happen inside
-    // staged_shred_mutation; a crash at any point is recoverable via
-    // repair_keys_staging. B5: verify-first, strand check and the
-    // history-derived destroy list all come from KeyStore::shred —
-    // do not weaken them.
-    //
-    // #339: reload the vault AFTER the working-tree mutations above so
-    // the pre-swap check sees the post-shred record state (deleted edges,
-    // stripped interactions), as the old reload-and-check did.
-    let vault = load_vault(root)?;
-    let outcome = match staged_shred_mutation(
-        root,
-        &vault,
-        &config_dir,
-        &anchor,
-        &operator_sk,
-        identity.as_ref(),
-        client_id,
-        &all_refs,
-        &new_recipients,
-        &fresh_device_key,
-        deleted_edges.len(),
-        stripped_interactions.len(),
-        cli.no_input,
-        &mut guard,
-    ) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            // If the swap landed, staged_shred_mutation disarmed the guard:
-            // the shred is committed to rolling forward via the marker.
-            // Do NOT restore the working tree (that would be the privacy
-            // leak #320 closed); repair already ran inside.
-            if guard.is_armed() {
-                return Err(shred_restore(&mut guard, e));
-            }
-            return Err(e);
-        }
-    };
-    // The staged swap landed and the out-of-tree promotions completed
-    // (or the guard would still be armed): the working-tree mutations
-    // above are now intentional. The guard was disarmed on swap; this
-    // is a no-op safeguard.
-    guard.disarm();
-
-    // Delete this device's local search index (the QMD corpus + store): it
-    // is a plaintext mirror that may hold the shredded client's content, and
-    // it is now stale. Deleted ASAP so a later fallible step cannot leave it
-    // behind; other devices' indexes are unaffected (see the leftover
-    // warnings). Best-effort: failures become warnings, not errors.
-    let search_index_warnings = delete_search_index(root);
-
-    // #220: the anchor re-pin, operator-cert re-sign (into the staged
-    // tree), device-key promotion and phrase display all happened inside
-    // staged_shred_mutation before the swap. The check ran there too.
-    // B2: one commit.
-    let no_input = cli.no_input;
-    stage_keys(root, no_input)?;
-    // #179: stage the deleted edge files (deletions only, exact paths) so
-    // they land in the same signed shred commit. Only tracked paths: an
-    // edge file that was never committed has nothing to stage. Per-path,
-    // so unrelated unstaged changes under edges/ are not swept in.
-    if !deleted_edges.is_empty() {
-        let mut ls_args: Vec<&str> = vec!["ls-files", "-z", "--"];
-        ls_args.extend(deleted_edges.iter().map(String::as_str));
-        let listed = confidant_core::write::git(root, &ls_args, no_input)?;
-        let tracked: Vec<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
-        if !tracked.is_empty() {
-            let mut add_args: Vec<&str> = vec!["add", "--"];
-            add_args.extend(tracked);
-            confidant_core::write::git(root, &add_args, no_input)?;
-        }
-    }
-    // #258: stage the re-encrypted interaction files (modifications only,
-    // exact paths) so they land in the same signed shred commit. They are
-    // tracked (the interactions existed before the shred), so a plain
-    // `git add` stages the modification without sweeping unrelated files.
-    if !stripped_interactions.is_empty() {
-        let mut add_args: Vec<&str> = vec!["add", "--"];
-        add_args.extend(stripped_interactions.iter().map(String::as_str));
-        confidant_core::write::git(root, &add_args, no_input)?;
-    }
-    confidant_core::write::git(
-        root,
-        &["commit", "-m", &format!("keys: shred {client_id}")],
-        no_input,
-    )?;
-
-    // #105 B5: inbox interplay. The CLI decides (not the crypt layer):
-    // if this device holds the inbox key, run the rotation path now
-    // (anchor already re-pinned above). Otherwise write the device-local
-    // reminder.
-    let mut inbox_rotated = false;
-    if inbox_keys.is_some() {
-        // Run the inbox rotation on this device, through the same backend
-        // the window check used.
-        let vault_config = root.join("confidant.toml");
-        let user_config = config_dir.join("config.toml");
-        let opts = confidant_core::inbox::InboxRotateOptions {
-            finish: false,
-            allow_unsigned: false,
-            trusted_signers: Vec::new(),
-            pinned_pubkey: None,
-        };
-        confidant_core::inbox::run_inbox_rotate(
-            root,
-            &*backend,
-            Some(&config_dir),
-            &vault_config,
-            &user_config,
-            &opts,
-        )
+/// Run the operator's editor on a note's scratch file.
+#[cfg(unix)]
+pub(crate) fn run_note_editor(path: &Path) -> anyhow::Result<()> {
+    let editor = resolve_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(path)
+        .status()
         .map_err(|e| {
-            anyhow::Error::new(DomainError::invalid(format!("inbox rotation failed: {e}")))
+            anyhow::Error::new(DomainError::internal(format!(
+                "could not run editor '{editor}': {e}"
+            )))
         })?;
-        inbox_rotated = true;
-    } else {
-        // Off-inbox device: write the reminder (⚠5, #105 B3).
-        write_pending_inbox_rotation(&vault.config.vault_id, client_id)?;
+    if !status.success() {
+        return Err(anyhow::Error::new(
+            DomainError::invalid("editor exited with an error; the note was not changed")
+                .with_fix("Fix the note and retry, or use --file"),
+        ));
     }
-
-    // #154 must-fix 4: warn (do not fail) when git history is degraded, so
-    // the operator knows the shredded-client / retired-recovery checks only
-    // saw the working tree.
-    let mut shred_warnings = outcome.warnings.clone();
-    if let Some(w) = store.history_degraded_reason() {
-        eprintln!("warning: {w}");
-        shred_warnings.push(w);
-    }
-    let search_index_deleted = search_index_warnings.is_empty();
-    shred_warnings.extend(search_index_warnings);
-
-    if cli.json {
-        print_json(&serde_json::json!({
-            "ok": true,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": root.to_string_lossy(),
-            "client_id": client_id,
-            "destroy_key_ids": outcome.destroy_key_ids,
-            "warnings": shred_warnings,
-            "deleted_edges": &deleted_edges,
-            "stripped_interactions": stripped_interactions.len(),
-            "inbox_rotated": inbox_rotated,
-            "device_key_rotated": true,
-            "search_index_deleted": search_index_deleted,
-            "note": "this device was re-enrolled with a fresh keypair; other devices must re-enroll via `keys device-add`",
-        }))?;
-    } else {
-        println!("shredded client {client_id}");
-        println!("device key rotated: this device was re-enrolled with a fresh keypair");
-        println!("other devices were removed: re-enroll them with `keys device-add`");
-        if !deleted_edges.is_empty() {
-            println!(
-                "deleted {} edge(s) naming {client_id} (same commit)",
-                deleted_edges.len()
-            );
-        }
-        if !stripped_interactions.is_empty() {
-            println!(
-                "re-encrypted {} interaction(s) to remove {client_id} from their participant lists (same commit)",
-                stripped_interactions.len()
-            );
-        }
-        if search_index_deleted {
-            println!("local search index deleted (re-run `confidant reindex` to rebuild)");
-        }
-        if inbox_rotated {
-            println!(
-                "inbox key rotated (run `confidant inbox rotate --finish` to destroy the old key)"
-            );
-        } else {
-            println!(
-                "inbox rotation pending: this device does not hold the inbox key; reminder written"
-            );
-        }
-        println!(
-            "next: confirm the copy you just saved with `confidant keys verify-recovery --phrase-file <path>`"
-        );
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Print the structured failure for `keys verify-recovery`.
-///
-/// The error envelope is the ordinary ADR-7 shape (`ok:false`, stable
-/// `code`); `outcome` and `checks` are additive so `--json` still reports
-/// which checks passed. Never include words, positions, derived keys, or
-/// recipient fingerprints.
-fn verify_recovery_failure(
-    cli: &Cli,
-    root: &Path,
-    outcome: &str,
-    checks: Option<Value>,
-    err: DomainError,
-) -> anyhow::Result<ExitCode> {
-    let code = err.exit_code() as u8;
-    if cli.json {
-        let mut body = serde_json::json!({
-            "ok": false,
-            "schema_version": confidant_core::check::JSON_SCHEMA_VERSION,
-            "vault": vault_json(Some(root)),
-            "outcome": outcome,
-            "error": err.to_json(),
-        });
-        if let Some(checks) = checks {
-            body["checks"] = checks;
-        }
-        print_json(&body)?;
-    } else {
-        print_error(false, None, &err)?;
-    }
-    Ok(ExitCode::from(code))
-}
-
-/// `confidant keys verify-recovery` (#663): check a saved phrase without
-/// changing anything.
-///
-/// Match requires all of:
-/// 1. when `~/.config/confidant/trust.toml` exists, both its Ed25519
-///    `recovery_pubkey` and X25519 `recovery_age_recipient` match the
-///    phrase (and a disagreement never falls back to `keys/`);
-/// 2. when `keys/operator.toml` exists, its certificate verifies against
-///    the phrase-derived recovery pubkey;
-/// 3. the phrase identity trial-unwraps the current-epoch
-///    `wrapped/recovery.age` for every initialized client except the
-///    device-only `vault:lookup` key.
-fn cmd_keys_verify_recovery(
-    cli: &Cli,
-    root: &Path,
-    phrase_file: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
-    use confidant_crypt::{
-        anchor,
-        lifecycle::KeyStore,
-        manifest::{RECOVERY_KEY_ID, VAULT_CLIENT_ID},
-        recovery::Recovery,
-    };
-
-    // B7: stdin or --phrase-file only, never argv; zeroizing buffers.
-    let phrase = read_phrase(phrase_file)?;
-    let recovery = match Recovery::from_phrase(&phrase) {
-        Ok(recovery) => recovery,
-        Err(e) => {
-            drop(phrase);
-            // The position hint is stderr-only. The JSON error message is
-            // deliberately generic so no word position reaches --json.
-            eprintln!("hint: {e}");
-            return verify_recovery_failure(
-                cli,
-                root,
-                "malformed",
-                None,
-                DomainError::new(
-                    ErrorKind::RecoveryMalformed,
-                    "recovery phrase is malformed (expected 24 BIP39 words)",
-                )
-                .with_fix("Check the saved copy and re-enter the 24 words from it"),
-            );
-        }
-    };
-    drop(phrase);
-
-    let vault = load_vault(root)?;
-    let config_dir = confidant_config_dir().ok_or_else(|| {
-        anyhow::Error::new(DomainError::invalid(
-            "HOME is not set; cannot locate the operator config dir",
-        ))
-    })?;
-    let keys_dir = root.join("keys");
-    let trust_path = config_dir.join(anchor::TRUST_FILE);
-    let trust_exists = trust_path.is_file();
-
-    let derived_pubkey = recovery.verifying_key();
-    let derived_recipient = recovery.age_identity().to_recipient_string();
-
-    let mut anchor_pin: Option<anchor::Anchor> = None;
-    let mut anchor_state = "absent";
-    let mut recipient_state = "absent";
-    if trust_exists {
-        match anchor::load(&config_dir, root) {
-            Ok((loaded, _warnings)) => {
-                let (pubkey_matches, recipient_matches) =
-                    recovery_matches_anchor(&loaded, &recovery);
-                anchor_state = if pubkey_matches { "pass" } else { "fail" };
-                recipient_state = if recipient_matches { "pass" } else { "fail" };
-                anchor_pin = Some(loaded);
-            }
-            Err(e) => {
-                // The anchor exists but cannot be used: fail closed. Never
-                // fall back to the keys/ tree in this case.
-                let checks = serde_json::json!({
-                    "anchor": "fail",
-                    "recipient": "fail",
-                    "cert": "absent",
-                    "unwrap": {},
-                });
-                let err = DomainError::new(
-                    ErrorKind::RecoveryMismatch,
-                    format!(
-                        "trust anchor exists at {} but cannot be used: {e}",
-                        trust_path.display()
-                    ),
-                )
-                .with_fix(
-                    "Restore a valid trust.toml from backup; verify-recovery never falls back \
-                     to the vault's keys/ tree when an anchor exists",
-                );
-                return verify_recovery_failure(cli, root, "mismatch", Some(checks), err);
-            }
-        }
-    }
-
-    let store = KeyStore::with_config_dir(keys_dir.clone(), &vault.config.vault_id, &config_dir)
-        .map_err(anyhow::Error::new)?;
-
-    // A retired phrase is only knowable against a current anchor: the
-    // append-only history also records the current recipient, so membership
-    // alone would flag a healthy phrase after any rotation.
-    let retired = trust_exists
-        && recipient_state == "fail"
-        && store.recovery_history().contains(&derived_recipient);
-
-    // The operator certificate is what a fresh-device `recover` relies on.
-    let mut cert_state = "absent";
-    let mut cert_error: Option<String> = None;
-    if keys_dir.join(anchor::OPERATOR_CERT_FILE).is_file() {
-        match anchor::verify_operator_cert(&keys_dir, &vault.config.vault_id, &derived_pubkey) {
-            Ok(operator) => {
-                cert_state = "pass";
-                if anchor_pin.is_none() {
-                    // Fresh device: rebuild the anchor from the verified
-                    // certificate, exactly as `recover` does.
-                    anchor_pin = Some(anchor::Anchor {
-                        operator,
-                        recovery: derived_pubkey,
-                        recovery_age: derived_recipient.clone(),
-                        source: trust_path.clone(),
-                    });
-                }
-            }
-            Err(e) => {
-                cert_state = "fail";
-                cert_error = Some(e.to_string());
-            }
-        }
-    }
-
-    let identity = recovery.age_identity().to_age_identity().map_err(|e| {
-        anyhow::Error::new(DomainError::invalid(format!("bad recovery identity: {e}")))
-    })?;
-
-    let mut clients: Vec<String> = store
-        .manifest_clients()
-        .into_iter()
-        .filter(|c| c != VAULT_CLIENT_ID)
-        .collect();
-    clients.sort();
-
-    let mut unwrap = serde_json::Map::new();
-    let mut unwrap_failed = false;
-    let mut unwrap_error: Option<(String, String)> = None;
-    if let Some(anchor) = &anchor_pin {
-        for client_id in &clients {
-            let result = (|| -> Result<(), String> {
-                let epoch = store.current_epoch(client_id).map_err(|e| e.to_string())?;
-                // The trial key is a DataKey (zeroizing). Drop it right
-                // here: it is never returned, logged, or cached.
-                let key = store
-                    .trial_unwrap_data_key(client_id, RECOVERY_KEY_ID, epoch, &identity, anchor)
-                    .map_err(|e| e.to_string())?;
-                drop(key);
-                Ok(())
-            })();
-            match result {
-                Ok(()) => {
-                    unwrap.insert(client_id.clone(), Value::String("pass".to_owned()));
-                }
-                Err(e) => {
-                    unwrap_failed = true;
-                    unwrap_error.get_or_insert_with(|| (client_id.clone(), e));
-                    unwrap.insert(client_id.clone(), Value::String("fail".to_owned()));
-                }
-            }
-        }
-    }
-
-    let checks = serde_json::json!({
-        "anchor": anchor_state,
-        "recipient": recipient_state,
-        "cert": cert_state,
-        "unwrap": Value::Object(unwrap),
-    });
-
-    let outcome = if retired {
-        "retired"
-    } else if anchor_state == "fail" || recipient_state == "fail" || cert_state == "fail" {
-        "mismatch"
-    } else if unwrap_failed {
-        "unwrap_failed"
-    } else if anchor_pin.is_none() {
-        // Nothing to verify against: no anchor, no operator certificate.
-        "mismatch"
-    } else {
-        "match"
-    };
-
-    if outcome != "match" {
-        let err = match outcome {
-            "retired" => DomainError::new(
-                ErrorKind::RecoveryRetired,
-                "this is a retired recovery phrase (a later `recover` or `keys shred` replaced it)",
-            )
-            .with_fix(
-                "Destroy that copy: it still opens the vault's history, but it cannot recover \
-                 the current device. Use the current phrase.",
-            ),
-            "unwrap_failed" => {
-                let (client_id, detail) = unwrap_error
-                    .unwrap_or_else(|| ("unknown".to_owned(), "unwrap failed".to_owned()));
-                DomainError::new(
-                    ErrorKind::RecoveryUnwrap,
-                    format!(
-                        "the phrase matches the pinned keys but cannot unwrap the current data \
-                         key for {client_id}: {detail}"
-                    ),
-                )
-                .with_fix(
-                    "Re-check the saved copy; if trust.toml was restored from an old backup, \
-                     restore the current one",
-                )
-            }
-            _ => {
-                if anchor_state == "fail" {
-                    DomainError::new(
-                        ErrorKind::RecoveryMismatch,
-                        "recovery phrase does not match this vault's trust anchor",
-                    )
-                    .with_fix("Use the current phrase; do not run `recover` with this copy")
-                } else if recipient_state == "fail" {
-                    DomainError::new(
-                        ErrorKind::RecoveryMismatch,
-                        "recovery phrase does not match this vault's trust anchor (recovery recipient)",
-                    )
-                    .with_fix("Use the current phrase; do not run `recover` with this copy")
-                } else if cert_state == "fail" {
-                    DomainError::new(
-                        ErrorKind::RecoveryMismatch,
-                        format!(
-                            "operator certificate does not verify against this recovery phrase: {}",
-                            cert_error.as_deref().unwrap_or("signature check failed")
-                        ),
-                    )
-                    .with_fix(
-                        "Use the current phrase; a fresh-device `recover` with this copy would \
-                         fail the same way",
-                    )
-                } else {
-                    DomainError::new(
-                        ErrorKind::RecoveryMismatch,
-                        "cannot verify this phrase: the vault has neither a trust anchor nor an \
-                         operator certificate",
-                    )
-                    .with_fix(
-                        "Restore ~/.config/confidant/trust.toml from a backup; pre-certificate \
-                         vaults cannot verify a phrase without one",
-                    )
-                }
-            }
-        };
-        return verify_recovery_failure(cli, root, outcome, Some(checks), err);
-    }
-
-    if cli.json {
-        print_json(&ok_envelope(
-            Some(root),
-            serde_json::json!({
-                "outcome": "match",
-                "checks": checks,
-                "clients_checked": clients.len(),
-            }),
-        ))?;
-    } else {
-        println!("recovery phrase matches this vault");
-        match anchor_state {
-            "pass" => println!("  trust anchor  both recovery halves match"),
-            _ => println!("  trust anchor  not on this device (verified from keys/)"),
-        }
-        match cert_state {
-            "pass" => println!("  certificate   verified against the phrase"),
-            _ => println!("  certificate   not present in keys/"),
-        }
-        println!(
-            "  data keys     {} client(s) opened with the phrase",
-            clients.len()
-        );
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 fn print_error(json: bool, vault: Option<&str>, err: &DomainError) -> io::Result<()> {
@@ -16651,6 +8615,65 @@ backup\tgit@host.example:org/repo.git (push)
         assert!(parse_git_remotes("").is_empty());
     }
 
+    /// #660: transport classification decides whether a vault's content
+    /// crosses the network readable. Encrypted and local transports are
+    /// safe; `http://` and `git://` are cleartext; an unknown scheme is
+    /// left unverified.
+    #[test]
+    fn git_remote_transport_classification() {
+        use super::{remote_transport, RemoteTransport};
+        for url in [
+            "https://host.example/org/repo.git",
+            "HTTPS://host.example/org/repo.git",
+            "ssh://git@host.example/org/repo.git",
+            "git@host.example:org/repo.git",
+            "host.example:org/repo.git",
+            "file:///srv/remote.git",
+            "/srv/remote.git",
+            "../remote.git",
+            "remote.git",
+        ] {
+            assert_eq!(remote_transport(url), RemoteTransport::Safe, "{url}");
+        }
+        assert_eq!(
+            remote_transport("http://host.example/org/repo.git"),
+            RemoteTransport::Cleartext("http")
+        );
+        assert_eq!(
+            remote_transport("git://host.example/org/repo.git"),
+            RemoteTransport::Cleartext("git")
+        );
+        assert_eq!(
+            remote_transport("ftp://host.example/org/repo.git"),
+            RemoteTransport::Unverified
+        );
+    }
+
+    /// `git remote -v` can list distinct fetch and push URLs; both survive
+    /// parsing under the remote's name.
+    #[test]
+    fn git_remote_urls_keep_fetch_and_push() {
+        use super::parse_git_remote_urls;
+        let out = "\
+origin\thttps://host.example/org/repo.git (fetch)
+origin\tssh://git@host.example/org/repo.git (push)
+";
+        assert_eq!(
+            parse_git_remote_urls(out),
+            vec![
+                (
+                    "origin".to_owned(),
+                    "https://host.example/org/repo.git".to_owned()
+                ),
+                (
+                    "origin".to_owned(),
+                    "ssh://git@host.example/org/repo.git".to_owned()
+                ),
+            ]
+        );
+        assert!(parse_git_remote_urls("").is_empty());
+    }
+
     /// #665: `git rev-list --left-right --count @{u}...HEAD` prints
     /// `<behind>\t<ahead>`; the right column is ahead, not behind.
     #[test]
@@ -16694,58 +8717,6 @@ backup\tgit@host.example:org/repo.git (push)
         assert_eq!(sync_push_refspec("origin", "origin/"), None);
     }
 
-    /// #653(d): `findmnt` output is a device path with an optional btrfs
-    /// subvolume suffix; non-block sources cannot be traced through
-    /// `lsblk` and must report status "unknown" (#709), never `ok`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn findmnt_source_parser() {
-        use super::parse_findmnt_source;
-        assert_eq!(
-            parse_findmnt_source("/dev/nvme0n1p2\n"),
-            Some("/dev/nvme0n1p2".to_owned())
-        );
-        assert_eq!(
-            parse_findmnt_source("/dev/sda2[/@root]\n"),
-            Some("/dev/sda2".to_owned())
-        );
-        assert_eq!(parse_findmnt_source("overlay\n"), None);
-        assert_eq!(parse_findmnt_source("UUID=abcd-1234\n"), None);
-        assert_eq!(parse_findmnt_source("\n"), None);
-    }
-
-    /// #709: the `disk-encryption` decision for every probe shape.
-    /// Undetermined shapes (no source, no TYPE list, empty TYPE list)
-    /// are `unknown`, never `ok`; only a readable ancestry decides
-    /// between `ok` (crypt present) and `warning` (no crypt).
-    #[test]
-    fn disk_encryption_check_status_rules() {
-        use super::disk_encryption_check_from;
-        // No source: findmnt missing, failed, or a non-block root
-        // (e.g. overlay on a VM/container) — the issue's shape.
-        let c = disk_encryption_check_from(None, None, "root filesystem is not on a block device");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("could not determine disk encryption"));
-        assert!(c.message.contains("not on a block device"));
-        assert!(c.fix.is_none());
-        // A device but no TYPE list: lsblk missing or failed.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), None, "lsblk is not available");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("lsblk is not available"));
-        // A device with an empty TYPE list: lsblk ran, said nothing.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some(""), "lsblk is not available");
-        assert_eq!(c.status, "unknown");
-        assert!(c.message.contains("lsblk returned no device types"));
-        // Determined outcomes are unchanged.
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("crypt\npart\ndisk\n"), "");
-        assert_eq!(c.status, "ok");
-        assert!(c.message.contains("encrypted device"));
-        let c = disk_encryption_check_from(Some("/dev/sda2"), Some("part\ndisk\n"), "");
-        assert_eq!(c.status, "warning");
-        assert!(c.message.contains("not on an encrypted disk"));
-        assert!(c.fix.is_some());
-    }
-
     /// #709: staleness the fetch cannot determine is `unknown`, not
     /// `ok`; an operator opt-out is the only `ok` non-determination.
     #[test]
@@ -16761,16 +8732,6 @@ backup\tgit@host.example:org/repo.git (push)
         let c = cli_staleness_check(None, true);
         assert_eq!(c.status, "ok");
         assert!(c.message.contains("disabled"));
-    }
-
-    /// #653(d): only a `crypt` ancestor means the root disk is encrypted.
-    #[test]
-    fn lsblk_types_detect_crypt() {
-        use super::lsblk_types_include_crypt;
-        assert!(lsblk_types_include_crypt("lvm\ncrypt\npart\ndisk\n"));
-        assert!(lsblk_types_include_crypt("crypt\n"));
-        assert!(!lsblk_types_include_crypt("lvm\npart\ndisk\n"));
-        assert!(!lsblk_types_include_crypt(""));
     }
 
     /// #542: a `confidant <command>` hint in `reject_unsupported_prefix`
@@ -16903,585 +8864,25 @@ backup\tgit@host.example:org/repo.git (push)
     #[test]
     fn git_version_check_status_rules() {
         // At or above the floor is ok either way.
-        let c = git_version_check_from(Some(MIN_GIT_VERSION), true);
+        let c = git_version_check_from(Some(MIN_GIT_VERSION));
         assert_eq!(c.status, "ok");
         assert!(c.message.contains("2.34.0"));
-        let c = git_version_check_from(Some((2, 50, 0)), false);
+        let c = git_version_check_from(Some((2, 50, 0)));
         assert_eq!(c.status, "ok");
 
-        // Below the floor: error with signers (signature verification in
-        // use), warning without (nothing verifies signatures).
-        let c = git_version_check_from(Some((2, 33, 0)), true);
-        assert_eq!(c.status, "error");
-        assert!(c.message.contains("upgrade git to >= 2.34.0"));
-        assert!(c.message.contains("SSH-signed inbox commits"));
-        let c = git_version_check_from(Some((2, 33, 0)), false);
+        // Below the floor: a warning, never an error (nothing here verifies
+        // signatures).
+        let c = git_version_check_from(Some((2, 33, 0)));
         assert_eq!(c.status, "warning");
         assert!(c.message.contains("upgrade git to >= 2.34.0"));
+        assert!(c.message.contains("upgrade git to >="));
 
         // Undetermined version is `unknown` (#709), warning-tier, never
         // an error and never `ok`.
-        let c = git_version_check_from(None, true);
+        let c = git_version_check_from(None);
         assert_eq!(c.status, "unknown");
     }
 
-    /// Snapshot a directory tree as sorted (relative path, bytes) pairs,
-    /// for byte-identical comparisons of `keys/`.
-    fn snapshot_tree(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-        fn walk(
-            dir: &std::path::Path,
-            base: &std::path::Path,
-            out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
-        ) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                let p = entry.path();
-                if p.is_dir() {
-                    walk(&p, base, out);
-                } else if p.is_file() {
-                    out.push((
-                        p.strip_prefix(base).unwrap().to_path_buf(),
-                        std::fs::read(&p).unwrap(),
-                    ));
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(dir, dir, &mut out);
-        out.sort();
-        out
-    }
-
-    /// Minimal vault dir (confidant.toml only) + a fake `keys/` tree +
-    /// a seq tracker, for staging-helper tests.
-    fn staging_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("vault");
-        let config_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            root.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("keys/client-a/wrapped")).unwrap();
-        std::fs::write(root.join("keys/client-a/recipients.toml"), "seq = 1\n").unwrap();
-        std::fs::write(root.join("keys/client-a/wrapped/abc.age"), b"wrapped").unwrap();
-        std::fs::write(
-            root.join("keys/recovery-recipients.toml"),
-            "recipients = []\n",
-        )
-        .unwrap();
-        std::fs::write(
-            config_dir.join("manifest-seq.toml"),
-            "[01TEST00000000000000000000]\nclient-a = 3\n",
-        )
-        .unwrap();
-        (tmp, root, config_dir)
-    }
-
-    #[test]
-    fn staged_keys_mutation_failure_leaves_keys_and_tracker_untouched() {
-        // #175: a failing mutation must leave keys/ byte-identical, the
-        // real tracker untouched, and no staging leftovers. The helper
-        // cannot distinguish "before" vs "mid" mutation — the cleanup
-        // path is identical — so a failing closure proves the mechanics;
-        // the CLI check-failure tests prove a fully-mutated stage is
-        // discarded too.
-        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, staged_keys_mutation};
-        let (_tmp, root, config_dir) = staging_fixture();
-        let before = snapshot_tree(&root.join("keys"));
-        let vault = confidant_core::load_vault(&root).unwrap();
-        let err =
-            staged_keys_mutation(&root, &vault, &config_dir, |_store| -> anyhow::Result<()> {
-                Err(anyhow::anyhow!("injected failure"))
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("injected failure"));
-        assert_eq!(snapshot_tree(&root.join("keys")), before);
-        assert_eq!(
-            std::fs::read_to_string(config_dir.join("manifest-seq.toml")).unwrap(),
-            "[01TEST00000000000000000000]\nclient-a = 3\n"
-        );
-        assert!(!keys_stage_dir(&root).exists());
-        assert!(!keys_old_dir(&root).exists());
-        assert!(!keys_staged_tracker_path(&config_dir).exists());
-    }
-
-    #[test]
-    fn repair_keys_staging_restores_mid_swap() {
-        // Crash after the first rename: keys/ missing, keys.old holds
-        // the old tree, stage + staged tracker are stale.
-        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, repair_keys_staging};
-        let (_tmp, root, config_dir) = staging_fixture();
-        std::fs::create_dir_all(root.join(".confidant")).unwrap();
-        std::fs::rename(root.join("keys"), keys_old_dir(&root)).unwrap();
-        std::fs::create_dir_all(keys_stage_dir(&root)).unwrap();
-        std::fs::write(keys_stage_dir(&root).join("sentinel"), b"stale").unwrap();
-        std::fs::write(keys_staged_tracker_path(&config_dir), b"stale").unwrap();
-        repair_keys_staging(&root, &config_dir).unwrap();
-        assert!(root.join("keys/client-a/recipients.toml").is_file());
-        assert!(!keys_old_dir(&root).exists());
-        assert!(!keys_stage_dir(&root).exists());
-        assert!(!keys_staged_tracker_path(&config_dir).exists());
-    }
-
-    #[test]
-    fn repair_keys_staging_cleans_completed_swap() {
-        // Swap completed (keys/ is the new tree), cleanup never ran:
-        // keys.old is deleted, keys/ is untouched.
-        use super::{keys_old_dir, repair_keys_staging};
-        let (_tmp, root, config_dir) = staging_fixture();
-        let before = snapshot_tree(&root.join("keys"));
-        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
-        std::fs::write(keys_old_dir(&root).join("sentinel"), b"old").unwrap();
-        repair_keys_staging(&root, &config_dir).unwrap();
-        assert_eq!(snapshot_tree(&root.join("keys")), before);
-        assert!(!keys_old_dir(&root).exists());
-    }
-
-    #[test]
-    fn repair_keys_staging_refuses_inconsistent_state() {
-        // keys/ missing with a stage but no backup: the copy never
-        // deletes keys/, so this means external interference — refuse
-        // to guess.
-        use super::{keys_stage_dir, repair_keys_staging};
-        let (_tmp, root, config_dir) = staging_fixture();
-        std::fs::remove_dir_all(root.join("keys")).unwrap();
-        std::fs::create_dir_all(keys_stage_dir(&root)).unwrap();
-        assert!(repair_keys_staging(&root, &config_dir).is_err());
-    }
-
-    /// Fixture for shred-marker repair tests: a vault root with keys/,
-    /// a config dir with a valid trust.toml, and a test keychain dir.
-    /// Returns (tmp, root, config_dir, keychain_dir, env_guard) — the
-    /// guard restores `CONFIDANT_TEST_KEYCHAIN_DIR` on drop.
-    ///
-    /// NOTE: the marker tests manipulate the process-global
-    /// `CONFIDANT_TEST_KEYCHAIN_DIR`; they take `KEYCHAIN_ENV_LOCK` to
-    /// serialize against each other.
-    static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores `CONFIDANT_TEST_KEYCHAIN_DIR` to its previous value (or
-    /// unsets it) on drop, so marker tests don't leak the process-global
-    /// env var into other tests running in the same binary.
-    struct KeychainEnvGuard {
-        old: Option<std::ffi::OsString>,
-    }
-
-    impl KeychainEnvGuard {
-        fn set_dir(dir: &std::path::Path) -> Self {
-            let old = std::env::var_os("CONFIDANT_TEST_KEYCHAIN_DIR");
-            std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", dir);
-            Self { old }
-        }
-    }
-
-    impl Drop for KeychainEnvGuard {
-        fn drop(&mut self) {
-            match self.old.take() {
-                Some(v) => std::env::set_var("CONFIDANT_TEST_KEYCHAIN_DIR", v),
-                None => std::env::remove_var("CONFIDANT_TEST_KEYCHAIN_DIR"),
-            }
-        }
-    }
-
-    fn shred_marker_fixture() -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        KeychainEnvGuard,
-    ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("vault");
-        let config_dir = tmp.path().join("config");
-        let keychain_dir = tmp.path().join("keychain");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::create_dir_all(&keychain_dir).unwrap();
-        // Minimal vault.
-        std::fs::write(
-            root.join("confidant.toml"),
-            "spec = \"0.1\"\npacks = []\nvault_id = \"01TEST00000000000000000000\"\n",
-        )
-        .unwrap();
-        // Old keys/ tree (sentinel to distinguish from the new tree).
-        std::fs::create_dir_all(root.join("keys")).unwrap();
-        std::fs::write(root.join("keys").join("OLD_TREE"), b"old").unwrap();
-        // Valid trust.toml with generated keys.
-        let operator_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let hex = |k: &[u8]| k.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let trust_toml = format!(
-            "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3\"\n",
-            hex(operator_sk.verifying_key().as_bytes()),
-            hex(recovery_sk.verifying_key().as_bytes()),
-        );
-        std::fs::write(config_dir.join("trust.toml"), trust_toml).unwrap();
-        // Test keychain with an old device key.
-        std::fs::write(keychain_dir.join("device.key"), b"OLD_DEVICE_KEY").unwrap();
-        // Point the test keychain at our dir (restored on drop by the guard).
-        let env_guard = KeychainEnvGuard::set_dir(&keychain_dir);
-        (tmp, root, config_dir, keychain_dir, env_guard)
-    }
-
-    fn write_test_marker(path: &std::path::Path, recovery_vk_hex: &str, device_key: &str) {
-        use super::{write_shred_marker, ShredStageMarker, SHRED_MARKER_VERSION};
-        let marker = ShredStageMarker {
-            version: SHRED_MARKER_VERSION,
-            recovery_verifying_key_hex: recovery_vk_hex.to_owned(),
-            recovery_age_recipient: "age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3".to_string(),
-            device_key_bech32: device_key.to_owned(),
-        };
-        write_shred_marker(path, &marker).unwrap();
-    }
-
-    #[test]
-    fn shred_marker_pre_swap_rolls_forward() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220: crash after check, before swap (marker in .confidant/).
-        // Repair must finish the swap, re-pin the anchor, promote the
-        // device key, and clear the marker — never discard the stage.
-        use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let stage = keys_stage_dir(&root);
-        std::fs::create_dir_all(&stage).unwrap();
-        // New tree in the stage (sentinel).
-        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
-        // Marker in .confidant/ with new anchor material and device key.
-        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let new_vk_hex: String = new_recovery_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
-        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-
-        repair_keys_staging(&root, &config_dir).unwrap();
-
-        // Swap completed: keys/ holds the new tree, old tree gone.
-        assert!(root.join("keys/NEW_TREE").is_file());
-        assert!(!root.join("keys/OLD_TREE").exists());
-        assert!(!root.join(".confidant/keys.old").exists());
-        assert!(!stage.exists());
-        // Marker cleared from .confidant/.
-        assert!(!shred_marker_path(&root).exists());
-        // Anchor re-pinned to the new recovery key.
-        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-        assert_ne!(new_anchor, old_anchor);
-        assert!(new_anchor.contains(&new_vk_hex));
-        // Device key promoted.
-        let device_key = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
-        assert_eq!(device_key, "NEW_DEVICE_KEY");
-    }
-
-    #[test]
-    fn shred_marker_post_swap_finishes_promotions() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220: crash after swap, before re-pin (marker in .confidant/,
-        // keys.old present, keys/ is the new tree). Repair must finish
-        // the re-pin and device-key promotion from the marker, then
-        // clear it.
-        use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let keys_dir = root.join("keys");
-        // Simulate post-swap: new tree in keys/, old tree in keys.old.
-        std::fs::write(keys_dir.join("NEW_TREE"), b"new").unwrap();
-        std::fs::remove_file(keys_dir.join("OLD_TREE")).unwrap();
-        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
-        std::fs::write(keys_old_dir(&root).join("OLD_TREE"), b"old").unwrap();
-        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let new_vk_hex: String = new_recovery_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
-        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-
-        repair_keys_staging(&root, &config_dir).unwrap();
-
-        // Marker cleared, anchor re-pinned, device key promoted.
-        assert!(!shred_marker_path(&root).exists());
-        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-        assert_ne!(new_anchor, old_anchor);
-        assert!(new_anchor.contains(&new_vk_hex));
-        let device_key = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
-        assert_eq!(device_key, "NEW_DEVICE_KEY");
-        // keys/ untouched apart from the swap; old tree cleaned up.
-        assert!(keys_dir.join("NEW_TREE").is_file());
-        assert!(!keys_old_dir(&root).exists());
-    }
-
-    #[test]
-    fn shred_no_marker_discards_stage() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220: crash during mutate/check (no marker). The stage is
-        // discarded; keys/ and the anchor are untouched.
-        use super::{keys_stage_dir, repair_keys_staging};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let stage = keys_stage_dir(&root);
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("PARTIAL"), b"partial").unwrap();
-        let keys_before: Vec<_> = std::fs::read_dir(root.join("keys"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        let anchor_before = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-        let device_before = std::fs::read_to_string(_keychain.join("device.key")).unwrap();
-
-        repair_keys_staging(&root, &config_dir).unwrap();
-
-        // Stage discarded, keys/ byte-identical, anchor and device key untouched.
-        assert!(!stage.exists());
-        let keys_after: Vec<_> = std::fs::read_dir(root.join("keys"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(keys_before, keys_after);
-        assert_eq!(
-            std::fs::read_to_string(config_dir.join("trust.toml")).unwrap(),
-            anchor_before
-        );
-        assert_eq!(
-            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
-            device_before
-        );
-    }
-
-    #[test]
-    fn shred_marker_post_repin_is_safe_noop() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220/#339: crash after the re-pin, before marker removal.
-        // Repair must be a safe no-op re-run (idempotent re-pin and
-        // device-key promotion), then clear the marker. A second run
-        // must also succeed.
-        use super::{keys_old_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let keys_dir = root.join("keys");
-        // Simulate post-re-pin: new tree in keys/, old tree in keys.old,
-        // anchor ALREADY re-pinned, device key ALREADY promoted.
-        std::fs::write(keys_dir.join("NEW_TREE"), b"new").unwrap();
-        std::fs::remove_file(keys_dir.join("OLD_TREE")).unwrap();
-        std::fs::create_dir_all(keys_old_dir(&root)).unwrap();
-        std::fs::write(keys_old_dir(&root).join("OLD_TREE"), b"old").unwrap();
-        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let new_vk_hex: String = new_recovery_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        // Pre-pin the anchor and promote the device key (as a crash
-        // after step 5 would have left them).
-        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
-        // Manually re-pin: rewrite trust.toml with the new recovery key
-        // (keeping a valid operator pubkey).
-        let operator_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let operator_hex: String = operator_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let trust_toml = format!(
-            "[trust]\noperator_pubkey = \"{}\"\nrecovery_pubkey = \"{}\"\nrecovery_age_recipient = \"age1ql5z7k2dpq6x9x8v4n3m2l1k0j9h8g7f6d5s4a3\"\n",
-            operator_hex, new_vk_hex
-        );
-        std::fs::write(config_dir.join("trust.toml"), &trust_toml).unwrap();
-        std::fs::write(_keychain.join("device.key"), b"NEW_DEVICE_KEY").unwrap();
-        let anchor_before = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-
-        // First repair: idempotent re-run, then clear marker.
-        repair_keys_staging(&root, &config_dir).unwrap();
-        assert!(!shred_marker_path(&root).exists());
-        // Anchor still the new key (re-pin was a no-op).
-        assert_eq!(
-            std::fs::read_to_string(config_dir.join("trust.toml")).unwrap(),
-            anchor_before
-        );
-        // Device key still promoted.
-        assert_eq!(
-            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
-            "NEW_DEVICE_KEY"
-        );
-        // keys/ still the new tree.
-        assert!(keys_dir.join("NEW_TREE").is_file());
-
-        // Second repair: no marker, normal path, succeeds.
-        repair_keys_staging(&root, &config_dir).unwrap();
-        assert!(keys_dir.join("NEW_TREE").is_file());
-    }
-
-    #[test]
-    fn shred_marker_mid_swap_completes_swap() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220/#339: mid-swap crash. Marker in .confidant/, keys/
-        // missing, keys.old present (old tree), stage present (new tree).
-        // Repair must complete the swap, then finish promotions.
-        use super::{keys_old_dir, keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let stage = keys_stage_dir(&root);
-        // Simulate mid-swap: keys/ -> keys.old done, stage -> keys/ not.
-        std::fs::create_dir_all(root.join(".confidant")).unwrap();
-        std::fs::rename(root.join("keys"), keys_old_dir(&root)).unwrap();
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
-        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let new_vk_hex: String = new_recovery_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
-
-        repair_keys_staging(&root, &config_dir).unwrap();
-
-        // Swap completed, promotions done, marker cleared.
-        assert!(root.join("keys/NEW_TREE").is_file());
-        assert!(!root.join("keys/OLD_TREE").exists());
-        assert!(!keys_old_dir(&root).exists());
-        assert!(!stage.exists());
-        assert!(!shred_marker_path(&root).exists());
-        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-        assert!(new_anchor.contains(&new_vk_hex));
-        assert_eq!(
-            std::fs::read_to_string(_keychain.join("device.key")).unwrap(),
-            "NEW_DEVICE_KEY"
-        );
-    }
-
-    #[test]
-    fn shred_marker_corrupt_fails_closed() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #339: a corrupt or empty marker must fail closed, and the error
-        // must NOT quote the marker content (it may hold a private key).
-        use super::{repair_keys_staging, shred_marker_path};
-        for (name, content) in [
-            (
-                "corrupt",
-                "version = 1\ndevice_key_bech32 = \"SECRET_KEY_MATERIAL_12345\"\n###garbage###",
-            ),
-            ("empty", ""),
-            (
-                "truncated",
-                "version = 1\nrecovery_verifying_key_hex = \"ab",
-            ),
-        ] {
-            let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-            let marker_path = shred_marker_path(&root);
-            std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-            std::fs::write(&marker_path, content).unwrap();
-            let err = repair_keys_staging(&root, &config_dir).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                !msg.contains("SECRET_KEY_MATERIAL_12345"),
-                "{name}: error leaked marker content: {msg}"
-            );
-            assert!(
-                !msg.contains("garbage"),
-                "{name}: error leaked marker content: {msg}"
-            );
-            // keys/ untouched.
-            assert!(root.join("keys/OLD_TREE").is_file());
-        }
-    }
-
-    #[test]
-    fn shred_marker_other_op_rolls_forward() {
-        let _lock = KEYCHAIN_ENV_LOCK.lock().unwrap();
-        // #220/#339, #99 rule: a different key operation (e.g. rotate)
-        // starting while a shred marker exists must finish the shred
-        // first via repair_keys_staging, not clobber it. The marker takes
-        // precedence over the normal "discard the stage" path.
-        use super::{keys_stage_dir, repair_keys_staging, shred_marker_path};
-        let (_tmp, root, config_dir, _keychain, _env_guard) = shred_marker_fixture();
-        let stage = keys_stage_dir(&root);
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("NEW_TREE"), b"new").unwrap();
-        let new_recovery_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let new_vk_hex: String = new_recovery_sk
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        write_test_marker(&shred_marker_path(&root), &new_vk_hex, "NEW_DEVICE_KEY");
-        let old_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-
-        // This is what `keys rotate` / `keys init-client` call first.
-        repair_keys_staging(&root, &config_dir).unwrap();
-
-        // The shred rolled forward (not discarded): new tree swapped in,
-        // anchor re-pinned to the marker's key, marker cleared.
-        assert!(root.join("keys/NEW_TREE").is_file());
-        assert!(!stage.exists());
-        assert!(!shred_marker_path(&root).exists());
-        let new_anchor = std::fs::read_to_string(config_dir.join("trust.toml")).unwrap();
-        assert_ne!(new_anchor, old_anchor);
-        assert!(new_anchor.contains(&new_vk_hex));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn staged_keys_mutation_copy_failure_leaves_no_leftovers() {
-        // #175: a symlink in keys/ makes the staged copy fail — the
-        // partial stage must be cleaned up, not left behind.
-        use super::{keys_old_dir, keys_stage_dir, keys_staged_tracker_path, staged_keys_mutation};
-        let (_tmp, root, config_dir) = staging_fixture();
-        std::os::unix::fs::symlink(
-            root.join("keys/client-a/recipients.toml"),
-            root.join("keys/link.toml"),
-        )
-        .unwrap();
-        let vault = confidant_core::load_vault(&root).unwrap();
-        let err =
-            staged_keys_mutation(&root, &vault, &config_dir, |_store| -> anyhow::Result<()> {
-                Ok(())
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("symlink"));
-        assert!(root.join("keys/link.toml").exists());
-        assert!(!keys_stage_dir(&root).exists());
-        assert!(!keys_old_dir(&root).exists());
-        assert!(!keys_staged_tracker_path(&config_dir).exists());
-    }
-
-    #[test]
-    fn copy_dir_recursive_copies_tree_and_refuses_symlink() {
-        use super::copy_dir_recursive;
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("a.txt"), b"a").unwrap();
-        std::fs::write(src.join("sub/b.txt"), b"b").unwrap();
-        copy_dir_recursive(&src, &dst).unwrap();
-        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
-        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"b");
-
-        #[cfg(unix)]
-        {
-            let src2 = tmp.path().join("src2");
-            let dst2 = tmp.path().join("dst2");
-            std::fs::create_dir_all(&src2).unwrap();
-            std::fs::write(src2.join("real.txt"), b"real").unwrap();
-            std::os::unix::fs::symlink(src2.join("real.txt"), src2.join("link.txt")).unwrap();
-            assert!(copy_dir_recursive(&src2, &dst2).is_err());
-        }
-    }
-
-    /// #527: a lockfile `source` with URL userinfo must not leak the
-    /// credential into the label. The lockfile reader refuses such a source,
-    /// so the loader never serves that pack; the label is still sanitized
-    /// defensively (a synced or hand-edited file is untrusted input), which
-    /// this test pins directly.
     #[test]
     fn external_pack_label_strips_source_userinfo() {
         use super::{external_pack_label_line, sanitize_pack_source};

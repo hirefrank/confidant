@@ -15,11 +15,12 @@ Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs L
   - Ledger hits (`ledger/*.cfd`) are kept only when the hit's line resolves
     to a line in `cleared_ledger_lines` (`file`, `line`, `owning_packs`).
     The file mixes people and the QMD corpus can be stale after a `no-ai`
-    change, so the whole *file* is not enough. `reindex` writes only the
+    change, so the whole *file* is not enough. `qmd-index.py` stages only the
     cleared ledger lines into the corpus, in order, so the corpus line
     number qmd reports is not the vault line number; the two are aligned by
-    exact line text. A line that no longer aligns — edited, dropped, or
-    never cleared since the index was built — resolves to nothing and is
+    exact line text (via an inverted index, so one edited line does not
+    shift or drop the rest). A line that no longer aligns — edited, dropped,
+    or never cleared since the index was built — resolves to nothing and is
     dropped.
   - Anything unverified is dropped and counted, never returned: fail closed.
 - Snippets come from the QMD hit text (records) or the aligned corpus line
@@ -30,8 +31,9 @@ Usage: qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs L
 - `--packs` (comma-separated, issue #178) scopes the allowlist and the
   fallback `find` call, so a scoped agent never sees hits owned by another
   pack. The QMD index itself is unscoped; the allowlist call is the
-  enforcement point. `reindex` annotates each cleared file/line with its
-  owning packs (`allowlist --json` `owning_packs`) for index-time consumers.
+  enforcement point. `qmd-index.py` stages each cleared file/line from the
+  CLI's cleared set (`allowlist --json`), which carries `owning_packs` for
+  index-time consumers.
 
 This keeps the allowlist logic in exactly one place (the Rust CLI): the
 skill never reimplements clearance, so it cannot drift.
@@ -43,6 +45,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import deque
 
 COLLECTION = "confidant"
 SCHEMA_VERSION = "1"
@@ -56,7 +59,7 @@ CORPUS_REL = os.path.join(".confidant", "qmd-corpus")
 # model hub per query (the 0.7.0 field failure: a 3m01s wait with 0.76s
 # user CPU, silently degraded to the find fallback); `default_mode` is
 # the preflight-recommended mode for this host. The user config is the
-# same file that carries the #540/#723 encrypted-disk assertion.
+# same file qmd-preflight.py reads its [qmd] table from.
 USER_CONFIG_REL = os.path.join(".config", "confidant", "config.toml")
 # Per-vault preflight state (issue #722 remainder): under the vault's
 # own .confidant/ dir, which is local and gitignored like the corpus
@@ -194,11 +197,19 @@ def record_id_from_path(rel):
 def corpus_line_index(vault, corpus, rel, cache):
     """Map 1-based corpus line -> 1-based vault line for one corpus file.
 
-    `reindex` writes exactly the §12 cleared ledger lines into the corpus,
-    in vault order, so the corpus file is a subsequence of the vault file.
-    Align the two by exact line text to recover the vault line numbers qmd
-    cannot know. Lines that do not align (edited or dropped since the index
-    was built) are absent from the map: the caller drops them.
+    The corpus mirrors exactly the §12 cleared ledger lines, in vault order,
+    so the corpus file is a subsequence of the vault file. Align the two by
+    exact line text to recover the vault line numbers qmd cannot know.
+    Lines that do not align (edited or dropped since the index was built)
+    are absent from the map: the caller drops them.
+
+    The map is built from an inverted index (line text -> ascending vault
+    line numbers), not a forward scan: one edited or removed vault line used
+    to make the scan run off the end and drop every later line in the file
+    (#795). Now each corpus line takes the next unused occurrence at or
+    after the last match, so an edit costs only the lines it actually
+    affects; an out-of-order occurrence falls back to an exact match instead
+    of being lost.
     """
     if rel in cache:
         return cache[rel]
@@ -210,14 +221,22 @@ def corpus_line_index(vault, corpus, rel, cache):
     vault_lines = read_lines(os.path.join(vault, rel))
     mapping = {}
     if corpus_lines is not None and vault_lines is not None:
-        i = 0
+        positions = {}
+        for n, text in enumerate(vault_lines, 1):
+            positions.setdefault(text, deque()).append(n)
+        last = 0
         for n, text in enumerate(corpus_lines, 1):
-            while i < len(vault_lines) and vault_lines[i] != text:
-                i += 1
-            if i >= len(vault_lines):
-                break
-            mapping[n] = i + 1
-            i += 1
+            candidates = positions.get(text)
+            if not candidates:
+                continue
+            picked = next((pos for pos in candidates if pos >= last), None)
+            if picked is None:
+                # Corpus order does not follow vault order here: take the
+                # earliest remaining exact match rather than dropping it.
+                picked = candidates[0]
+            candidates.remove(picked)
+            mapping[n] = picked
+            last = picked
         cache[rel] = (mapping, corpus_lines)
     else:
         cache[rel] = ({}, [])

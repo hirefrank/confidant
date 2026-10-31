@@ -4,8 +4,8 @@ vault  /tmp/fake-vault   scope  not resolved yet   doctor  not run
 │ Conflicts 2 record(s)                                                                            │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ › p-01FAKE000000000000000001 encrypted record has two versions after a merge conflict            │
-│   p-01FAKE000000000000000002 encrypted record has two versions after a merge conflict            │
+│ › p-01FAKE000000000000000001 record has two versions after a merge conflict                      │
+│   p-01FAKE000000000000000002 record has two versions after a merge conflict                      │
 │                                                                                                  │
 │   Enter: show both sides   r: refresh                                                            │
 │                                                                                                  │

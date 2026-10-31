@@ -1,16 +1,2 @@
 # cargo-audit configuration for Confidant.
 # CI runs bare `cargo audit`, which picks up this file.
-# Only RUSTSEC-2026-0387 is ignored here, nothing else.
-
-[advisories]
-ignore = [
-    # RUSTSEC-2026-0387 ONLY (scoped to this advisory ID, nothing else):
-    # timing variability in crypto-bigint's constant-time operations.
-    # It reaches us via p256 0.13.2 -> age 0.12.1, which wraps vault keys.
-    # It cannot be bumped away: fixed crypto-bigint exists only at
-    # >=0.7.6, which needs p256 0.14, which age 0.12.1 (latest release)
-    # refuses (it requires p256 ^0.13), and no fixed 0.5.x exists.
-    # Revisit this ignore when an age release supports p256 0.14, so the
-    # bump path opens again. Full rationale: PR body for #766.
-    "RUSTSEC-2026-0387",
-]

@@ -1,13 +1,11 @@
-//! Resolve a `--person` / `resolve` query to the canonical person (#537).
+//! Resolve a `--person` / `resolve` / `alias` query to the canonical person
+//! (#537).
 //!
 //! [`resolve_person`] accepts two forms; [`resolve_alias`] takes a
-//! precomputed `(kind, hmac)` alias and resolves it against the same cleared
-//! set:
+//! `(kind, value)` alias and resolves it against the same cleared set:
 //!
-//! - an opaque `p-<ULID>`, resolved directly against the loaded vault. The
-//!   id and record type live in the outer envelope header on an encrypted
-//!   record, so a `no-ai: true` person stays addressable by id without
-//!   decrypting anything;
+//! - an opaque `p-<ULID>`, resolved directly against the loaded vault, so a
+//!   `no-ai: true` person stays addressable by id;
 //! - an **exact display name** among the §12 cleared set
 //!   ([`cleared_record_ids`]): trimmed, Unicode case-insensitive,
 //!   whole-string equality. `find` remains the fuzzy path.
@@ -20,22 +18,17 @@
 //! canonicalizes to a hidden id and does not resolve by name, or echoing
 //! the pick would leak the hidden person. More than one cleared person
 //! with the same name is [`PersonResolveError::Ambiguous`], never a guess.
-//! And a miss against a vault whose person records did not all load
-//! (skipped encrypted person records, refused person envelopes) is
-//! [`PersonResolveError::CannotSearch`], never `NotFound` (#717): the
-//! searched person set is incomplete, so absence cannot be established.
-//! The gate is person-scoped: an unreadable org, deal, note, edge, or
-//! interaction cannot hide a person, so it never flips a person miss.
-//! Only the negative outcome is gated: a match found in the searched set
-//! still succeeds, which deliberately accepts one residual — a skipped
-//! envelope could hide a second person with the same display name,
-//! turning a true ambiguity into a confident single match. Gating every
-//! match instead would fail all lookups whenever any person record is
-//! unreadable, which is worse than the residual.
+//!
+//! Aliases are plain contact values, not secrets: [`resolve_alias`] matches
+//! `email` against the person's `emails` front-matter list, `phone` against
+//! `phones`, `handle` against `handles` (or the value half of a `links`
+//! entry), and `name` against the display name. Matching is trimmed,
+//! case-insensitive, whole-string, and goes through the same cleared set and
+//! merge canonicalization as a name lookup.
 
 use std::collections::{BTreeSet, HashSet};
 
-use crate::check::{canonical_on, check_aliases_and_merges, parse_alias, resolve_as_of_date};
+use crate::check::{canonical_on, check_aliases_and_merges, resolve_as_of_date};
 use crate::id::RecordId;
 use crate::record::RecordKind;
 use crate::search::{case_fold, cleared_record_ids};
@@ -64,19 +57,9 @@ pub enum PersonResolveError {
     /// are opaque ids, never names.
     Ambiguous { candidates: Vec<RecordId> },
     /// The vault could not be fully searched, so a miss cannot establish
-    /// absence (#717). `skipped` person-record files were skipped as
-    /// encrypted-but-unreadable (no usable key material on this device)
-    /// and `refused` person envelopes were refused as tampered or corrupt;
-    /// a person in any of them would be missed. The counts are
-    /// person-scoped (see `miss`): unreadable records of other kinds do
-    /// not contribute. Callers must surface this as a cannot-search
-    /// error, never as `NotFound`: a confident wrong negative ("no person
-    /// matches") about a real person is the failure this variant exists
-    /// to prevent. A match found in the searched set is still returned
-    /// normally — only the negative outcome is gated, because only the
-    /// negative asserts absence. That deliberately accepts the residual
-    /// that a skipped envelope could hide a second same-name person and
-    /// mask a true ambiguity as a single match (see the module docs).
+    /// absence (#717). Kept on the public error surface so callers can keep
+    /// branching on it; with plaintext vaults every record file loads, so
+    /// no lookup constructs it today.
     CannotSearch { skipped: u32, refused: u32 },
 }
 
@@ -88,41 +71,26 @@ impl std::fmt::Display for PersonResolveError {
                 write!(formatter, "{} people matched", candidates.len())
             }
             Self::CannotSearch { skipped, refused } => {
-                let mut parts = Vec::new();
-                if *skipped > 0 {
-                    parts.push(format!("{skipped} encrypted record(s) unreadable"));
-                }
-                if *refused > 0 {
-                    parts.push(format!("{refused} envelope(s) refused"));
-                }
-                if parts.is_empty() {
+                let unreadable = skipped.saturating_add(*refused);
+                let cause = if unreadable > 0 {
+                    format!("{unreadable} person record file(s) unreadable")
+                } else {
                     // The constructor is public, so a (0, 0) value can
                     // exist even though `miss()` never builds one; never
                     // render an empty cause list.
-                    parts.push("the vault could not be fully searched".to_owned());
-                }
-                write!(formatter, "cannot search the vault: {}", parts.join(", "))
+                    "the vault could not be fully searched".to_owned()
+                };
+                write!(formatter, "cannot search the vault: {cause}")
             }
         }
     }
 }
 
-/// The miss outcome for `vault`: `CannotSearch` when any person-record
-/// file went unread (skipped or refused), so the searched person set is
-/// incomplete and a miss proves nothing; `NotFound` only when the person
-/// set loaded in full. Person-scoped by construction: the loader counts
-/// only person-record jobs (`Vault::skipped_person_records` /
-/// `refused_person_records`), so an unreadable org, deal, note, edge, or
-/// interaction never flips a person miss.
-fn miss(vault: &Vault) -> PersonResolveError {
-    if vault.skipped_person_records > 0 || vault.refused_person_records > 0 {
-        PersonResolveError::CannotSearch {
-            skipped: vault.skipped_person_records,
-            refused: vault.refused_person_records,
-        }
-    } else {
-        PersonResolveError::NotFound
-    }
+/// The miss outcome for `vault`. A plaintext vault loads every record file,
+/// so a miss always establishes absence; `CannotSearch` is retained on the
+/// public error surface for callers but never constructed.
+fn miss(_vault: &Vault) -> PersonResolveError {
+    PersonResolveError::NotFound
 }
 
 impl std::error::Error for PersonResolveError {}
@@ -203,25 +171,32 @@ pub fn resolve_person(vault: &Vault, query: &str) -> Result<PersonMatch, PersonR
     }
 }
 
-/// Resolve a `(kind, hmac)` alias to exactly one cleared person (#537 phase 3b).
+/// Resolve a `(kind, value)` alias to exactly one cleared person (#537
+/// phase 3b).
 ///
-/// `hmac_hex` is the lowercase hex of `HMAC(vault_lookup_key, normalized
-/// value)` (spec §6). The caller computes it — core never touches keys — so
-/// the plaintext value never reaches this function or its errors.
+/// Aliases are plain front-matter values, matched trimmed and
+/// case-insensitively as whole strings:
+///
+/// - `email` → the `emails` list;
+/// - `phone` → the `phones` list;
+/// - `handle` → the `handles` list, or the value half of a `links` entry;
+/// - `name` → the record's display name.
 ///
 /// The match is against the §12 cleared set, exactly like a display-name
-/// lookup: an alias line whose canonical person is `no-ai: true` is
-/// indistinguishable from an unmatched alias ([`PersonResolveError::NotFound`]),
-/// so the error never confirms a hidden person exists. Ledger `alias` lines
-/// for a merged-away member canonicalize to the canonical person; two
-/// distinct cleared canonical people sharing one alias fail closed
-/// ([`PersonResolveError::Ambiguous`]).
+/// lookup: a person who is `no-ai: true` is indistinguishable from an
+/// unmatched alias ([`PersonResolveError::NotFound`]), so the error never
+/// confirms a hidden person exists. A merged-away member canonicalizes to
+/// the canonical person; two distinct cleared canonical people sharing one
+/// alias fail closed ([`PersonResolveError::Ambiguous`]).
 pub fn resolve_alias(
     vault: &Vault,
     kind: &str,
-    hmac_hex: &str,
+    value: &str,
 ) -> Result<PersonMatch, PersonResolveError> {
-    let needle = hmac_hex.to_ascii_lowercase();
+    let needle = case_fold(value.trim());
+    if needle.is_empty() {
+        return Err(PersonResolveError::NotFound);
+    }
     let cleared = cleared_record_ids(vault);
     let as_of = resolve_as_of_date(vault);
     let known_ids: HashSet<RecordId> = vault.records.keys().cloned().collect();
@@ -230,25 +205,33 @@ pub fn resolve_alias(
     drop(merge_findings);
 
     let mut matches: BTreeSet<RecordId> = BTreeSet::new();
-    for sourced in &vault.entries {
-        if sourced.entry.verb != "alias" {
+    for record in vault.records.values() {
+        if record.kind != RecordKind::Person || !cleared.contains(&record.id) {
             continue;
         }
-        // Reuse the check engine's parser so the accepted `hmac:HEX` shapes
-        // (token or pair) stay identical to what `check` validates.
-        match parse_alias(&sourced.entry) {
-            Ok((k, hex)) if k == kind && hex == needle => {}
-            _ => continue,
+        let hit = match kind {
+            "email" => list_field_contains(record, "emails", &needle),
+            "phone" => list_field_contains(record, "phones", &needle),
+            "handle" => {
+                list_field_contains(record, "handles", &needle)
+                    || links_field_contains(record, &needle)
+            }
+            "name" => record
+                .name
+                .as_deref()
+                .is_some_and(|name| case_fold(name.trim()) == needle),
+            _ => false,
+        };
+        if !hit {
+            continue;
         }
-        let canonical = canonical_on(&sourced.entry.id, &merges, as_of);
+        let canonical = canonical_on(&record.id, &merges, as_of);
         // Only cleared people resolve. A cleared member merged into a
         // `no-ai: true` canonical maps to a hidden id and is dropped, so a
         // hidden person is never surfaced by an alias either.
-        match vault.records.get(&canonical) {
-            Some(record) if record.kind == RecordKind::Person && cleared.contains(&canonical) => {}
-            _ => continue,
+        if cleared.contains(&canonical) {
+            matches.insert(canonical);
         }
-        matches.insert(canonical);
     }
 
     match matches.len() {
@@ -261,6 +244,27 @@ pub fn resolve_alias(
             candidates: matches.into_iter().collect(),
         }),
     }
+}
+
+/// Whether a `list` front-matter field contains `needle` (already
+/// case-folded). A value that does not parse as a list never matches.
+fn list_field_contains(record: &crate::record::Record, field: &str, needle: &str) -> bool {
+    record
+        .field(field)
+        .and_then(crate::packs::grammars::parse_list)
+        .is_some_and(|entries| entries.iter().any(|e| case_fold(e.trim()) == needle))
+}
+
+/// Whether a `links` labeled-list field carries `needle` as its value half.
+fn links_field_contains(record: &crate::record::Record, needle: &str) -> bool {
+    record
+        .field("links")
+        .and_then(crate::packs::grammars::parse_labeled_list)
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(_, value)| case_fold(value.trim()) == needle)
+        })
 }
 
 /// The merge-canonical person id for `id` as of the vault's resolution
@@ -333,53 +337,6 @@ mod tests {
 
     fn load(root: &Path) -> Vault {
         crate::load_vault(root).unwrap()
-    }
-
-    /// Load with a hook that refuses (or skips) only the record file whose
-    /// vault-relative path contains `needle`, standing in for one
-    /// unreadable record in an otherwise readable vault. Every other file
-    /// passes through unchanged, so the rest of the vault loads normally.
-    fn load_refusing_only(root: &Path, needle: &str, skipped: bool) -> Vault {
-        use crate::vault::ContentOutcome;
-        let needle = needle.to_owned();
-        let hook = std::sync::Arc::new(move |file: &str, bytes: &[u8]| {
-            if file.contains(&needle) {
-                if skipped {
-                    ContentOutcome::Skipped
-                } else {
-                    ContentOutcome::Refused
-                }
-            } else {
-                ContentOutcome::Content(bytes.to_vec())
-            }
-        });
-        crate::vault::load_vault_with_hook(root, Some(hook)).unwrap()
-    }
-
-    /// Load with a hook that refuses to read any record file, standing in
-    /// for a device with no usable key material (`skipped`) or with
-    /// tampered envelopes (`refused`): the vault loads, but the record
-    /// set is incomplete and the skip/refuse counts are nonzero.
-    fn load_unread(root: &Path, skipped: bool) -> Vault {
-        use crate::vault::ContentOutcome;
-        let hook = std::sync::Arc::new(move |_: &str, _: &[u8]| {
-            if skipped {
-                ContentOutcome::Skipped
-            } else {
-                ContentOutcome::Refused
-            }
-        });
-        crate::vault::load_vault_with_hook(root, Some(hook)).unwrap()
-    }
-
-    fn org(dir: &Path, id: &str, name: &str) {
-        let d = dir.join(format!("orgs/{id}"));
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("org.md"),
-            format!("---\nid: {id}\ntype: org\nname: \"{name}\"\n---\n"),
-        )
-        .unwrap();
     }
 
     const ADA: &str = "p-01J9Z3K4QF0000000000000000";
@@ -457,7 +414,8 @@ mod tests {
             resolve_person(&vault, "Hidden Person"),
             Err(PersonResolveError::NotFound)
         );
-        // The id still resolves (id indexes without decrypting).
+        // The id still resolves (an id lookup never consults the display
+        // name or the cleared set).
         assert_eq!(
             resolve_person(&vault, ADA),
             Ok(PersonMatch {
@@ -573,140 +531,6 @@ mod tests {
     }
 
     #[test]
-    fn unread_vault_miss_is_cannot_search_not_not_found() {
-        // #717: the field case — the person exists, but this device
-        // cannot read the record file, so the name set is incomplete and
-        // a miss must not be reported as "not found".
-        for skipped in [true, false] {
-            let (_tmp, root) = vault("unread", |root| {
-                person(root, ADA, Some("Ada Example"), None);
-            });
-            let vault = load_unread(&root, skipped);
-            assert!(vault.skipped_encrypted + vault.refused_envelopes > 0);
-            let expected = if skipped {
-                PersonResolveError::CannotSearch {
-                    skipped: 1,
-                    refused: 0,
-                }
-            } else {
-                PersonResolveError::CannotSearch {
-                    skipped: 0,
-                    refused: 1,
-                }
-            };
-            // The existing person's own name is missed too: her file
-            // went unread, so the lookup cannot establish anything.
-            assert_eq!(resolve_person(&vault, "Ada Example"), Err(expected.clone()));
-            assert_eq!(resolve_person(&vault, "Nobody Here"), Err(expected.clone()));
-            assert_eq!(resolve_person(&vault, ADA), Err(expected.clone()));
-            // Alias lookups consult the same incomplete cleared set.
-            assert_eq!(resolve_alias(&vault, "email", H1), Err(expected));
-        }
-    }
-
-    #[test]
-    fn mixed_vault_readable_person_resolves_unreadable_is_cannot_search() {
-        // #717 review: the partial-search case — one readable person plus
-        // one unreadable record. The readable person still resolves, but
-        // the unreadable person's name and any unknown name are
-        // cannot-search, not not-found.
-        for skipped in [true, false] {
-            let (_tmp, root) = vault("mixed", |root| {
-                person(root, ADA, Some("Ada Example"), None);
-                person(root, BEA, Some("Bea Demo"), None);
-            });
-            let vault = load_refusing_only(&root, BEA, skipped);
-            assert_eq!(vault.skipped_person_records, u32::from(skipped));
-            assert_eq!(vault.refused_person_records, u32::from(!skipped));
-            let expected = if skipped {
-                PersonResolveError::CannotSearch {
-                    skipped: 1,
-                    refused: 0,
-                }
-            } else {
-                PersonResolveError::CannotSearch {
-                    skipped: 0,
-                    refused: 1,
-                }
-            };
-            assert_eq!(
-                resolve_person(&vault, "Ada Example"),
-                Ok(PersonMatch {
-                    id: RecordId::parse(ADA).unwrap(),
-                    matched_by_name: true,
-                })
-            );
-            assert_eq!(resolve_person(&vault, "Bea Demo"), Err(expected.clone()));
-            assert_eq!(resolve_person(&vault, "Nobody Here"), Err(expected.clone()));
-            assert_eq!(resolve_person(&vault, BEA), Err(expected));
-        }
-    }
-
-    #[test]
-    fn unreadable_non_person_record_does_not_gate_person_miss() {
-        // #717 review: the gate is person-scoped. An unreadable org file
-        // counts vault-wide but cannot hide a person, so a person miss
-        // against an otherwise fully readable person set stays NotFound.
-        // (The org id's ULID differs from Ada's: sharing a ULID stem
-        // across prefixes would taint the cleared set via `path_ulids`,
-        // which is a different rule, not the gate.)
-        const ORG: &str = "o-01J9Z3K4QF0000000000000001";
-        let (_tmp, root) = vault("org-unread", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            org(root, ORG, "Acme");
-        });
-        let vault = load_refusing_only(&root, ORG, false);
-        assert_eq!(vault.refused_envelopes, 1);
-        assert_eq!(vault.refused_person_records, 0);
-        assert_eq!(vault.skipped_person_records, 0);
-        assert_eq!(
-            resolve_person(&vault, "Ada Example"),
-            Ok(PersonMatch {
-                id: RecordId::parse(ADA).unwrap(),
-                matched_by_name: true,
-            })
-        );
-        assert_eq!(
-            resolve_person(&vault, "Nobody Here"),
-            Err(PersonResolveError::NotFound)
-        );
-        assert_eq!(
-            resolve_person(&vault, "p-01J9Z3K4QF9999999999999999"),
-            Err(PersonResolveError::NotFound)
-        );
-    }
-
-    #[test]
-    fn non_person_id_and_empty_query_are_not_found_on_unread_vault() {
-        // #717 review: both arms are positive knowledge, not misses. An
-        // id that resolves to a loaded non-person record is known not to
-        // be a person, and an empty string can never match, so neither
-        // may become CannotSearch just because person records went
-        // unread. (Only the person file is refused here: refusing every
-        // file would leave the org itself unread, which is a miss, not
-        // positive knowledge.)
-        const ORG: &str = "o-01J9Z3K4QF0000000000000001";
-        let (_tmp, root) = vault("org", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            org(root, ORG, "Acme");
-        });
-        let vault = load_refusing_only(&root, ADA, false);
-        assert_eq!(vault.refused_person_records, 1);
-        assert_eq!(
-            resolve_person(&vault, ORG),
-            Err(PersonResolveError::NotFound)
-        );
-        assert_eq!(
-            resolve_person(&vault, ""),
-            Err(PersonResolveError::NotFound)
-        );
-        assert_eq!(
-            resolve_person(&vault, "   "),
-            Err(PersonResolveError::NotFound)
-        );
-    }
-
-    #[test]
     fn cannot_search_display_with_zero_counts_names_a_cause() {
         // The constructor is public, so a (0, 0) value can exist even
         // though `miss()` never builds one; its rendering must still name
@@ -757,10 +581,6 @@ mod tests {
         );
     }
 
-    // Fake 64-hex HMACs (the real ones come from the lookup key in the CLI).
-    const H1: &str = "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677";
-    const H2: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddee";
-
     fn ledger_line(root: &Path, line: &str) {
         let dir = root.join("ledger/2026");
         std::fs::create_dir_all(&dir).unwrap();
@@ -771,96 +591,95 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    fn alias(root: &Path, date: &str, id: &str, kind: &str, hmac: &str) {
-        ledger_line(root, &format!("{date} alias {id} {kind} hmac:{hmac}"));
+    /// A person with extra front-matter fields (contact lists).
+    fn contact_person(dir: &Path, id: &str, name: &str, extra: &str) {
+        let d = dir.join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: \"{name}\"\n{extra}---\n\nFake bio.\n"),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn resolve_alias_matches_one_cleared_person() {
+    fn resolve_alias_matches_front_matter_contact_lists() {
         let (_tmp, root) = vault("alias", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            alias(root, "2026-10-03", ADA, "email", H1);
+            contact_person(
+                root,
+                ADA,
+                "Ada Example",
+                "emails: [ada@example.com, ada@work.example]\nphones: +15550100\nhandles: @ada\nlinks: linkedin:https://example.test/in/ada\n",
+            );
         });
         let vault = load(&root);
+        let expected = PersonMatch {
+            id: RecordId::parse(ADA).unwrap(),
+            matched_by_name: false,
+        };
         assert_eq!(
-            resolve_alias(&vault, "email", H1),
-            Ok(PersonMatch {
-                id: RecordId::parse(ADA).unwrap(),
-                matched_by_name: false,
-            })
+            resolve_alias(&vault, "email", "ada@example.com"),
+            Ok(expected.clone())
         );
-        // HMAC hex comparison is case-insensitive.
+        // Trimmed and case-insensitive.
         assert_eq!(
-            resolve_alias(&vault, "email", &H1.to_ascii_uppercase()),
-            Ok(PersonMatch {
-                id: RecordId::parse(ADA).unwrap(),
-                matched_by_name: false,
-            })
+            resolve_alias(&vault, "email", "  ADA@WORK.EXAMPLE "),
+            Ok(expected.clone())
         );
-        // Wrong kind, wrong hmac, and unknown kinds never match.
         assert_eq!(
-            resolve_alias(&vault, "phone", H1),
+            resolve_alias(&vault, "phone", "+15550100"),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_alias(&vault, "handle", "@ada"),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            resolve_alias(&vault, "handle", "https://example.test/in/ada"),
+            Ok(expected.clone())
+        );
+        assert_eq!(resolve_alias(&vault, "name", "Ada Example"), Ok(expected));
+    }
+
+    #[test]
+    fn resolve_alias_is_kind_scoped_and_misses_cleanly() {
+        let (_tmp, root) = vault("alias-kinds", |root| {
+            contact_person(root, ADA, "Ada Example", "emails: ada@example.com\n");
+        });
+        let vault = load(&root);
+        // The value exists, but under `email`, not `phone`/`handle`.
+        assert_eq!(
+            resolve_alias(&vault, "phone", "ada@example.com"),
             Err(PersonResolveError::NotFound)
         );
         assert_eq!(
-            resolve_alias(&vault, "email", H2),
+            resolve_alias(&vault, "handle", "ada@example.com"),
             Err(PersonResolveError::NotFound)
         );
         assert_eq!(
-            resolve_alias(&vault, "twitter", H1),
+            resolve_alias(&vault, "email", "nobody@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+        // An unknown kind never matches.
+        assert_eq!(
+            resolve_alias(&vault, "twitter", "ada@example.com"),
+            Err(PersonResolveError::NotFound)
+        );
+        assert_eq!(
+            resolve_alias(&vault, "email", "   "),
             Err(PersonResolveError::NotFound)
         );
     }
 
     #[test]
-    fn resolve_alias_name_kind_matches_one_cleared_person() {
-        // #748: a `name` alias resolves through the same HMAC path as the
-        // other kinds, and is kind-scoped — the same HMAC under `email`
-        // does not match it.
-        let (_tmp, root) = vault("alias-name", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            alias(root, "2026-10-03", ADA, "name", H1);
+    fn resolve_alias_shared_by_two_cleared_people_is_ambiguous() {
+        let (_tmp, root) = vault("alias-dup", |root| {
+            contact_person(root, ADA, "Ada Example", "emails: shared@example.com\n");
+            contact_person(root, BEA, "Bea Demo", "emails: shared@example.com\n");
         });
         let vault = load(&root);
         assert_eq!(
-            resolve_alias(&vault, "name", H1),
-            Ok(PersonMatch {
-                id: RecordId::parse(ADA).unwrap(),
-                matched_by_name: false,
-            })
-        );
-        // Different case/whitespace-insensitive comparison is on the HMAC
-        // hex, as for the other kinds.
-        assert_eq!(
-            resolve_alias(&vault, "name", &H1.to_ascii_uppercase()),
-            Ok(PersonMatch {
-                id: RecordId::parse(ADA).unwrap(),
-                matched_by_name: false,
-            })
-        );
-        assert_eq!(
-            resolve_alias(&vault, "email", H1),
-            Err(PersonResolveError::NotFound)
-        );
-        assert_eq!(
-            resolve_alias(&vault, "twitter", H1),
-            Err(PersonResolveError::NotFound)
-        );
-    }
-
-    #[test]
-    fn resolve_alias_name_kind_shared_by_two_cleared_people_is_ambiguous() {
-        // #748: the shared-alias ambiguity rule applies to `name` exactly
-        // as to the other kinds — two cleared people, fail closed.
-        let (_tmp, root) = vault("alias-name-dup", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            person(root, BEA, Some("Bea Demo"), None);
-            alias(root, "2026-10-03", ADA, "name", H1);
-            alias(root, "2026-10-03", BEA, "name", H1);
-        });
-        let vault = load(&root);
-        assert_eq!(
-            resolve_alias(&vault, "name", H1),
+            resolve_alias(&vault, "email", "shared@example.com"),
             Err(PersonResolveError::Ambiguous {
                 candidates: vec![RecordId::parse(ADA).unwrap(), RecordId::parse(BEA).unwrap()],
             })
@@ -870,73 +689,61 @@ mod tests {
     #[test]
     fn resolve_alias_canonicalizes_merged_away_member() {
         let (_tmp, root) = vault("alias-merged", |root| {
-            person(root, ADA, Some("Ada Old"), None);
-            person(root, BEA, Some("Bea New"), None);
-            alias(root, "2026-10-03", ADA, "handle", H1);
-            alias(root, "2026-10-04", BEA, "handle", H2);
-            // The merge is dated after the alias lines; current-state
-            // resolution folds both onto the canonical.
+            contact_person(root, ADA, "Ada Old", "emails: ada@example.com\n");
+            contact_person(root, BEA, "Bea New", "emails: bea@example.com\n");
             ledger_line(root, &format!("2026-10-05 merge {ADA} into {BEA}"));
         });
         let vault = load(&root);
-        assert_eq!(
-            resolve_alias(&vault, "handle", H1),
-            Ok(PersonMatch {
-                id: RecordId::parse(BEA).unwrap(),
-                matched_by_name: false,
-            })
-        );
-        assert_eq!(
-            resolve_alias(&vault, "handle", H2),
-            Ok(PersonMatch {
-                id: RecordId::parse(BEA).unwrap(),
-                matched_by_name: false,
-            })
-        );
+        for email in ["ada@example.com", "bea@example.com"] {
+            assert_eq!(
+                resolve_alias(&vault, "email", email),
+                Ok(PersonMatch {
+                    id: RecordId::parse(BEA).unwrap(),
+                    matched_by_name: false,
+                })
+            );
+        }
     }
 
     #[test]
     fn resolve_alias_no_ai_true_person_is_not_surfaced() {
         let (_tmp, root) = vault("alias-hidden", |root| {
-            person(root, ADA, Some("Hidden Person"), Some("true"));
-            alias(root, "2026-10-03", ADA, "email", H1);
+            let d = root.join(format!("people/{ADA}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("profile.md"),
+                format!(
+                    "---\nid: {ADA}\ntype: person\nname: \"Hidden Person\"\nno-ai: true\nemails: hidden@example.com\n---\n\nFake bio.\n"
+                ),
+            )
+            .unwrap();
         });
         let vault = load(&root);
         // Indistinguishable from an unmatched alias: no existence oracle.
         assert_eq!(
-            resolve_alias(&vault, "email", H1),
+            resolve_alias(&vault, "email", "hidden@example.com"),
             Err(PersonResolveError::NotFound)
-        );
-    }
-
-    #[test]
-    fn resolve_alias_shared_by_two_cleared_people_is_ambiguous() {
-        let (_tmp, root) = vault("alias-dup", |root| {
-            person(root, ADA, Some("Ada Example"), None);
-            person(root, BEA, Some("Bea Demo"), None);
-            alias(root, "2026-10-03", ADA, "email", H1);
-            alias(root, "2026-10-03", BEA, "email", H1);
-        });
-        let vault = load(&root);
-        assert_eq!(
-            resolve_alias(&vault, "email", H1),
-            Err(PersonResolveError::Ambiguous {
-                candidates: vec![RecordId::parse(ADA).unwrap(), RecordId::parse(BEA).unwrap()],
-            })
         );
     }
 
     #[test]
     fn resolve_alias_cleared_name_merged_into_no_ai_is_not_surfaced() {
         let (_tmp, root) = vault("alias-merged-hidden", |root| {
-            person(root, ADA, Some("Ada Old"), None);
-            person(root, BEA, Some("Hidden Canonical"), Some("true"));
-            alias(root, "2026-10-03", ADA, "email", H1);
+            contact_person(root, ADA, "Ada Old", "emails: ada@example.com\n");
+            let d = root.join(format!("people/{BEA}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("profile.md"),
+                format!(
+                    "---\nid: {BEA}\ntype: person\nname: \"Hidden Canonical\"\nno-ai: true\n---\n\nFake bio.\n"
+                ),
+            )
+            .unwrap();
             ledger_line(root, &format!("2026-10-05 merge {ADA} into {BEA}"));
         });
         let vault = load(&root);
         assert_eq!(
-            resolve_alias(&vault, "email", H1),
+            resolve_alias(&vault, "email", "ada@example.com"),
             Err(PersonResolveError::NotFound)
         );
     }

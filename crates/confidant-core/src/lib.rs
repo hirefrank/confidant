@@ -13,11 +13,9 @@ pub mod check;
 pub mod config;
 pub mod conflict;
 pub mod context;
-pub mod crypto_mode;
 pub mod discover;
 pub mod error;
 pub mod id;
-pub mod inbox;
 pub mod ledger;
 pub mod paths;
 pub mod record;
@@ -36,18 +34,10 @@ pub use check::{
     run as check_vault, CheckOptions, CheckReport, Finding, FindingCode, Severity,
     JSON_SCHEMA_VERSION,
 };
-pub use config::{InboxConfig, TrustConfig, VaultConfig, SPEC_VERSION};
+pub use config::{VaultConfig, SPEC_VERSION};
 pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
-#[cfg(test)]
-pub use inbox::inbox_decrypt;
-pub use inbox::{
-    discard_inbox_items, queue_items, queue_signing_configured, read_inbox_item, run_inbox,
-    run_inbox_rotate, verify_inbox_trust, DecryptExistingFn, DecryptFn, EncryptFn,
-    InboxItemContent, InboxKeys, InboxOptions, InboxReport, InboxRotateOptions, InboxRotateOutcome,
-    ItemOutcome, QueueItem, SkippedItem, ALLOW_UNSIGNED_WARNING, INBOX_BRANCH,
-};
 pub use ledger::{format_entry, parse_ledger, parse_line, LedgerEntry, ParseErrorKind};
 pub use record::{format_record, parse_record, Record};
 pub use roster::{build_roster, Roster, RosterEntry};
@@ -60,4 +50,4 @@ pub use search::{
     cleared_record_ids_for_operator, cleared_record_owners, cleared_record_paths,
     operator_no_ai_badge, search, search_for_operator, SearchHit, SearchResult,
 };
-pub use vault::{load_vault, load_vault_with_hook, ContentHook, ContentOutcome, Vault};
+pub use vault::{load_vault, Vault};

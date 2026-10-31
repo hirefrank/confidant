@@ -9,8 +9,8 @@ vault  /fake/demo-vault   scope  personal@0.2   doctor  not run
 │     birt│   s/t/n pre-fill the selected person; a composes a fresh one                 │         │
 │   People│   context: j/k scroll   g top   [ / ] select the context item   e edit it    │         │
 │ › Ada Ex│ Review Queue                                                                 │0008     │
-│   Bea De│   o Proposals   i Inbox   c Conflicts   r refresh   Enter open/detail        │         │
-│         │   Inbox: a apply (dry run, then y)   Conflicts: o/t take a side, m merge     │         │
+│   Bea De│   o Proposals   c Conflicts   r refresh   Enter open/detail                  │         │
+│         │   Conflicts: o/t take a side, m merge                                        │         │
 │         │ Check                                                                        │         │
 │         │   3 Check   d Doctor   r refresh   x raw CLI output (from an alert)          │         │
 │         │ Anywhere                                                                     │         │

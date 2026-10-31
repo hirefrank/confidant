@@ -26,7 +26,7 @@ A useful report includes: what you think the impact is, steps to reproduce
 
 Confidant is built to hold other people's private notes, so reports must
 never contain real client data — no real names, emails, notes, transcripts,
-keys, or recovery phrases. Reproduce against the fake-data
+or credentials. Reproduce against the fake-data
 [demo vault](examples/demo-vault) (people like "Ada Example" exist precisely
 for this) or construct a minimal temporary vault. A report containing real
 PII will be deleted on sight and you will be asked to re-file with fake
@@ -36,14 +36,14 @@ data.
 
 In scope:
 
-- `crates/confidant-crypt` — key hierarchy, record envelopes, AAD binding,
-  recovery, rotation, revocation, and shredding.
-- The CLI write path that moves plaintext into and out of envelopes
-  (`record add`, `note add`, `log session --note`, `reindex`, `find`,
-  `context`) and the privacy allowlist (`no-ai`, the §12 cleared set) that
-  gates what agents can read.
-- Inbox signature verification and the merge pipeline (`inbox`,
-  `inbox rotate`).
+- The privacy allowlist (`no-ai`, the §12 cleared set): any path that lets
+  an agent-facing surface (`find`, `context`, `allowlist`, MCP, the QMD
+  corpus) return content it should withhold.
+- The write path (`record add`, `note add`, `log session`, `log touch`,
+  `import`) and the `check`-before-commit gate, including anything that
+  corrupts a vault, drops data, or commits without the gate passing.
+- Git and sync behaviour: transport checks, `confidant sync` refusals, and
+  anything that could push a vault somewhere the operator did not intend.
 - Supply-chain integrity of releases: `cargo dist` artifacts, checksums,
   build-provenance attestations, and crates.io trusted publishing.
 
@@ -51,8 +51,11 @@ Out of scope:
 
 - The `examples/demo-vault` contents (deliberately fake data).
 - Third-party components Confidant integrates with but does not ship: QMD
-  search, the OS keychain / Secret Service, and the model providers agents
-  call. Report those issues to their own projects (we will happily link).
+  search, git, the OS credential store, and the model providers agents call.
+  Report those issues to their own projects (we will happily link).
+- The confidentiality of a vault you placed somewhere readable: records are
+  plaintext on disk by design (ADR-4), so a public repo, an unencrypted
+  disk, or a shared backup is a deployment mistake, not a vulnerability.
 - Social engineering, physical access to trusted devices, and compromised
   model providers — these are documented assumptions, not vulnerabilities.
   See [docs/threat-model-agents.md](docs/threat-model-agents.md).
@@ -70,10 +73,15 @@ the default; tell us if you would rather stay anonymous.
 - You will be kept informed of status until the fix ships, and the fix
   release notes will describe the issue once it is safe to do so.
 
-## Known limitation (standing disclosure)
+## Standing design decisions (not vulnerabilities)
 
-Confidant's encryption hasn't been reviewed by an independent auditor. This
-is tracked in [#138](https://github.com/hirefrank/confidant/issues/138) and
-disclosed in the README: use your own judgment before storing other
-people's sensitive data. Reports that restate this known limitation without
-a new finding will be closed as duplicates of #138.
+Two decisions are deliberate and documented, so a report that only restates
+them will be closed:
+
+- **Records are plaintext on disk** in a private repo on a full-disk
+  encrypted machine (`docs/architecture.md` ADR-4). There is no
+  application-level secrecy layer to bypass.
+- **`no-ai` is an exposure control, not access control.** It keeps marked
+  content out of agent-facing output; it does not make the files secret from
+  the operator or from anything with a shell on the machine
+  (`docs/threat-model-agents.md`).

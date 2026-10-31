@@ -14,7 +14,7 @@ use crate::apply::{ApplyFlow, FlowPhase, StepApplyOutcome, StepStatus, WriteOutc
 use crate::capture::{self, Capture, CaptureKind, CapturePhase, FieldId};
 use crate::contract::{
     parse_raw_output, CheckReport, Context, ContractOutcome, DoctorReport, EditSource, ErrorBody,
-    FindResult, InboxReport, ResolveApplied, ResolveShow, Roster, SearchResult, SyncReport,
+    FindResult, ResolveApplied, ResolveShow, Roster, SearchResult, SyncReport,
 };
 use crate::edit::{self, EditFlow, EditPhase};
 use crate::ids;
@@ -30,7 +30,6 @@ use crate::views::context::{self, ContextViewState};
 use crate::views::diff::{self, DiffState};
 use crate::views::doctor::{self, DoctorViewState};
 use crate::views::help;
-use crate::views::inbox::{self, InboxViewState};
 use crate::views::info::{self, InfoState};
 use crate::views::palette::{render as render_palette, PaletteState};
 use crate::views::people::{self, PeopleViewState};
@@ -43,7 +42,7 @@ use crate::views::search;
 ///
 /// The underlying [`ActiveView`] still exists per view; a workspace is the
 /// coarse job the operator is doing. `Search` and `Context` live under
-/// People; Proposals/Inbox/Conflicts share the Review workspace and carry a
+/// People; Proposals/Conflicts share the Review workspace and carry a
 /// pending-count badge so a queued item is visible from any workspace
 /// (#556 phase 3); Check and Doctor are the third workspace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,11 +66,7 @@ impl Workspace {
     fn views(self) -> &'static [ActiveView] {
         match self {
             Self::People => &[ActiveView::People, ActiveView::Search],
-            Self::Review => &[
-                ActiveView::Proposals,
-                ActiveView::Inbox,
-                ActiveView::Conflicts,
-            ],
+            Self::Review => &[ActiveView::Proposals, ActiveView::Conflicts],
             Self::Check => &[ActiveView::Check, ActiveView::Doctor],
         }
     }
@@ -79,7 +74,7 @@ impl Workspace {
 
 /// The underlying views: People & Search (master–detail), Check, full-screen
 /// Context, Doctor, Proposals, unified Search (qmd-ranked with an exact
-/// `find` toggle), Inbox, and Conflicts.
+/// `find` toggle), and Conflicts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActiveView {
     #[default]
@@ -89,7 +84,6 @@ pub enum ActiveView {
     Doctor,
     Proposals,
     Search,
-    Inbox,
     Conflicts,
 }
 
@@ -98,7 +92,7 @@ impl ActiveView {
     pub fn workspace(self) -> Workspace {
         match self {
             Self::People | Self::Search | Self::Context => Workspace::People,
-            Self::Proposals | Self::Inbox | Self::Conflicts => Workspace::Review,
+            Self::Proposals | Self::Conflicts => Workspace::Review,
             Self::Check | Self::Doctor => Workspace::Check,
         }
     }
@@ -120,7 +114,7 @@ pub struct ProposalsTab {
 /// The TUI never fetches, pulls, or pushes on its own. It reads ahead/behind
 /// from the last fetch and only pushes after an explicit `y` in the quit
 /// prompt. `code` carries the CLI's stable error code when sync is not
-/// available (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`) or the branch diverged
+/// available (`E_NO_REMOTE`) or the branch diverged
 /// (`E_NOT_FAST_FORWARD`), so no message text is ever parsed here.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SyncViewState {
@@ -232,7 +226,6 @@ pub struct App<R: Runner> {
     pub palette: Option<PaletteState>,
     pub should_quit: bool,
     pub proposals: ProposalsTab,
-    pub inbox: InboxViewState,
     pub conflict: ConflictViewState,
     /// Pending interactive command (set by hand-merge confirm); the host
     /// takes it, suspends the terminal, runs it, and resumes.
@@ -281,7 +274,6 @@ impl<R: Runner> App<R> {
             palette: None,
             should_quit: false,
             proposals: ProposalsTab::default(),
-            inbox: InboxViewState::default(),
             conflict: ConflictViewState::default(),
             suspended: None,
             operator_mode: false,
@@ -817,9 +809,9 @@ impl<R: Runner> App<R> {
     /// Run `confidant sync --dry-run --json --no-input` and update the
     /// unpushed-commit status (#665). Read-only: the CLI reports the
     /// last-fetched upstream state and never contacts the remote. A stable
-    /// error code (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`,
-    /// `E_NOT_FAST_FORWARD`) is kept in `sync.code`; it is not an alert,
-    /// because a local-only or plaintext vault is a valid setup.
+    /// error code (`E_NO_REMOTE`, `E_NOT_FAST_FORWARD`) is kept in
+    /// `sync.code`; it is not an alert, because a local-only vault is a
+    /// valid setup.
     pub fn load_sync(&mut self) {
         let raw = match self.runner.run(&["sync", "--dry-run"]) {
             Ok(r) => r,
@@ -932,65 +924,6 @@ impl<R: Runner> App<R> {
         true
     }
 
-    /// Run `confidant inbox --dry-run --json --no-input` and update the
-    /// Inbox view state. Read-only: decrypts and plans, commits nothing.
-    ///
-    /// Returns `false` when the dry run failed (runner error, CLI error,
-    /// invalid JSON, or a version mismatch); in that case any report already
-    /// on the state is left untouched, and the caller must not treat it as a
-    /// fresh preview. The palette's apply entry gates its confirm on this.
-    pub fn load_inbox(&mut self) -> bool {
-        let raw = match self.runner.run(&["inbox", "--dry-run"]) {
-            Ok(r) => r,
-            Err(e) => {
-                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
-                return false;
-            }
-        };
-        if let Some((_, report)) = self.apply_outcome::<InboxReport>(&raw) {
-            self.inbox.report = Some(report);
-            self.inbox.confirming = false;
-            self.inbox.last_apply = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Open the apply confirm modal, if there is anything to apply.
-    pub fn inbox_begin_apply(&mut self) {
-        let can_apply = self
-            .inbox
-            .report
-            .as_ref()
-            .map(|r| !r.empty && !r.items.is_empty())
-            .unwrap_or(false);
-        if can_apply {
-            self.inbox.confirming = true;
-        }
-    }
-
-    /// Run the real `confidant inbox` (all-or-nothing merge + clear), then
-    /// reload the dry run so the view shows the new state.
-    pub fn inbox_run_apply(&mut self) {
-        self.inbox.confirming = false;
-        let raw = match self.runner.run(&["inbox"]) {
-            Ok(r) => r,
-            Err(e) => {
-                self.alert = Some(AlertState::runner_error(&format!("{e:#}")));
-                return;
-            }
-        };
-        if let Some((_, report)) = self.apply_outcome::<InboxReport>(&raw) {
-            let msg = format!(
-                "merged {} item(s), cleared {}",
-                report.merged, report.cleared
-            );
-            self.load_inbox();
-            self.inbox.last_apply = Some(msg);
-        }
-    }
-
     /// Run `confidant check --json --no-input` and list the
     /// `E_MERGE_CONFLICT` findings that carry a record id (#456).
     pub fn load_conflicts(&mut self) {
@@ -1032,7 +965,7 @@ impl<R: Runner> App<R> {
     }
 
     /// Open the detail view for the selected conflict: run
-    /// `record resolve <id> --show` and keep both decrypted sides in
+    /// `record resolve <id> --show` and keep both sides in
     /// memory only.
     pub fn open_conflict_detail(&mut self) {
         let Some(entry) = self.conflict.entries.get(self.conflict.selected) else {
@@ -1601,38 +1534,20 @@ impl<R: Runner> App<R> {
     }
 
     /// Run each capture source that is cheap to know up front so the Review
-    /// Queue badge is populated from launch: the proposal manifests from disk,
-    /// and the inbox dry run. Conflicts are derived from the check report
-    /// `load_check` already fetched.
-    ///
-    /// The inbox read must not mask an earlier startup failure: a successful
-    /// `load_inbox` clears the alert (the usual "a good reload clears the
-    /// alert" rule), and a failed one replaces it. Either way an alert raised
-    /// by the startup `check`/roster load is the one the operator should see,
-    /// so it is restored when there was one.
+    /// Queue badge is populated from launch: the proposal manifests from disk.
+    /// Conflicts are derived from the check report `load_check` already
+    /// fetched.
     pub fn prime_review_queue(&mut self) {
         self.load_proposals();
-        let prior_alert = self.alert.take();
-        self.load_inbox();
-        if prior_alert.is_some() {
-            self.alert = prior_alert;
-        }
     }
 
-    /// Pending items across the Review Queue sources: proposal manifests,
-    /// inbox items to merge, and conflicted records. Derived from cached
-    /// state only; nothing here runs the CLI.
+    /// Pending items across the Review Queue sources: proposal manifests and
+    /// conflicted records. Derived from cached state only; nothing here runs
+    /// the CLI.
     pub fn review_pending(&self) -> usize {
         let proposals = self.proposals.entries.len();
-        let inbox = self
-            .inbox
-            .report
-            .as_ref()
-            .filter(|report| !report.empty)
-            .map(|report| report.items.len())
-            .unwrap_or(0);
         let conflicts = conflict::entries_from_report(self.check.report.as_ref()).len();
-        proposals + inbox + conflicts
+        proposals + conflicts
     }
 
     /// The workspace tab label, with a pending-count badge on Review Queue.
@@ -1985,9 +1900,6 @@ impl<R: Runner> App<R> {
                     self.run_search(&q);
                 }
             }
-            ActiveView::Inbox => {
-                self.load_inbox();
-            }
             ActiveView::Conflicts => self.load_conflicts(),
         }
     }
@@ -2217,17 +2129,13 @@ impl<R: Runner> App<R> {
             ActiveView::Check if self.check.report.is_none() => self.load_check(),
             ActiveView::Doctor if self.doctor.report.is_none() => self.load_doctor(),
             ActiveView::Proposals if !self.proposals.loaded => self.load_proposals(),
-            ActiveView::Inbox if self.inbox.report.is_none() => {
-                self.load_inbox();
-            }
             ActiveView::Conflicts if !self.conflict.loaded => self.load_conflicts(),
             _ => {}
         }
     }
 
     /// Move to `view` and leave any local text mode, without loading
-    /// anything. The caller owns the refresh (the palette's inbox apply
-    /// wants exactly one fresh dry run, not the lazy load plus another).
+    /// anything.
     fn reset_for_navigation(&mut self, view: ActiveView) {
         self.active_view = view;
         self.input_mode = InputMode::Normal;
@@ -2247,7 +2155,7 @@ impl<R: Runner> App<R> {
             Workspace::Review => {
                 if !matches!(
                     self.active_view,
-                    ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts
+                    ActiveView::Proposals | ActiveView::Conflicts
                 ) {
                     self.switch_to(ActiveView::Proposals);
                 }
@@ -2415,7 +2323,6 @@ impl<R: Runner> App<R> {
         self.input_mode == InputMode::Normal
             && self.edit_flow.is_none()
             && self.capture.is_none()
-            && !self.inbox.confirming
             && self.conflict.confirming.is_none()
             && self
                 .proposals
@@ -2469,19 +2376,16 @@ impl<R: Runner> App<R> {
     /// Run a palette entry through the same path as its key binding.
     ///
     /// Read-only entries switch views or open a modal. Write entries
-    /// (`capture.*`, `record.edit`, `inbox.apply`) only *start* the usual
-    /// flow: a `--dry-run` preview followed by an explicit `y`. Nothing here
-    /// writes on `Enter` alone. `record.edit` is refused outside People and
-    /// the Context view (where the operator can see the loaded context), and
-    /// `inbox.apply` opens its confirm only when the fresh dry run it just
-    /// issued succeeded, so `y` can never apply behind a stale preview.
+    /// (`capture.*`, `record.edit`) only *start* the usual flow: a
+    /// `--dry-run` preview followed by an explicit `y`. Nothing here writes
+    /// on `Enter` alone. `record.edit` is refused outside People and the
+    /// Context view (where the operator can see the loaded context).
     fn run_palette_action(&mut self, id: &str) {
         match id {
             "workspace.people" => self.switch_workspace(Workspace::People),
             "workspace.review" => self.switch_workspace(Workspace::Review),
             "workspace.check" => self.switch_workspace(Workspace::Check),
             "view.proposals" => self.switch_to(ActiveView::Proposals),
-            "view.inbox" => self.switch_to(ActiveView::Inbox),
             "view.conflicts" => self.switch_to(ActiveView::Conflicts),
             "view.doctor" => self.switch_to(ActiveView::Doctor),
             "people.filter" => {
@@ -2529,17 +2433,6 @@ impl<R: Runner> App<R> {
                         blocking: false,
                         raw: None,
                     });
-                }
-            }
-            // Re-run the dry run first, then open the normal apply confirm —
-            // but only when that fresh dry run succeeded. If it failed, the
-            // loaded report is stale (e.g. the one primed at launch); opening
-            // the confirm on it would let `y` apply behind a preview the TUI
-            // just failed to refresh.
-            "inbox.apply" => {
-                self.reset_for_navigation(ActiveView::Inbox);
-                if self.load_inbox() {
-                    self.inbox_begin_apply();
                 }
             }
             "operator.toggle" => self.toggle_operator_mode(),
@@ -2607,10 +2500,6 @@ impl<R: Runner> App<R> {
             }
             KeyCode::Char('o') => {
                 self.switch_to(ActiveView::Proposals);
-                true
-            }
-            KeyCode::Char('i') => {
-                self.switch_to(ActiveView::Inbox);
                 true
             }
             KeyCode::Char('c') => {
@@ -2689,39 +2578,6 @@ impl<R: Runner> App<R> {
             }
             KeyCode::Char('r') => self.load_proposals(),
             _ => {}
-        }
-    }
-
-    /// Handle a key event while the inbox tab is active.
-    ///
-    /// Returns true when the key was consumed. The confirm modal swallows
-    /// every key: `y` applies, anything else just cancels. Outside the
-    /// modal, `r` re-runs the dry run and `a` opens the all-or-nothing
-    /// apply confirm; everything else falls through to the shared
-    /// navigation and quit handling in `handle_key`.
-    fn handle_inbox_key(&mut self, key: KeyEvent) -> bool {
-        // Esc dismisses an alert first, before any view action.
-        if self.alert.is_some() && matches!(key.code, KeyCode::Esc) {
-            self.alert = None;
-            return true;
-        }
-        if self.inbox.confirming {
-            match key.code {
-                KeyCode::Char('y') => self.inbox_run_apply(),
-                _ => self.inbox.confirming = false,
-            }
-            return true;
-        }
-        match key.code {
-            KeyCode::Char('r') => {
-                self.load_inbox();
-                true
-            }
-            KeyCode::Char('a') => {
-                self.inbox_begin_apply();
-                true
-            }
-            _ => false,
         }
     }
 
@@ -3079,10 +2935,6 @@ impl<R: Runner> App<R> {
             return;
         }
 
-        if self.active_view == ActiveView::Inbox && self.handle_inbox_key(key) {
-            return;
-        }
-
         if self.active_view == ActiveView::Conflicts && self.handle_conflict_key(key) {
             return;
         }
@@ -3230,8 +3082,8 @@ impl<R: Runner> App<R> {
                     }
                 }
             }
-            // The proposals, inbox, and conflicts tabs handle their own keys.
-            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
+            // The proposals and conflicts tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Conflicts => {}
         }
     }
 
@@ -3250,8 +3102,8 @@ impl<R: Runner> App<R> {
             ActiveView::Search => {
                 self.search.selected = self.search.selected.saturating_sub(1);
             }
-            // The proposals, inbox, and conflicts tabs handle their own keys.
-            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
+            // The proposals and conflicts tabs handle their own keys.
+            ActiveView::Proposals | ActiveView::Conflicts => {}
         }
     }
 
@@ -3307,9 +3159,8 @@ impl<R: Runner> App<R> {
                 }
             }
             // The proposals and conflicts tabs handle `g`/`G` in their own
-            // list handlers (they own Enter/selection); Inbox has no row
-            // selection.
-            ActiveView::Proposals | ActiveView::Inbox | ActiveView::Conflicts => {}
+            // list handlers (they own Enter/selection).
+            ActiveView::Proposals | ActiveView::Conflicts => {}
         }
     }
 
@@ -3339,7 +3190,6 @@ impl<R: Runner> App<R> {
             | ActiveView::Context
             | ActiveView::Doctor
             | ActiveView::Proposals
-            | ActiveView::Inbox
             | ActiveView::Conflicts => None,
         };
 
@@ -3384,7 +3234,6 @@ impl<R: Runner> App<R> {
                 ActiveView::Doctor => doctor::render(&self.doctor, frame, chunks[1]),
                 ActiveView::Proposals => self.render_proposals(frame, chunks[1]),
                 ActiveView::Search => search::render(&self.search, frame, chunks[1]),
-                ActiveView::Inbox => self.render_inbox(frame, chunks[1]),
                 ActiveView::Conflicts => self.render_conflict(frame, chunks[1]),
             }
         }
@@ -3405,8 +3254,7 @@ impl<R: Runner> App<R> {
                         vec![
                             format!("{noun} {} ({})", flow.target.id, flow.target.label),
                             String::new(),
-                            "This re-encrypts and creates one commit (if anything changed)."
-                                .to_owned(),
+                            "This creates one commit (if anything changed).".to_owned(),
                         ],
                     ),
                     frame,
@@ -3463,7 +3311,7 @@ impl<R: Runner> App<R> {
                             }
                         ),
                         String::new(),
-                        "Pushing uploads ciphertext commits; the vault is encrypted.".to_owned(),
+                        "Pushing uploads the vault's commits to the remote.".to_owned(),
                     ],
                 )
                 .with_hint("Type y to push and quit, n to quit without pushing, or Esc to stay."),
@@ -3603,15 +3451,6 @@ impl<R: Runner> App<R> {
                 ("?", "help"),
                 ("q", "quit"),
             ],
-            ActiveView::Inbox => vec![
-                ("1-3", "ws"),
-                ("Tab", "view"),
-                ("a", "apply"),
-                ("r", "reload"),
-                (":", "palette"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
             ActiveView::Conflicts => vec![
                 ("1-3", "ws"),
                 ("Tab", "view"),
@@ -3645,16 +3484,6 @@ impl<R: Runner> App<R> {
                 ("?", "help"),
                 ("q", "quit"),
             ],
-        }
-    }
-
-    /// Render the inbox tab: dry-run report, or the apply confirm modal.
-    fn render_inbox(&self, frame: &mut Frame<'_>, area: Rect) {
-        inbox::render(&self.inbox, frame, area);
-        if self.inbox.confirming {
-            if let Some(report) = &self.inbox.report {
-                inbox::render_confirm(frame, area, report.merged, report.cleared);
-            }
         }
     }
 

@@ -2,11 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::check::{Finding, FindingCode, Severity};
 use crate::config::{VaultConfig, SPEC_VERSION};
-use crate::conflict::is_envelope_conflict;
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::packs::embedded as packs_embedded;
@@ -19,35 +17,6 @@ use crate::record::{
 };
 
 const COLLECTIONS: &[&str] = &["people", "orgs", "deals", "interactions", "notes", "edges"];
-
-/// Per-file outcome of the read-path content hook (spec 4, issue #148).
-///
-/// Core stays keyless: it never sees key material or `confidant-crypt`
-/// types. The CLI implements the hook with its decryptor; `check` passes
-/// no hook and keeps today's structural behavior.
-#[derive(Debug)]
-pub enum ContentOutcome {
-    /// Bytes for core to parse as the record: plaintext passthrough or
-    /// decrypted inner record.
-    Content(Vec<u8>),
-    /// Envelope with `no-ai: true` in the outer header. Core synthesizes a
-    /// shell record from the header (`id`/`type`/`no-ai: true`, empty body)
-    /// so `context` keeps working and `find` keeps excluding it via the
-    /// existing §12 allowlist rule. Never decrypted.
-    NoAiShell { id: String, record_type: String },
-    /// Encrypted record this device cannot read (no device key, or the data
-    /// key won't unwrap). Not loaded; counted as `skipped_encrypted`.
-    Skipped,
-    /// Envelope failed structural parse or AEAD authentication
-    /// (tampered/corrupt). Not loaded; counted as `refused_envelopes`.
-    /// Never folded into the skip count.
-    Refused,
-}
-
-/// Opaque per-file content provider for the read path: vault-relative path
-/// and raw file bytes in, [`ContentOutcome`] out. `Send + Sync` because
-/// record files load on worker threads.
-pub type ContentHook = Arc<dyn Fn(&str, &[u8]) -> ContentOutcome + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct SourcedEntry {
@@ -90,21 +59,6 @@ pub struct Vault {
     /// Crockford ULIDs taken from visited file/directory names whose windows
     /// are not already a loaded record's own exact name.
     pub path_ulids: BTreeSet<String>,
-    /// Record files skipped as encrypted-but-unreadable by the content hook
-    /// (spec 4). No-ai envelopes are loaded as shells, not counted here.
-    pub skipped_encrypted: u32,
-    /// Envelopes refused as tampered/corrupt by the content hook (spec 4).
-    /// Never folded into `skipped_encrypted`.
-    pub refused_envelopes: u32,
-    /// Skipped record files that are person records (see
-    /// `is_person_record_job`). Person-lookup gating (#717) uses these,
-    /// not the vault-wide counts: an unreadable org, deal, note, edge, or
-    /// interaction cannot hide a person, so it must not flip a person
-    /// miss to `E_CANNOT_SEARCH`.
-    pub skipped_person_records: u32,
-    /// Refused envelopes that are person records (same rule as
-    /// `skipped_person_records`).
-    pub refused_person_records: u32,
     /// The vault's own pack registry: compiled packs plus the loaded
     /// external packs (#438). Replaces #432's process-wide static.
     pack_registry: PackRegistry,
@@ -123,27 +77,17 @@ impl Vault {
 }
 
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
-    load_vault_with_hook(root, None)
-}
-
-/// Load a vault, applying `hook` to every record file's raw bytes before
-/// parsing (spec 4). `None` keeps the historical behavior: raw bytes are
-/// parsed as-is (`check` stays keyless and structural).
-pub fn load_vault_with_hook(
-    root: &Path,
-    hook: Option<ContentHook>,
-) -> Result<Vault, crate::error::DomainError> {
     let root = root
         .canonicalize()
         .map_err(|_| crate::error::DomainError::vault_not_found())?;
-    load_vault_inner(&root, hook.as_ref()).map_err(|err| {
+    load_vault_inner(&root).map_err(|err| {
         crate::error::DomainError::of(&err)
             .cloned()
             .unwrap_or_else(|| crate::error::DomainError::invalid(err.to_string()))
     })
 }
 
-fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<Vault> {
+fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let cfg_text = paths::read_to_string(root, Path::new("confidant.toml")).map_err(|err| {
         if crate::error::is_missing(&err) {
             anyhow::Error::new(crate::error::DomainError::vault_not_found())
@@ -220,23 +164,13 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
     let mut entries = Vec::new();
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
-    let mut skipped_encrypted = 0u32;
-    let mut refused_envelopes = 0u32;
-    let mut skipped_person_records = 0u32;
-    let mut refused_person_records = 0u32;
 
     if config.spec == SPEC_VERSION {
         let mut jobs = Vec::new();
         let mut names = Vec::new();
         scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
-        let outs = load_markdown_jobs(root, &jobs, hook);
+        let outs = load_markdown_jobs(root, &jobs);
         for (job, out) in jobs.iter().zip(outs) {
-            skipped_encrypted += out.skipped;
-            refused_envelopes += out.refused;
-            if is_person_record_job(job) {
-                skipped_person_records += out.skipped;
-                refused_person_records += out.refused;
-            }
             if out.conflicted {
                 if let Some(id) = &job.path_id {
                     conflicted_ids.insert(id.clone());
@@ -267,10 +201,6 @@ fn load_vault_inner(root: &Path, hook: Option<&ContentHook>) -> anyhow::Result<V
         path_ids,
         conflicted_ids,
         path_ulids,
-        skipped_encrypted,
-        refused_envelopes,
-        skipped_person_records,
-        refused_person_records,
         pack_registry,
         pack_problems,
     })
@@ -882,29 +812,7 @@ struct MarkdownJob {
 
 /// Read, parse and check the jobs on worker threads, preserving job
 /// order in the output so the merge is deterministic.
-/// Whether a markdown job is a person record for #717 gating: its
-/// path-derived id has the person prefix and it is not a note under a
-/// person directory (notes carry `note_owner`). The path id is the only
-/// signal available when the file itself went unread — a skipped or
-/// refused envelope's header is never parsed — so a job whose path claims
-/// a person id is counted as a person record, and every other job (orgs,
-/// deals, interactions, notes, edges, and any path whose id does not
-/// parse as a person) is not. Jobs always carry a path id in practice
-/// (a filename that does not parse never becomes a job); the `None` arm
-/// simply never counts.
-fn is_person_record_job(job: &MarkdownJob) -> bool {
-    job.note_owner.is_none()
-        && job
-            .path_id
-            .as_ref()
-            .is_some_and(|id| id.prefix() == Prefix::Person)
-}
-
-fn load_markdown_jobs(
-    root: &Path,
-    jobs: &[MarkdownJob],
-    hook: Option<&ContentHook>,
-) -> Vec<JobOutput> {
+fn load_markdown_jobs(root: &Path, jobs: &[MarkdownJob]) -> Vec<JobOutput> {
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -919,7 +827,7 @@ fn load_markdown_jobs(
         for part in jobs.chunks(chunk) {
             handles.push(s.spawn(|| {
                 part.iter()
-                    .map(|job| run_markdown_job(root, job, hook))
+                    .map(|job| run_markdown_job(root, job))
                     .collect::<Vec<_>>()
             }));
         }
@@ -930,14 +838,11 @@ fn load_markdown_jobs(
     out
 }
 
-/// One job's result: the parsed record (if any), its findings, and the
-/// spec-4 hook counts.
+/// One job's result: the parsed record (if any), its findings, and
+/// whether the file carries git conflict markers (#396).
 struct JobOutput {
     record: Option<Record>,
     findings: Vec<Finding>,
-    skipped: u32,
-    refused: u32,
-    /// Whether the file carries git conflict markers (#396).
     conflicted: bool,
 }
 
@@ -985,14 +890,12 @@ fn merge_markdown_job(
     }
 }
 
-fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) -> JobOutput {
+fn run_markdown_job(root: &Path, job: &MarkdownJob) -> JobOutput {
     let mut findings = Vec::new();
     let file = paths::display_relative(&job.relative);
     let fail = |findings: Vec<Finding>, conflicted: bool| JobOutput {
         record: None,
         findings,
-        skipped: 0,
-        refused: 0,
         conflicted,
     };
     let text = match paths::read_to_string(root, &job.relative) {
@@ -1010,88 +913,20 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
             return fail(findings, false);
         }
     };
-    // #391: conflict markers are detected from the raw bytes, before any
-    // decrypt. The finding is pushed here so it also survives the
-    // skip/refuse paths below.
+    // #391: conflict markers are detected from the raw bytes, so the
+    // finding is pushed before parsing.
     let conflicted = has_conflict_markers(&text);
     if conflicted {
-        // CD1 (#452): when both conflict sides parse as encrypted
-        // envelopes, the record is an encrypted record with two versions —
-        // say so and point at `record resolve`. Every other conflicted
-        // file keeps the generic message and fix exactly.
-        let envelope_id = is_envelope_conflict(&text)
-            .then(|| job.path_id.clone())
-            .flatten();
-        let finding = match envelope_id {
-            Some(id) => Finding::new(
-                FindingCode::MergeConflict,
-                Severity::Error,
-                "encrypted record has two versions after a merge conflict".to_owned(),
-            )
-            .at_file(&file)
-            .for_id(&id)
-            .with_fix(format!(
-                "Run `confidant record resolve {id} --show` to compare the two versions"
-            )),
-            None => Finding::new(
+        findings.push(
+            Finding::new(
                 FindingCode::MergeConflict,
                 Severity::Error,
                 "file contains git conflict markers".to_owned(),
             )
             .at_file(&file)
             .with_fix("Resolve the conflict; check keeps both sides visible until you do"),
-        };
-        findings.push(finding);
+        );
     }
-    // Spec 4: the content hook maps raw bytes to the bytes core parses
-    // (decrypted inner record), a no-ai shell, or a skip/refuse decision.
-    // `check` passes no hook and keeps the historical behavior.
-    let bytes: Vec<u8> = match hook {
-        None => text.into_bytes(),
-        Some(hook) => match hook(&file, text.as_bytes()) {
-            ContentOutcome::Content(bytes) => bytes,
-            ContentOutcome::NoAiShell { id, record_type } => {
-                // Synthesize the public shell from the outer header:
-                // id/type/no-ai are plaintext in the envelope, the body
-                // stays empty. The allowlist excludes it via `no_ai()`
-                // exactly like a plaintext no-ai record.
-                format!("---\nid: {id}\ntype: {record_type}\nno-ai: true\n---\n").into_bytes()
-            }
-            ContentOutcome::Skipped => {
-                return JobOutput {
-                    record: None,
-                    findings,
-                    skipped: 1,
-                    refused: 0,
-                    conflicted,
-                }
-            }
-            ContentOutcome::Refused => {
-                return JobOutput {
-                    record: None,
-                    findings,
-                    skipped: 0,
-                    refused: 1,
-                    conflicted,
-                }
-            }
-        },
-    };
-    let text = match String::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(_) => {
-            findings.push(
-                Finding::new(
-                    FindingCode::Unreadable,
-                    Severity::Error,
-                    "path is unreadable".to_owned(),
-                )
-                .at_file(&file)
-                .with_fix("Replace the file with valid UTF-8 Markdown"),
-            );
-            return fail(findings, false);
-        }
-    };
     if conflicted {
         // #399: only skip parsing when the front matter itself is conflicted.
         // Markers confined to the body still parse, so the record stays in
@@ -1114,8 +949,6 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
             JobOutput {
                 record: None,
                 findings,
-                skipped: 0,
-                refused: 0,
                 conflicted,
             }
         }
@@ -1171,8 +1004,6 @@ fn run_markdown_job(root: &Path, job: &MarkdownJob, hook: Option<&ContentHook>) 
             JobOutput {
                 record: Some(rec),
                 findings,
-                skipped: 0,
-                refused: 0,
                 conflicted,
             }
         }

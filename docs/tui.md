@@ -9,7 +9,7 @@ this page keeps the detail and the phase history.
 
 The TUI consumes only the ADR-7 CLI JSON contract
 (`confidant <subcommand> --json --no-input`), never opens vault files
-directly, and keeps plaintext on the alternate screen only.
+directly, and keeps record content on the alternate screen only.
 
 It ships as a GitHub Releases binary (next to `confidant`) and on crates.io.
 You need **both** binaries: the TUI shells out to a `confidant` on `PATH`
@@ -50,7 +50,7 @@ screen without the banner.
 Editing is always operator-only, independent of operator mode: from the
 context pane, `[`/`]` select the person, a note, or an interaction and `e`
 edits it. `e` uses `record show --for-edit` / `note show --for-edit`, which
-decrypt `no-ai` records even while the roster view is un-badged (operator
+read `no-ai` records even while the roster view is un-badged (operator
 mode off); the badges and banner describe the roster/context view, not the
 edit path.
 
@@ -70,25 +70,17 @@ in the same 0600 gitignored scratch as the editor flow and removed after the
 write.
 
 Search moved to `f` (it was `s`). The Review Queue workspace (`2`) carries a
-badge with its pending count — proposal manifests, inbox items, and
-unresolved conflicts — so a queued item is visible from every workspace.
+badge with its pending count — proposal manifests and unresolved conflicts —
+so a queued item is visible from every workspace.
 
 ## Proposals (Phase 2, #211)
 
 The proposals tab lists the manifests in `<vault>/.confidant/proposals/` and
 applies them exactly as the skill workflow does: ledger import, then notes,
 then records — each step shown as a dry-run diff first and applied only on
-an explicit `y` confirm. Records are never hand-written into the vault tree
-(pre-M2 records stay with the skill workflow); every write goes through the
-CLI, one commit per write, with progress tracked so a crashed apply resumes
-where it stopped.
-
-## Inbox (Phase 3, #212)
-
-The inbox tab shows the `inbox --dry-run` plan — items with their merge
-actions, deferred items, and warnings — and applies it all-or-nothing
-through the existing `inbox` command on an explicit `y` confirm. There is no
-per-item selection in the TUI.
+an explicit `y` confirm. Records are never hand-written into the vault tree;
+every write goes through the CLI, one commit per write, with progress
+tracked so a crashed apply resumes where it stopped.
 
 ## Search (Phase 3a, #212)
 
@@ -106,9 +98,8 @@ The header shows a `sync` pill only when there is something to report:
 `2 unpushed`, `1 behind`, or `diverged`. It comes from
 `confidant sync --dry-run --json --no-input` at launch and on `r`/quit,
 which reports the last-fetched upstream state and **never contacts the
-remote**. A local-only vault, a vault with no upstream, or a plaintext
-vault has no pill: `sync` is refused there (`E_NO_REMOTE` or
-`E_PLAINTEXT_REMOTE`) and the TUI stays quiet rather than showing an
+remote**. A local-only vault or a vault with no upstream has no pill:
+`sync` reports `E_NO_REMOTE` and the TUI stays quiet rather than showing an
 alert.
 
 `q` (or the palette's Quit) checks that state once more. If commits are
@@ -134,7 +125,7 @@ stable refusal codes, and the timer units are in [`docs/sync.md`](sync.md).
 
 ## See also
 
-- [`docs/privacy.md`](privacy.md) — proposal scratch files, plaintext on
+- [`docs/privacy.md`](privacy.md) — proposal scratch files, content on
   screen, and the search allowlist.
 - [`docs/threat-model-agents.md`](threat-model-agents.md) — why operator
   mode and `--for-edit` are boundaries in the CLI surface, not access

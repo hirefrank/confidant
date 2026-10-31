@@ -11,8 +11,6 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = "1"
 
-[dependencies.confidant-crypt]
-path = "../crates/confidant-crypt"
 [dependencies.confidant-core]
 path = "../crates/confidant-core"
 
@@ -22,11 +20,5 @@ path = "../crates/confidant-core"
 [[bin]]
 name = "ledger_line"
 path = "fuzz_targets/ledger_line.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "envelope_decode"
-path = "fuzz_targets/envelope_decode.rs"
 test = false
 doc = false

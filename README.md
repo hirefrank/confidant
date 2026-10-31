@@ -76,10 +76,9 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
      upgrade (strongly recommended): macOS `brew upgrade git`, Linux
      `apt upgrade git`, `dnf upgrade git`, or `pacman -Syu git` (inside
      WSL2 for Windows). Below the floor is not a hard block on a fresh
-     install: `confidant doctor` reports it as a warning unless SSH
-     signers are configured, when it is an error — SSH signature
-     verification needs git >= 2.34, so upgrade before configuring
-     signers.
+     install: `confidant doctor` reports it as a warning, since older git
+     is still usable for the commands Confidant runs. Upgrade when you
+     can.
    - Make sure git has an identity, because `init` commits: check first
      with `git config --global user.name` and
      `git config --global user.email`, and set only values that are
@@ -104,38 +103,20 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    different vault. Give me the line to add to my shell rc for interactive
    use as separate advice. If I have no vault yet, ask whether to create
    one at a path I choose or stop — do not invent a path.
-5. Ask me whether this vault should be **encrypted** (the production
-   default: record bodies are unreadable in git) or **plaintext** (simpler:
-   every record body is readable by anyone with repo access), explain the
-   tradeoff before editing `confidant.toml` or running `confidant init`, and
-   let me choose:
-   - **Encrypted (default):** git identity was set in step 3 (init
-     commits). For a fresh vault, run
-     `confidant init --create --no-input --phrase-out <path>` against an
-     absent or empty directory (add `--remote <url>` if I already have a
-     remote; it sets origin and does not push): it scaffolds the directory,
-     starts the git repo on branch `main` (and reports the branch), seeds
-     `packs = []` (packs are optional), writes `.gitignore` and
-     `confidant.toml`, then creates the keys. For an existing directory that
-     is not yet initialized, first ensure
-     `confidant.toml` does **not** set `[crypto] mode = "plaintext"` (do not
-     flip a mode I already chose) and the working tree is clean
-     (`git status`), then run `confidant init`. Record bodies are encrypted
-     in git; ledger lines stay structural plaintext. The 24-word recovery
-     phrase goes to `<path>` (mode 0600, refuses to overwrite) and the
-     command prints only the path — never echo, copy, or read the phrase into
-     this chat. Have me run the human-only check
-     `confidant keys verify-recovery --phrase-file <path>` before moving
-     the file offline, then move it offline and delete the local copy
-     (agents must not handle or pipe the phrase).
-   - **Plaintext:** set or keep `mode = "plaintext"` under `[crypto]` in
-     `confidant.toml` (only valid while the vault is structurally
-     plaintext), do **not** run `confidant init`, and tell me plainly that
-     every record body, history included, is readable by anyone with the
-     repo or a clone, and that a remote on such a vault shows up as a
-     `git-remote` warning in `confidant doctor`. `confidant sync` refuses a
-     structurally plaintext vault (`E_PLAINTEXT_REMOTE`), so a push stays a
-     manual `git push` I explicitly choose.
+5. Tell me plainly, before any vault step, that Confidant keeps **plaintext**
+   records in a private git repo: every record body, history included, is
+   readable by anyone who can read that repo, so it belongs on a machine with
+   full-disk encryption (LUKS or FileVault) and a **private** remote. There is
+   no mode to choose and no key to set up; `no-ai` on a record keeps its
+   content out of what agents read, but it does not make the bytes secret.
+   For a fresh vault, run `confidant init --create --no-input` against an
+   absent or empty directory (add `--remote <url>` if I already have a
+   remote; it sets origin and does not push): it scaffolds the directory,
+   starts the git repo on branch `main` (and reports the branch), seeds
+   `packs = []` (packs are optional), writes `.gitignore` and
+   `confidant.toml`, creates the collection directories, and commits the
+   skeleton. For an existing directory that is not yet initialized, make sure
+   the working tree is clean (`git status`) and run `confidant init`.
 6. Optional remote: **before** `init`, ask whether I already have a git
    remote URL for backup and putting this vault on another device. If I do,
    pass `--remote <url>` on `confidant init --create` (it sets `origin` and
@@ -163,8 +144,8 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    that login alone does not register the helper. If the operator chose
    SSH during login, the helper claim does not apply at all.
    Alternatives: an SSH key, where SSH to the host actually works, or a
-   PAT stored via the git credential helper / OS keychain — never
-   pasted into a repo config, never committed, and never an account
+   PAT stored via the git credential helper or the OS credential store —
+   never pasted into a repo config, never committed, and never an account
    password (GitHub rejects passwords for git operations). A token
    that only exists somewhere else (for example one an agent can only
    use through an API) does not count: if it cannot be handed to git,
@@ -172,25 +153,23 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    If I decide after init, show me `git remote add origin
    <url>` (and probe before the first push, as above). In either case,
    set the upstream once with `git push -u origin
-   main`, then use `confidant sync --push` for later pushes on an encrypted
-   vault — never push without my explicit confirmation. On a **new device
-   for an existing vault**, do not run `init`: confirm
-   `git ls-remote <url>` succeeds first (the probe above), then clone the repo and
-   run `confidant keys device-add` (`recover` only if every enrolled device is
-   lost).
+   main`, then use `confidant sync --push` for later pushes — never push
+   without my explicit confirmation. On a **new device for an existing
+   vault**, do not run `init`: confirm `git ls-remote <url>` succeeds first
+   (the probe above), then clone the repo and start using it.
 7. Verify: run `confidant check --vault "<path>" --json --no-input` and
    `confidant doctor --vault "<path>"`; report the error/warning counts,
    the branch `init` created, and any `git-remote` or `local-commits`
    warning.
 8. Read the routing snippet (`confidant routing`) for the propose →
    confirm → apply workflow every skill follows, and the Privacy rules
-   (trusted devices with encrypted disks only; `.confidant/` is never
-   committed; `no-ai` records stay out of agent output — see the README's
-   Encryption and privacy section and `docs/privacy.md` in the GitHub repo).
+   (trusted devices with full-disk encryption; a private remote;
+   `.confidant/` is never committed; `no-ai` records stay out of agent
+   output — see the README's Privacy section and `docs/privacy.md` in the
+   GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
-vault crypto mode (encrypted or plaintext), the vault branch, the `check`
-result, and any `confidant doctor` warnings.
+the vault branch, the `check` result, and any `confidant doctor` warnings.
 ```
 
 **No agent?** `cargo install confidant-cli confidant-tui && confidant setup --agent auto`
@@ -207,10 +186,8 @@ Contributors: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 `confidant init --create` starts a local git repo on `main`. Pass
 `--remote <url>` to set `origin` (it still does not push). Local-only is a
 valid setup; a remote is what makes backup and putting the vault on another
-device possible. On a second device, clone the repo and run
-`confidant keys device-add` — not `init`, and not `recover` unless every
-enrolled device is lost (`recover` rotates the recovery phrase). If the
-vault already exists without a remote:
+device possible. On a second device, clone the repo and use it — there is
+no enrollment step. If the vault already exists without a remote:
 
 ```sh
 git remote add origin <url>
@@ -228,18 +205,17 @@ confidant sync --pull      # fast-forward only, after confirmation
 confidant sync --dry-run   # report the last-fetched state; no network
 ```
 
-`confidant doctor` reports a `git-remote` check: local-only is fine, an
-encrypted vault with a remote is fine, and a remote on a
-`[crypto] mode = "plaintext"` vault is a **warning**. A second
-`local-commits` check reports ahead/behind from the last fetch. The manual
-rhythm, refusal codes, and the opt-in systemd/launchd timer are in
-[`docs/sync.md`](docs/sync.md).
+`confidant doctor` reports a `git-remote` check: local-only is fine, a
+private `https://` or `ssh://` remote is fine, and a cleartext or
+unverifiable transport is a **warning**. A second `local-commits` check
+reports ahead/behind from the last fetch. The manual rhythm, refusal codes,
+and the opt-in systemd/launchd timer are in [`docs/sync.md`](docs/sync.md).
 
-A plaintext-mode vault on a remote exposes every record body, history
-included, to anyone with access to the repository; `confidant doctor`
-reports that as a `git-remote` warning. If that is not the tradeoff you
-want, remove the remote; anything already pushed stays readable in its
-history. Details:
+**The remote must be private.** A remoted vault exposes every record body,
+history included, to anyone with access to the repository, and Confidant
+cannot see a host's privacy setting. If that is not the tradeoff you want,
+remove the remote; anything already pushed stays readable in its history.
+Details:
 [`docs/agent-setup.md`](docs/agent-setup.md#connect-a-git-remote-optional).
 
 ## First five minutes: the people in your life
@@ -307,13 +283,10 @@ confidant check
 ```
 
 `log touch` resolves the display name and writes one committed ledger line.
-The demo is plaintext fake data. For your own vault,
-`confidant init --create --no-input --phrase-out <path>` on an empty
-directory makes an encrypted vault by default on branch `main` and writes a
-24-word recovery phrase once to `<path>` (mode 0600; move it offline and
-delete the local copy). Never paste the phrase into chat or a log;
-`confidant keys verify-recovery --phrase-file <path>` is the human-only
-read-only check that the saved copy matches the vault.
+The demo is fake data. For your own vault, `confidant init --create
+--no-input` on an empty directory creates one on branch `main`. Records are
+plaintext in the repo, so keep it private and on a full-disk-encrypted
+machine ([Privacy](#privacy)).
 
 ## How your agents use it
 
@@ -326,7 +299,7 @@ and `--no-input`; usage errors exit 2; branch on `code`, never message text.
 `context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
 `pack_skill`); no tool can widen that list. A write runs `check` and commits once. `--packs` scopes
 reads (on `mcp` it is the instance ceiling) as a read-time policy filter,
-not cryptography ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
+not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
 [`docs/threat-model-agents.md`](docs/threat-model-agents.md)).
 
 `no-ai` keeps a record out of agent output; `--for-operator` on `find`,
@@ -341,22 +314,23 @@ fuzzy and `no-ai: true` people are ID-only.
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
-| Keys | `init`, `recover`, `keys init-client` / `rotate` / `revoke` / `shred` / `device-add` / `verify-recovery` |
-| Inbox | `inbox`, `inbox rotate` |
-| Search | `reindex` + `qmd-search` skill |
+| Setup | `init`, `setup`, `update`, `doctor` |
+| Search | `find`, plus the optional `qmd-search` skill |
 | Sync | `sync` (read-only report; `--pull` / `--push` explicit) |
-| Health | `doctor` |
-| Agents | `mcp`, `setup`, `update`, `agents`, `which`, `routing`, `tui` |
+| Agents | `mcp`, `agents`, `which`, `routing`, `tui` |
 
-**Aliases** map a `kind:value` to a person. The raw value is PII: `alias
-add` and `alias resolve` read it from stdin or `--value-file`, never an
-argument, and emit only `hmac:`.
+**Contact values** (emails, phones, handles, former names) are front-matter
+fields on the person, declared by the personal pack. `alias resolve <kind>
+<value>` matches them directly — trimmed, case-insensitive, whole-string —
+and canonicalizes through merges. Two different people sharing a value is
+`E_AMBIGUOUS_PERSON`, not a silent pick.
 
 ## The TUI
 
 `confidant-tui` is a terminal UI for the roster, a person's context, vault
 health, quick capture, and review of queued work. It consumes only the
-ADR-7 CLI JSON contract and keeps plaintext on the alternate screen only.
+ADR-7 CLI JSON contract and keeps record content on the alternate screen
+only.
 Install both from the same release — `cargo install confidant-cli
 confidant-tui` — then run `confidant tui --vault examples/demo-vault`.
 `confidant tui` and `confidant doctor` warn when the CLI and TUI versions
@@ -440,7 +414,8 @@ agent instructions. It cannot widen the §12 allowlist or read `no-ai`
 content; the CLI enforces that, not the pack text.
 
 **Scoping.** Packs share a vault, and `--packs` scopes a read to the packs
-you name. That is a read-time policy filter, not per-pack cryptography
+you name. That is a read-time policy filter, not an access boundary —
+the vault is plaintext on disk
 ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178)).
 
 ## Search
@@ -452,42 +427,43 @@ omitted, not redacted. Numbers:
 [`docs/search-benchmark.md`](docs/search-benchmark.md).
 
 **QMD search** is an optional on-device semantic layer (BM25 + vectors +
-reranking), shipped as an embedded skill, not a CLI dependency.
-`confidant reindex` builds the corpus from the cleared set under
-`<vault>/.confidant/` (gitignored, never committed). `qmd-search` verifies
-every hit through the CLI, so a query-path bug degrades to missing results;
-without QMD it falls back to `confidant find` and says so.
+reranking), shipped as an embedded skill, not a CLI dependency. The skill
+stages a copy of the cleared set under `<vault>/.confidant/` (gitignored,
+never committed) and verifies every hit through `confidant allowlist`, so a
+query-path bug degrades to missing results; without QMD it falls back to
+`confidant find` and says so. Design:
+[`crates/confidant-cli/skills/qmd-search/docs/design.md`](crates/confidant-cli/skills/qmd-search/docs/design.md).
 
-## Encryption and privacy
+## Privacy
 
-Encrypted vaults (the default) keep record bodies out of git. On a keyed
-vault, `record add`, `note add`, and `log session --note` write §14
-envelopes (per-client data keys; `name:` lives only inside the ciphertext),
-and inbox items encrypt at drain time. Ledger entries, `import`, and
-`confidant.toml` stay plaintext by design — a `touch` line carries a date,
-an opaque ID, and a kind, never prose.
+**Records are plaintext on disk.** A vault is Markdown and `.cfd` files in a
+git repo; `record add`, `note add`, and `log session --note` write those
+bytes directly. There is no second secrecy layer and no key material, so a
+clone is the whole vault.
 
-`[crypto] mode = "plaintext"` is the alternative: nothing is encrypted, and
-every record body is readable by anyone with the repo, history included. It
-is valid only while the vault is structurally plaintext, it can never
-downgrade a keyed vault, and existing plaintext records are never encrypted
-in place. That suits demo and learning vaults, and it is a legitimate choice
-for real data too if you are comfortable with who can read the repo.
-`find`, `context`, and MCP decrypt cleared records (never `no-ai`, except
-the operator-only `--for-operator` flag).
+That makes the perimeter easy to state, and it is the whole privacy model:
+
+- **The machine.** Run Confidant on devices you control, with full-disk
+  encryption on (LUKS, FileVault). Disk encryption is the operating-system
+  setting that covers a stolen laptop; Confidant does not manage it.
+- **The repo.** Sync to a **private** remote. Anyone with access to the repo
+  can read every record and every commit, history included, and anything
+  pushed there stays in history (deleting a file is not erasing it).
+- **`no-ai`.** A record or a person can be marked `no-ai`, which keeps its
+  content out of `find`, `context`, the allowlist, MCP, and the search
+  corpus that agents read. Content stays out while `context` still serves
+  derived ledger metadata; the flag itself is visible in the record's front
+  matter.
+
+`no-ai` is an exposure control, not access control: the operator owns the
+files, and an agent with a shell on the same machine can read them. A stolen
+unlocked device, or malware on a trusted device, defeats every guarantee.
+See [`docs/privacy.md`](docs/privacy.md),
+[`docs/threat-model-agents.md`](docs/threat-model-agents.md), and
+[`docs/architecture.md`](docs/architecture.md) §3–§4.
 
 Content an agent reads is sent to a hosted model provider; this is explicit
 and accepted, and Confidant makes no claim about what the provider stores.
-
-`no-ai` is an exposure control, not access control. Content stays out of
-`find`, `context`, the allowlist, and the search corpus, while `context`
-still serves derived ledger metadata and the flag itself is visible in the
-envelope header. A stolen unlocked device defeats every guarantee. See
-[`docs/privacy.md`](docs/privacy.md),
-[`docs/threat-model-agents.md`](docs/threat-model-agents.md), and
-[`docs/crypto-design.md`](docs/crypto-design.md). The encryption has not
-been independently audited; see
-[Security status](#security-status-no-independent-audit-yet).
 
 `confidant doctor` checks GitHub for the latest release and reports skills
 link health. The release check is one unauthenticated `GET` to
@@ -500,48 +476,34 @@ Set `CONFIDANT_OFFLINE=1` to skip the request; the check then reports
 
 - [`spec/0.1.md`](spec/0.1.md) — vault format; [`spec/findings.md`](spec/findings.md) — finding codes; [`spec/pack-manifest.md`](spec/pack-manifest.md) — pack manifests.
 - [`docs/architecture.md`](docs/architecture.md) — privacy, threat model, ADRs, milestones.
-- [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, shred; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
-- [`docs/crypto-design.md`](docs/crypto-design.md) — keys, envelopes, recovery; [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
+- [`docs/privacy.md`](docs/privacy.md) — allowlist, `no-ai`, pack scoping, edges; [`docs/threat-model-agents.md`](docs/threat-model-agents.md) — agent limits and gaps.
+- [`docs/sync.md`](docs/sync.md) — the explicit git boundary and timer; [`docs/tui.md`](docs/tui.md) — TUI detail; [`docs/agent-setup.md`](docs/agent-setup.md) — headless hosts and updates.
 - [`packs/`](packs/) — pack contracts; [`docs/search-benchmark.md`](docs/search-benchmark.md) — search numbers.
 
 ## Where we're going
 
 The roadmap is the open issues on GitHub. The current themes:
 
-- **Outside crypto audit** — [#138](https://github.com/hirefrank/confidant/issues/138), the gate on public launch.
-- **Crypto scope and shredding** — scoped recipients ([#160](https://github.com/hirefrank/confidant/issues/160)), pair keys for edges ([#257](https://github.com/hirefrank/confidant/issues/257)), a real shred path ([#155](https://github.com/hirefrank/confidant/issues/155)).
-- **Agent ergonomics** — cache decrypted reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
+- **Domain model** — record types and edges defined by packs, so a domain beyond people is first-class ([#796](https://github.com/hirefrank/confidant/issues/796)).
+- **Agent ergonomics** — cheaper reads across MCP calls ([#543](https://github.com/hirefrank/confidant/issues/543)).
 - **TUI** — a new-person modal ([#621](https://github.com/hirefrank/confidant/issues/621)).
-- **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), safe `init --force` ([#640](https://github.com/hirefrank/confidant/issues/640)), a reset path for local state ([#638](https://github.com/hirefrank/confidant/issues/638)).
+- **First-run setup** — pack selection on `init --create` ([#639](https://github.com/hirefrank/confidant/issues/639)), a safer `init` on a non-empty directory ([#640](https://github.com/hirefrank/confidant/issues/640)).
 
-## Security status: no independent audit yet
+## Security status
 
-Confidant's encryption hasn't been reviewed by an independent auditor. No
-audit is scheduled. One will happen if someone sponsors it. If you'd like to
-sponsor or arrange one, comment on
-[#138](https://github.com/hirefrank/confidant/issues/138).
+Confidant keeps records in plaintext by design (see [Privacy](#privacy)), so
+there is no cipher for an outside auditor to review. What the project does
+maintain: the
+[OSTIF / LeastAuthority security best-practices guide](https://github.com/ostif-org/best-practices-guide)
+as its baseline, a private vulnerability reporting channel
+([SECURITY.md](SECURITY.md)), CI running `cargo deny`, `cargo audit` and
+CodeQL on every change, `-D warnings` builds, no `unsafe` in
+`confidant-core`, fuzz targets for the parser, and attested release builds.
 
-What is in place: the project follows the
-[OSTIF / LeastAuthority security best-practices guide](https://github.com/ostif-org/best-practices-guide).
-That means a private reporting channel ([SECURITY.md](SECURITY.md)), and CI
-that runs `cargo deny`, `cargo audit` and CodeQL on every change. It also
-means no `unsafe` code in the crypto crate, fuzz targets for the parsers,
-and attested release builds. The design is written down so you can judge it
-yourself:
-
-- [`docs/crypto-design.md`](docs/crypto-design.md): key hierarchy,
-  envelopes, recovery and shredding, plus the in-project review history
-- [`docs/threat-model-agents.md`](docs/threat-model-agents.md): what
-  Confidant does and doesn't protect against when agents read your vault
-- [`docs/privacy.md`](docs/privacy.md): what stays plaintext, what `no-ai`
-  does, and what reaches a model provider
-- [`spec/0.1.md`](spec/0.1.md) §14: the normative envelope format
-
-Until an independent review happens, keep vaults on trusted devices with
-encrypted disks, and use your own judgment before storing other people's
-sensitive data. `check`, the privacy allowlist and `no-ai` are working
-controls, but they don't replace an independent review. This section will
-be updated if an audit takes place.
+Two operational rules do the work that a secrecy layer would otherwise do:
+keep the vault on machines you control with full-disk encryption on, and push
+only to a private remote. `check`, the allowlist and `no-ai` are working
+controls over what agents read, not substitutes for those two rules.
 
 ## License
 

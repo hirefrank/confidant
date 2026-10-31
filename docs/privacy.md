@@ -3,8 +3,7 @@
 Confidant's search is **fail-closed**: a record is searchable only when it
 parses cleanly, carries no `no-ai` flag, and every ID it references is
 cleared. This document describes the allowlist mechanics in detail. For the
-short version, see the README's
-[Encryption and privacy](../README.md#encryption-and-privacy) section.
+short version, see the README's [Privacy](../README.md#privacy) section.
 
 ## What `confidant find` returns
 
@@ -34,10 +33,11 @@ only). There are no field-level flags — the record is the unit.
   `recent_touches`, and the declared `snooze_until`), the top-level
   `touchpoints` list (dates and kinds of the `touch` lines), any enabled
   pack's derived balance metrics and recent entries (dates, durations,
-  tags), and opaque `hmac:` alias hashes. These are
-  structural, not content: a schedule and the dates it ran against, so an
-  agent can still tell that the person is overdue or deliberately set to
-  `never`. `find`, the allowlist, and the search corpus return none of that.
+  tags). These are structural, not content: a schedule and the dates it ran
+  against, so an agent can still tell that the person is overdue or
+  deliberately set to `never`. `find`, the allowlist, and the search corpus
+  return none of that; contact values (emails, phones, handles) are profile
+  data and stay hidden with the rest of the profile.
   Findings about such a person never carry their name or other PII to
   agents — the warning is suppressed or reduced to a code and a count.
 - **`no-ai: notes`** on a person keeps the person visible — name, birthday,
@@ -50,20 +50,21 @@ only). There are no field-level flags — the record is the unit.
   This is fail-closed on purpose — a note that mentions a notes-mode
   person is hidden unless it carries an explicit `no-ai: false`.
 - **Per-note `no-ai: true`** on an otherwise visible person already works:
-  "any `true` wins", so the note is excluded from `find`/`allowlist`/
-  `reindex` while the person stays visible. Use this for one-off sensitive
+  "any `true` wins", so the note is excluded from `find`/`allowlist`/the
+  search corpus while the person stays visible. Use this for one-off sensitive
   detail (a medical note); use `notes` mode when most notes should be
   hidden. A note's explicit `no-ai: false` overrides the `notes` default
   (set it in front matter, e.g. via `note edit`; `note add` has no flag for
   it), but can never un-hide a `no-ai: true` person.
 
-On encrypted vaults the mode rides the envelope's plaintext outer header
-(`no-ai: notes`), so `find`/`context` fail closed without keys; readers
-that only know `true`/`false` reject `notes` rather than misreading it.
-Unreadable or missing person headers fail closed when stamping children
-(stamped `no-ai: true`). Mixed-version writers (CLI builds from before
-`no-ai: notes` landed) must not rewrite `notes`-mode people or write
-children under them.
+`no-ai` is read from the record's own front matter, which is plaintext like
+the rest of the vault (ADR-4). That is what makes the mode cheap to honour
+on every read: `find`/`context` decide from the file itself, with no separate
+index or side channel to keep in step. A person that cannot be parsed, or
+whose front matter is missing, fails closed when stamping children: the
+children are treated as `no-ai: true`. Because the flag itself is readable,
+anyone who can read the file learns that a record is marked — but the read
+surfaces still withhold its content from agents.
 
 ## Ledger lines
 
@@ -73,7 +74,7 @@ allowed; this does not apply to persons.
 
 ## TUI proposal review
 
-`confidant-tui` renders dry-run plaintext (ledger lines, note bodies, record
+`confidant-tui` renders dry-run content (ledger lines, note bodies, record
 content) on screen only by the TUI itself; it is not logged or sent anywhere.
 The proposal files it reads are plaintext on disk under
 `<vault>/.confidant/proposals/` (gitignored) until cleanup: manifest, lines
@@ -140,17 +141,17 @@ tokens. Near-ULID bare runs are not IDs.
 - Name-only prose.
 - `check`'s location field still shows the paths of invalid files.
 
-Milestone 3 `context` continues to honour `no-ai`.
+`context` honours `no-ai` on the same terms as `find`.
 
 ## Pack scoping (issue #178)
 
 Every agent-facing read path takes a pack scope: `context`, `find`, MCP
-tools, and `allowlist` / `reindex` outputs. `check` and `doctor` always run
-unscoped — they verify the whole vault. Scoping is a policy filter at read
-time: records, fields, and ledger lines are attributed to an owning pack
-from the pack registry, and out-of-scope items are filtered out. It is NOT
-cryptography — every client still holds the same recipient set, so a
-scoped agent that can read the vault files directly can see everything.
+tools, and `allowlist` output plus the search corpus. `check` and `doctor`
+always run unscoped — they verify the whole vault. Scoping is a policy filter
+at read time: records, fields, and ledger lines are attributed to an owning
+pack from the pack registry, and out-of-scope items are filtered out. It is
+NOT access control — the vault is plaintext on disk (ADR-4), so a scoped
+agent that can read the vault files directly can see everything.
 What scoping stops is an agent over-reaching through the tool surface:
 a pack-scoped agent never sees another pack's notes about the same person
 through `context`, `find`, or MCP.
@@ -190,46 +191,29 @@ Rules:
   is visible only unscoped and is `E_UNKNOWN_EDGE_KIND`. The edge's own
   front matter has no pack-owned fields to filter.
 
-## Edges and shred (issue #179)
+## Edges (issue #179)
 
 An edge record carries only ids, kind, and dates — no body, no note.
-Sensitive context belongs in a note on one of the edge's people, which
-does get crypto-shredded. Edges live under the shared key
-(`vault:shared`), so destroying one person's client key cannot shred
-them. Instead, `keys shred p-A` deletes every edge file naming A from
-the working tree in the same signed commit, and states plainly in its
-output:
+Sensitive context belongs in a note on one of the edge's people, where the
+`no-ai` rules above decide who may read it. Because an edge holds no prose,
+it can be visible while the interesting detail stays hidden.
 
-> Edges that named this person were deleted from the working tree, but
-> earlier versions in git history remain readable with the shared key.
+A person's own touchpoints stay in the ledger as opaque-id lines. A `touch`
+line carries a date, one opaque id, and a kind: no other participant, no
+note body. It says that this person was contacted on that day, which is the
+minimum the ledger needs to compute cadence.
 
-A shredded participant's own touchpoints stay in the ledger as
-opaque-id lines — the ledger is not rewritten by shred, and a `touch`
-line carries no other participant's id, so it does not re-identify
-anyone by itself.
-
-Multi-person interactions are encrypted to their *primary* person's key
-and list other participants in `with:` inside the ciphertext. `keys shred
-p-A` re-encrypts every interaction naming A in its `with:` list, dropping
-A, in the same signed commit — through the normal write path, so it only
-needs the primary's key (which shred never destroys). Earlier versions in
-git history still list A's opaque id under the primary's key, which
-survives A's shred; shred says so in its output. The reverse case — A is
-the *primary* and someone else is only in `with:` — loses the whole
-interaction from the participant's view, because it is under A's destroyed
-key; that is the #179 design.
+Multi-person interactions list participants in `with:` in the record itself.
 
 Since #505 `record add` also mirrors a `touch` line for an interaction's
 primary person, not only for `with:` participants. A logged interaction
-therefore puts its exact date and the primary's opaque id in the plaintext
-ledger, where before that date lived only in the ciphertext (plus the
-commit time). It is the same shape a `with:` line already had — a date and
-one opaque id, no other participant, no interaction id, no content — and
-the same trade #179 accepted. An interaction written before #505, or
-hand-written, may carry no such line.
+therefore puts its exact date and the primary's opaque id in the ledger. It
+is the same shape a `with:` line already had — a date and one opaque id, no
+other participant, no interaction id, no content. An interaction written
+before #505, or hand-written, may carry no such line.
 
-For when per-pack *keys* would be needed, see
-`docs/per-pack-keys-design-note.md`.
+For the boundaries pack scoping does and does not provide, see "Pack scoping"
+above.
 
 ## Error handling
 
