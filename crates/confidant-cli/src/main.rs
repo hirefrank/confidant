@@ -6651,33 +6651,14 @@ const VAULT_DIRS: &[&str] = &[
     "ledger",
 ];
 
-/// Repo-local fallback commit identity, used only when git cannot resolve
-/// any `user.name`/`user.email` (no global or environment config). Never
-/// overrides an operator's real identity.
+/// Repo-local commit identity, always written so a vault never leaks the
+/// operator's global (e.g. corporate/work) identity into its commit history.
+/// The operator can override it per-vault by editing `<vault>/.git/config`.
 const FALLBACK_GIT_NAME: &str = "Confidant Operator";
 const FALLBACK_GIT_EMAIL: &str = "operator@confidant.local";
 
-/// True when git can resolve a commit identity for the repo at `root`.
-/// Works before the repo exists (`GIT_DIR`) and inside one (`-C`).
-fn git_identity_resolves(root: &Path, no_input: bool) -> bool {
-    let mut cmd = std::process::Command::new("git");
-    if is_git_repo_root(root, no_input) {
-        cmd.arg("-C").arg(root);
-    } else {
-        cmd.env("GIT_DIR", root.join(".git"));
-    }
-    cmd.args(["var", "GIT_AUTHOR_IDENT"]);
-    if no_input {
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-    }
-    cmd.output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
-
-/// Create the collection directories and, when git has no identity at all,
-/// write the repo-local fallback identity into `<vault>/.git/config`. Both
-/// steps are idempotent and never overwrite existing data.
+/// Create the collection directories and write the repo-local fallback
+/// identity into `<vault>/.git/config`. Both steps are idempotent.
 fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
     for dir in VAULT_DIRS {
         std::fs::create_dir_all(root.join(dir)).map_err(|e| {
@@ -6686,13 +6667,11 @@ fn initialize_vault_shape(root: &Path, no_input: bool) -> anyhow::Result<()> {
             )))
         })?;
     }
-    if !git_identity_resolves(root, no_input) {
-        for (key, value) in [
-            ("user.name", FALLBACK_GIT_NAME),
-            ("user.email", FALLBACK_GIT_EMAIL),
-        ] {
-            confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
-        }
+    for (key, value) in [
+        ("user.name", FALLBACK_GIT_NAME),
+        ("user.email", FALLBACK_GIT_EMAIL),
+    ] {
+        confidant_core::write::git(root, &["config", "--local", key, value], no_input)?;
     }
     Ok(())
 }
@@ -6871,11 +6850,9 @@ fn print_init_scaffold_dry_run(cli: &Cli, root: &Path, packs: &[String]) -> anyh
             VAULT_DIRS.join(", ")
         );
         println!("  would    run git init -b main and commit .gitignore + confidant.toml");
-        if !git_identity_resolves(root, cli.no_input) {
-            println!(
-                "  would    set a repo-local fallback git identity ({FALLBACK_GIT_NAME} <{FALLBACK_GIT_EMAIL}>)"
-            );
-        }
+        println!(
+            "  would    set a repo-local fallback git identity ({FALLBACK_GIT_NAME} <{FALLBACK_GIT_EMAIL}>)"
+        );
         match remote {
             Some(url) => println!(
                 "  would    add git remote origin {} (not pushed)",

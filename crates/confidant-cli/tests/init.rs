@@ -129,7 +129,7 @@ fn init_create_makes_the_vault_shape_and_a_fallback_identity() {
 }
 
 #[test]
-fn init_create_never_overrides_an_existing_identity() {
+fn init_create_uses_the_neutral_identity_even_with_a_global_one() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -142,17 +142,19 @@ fn init_create_never_overrides_an_existing_identity() {
 
     run_init(&vault, &home, true);
 
-    // The real identity resolves, so no repo-local fallback is written.
-    let local = Command::new("git")
-        .arg("-C")
-        .arg(&vault)
-        .args(["config", "--local", "--get", "user.name"])
-        .output()
-        .unwrap();
-    assert!(!local.status.success(), "fallback identity was written");
+    // The neutral repo-local identity wins, so the operator's global identity
+    // never leaks into the vault's commit history.
+    assert_eq!(
+        git(&vault, &["config", "--local", "--get", "user.name"]).trim(),
+        "Confidant Operator"
+    );
+    assert_eq!(
+        git(&vault, &["config", "--local", "--get", "user.email"]).trim(),
+        "operator@confidant.local"
+    );
     assert_eq!(
         git(&vault, &["log", "-1", "--format=%an"]).trim(),
-        "Robin Operator"
+        "Confidant Operator"
     );
 }
 
