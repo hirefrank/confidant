@@ -9,7 +9,8 @@ This is deliberate:
 
 - A write must not depend on the network. `confidant log session` keeps
   working offline, on a plane, or with the remote down.
-- A push is a privacy boundary. Only an encrypted vault may cross it.
+- A push is a privacy boundary. Only a private remote should receive the
+  vault, and the operator decides when.
 - A pull that merges automatically can create conflicts in the middle of
   an edit. Confidant never auto-merges and never force-pushes.
 
@@ -89,7 +90,6 @@ force flag.
   "upstream": "origin/main",
   "ahead": 0,
   "behind": 2,
-  "crypto_mode": "encrypted",
   "fetched": true,
   "dry_run": false,
   "action": "none",
@@ -115,28 +115,28 @@ names commit-or-stash first, because `--pull` refuses a tree it would
 overwrite.
 
 Existing JSON consumers gain a `remedy` key (string or null) on every
-`sync` success envelope. Tolerant parsers are unaffected; strict-schema
+`sync` success response. Tolerant parsers are unaffected; strict-schema
 or exact-snapshot consumers will see a new key. That is intended, not a
-breaking change to the envelope shape.
+breaking change to the response shape.
 
 ### Refusals (stable codes)
 
 | Code | When |
 |---|---|
 | `E_NO_REMOTE` | No git remote, or the current branch has no upstream. Exit 1. |
-| `E_PLAINTEXT_REMOTE` | The vault is structurally plaintext. Exit 1, before any network access, even for `--dry-run`. |
 | `E_NOT_FAST_FORWARD` | Local and remote each have commits the other lacks (diverged). Exit 1. |
 | `E_CONFLICT` | `--pull` would overwrite uncommitted local changes. Commit or stash, then retry. Exit 1. |
 | `usage_error` | `--pull`/`--push` with `--no-input`/`--json` and no `--yes`. Exit 2. |
 
-**A plaintext vault is never synced.** Record bodies would be readable by
-anyone with repository access, which defeats the encryption boundary. Run
-`confidant init` to encrypt the vault, or remove the remote and keep it
-local-only. The `git-remote` doctor check warns about this setup too.
+**The remote must be private.** How private is a setting on the git host, and
+Confidant cannot see it: `confidant doctor`'s `git-remote` check refuses
+cleartext transports (`http://`, `git://`), because the vault would then
+cross the network readable, and warns when it cannot verify a transport. Use
+`https://` or `ssh://`.
 
 If the branch diverged, reconcile it yourself. The `E_NOT_FAST_FORWARD`
 error carries these steps as its `fix`, naming the branch and upstream,
-so a diverged report names its recovery instead of just refusing:
+so a diverged report names its next steps instead of just refusing:
 
 ```sh
 git fetch origin
@@ -149,7 +149,7 @@ Confidant never runs that merge or rebase for you, and never force-pushes.
 
 ## The manual rhythm
 
-A normal day, with an encrypted vault and an `origin` remote:
+A normal day, with a private `origin` remote:
 
 ```sh
 confidant log session p-01… 60m paid --date 2026-10-20
@@ -222,6 +222,6 @@ launchctl list | grep com.confidant.sync
 `StartInterval` is 900 seconds. `RunAtLoad` runs once when the agent loads.
 
 Both examples are opt-in templates, not installed by `confidant setup`.
-A timer that pushes ciphertext commits is fine for an encrypted vault; on a
-plaintext vault the command refuses with `E_PLAINTEXT_REMOTE` every run,
-which is the guard working as intended.
+A timer that pushes to a private remote is fine; a timer pointed at a public
+or shared repository is the whole vault leaving the machine on a schedule.
+Check the remote once, deliberately, before enabling it.

@@ -13,9 +13,15 @@ this file in the same PR.
 
 Confidant is relationship memory you own: plain-text records in a git repo
 (the vault) for one operator and their AI agents. The Rust CLI `confidant`
-reads, checks, and (from milestone 3) writes them. There is no server.
-Client content is meant to be encrypted at rest in git once milestone 2
-lands, so privacy rules here are hard rules, not style.
+reads, checks and writes them. There is no server.
+
+Records are **plaintext on disk**, in a private git repo, on a machine whose
+disk is encrypted (LUKS, FileVault). There is no application-level
+encryption layer. The privacy boundary is the operator's own machines plus
+`no-ai` on agent-facing reads, so the privacy rules here are hard rules, not
+style. Multi-user (a shared vault, peers with their own agents) is out of
+scope until there is a second human; the expected shape is separate
+interoperating vaults, not one shared vault.
 
 Read before changing behaviour:
 
@@ -24,10 +30,8 @@ Read before changing behaviour:
   are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
-  ADR-1 to ADR-15, milestones (section 8), and risk decisions (section 9b,
+  ADR-1 to ADR-16, milestones (section 8), and risk decisions (section 9b,
   binding).
-- [`docs/crypto-design.md`](docs/crypto-design.md): milestone 2 encryption
-  design (key hierarchy, envelope, AAD, recovery, test plan).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
 - [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
   relationships pack (implicit built-in).
@@ -46,15 +50,14 @@ Read before changing behaviour:
 |---|---|
 | `crates/confidant-core/` | Parser, model, derived values, check engine, search allowlist |
 | `crates/confidant-cli/` | The `confidant` binary (package `confidant-cli`) |
-| `crates/confidant-crypt/` | Encryption (milestone 2): per-client keys, envelope, AAD. Publishable as of 2026-10-12 (first publish is the operator's manual step), disclosed as unaudited (see README Status); wired into the CLI write path since spec 3 (`record add`, `note add`, `log session --note` encrypt; inbox `RecordWrite` encrypts at drain time, #213) |
 | `crates/confidant-tui/` | Terminal UI (`confidant-tui`): reference second consumer of the ADR-7 `--json --no-input` CLI contract. Ships as a GitHub Releases binary and on crates.io; launched via `confidant tui` |
-| `fuzz/` | cargo-fuzz harnesses for the ledger parser and §14 envelope decoder (own workspace, excluded from the main one; not run in CI) |
+| `fuzz/` | cargo-fuzz harnesses for the ledger parser (own workspace, excluded from the main one; not run in CI) |
 | `spec/` | Format spec and finding codes |
 | `packs/` | Schema packs (built-in personal; external packs live in the vault) |
 | `crates/confidant-cli/pack-skills/`, `crates/confidant-core/pack-manifests/` | In-crate vendored pack skill/manifest copies the binary embeds; regenerate with `python3 .github/scripts/sync-packs.py` (drift tests guard them) |
 | `examples/demo-vault/` | Fake-data vault used by tests, docs, and CI |
 | `testdata/golden/` | Golden `check --json` outputs |
-| `docs/` | Architecture, crypto design, benchmarks, research |
+| `docs/` | Architecture, privacy, sync, benchmarks, research |
 | `contrib/` | Opt-in systemd/launchd timer templates for `confidant sync` (#665) |
 | `.github/workflows/ci.yml` | The CI gate. Source of truth for the commands below |
 
@@ -121,30 +124,26 @@ docs-only fast path; expect the full suite.
 These are blocking. Do not open a PR for review that breaks one.
 
 1. **Fake data only.** Never put real client data, real names, emails,
-   phone numbers, notes, transcripts, keys, recovery phrases, tokens, or
-   secrets anywhere in the repo: code, tests, fixtures, docs, examples,
-   commit messages, issues, or CI logs. Use the demo vault's style of
-   obviously fake people (`Robin Example`) and fake ULIDs.
-2. **CI never holds vault keys.** Crypto tests generate throwaway keys
-   during the run (ADR-14). Do not add secrets to workflows, and never give
-   a GitHub Action decryption keys.
+   phone numbers, notes, transcripts, credentials, tokens, or secrets
+   anywhere in the repo: code, tests, fixtures, docs, examples, commit
+   messages, issues, or CI logs. Use the demo vault's style of obviously
+   fake people (`Robin Example`) and fake ULIDs.
+2. **CI never holds vault data or credentials.** Tests use the demo vault
+   and generated temp vaults during the run. Do not add secrets to
+   workflows, and never give a GitHub Action access to a real vault or to
+   the operator's git credentials.
 3. **Honour `no-ai` on every agent-facing output.** A record or client with
    `no-ai` must stay out of `find`, `context`, and any `--json` output an
    agent reads. When unsure whether something is cleared, leave it out:
    `find` uses the allowlist in spec section 12, and findings carry a code
    and count, not raw text or paths, unless the record is cleared. New
    output paths need tests proving `no-ai` content is excluded.
-4. **Never log secrets.** Recovery phrases, private keys, data keys, and
-   decrypted content must never reach stdout, stderr, logs, error messages,
-   `Debug` output, or panics. Crypto code fails closed: a missing key, bad
-   signature, or tampered envelope is an error, never silent plaintext.
-5. **Plaintext stays local.** Indexes and caches live in `.confidant/`
+4. **Never log secrets.** Credentials, tokens, and vault content beyond what
+   the command is meant to print must never reach stdout, stderr, logs,
+   error messages, `Debug` output, or panics. Errors fail closed: a missing
+   file or a malformed record is a typed error, never a silent pass.
+5. **Local state stays local.** Indexes and caches live in `.confidant/`
    (gitignored), stay on trusted devices, and never go in git (ADR-6).
-6. **Crypto changes need review first.** Any change to `confidant-crypt`,
-   key handling, the envelope, or AAD needs an open `crypto-review` issue
-   before code. Crypto PRs must state in the body: **needs outside audit
-   before public launch.** Do not invent primitives; follow
-   `docs/crypto-design.md`.
 7. **Format and privacy changes need review first.** A change to the vault
    file format, finding-code semantics, or the privacy model needs an
    `<topic>-review` issue and the maintainer's answer before code.
@@ -166,8 +165,8 @@ These are blocking. Do not open a PR for review that breaks one.
 
 - Match the surrounding code. `rustfmt.toml` and clippy with `-D warnings`
   are the style guide; do not silence a lint without a comment saying why.
-- `confidant-core` denies `unsafe` (one documented exception in `paths`);
-  `confidant-crypt` forbids it. Do not add new `unsafe`.
+- `confidant-core` denies `unsafe` (one documented exception in `paths`).
+  Do not add new `unsafe`.
 - Errors name the file and line and suggest a fix. Paths in errors are
   opaque IDs, never names.
 - Code adapted from other projects keeps its license header and is recorded
@@ -200,7 +199,7 @@ These are blocking. Do not open a PR for review that breaks one.
   not count. Reviewers confirm these lines before signing off.
 - **When the spec is silent, choose the simpler option** and record it under
   Decisions I made. Stop and ask only for changes to the file format or the
-  privacy model (rules 6 and 7).
+  privacy model (rule 7).
 - **Questions go in GitHub issues**, labeled `<topic>-review` and titled
   `[<topic>-review] <question>`. State your recommendation and reasoning,
   and end with a specific ask.

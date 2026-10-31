@@ -1,14 +1,12 @@
 # Threat model: agents
 
-What an MCP-connected agent can and cannot do — and exactly what `no-ai`, the
-`check` gate, and the inbox guarantee (and don't).
+What an MCP-connected agent can and cannot do — and exactly what `no-ai` and
+the `check` gate guarantee (and don't).
 
 This is the **agent-focused** threat model. It does not replace the others:
 
-- `docs/architecture.md` §4 — storage and hosting threats (leaked remote,
-  stolen backup, curious host).
-- `docs/crypto-design.md` §11 — cryptography threats (key compromise,
-  rollback, shredding).
+- `docs/architecture.md` §4 — storage and hosting threats (stolen laptop,
+  leaked or shared repo, metadata a host still sees).
 - `docs/privacy.md` — the §12 search allowlist mechanics in full detail.
 
 Every guarantee below cites the code or test that enforces it. Known gaps are
@@ -17,7 +15,8 @@ but narrower than it sounds.
 
 ## Guarantees in one line each
 
-- An MCP agent can only call 8 fixed tools, and cannot grant itself more.
+- An MCP agent can only call the fixed tool list, and cannot grant itself
+  more.
 - An agent can read private data through `context` only by passing
   `exclude_private: false` — which it can do by itself.
 - A `no-ai` record's content never appears in `find`, `context`, the
@@ -27,10 +26,7 @@ but narrower than it sounds.
 - `no-ai` does not hide a record from the vault's owner.
 - `check` blocks a commit on errors, never on warnings, and verifies
   coherence, not truthfulness.
-- Ledger lines are plaintext even in an encrypted vault.
-- An inbox item is merged only if every commit that touched it carries a valid
-  signature from a `[trust]` signer, and the merge passes `check`.
-- Inbox intake can never change identity (`merge`) or balances (`balance`).
+- Ledger lines are plaintext in the vault, as is every other file.
 - A write commits directly after `check` passes, with no human review step.
 - A hosted model provider sees whatever the agent sends it; Confidant makes
   no claim about what the provider stores.
@@ -42,43 +38,34 @@ server configured) works through one fixed tool list.
 
 | Can | Cannot | Enforced by |
 |---|---|---|
-| Call 8 tools: `check`, `find`, `context`, `log_session`, `import_ledger`, `note_add`, `schema`, `doctor` | Call any other tool, or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
+| Call 10 tools: `check`, `find`, `context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`, `doctor`, `pack_skill` | Call any other tool, or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
 | Read a person's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
-| Append a session line, bulk-append ledger lines, or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
+| Append a session or touchpoint line, bulk-append ledger lines, or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
 | Pass `exclude_private: false` and read private data | Be stopped from doing so by any vault setting — no vault config removes the opt-out | Current behavior; see Known gaps |
 
 There are **no per-agent scopes and no agent identity** in the MCP server.
 The server trusts its local caller. Every tool call is dispatched by shelling
 out to the CLI with `--json --no-input --vault <path>` (`call_tool()` in
 `crates/confidant-cli/src/mcp.rs`), so the MCP agent has exactly the CLI's
-powers through those 8 tools — no more, no less. Per-pack agent scoping is
-future work (#178); until then, an agent that can call `context` can call it
-for any person in the vault.
+powers through those tools — no more, no less. The instance takes an optional
+`--packs` ceiling (#178), but that is a policy filter on reads, not a
+boundary against a caller that can run the CLI unscoped or read the files.
 
-## Remote proposer via inbox
+## Outside tools
 
-An outside tool (a capture script, another agent, a phone shortcut) can
-propose content by encrypting items to the vault's public inbox key and
-pushing them to the `inbox` branch. It cannot write to main directly.
+There is no intake channel. A capture script, another agent, or a phone
+shortcut cannot hand content to a vault remotely: to reach it at all, it
+needs the vault files or the CLI, which means it is already inside the
+trusted boundary (`docs/architecture.md` §3). What arrives from outside is
+what the operator or an agent chooses to import through the CLI, with `src:`
+provenance so a re-run adds nothing.
 
-| Can | Cannot | Enforced by |
-|---|---|---|
-| Push encrypted items to the `inbox` branch | Write to the main branch, or merge its own items | `confidant inbox` is the only merge path, and it runs on the operator's device (`crates/confidant-core/src/inbox/mod.rs`) |
-| Propose ledger lines (each needs a `src:`) and new records | Change identity or balances — the `merge` and `balance` verbs are rejected at intake | `crates/confidant-core/src/inbox/mod.rs` header: "the `merge` / `balance` verbs are rejected" |
-| Get items merged once they decrypt, parse, and pass `check` | Get a partial merge — the run is all-or-nothing: any failure merges nothing and clears nothing | `crates/confidant-core/src/inbox/mod.rs` header |
-| Submit the same item twice | Duplicate it — lines whose `src:` already exists are skipped | `crates/confidant-core/src/inbox/mod.rs` header |
-
-Trust at intake (all fail closed):
-
-- Every commit that adds or changes an item must carry a valid signature from
-  a `[trust]` signer — checking only the tip is not enough. With no signers
-  configured, the run refuses unless `--allow-unsigned`.
-- The vault's advertised `[inbox].pubkey` must match the operator's
-  out-of-band pin (`~/.config/confidant/config.toml [inbox] pubkey`), and must
-  also match the recipient derived from the local inbox private key. The
-  private key is the ground truth for who can actually read these items.
-- The inbox private key lives with the operator (OS keychain). No decryption
-  keys live in CI, and intake never uses webhooks.
+That is deliberate (#795). An intake queue is a second write path with its
+own trust rules — signer chains, a pinned key, a merge step that can refuse
+everything — and the single-operator model does not need one. If an
+untrusted remote writer is ever required, that is a new intake design with
+its own threat model, not a flag on today's CLI. GitHub webhooks are not used
+for intake: they only notify a server someone would have to run.
 
 ## Model provider
 
@@ -99,65 +86,64 @@ received.
 ## Stolen device
 
 A stolen unlocked device, or malware on a trusted device, defeats every
-guarantee in this document. The device holds the operator's CLI, the
-keychain, and the device keys; `no-ai`, `check`, and inbox trust do not help
-against someone holding the operator's own session. This is out of scope by
-design (`docs/architecture.md` §4: "does not protect against a compromised
-trusted device"). The response is revocation (`keys revoke`), and shredding
-(`keys shred`) if the exposure warrants it — not any per-record flag.
+guarantee in this document. The device holds the operator's CLI, the vault
+working tree, and whatever git credentials it uses; `no-ai` and `check` do
+not help against someone holding the operator's own session. This is out of
+scope by design (`docs/architecture.md` §4: a compromised trusted device is
+not protected against). The response is operational, not a per-record flag:
+revoke the device's access to the private remote (remove the SSH key, deploy
+key, or token), rotate any credential that lived on it, and treat whatever it
+could read as exposed. Full-disk encryption is what covers the stolen-locked
+case.
 
-Related: local indexes and caches (`.confidant/`, any search index) contain
+Related: local indexes and caches (`.confidant/`, any search index) hold
 plaintext and embeddings. They are sensitive, gitignored, and stay on
 trusted devices.
 
-## The three mechanisms, precisely
+## The mechanisms, precisely
 
 ### `no-ai`: an exposure control, not access control
 
-`no-ai` is a per-record flag in the plaintext outer header of the record
-envelope (`no-ai: bool`, `crates/confidant-crypt/src/envelope.rs`). A
-record's effective flag is its own flag **or** its person's flag — "any
-`true` wins" (`person_no_ai()` in `crates/confidant-cli/src/record_crypto.rs`).
+`no-ai` is a per-record flag in the record's YAML front matter
+(`no-ai: true`, or `no-ai: notes` on a person), read by
+`crates/confidant-core/src/search.rs`. A record's effective flag is its own
+flag **or** its person's flag — "any `true` wins".
 
 What it does: a `no-ai` record's content never appears in `find` (filter in
 `crates/confidant-core/src/search.rs`), in `context` (which shows a `no-ai`
 person only through their derived ledger metadata — cadence, touch and
-session state, opaque alias hashes; see `docs/privacy.md` — never their
-content), in the `allowlist` response ("no-ai records never appear",
-`crates/confidant-core/src/schema.rs`), or in the reindex corpus (built
-from the cleared set, `crates/confidant-cli/src/main.rs`
-`build_reindex_corpus`) — unless the operator passes the operator-only
-`--for-operator` flag (on `find`, `context`, and `record list`). The agent
-read path never decrypts a `no-ai` envelope: its decrypt hook returns a
-shell with the id and type, never the content
-(`crates/confidant-cli/src/record_decrypt.rs`). The reads that do decrypt
-are the operator's own `confidant record show <id> --for-edit`,
-`confidant note show <id> --for-edit`, and `--for-operator` on `find`,
-`context`, and `record list`, covered below.
+session state; see `docs/privacy.md` — never their content), in the
+`allowlist` response ("no-ai records never appear",
+`crates/confidant-core/src/schema.rs`), or in the QMD corpus (staged from
+the cleared set by `skills/qmd-search/bin/qmd-index.py` via
+`confidant allowlist --json`) — unless the operator passes the
+operator-only `--for-operator` flag (on `find`, `context`, and
+`record list`). The filter is applied to the parsed record on the agent
+read path (`load_vault_for_reads` in `crates/confidant-cli/src/main.rs`);
+the reads that skip it are the operator's own `confidant record show <id>
+--for-edit`, `confidant note show <id> --for-edit`, and `--for-operator` on
+`find`, `context`, and `record list`, covered below.
 
 What it does not do:
 
 - **It does not hide the record from the vault's owner.** The CLI's
   `find`/`context` honor `no-ai` exactly like MCP does — they share the
   same read path (`load_vault_for_reads`) — except under the operator-only
-  `--for-operator` flag. But the operator owns the files and holds the
-  device key, so nothing prevents reading the record outside the read
-  surfaces (raw bytes from git, decrypted with the operator's own key
-  material). `no-ai` keeps a record out of agent flows; it is not access
-  control against the owner.
+  `--for-operator` flag. But the operator owns the files, so nothing
+  prevents reading the record outside the read surfaces (opening
+  `people/<id>/profile.md`, or `git show`). `no-ai` keeps a record out of
+  agent flows; it is not access control against the owner.
 - **It does not stop an agent that already has a shell on this device.**
   MCP dispatches from a fixed tool whitelist
   (`crates/confidant-cli/src/mcp.rs`) that omits `record show --for-edit`,
   `note show --for-edit`, and `note edit`, and never passes `--for-operator`
   to `find`, `context`, or `record list`, so a tool call cannot reach them.
-  An agent that can run commands on this machine, with this device's key
-  material in reach, can invoke it directly — exactly as it could decrypt
-  the file itself, or shell out to the CLI at all. `--for-edit` and
-  `--for-operator` are a boundary in the CLI's surface, not access control
-  against a caller that already holds the device key.
-- **The flag itself is visible.** `no-ai: true` sits in the envelope's
-  plaintext outer header, so anyone who can read the file learns that the
-  record is marked — though not its content.
+  An agent that can run commands on this machine can invoke them directly,
+  or `cat` the file. `--for-edit` and `--for-operator` are a boundary in the
+  CLI's surface, not access control against a caller with a shell.
+- **The flag itself is visible.** `no-ai: true` sits in the front matter of
+  a readable file, so anyone who can read the file learns that the record is
+  marked — though the read surfaces still withhold its content.
 
 ### `check`: coherence, not truthfulness
 
@@ -176,19 +162,8 @@ the world: a well-formed false fact — a session that never happened, a
 note with invented content — passes `check` exactly like a true one.
 `check` guarantees the vault is internally coherent, not that it is true.
 
-One scoping note: `check` runs against the live vault, not a staged copy
-(#209). That is fine today because `check` only looks at whether `keys/`
-exists; if `check` ever reads files inside `keys/`, it must run against
-the staged tree instead.
-
-### Inbox: signed proposals, operator-side merge
-
-The inbox is a holding branch, not a write path. Items arrive encrypted to
-the public inbox key; the operator's `confidant inbox` run decrypts them,
-runs `check` on the merged result, merges into the current branch, and
-clears the inbox. See "Remote proposer via inbox" above for the trust
-rules. The key property: nothing from the inbox reaches main without a
-valid `[trust]` signature chain **and** a passing `check`.
+Nothing downstream assumes a staged tree: `check` runs against the live
+vault, and every write rolls back on a failing check (#209).
 
 ## Known gaps, stated plainly
 
@@ -200,14 +175,13 @@ valid `[trust]` signature chain **and** a passing `check`.
    agent-proposed changes before main — is future work (#191).
 3. **`check` verifies coherence, not truth.** A well-formed false fact
    passes.
-4. **Ledger lines are plaintext** even in encrypted vaults
-   (`crates/confidant-core/src/crypto_mode.rs`: "everything else (ledger,
-   `confidant.toml`, inbox) stays plaintext by design"). Dates, verbs,
-   opaque IDs, and `src:` tokens are visible to anyone with repo read
-   access. Never put sensitive text in a ledger line; detail goes in an
-   encrypted note.
-5. **`no-ai` is not access control**, and the `no-ai` flag itself is
-   plaintext in the envelope header.
+4. **Every file is readable to anyone with repo access**, ledger lines
+   included. Dates, verbs, opaque IDs, `src:` tokens, note bodies and names
+   are all in the clear on disk and in the private remote. `no-ai` keeps
+   content out of agent *surfaces*; it does not make the bytes secret.
+   Never put something in a vault that the repo's readers must not see.
+5. **`no-ai` is not access control**, and the flag itself is readable in
+   front matter.
 6. **The model provider sees whatever the agent sends.** No claim about
    provider storage, retention, or training.
 7. **A stolen unlocked device defeats everything.** Out of scope by design.
@@ -217,7 +191,5 @@ valid `[trust]` signature chain **and** a passing `check`.
 - #178 (per-pack access scoping) — agents limited to one pack's data.
 - #181 (finer `no-ai` granularity) — field- or section-level hiding.
 - #191 (proposal review UX) — human approval before agent writes reach main.
-- #209 (`check` vs staged `keys/`) — `check` must read the staged tree if
-  it ever reads inside `keys/`.
 
 Update this document whenever any of those land.
