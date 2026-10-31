@@ -18,7 +18,8 @@ tests, clippy and CI can all pass over:
 Everything is fake data. The script points `HOME` at a throwaway config
 directory and never touches a real vault.
 
-The binary must be built with `--all-features` (the CI job does).
+The binary may be built with `--all-features` (the CI job does); the smoke
+itself needs no feature of its own.
 
 A `--workdir` is wiped before a run, so the script refuses to delete a
 directory it did not create: it drops a `.qa-smoke` marker when it makes a
@@ -268,8 +269,7 @@ class Smoke:
         """Seed the `grant` line the example pack's balance rule reads.
 
         `no_ai_touch` also seeds a `touch` line naming the no-ai person, the
-        operator-only ledger hit the read-path checks assert on. The
-        encrypted vault is single-person, so it seeds the grant line alone.
+        operator-only ledger hit the read-path checks assert on.
         """
         ledger = vault / "ledger" / "2026" / "10.cfd"
         ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -364,9 +364,9 @@ def plaintext_vault_steps(smoke: Smoke) -> None:
                 str(vault),
             ],
         )
-    # Plaintext vault: the record must NOT be an envelope.
+    # Records are plaintext: YAML front matter followed by the Markdown body.
     profile = (vault / "people" / PERSON / "profile.md").read_text()
-    smoke.ok(step, "enc:" not in profile, "plaintext vault wrote an envelope")
+    smoke.ok(step, profile.startswith("---\n"), "record has no front matter")
     smoke.ok(step, "Ada Example" in profile, "plaintext record lost its name")
     smoke.mark(step)
 

@@ -252,8 +252,8 @@ jobs:
         if: needs.changes.outputs.docs_only != 'true'
       - name: build CLI
         if: needs.changes.outputs.docs_only != 'true'
-        # --all-features enables `test-overrides`, so the smoke can use
-        # throwaway keys via env instead of a real keychain (ADR-14).
+        # Same build as the test job (`--all-features`); the smoke only drives
+        # the binary and needs no feature of its own.
         run: cargo build -p confidant-cli --locked --all-features
       - name: end-to-end smoke
         if: needs.changes.outputs.docs_only != 'true'

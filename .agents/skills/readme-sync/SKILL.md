@@ -79,7 +79,7 @@ Check `docs/architecture.md` ADR-4 and §3–§4, and `docs/privacy.md`. The
 README's "Privacy" section should reflect:
 
 - That records are plaintext on disk, in a private repo, on a
-  full-disk-encrypted machine (the perimeter).
+  machine with full-disk encryption enabled (the perimeter).
 - That there is no application-level secrecy layer, and no key material in a
   vault.
 - The `no-ai` flag and what it guarantees (and that it is an exposure

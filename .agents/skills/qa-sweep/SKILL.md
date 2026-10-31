@@ -28,9 +28,11 @@ changed since the last sweep.
 - **Not code review.** Do not read the diff to decide what to test. A
   sweep that starts from the code tests what the author already thought
   about. Drive the binary and follow what it does.
-- **Not a security audit.** The outside crypto audit (#138, OSTIF) covers
-  the threat model. A sweep is functional and adversarial, not a
-  penetration test.
+- **Not a security audit.** The privacy boundary is `no-ai` plus a plaintext
+  vault on a disk you control (see `docs/architecture.md` and the main
+  README's security status). A sweep is functional and adversarial, not a
+  penetration test; it still treats `no-ai` enforcement as a functional
+  invariant, not an optional nicety.
 - **Not the fix.** A sweeper never authors the fix. The finder and the
   fixer stay in separate lanes so the stance stays adversarial; the moment
   you can edit the code you stop trying to break it. File an issue and
@@ -39,18 +41,18 @@ changed since the last sweep.
 ## Protocol
 
 1. **Build fresh.** `cargo build -p confidant-cli --locked --all-features`
-   (the smoke needs the `test-overrides` feature for throwaway keys).
-   Build `confidant-tui` too for the TUI pass. Point every run at the
-   freshly built binary — for the TUI, `CONFIDANT_BIN=<path to the CLI>`.
+   (the same build CI uses). Build `confidant-tui` too for the TUI pass.
+   Point every run at the freshly built binary — for the TUI,
+   `CONFIDANT_BIN=<path to the CLI>`.
 2. **Throwaway vaults, fake data only.** Work under
    `/tmp/opencode/<sweep>` (e.g. `/tmp/opencode/qa-2026-10-19`). Never a
-   real vault, never real names, notes, or keys. The demo vault's
+   real vault, never real names or notes. The demo vault's
    `Ada Example` style is the bar.
-3. **Isolate `HOME` and config.** When exercising encrypted paths, set
-   `HOME` to a throwaway config dir and use throwaway keys via
-   `CONFIDANT_DEVICE_KEY` / `CONFIDANT_TEST_OPERATOR_KEY` with
-   `CONFIDANT_KEYCHAIN=off` (ADR-14: CI never holds vault keys). Never
-   point a write at the operator's real config dir or keychain.
+3. **Isolate `HOME` and config.** Set `HOME` to a throwaway config
+   directory so QMD state and the CLI's own config never touch the
+   operator's real ones; the smoke does this itself and so should a manual
+   pass. Records are plaintext on disk, so there is no key material to
+   stage.
 4. **Give throwaway vaults their own git identity, and cut off the real
    one.** Writes need `git user.name`/`user.email`; a developer machine
    supplies them from the real config, a runner does not, so a sweep that
@@ -64,7 +66,7 @@ changed since the last sweep.
    (#585).
 6. **Drive it, then poke it.** Run the happy path, then refuse things:
    bad input, a second write, a conflicting pack, a stale pin, a symlink,
-   a missing key.
+   a missing record.
 
 ## What to target
 
@@ -86,7 +88,7 @@ The high-yield list, roughly in the order sweeps keep finding bugs:
   repair, remove. Then the refusals: a no-op that is not reported
   unchanged, a symlinked pack dir or file, a conflict with an installed
   pack, a pack claiming a builtin finding code.
-- **Conflict and proposal flows.** Two writers, an inbox drain, a merge
+- **Conflict and proposal flows.** Two writers, a merge
   that conflicts, a proposal accepted or rejected. The interesting states
   are the ones in between.
 - **Platform-variance guards.** Never let a test or snapshot depend on
@@ -104,7 +106,7 @@ sweep covered.
 | Refusal / invariant paths | refused writes leave no trace; vault still checks |
 | Pack lifecycle | add/update/remove, no-op, stale pin, symlink refusals |
 | Write rollback | a failed multi-file write commits nothing and deletes nothing else |
-| Proposal / conflict flows | inbox, proposals, merges, review queues |
+| Proposal / conflict flows | proposals, merges, review queues |
 | TUI operator / edit / capture | tmux pass, `CONFIDANT_BIN` skew, preview vs apply |
 | Platform variance | TMPDIR/path assumptions, macOS vs Linux behaviour |
 
@@ -139,11 +141,9 @@ cargo build -p confidant-cli --locked --all-features
 python3 .github/scripts/qa-smoke.py --cli target/debug/confidant
 ```
 
-It covers encrypted `init` and the refusal of a plaintext declaration,
-record/note/log writes on both vault modes, the alias stdin round-trip,
-`find`/`context` with and without `--for-operator`, a clean `check`, the
-pack lifecycle including the no-op and the stale-pin repair, and the
-refused-write invariant. Run
+It covers plaintext record/note/log writes, the `no-ai` read path with and
+without `--for-operator`, a clean `check`, the refused-write invariant, and
+the pack lifecycle including the no-op and the stale-pin repair. Run
 `python3 .github/scripts/qa-smoke.py --self-test` to exercise the
 `--workdir` safety check on its own.
 
@@ -160,7 +160,7 @@ rotation table the script does not cover.
 ## Do not
 
 - Do not read the diff to decide what to test, and do not write the fix.
-- Do not use a real vault, real config dir, real keychain, or real data.
+- Do not use a real vault, real config dir, or real data.
 - Do not check only `git status` for a refused write — check `confidant
   check` too; that is where the leak hid.
 - Do not file style nits or duplicates.

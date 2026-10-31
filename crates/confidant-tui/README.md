@@ -2,13 +2,13 @@
 
 The `confidant-tui` binary — a terminal UI for Confidant. It covers
 `check`, `find`, `context`, and `doctor`, plus confirm-before-apply review
-of skill proposals, QMD-backed search, and inbox review.
+of skill proposals and conflicts, and QMD-backed search.
 
 ## Operator layout
 
 The screen is a three-workspace bar: **1 People & Search** (the default
-master–detail view), **2 Review Queue** (Proposals, Inbox, and Conflicts,
-with a pending-count badge), and **3 Check**. `d` opens Doctor, `p` shows
+master–detail view), **2 Review Queue** (Proposals and Conflicts, with a
+pending-count badge), and **3 Check**. `d` opens Doctor, `p` shows
 the resolved scope, `?` shows the grouped keymap, and `:` (or `Ctrl-P`)
 opens the command palette.
 
@@ -67,12 +67,13 @@ explicit `--vault` the same way. In a non-interactive or agent session,
 export `CONFIDANT_VAULT` in that process or pass `--vault`; do not rely on
 `source ~/.bashrc`, whose interactive guard skips the export.
 
-## Status: not yet audited
+## Status: plaintext by design
 
 The TUI is a layer on top of the Confidant project: it inherits the
-project's trust story rather than having a separate one. Confidant's
-encryption hasn't been reviewed by an independent auditor — see the
-[Security status](https://github.com/hirefrank/confidant#security-status-no-independent-audit-yet)
+project's trust story rather than having a separate one. Confidant keeps
+records in plaintext on disk by design, so there is no cipher for an
+independent auditor to review — see the
+[Security status](https://github.com/hirefrank/confidant#security-status)
 section of the main repository README (tracked in
 [#138](https://github.com/hirefrank/confidant/issues/138)). Use your own
 judgment before storing other people's sensitive data.
