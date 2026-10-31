@@ -95,6 +95,20 @@ pub fn skill_ids() -> Vec<&'static str> {
     ids
 }
 
+/// Whether an extracted entry must be executable.
+///
+/// `include_dir` carries no file modes, and `std::fs::write` creates files
+/// `0644`, so the shipped `qmd-search/bin/*.py` scripts would lose the `+x`
+/// bit they have in the repo (#795). A `bin/` component, a `.py`/`.sh`
+/// extension, or a shebang is the signal; over-marking a few files
+/// executable is harmless, under-marking a script breaks `setup`.
+#[cfg(unix)]
+fn wants_executable_bit(rel: &Path, contents: &[u8]) -> bool {
+    let in_bin = rel.components().any(|c| c.as_os_str() == "bin");
+    let script_ext = matches!(rel.extension().and_then(|s| s.to_str()), Some("py" | "sh"));
+    in_bin || script_ext || contents.starts_with(b"#!")
+}
+
 /// Recursively materialize `dir` under `root`, overwriting files.
 /// `root` is the tree root; file paths from `include_dir` are already
 /// relative to it (e.g. `qmd-search/bin/qmd-query.py`).
@@ -120,6 +134,11 @@ fn extract_dir(dir: &Dir<'static>, root: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&dest, f.contents())?;
+        #[cfg(unix)]
+        if wants_executable_bit(rel, f.contents()) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+        }
     }
     for sub in dir.dirs() {
         if sub.path().file_name().and_then(|s| s.to_str()) == Some("__pycache__") {
@@ -146,6 +165,40 @@ mod tests {
         let ids = skill_ids();
         assert_eq!(ids, vec!["pack-author", "qmd-search"]);
         assert!(SKILLS.get_dir("bin").is_none());
+    }
+
+    /// #795: `include_dir` carries no file modes and `fs::write` creates
+    /// files `0644`, so extraction must put the `+x` bit back on the shipped
+    /// scripts. Non-script files stay non-executable.
+    #[cfg(unix)]
+    #[test]
+    fn extraction_preserves_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        materialize_all(tmp.path()).expect("materialize embedded skills");
+
+        for rel in [
+            "qmd-search/bin/qmd-index.py",
+            "qmd-search/bin/qmd-query.py",
+            "qmd-search/bin/qmd-preflight.py",
+        ] {
+            let meta = std::fs::metadata(tmp.path().join(rel))
+                .unwrap_or_else(|e| panic!("stat {rel}: {e}"));
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "{rel} was extracted as {mode:o}");
+        }
+
+        let readme = tmp.path().join("README.md");
+        let mode = std::fs::metadata(readme)
+            .expect("stat README.md")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "a plain markdown file must not be executable"
+        );
     }
 
     #[test]
