@@ -120,7 +120,7 @@ pub struct ProposalsTab {
 /// The TUI never fetches, pulls, or pushes on its own. It reads ahead/behind
 /// from the last fetch and only pushes after an explicit `y` in the quit
 /// prompt. `code` carries the CLI's stable error code when sync is not
-/// available (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`) or the branch diverged
+/// available (`E_NO_REMOTE`) or the branch diverged
 /// (`E_NOT_FAST_FORWARD`), so no message text is ever parsed here.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SyncViewState {
@@ -817,9 +817,9 @@ impl<R: Runner> App<R> {
     /// Run `confidant sync --dry-run --json --no-input` and update the
     /// unpushed-commit status (#665). Read-only: the CLI reports the
     /// last-fetched upstream state and never contacts the remote. A stable
-    /// error code (`E_NO_REMOTE`, `E_PLAINTEXT_REMOTE`,
-    /// `E_NOT_FAST_FORWARD`) is kept in `sync.code`; it is not an alert,
-    /// because a local-only or plaintext vault is a valid setup.
+    /// error code (`E_NO_REMOTE`, `E_NOT_FAST_FORWARD`) is kept in
+    /// `sync.code`; it is not an alert, because a local-only vault is a
+    /// valid setup.
     pub fn load_sync(&mut self) {
         let raw = match self.runner.run(&["sync", "--dry-run"]) {
             Ok(r) => r,

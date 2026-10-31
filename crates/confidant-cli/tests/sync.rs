@@ -45,21 +45,9 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@example.invalid"]);
 }
 
-/// A throwaway age identity for `init --create`; the OS keychain is never
-/// consulted (ADR-14: CI generates ephemeral keys during the run).
-#[cfg(unix)]
-fn age_generate_bech32() -> String {
-    use age::secrecy::ExposeSecret;
-    age::x25519::Identity::generate()
-        .to_string()
-        .expose_secret()
-        .to_owned()
-        .to_uppercase()
-}
-
-/// A real encrypted vault (created through `init --create`) plus a local
-/// bare remote it has pushed to. The vault's branch is `main` with
-/// `origin/main` as its upstream.
+/// A real vault (created through `init --create`) plus a local bare remote
+/// it has pushed to. The vault's branch is `main` with `origin/main` as its
+/// upstream.
 #[cfg(unix)]
 struct SyncVault {
     _tmp: tempfile::TempDir,
@@ -86,8 +74,6 @@ impl SyncVault {
             .args(["init", "--create", "--no-input", "--json", "--vault"])
             .arg(&vault)
             .env("HOME", &home)
-            .env("CONFIDANT_DEVICE_KEY", age_generate_bech32())
-            .env("CONFIDANT_KEYCHAIN", "off")
             .env("CONFIDANT_OFFLINE", "1")
             .output()
             .unwrap();
@@ -144,9 +130,7 @@ impl SyncVault {
             .arg("--vault")
             .arg(&self.vault)
             .env("HOME", &self.home)
-            .env("CONFIDANT_OFFLINE", "1")
-            .env("CONFIDANT_KEYCHAIN", "off")
-            .env_remove("CONFIDANT_DEVICE_KEY");
+            .env("CONFIDANT_OFFLINE", "1");
         cmd.output().unwrap()
     }
 
@@ -189,7 +173,7 @@ fn dry_run_reports_ahead_and_never_contacts_the_remote() {
     assert_eq!(v["remote"], "origin", "{v}");
     assert_eq!(v["branch"], "main", "{v}");
     assert_eq!(v["upstream"], "origin/main", "{v}");
-    assert_eq!(v["crypto_mode"], "encrypted", "{v}");
+    assert_eq!(v["crypto_mode"], "plaintext", "{v}");
     assert_eq!(v["fetched"], false, "{v}");
     assert_eq!(v["dry_run"], true, "{v}");
     assert_eq!(v["applied"], false, "{v}");
@@ -379,43 +363,66 @@ fn diverged_branch_refuses_push_and_pull_with_a_stable_code() {
 
 #[cfg(unix)]
 #[test]
-fn plaintext_vault_is_refused_even_for_a_dry_run() {
+fn plaintext_vault_syncs_against_any_remote() {
+    // A plaintext vault is the only kind now, so `sync` must work against a
+    // configured `origin` rather than refusing with `E_PLAINTEXT_REMOTE`.
     let tmp = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Confidant Test\n\temail = test@example.invalid\n",
+    )
+    .unwrap();
     let vault = tmp.path().join("vault");
     common::copy_dir(&demo(), &vault);
     init_repo(&vault);
     git(&vault, &["add", "-A"]);
     git(&vault, &["commit", "-q", "-m", "demo"]);
+
+    let remote = tmp.path().join("remote.git");
     git(
-        &vault,
+        tmp.path(),
         &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.com/fake/vault.git",
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
         ],
     );
+    let url = format!("file://{}", remote.display());
+    git(&vault, &["remote", "add", "origin", &url]);
+    git(&vault, &["push", "-q", "-u", "origin", "main"]);
 
-    for args in [
-        vec!["sync", "--dry-run", "--json", "--no-input"],
-        vec!["sync", "--push", "--yes", "--json", "--no-input"],
-    ] {
-        let out = Command::new(bin())
-            .args(&args)
-            .arg("--vault")
-            .arg(&vault)
-            .env("HOME", home.path())
-            .env("CONFIDANT_OFFLINE", "1")
-            .env("CONFIDANT_KEYCHAIN", "off")
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(v["error"]["code"], "E_PLAINTEXT_REMOTE", "{args:?}: {v}");
-        let message = v["error"]["message"].as_str().unwrap();
-        assert!(message.contains("plaintext"), "{message}");
-    }
+    let out = Command::new(bin())
+        .args(["sync", "--dry-run", "--json", "--no-input", "--vault"])
+        .arg(&vault)
+        .env("HOME", &home)
+        .env("CONFIDANT_OFFLINE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["crypto_mode"], "plaintext", "{v}");
+    assert_eq!(v["remote"], "origin", "{v}");
+
+    // And a real push succeeds.
+    git(&vault, &["commit", "-q", "--allow-empty", "-m", "local"]);
+    let out = Command::new(bin())
+        .args(["sync", "--push", "--yes", "--json", "--no-input", "--vault"])
+        .arg(&vault)
+        .env("HOME", &home)
+        .env("CONFIDANT_OFFLINE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["applied"], true, "{v}");
+    assert_eq!(v["action"], "push", "{v}");
 }
 
 #[cfg(unix)]
@@ -434,8 +441,6 @@ fn no_remote_is_a_stable_error_and_does_not_touch_the_network() {
         .args(["init", "--create", "--no-input", "--json", "--vault"])
         .arg(&vault)
         .env("HOME", &home)
-        .env("CONFIDANT_DEVICE_KEY", age_generate_bech32())
-        .env("CONFIDANT_KEYCHAIN", "off")
         .env("CONFIDANT_OFFLINE", "1")
         .output()
         .unwrap();
@@ -446,7 +451,6 @@ fn no_remote_is_a_stable_error_and_does_not_touch_the_network() {
         .arg(&vault)
         .env("HOME", &home)
         .env("CONFIDANT_OFFLINE", "1")
-        .env("CONFIDANT_KEYCHAIN", "off")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));

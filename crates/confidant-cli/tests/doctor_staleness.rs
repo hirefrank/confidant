@@ -131,12 +131,7 @@ fn run_doctor_env(releases_url: Option<&str>, env: &DoctorEnv<'_>) -> Value {
         .arg(demo())
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
         .env_remove("CONFIDANT_OFFLINE")
-        .env_remove("CONFIDANT_SKILLS_DIR")
-        // #541: the device-key check probes the keychain. Disable it so a
-        // developer's real keychain is never touched (and the result is
-        // deterministic on hosts with or without Secret Service).
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off");
+        .env_remove("CONFIDANT_SKILLS_DIR");
     give_child_git_identity(&mut cmd);
     if let Some(url) = releases_url {
         cmd.env("CONFIDANT_TEST_RELEASES_URL", url);
@@ -594,8 +589,6 @@ fn doctor_skills_links_reporter_sequence_absolute_home_default_share() {
         .env_remove("CONFIDANT_SKILLS_DIR")
         .env_remove("CONFIDANT_VAULT")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off")
         .env("CONFIDANT_TEST_RELEASES_URL", unreachable_url());
     let out = doctor.output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {

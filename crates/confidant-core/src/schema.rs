@@ -267,7 +267,7 @@ pub fn contract_schema() -> Value {
                         "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape. The legacy \"coaching\" field duplicates this map's coaching entry."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
-                    "aliases": {"type": "array", "items": {"type": "string"}, "description": "Opaque hmac:<hex> values."}
+                    "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
                 }
             },
             "doctorReport": {
@@ -294,7 +294,7 @@ pub fn contract_schema() -> Value {
             },
             "syncReport": {
                 "title": "sync --json",
-                "description": "Ahead/behind counts after the fetch (or from the last fetch with --dry-run). Only an encrypted vault with a remote and upstream reaches this shape; otherwise the error envelope carries E_NO_REMOTE, E_PLAINTEXT_REMOTE, or E_NOT_FAST_FORWARD.",
+                "description": "Ahead/behind counts after the fetch (or from the last fetch with --dry-run). Only a vault with a remote and upstream reaches this shape; otherwise the error envelope carries E_NO_REMOTE or E_NOT_FAST_FORWARD.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "remote", "branch", "upstream", "ahead", "behind", "crypto_mode", "fetched", "dry_run", "action", "applied"],
                 "properties": {
@@ -306,7 +306,7 @@ pub fn contract_schema() -> Value {
                     "upstream": {"type": "string"},
                     "ahead": {"type": "integer", "minimum": 0},
                     "behind": {"type": "integer", "minimum": 0},
-                    "crypto_mode": {"type": "string", "const": "encrypted"},
+                    "crypto_mode": {"type": "string", "const": "plaintext"},
                     "fetched": {"type": "boolean", "description": "False when --dry-run skipped the fetch."},
                     "dry_run": {"type": "boolean"},
                     "action": {"type": "string", "enum": ["none", "pull", "push"]},

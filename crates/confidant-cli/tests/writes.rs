@@ -32,7 +32,7 @@ fn make_vault() -> tempfile::TempDir {
         root.join("confidant.toml"),
         // Spec 3 (B10): the plaintext-write fixture declares the opt-out,
         // so the suite keeps exercising the plaintext path.
-        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -92,8 +92,6 @@ fn run_json(args: &[&str]) -> (bool, Value) {
     let out = Command::new(bin())
         .args(args)
         .env("HOME", tmp_home.path())
-        .env("CONFIDANT_KEYCHAIN", "off")
-        .env_remove("CONFIDANT_DEVICE_KEY")
         .output()
         .unwrap();
     let v: Value = match serde_json::from_slice(&out.stdout) {
@@ -119,8 +117,6 @@ fn run_raw(args: &[&str]) -> (bool, String, String) {
         .args(args)
         .env("HOME", tmp_home.path())
         // #541: doctor probes the keychain; keep the suite off the real one.
-        .env("CONFIDANT_KEYCHAIN", "off")
-        .env_remove("CONFIDANT_DEVICE_KEY")
         .output()
         .unwrap();
     (
@@ -232,7 +228,7 @@ fn log_session_dry_run_fails_when_verb_not_enabled() {
     let root = dir.path();
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -340,7 +336,7 @@ fn log_session_refuses_unlisted_pack_verb() {
     install_example_pack(root);
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -403,7 +399,7 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
     install_example_pack(root);
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     // Break the lockfile hash without breaking the manifest parse.
@@ -466,91 +462,13 @@ fn log_session_dry_run_passes_for_problem_pack_verb() {
     assert_eq!(commits(root), 1, "no commit on blocked apply");
 }
 
-/// #732 fix wave: the gate runs before the `--fallback-inbox` queueing
-/// path, so a refused `log session --note --fallback-inbox` queues
-/// nothing. This plaintext fixture cannot reach the encrypted-only
-/// queue branch itself, so the test pins the observable contract: the
-/// refusal, no commit, no ledger change, and no `inbox` branch.
-#[test]
-fn log_session_refused_before_fallback_inbox_queueing() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
-    )
-    .unwrap();
-    let person_dir = root.join(format!("people/{PERSON}"));
-    std::fs::create_dir_all(&person_dir).unwrap();
-    std::fs::write(
-        person_dir.join("profile.md"),
-        format!("---\nid: {PERSON}\ntype: person\nname: \"Test Person\"\n---\n\nTest bio.\n"),
-    )
-    .unwrap();
-    let ledger_dir = root.join("ledger/2026");
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    std::fs::write(
-        ledger_dir.join("10.cfd"),
-        format!("2026-10-01 touch {PERSON} call\n"),
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "test@example.com"]);
-    git(root, &["config", "user.name", "Test"]);
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-qm", "init"]);
-    let vroot = vault_arg(root);
-    let before = std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap();
-
-    for extra in [&["--dry-run"][..], &[][..]] {
-        let mut args: Vec<&str> = vec![
-            "log",
-            "session",
-            PERSON,
-            "60m",
-            "--date",
-            "2026-10-23",
-            "--note",
-            "Great session",
-            "--fallback-inbox",
-            "--json",
-            "--no-input",
-            "--vault",
-            &vroot,
-        ];
-        args.extend_from_slice(extra);
-        let (ok, v) = run_json(&args);
-        assert!(!ok, "{v}");
-        assert_eq!(v["error"]["code"], "E_INVALID");
-        assert_eq!(commits(root), 1, "no commit on refused log");
-        assert_eq!(
-            std::fs::read_to_string(root.join("ledger/2026/10.cfd")).unwrap(),
-            before,
-            "no file change on refused log"
-        );
-    }
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["branch", "--list", "inbox"])
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        "no inbox branch may be created by a refused log"
-    );
-}
-
-/// #732 fix wave: `import` gets the same up-front verb gate as `log`.
-/// A `session` line into a `packs = []` vault refuses before writing
-/// anything; a core `touch` line still imports.
 #[test]
 fn import_refuses_unknown_verb_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     let person_dir = root.join(format!("people/{PERSON}"));
@@ -1655,7 +1573,7 @@ fn cadence_overdue_clears_after_interaction_logged() {
     // the person a cadence with no contact on record.
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\nexample-pack.notes = \"off\"\nexample-pack.gap = \"off\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[checks]\nas_of = \"2026-10-08\"\nexample-pack.notes = \"off\"\nexample-pack.gap = \"off\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -1759,7 +1677,7 @@ fn context_honors_no_ai() {
     install_example_pack(root);
     std::fs::write(
         root.join("confidant.toml"),
-        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n\n[crypto]\nmode = \"plaintext\"\n",
+        "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
     )
     .unwrap();
     std::fs::create_dir_all(root.join(format!("people/{no_ai}"))).unwrap();
@@ -2470,77 +2388,9 @@ fn doctor_reports_expected_checks() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    for expected in [
-        "git-repo",
-        "git-identity",
-        "git-version",
-        "spec",
-        "check",
-        "crypto",
-    ] {
+    for expected in ["git-repo", "git-identity", "git-version", "spec", "check"] {
         assert!(ids.contains(&expected), "missing check {expected}");
     }
-    let crypto = v["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["id"] == "crypto")
-        .unwrap();
-    // Spec 3: the CLI write path encrypts by default; this fixture vault
-    // opts out via [crypto] mode = "plaintext", so doctor reports ok and
-    // names the opt-out.
-    assert_eq!(crypto["status"], "ok");
-    assert!(crypto["message"].as_str().unwrap().contains("opts out"));
-    // The record-encryption mix check is present (code + count only).
-    let mix = v["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["id"] == "record-encryption-mix")
-        .expect("record-encryption-mix check missing");
-    assert_eq!(mix["status"], "ok");
-}
-
-#[test]
-fn doctor_flags_corrupt_manifest_not_absent() {
-    // #73: a corrupt recipients.toml must surface as an error, distinct
-    // from "no manifest".
-    let dir = make_vault();
-    let root = dir.path();
-    let mdir = root.join("keys/p-01J9Z3K4QF0000000000000006");
-    std::fs::create_dir_all(&mdir).unwrap();
-    std::fs::write(mdir.join("recipients.toml"), b"this is not toml {{{").unwrap();
-
-    let vroot = vault_arg(root);
-    let (ok, v) = run_json(&["doctor", "--json", "--no-input", "--vault", &vroot]);
-    assert!(!ok, "{v}");
-    let check = v["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["id"] == "crypto-manifests")
-        .expect("missing crypto-manifests check");
-    assert_eq!(check["status"], "error");
-    let msg = check["message"].as_str().unwrap();
-    assert!(msg.contains("corrupt"), "{msg}");
-    assert!(msg.contains("p-01J9Z3K4QF0000000000000006"), "{msg}");
-}
-
-#[test]
-fn doctor_manifest_check_ok_when_no_keys_dir() {
-    // No keys/ tree at all: nothing to diagnose, check stays quiet.
-    let dir = make_vault();
-    let vroot = vault_arg(dir.path());
-    let (ok, v) = run_json(&["doctor", "--json", "--no-input", "--vault", &vroot]);
-    assert!(ok, "{v}");
-    assert!(
-        !v["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["id"] == "crypto-manifests"),
-        "{v}"
-    );
 }
 
 #[test]
@@ -2674,7 +2524,6 @@ fn help_json_lists_every_subcommand() {
         .iter()
         .map(|s| s.as_str().unwrap())
         .collect();
-    assert!(alias_subs.contains(&"add"), "{alias_subs:?}");
     assert!(alias_subs.contains(&"resolve"), "{alias_subs:?}");
 }
 

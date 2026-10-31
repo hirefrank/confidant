@@ -131,12 +131,10 @@ pub struct PersonContext {
     /// alias is tied to the pack named `coaching` (ADR-7), whatever origin it
     /// came from.
     pub packs: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Opaque `hmac:<hex>` values from ledger `alias` lines.
+    /// The person's contact values (`emails`, `phones`, `handles`), shown
+    /// only when private data is included. Empty under `--exclude-private`
+    /// and for records outside the cleared set.
     pub aliases: Vec<String>,
-    /// Envelopes skipped as unreadable while loading (spec 4, ⚠2).
-    pub skipped_encrypted: u32,
-    /// Envelopes refused as tampered/corrupt while loading (spec 4, ⚠2c).
-    pub refused_envelopes: u32,
     /// Pack names in scope for this bundle, sorted. For an unscoped call,
     /// every enabled pack — the scope that actually applied (#178).
     pub scope: Vec<String>,
@@ -294,15 +292,19 @@ pub fn build_context(
         .collect();
     interactions.sort_by(|a, b| a.date.cmp(&b.date).then(a.id.cmp(&b.id)));
 
-    let aliases: Vec<String> = vault
-        .entries
-        .iter()
-        .filter(|s| {
-            s.entry.verb == "alias" && canonical_on(&s.entry.id, &merges, as_of) == canonical
-        })
-        .filter_map(|s| s.entry.pair("hmac"))
-        .map(|h| format!("hmac:{h}"))
-        .collect();
+    // Aliases are plain front-matter contact values now, so they follow the
+    // same PII gate as the rest of the person's profile.
+    let mut aliases: Vec<String> = Vec::new();
+    if show_pii {
+        for field in ["emails", "phones", "handles"] {
+            if let Some(entries) = record
+                .field(field)
+                .and_then(crate::packs::grammars::parse_list)
+            {
+                aliases.extend(entries);
+            }
+        }
+    }
 
     // #179: mirrored touchpoints — the participant's own `touch` lines.
     // Like aliases, these are ledger-derived metadata (not record PII),
@@ -345,8 +347,6 @@ pub fn build_context(
         coaching,
         packs,
         aliases,
-        skipped_encrypted: vault.skipped_encrypted,
-        refused_envelopes: vault.refused_envelopes,
         scope: scope_names,
         for_operator,
     })

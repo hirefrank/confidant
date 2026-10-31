@@ -121,14 +121,51 @@ impl Record {
     /// value here is only valid on person records — `parse_record`
     /// validates that — so callers can rely on the parse. Anything
     /// unrecognized maps to hidden (fail closed); unreachable in practice.
-    pub fn no_ai_mode(&self) -> Option<confidant_crypt::envelope::NoAi> {
+    pub fn no_ai_mode(&self) -> Option<NoAi> {
         let v = self.field("no-ai")?;
-        match v {
-            "true" => Some(confidant_crypt::envelope::NoAi::True),
-            "false" => Some(confidant_crypt::envelope::NoAi::False),
-            "notes" => Some(confidant_crypt::envelope::NoAi::Notes),
-            _ => Some(confidant_crypt::envelope::NoAi::True),
+        Some(NoAi::parse(v).unwrap_or(NoAi::True))
+    }
+}
+
+/// Tri-state `no-ai` value (`spec/0.1.md` §4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoAi {
+    False,
+    True,
+    Notes,
+}
+
+impl NoAi {
+    /// Parse a front-matter value. Anything else is [`None`] — in
+    /// particular, readers that only know `true`/`false` reject `notes`,
+    /// so a `notes`-mode person can never be misread as a visible bool.
+    pub fn parse(v: &str) -> Option<NoAi> {
+        match v.trim() {
+            "true" => Some(NoAi::True),
+            "false" => Some(NoAi::False),
+            "notes" => Some(NoAi::Notes),
+            _ => None,
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoAi::True => "true",
+            NoAi::False => "false",
+            NoAi::Notes => "notes",
+        }
+    }
+
+    /// Is this record itself hidden from agents? Only `True` — a `Notes`
+    /// person stays visible (their children default hidden instead).
+    pub fn hidden_from_agents(self) -> bool {
+        matches!(self, NoAi::True)
+    }
+}
+
+impl std::fmt::Display for NoAi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -563,15 +600,12 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
             "Use a prefixed 26-character Crockford ULID",
         )
     })?;
-    // An envelope shell (`enc:` present) carries the outer header's
-    // `no-ai` and a base64 ciphertext body — neither is the inner
-    // record's front matter. The inner no-ai / body rules do not apply
-    // to the shell: the outer `no-ai` is honoured by the allowlist, and
-    // the body is ciphertext, not prose.
-    let is_envelope = fields.contains_key("enc");
+    // #390: an edge carries only ids, kind, and dates, so a front-matter key
+    // outside that set is rejected rather than ignored like unknown keys
+    // elsewhere (spec §4).
     if fields.contains_key("no-ai") {
         let line = line_of("no-ai").unwrap_or(1);
-        if !is_envelope && !kind.allows_no_ai() {
+        if !kind.allows_no_ai() {
             return Err(FrontmatterError::key_at(
                 line,
                 "no-ai",
@@ -611,11 +645,9 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
     }
     // #390: an edge carries only ids, kind, and dates, so a front-matter key
     // outside that set is rejected rather than ignored like unknown keys
-    // elsewhere (spec §4). An extra key is the same shared-key residue as a
-    // body: its value would be encrypted under `vault:shared` and survive a
-    // shred. Envelope shells are exempt — their outer header is the
-    // envelope's (id/type/no-ai/enc/key_id/nonce), not the record's.
-    if kind == RecordKind::Edge && !is_envelope {
+    // elsewhere (spec §4). An extra key on an edge has no home, so it is
+    // rejected rather than silently stored.
+    if kind == RecordKind::Edge {
         const ALLOWED: [&str; 7] = ["id", "type", "a", "b", "kind", "since", "until"];
         let disallowed = fields.keys().find(|k| !ALLOWED.contains(&k.as_str()));
         if let Some(key) = disallowed {
@@ -629,11 +661,8 @@ pub fn parse_record(text: &str, path: &str) -> Result<Record, FrontmatterError> 
         }
     }
     // #179: an edge carries only ids, kind, and dates — no body. Sensitive
-    // context belongs in a note on one of the edge's people, which does
-    // get crypto-shredded; an edge body would survive shred as shared-key
-    // residue. `check` reports this as a Frontmatter error. Envelope
-    // shells are exempt: their body is ciphertext, not prose.
-    if kind == RecordKind::Edge && !is_envelope && !body.trim().is_empty() {
+    // context belongs in a note on one of the edge's people.
+    if kind == RecordKind::Edge && !body.trim().is_empty() {
         return Err(FrontmatterError::new(
             "edge records carry no body",
             "Move the context into a note on one of the edge's people",
@@ -838,10 +867,7 @@ mod tests {
         let person = "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nno-ai: notes\n---\n";
         let rec = parse_record(person, "x.md").unwrap();
         assert!(!rec.no_ai(), "notes-mode person stays visible");
-        assert_eq!(
-            rec.no_ai_mode(),
-            Some(confidant_crypt::envelope::NoAi::Notes)
-        );
+        assert_eq!(rec.no_ai_mode(), Some(super::NoAi::Notes));
 
         let note =
             "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\nno-ai: notes\n---\n"
@@ -853,10 +879,7 @@ mod tests {
         let note_ok = "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\nno-ai: false\n---\n";
         let rec = parse_record(note_ok, "x.md").unwrap();
         assert!(!rec.no_ai());
-        assert_eq!(
-            rec.no_ai_mode(),
-            Some(confidant_crypt::envelope::NoAi::False)
-        );
+        assert_eq!(rec.no_ai_mode(), Some(super::NoAi::False));
         let rec_none = parse_record(
             "---\nid: n-01M3TC5H00MPJG000000000001\ntype: note\nperson: p-01M3TC5H00MPJG000000000000\n---\n",
             "x.md",

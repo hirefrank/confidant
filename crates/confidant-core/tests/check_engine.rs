@@ -88,7 +88,6 @@ fn report_json(root: &Path, as_of: Option<&str>) -> Value {
         &CheckOptions {
             as_of,
             fail_on: Some(Severity::Warning),
-            pinned_inbox_pubkey: None,
         },
     );
     let mut v = serde_json::to_value(&report).unwrap();
@@ -338,28 +337,6 @@ fn malformed_ledger_and_bad_filename() {
 }
 
 #[test]
-fn alias_plaintext_and_collision() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    person(dir.path(), ADA, "Ada Example");
-    let bea = "p-01M3TC5H00MPJG000H24000001";
-    person(dir.path(), bea, "Bea Demo");
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!(
-            "             2026-10-01 alias {ADA} email not-an-hmac\n\
-             2026-10-02 alias {ADA} email hmac:abcdef12abcdef12abcdef12abcdef12\n\
-             2026-10-02 alias {bea} email hmac:abcdef12abcdef12abcdef12abcdef12\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    let c = codes(&json);
-    assert!(c.contains(&"E_ALIAS_PLAINTEXT".into()), "{c:?}");
-    assert!(c.contains(&"E_ALIAS_COLLISION".into()), "{c:?}");
-}
-
-#[test]
 fn json_shape_has_stable_keys() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
@@ -506,30 +483,6 @@ example-pack.gap = "off"
     assert!(
         codes(&json).contains(&"E_EXAMPLE_NOTE_INVALID_ID".into()),
         "{json}"
-    );
-}
-
-#[test]
-fn alias_unknown_kind_does_not_echo_raw_token() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    person(dir.path(), ADA, "Ada Example");
-    write(
-        dir.path(),
-        "ledger/2026/10.cfd",
-        &format!("2026-10-01 alias {ADA} secret-pii hmac:abcdef12abcdef12abcdef12abcdef12\n"),
-    );
-    let json = report_json(dir.path(), None);
-    assert!(codes(&json).contains(&"E_ALIAS_PLAINTEXT".into()), "{json}");
-    let messages: Vec<_> = json["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|f| f["message"].as_str())
-        .collect();
-    assert!(
-        messages.iter().all(|m| !m.contains("secret-pii")),
-        "{messages:?}"
     );
 }
 
@@ -3792,67 +3745,6 @@ fn check_ledger_merge_conflict_does_not_leak_name() {
 /// the outer front matter (the `nonce:` line) as well as the body, which
 /// is the case that makes the markers unparseable by `parse_record`.
 #[test]
-fn check_envelope_merge_conflict_reports_the_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    // A `keys/` tree is what makes the vault structurally encrypted.
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    write(
-        dir.path(),
-        "people/p-01M3TC5H00MPJG000000000000/profile.md",
-        "---\nid: p-01M3TC5H00MPJG000000000000\ntype: person\nno-ai: false\n\
-         <<<<<<< HEAD\nenc: xchacha20poly1305\nkey_id: p-01M3TC5H00MPJG000000000000/e1\n\
-         nonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n=======\nenc: xchacha20poly1305\n\
-         key_id: p-01M3TC5H00MPJG000000000000/e1\nnonce: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n\
-         >>>>>>> other\n---\nAQID\n",
-    );
-    let json = report_json(dir.path(), None);
-    let found = codes(&json);
-    assert!(found.contains(&"E_MERGE_CONFLICT".to_string()), "{json}");
-    assert!(
-        !found.contains(&"E_FRONTMATTER".to_string()),
-        "conflict markers produced a derived E_FRONTMATTER: {json}"
-    );
-}
-
-/// #452: a conflicted file whose two sides are both encrypted envelopes
-/// reports the encrypted-record message, with the record id and a
-/// `record resolve` fix. Synthetic envelopes with fake base64 (keyless).
-#[test]
-fn conflicted_envelope_reports_encrypted_message_and_id() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    let id = "p-01M3TC5H00MPJG000000000000";
-    let ours = fake_envelope(id, &"A".repeat(32), "QUJD");
-    let theirs = fake_envelope(id, &"B".repeat(32), "REVG");
-    let conflicted = format!("<<<<<<< HEAD\n{ours}=======\n{theirs}>>>>>>> other\n");
-    write(dir.path(), &format!("people/{id}/profile.md"), &conflicted);
-    let json = report_json(dir.path(), None);
-    let findings: Vec<_> = json["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["code"].as_str() == Some("E_MERGE_CONFLICT"))
-        .collect();
-    assert_eq!(findings.len(), 1, "expected one E_MERGE_CONFLICT: {json}");
-    let f = findings[0];
-    assert_eq!(
-        f["message"].as_str(),
-        Some("encrypted record has two versions after a merge conflict"),
-        "{json}"
-    );
-    assert_eq!(f["id"].as_str(), Some(id), "{json}");
-    let fix = f["fix"].as_str().unwrap_or("");
-    assert!(
-        fix.contains(&format!("confidant record resolve {id} --show")),
-        "fix should point at record resolve: {fix}"
-    );
-}
-
-/// #452: a conflicted plaintext record keeps the generic message and fix,
-/// with no id set.
-#[test]
 fn conflicted_plaintext_record_keeps_generic_message() {
     let dir = tempfile::tempdir().unwrap();
     vault_toml(dir.path(), DEFAULT_CHECKS);
@@ -3915,90 +3807,6 @@ fn conflicted_ledger_keeps_generic_message() {
 
 /// #452: when only one conflict side is an envelope, the generic message
 /// is kept.
-#[test]
-fn conflict_with_only_one_envelope_side_keeps_generic_message() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    let id = "p-01M3TC5H00MPJG000000000000";
-    let ours = fake_envelope(id, &"A".repeat(32), "QUJD");
-    let conflicted = format!("<<<<<<< HEAD\n{ours}=======\nnot an envelope\n>>>>>>> other\n");
-    write(dir.path(), &format!("people/{id}/profile.md"), &conflicted);
-    let json = report_json(dir.path(), None);
-    let findings: Vec<_> = json["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["code"].as_str() == Some("E_MERGE_CONFLICT"))
-        .collect();
-    assert_eq!(findings.len(), 1, "expected one E_MERGE_CONFLICT: {json}");
-    assert_eq!(
-        findings[0]["message"].as_str(),
-        Some("file contains git conflict markers"),
-        "{json}"
-    );
-}
-
-/// #452: the JSON report for a conflicted encrypted record carries no
-/// plaintext and no ciphertext — only code, severity, path, id, message,
-/// fix.
-#[test]
-fn conflicted_envelope_json_has_no_ciphertext_or_plaintext() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    let id = "p-01M3TC5H00MPJG000000000000";
-    // Distinctive fake base64 body and a sentinel in the nonce area are
-    // both absent from the report.
-    let body_b64 = "U0VOVElORUxDQUtF"; // "SENTINELCAKE"
-    let ours = fake_envelope(id, &"A".repeat(32), body_b64);
-    let theirs = fake_envelope(id, &"B".repeat(32), body_b64);
-    let conflicted = format!("<<<<<<< HEAD\n{ours}=======\n{theirs}>>>>>>> other\n");
-    write(dir.path(), &format!("people/{id}/profile.md"), &conflicted);
-    let json = report_json(dir.path(), None);
-    let dumped = json.to_string();
-    assert!(
-        !dumped.contains(body_b64),
-        "ciphertext body leaked in check output"
-    );
-    assert!(
-        !dumped.contains("SENTINELCAKE"),
-        "decoded body leaked in check output"
-    );
-}
-
-/// #452: a note referencing a conflicted encrypted record does not cascade
-/// into E_DANGLING_REF (existing #396 suppression behaviour, unchanged).
-#[test]
-fn conflicted_envelope_does_not_cascade_dangling_refs() {
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    let id = "p-01M3TC5H00MPJG000000000000";
-    let ours = fake_envelope(id, &"A".repeat(32), "QUJD");
-    let theirs = fake_envelope(id, &"B".repeat(32), "REVG");
-    let conflicted = format!("<<<<<<< HEAD\n{ours}=======\n{theirs}>>>>>>> other\n");
-    write(dir.path(), &format!("people/{id}/profile.md"), &conflicted);
-    note(dir.path(), NOTE, id, "2026-10-01");
-    let json = report_json(dir.path(), None);
-    let found = codes(&json);
-    assert!(found.contains(&"E_MERGE_CONFLICT".to_string()), "{json}");
-    assert!(
-        !found.contains(&"E_DANGLING_REF".to_string()),
-        "conflicted record cascaded into E_DANGLING_REF: {json}"
-    );
-}
-
-/// A synthetic envelope with fake base64. Parses via `envelope::parse`
-/// but carries no real ciphertext (keyless test).
-fn fake_envelope(id: &str, nonce_b64: &str, body_b64: &str) -> String {
-    format!(
-        "---\nid: {id}\ntype: person\nno-ai: false\nenc: xchacha20poly1305\nkey_id: {id}/e1\nnonce: {nonce_b64}\n---\n{body_b64}\n"
-    )
-}
-
-/// #7 (round 2): an unreadable ledger subdirectory redacts the directory
-/// name in the directory-level Unreadable finding.
 #[test]
 #[cfg(unix)]
 fn check_unreadable_ledger_dir_does_not_leak_name() {
@@ -4691,29 +4499,6 @@ fn edge_dates_are_still_allowed() {
     );
     let json = report_json(dir.path(), None);
     assert!(codes(&json).is_empty(), "{json}");
-}
-
-#[test]
-fn edge_envelope_shell_is_exempt_from_the_whitelist() {
-    // #390 carve-out: an encrypted edge's outer header belongs to the
-    // envelope (id/type/no-ai/enc/key_id/nonce), not to the record, so the
-    // edge field whitelist must not apply to the shell.
-    let dir = tempfile::tempdir().unwrap();
-    vault_toml(dir.path(), DEFAULT_CHECKS);
-    write(dir.path(), "keys/operator.toml", "# placeholder\n");
-    write(
-        dir.path(),
-        &format!("edges/{EDGE1}/edge.md"),
-        &format!(
-            "---\nid: {EDGE1}\ntype: edge\nno-ai: false\nenc: xchacha20poly1305\n\
-             key_id: vault:shared/e1\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\nAQID\n"
-        ),
-    );
-    let json = report_json(dir.path(), None);
-    assert!(
-        !codes(&json).contains(&"E_FRONTMATTER".to_string()),
-        "the edge envelope shell was rejected as a record: {json}"
-    );
 }
 
 #[test]

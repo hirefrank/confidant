@@ -493,10 +493,6 @@ pub struct CheckReport {
 pub struct CheckOptions {
     pub as_of: Option<NaiveDate>,
     pub fail_on: Option<Severity>,
-    /// The operator's out-of-band pin of the vault's inbox public key. When
-    /// set and the vault's `[inbox].pubkey` differs, an error finding is
-    /// reported (possible key substitution; see `docs/inbox.md`).
-    pub pinned_inbox_pubkey: Option<String>,
 }
 
 /// Run every check against `vault`, collecting rather than propagating.
@@ -513,58 +509,6 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
             .at_file("confidant.toml")
             .with_fix("Use spec = \"0.1\" or upgrade the CLI"),
         );
-    }
-
-    // Spec 3 (§2.2): a `mode = "plaintext"` declaration combined with a
-    // structurally encrypted vault (any `enc:` envelope or any `keys/`
-    // tree) is E_CONFIG — the declaration can never downgrade an
-    // encrypted vault.
-    if vault.config.crypto.mode.as_deref() == Some("plaintext")
-        && crate::crypto_mode::is_structurally_encrypted(&vault.root)
-    {
-        findings.push(
-            Finding::new(
-                FindingCode::Config,
-                Severity::Error,
-                "confidant.toml declares [crypto] mode = \"plaintext\" but the vault \
-                 is structurally encrypted (it has an `enc:` envelope or a `keys/` tree); \
-                 the declaration cannot downgrade an encrypted vault",
-            )
-            .at_file("confidant.toml")
-            .with_fix("Remove the `[crypto] mode = \"plaintext\"` line"),
-        );
-    }
-
-    // Key-substitution defense: the vault's advertised inbox key must match
-    // the operator's out-of-band pin. Anyone with git write access can change
-    // confidant.toml; only the local pin is trustworthy.
-    if let Some(pinned) = options
-        .pinned_inbox_pubkey
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match vault
-            .config
-            .inbox
-            .pubkey
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(vault_key) if vault_key != pinned => {
-                findings.push(
-                    Finding::new(
-                        FindingCode::InboxKeyMismatch,
-                        Severity::Error,
-                        "vault [inbox].pubkey does not match the pinned key in user config; possible key substitution",
-                    )
-                    .at_file("confidant.toml")
-                    .with_fix("Restore the pinned public key, or update the pin in ~/.config/confidant/config.toml after verifying the key out of band"),
-                );
-            }
-            _ => {}
-        }
     }
 
     let spec_ok = vault.config.spec == SPEC_VERSION;
@@ -1086,7 +1030,7 @@ pub(crate) type MergeMap = HashMap<RecordId, (RecordId, NaiveDate)>;
 pub(crate) fn check_aliases_and_merges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
-    as_of: NaiveDate,
+    _as_of: NaiveDate,
     findings: &mut Vec<Finding>,
 ) -> MergeMap {
     let mut parent: MergeMap = HashMap::new();
@@ -1211,43 +1155,6 @@ pub(crate) fn check_aliases_and_merges(
         findings.push(finding);
     }
 
-    let mut seen_alias: BTreeMap<(String, String), RecordId> = BTreeMap::new();
-    for sourced in &vault.entries {
-        if sourced.entry.verb != "alias" {
-            continue;
-        }
-        let e = &sourced.entry;
-        match parse_alias(e) {
-            Err(msg) => findings.push(
-                Finding::new(FindingCode::AliasPlaintext, Severity::Error, msg)
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&e.id)
-                    .with_fix("Store HMAC(vault lookup key, normalized value) as hmac:<hex>"),
-            ),
-            Ok((kind, hmac)) => {
-                let canon = canonical_on(&e.id, &parent, as_of);
-                let key = (kind.clone(), hmac);
-                if let Some(existing) = seen_alias.get(&key) {
-                    if existing != &canon {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::AliasCollision,
-                                Severity::Warning,
-                                format!("alias {kind} hmac is shared by {existing} and {canon}"),
-                            )
-                            .at_file(&sourced.file)
-                            .at_line(sourced.line)
-                            .for_id(&canon)
-                            .with_fix("Merge the duplicate records or drop one alias"),
-                        );
-                    }
-                } else {
-                    seen_alias.insert(key, canon);
-                }
-            }
-        }
-    }
     parent
 }
 
@@ -1274,32 +1181,6 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
         },
         Err(_) => MergeParse::InvalidTo,
     }
-}
-
-const ALIAS_HMAC_MIN_HEX: usize = 32;
-
-pub(crate) fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
-    if entry.args.len() != 2 {
-        return Err("alias line must be exactly KIND hmac:HEX".to_owned());
-    }
-    let kind = entry.args[0]
-        .as_token()
-        .ok_or_else(|| "alias kind must be a token (email, phone, handle, or name)".to_owned())?;
-    if !matches!(kind, "email" | "phone" | "handle" | "name") {
-        return Err("alias kind must be email, phone, handle, or name".to_owned());
-    }
-    let hmac = match &entry.args[1] {
-        Arg::Token(s) if s.starts_with("hmac:") => s.clone(),
-        Arg::Pair { key, value } if key == "hmac" => format!("hmac:{value}"),
-        _ => return Err("alias value is not hmac:<hex>".to_owned()),
-    };
-    let hex = hmac.strip_prefix("hmac:").unwrap_or("");
-    if hex.len() < ALIAS_HMAC_MIN_HEX || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "alias HMAC must be hmac: plus at least {ALIAS_HMAC_MIN_HEX} hex characters"
-        ));
-    }
-    Ok((kind.to_owned(), hex.to_ascii_lowercase()))
 }
 
 pub(crate) fn canonical_on(id: &RecordId, parent: &MergeMap, on: NaiveDate) -> RecordId {
@@ -1963,7 +1844,7 @@ pub(crate) fn duration_of(entry: &LedgerEntry) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_alias, parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
+    use super::{parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
 
     #[test]
     fn fail_on_and_summary() {
@@ -1978,35 +1859,6 @@ mod tests {
         };
         assert!(!s.fails(Severity::Error));
         assert!(s.fails(Severity::Warning));
-    }
-
-    /// #748: `name` is a valid alias kind (former/married name, nickname,
-    /// preferred name); an unknown kind is still refused by the parser.
-    #[test]
-    fn parse_alias_accepts_name_kind() {
-        use crate::id::RecordId;
-        use crate::ledger::{Arg, LedgerEntry};
-        use chrono::NaiveDate;
-        let entry = |kind: &str| LedgerEntry {
-            date: NaiveDate::from_ymd_opt(2026, 10, 24).unwrap(),
-            verb: "alias".to_owned(),
-            id: RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap(),
-            args: vec![
-                Arg::Token(kind.to_owned()),
-                Arg::Token(
-                    "hmac:6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
-                        .to_owned(),
-                ),
-            ],
-            comment: None,
-        };
-        let (kind, hex) = parse_alias(&entry("name")).unwrap();
-        assert_eq!(kind, "name");
-        assert_eq!(
-            hex,
-            "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
-        );
-        assert!(parse_alias(&entry("twitter")).is_err());
     }
 
     /// #732 fix wave: the orphan branch of the shared verb-set helper.

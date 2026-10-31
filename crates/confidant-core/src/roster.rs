@@ -51,10 +51,6 @@ pub struct Roster {
     /// scope does not remove them today; it is reported for contract
     /// consistency with `find` / `context` and validates `--packs`.
     pub scope: Vec<String>,
-    /// Envelopes skipped as unreadable by the content hook (spec 4, ⚠2).
-    pub skipped_encrypted: u32,
-    /// Envelopes refused as tampered/corrupt (spec 4, ⚠2c).
-    pub refused_envelopes: u32,
 }
 
 /// Build the roster for `kind`.
@@ -106,8 +102,6 @@ pub fn build_roster(
         for_operator,
         records: sortable.into_iter().map(|(_, _, entry)| entry).collect(),
         scope: scope_names,
-        skipped_encrypted: vault.skipped_encrypted,
-        refused_envelopes: vault.refused_envelopes,
     }
 }
 

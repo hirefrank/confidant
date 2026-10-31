@@ -13,16 +13,12 @@ tests, clippy and CI can all pass over:
     `no-ai` person, while `--for-operator` does (`find` / `context`);
   - the pack lifecycle no-ops cleanly (`unchanged`), repairs a stale lock
     hash, and rolls back a refused change;
-  - writes encrypt on an encrypted vault and stay plaintext only on a
-    vault that declares the opt-out.
+  - records are written as plaintext YAML front matter plus Markdown.
 
-Everything is fake data and throwaway keys (ADR-14): the script generates
-its own age device key and Ed25519 operator seed in-process, points `HOME`
-at a throwaway config dir, and never touches a real vault or keychain.
+Everything is fake data. The script points `HOME` at a throwaway config
+directory and never touches a real vault.
 
-The binary must be built with `--all-features` (the CI job does): the
-encrypted steps need the `test-overrides` feature so the operator seed can
-arrive via `CONFIDANT_TEST_OPERATOR_KEY` and no real keychain is touched.
+The binary must be built with `--all-features` (the CI job does).
 
 A `--workdir` is wiped before a run, so the script refuses to delete a
 directory it did not create: it drops a `.qa-smoke` marker when it makes a
@@ -93,58 +89,6 @@ class SmokeFailure(Exception):
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
-def _bech32_polymod(values: list[int]) -> int:
-    gen = [0x3B6A57B2, 0x2650_8E6D, 0x1EA1_19FA, 0x3D42_33DD, 0x2A14_62B3]
-    chk = 1
-    for value in values:
-        top = chk >> 25
-        chk = (chk & 0x1FFFFFF) << 5 ^ value
-        for i in range(5):
-            chk ^= gen[i] if ((top >> i) & 1) else 0
-    return chk
-
-
-def _bech32_hrp_expand(hrp: str) -> list[int]:
-    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
-
-
-def _bech32_convertbits(data: bytes, frombits: int, tobits: int) -> list[int]:
-    acc = 0
-    bits = 0
-    ret: list[int] = []
-    maxv = (1 << tobits) - 1
-    for value in data:
-        acc = (acc << frombits) | value
-        bits += frombits
-        while bits >= tobits:
-            bits -= tobits
-            ret.append((acc >> bits) & maxv)
-    if bits:
-        ret.append((acc << (tobits - bits)) & maxv)
-    return ret
-
-
-def age_secret_key() -> str:
-    """A fresh throwaway age x25519 identity, e.g. `AGE-SECRET-KEY-1…`.
-
-    Implemented in pure Python so the smoke needs no `age-keygen` install
-    (the crypto tests get theirs from a Rust dev-dependency).
-    """
-    raw = os.urandom(32)
-    hrp = "age-secret-key-"
-    data = _bech32_convertbits(raw, 8, 5)
-    values = _bech32_hrp_expand(hrp) + data + [0, 0, 0, 0, 0, 0]
-    polymod = _bech32_polymod(values) ^ 1
-    checksum = [(polymod >> (5 * (5 - i))) & 31 for i in range(6)]
-    encoded = "".join(_BECH32_CHARSET[d] for d in data + checksum)
-    return (hrp + "1" + encoded).upper()
-
-
-# ---------------------------------------------------------------------------
-# Step runner
-# ---------------------------------------------------------------------------
-
-
 class Smoke:
     """Runs the smoke steps and keeps a summary of what ran."""
 
@@ -157,8 +101,6 @@ class Smoke:
         for path in (self.vaults, self.scratch, self.home):
             path.mkdir(parents=True, exist_ok=True)
 
-        self.device_key = age_secret_key()
-        self.operator_hex = os.urandom(32).hex()
         # A throwaway git identity, written into the throwaway HOME *and* named
         # explicitly via GIT_CONFIG_GLOBAL. Without this the smoke passes on a
         # developer machine (git falls back to the real user's config) and fails
@@ -186,9 +128,6 @@ class Smoke:
             {
                 "HOME": str(self.home),
                 "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
-                "CONFIDANT_KEYCHAIN": "off",
-                "CONFIDANT_DEVICE_KEY": self.device_key,
-                "CONFIDANT_TEST_OPERATOR_KEY": self.operator_hex,
                 "GIT_AUTHOR_NAME": "QA Smoke",
                 "GIT_AUTHOR_EMAIL": "qa-smoke@example.invalid",
                 "GIT_COMMITTER_NAME": "QA Smoke",
@@ -310,7 +249,7 @@ class Smoke:
         (vault / "confidant.toml").write_text(
             f'spec = "0.1"\npacks = [{pack_list}]\nvault_id = "{VAULT_ID}"\n'
             '\n[checks]\nas_of = "2026-10-08"\n'
-            '\n[crypto]\nmode = "plaintext"\n'
+            '\n'
         )
         self.git(vault, ["init", "-q"])
         self.git(vault, ["add", "-A"])
@@ -627,172 +566,6 @@ def refused_write_step(smoke: Smoke, vault: Path) -> None:
     smoke.mark(step)
 
 
-def encrypted_vault_steps(smoke: Smoke) -> None:
-    """Init, keys, encrypted writes, and the alias stdin round-trip."""
-    vault = smoke.vaults / "encrypted"
-    if vault.exists():
-        shutil.rmtree(vault)
-
-    step = "init (encrypted)"
-    report = smoke.cli_ok(
-        step,
-        [
-            "init",
-            "--create",
-            "--no-input",
-            "--json",
-            "--vault",
-            str(vault),
-        ],
-    )
-    smoke.ok(step, report.get("ok") is True, f"init failed: {report}")
-    smoke.ok(step, (vault / "keys").is_dir(), "init did not create the keys/ tree")
-    smoke.ok(
-        step,
-        (smoke.home / ".config" / "confidant" / "trust.toml").is_file(),
-        "init did not write the trust anchor",
-    )
-    smoke.mark(step)
-
-    # The example pack is external; install it before the ledger write.
-    smoke.install_example_pack(vault)
-
-    step = "keys init-client (encrypted)"
-    smoke.cli_ok(
-        step,
-        ["keys", "init-client", PERSON, "--json", "--no-input", "--vault", str(vault)],
-    )
-    smoke.mark(step)
-
-    smoke.write_person(PERSON, "Ada Example")
-
-    step = "record add (encrypted)"
-    smoke.cli_ok(
-        step,
-        [
-            "record",
-            "add",
-            "--file",
-            str(smoke.scratch / f"{PERSON}.md"),
-            "--json",
-            "--no-input",
-            "--vault",
-            str(vault),
-        ],
-    )
-    profile = (vault / "people" / PERSON / "profile.md").read_text()
-    smoke.ok(step, "\nenc:" in f"\n{profile}", f"encrypted vault wrote plaintext: {profile[:120]}")
-    smoke.ok(step, "Ada Example" not in profile, "encrypted profile leaked its plaintext name")
-    smoke.mark(step)
-
-    smoke.seed_grant_line(vault, no_ai_touch=False)
-
-    step = "note add (encrypted)"
-    note_body = smoke.scratch / "enc-note.md"
-    note_body.write_text("Follow up on the launch.\n")
-    smoke.cli_ok(
-        step,
-        [
-            "note",
-            "add",
-            "--person",
-            PERSON,
-            "--body-file",
-            str(note_body),
-            "--json",
-            "--no-input",
-            "--vault",
-            str(vault),
-        ],
-    )
-    smoke.mark(step)
-
-    step = "log session (encrypted)"
-    smoke.cli_ok(
-        step,
-        [
-            "log",
-            "session",
-            PERSON,
-            "60m",
-            "paid",
-            "--date",
-            SESSION_DATE,
-            "--note",
-            "Fake session note.",
-            "--json",
-            "--no-input",
-            "--vault",
-            str(vault),
-        ],
-    )
-    smoke.mark(step)
-
-    step = "alias add + resolve (stdin)"
-    value_file = smoke.scratch / "alias-email.txt"
-    value_file.write_text(" Ada@Example.com \n")
-    added = smoke.cli_ok(
-        step,
-        [
-            "alias",
-            "add",
-            PERSON,
-            "email",
-            "--value-file",
-            str(value_file),
-            "--date",
-            ALIAS_DATE,
-            "--json",
-            "--no-input",
-            "--vault",
-            str(vault),
-        ],
-    )
-    smoke.ok(step, added.get("command") == "alias-add", f"bad alias add: {added}")
-    smoke.ok(step, str(added.get("hmac", "")).startswith("hmac:"), f"no hmac: {added}")
-    smoke.ok(
-        step,
-        "Ada@Example.com" not in json.dumps(added),
-        "the alias value leaked into alias-add output",
-    )
-    resolved = smoke.cli_ok(
-        step,
-        ["alias", "resolve", "email", "--json", "--no-input", "--vault", str(vault)],
-        stdin="ada@example.com",
-    )
-    smoke.ok(
-        step,
-        resolved.get("matched_by") == "alias" and resolved["person"]["id"] == PERSON,
-        f"alias resolve failed: {resolved}",
-    )
-    smoke.ok(
-        step,
-        "ada@example.com" not in json.dumps(resolved),
-        "the alias value leaked into alias-resolve output",
-    )
-    smoke.mark(step)
-
-    smoke.check_clean("check --json (encrypted)", vault)
-    smoke.mark("check --json (encrypted)")
-
-
-def plaintext_init_refusal_step(smoke: Smoke) -> None:
-    """Spec 3: `init` must refuse a vault that declares `mode = "plaintext"`."""
-    step = "init refuses a plaintext declaration"
-    vault = smoke.make_plaintext_vault("plaintext-init", [])
-    smoke.cli_fail(
-        step,
-        ["init", "--no-input", "--json", "--vault", str(vault)],
-        code="E_CONFIG",
-    )
-    smoke.ok(
-        step,
-        not (vault / "keys").exists(),
-        "a refused init left a keys/ tree behind",
-    )
-    smoke.mark(step)
-
-
 def pack_lifecycle_steps(smoke: Smoke) -> None:
     """Install, no-op update, stale-pin repair, and remove."""
     vault = smoke.make_plaintext_vault("packs", [])
@@ -1097,10 +870,6 @@ def main() -> int:
 
     try:
         plaintext_vault_steps(smoke)
-        # Before the encrypted init writes a trust anchor: the plaintext
-        # refusal is masked by "anchor already exists" once one does.
-        plaintext_init_refusal_step(smoke)
-        encrypted_vault_steps(smoke)
         pack_lifecycle_steps(smoke)
     except SmokeFailure as err:
         print(f"\nqa smoke FAILED at step: {err.step}", file=sys.stderr)

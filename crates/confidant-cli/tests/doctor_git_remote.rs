@@ -2,7 +2,7 @@
 //!
 //! Read-only and offline: the check reads `git remote -v` and never
 //! fetches or pushes. Tests cover a local-only repo, a remote on a
-//! plaintext vault (warning), a remote on an encrypted vault (ok), and a
+//! vault with a remote (ok), and a
 //! directory that is not a git repo (advisory, never an error). All data
 //! and URLs are fake.
 
@@ -52,27 +52,16 @@ fn git(vault: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// A throwaway age identity for `init --create`; the OS keychain is never
-/// consulted (ADR-14: CI generates ephemeral keys during the run).
-fn age_generate_bech32() -> String {
-    use age::secrecy::ExposeSecret;
-    age::x25519::Identity::generate()
-        .to_string()
-        .expose_secret()
-        .to_owned()
-        .to_uppercase()
-}
-
-/// An encrypted vault created by the real bootstrap path, plus the temp
-/// HOME that holds its trust anchor and manifest tracking.
-struct EncryptedVault {
+/// A vault created by the real bootstrap path, plus the temp HOME git
+/// identity.
+struct BootstrapVault {
     _tmp: tempfile::TempDir,
     home: PathBuf,
     vault: PathBuf,
 }
 
 #[cfg(unix)]
-fn encrypted_vault() -> EncryptedVault {
+fn bootstrap_vault() -> BootstrapVault {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -86,8 +75,6 @@ fn encrypted_vault() -> EncryptedVault {
         .args(["init", "--create", "--no-input", "--json", "--vault"])
         .arg(&vault)
         .env("HOME", &home)
-        .env("CONFIDANT_DEVICE_KEY", age_generate_bech32())
-        .env("CONFIDANT_KEYCHAIN", "off")
         .output()
         .unwrap();
     assert!(
@@ -96,7 +83,7 @@ fn encrypted_vault() -> EncryptedVault {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    EncryptedVault {
+    BootstrapVault {
         _tmp: tmp,
         home,
         vault,
@@ -121,9 +108,7 @@ fn run_doctor(vault: &Path, home: &Path) -> Value {
         .env("HOME", home)
         .env("CONFIDANT_OFFLINE", "1")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_SKILLS_DIR")
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off");
+        .env_remove("CONFIDANT_SKILLS_DIR");
     give_child_git_identity(&mut cmd);
     let out = cmd.output().unwrap();
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
@@ -160,20 +145,16 @@ fn git_remote_absent_is_ok_with_add_remote_fix() {
     assert!(msg.contains("backup"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
     assert!(fix.contains("git remote add origin"), "{fix}");
-    assert!(fix.contains("keys device-add"), "{fix}");
     // Provider-neutral: no host is hard-coded.
     assert!(!fix.contains("github"), "{fix}");
 }
 
 #[cfg(unix)]
 #[test]
-fn git_remote_on_plaintext_vault_warns() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let vault = plaintext_vault_copy(dir.path());
-    git(&vault, &["init", "-q"]);
+fn git_remote_on_a_vault_is_ok() {
+    let v = bootstrap_vault();
     git(
-        &vault,
+        &v.vault,
         &[
             "remote",
             "add",
@@ -182,38 +163,12 @@ fn git_remote_on_plaintext_vault_warns() {
         ],
     );
 
-    let v = run_doctor(&vault, home.path());
-    let c = check(&v, "git-remote").expect("git-remote check missing");
-    assert_eq!(c["status"], "warning", "{v}");
+    let out = run_doctor(&v.vault, &v.home);
+    let c = check(&out, "git-remote").expect("git-remote check missing");
+    assert_eq!(c["status"], "ok", "{out}");
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("origin"), "{msg}");
-    assert!(msg.contains("plaintext"), "{msg}");
-    assert!(msg.contains("readable by anyone with repo access"), "{msg}");
-    let fix = c["fix"].as_str().expect("fix field missing");
-    assert!(fix.contains("if the exposure is unintended"), "{fix}");
-}
-
-#[cfg(unix)]
-#[test]
-fn git_remote_on_encrypted_vault_is_ok() {
-    let enc = encrypted_vault();
-    git(
-        &enc.vault,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.com/fake/vault.git",
-        ],
-    );
-
-    let v = run_doctor(&enc.vault, &enc.home);
-    let c = check(&v, "git-remote").expect("git-remote check missing");
-    assert_eq!(c["status"], "ok", "{v}");
-    let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("origin"), "{msg}");
-    assert!(msg.contains("vault is encrypted"), "{msg}");
-    assert!(c.get("fix").is_none(), "healthy check must omit fix: {v}");
+    assert!(c.get("fix").is_none(), "healthy check must omit fix: {out}");
 }
 
 #[cfg(unix)]

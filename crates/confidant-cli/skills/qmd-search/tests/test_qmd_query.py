@@ -126,6 +126,32 @@ def hit(rel, line, snippet, score=1.0):
             "score": score, "snippet": snippet}
 
 
+def stage_cleared_corpus(cli, vault):
+    """Copy the cleared set into `.confidant/qmd-corpus/` (spec section 12)."""
+    r = subprocess.run(
+        [str(cli), "allowlist", "--json", "--no-input", "--vault", str(vault)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise AssertionError(f"allowlist failed: {r.stdout}{r.stderr}")
+    data = json.loads(r.stdout)
+    corpus = vault / ".confidant" / "qmd-corpus"
+    if corpus.exists():
+        shutil.rmtree(corpus)
+    corpus.mkdir(parents=True)
+    for rel in data.get("cleared_files", []):
+        src = vault / rel
+        dest = corpus / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+    for entry in data.get("cleared_ledger_lines", []):
+        rel, line_no = entry["file"], int(entry["line"])
+        lines = (vault / rel).read_text(encoding="utf-8").splitlines()
+        dest = corpus / (rel + ".md")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("a", encoding="utf-8") as fh:
+            fh.write(lines[line_no - 1] + "\n")
+
+
 class QmdQueryTest(unittest.TestCase):
     maxDiff = None
 
@@ -134,7 +160,7 @@ class QmdQueryTest(unittest.TestCase):
         if not QUERY.is_file():
             raise unittest.SkipTest(f"skill script not found: {QUERY}")
         if shutil.which("git") is None:
-            raise unittest.SkipTest("git is required (reindex probes the gitignore)")
+            raise unittest.SkipTest("git is required (the corpus stages from the vault)")
         cls.cli = resolve_cli()
         if not cls.cli.is_file():
             raise unittest.SkipTest(
@@ -156,14 +182,9 @@ class QmdQueryTest(unittest.TestCase):
         )
         (cls.vault / ".gitignore").write_text(".confidant/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=cls.vault, check=True)
-        # Build the real corpus: the ledger alignment reads the file reindex
-        # writes, so the test exercises the shipped corpus layout.
-        r = subprocess.run(
-            [str(cls.cli), "reindex", "--json", "--no-input",
-             "--vault", str(cls.vault)],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            raise AssertionError(f"reindex failed: {r.stdout}{r.stderr}")
+        # Stage the corpus from the `allowlist --json` cleared set: the
+        # ledger alignment reads the same layout a real index build uses.
+        stage_cleared_corpus(cls.cli, cls.vault)
 
         cls.bin = cls.root / "bin"
         cls.bin.mkdir()

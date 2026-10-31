@@ -64,10 +64,7 @@ fn run_doctor_home(
         .env("PATH", path)
         .env("CONFIDANT_OFFLINE", "1")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_SKILLS_DIR")
-        // #541: keep the device-key probe off the real OS keychain.
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off");
+        .env_remove("CONFIDANT_SKILLS_DIR");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -130,7 +127,7 @@ fn path_with_fake_qmd(dir: &Path) -> std::ffi::OsString {
 
 #[cfg(unix)]
 #[test]
-fn doctor_qmd_present_without_corpus_points_at_reindex() {
+fn doctor_qmd_present_without_corpus_points_at_the_skill() {
     let dir = tempfile::tempdir().unwrap();
     write_fake_qmd(dir.path());
     // Throwaway vault copy with no `.confidant/qmd-corpus/`.
@@ -145,10 +142,10 @@ fn doctor_qmd_present_without_corpus_points_at_reindex() {
     assert_eq!(c["status"], "warning", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("corpus is missing"), "{msg}");
-    assert!(msg.contains("confidant reindex"), "{msg}");
+    assert!(msg.contains("qmd-search"), "{msg}");
     assert!(msg.contains("confidant find"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
-    assert!(fix.contains("confidant reindex"), "{fix}");
+    assert!(fix.contains("confidant setup"), "{fix}");
 }
 
 #[cfg(unix)]

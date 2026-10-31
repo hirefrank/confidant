@@ -20,8 +20,8 @@ the TUI adds no check logic and runs no CLI call per keystroke.
 
 It consumes only the ADR-7 CLI JSON contract
 (`confidant <subcommand> --json --no-input`): it never opens vault files
-directly and deliberately never links `confidant-core` or
-`confidant-crypt`, so it stays the second consumer of that contract.
+directly and deliberately never links `confidant-core`, so it stays the
+second consumer of that contract.
 
 Review is bound to what it shows: a proposal step's dry-run pins the bytes
 of the manifest file it reviewed (the ledger `lines_file` or a note's

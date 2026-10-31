@@ -1302,52 +1302,6 @@ fn inbox_q_quits() {
     assert!(app.should_quit, "q quits from the inbox tab");
 }
 
-/// Live dry run against a throwaway git vault with no inbox branch,
-/// reusing the `crates/confidant-cli/tests/inbox.rs` fixture shape.
-#[test]
-fn inbox_live_dry_run_empty_vault() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let root = dir.path();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?} failed");
-    };
-    git(&["init", "-b", "main", "-q"]);
-    fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\nvault_id = \"tui-inbox-test\"\n",
-    )
-    .unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-
-    let bin = confidant_bin();
-    let home = tempfile::TempDir::new().expect("temp home");
-    let runner = ProcessRunner::new(bin, Some(root.to_path_buf()))
-        .with_env("CONFIDANT_KEYCHAIN", "off")
-        .with_env("HOME", home.path().to_string_lossy().to_string());
-    let mut app = App::new(runner);
-    app.handle_key(key(KeyCode::Char('i')));
-    let report = app.inbox.report.as_ref().expect("report loaded");
-    assert!(report.empty, "no inbox branch -> empty");
-    assert!(report.dry_run);
-    let rendered = render_to_string(&app);
-    assert!(
-        rendered.contains("nothing to do"),
-        "live empty state:\n{rendered}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // QMD search view (Phase 3a, #212)
 // ---------------------------------------------------------------------------
