@@ -69,7 +69,10 @@ pub fn contract_schema() -> Value {
                     "id": {"type": "string"},
                     "kind": {"type": "string", "enum": ["person", "org"]},
                     "name": {"type": ["string", "null"]},
-                    "no_ai": {"type": "boolean"},
+                    "no_ai": {
+                        "type": ["boolean", "string"],
+                        "description": "Agent path: boolean. Operator path: the tri-state string (`true`, `notes`, or `false`)."
+                    },
                     "profile": {"type": ["string", "null"]}
                 }
             },
@@ -255,7 +258,10 @@ pub fn contract_schema() -> Value {
                         "properties": {
                             "id": {"type": "string"},
                             "name": {"type": ["string", "null"]},
-                            "no_ai": {"type": "boolean"},
+                            "no_ai": {
+                                "type": ["boolean", "string"],
+                                "description": "Agent path: boolean. Operator path: the tri-state string (`true`, `notes`, or `false`)."
+                            },
                             "profile": {"type": ["string", "null"]}
                         }
                     },
