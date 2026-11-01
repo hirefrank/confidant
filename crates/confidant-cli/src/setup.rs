@@ -21,6 +21,24 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("agents", ".agents/skills"),
 ];
 
+/// Agent id -> always-on instruction/memory file, relative to `$HOME`.
+///
+/// These are the files the host loads at the start of every session. The
+/// setup command installs the system-of-record rule there (#727); skill
+/// links alone only reach sessions that already think to load a skill.
+/// `muse` and `agents` share one file, and setup dedupes by path.
+pub const AGENT_INSTRUCTIONS: &[(&str, &str)] = &[
+    ("claude-code", ".claude/CLAUDE.md"),
+    ("cursor", ".cursor/rules/confidant.mdc"),
+    ("codex", ".codex/AGENTS.md"),
+    ("opencode", ".config/opencode/AGENTS.md"),
+    ("pi", ".pi/agent/AGENTS.md"),
+    ("gemini-cli", ".gemini/GEMINI.md"),
+    ("hermes-agent", ".hermes/AGENTS.md"),
+    ("muse", ".agents/AGENTS.md"),
+    ("agents", ".agents/AGENTS.md"),
+];
+
 /// Marker file identifying a directory confidant copied via `--copy`.
 /// Contents are the CLI version that wrote it. Together with "symlink under
 /// our skills root" this is the ownership rule: only owned entries are
@@ -66,6 +84,14 @@ pub fn agent_subpath(name: &str) -> Option<&'static str> {
 
 pub fn agent_dir(name: &str, home: &Path) -> Option<PathBuf> {
     agent_subpath(name).map(|sub| home.join(sub))
+}
+
+/// The always-on instruction/memory file for one agent, relative to `$HOME`.
+pub fn agent_instruction_path(name: &str, home: &Path) -> Option<PathBuf> {
+    AGENT_INSTRUCTIONS
+        .iter()
+        .find(|(id, _)| *id == name)
+        .map(|(_, sub)| home.join(sub))
 }
 
 /// An agent counts as installed when its skills dir exists.
@@ -262,6 +288,9 @@ pub struct SetupResult {
     pub home: PathBuf,
     pub version: String,
     pub agents: Vec<AgentSetup>,
+    /// Individual agent ids the run selected, before dirs are joined for
+    /// display. Instruction files are keyed by agent, not by joined label.
+    pub resolved_agents: Vec<String>,
     pub unknown_agents: Vec<String>,
     pub verbose_lines: Vec<String>,
     /// True when the run only reported planned actions (#649).
@@ -758,6 +787,7 @@ pub fn run_setup(
 
     // Resolve target parents, deduped by dir (muse/agents share one).
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
+    let mut resolved_agents: Vec<String> = Vec::new();
     let mut unknown_agents = Vec::new();
     let mut fallback_note = None;
     if let Some(single) = skills_dir_override() {
@@ -776,6 +806,7 @@ pub fn run_setup(
         }
         for name in resolved.agents {
             if let Some(dir) = agent_dir(&name, &home) {
+                resolved_agents.push(name.clone());
                 push_target(&mut targets, &name, dir);
             }
         }
@@ -839,6 +870,7 @@ pub fn run_setup(
         home,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         agents,
+        resolved_agents,
         unknown_agents,
         verbose_lines,
         dry_run,
@@ -990,7 +1022,329 @@ pub fn agents_health(home: &Path) -> Vec<AgentHealth> {
         .collect()
 }
 
-pub const ROUTING_SNIPPET: &str = "## Confidant\n\nLocal skill suite for the Confidant vault. Skills are self-describing, so agents normally route on their own. This snippet is only useful if you want to pin the workflow explicitly in a project's instructions.\n\n### Routing\n\n| User intent | Skill |\n|-------------|-------|\n| Search via QMD (optional backend) | `qmd-search` |\n| Author a local schema pack | `pack-author` |\n\n### Rules\n\n- Skills never write the vault; apply changes through the CLI (`record add`, `note add`, `import --file`) with `--dry-run` first.\n- Never invent IDs, verbs, or dates.\n- Run `confidant which --skills-dir` to locate the installed skills.\n";
+/// Markers around the block setup owns in an agent instruction file. Text
+/// outside the block belongs to the operator and is never touched.
+pub const INSTRUCTION_BEGIN: &str = "<!-- confidant:system-of-record:begin -->";
+pub const INSTRUCTION_END: &str = "<!-- confidant:system-of-record:end -->";
+
+/// Cursor needs front matter on a new `.mdc` rule; the other hosts read
+/// plain Markdown. Only written when the file is new, so an existing rule
+/// keeps its own front matter.
+const CURSOR_FRONT_MATTER: &str = "---\ndescription: Confidant is the system of record for relationship memory\nalwaysApply: true\n---\n\n";
+
+const SYSTEM_OF_RECORD_TEMPLATE: &str = r#"## Confidant: system of record for relationship memory
+
+{claim_subject} is the system of record for relationship memory: people,
+orgs, deals, interactions, touches, and what is owed. Treat your own memory
+as a pointer to this record, not as a second store of relationship facts.
+
+{vault_line}
+{access_line}
+
+Read routing:
+- A person comes up: run `confidant resolve <name>` and then
+  `confidant context <id>` before answering from memory.
+- Exact or exhaustive lookup: run `confidant find <query>`.
+- Fuzzy or semantic lookup: use the `qmd-search` skill; without it, run
+  `confidant find`.
+- Never hand-read vault files. Go through the CLI, which also enforces the
+  `no-ai` boundary.
+
+Write routing:
+- Relationship facts learned in any conversation go to the vault through the
+  CLI: propose the change with `--dry-run`, show the operator, then apply it.
+- Keep only this pointer and this rule in your own memory. Do not copy vault
+  facts into memory; copies go stale.
+
+Boundary:
+- The operator's own preferences and household operations are not
+  relationship memory. Keep those in your own memory.
+- A record marked `no-ai: true` is never read into the agent. On a person
+  marked `no-ai: notes`, the person record is visible but their notes and
+  interactions stay out.
+
+If the vault is unreachable or unreadable, say so plainly. Never answer from
+an agent-side recollection as if it were current.
+
+Re-check readiness with `confidant status`.
+"#;
+
+/// The system-of-record declaration installed into an agent's always-on
+/// instructions (#727), or printed by `confidant routing`. The write-routing
+/// rules from the old snippet survive; the claim and the vault pointer lead.
+pub fn system_of_record_text(vault: Option<&Path>) -> String {
+    let (vault_line, access_line) = match vault {
+        Some(root) => (
+            format!("Vault: {}", root.display()),
+            format!(
+                "Access: run `confidant --vault {} <command>`, or set\n\
+                 `CONFIDANT_VAULT={}` once. No secret is needed to read the vault.",
+                root.display(),
+                root.display()
+            ),
+        ),
+        None => (
+            "Vault: not configured on this machine yet.".to_owned(),
+            "Access: ask the operator for the vault path, then run\n\
+             `confidant --vault <path> <command>`, or set `CONFIDANT_VAULT=<path>`."
+                .to_owned(),
+        ),
+    };
+    let claim_subject = if vault.is_some() {
+        "This vault"
+    } else {
+        "The operator's Confidant vault"
+    };
+    SYSTEM_OF_RECORD_TEMPLATE
+        .replace("{claim_subject}", claim_subject)
+        .replace("{vault_line}", &vault_line)
+        .replace("{access_line}", &access_line)
+}
+
+/// What happened to one agent instruction file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionOutcome {
+    Written,
+    Updated,
+    Unchanged,
+    WouldWrite,
+    WouldUpdate,
+}
+
+impl InstructionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstructionOutcome::Written => "written",
+            InstructionOutcome::Updated => "updated",
+            InstructionOutcome::Unchanged => "unchanged",
+            InstructionOutcome::WouldWrite => "would_write",
+            InstructionOutcome::WouldUpdate => "would_update",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionInstall {
+    pub agent: String,
+    pub path: PathBuf,
+    pub outcome: InstructionOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionHealth {
+    pub agent: String,
+    pub path: PathBuf,
+    pub installed: bool,
+    pub pointer: Option<String>,
+    /// True when the recorded pointer names the vault the caller asked
+    /// about. Always true when no vault was supplied (nothing to compare).
+    pub matches_vault: bool,
+}
+
+fn render_instruction_file(
+    existing: Option<&str>,
+    body: &str,
+    is_cursor_rule: bool,
+) -> anyhow::Result<(String, InstructionOutcome)> {
+    let block = format!(
+        "{INSTRUCTION_BEGIN}\n{}\n{INSTRUCTION_END}\n",
+        body.trim_end()
+    );
+    let Some(existing) = existing else {
+        let mut out = String::new();
+        if is_cursor_rule {
+            out.push_str(CURSOR_FRONT_MATTER);
+        }
+        out.push_str(&block);
+        return Ok((out, InstructionOutcome::Written));
+    };
+    let begin = existing.find(INSTRUCTION_BEGIN);
+    let end = existing.find(INSTRUCTION_END);
+    match (begin, end) {
+        (Some(begin), Some(end)) if end > begin => {
+            let mut out = String::new();
+            out.push_str(&existing[..begin]);
+            out.push_str(&block);
+            // The marker line's own newline belongs to the block. Consume
+            // it so repeated runs do not grow a blank line each time.
+            let after = &existing[end + INSTRUCTION_END.len()..];
+            let after = after
+                .strip_prefix("\r\n")
+                .or_else(|| after.strip_prefix('\n'))
+                .unwrap_or(after);
+            out.push_str(after);
+            let outcome = if out == existing {
+                InstructionOutcome::Unchanged
+            } else {
+                InstructionOutcome::Updated
+            };
+            Ok((out, outcome))
+        }
+        (None, None) => {
+            let mut out = existing.to_owned();
+            if !out.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+            } else if is_cursor_rule {
+                out.push_str(CURSOR_FRONT_MATTER);
+            }
+            out.push_str(&block);
+            Ok((out, InstructionOutcome::Written))
+        }
+        _ => anyhow::bail!(
+            "instruction file has one Confidant marker but not the other; \
+             fix or remove the partial block before re-running setup"
+        ),
+    }
+}
+
+/// Install the system-of-record declaration into each selected agent's
+/// always-on instruction file (#727). Only the marked block is owned by
+/// Confidant; everything outside it is preserved. A dry run plans the
+/// outcomes and writes nothing.
+///
+/// When no vault is configured, an existing block is left alone: setup run
+/// from `$HOME` must not replace a pointer that was installed earlier.
+pub fn install_instructions(
+    agents: &[String],
+    home: &Path,
+    vault: Option<&Path>,
+    dry_run: bool,
+) -> anyhow::Result<Vec<InstructionInstall>> {
+    let body = system_of_record_text(vault);
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut installed = Vec::new();
+    for agent in agents {
+        let Some(path) = agent_instruction_path(agent, home) else {
+            continue;
+        };
+        if seen.iter().any(|p| p == &path) {
+            continue;
+        }
+        seen.push(path.clone());
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "cannot read instruction file {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        if vault.is_none()
+            && existing
+                .as_deref()
+                .is_some_and(|text| text.contains(INSTRUCTION_BEGIN))
+        {
+            installed.push(InstructionInstall {
+                agent: agent.clone(),
+                path,
+                outcome: InstructionOutcome::Unchanged,
+            });
+            continue;
+        }
+        let is_cursor_rule = path.extension().and_then(|e| e.to_str()) == Some("mdc");
+        let (content, outcome) =
+            render_instruction_file(existing.as_deref(), &body, is_cursor_rule)?;
+        let outcome = match (dry_run, outcome) {
+            (true, InstructionOutcome::Written) => InstructionOutcome::WouldWrite,
+            (true, InstructionOutcome::Updated) => InstructionOutcome::WouldUpdate,
+            (_, outcome) => outcome,
+        };
+        if !dry_run && outcome != InstructionOutcome::Unchanged {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    anyhow::anyhow!(
+                        "cannot create instruction directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+            std::fs::write(&path, &content).map_err(|err| {
+                anyhow::anyhow!("cannot write instruction file {}: {err}", path.display())
+            })?;
+            // Verify the block is present: a partial write must fail loudly,
+            // not leave an agent with half a rule.
+            let written = std::fs::read_to_string(&path)
+                .map_err(|err| anyhow::anyhow!("cannot read back {}: {err}", path.display()))?;
+            if !written.contains(INSTRUCTION_BEGIN) || !written.contains(INSTRUCTION_END) {
+                return Err(anyhow::anyhow!(
+                    "instruction file {} did not contain the Confidant block after writing",
+                    path.display()
+                ));
+            }
+        }
+        installed.push(InstructionInstall {
+            agent: agent.clone(),
+            path,
+            outcome,
+        });
+    }
+    Ok(installed)
+}
+
+/// Health of the installed system-of-record rule for every detected agent.
+/// Detected agents share one file per host list (`muse` and `agents`), so
+/// duplicate paths are reported once.
+pub fn system_of_record_health(home: &Path, vault: Option<&Path>) -> Vec<InstructionHealth> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut health = Vec::new();
+    for agent in detect_agents(home) {
+        let Some(path) = agent_instruction_path(&agent, home) else {
+            continue;
+        };
+        if seen.iter().any(|p| p == &path) {
+            continue;
+        }
+        seen.push(path.clone());
+        let content = std::fs::read_to_string(&path).ok();
+        let installed = content
+            .as_deref()
+            .is_some_and(|text| text.contains(INSTRUCTION_BEGIN) && text.contains(INSTRUCTION_END));
+        let pointer = content.as_deref().and_then(instruction_pointer);
+        let matches_vault = match (vault, pointer.as_deref()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(vault), Some(pointer)) => {
+                let recorded = Path::new(pointer);
+                recorded == vault
+                    || match (recorded.canonicalize(), vault.canonicalize()) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => false,
+                    }
+            }
+        };
+        health.push(InstructionHealth {
+            agent,
+            path,
+            installed,
+            pointer,
+            matches_vault,
+        });
+    }
+    health
+}
+
+/// The `Vault:` line inside a marker block, if it names a real path.
+fn instruction_pointer(content: &str) -> Option<String> {
+    let begin = content.find(INSTRUCTION_BEGIN)?;
+    let end = content.find(INSTRUCTION_END)?;
+    if end <= begin {
+        return None;
+    }
+    let block = &content[begin + INSTRUCTION_BEGIN.len()..end];
+    block
+        .lines()
+        .find_map(|line| line.strip_prefix("Vault: "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.starts_with("not configured"))
+        .map(str::to_owned)
+}
 
 #[cfg(test)]
 mod tests {

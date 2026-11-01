@@ -231,6 +231,21 @@ fn run_setup_default_share(home: &str, cwd: &std::path::Path, agent: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn doctor_json_carries_a_status_summary() {
+    let v = run_doctor(Some(&unreachable_url()));
+    let summary = &v["summary"];
+    for key in ["ok", "warning", "error", "unknown"] {
+        assert!(summary[key].is_u64(), "summary.{key} missing: {v}");
+    }
+    let total: u64 = ["ok", "warning", "error", "unknown"]
+        .iter()
+        .map(|key| summary[key].as_u64().unwrap())
+        .sum();
+    assert_eq!(total as usize, v["checks"].as_array().unwrap().len(), "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+}
+
+#[test]
 fn doctor_cli_current_is_ok() {
     let url = stub_release_server(&format!("v{LOCAL}"));
     let v = run_doctor(Some(&url));

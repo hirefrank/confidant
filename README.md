@@ -54,9 +54,9 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    `confidant setup --agent auto`. This materializes the skills to a
    versioned share dir and links each skill into the detected agent's
    skills directory. (No vault configured yet? `confidant doctor` exits
-   with `E_VAULT_NOT_FOUND` before reporting skills-link health, so
-   confirm the links with `confidant agents` or
-   `confidant which --skills-dir` instead.) (`confidant doctor` checks GitHub for the latest
+   with `E_VAULT_NOT_FOUND`, but `confidant status` works without a vault
+   and reports skill links honestly; `confidant agents` or
+   `confidant which --skills-dir` also confirm the install.) (`confidant doctor` checks GitHub for the latest
    release unless `CONFIDANT_OFFLINE=1` is exported — add that to my
    shell rc too, this session and permanently, only if I want that
    request disabled.)
@@ -161,12 +161,17 @@ Set up Confidant (relationship memory you own — a CLI plus embedded agent skil
    `confidant doctor --vault "<path>"`; report the error/warning counts,
    the branch `init` created, and any `git-remote` or `local-commits`
    warning.
-8. Read the routing snippet (`confidant routing`) for the propose →
-   confirm → apply workflow every skill follows, and the Privacy rules
-   (trusted devices with full-disk encryption; a private remote;
-   `.confidant/` is never committed; `no-ai` records stay out of agent
-   output — see the README's Privacy section and `docs/privacy.md` in the
-   GitHub repo).
+8. Confirm the system-of-record step: `confidant setup` writes the
+   Confidant rule into each detected agent's always-on instruction file
+   (for example `~/.claude/CLAUDE.md`) and prints the exact text and paths.
+   Re-print it with `confidant routing`. The rule covers read routing
+   (`resolve`/`context`, `find`, QMD), writes through the CLI (dry-run →
+   confirm → apply), the `no-ai` boundary, and failure honesty. Setup ends
+   with a completion brief; `confidant status` reprints the readiness
+   rollup and that brief. Also read the Privacy rules (trusted devices with
+   full-disk encryption; a private remote; `.confidant/` is never
+   committed; `no-ai` records stay out of agent output — see the README's
+   Privacy section and `docs/privacy.md` in the GitHub repo).
 
 Report back: CLI version (`confidant --version`), which skills you linked,
 the vault branch, the `check` result, and any `confidant doctor` warnings.
@@ -292,8 +297,12 @@ machine ([Privacy](#privacy)).
 
 `confidant setup --agent auto` links the embedded skills. Agents use the
 CLI — or `confidant mcp`, a thin stdio wrapper over the same commands — and
-follow one workflow: propose, confirm, apply. Every command takes `--json`
-and `--no-input`; usage errors exit 2; branch on `code`, never message text.
+follow one workflow: propose, confirm, apply. Setup also writes the
+system-of-record declaration into each detected agent's always-on
+instructions, so a session that never loads a skill still knows where
+relationship facts live and that they go through the CLI. Every command
+takes `--json` and `--no-input`; usage errors exit 2; branch on `code`,
+never message text.
 
 `confidant mcp` exposes ten fixed tools (`check`, `doctor`, `find`,
 `context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
@@ -314,7 +323,7 @@ fuzzy and `no-ai: true` people are ID-only.
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
-| Setup | `init`, `setup`, `update`, `doctor` |
+| Setup | `init`, `setup`, `update`, `doctor`, `status` |
 | Search | `find`, plus the optional `qmd-search` skill |
 | Sync | `sync` (read-only report; `--pull` / `--push` explicit) |
 | Agents | `mcp`, `agents`, `which`, `routing`, `tui` |
