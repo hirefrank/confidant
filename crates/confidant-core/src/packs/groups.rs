@@ -1,11 +1,11 @@
 //! Merge-canonicalization machinery shared by every compiled pack fold (#303).
 //!
-//! Coaching and personal independently grew the same skeleton: a merge map,
+//! Two pack folds independently grew the same skeleton: a merge map,
 //! a per-date cache of merge groups, and the `canonical_on` / `ensure_members`
 //! / `group_people` helpers around it. This module factors that skeleton so a
-//! third pack reuses it instead of copying it, and reconciles the two packs'
-//! subtly divergent `ensure_members` seeding (coaching seeded only from its
-//! own people; personal also seeded every merge-map endpoint).
+//! third pack reuses it instead of copying it, and reconciles their subtly
+//! divergent `ensure_members` seeding (one seeded only from its own people;
+//! the other also seeded every merge-map endpoint).
 
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
