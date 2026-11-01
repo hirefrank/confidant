@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{Datelike, NaiveDate};
 use serde::Serialize;
 
-use crate::config::{parse_iso_date, SPEC_VERSION};
+use crate::config::{parse_iso_date, SpecVersion};
 use crate::error::DomainError;
 use crate::id::{scan_id_tokens, Prefix, RecordId};
 use crate::ledger::{parse_duration_minutes, Arg, LedgerEntry};
-use crate::packs::{find_conflict, OrphanOwners, Pack, PackState, CORE_EDGE_KINDS};
+use crate::packs::{find_conflict, OrphanOwners, Pack, PackState};
 
 /// #438: external pack problems, for the fail-closed finding conversion.
 use crate::packs::external as packs_external;
@@ -489,19 +489,19 @@ pub struct CheckOptions {
 pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     let mut findings = vault.load_findings.clone();
 
-    if vault.config.spec != SPEC_VERSION {
+    if !SpecVersion::is_supported(&vault.config.spec) {
         findings.push(
             Finding::new(
                 FindingCode::SpecUnsupported,
                 Severity::Error,
-                format!("vault spec is not supported (this CLI implements {SPEC_VERSION})"),
+                "vault spec is not supported (this CLI implements 0.1 and 0.2)".to_owned(),
             )
             .at_file("confidant.toml")
-            .with_fix("Use spec = \"0.1\" or upgrade the CLI"),
+            .with_fix("Use spec = \"0.1\" or \"0.2\", or upgrade the CLI"),
         );
     }
 
-    let spec_ok = vault.config.spec == SPEC_VERSION;
+    let spec_ok = SpecVersion::is_supported(&vault.config.spec);
     let (enabled_packs, unknown_packs) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     // #497: on an unsupported spec external packs are never resolved (see
     // `vault.rs`), so the compiled-only registry would report every listed
@@ -594,7 +594,15 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
     check_orphan_fields_and_types(vault, &orphans, &mut findings);
     check_duplicate_ulids(vault, &mut findings);
     check_dangling_refs(vault, &known_ids, &mut findings);
-    check_edges(vault, &known_ids, &enabled_packs, &orphans, &mut findings);
+    check_edges(
+        vault,
+        &known_ids,
+        &enabled_packs,
+        &orphans,
+        &merges,
+        as_of,
+        &mut findings,
+    );
     check_with_lists(vault, &known_ids, &mut findings);
     check_duplicate_src(vault, &mut findings);
     check_duplicate_touches(vault, &mut findings);
@@ -1405,16 +1413,13 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
     }
 }
 
-/// Edge rules (#179). Runs on every edge record: with plaintext records the
-/// `a` / `b` / `kind` fields are always readable.
-/// Kind symmetry is
-/// looked up over enabled packs, core, and all registered packs (a kind
-/// owned by a disabled pack is still a known kind for duplicate
-/// detection; the edge itself warns as `W_PACK_ORPHAN`).
-/// The closed edge-kind list for this vault: core kinds plus every enabled
-/// pack's kinds, sorted and deduped (#299).
-fn edge_kind_names(enabled_packs: &[&dyn Pack]) -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = CORE_EDGE_KINDS.iter().map(|k| k.name).collect();
+/// The closed edge-kind list for this vault: core kinds for `spec` plus every
+/// enabled pack's kinds, sorted and deduped (#299).
+fn edge_kind_names(enabled_packs: &[&dyn Pack], spec: SpecVersion) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = crate::packs::core_edge_kinds(spec)
+        .iter()
+        .map(|k| k.name)
+        .collect();
     for pack in enabled_packs {
         names.extend(pack.edge_kinds().iter().map(|k| k.name));
     }
@@ -1423,13 +1428,44 @@ fn edge_kind_names(enabled_packs: &[&dyn Pack]) -> Vec<&'static str> {
     names
 }
 
+/// Human wording for an allowed endpoint set (`a person`, `an org`,
+/// `a person or org`), used only in fix text.
+fn endpoint_words(endpoints: &[Prefix]) -> String {
+    let labels: Vec<&str> = endpoints
+        .iter()
+        .map(|prefix| prefix.record_type().unwrap_or("record"))
+        .collect();
+    match labels.as_slice() {
+        ["person"] => "a person".to_owned(),
+        ["org"] => "an org".to_owned(),
+        _ => format!("a {}", labels.join(" or ")),
+    }
+}
+
+/// Edge rules (#179, #813). Runs on every edge record: with plaintext
+/// records the `a` / `b` / `kind` fields are always readable.
+///
+/// 0.1 is frozen: both ends must be person IDs, the core kind list is the
+/// 0.1 list, and self/duplicate detection compares the IDs as written.
+/// 0.2 allows the declared entity types, checks each end against the
+/// kind's `from`/`to` declaration, and canonicalizes merges before the
+/// self/duplicate rules.
+///
+/// Kind symmetry is looked up over enabled packs, core, and all registered
+/// packs (a kind owned by a disabled pack is still a known kind for
+/// duplicate detection; the edge itself warns as `W_PACK_ORPHAN`).
 fn check_edges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
     enabled_packs: &[&dyn Pack],
     orphans: &OrphanOwners,
+    merges: &MergeMap,
+    as_of: NaiveDate,
     findings: &mut Vec<Finding>,
 ) {
+    let spec = vault.spec_version().unwrap_or(SpecVersion::V01);
+    let core_kinds = crate::packs::core_edge_kinds(spec);
+
     // Canonical key for duplicate detection: the pair plus the kind.
     // Sorted ends for symmetric kinds (so (a, b) and (b, a) collide),
     // as-written ends for directed kinds — plus the first record's
@@ -1442,21 +1478,48 @@ fn check_edges(
         if rec.kind != RecordKind::Edge {
             continue;
         }
+
+        // Resolve the kind first: the endpoint rules are per kind.
+        let kind_raw = rec.field("kind");
+        let kind_resolved: Option<&'static crate::packs::EdgeKind> = kind_raw.and_then(|kind| {
+            enabled_packs
+                .iter()
+                .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind))
+                .or_else(|| core_kinds.iter().find(|k| k.name == kind))
+        });
+        let orphan_owner = kind_raw.and_then(|kind| orphans.edge_kinds.get(kind).copied());
+        let orphan_kind: Option<&'static crate::packs::EdgeKind> =
+            if kind_resolved.is_none() && orphan_owner.is_some() {
+                kind_raw.and_then(|kind| {
+                    vault
+                        .pack_registry()
+                        .all()
+                        .iter()
+                        .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind))
+                })
+            } else {
+                None
+            };
+        let declared_kind = kind_resolved.or(orphan_kind);
+
+        let end_fix = |key: &str| -> String {
+            if spec == SpecVersion::V01 {
+                format!("Add {key}: p-<ULID>")
+            } else {
+                format!("Add {key}: p-<ULID> or o-<ULID>")
+            }
+        };
+
         let mut ends: Vec<RecordId> = Vec::new();
+        // Both ends are declared entity types and match the kind, so the
+        // self/duplicate rules can trust the pair. A wrong-type or
+        // kind-incompatible end is already flagged.
+        let mut ends_valid = true;
         for key in ["a", "b"] {
             match rec.field(key) {
-                None => findings.push(
-                    Finding::new(
-                        FindingCode::Frontmatter,
-                        Severity::Error,
-                        format!("front matter key '{key}' is missing"),
-                    )
-                    .at_file(&rec.path)
-                    .for_id(&rec.id)
-                    .with_fix(format!("Add {key}: p-<ULID>")),
-                ),
-                Some(raw) => match parse_ref_id(raw) {
-                    FrontmatterRef::Absent => findings.push(
+                None => {
+                    ends_valid = false;
+                    findings.push(
                         Finding::new(
                             FindingCode::Frontmatter,
                             Severity::Error,
@@ -1464,9 +1527,25 @@ fn check_edges(
                         )
                         .at_file(&rec.path)
                         .for_id(&rec.id)
-                        .with_fix(format!("Add {key}: p-<ULID>")),
-                    ),
+                        .with_fix(end_fix(key)),
+                    );
+                }
+                Some(raw) => match parse_ref_id(raw) {
+                    FrontmatterRef::Absent => {
+                        ends_valid = false;
+                        findings.push(
+                            Finding::new(
+                                FindingCode::Frontmatter,
+                                Severity::Error,
+                                format!("front matter key '{key}' is missing"),
+                            )
+                            .at_file(&rec.path)
+                            .for_id(&rec.id)
+                            .with_fix(end_fix(key)),
+                        );
+                    }
                     FrontmatterRef::Invalid => {
+                        ends_valid = false;
                         // A malformed ID token is already flagged at load
                         // time; skip to avoid double-reporting (#5).
                         if scan_id_tokens(raw).iter().any(|tok| tok.is_malformed()) {
@@ -1484,18 +1563,71 @@ fn check_edges(
                         );
                     }
                     FrontmatterRef::Id(id) => {
-                        if id.prefix() != Prefix::Person {
-                            findings.push(
-                                Finding::new(
-                                    FindingCode::WrongIdType,
-                                    Severity::Error,
-                                    format!("edge end '{key}' must be a person id"),
-                                )
-                                .at_file(&rec.path)
-                                .for_id(&rec.id)
-                                .with_fix("Use a p-<ULID> id"),
-                            );
-                        } else if !known_ids.contains(&id) && !vault.conflicted_ids.contains(&id) {
+                        let prefix = id.prefix();
+                        // 0.1 is person-only; 0.2 allows the declared
+                        // entity types.
+                        let entity_ok = if spec == SpecVersion::V01 {
+                            prefix == Prefix::Person
+                        } else {
+                            prefix.is_entity()
+                        };
+                        let mut acceptable = entity_ok;
+                        if !entity_ok {
+                            ends_valid = false;
+                            if spec == SpecVersion::V01 {
+                                findings.push(
+                                    Finding::new(
+                                        FindingCode::WrongIdType,
+                                        Severity::Error,
+                                        format!("edge end '{key}' must be a person id"),
+                                    )
+                                    .at_file(&rec.path)
+                                    .for_id(&rec.id)
+                                    .with_fix("Use a p-<ULID> id"),
+                                );
+                            } else {
+                                findings.push(
+                                    Finding::new(
+                                        FindingCode::WrongIdType,
+                                        Severity::Error,
+                                        format!("edge end '{key}' must be a person or org id"),
+                                    )
+                                    .at_file(&rec.path)
+                                    .for_id(&rec.id)
+                                    .with_fix("Use a p-<ULID> or o-<ULID> id"),
+                                );
+                            }
+                        } else if spec == SpecVersion::V02 {
+                            // The kind owns the endpoint declaration. An
+                            // unknown kind has no authoritative set, so
+                            // only the global entity rule applies.
+                            if let Some(kind) = declared_kind {
+                                let allowed = if key == "a" { kind.from } else { kind.to };
+                                if !allowed.contains(&prefix) {
+                                    ends_valid = false;
+                                    acceptable = false;
+                                    findings.push(
+                                        Finding::new(
+                                            FindingCode::WrongIdType,
+                                            Severity::Error,
+                                            format!(
+                                                "edge end '{key}' is not allowed for this edge kind"
+                                            ),
+                                        )
+                                        .at_file(&rec.path)
+                                        .for_id(&rec.id)
+                                        .with_fix(format!(
+                                            "Use {} id for this kind",
+                                            endpoint_words(allowed)
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                        if acceptable
+                            && !known_ids.contains(&id)
+                            && !vault.conflicted_ids.contains(&id)
+                        {
                             let mut finding = Finding::new(
                                 FindingCode::DanglingRef,
                                 Severity::Error,
@@ -1514,22 +1646,43 @@ fn check_edges(
                 },
             }
         }
-        if ends.len() == 2 && ends[0] == ends[1] {
-            findings.push(
-                Finding::new(
-                    FindingCode::SelfEdge,
-                    Severity::Error,
-                    "edge links a person to themself".to_owned(),
+
+        // Self-edges compare the canonical pair in 0.2, so a merge cannot
+        // leave a record linked to itself. 0.1 keeps the raw comparison.
+        if ends.len() == 2 {
+            let (left, right) = if spec == SpecVersion::V02 {
+                (
+                    canonical_on(&ends[0], merges, as_of),
+                    canonical_on(&ends[1], merges, as_of),
                 )
-                .at_file(&rec.path)
-                .for_id(&rec.id)
-                .with_fix("Remove the edge or link two different people"),
-            );
+            } else {
+                (ends[0].clone(), ends[1].clone())
+            };
+            if left == right {
+                let (message, fix) = if spec == SpecVersion::V01 {
+                    (
+                        "edge links a person to themself",
+                        "Remove the edge or link two different people",
+                    )
+                } else {
+                    (
+                        "edge links an entity to itself",
+                        "Remove the edge or link two different entities",
+                    )
+                };
+                findings.push(
+                    Finding::new(FindingCode::SelfEdge, Severity::Error, message.to_owned())
+                        .at_file(&rec.path)
+                        .for_id(&rec.id)
+                        .with_fix(fix),
+                );
+            }
         }
+
         // Kind: closed list (core + enabled packs). A kind owned by a
         // disabled pack is W_PACK_ORPHAN, never an unknown-kind error.
         let mut symmetric: Option<bool> = None;
-        match rec.field("kind") {
+        match kind_raw {
             None => findings.push(
                 Finding::new(
                     FindingCode::Frontmatter,
@@ -1540,17 +1693,13 @@ fn check_edges(
                 .for_id(&rec.id)
                 .with_fix(format!(
                     "Add kind: {}",
-                    edge_kind_names(enabled_packs).join(", ")
+                    edge_kind_names(enabled_packs, spec).join(", ")
                 )),
             ),
-            Some(kind) => {
-                let in_enabled = enabled_packs
-                    .iter()
-                    .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind));
-                let in_core = CORE_EDGE_KINDS.iter().find(|k| k.name == kind);
-                if let Some(k) = in_enabled.or(in_core) {
+            Some(_) => {
+                if let Some(k) = kind_resolved {
                     symmetric = Some(k.symmetric);
-                } else if let Some(owner) = orphans.edge_kinds.get(kind) {
+                } else if let Some(owner) = orphan_owner {
                     // Owned by a registered pack that is not enabled:
                     // warn, never error (#177 Q2). Symmetry still comes
                     // from the registry for duplicate detection.
@@ -1564,12 +1713,7 @@ fn check_edges(
                         .for_id(&rec.id)
                         .with_fix(format!("Enable {owner} or remove the edge")),
                     );
-                    symmetric = vault
-                        .pack_registry()
-                        .all()
-                        .iter()
-                        .find_map(|p| p.edge_kinds().iter().find(|k| k.name == kind))
-                        .map(|k| k.symmetric);
+                    symmetric = orphan_kind.map(|k| k.symmetric);
                 } else {
                     let mut finding = Finding::new(
                         FindingCode::UnknownEdgeKind,
@@ -1586,25 +1730,34 @@ fn check_edges(
                 }
             }
         }
-        // Reversed / exact duplicates, per kind. Only for valid person ends:
-        // a wrong-type or missing end is already flagged above. The kind
-        // joins the key: two edges on the same pair with different kinds
-        // are different relations, not duplicates. A missing or unknown
-        // kind already errors above; it still keys separately here so the
-        // duplicate rule stays total.
-        if ends.len() == 2 && ends.iter().all(|id| id.prefix() == Prefix::Person) {
-            let kind_key = rec.field("kind").unwrap_or("").to_string();
+
+        // Reversed / exact duplicates, per kind. Only for valid entity
+        // ends that match the kind: a wrong-type or missing end is already
+        // flagged above. The kind joins the key: two edges on the same
+        // pair with different kinds are different relations, not
+        // duplicates. A missing or unknown kind already errors above; it
+        // still keys separately here so the duplicate rule stays total.
+        if ends.len() == 2 && ends_valid {
+            let kind_key = kind_raw.unwrap_or("").to_string();
+            let (left, right) = if spec == SpecVersion::V02 {
+                (
+                    canonical_on(&ends[0], merges, as_of),
+                    canonical_on(&ends[1], merges, as_of),
+                )
+            } else {
+                (ends[0].clone(), ends[1].clone())
+            };
             let pair = if symmetric == Some(true) {
-                if ends[0] <= ends[1] {
-                    (ends[0].clone(), ends[1].clone(), kind_key)
+                if left <= right {
+                    (left.clone(), right.clone(), kind_key)
                 } else {
-                    (ends[1].clone(), ends[0].clone(), kind_key)
+                    (right.clone(), left.clone(), kind_key)
                 }
             } else {
-                (ends[0].clone(), ends[1].clone(), kind_key)
+                (left.clone(), right.clone(), kind_key)
             };
             if let Some(first) = seen_pairs.get(&pair) {
-                let reversed = first.0 != ends[0] || first.1 != ends[1];
+                let reversed = first.0 != left || first.1 != right;
                 findings.push(
                     Finding::new(
                         FindingCode::DuplicateEdge,
@@ -1620,7 +1773,7 @@ fn check_edges(
                     .with_fix("Keep one edge for the relation"),
                 );
             } else {
-                seen_pairs.insert(pair, (ends[0].clone(), ends[1].clone()));
+                seen_pairs.insert(pair, (left, right));
             }
         }
     }

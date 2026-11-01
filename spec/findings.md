@@ -31,7 +31,7 @@ present, for CI users who want the stricter gate.
 | `E_INVALID_FILENAME` | error | | A collection or record directory contains a name that is not a record ID, a non-UTF-8 name, or a leftover `.confidant-tmp-*` file. |
 | `E_ID_PATH_MISMATCH` | error | | Front matter `id` does not equal the path ID, or a note's `person` does not match `people/<id>/`. On `find`, a mismatch on a note, interaction, or deal uncleares only that record; a mismatch or `E_DUPLICATE_ID` on a person's profile uncleares that whole person. |
 | `E_TYPE_PATH_MISMATCH` | error | | Front matter `type` / ID prefix does not match the collection directory. |
-| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, or a `merge` folds one record type into another. |
+| `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, a `merge` folds one record type into another, or an edge end is not a declared entity type (0.2: person or org) or does not match its kind's `from` / `to` endpoint declaration. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
 | `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a person record — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; and note `date` / `session` that is not YYYY-MM-DD). Messages never echo a raw front-matter value. They name the key only when it is a known spec key; otherwise they give the line number only. |
@@ -47,8 +47,8 @@ present, for CI users who want the stricter gate.
 | `E_SYMLINK` | error | | A symbolic link exists in the vault. |
 | `E_MERGE_CONFLICT` | error | | Git conflict markers (`<<<<<<<` / `>>>>>>>`) are present in a vault file. |
 | `E_DANGLING_REF` | error | | A front-matter `person` / `org` / `deal` ID (including ASCII case variants) has no record. Also: an edge end (`a` / `b`) or a `with:` entry with no record. |
-| `E_SELF_EDGE` | error | | An edge links a person to themself (`a` and `b` are the same id). |
-| `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. |
+| `E_SELF_EDGE` | error | | An edge links an entity to itself (`a` and `b` are the same id; in a 0.2 vault, the same canonical id after merge mappings). |
+| `E_DUPLICATE_EDGE` | error | | Two edges state the same relation: an exact duplicate, or a reversed duplicate (`b, a`) of a symmetric kind. In a 0.2 vault the pair is compared after merge canonicalization. |
 | `E_UNKNOWN_EDGE_KIND` | error | | An edge `kind` is not in the closed kind list (core kinds plus enabled packs' kinds). A kind owned by a disabled pack is `W_PACK_ORPHAN` instead. |
 | `E_TOUCH_MALFORMED` | error | | A `touch` ledger line is malformed. The built-in personal pack is implicit, so a `touch` line carries either `[kind:call\|text\|email\|meet\|meal\|event\|gift\|video\|other]` or `<call\|text\|email\|meet\|meal\|event\|gift\|video\|other> [note:NOTE-ID] [src:PROVENANCE]`; any other shape is malformed. |
 | `W_DUPLICATE_TOUCH` | warning | | A `touch` ledger line repeats an earlier line for the same person, date, and kind (`note:` and `src:` do not distinguish lines). Only the second and later occurrences are flagged; kind-less mirrored lines carry no identity and are never flagged. |

@@ -67,6 +67,15 @@ impl Prefix {
         }
     }
 
+    /// Whether this prefix names an entity an edge may connect (#813).
+    ///
+    /// Phase 1 declares person and org. Deals, notes, interactions, edges,
+    /// and packages are not endpoints; a future spec adds place/thing
+    /// through the type registry.
+    pub fn is_entity(self) -> bool {
+        matches!(self, Self::Person | Self::Org)
+    }
+
     pub fn collection(self) -> Option<&'static str> {
         match self {
             Self::Person => Some("people"),

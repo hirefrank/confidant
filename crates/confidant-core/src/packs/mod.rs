@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::NaiveDate;
 
 use crate::check::{Finding, MergeMap};
+use crate::config::SpecVersion;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::vault::{SourcedEntry, Vault};
@@ -37,33 +38,125 @@ pub mod untrusted;
 
 pub use registry::PackRegistry;
 
-/// One edge kind a pack owns (#179). `name` is the `kind` front-matter
-/// value on an edge record; `symmetric` declares whether the relation
-/// reads the same in both directions (`married` is symmetric, `introduced`
-/// is directed). The kind list is closed: an edge whose kind no core or
-/// enabled pack claims is a `check` error, not free text.
+/// The entity endpoint set for a person (`a`/`b` may be `p-` IDs).
+pub const PERSON_ENDPOINT: &[Prefix] = &[Prefix::Person];
+/// The entity endpoint set for an org (`a`/`b` may be `o-` IDs).
+pub const ORG_ENDPOINT: &[Prefix] = &[Prefix::Org];
+
+/// One edge kind a pack owns (#179, #813). `name` is the `kind`
+/// front-matter value on an edge record; `symmetric` declares whether the
+/// relation reads the same in both directions (`married` is symmetric,
+/// `introduced` is directed). `from`/`to` are the endpoint type sets for
+/// `a`/`b`: a kind is the schema for which entity types its ends may hold.
+/// The kind list is closed: an edge whose kind no core or enabled pack
+/// claims is a `check` error, not free text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EdgeKind {
     pub name: &'static str,
     pub symmetric: bool,
+    /// Allowed endpoint types for `a`.
+    pub from: &'static [Prefix],
+    /// Allowed endpoint types for `b`.
+    pub to: &'static [Prefix],
 }
 
-/// Edge kinds core ships (#179). Packs add their own via
-/// [`Pack::edge_kinds`].
-pub const CORE_EDGE_KINDS: &[EdgeKind] = &[
+impl EdgeKind {
+    /// Whether `a`/`b` match this kind's endpoint declaration.
+    pub fn allows(&self, a: Prefix, b: Prefix) -> bool {
+        self.from.contains(&a) && self.to.contains(&b)
+    }
+}
+
+/// Edge kinds core ships in 0.1 (#179). Packs add their own via
+/// [`Pack::edge_kinds`]. These are person↔person only; 0.2 keeps them
+/// unchanged and adds the person→org kinds below.
+pub const CORE_EDGE_KINDS_0_1: &[EdgeKind] = &[
     EdgeKind {
         name: "married",
         symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
     EdgeKind {
         name: "introduced",
         symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
     EdgeKind {
         name: "colleague",
         symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
     },
 ];
+
+/// Edge kinds core ships in 0.2 (#813): the 0.1 kinds plus directed
+/// person→org relations.
+pub const CORE_EDGE_KINDS_0_2: &[EdgeKind] = &[
+    EdgeKind {
+        name: "married",
+        symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "introduced",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "colleague",
+        symmetric: true,
+        from: PERSON_ENDPOINT,
+        to: PERSON_ENDPOINT,
+    },
+    EdgeKind {
+        name: "works_at",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "founder_of",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "investor_in",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+    EdgeKind {
+        name: "advisor_to",
+        symmetric: false,
+        from: PERSON_ENDPOINT,
+        to: ORG_ENDPOINT,
+    },
+];
+
+/// The core edge kinds for a vault spec. 0.1 is frozen: the new
+/// person→org kinds are 0.2-only, so a 0.1 vault still reports `works_at`
+/// as `E_UNKNOWN_EDGE_KIND`.
+pub fn core_edge_kinds(spec: SpecVersion) -> &'static [EdgeKind] {
+    match spec {
+        SpecVersion::V01 => CORE_EDGE_KINDS_0_1,
+        SpecVersion::V02 => CORE_EDGE_KINDS_0_2,
+    }
+}
+
+/// Whether `name` is any core edge kind, across every frozen spec version.
+/// External packs may never claim one, even a kind the newest spec no
+/// longer ships.
+pub fn is_core_edge_kind(name: &str) -> bool {
+    CORE_EDGE_KINDS_0_1
+        .iter()
+        .chain(CORE_EDGE_KINDS_0_2)
+        .any(|kind| kind.name == name)
+}
 
 /// Pack-owned state produced by [`Pack::fold`].
 ///
@@ -102,8 +195,8 @@ pub trait Pack: Send + Sync {
     fn balance_open_verbs(&self) -> &'static [&'static str] {
         &[]
     }
-    /// Edge kinds this pack owns (#179). Core ships
-    /// [`CORE_EDGE_KINDS`]; a pack that introduces a kind claims it here.
+    /// Edge kinds this pack owns (#179). Core ships the per-spec lists in
+    /// [`core_edge_kinds`]; a pack that introduces a kind claims it here.
     /// Defaults to none.
     fn edge_kinds(&self) -> &'static [EdgeKind] {
         &[]
@@ -488,6 +581,8 @@ mod tests {
             &[EdgeKind {
                 name: "mentor",
                 symmetric: false,
+                from: PERSON_ENDPOINT,
+                to: PERSON_ENDPOINT,
             }]
         }
         fn finding_codes(&self) -> &'static [&'static str] {
@@ -696,6 +791,8 @@ mod tests {
                 &[EdgeKind {
                     name: "mentor",
                     symmetric: false,
+                    from: PERSON_ENDPOINT,
+                    to: PERSON_ENDPOINT,
                 }]
             }
             fn finding_codes(&self) -> &'static [&'static str] {

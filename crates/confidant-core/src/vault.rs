@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::check::{Finding, FindingCode, Severity};
-use crate::config::{VaultConfig, SPEC_VERSION};
+use crate::config::{SpecVersion, VaultConfig};
 use crate::id::{collect_uncovered_ulid_windows, scan_id_tokens, IdToken, Prefix, RecordId};
 use crate::ledger::{parse_ledger, LedgerEntry, ParseErrorKind};
 use crate::packs::embedded as packs_embedded;
@@ -73,6 +73,14 @@ impl Vault {
     /// process-wide static.
     pub fn pack_registry(&self) -> &PackRegistry {
         &self.pack_registry
+    }
+
+    /// The declared spec version, when this binary implements it. `check`
+    /// and every read path gate on this first, so callers that already
+    /// passed the gate can use the value; an unsupported vault has no
+    /// records loaded.
+    pub fn spec_version(&self) -> Option<SpecVersion> {
+        SpecVersion::parse(&self.config.spec)
     }
 }
 
@@ -243,7 +251,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     // vendored directory or pin for its name, #504 R8).
     let builtins: &[packs_embedded::EmbeddedPack] = packs_embedded::embedded_packs();
     let (pack_registry, pack_problems, external_manifests, lockfile_error) =
-        if config.spec == SPEC_VERSION {
+        if SpecVersion::is_supported(&config.spec) {
             let compiled = PackRegistry::compiled();
             let load = packs_external::load_external_packs(
                 root,
@@ -292,7 +300,7 @@ fn load_vault_inner(root: &Path) -> anyhow::Result<Vault> {
     let mut ledger_lines = Vec::new();
     let mut ledger_unread_count = 0u32;
 
-    if config.spec == SPEC_VERSION {
+    if SpecVersion::is_supported(&config.spec) {
         let mut jobs = Vec::new();
         let mut names = Vec::new();
         scan_collections(root, &mut path_ids, &mut findings, &mut jobs, &mut names);
@@ -593,7 +601,7 @@ fn scan_unexpected_top_level(root: &Path, findings: &mut Vec<Finding>) {
                     "unexpected vault entry".to_owned(),
                 )
                 .at_file(redacted_filename(Path::new(&ent.name)))
-                .with_fix("Use the layout in spec/0.1.md (people/, orgs/, deals/, ledger/, …)"),
+                .with_fix("Use the vault layout in spec/ (people/, orgs/, deals/, ledger/, …)"),
             );
         }
     }

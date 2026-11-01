@@ -842,7 +842,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
             };
-            if vault.config.spec != confidant_core::SPEC_VERSION {
+            if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
                 print_error(
                     json,
                     Some(&vault.root.display().to_string()),
@@ -2656,7 +2656,7 @@ fn cmd_find(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             json,
             Some(&vault_path),
@@ -3874,7 +3874,7 @@ fn cmd_note_show(cli: &Cli, root: &Path, id_raw: &str, for_edit: bool) -> anyhow
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -3931,7 +3931,7 @@ fn cmd_note_edit(
     edit: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -4254,7 +4254,7 @@ fn cmd_record_list(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             cli.json,
             Some(&vault_path),
@@ -4343,7 +4343,7 @@ fn cmd_record_show(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -4404,7 +4404,7 @@ fn cmd_record_resolve(
     edit: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = vault_or!(root, cli.json);
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));
@@ -6409,11 +6409,11 @@ fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     if !legacy_encrypted {
         match load_vault(root) {
             Ok(vault) => {
-                if vault.config.spec == confidant_core::SPEC_VERSION {
+                if confidant_core::SpecVersion::is_supported(&vault.config.spec) {
                     checks.push(DoctorCheck {
                         id: "spec",
                         status: "ok",
-                        message: "vault spec 0.1 supported".to_owned(),
+                        message: format!("vault spec {} supported", vault.config.spec),
                         fix: None,
                     });
                 } else {
@@ -8034,7 +8034,7 @@ fn cmd_init(cli: &Cli, root: &Path, scaffold: Option<Scaffold>) -> anyhow::Resul
 
     require_git_repo(root, no_input)?;
     let vault = load_vault(root)?;
-    if vault.config.spec != confidant_core::SPEC_VERSION {
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         return Err(anyhow::Error::new(DomainError::spec_unsupported(
             &vault.config.spec,
         )));

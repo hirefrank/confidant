@@ -43,6 +43,14 @@ fn person(root: &Path, id: &str, name: &str) {
     );
 }
 
+fn org(root: &Path, id: &str, name: &str) {
+    write(
+        root,
+        &format!("orgs/{id}/org.md"),
+        &format!("---\nid: {id}\ntype: org\nname: {name}\n---\n\nFake org.\n"),
+    );
+}
+
 fn note(root: &Path, id: &str, person: &str, date: &str) {
     write(
         root,
@@ -61,6 +69,26 @@ fn vault_toml(root: &Path, checks: &str) {
         "confidant.toml",
         &format!(
             r#"spec = "0.1"
+packs = ["example-pack@0.1"]
+vault_id = "test-vault"
+
+[checks]
+as_of = "2026-10-08"
+{checks}
+"#
+        ),
+    );
+}
+
+/// The same fixture vault at spec 0.2 (#813). The example pack lists both
+/// spec versions, so it loads in either.
+fn vault_toml_02(root: &Path, checks: &str) {
+    install_example_pack(root);
+    write(
+        root,
+        "confidant.toml",
+        &format!(
+            r#"spec = "0.2"
 packs = ["example-pack@0.1"]
 vault_id = "test-vault"
 
@@ -4412,6 +4440,12 @@ fn two_people(dir: &Path) {
     person(dir, BEA, "Bea Demo");
 }
 
+fn two_people_02(dir: &Path) {
+    vault_toml_02(dir, DEFAULT_CHECKS);
+    person(dir, ADA, "Ada Example");
+    person(dir, BEA, "Bea Demo");
+}
+
 #[test]
 fn edge_valid_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -4651,6 +4685,202 @@ fn edge_wrong_type_end_is_rejected() {
     edge(dir.path(), EDGE1, ADA, ORG, "married");
     let json = report_json(dir.path(), None);
     assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"]);
+}
+
+// ---------------------------------------------------------------------------
+// #813: entity endpoints (0.2) and frozen 0.1 semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_person_to_org_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    for (idx, kind) in ["works_at", "founder_of", "investor_in", "advisor_to"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("e-01M3TC5H00MPJG00E4{idx:08}");
+        edge(dir.path(), &id, ADA, ORG, kind);
+    }
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_person_to_org_is_rejected_in_01() {
+    // 0.1 semantics are frozen: an org end is still E_WRONG_ID_TYPE and
+    // `works_at` is still outside the 0.1 core kind list.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    edge(dir.path(), EDGE1, ADA, ORG, "works_at");
+    let json = report_json(dir.path(), None);
+    let mut got = codes(&json);
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["E_UNKNOWN_EDGE_KIND", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+}
+
+#[test]
+fn edge_end_must_be_an_entity_type_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    for bad in [NOTE, IXN2, DEAL, EDGE1, PKG] {
+        edge(dir.path(), EDGE1, ADA, bad, "married");
+        let json = report_json(dir.path(), None);
+        assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{bad}: {json}");
+        let message = json["findings"][0]["message"].as_str().unwrap();
+        assert!(message.contains("person or org"), "{message}");
+    }
+}
+
+#[test]
+fn edge_kind_endpoint_mismatch_is_rejected_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+
+    // Directed person→org kind, reversed: both ends are the wrong type.
+    edge(dir.path(), EDGE1, ORG, ADA, "works_at");
+    let json = report_json(dir.path(), None);
+    assert_eq!(
+        codes(&json),
+        vec!["E_WRONG_ID_TYPE", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+    assert!(
+        json["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed"),
+        "{json}"
+    );
+
+    // A person↔person kind does not take an org end.
+    edge(dir.path(), EDGE1, ADA, ORG, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{json}");
+}
+
+#[test]
+fn edge_person_person_still_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    for (idx, kind) in ["married", "introduced", "colleague"].iter().enumerate() {
+        let id = format!("e-01M3TC5H00MPJG00E5{idx:08}");
+        edge(dir.path(), &id, ADA, BEA, kind);
+    }
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_merge_self_is_rejected_in_02_only() {
+    // 0.2 canonicalizes the pair: ADA merged into BEA turns ADA→BEA into
+    // a self-edge.
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_SELF_EDGE"], "{json}");
+
+    // 0.1 keeps the raw comparison, so the same data passes.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, ADA, BEA, "married");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_merge_duplicate_is_rejected_in_02_only() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, BEA, CAM, "married");
+    edge(dir.path(), EDGE2, ADA, CAM, "married");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_DUPLICATE_EDGE"], "{json}");
+
+    // Frozen 0.1: the raw pairs differ, so there is no duplicate.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    person(dir.path(), CAM, "Cam Sample");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 merge {ADA} into {BEA}\n"),
+    );
+    edge(dir.path(), EDGE1, BEA, CAM, "married");
+    edge(dir.path(), EDGE2, ADA, CAM, "married");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+}
+
+#[test]
+fn edge_missing_end_fix_names_both_entity_types_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    write(
+        dir.path(),
+        &format!("edges/{EDGE1}/edge.md"),
+        &format!("---\nid: {EDGE1}\ntype: edge\na: {ADA}\nkind: married\n---\n"),
+    );
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_FRONTMATTER"], "{json}");
+    let fix = json["findings"][0]["fix"].as_str().unwrap();
+    assert!(fix.contains("p-<ULID> or o-<ULID>"), "{fix}");
+}
+
+#[test]
+fn edge_pack_declared_org_endpoint_passes_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    two_people_02(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    // `backs` is org→person, declared by the example pack.
+    edge(dir.path(), EDGE1, ORG, ADA, "backs");
+    let json = report_json(dir.path(), None);
+    assert!(codes(&json).is_empty(), "{json}");
+
+    // Reversed fails both endpoint checks.
+    edge(dir.path(), EDGE1, ADA, ORG, "backs");
+    let json = report_json(dir.path(), None);
+    assert_eq!(
+        codes(&json),
+        vec!["E_WRONG_ID_TYPE", "E_WRONG_ID_TYPE"],
+        "{json}"
+    );
+}
+
+#[test]
+fn edge_pack_declared_org_endpoint_is_person_only_in_01() {
+    // 0.1 ignores a pack's endpoint declaration: every edge end is a
+    // person ID.
+    let dir = tempfile::tempdir().unwrap();
+    two_people(dir.path());
+    org(dir.path(), ORG, "Example Org");
+    edge(dir.path(), EDGE1, ORG, ADA, "backs");
+    let json = report_json(dir.path(), None);
+    assert_eq!(codes(&json), vec!["E_WRONG_ID_TYPE"], "{json}");
 }
 
 #[test]
@@ -5402,6 +5632,35 @@ fn external_pack_installed_checks_clean() {
     assert!(json["ok"].as_bool().unwrap(), "expected clean: {json}");
     assert!(codes(&json).is_empty(), "{json:?}");
     assert_eq!(json["summary"]["records"].as_u64().unwrap(), 1);
+}
+
+/// #813: a pack that lists only 0.1 fails closed in a 0.2 vault. The
+/// control (the same pack in 0.1) is clean, so the failure is the spec
+/// gate, not the pack bytes.
+#[test]
+fn external_pack_listing_only_01_fails_in_02() {
+    let dir = tempfile::tempdir().unwrap();
+    person(dir.path(), ADA, "Ada Example");
+    let hash = install_external_pack(dir.path(), "example-pack", "0.1", "greet");
+    install_lockfile(dir.path(), "example-pack", "0.1", &hash);
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.2\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n",
+    );
+    let json = report_json(dir.path(), None);
+    assert!(
+        codes(&json).contains(&"E_PACK_VERSION".to_string()),
+        "{json:?}"
+    );
+
+    // Control: the same pin loads in a 0.1 vault.
+    external_vault_toml(dir.path(), "\"example-pack@0.1\"", "");
+    let json = report_json(dir.path(), None);
+    assert!(
+        !codes(&json).contains(&"E_PACK_VERSION".to_string()),
+        "{json:?}"
+    );
 }
 
 /// #438/#449: a `[[pack]]` claim that collides with an enabled pack is
@@ -9873,7 +10132,7 @@ fn shipped_example_note_ref_codes_are_pack_own() {
 fn shipped_example_pack_hash_is_stable() {
     let pack = read_pack_dir(&example_pack_dir()).expect("shipped pack dir must read");
     assert_eq!(
-        pack.hash, "sha256:924c427db3318b575c07fcf19038d9f81f303195109c2945c0c9f078aba4438e",
+        pack.hash, "sha256:bc67a54ad6bd84d1f28b727e7407efc00878b4a964bcea48bd59f798678e0c30",
         "the example-pack fixture changed; update this pin in the same commit"
     );
     assert_eq!(pack.files.len(), 3);

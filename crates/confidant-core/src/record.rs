@@ -127,7 +127,7 @@ impl Record {
     }
 }
 
-/// Tri-state `no-ai` value (`spec/0.1.md` §4).
+/// Tri-state `no-ai` value (spec §4; unchanged in 0.1 and 0.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NoAi {
     False,
