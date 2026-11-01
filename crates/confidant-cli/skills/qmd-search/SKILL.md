@@ -92,7 +92,7 @@ npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 # to bound it. Exit 0 is NOT a gate: read the report (or --json) —
 # a LOW DISK / unreachable-hub / no-mode-recommended outcome still
 # exits 0.
-"$(confidant which --skills-dir)"/qmd-search/bin/qmd-preflight.py --vault /path/to/vault --persist --query coaching
+"$(confidant which --skills-dir)"/qmd-search/bin/qmd-preflight.py --vault /path/to/vault --persist --query notes
 ```
 
 `qmd-index` is idempotent: rebuilding replaces the corpus and re-adds the

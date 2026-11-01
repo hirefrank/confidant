@@ -210,7 +210,7 @@ pub(crate) fn resolve_declared_severity(
 }
 
 /// Read a required `*_code` parameter (#629). A rule kind's code
-/// parameters have no fallback: the compiled coaching path is gone
+/// parameters have no fallback: the compiled-pack path is gone
 /// (`ALL_PACKS` is empty), so a default can only point at a core code that
 /// an external pack may not name. The kind still checks that the returned
 /// code is declared and has its message variants.
@@ -958,17 +958,18 @@ static DATE_UPCOMING: DateUpcomingKind = DateUpcomingKind;
 
 /// `note-ref` (#458): every `<pair>:<note-id>` on a pack's ledger verb must
 /// name an existing note that belongs to the entry's canonical person.
-/// Reproduces the built-in personal pack's `touch_note_integrity` and coaching@0.1's
-/// `session_note_integrity`; only ids and path ownership are read, never
-/// note bodies (PD8).
+/// Covers the built-in personal pack's `touch_note_integrity` and the
+/// former compiled `session_note_integrity`; only ids and path ownership
+/// are read, never note bodies (PD8).
 ///
 /// Parameters (spec/pack-manifest.md):
 /// - `verb`: the ledger verb whose entries are checked.
 /// - `pair`: the `key:value` pair holding the note id (today `"note"`).
-/// - `variants`: `"touch"` (default) selects personal's variant names
+/// - `variants`: `"touch"` (default) selects the touchpoint variant names
 ///   (`default`/`default_fix` for the invalid-id and wrong-type
-///   problems); `"session"` selects coaching's `session_note`/
-///   `session_note_fix`. The `missing`/`wrong_owner` variants are shared.
+///   problems); `"session"` selects the session variant names
+///   (`session_note`/`session_note_fix`). The `missing`/`wrong_owner`
+///   variants are shared.
 /// - `invalid_code` / `wrong_type_code`: required codes for the first two
 ///   problems (#629). There are no defaults: an external pack cannot name
 ///   a core code (PD13), and a retired name is refused outright.
@@ -1185,8 +1186,9 @@ impl RuleKind for NoteRefKind {
                     wrong_type_code,
                     wrong_id_variant,
                     // The compiled packs name this placeholder `{id}` in
-                    // personal and `{nid}` in coaching; both are supplied so
-                    // either template renders.
+                    // the touch variants and `{nid}` in the session
+                    // variants; both are supplied so either template
+                    // renders.
                     &[("id", &nid), ("nid", &nid)],
                 )),
                 Ok(nid) => match ctx.vault.records.get(&nid) {
@@ -1326,7 +1328,7 @@ default = "test rule"
         std::fs::write(
             dir.path().join("confidant.toml"),
             format!(
-                "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n{operator_checks}\n"
+                "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n{operator_checks}\n"
             ),
         )
         .unwrap();
@@ -1994,7 +1996,7 @@ default_fix = "{{fix}}"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("people/p-01J9Z3K4QF0000000000000000")).unwrap();
@@ -2033,7 +2035,7 @@ mod note_kind_tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
         )
         .unwrap();
         for id in [ADA, BEA] {
@@ -2105,7 +2107,7 @@ wrong_owner_fix = "Point note: at a note for this person"
         parse_manifest(text).expect("v1 fixture manifest should parse")
     }
 
-    /// A v2 external-style manifest with pack-own codes and coaching's
+    /// A v2 external-style manifest with pack-own codes and the session
     /// variant names (`variants = "session"`).
     fn session_manifest() -> PackManifest {
         let text = r#"manifest_version = 2
@@ -2196,7 +2198,7 @@ wrong_owner_fix = "Point note: at a note for this person"
             vec!["E_NOTE_UNKNOWN", "E_NOTE_BAD_TYPE", "E_NOTE_BAD_ID"],
             "{out:?}"
         );
-        // Coaching's variant names and {nid} placeholder render.
+        // The session variant names and {nid} placeholder render.
         assert_eq!(
             out[0].message,
             format!("session note '{GHOST}' does not exist")
@@ -2214,7 +2216,7 @@ wrong_owner_fix = "Point note: at a note for this person"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
         )
         .unwrap();
         for id in [ADA, BEA] {
@@ -2254,7 +2256,7 @@ wrong_owner_fix = "Point note: at a note for this person"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join(format!("people/{ADA}"))).unwrap();
@@ -2821,7 +2823,7 @@ default_fix = "{{fix}}"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("confidant.toml"),
-            "spec = \"0.1\"\npacks = [\"coaching@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+            "spec = \"0.1\"\npacks = [\"example-pack@0.1\"]\nvault_id = \"test-vault\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(dir.path().join("people/p-01J9Z3K4QF0000000000000000")).unwrap();

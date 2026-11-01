@@ -35,8 +35,8 @@ pub const PERSONAL_0_2: &str = "personal@0.2";
 ///
 /// A built-in is implicit: it is enabled in every vault and a
 /// `personal@…` entry in `confidant.toml` is accepted as a no-op. The check
-/// is by name against the embedded packs (not every reserved name): a
-/// `coaching@9.9` listing is still an unknown external pin. The version
+/// is by name against the embedded packs (not every reserved name): an
+/// `example-pack@9.9` listing is still an unknown external pin. The version
 /// must be non-empty, so a malformed `personal@` is not a listing.
 pub fn is_builtin_listing(listed: &str) -> bool {
     let Some((name, version)) = listed.split_once('@') else {
@@ -331,7 +331,7 @@ mod tests {
         assert!(is_builtin_listing("personal@9.9"));
         assert!(!is_builtin_listing("personal@"));
         assert!(!is_builtin_listing("personal"));
-        assert!(!is_builtin_listing("coaching@0.1"));
+        assert!(!is_builtin_listing("example-pack@0.1"));
         let declared = find(PERSONAL_0_2).expect("personal@0.2 is embedded");
         assert!(declared.matches_listing("personal@0.1"));
         assert!(!declared.matches_listing("personal@"));

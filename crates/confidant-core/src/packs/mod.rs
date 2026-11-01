@@ -83,7 +83,7 @@ pub trait PackState {
 /// `context_view` methods receive the state this pack's `fold` produced.
 pub trait Pack: Send + Sync {
     /// The `name@version` string as listed in `confidant.toml`, e.g.
-    /// `"coaching@0.1"`.
+    /// `"example-pack@0.1"`.
     fn name(&self) -> &'static str;
     /// Ledger verbs this pack defines (e.g. `open`, `session`).
     fn verbs(&self) -> &'static [&'static str];
@@ -190,10 +190,10 @@ pub trait Pack: Send + Sync {
     /// ships with the binary; an external pack's bytes were read from the
     /// vault. The label that marks agent-facing external-pack text keys on
     /// this, never on the pack's name — an external pack whose base name
-    /// matches a compiled pack (`coaching@0.9` next to `coaching@0.1`) is
-    /// still external. Defaults to compiled-in; the runtime declarative
-    /// pack ([`manifest_pack::ManifestPack`]) carries the manifest's
-    /// origin.
+    /// matches a compiled pack (`example-pack@0.9` next to
+    /// `example-pack@0.1`) is still external. Defaults to compiled-in; the
+    /// runtime declarative pack ([`manifest_pack::ManifestPack`]) carries
+    /// the manifest's origin.
     fn origin(&self) -> manifest::PackOrigin {
         manifest::PackOrigin::CompiledIn
     }
@@ -211,8 +211,8 @@ pub trait Pack: Send + Sync {
     }
     /// The kind of `context` view this pack serves, if any (#594, spec
     /// §13.9). Defaults to `None`. This is a secondary guard: `context`
-    /// only populates the legacy `coaching` alias from the pack named
-    /// `coaching` (any origin) that also reports the
+    /// only populates the legacy "coaching" compatibility alias from the
+    /// pack that carries that base name (any origin) and also reports the
     /// [`crate::context::ledger_sessions::LEDGER_SESSIONS_VIEW`] kind, so a
     /// `[context]` pack under another name serves its own `packs` entry but
     /// never the alias. `None` for every pack that serves no core view.
@@ -253,7 +253,7 @@ pub(crate) fn pack_manifests_for_config() -> Vec<&'static manifest::PackManifest
 }
 
 /// The parsed manifest for a compiled or built-in pack, by `name@version`
-/// (e.g. `"coaching@0.1"`). Used by the CLI's drift tests to check
+/// (e.g. `"example-pack@0.1"`). Used by the CLI's drift tests to check
 /// manifest text against the embedded SKILL.md (#345).
 pub fn pack_manifest(name: &str) -> Option<&'static manifest::PackManifest> {
     pack_manifests_for_config()

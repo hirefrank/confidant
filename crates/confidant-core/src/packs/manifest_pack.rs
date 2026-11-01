@@ -356,11 +356,11 @@ impl Pack for ManifestPack {
     }
 
     /// #594: a declarative pack that declares `[context]` serves the core
-    /// `ledger-sessions` view. The legacy `coaching` alias is tied to the
-    /// base name `coaching` (`context` matches it), so this only makes the
-    /// coaching pack the alias — a `[context]` pack under another name serves
-    /// its own `packs` entry only. The built-in personal pack serves its own
-    /// view, so it is never the alias.
+    /// `ledger-sessions` view. The legacy "coaching" compatibility alias is
+    /// keyed on that base name (`context` matches it), so only a pack named
+    /// `coaching` populates it — a `[context]` pack under another name
+    /// serves its own `packs` entry only. The built-in personal pack serves
+    /// its own view, so it is never the alias.
     fn context_view_kind(&self) -> Option<&'static str> {
         if self.serves_core_personal_view() {
             return None;

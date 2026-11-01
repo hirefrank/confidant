@@ -1,10 +1,9 @@
-//! Shared ledger arithmetic for the coaching rule kinds (#446-#448).
+//! Shared ledger arithmetic for the ledger rule kinds (#446-#448).
 //!
-//! The shipped `coaching@0.1` pack's `ledger-balance` rule and the
-//! `session-checks` and `activity-gap` kinds must agree exactly, so this
-//! module owns the accumulation and the merge-aware queries. The rules and
-//! messages stay in their own modules; only the arithmetic and the fold
-//! ordering live here.
+//! The `ledger-balance`, `session-checks` and `activity-gap` kinds must
+//! agree exactly, so this module owns the accumulation and the merge-aware
+//! queries. The rules and messages stay in their own modules; only the
+//! arithmetic and the fold ordering live here.
 //!
 //! Semantics:
 //! - events are ordered by date, then opens before the consuming verb,
@@ -260,9 +259,9 @@ impl LedgerFacts {
 /// The verbs and cap one fold uses.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FoldParams<'a> {
-    /// The verb that adds units (`open` for coaching).
+    /// The verb that adds units (e.g. `grant`).
     pub(crate) open_verb: &'a str,
-    /// The verb that consumes a unit (`session` for coaching).
+    /// The verb that consumes a unit (e.g. `use`).
     pub(crate) consume_verb: &'a str,
     /// Per-entry cap on one `open` line.
     pub(crate) max_open_n: i64,

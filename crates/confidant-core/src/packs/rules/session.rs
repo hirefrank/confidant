@@ -1,11 +1,11 @@
-//! `session-checks` (#447): the per-entry checks coaching runs on its
+//! `session-checks` (#447): the per-entry checks a pack runs on its
 //! consuming verb — duration present, exactly one billing tag, the
-//! untagged warning, and "session has no notes".
+//! untagged warning, and "entry has no notes".
 //!
-//! Reproduces `coaching@0.1`'s `apply_session` checks,
-//! `session_without_notes` and `note_coverage`, including merge-aware
-//! person grouping. Only ledger metadata and note ids / paths / dates are
-//! read; note bodies are never opened (PD8). The `note:` id/type/
+//! Covers the `apply_session` checks, `session_without_notes` and
+//! `note_coverage` semantics, including merge-aware person grouping. Only
+//! ledger metadata and note ids / paths / dates are read; note bodies are
+//! never opened (PD8). The `note:` id/type/
 //! existence/ownership check is not reimplemented here: a pack uses the
 //! `note-ref` kind (#458) for that.
 
@@ -345,7 +345,7 @@ impl RuleKind for SessionChecksKind {
 
 pub(crate) static SESSION_CHECKS: SessionChecksKind = SessionChecksKind;
 
-/// The canonical person → note dates map `coaching@0.1` builds: each note
+/// The canonical person → note dates map the rule builds: each note
 /// record's `date` and `session` front-matter fields, owned by its
 /// `person:` field or its path. Only dates are read, never note bodies.
 fn note_coverage(

@@ -87,8 +87,8 @@ impl PackRegistry {
     /// rather than being compiled into the binary (#535). `false` for a
     /// name no pack implements. The decision is by [`Pack::origin`], never
     /// by base name, so an external pack whose base name matches a
-    /// compiled pack (`coaching@0.9` next to `coaching@0.1`) is still
-    /// external.
+    /// compiled pack (`example-pack@0.9` next to `example-pack@0.1`) is
+    /// still external.
     pub fn is_external(&self, name: &str) -> bool {
         self.packs
             .iter()
@@ -131,7 +131,7 @@ mod tests {
 
     impl Pack for CollidingExternal {
         fn name(&self) -> &'static str {
-            "coaching@0.9"
+            "example-pack@0.9"
         }
         fn verbs(&self) -> &'static [&'static str] {
             &[]
@@ -190,15 +190,16 @@ mod tests {
         let external: &'static dyn Pack = Box::leak(Box::new(CollidingExternal));
         registry.register(external);
 
-        // The external pack keeps the compiled pack's base name.
+        // The external pack keeps a colliding base name.
         assert_eq!(
-            "coaching@0.9".split('@').next(),
-            "coaching@0.1".split('@').next()
+            "example-pack@0.9".split('@').next(),
+            "example-pack@0.1".split('@').next()
         );
-        assert!(registry.is_external("coaching@0.9"));
-        // The compiled pack and the compiled-in built-in are not external,
-        // even though the built-in carries skill text of its own.
-        assert!(!registry.is_external("coaching@0.1"));
+        assert!(registry.is_external("example-pack@0.9"));
+        // A colliding name at a version no pack implements is not
+        // external, and the compiled-in built-in is not either, even
+        // though it carries skill text of its own.
+        assert!(!registry.is_external("example-pack@0.1"));
         assert!(!registry.is_external("personal@0.2"));
         // A name no pack implements is not external.
         assert!(!registry.is_external("nope@9.9"));

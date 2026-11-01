@@ -5157,6 +5157,20 @@ struct DoctorCheck {
     fix: Option<String>,
 }
 
+/// #809: a vault written by the encrypted Confidant (≤0.7) cannot be read
+/// as plaintext. One clear check replaces the stream of record and ledger
+/// parse errors the normal checks would report.
+fn legacy_encrypted_vault_check() -> DoctorCheck {
+    DoctorCheck {
+        id: "legacy-encrypted-vault",
+        status: "error",
+        message: "this vault was written by an encrypted Confidant ≤0.7; \
+                  re-create it with `confidant init`."
+            .to_owned(),
+        fix: None,
+    }
+}
+
 /// Latest GitHub Release endpoint (#165). Release builds always use the
 /// real endpoint. `test-overrides` builds use `CONFIDANT_TEST_RELEASES_URL`
 /// when set, and an unroutable loopback URL otherwise, so the test suite
@@ -6333,6 +6347,15 @@ fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     });
     checks.push(vault_access_check(root));
 
+    // #809: detect the encrypted ≤0.7 vault shape before loading it. One
+    // clear error beats a stream of parse and check findings, and the
+    // normal `spec` / `check` checks cannot say anything useful about a
+    // vault this binary has no reader for.
+    let legacy_encrypted = confidant_core::vault::is_legacy_encrypted_vault(root);
+    if legacy_encrypted {
+        checks.push(legacy_encrypted_vault_check());
+    }
+
     match require_git_repo(root, cli.no_input) {
         Ok(()) => checks.push(DoctorCheck {
             id: "git-repo",
@@ -6383,56 +6406,58 @@ fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     // advisory: no remote/upstream stays `ok`, and a real difference warns.
     checks.push(local_commits_check(root, cli.no_input));
 
-    match load_vault(root) {
-        Ok(vault) => {
-            if vault.config.spec == confidant_core::SPEC_VERSION {
-                checks.push(DoctorCheck {
-                    id: "spec",
-                    status: "ok",
-                    message: "vault spec 0.1 supported".to_owned(),
-                    fix: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    id: "spec",
-                    status: "error",
-                    message: format!("unsupported vault spec: {}", vault.config.spec),
-                    fix: None,
-                });
+    if !legacy_encrypted {
+        match load_vault(root) {
+            Ok(vault) => {
+                if vault.config.spec == confidant_core::SPEC_VERSION {
+                    checks.push(DoctorCheck {
+                        id: "spec",
+                        status: "ok",
+                        message: "vault spec 0.1 supported".to_owned(),
+                        fix: None,
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        id: "spec",
+                        status: "error",
+                        message: format!("unsupported vault spec: {}", vault.config.spec),
+                        fix: None,
+                    });
+                }
+                let report = check_vault(&vault, &CheckOptions::default());
+                if report.summary.errors > 0 {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "error",
+                        message: format!(
+                            "check reports {} error(s); writes are blocked until fixed",
+                            report.summary.errors
+                        ),
+                        fix: None,
+                    });
+                } else if report.summary.warnings > 0 {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "warning",
+                        message: format!("check reports {} warning(s)", report.summary.warnings),
+                        fix: None,
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        id: "check",
+                        status: "ok",
+                        message: "check is clean".to_owned(),
+                        fix: None,
+                    });
+                }
             }
-            let report = check_vault(&vault, &CheckOptions::default());
-            if report.summary.errors > 0 {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "error",
-                    message: format!(
-                        "check reports {} error(s); writes are blocked until fixed",
-                        report.summary.errors
-                    ),
-                    fix: None,
-                });
-            } else if report.summary.warnings > 0 {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "warning",
-                    message: format!("check reports {} warning(s)", report.summary.warnings),
-                    fix: None,
-                });
-            } else {
-                checks.push(DoctorCheck {
-                    id: "check",
-                    status: "ok",
-                    message: "check is clean".to_owned(),
-                    fix: None,
-                });
-            }
+            Err(e) => checks.push(DoctorCheck {
+                id: "vault-load",
+                status: "error",
+                message: format!("cannot load vault: {e}"),
+                fix: None,
+            }),
         }
-        Err(e) => checks.push(DoctorCheck {
-            id: "vault-load",
-            status: "error",
-            message: format!("cannot load vault: {e}"),
-            fix: None,
-        }),
     }
 
     // #165: staleness vs the latest GitHub Release. Warning-only: a stale

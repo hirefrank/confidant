@@ -1,12 +1,13 @@
 //! `ledger-balance` (#446): a per-person running count of opened units,
 //! consumed by a ledger verb, verified against `balance` lines.
 //!
-//! Implements the coaching pack's `sessions_remaining` and `icf_hours`
-//! behaviour: the fold's merge-aware
-//! accumulation, per-date ordering (opens before sessions), the
-//! comp/pps consumption rules, the per-open cap and overflow checks, the
-//! `pkg-` package rule, the negative-balance finding and the `balance`
-//! line verification (including hundredths-of-an-hour formatting).
+//! Implements a per-person unit balance and a minutes total (the
+//! `units_remaining` / `minutes_total` shape a pack declares): the fold's
+//! merge-aware accumulation, per-date ordering (opens before consuming
+//! entries), the pps/comp consumption rules, the per-open cap and overflow
+//! checks, the `pkg-` package rule, the negative-balance finding and the
+//! `balance` line verification (including hundredths-of-an-hour
+//! formatting).
 //!
 //! The arithmetic lives in [`super::ledger`]; this module only resolves
 //! parameters, validates them at load, and renders the pack's messages.
