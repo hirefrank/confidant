@@ -844,6 +844,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
+            if let Err(err) = legacy_vault_gate(&root) {
+                print_error(json, Some(&root.display().to_string()), &err)?;
+                return Ok(ExitCode::from(err.exit_code() as u8));
+            }
             // Spec 4: the allowlist is a read path — records participate,
             // uncleared ones are excluded by omission.
             let vault = match load_vault_for_reads(&root, json, false) {
@@ -1170,6 +1174,21 @@ fn load_vault_for_reads(
             let _ = print_error(json, Some(&root.display().to_string()), &err);
             Err(ExitCode::from(err.exit_code() as u8))
         }
+    }
+}
+
+/// Refuse a vault written by the encrypted Confidant (≤0.7) (#821).
+///
+/// The sniff is read-only and returns only a boolean; the command error
+/// carries the same message as the `check` finding and the `doctor` check.
+/// Every agent-facing read calls this after loading and before reading
+/// content, so a legacy vault fails closed instead of returning an empty or
+/// partial result.
+fn legacy_vault_gate(root: &Path) -> Result<(), DomainError> {
+    if confidant_core::vault::is_legacy_encrypted_vault(root) {
+        Err(DomainError::vault_legacy_encrypted())
+    } else {
+        Ok(())
     }
 }
 
@@ -2655,6 +2674,10 @@ fn cmd_find(
         return Err(anyhow::Error::new(DomainError::usage(
             "find requires a non-empty query",
         )));
+    }
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
     }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
@@ -4973,6 +4996,10 @@ fn cmd_context(
     include_private: bool,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(cli.json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
     // read path.
@@ -5073,6 +5100,7 @@ fn cmd_context(
 /// An ambiguous name fails closed with `E_AMBIGUOUS_PERSON` (candidate ids
 /// are opaque, never names).
 fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> {
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -5137,6 +5165,7 @@ fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
 /// cleared people sharing a value fail closed with `E_AMBIGUOUS_PERSON`.
 fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow::Result<ExitCode> {
     validate_alias_kind(kind)?;
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
@@ -5188,9 +5217,7 @@ fn legacy_encrypted_vault_check() -> DoctorCheck {
     DoctorCheck {
         id: "legacy-encrypted-vault",
         status: "error",
-        message: "this vault was written by an encrypted Confidant ≤0.7; \
-                  re-create it with `confidant init`."
-            .to_owned(),
+        message: confidant_core::error::LEGACY_ENCRYPTED_VAULT_MESSAGE.to_owned(),
         fix: None,
     }
 }

@@ -78,6 +78,7 @@ pub enum FindingCode {
     Unreadable,
     Config,
     SpecUnsupported,
+    VaultLegacyEncrypted,
     PackUnknown,
     PackConflict,
     PackOrphan,
@@ -131,6 +132,7 @@ impl FindingCode {
             Self::Unreadable => "E_UNREADABLE",
             Self::Config => "E_CONFIG",
             Self::SpecUnsupported => "E_SPEC_UNSUPPORTED",
+            Self::VaultLegacyEncrypted => "E_VAULT_LEGACY_ENCRYPTED",
             Self::PackUnknown => "E_PACK_UNKNOWN",
             Self::PackConflict => "E_PACK_CONFLICT",
             Self::PackOrphan => "W_PACK_ORPHAN",
@@ -185,6 +187,7 @@ impl FindingCode {
         "E_UNREADABLE",
         "E_CONFIG",
         "E_SPEC_UNSUPPORTED",
+        "E_VAULT_LEGACY_ENCRYPTED",
         "E_PACK_UNKNOWN",
         "E_PACK_CONFLICT",
         "W_PACK_ORPHAN",
@@ -321,6 +324,7 @@ impl FindingCode {
             "E_UNREADABLE" => Self::Unreadable,
             "E_CONFIG" => Self::Config,
             "E_SPEC_UNSUPPORTED" => Self::SpecUnsupported,
+            "E_VAULT_LEGACY_ENCRYPTED" => Self::VaultLegacyEncrypted,
             "E_PACK_UNKNOWN" => Self::PackUnknown,
             "E_PACK_CONFLICT" => Self::PackConflict,
             "W_PACK_ORPHAN" => Self::PackOrphan,
@@ -487,6 +491,21 @@ pub struct CheckOptions {
 
 /// Run every check against `vault`, collecting rather than propagating.
 pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
+    // #821: a ≤0.7 encrypted vault is not a plaintext vault with parse
+    // problems. The read-only sniff gives one clear finding and discards
+    // every load finding, so the operator never sees a parse-error stream.
+    if crate::vault::is_legacy_encrypted_vault(&vault.root) {
+        return finish_report(
+            vault,
+            options,
+            vec![Finding::new(
+                FindingCode::VaultLegacyEncrypted,
+                Severity::Error,
+                crate::error::LEGACY_ENCRYPTED_VAULT_MESSAGE.to_owned(),
+            )],
+        );
+    }
+
     let mut findings = vault.load_findings.clone();
 
     if !SpecVersion::is_supported(&vault.config.spec) {
@@ -2076,6 +2095,10 @@ mod tests {
         assert_eq!(FindingCode::PackOrphan.as_str(), "W_PACK_ORPHAN");
         assert_eq!(FindingCode::PackHash.as_str(), "E_PACK_HASH");
         assert_eq!(FindingCode::PackInvalid.as_str(), "E_PACK_INVALID");
+        assert_eq!(
+            FindingCode::VaultLegacyEncrypted.as_str(),
+            "E_VAULT_LEGACY_ENCRYPTED"
+        );
     }
 
     /// #629: a retired name stays reserved, so a pack-declared code cannot
@@ -2180,6 +2203,7 @@ mod tests {
             FindingCode::Unreadable,
             FindingCode::Config,
             FindingCode::SpecUnsupported,
+            FindingCode::VaultLegacyEncrypted,
             FindingCode::PackUnknown,
             FindingCode::PackConflict,
             FindingCode::PackOrphan,
@@ -2230,6 +2254,7 @@ mod tests {
                 | FindingCode::Unreadable
                 | FindingCode::Config
                 | FindingCode::SpecUnsupported
+                | FindingCode::VaultLegacyEncrypted
                 | FindingCode::PackUnknown
                 | FindingCode::PackConflict
                 | FindingCode::PackOrphan
