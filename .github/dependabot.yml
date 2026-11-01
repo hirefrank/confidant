@@ -26,6 +26,15 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    # CodeQL requires every `github/codeql-action` step in a workflow to run
+    # the same version (init/analyze/upload-sarif). Un-grouped updates bump
+    # one step at a time and fail with "Loaded a configuration file for
+    # version X, but running version Y", so keep the sub-actions together.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action"
+          - "github/codeql-action/*"
     # Actions are pinned to full commit SHAs with `# vX` comments (see the
     # note at the top of release.yml). Re-apply the SHA pin + comment when
     # merging a Dependabot PR that bumps an action — a merged mutable tag
