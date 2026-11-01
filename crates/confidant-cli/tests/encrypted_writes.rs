@@ -434,6 +434,8 @@ fn log_session_by_display_name_decrypts_and_resolves() {
             "Ada Example",
             "60m",
             "paid",
+            "--date",
+            "2026-10-01",
             "--json",
             "--no-input",
         ])
