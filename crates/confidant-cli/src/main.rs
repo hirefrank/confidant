@@ -844,16 +844,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Allowlist => {
             let root = vault_root.unwrap();
+            if let Err(err) = legacy_vault_gate(&root) {
+                print_error(json, Some(&root.display().to_string()), &err)?;
+                return Ok(ExitCode::from(err.exit_code() as u8));
+            }
             // Spec 4: the allowlist is a read path — records participate,
             // uncleared ones are excluded by omission.
             let vault = match load_vault_for_reads(&root, json, false) {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
             };
-            if let Err(err) = legacy_vault_gate(&vault.root) {
-                print_error(json, Some(&vault.root.display().to_string()), &err)?;
-                return Ok(ExitCode::from(err.exit_code() as u8));
-            }
             if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
                 print_error(
                     json,
@@ -2675,6 +2675,10 @@ fn cmd_find(
             "find requires a non-empty query",
         )));
     }
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
     // read path (`no-ai` records are then excluded by the §12 allowlist).
@@ -2683,10 +2687,6 @@ fn cmd_find(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
-    if let Err(err) = legacy_vault_gate(&vault.root) {
-        print_error(json, Some(&vault_path), &err)?;
-        return Ok(ExitCode::from(err.exit_code() as u8));
-    }
     if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             json,
@@ -4996,6 +4996,10 @@ fn cmd_context(
     include_private: bool,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
+    if let Err(err) = legacy_vault_gate(root) {
+        print_error(cli.json, Some(&root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // Operator mode (#572) loads through the operator read path (the same
     // mechanism as `record show --for-edit`); the default stays the agent
     // read path.
@@ -5003,10 +5007,6 @@ fn cmd_context(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    if let Err(err) = legacy_vault_gate(&vault.root) {
-        print_error(cli.json, Some(&vault.root.display().to_string()), &err)?;
-        return Ok(ExitCode::from(err.exit_code() as u8));
-    }
     // The bundle now parses edges, whose kind list depends on the vault
     // spec. Fail closed on a spec this binary does not implement instead of
     // rendering a partial bundle.
@@ -5100,11 +5100,11 @@ fn cmd_context(
 /// An ambiguous name fails closed with `E_AMBIGUOUS_PERSON` (candidate ids
 /// are opaque, never names).
 fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> {
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    legacy_vault_gate(&vault.root).map_err(anyhow::Error::new)?;
     let matched = match confidant_core::resolve::resolve_person(&vault, query) {
         Ok(m) => m,
         Err(err) => return Err(person_resolve_error(query, err)),
@@ -5165,11 +5165,11 @@ fn validate_alias_kind(kind: &str) -> anyhow::Result<()> {
 /// cleared people sharing a value fail closed with `E_AMBIGUOUS_PERSON`.
 fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow::Result<ExitCode> {
     validate_alias_kind(kind)?;
+    legacy_vault_gate(root).map_err(anyhow::Error::new)?;
     let vault = match load_vault_for_reads(root, cli.json, false) {
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
-    legacy_vault_gate(&vault.root).map_err(anyhow::Error::new)?;
     let id = match confidant_core::resolve::resolve_alias(&vault, kind, value) {
         Ok(m) => m.id,
         Err(err) => return Err(person_resolve_error(value, err)),

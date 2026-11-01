@@ -20,7 +20,7 @@ present, for CI users who want the stricter gate.
 | `E_PARSE` | error | | A ledger line or record file does not match the grammar. |
 | `E_UNREADABLE` | error | | A file is not valid UTF-8 or a directory cannot be read. |
 | `E_CONFIG` | error | | `confidant.toml` is missing a required field, is not valid TOML, or a `[checks]` key/value is unknown, mistyped, or out of range. |
-| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1`. |
+| `E_SPEC_UNSUPPORTED` | error | | `spec` is not `0.1` or `0.2`. |
 | `E_VAULT_LEGACY_ENCRYPTED` | error | | The vault matches the ≤0.7 encrypted-vault shell: a `keys/` tree beyond `.gitkeep`, an `enc:` front-matter header, or an `enc:` ledger line. `check` emits this one finding and stops; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return it as a command error instead of scanning. The message is the whole diagnosis and remedy; the finding carries no file path, id, or record content. |
 | `E_PACK_UNKNOWN` | error | | A listed pack is neither compiled into this CLI nor resolved through `confidant.lock`. The fix hint points at `confidant pack add`. The message may name the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. Not reported when `spec` is unsupported: external packs are not resolved and `check` stops after `E_SPEC_UNSUPPORTED`. |
 | `E_PACK_VERSION` | error | | A listed pack's pinned version is newer than this binary supports, or (for external packs) the pack's `requires_spec` does not include the vault's `spec`. The message names the failing `name@version` exactly as listed in `confidant.toml`; `file` is `confidant.toml`. |
@@ -103,7 +103,7 @@ Command-level error codes (not check findings unless the row says otherwise):
 | `E_INVALID` | 1 | The request is well formed but not valid for this vault. |
 | `E_CONFLICT` | 1 | The request conflicts with stored vault state (including a refused symlink on a write path). |
 | `E_CONFIG` | 1 | `confidant.toml` cannot be parsed as TOML or is missing `spec` / `vault_id`. Semantic `[checks]` problems are the finding of the same code. |
-| `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1`. `check` reports it as a finding; `find` returns this command error and does not scan. |
+| `E_SPEC_UNSUPPORTED` | 1 | Vault `spec` is not `0.1` or `0.2`. `check` reports it as a finding; `find` returns this command error and does not scan. |
 | `E_VAULT_LEGACY_ENCRYPTED` | 1 | The vault matches the ≤0.7 encrypted-vault shell. `check` reports it as one finding; `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return this command error and do not scan. The message is the whole diagnosis and remedy; no file path, id, or record content. |
 | `E_LEDGER_UNREADABLE` | 1 | A ledger file could not be read. `find` returns this command error (code and count only, no path) and no hits. `check` still reports finding `E_UNREADABLE`. |
 | `E_NO_REMOTE` | 1 | `confidant sync` found no git remote, no upstream branch, or no commits to compare. Local-only is a valid setup; nothing is fetched or pushed. |

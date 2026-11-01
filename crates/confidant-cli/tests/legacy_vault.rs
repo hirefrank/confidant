@@ -238,6 +238,31 @@ fn allowlist_resolve_and_alias_refuse_a_legacy_vault() {
     }
 }
 
+/// The legacy gate must run before `load_vault` for the read commands; a
+/// malformed config would otherwise mask the one clear diagnosis with a
+/// load error.
+#[test]
+fn legacy_gate_runs_before_a_load_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = [not valid toml\n",
+    )
+    .unwrap();
+    write_keys_tree(dir.path());
+
+    for (command, args) in [
+        ("find", vec!["find", "Robin", "--json", "--no-input"]),
+        ("allowlist", vec!["allowlist", "--json", "--no-input"]),
+    ] {
+        let out = run(args.as_slice(), dir.path());
+        assert_eq!(out.status.code(), Some(1), "{command}: {out:?}");
+        let v = json_of(&out);
+        assert_legacy_error(&v, command);
+        assert!(!v.to_string().contains("E_CONFIG"), "{v}");
+    }
+}
+
 /// The MCP `check`, `find`, and `context` tools shell out to the same CLI, so
 /// the same gates apply. One legacy vault, three tool calls, three codes.
 #[test]
