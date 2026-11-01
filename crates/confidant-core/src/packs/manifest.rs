@@ -66,7 +66,7 @@ const CORE_VERBS_V2: &[&str] = &["alias", "merge", "stage", "balance", "touch"];
 const CORE_RECORD_TYPES: &[&str] = &["person", "org", "deal", "interaction", "note", "edge"];
 
 /// Pack names reserved for compiled-in packs (PD14). `personal` is the
-/// only built-in; `coaching` became an external pack in #449.
+/// only built-in; every other pack is external (#449).
 const RESERVED_PACK_NAMES: &[&str] = &["personal"];
 
 /// Whether `name` is reserved for a compiled-in pack (PD14). An external
@@ -916,7 +916,7 @@ balance_metrics = ["sessions_remaining"]
 finding_codes = ["E_WRONG", "W_LATE"]
 
 [pack]
-name = "coaching"
+name = "example-pack"
 version = "0.1"
 skill = "SKILL.md"
 
@@ -937,11 +937,11 @@ symmetric = false
 
 [checks]
 [[checks.severity]]
-key = "coaching.wrong_thing"
+key = "example-pack.wrong_thing"
 default = "warning"
 
 [[checks.int]]
-key = "coaching.lookback_days"
+key = "example-pack.lookback_days"
 default = 7
 
 [messages."E_WRONG"]
@@ -958,7 +958,7 @@ default = "late"
     fn parses_valid_manifest() {
         let m = parse_manifest(&valid_toml()).unwrap();
         assert_eq!(m.manifest_version, 1);
-        assert_eq!(m.pack.name, "coaching");
+        assert_eq!(m.pack.name, "example-pack");
         assert_eq!(m.pack.version, "0.1");
         assert_eq!(m.balance_metrics, vec!["sessions_remaining".to_string()]);
         assert_eq!(m.verbs.len(), 2);
@@ -1146,7 +1146,7 @@ default = "x"
     #[test]
     fn rejects_checks_key_wrong_namespace() {
         let text = valid_toml().replace(
-            "key = \"coaching.wrong_thing\"",
+            "key = \"example-pack.wrong_thing\"",
             "key = \"personal.wrong_thing\"",
         );
         let err = parse_manifest(&text).unwrap_err();
@@ -1155,7 +1155,7 @@ default = "x"
 
     #[test]
     fn rejects_checks_key_core_owned() {
-        let text = valid_toml().replace("key = \"coaching.wrong_thing\"", "key = \"as_of\"");
+        let text = valid_toml().replace("key = \"example-pack.wrong_thing\"", "key = \"as_of\"");
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("not namespaced"), "{err:?}");
     }
@@ -1207,8 +1207,8 @@ default = "wrong {id}"
 
     #[test]
     fn rejects_empty_pack_name() {
-        let text = valid_toml().replace("name = \"coaching\"\nversion", "name = \"\"\nversion");
-        // Note: the first `name = "coaching"` is under [pack]; verbs use
+        let text = valid_toml().replace("name = \"example-pack\"\nversion", "name = \"\"\nversion");
+        // Note: the first `name = "example-pack"` is under [pack]; verbs use
         // `name = "session"` so this replace is scoped to the pack table.
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("[pack].name"), "{err:?}");
@@ -1217,8 +1217,8 @@ default = "wrong {id}"
     #[test]
     fn rejects_pack_name_with_at() {
         let text = valid_toml().replace(
-            "[pack]\nname = \"coaching\"",
-            "[pack]\nname = \"coaching@0.1\"",
+            "[pack]\nname = \"example-pack\"",
+            "[pack]\nname = \"example-pack@0.1\"",
         );
         let err = parse_manifest(&text).unwrap_err();
         assert!(err.to_string().contains("must not contain '@'"), "{err:?}");
@@ -1353,8 +1353,8 @@ default_fix = "{fix}"
         assert!(err.to_string().contains("reserved"), "{err:?}");
     }
 
-    /// #449: `coaching` is no longer reserved; the shipped external pack
-    /// must load under its real name.
+    /// #449: `coaching` is not reserved; an out-of-tree pack must load
+    /// under its real name.
     #[test]
     fn external_accepts_coaching_name() {
         let text = valid_v2_toml()

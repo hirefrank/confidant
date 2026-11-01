@@ -1,10 +1,9 @@
-//! `activity-gap` (#448): a paid client with no session lately.
+//! `activity-gap` (#448): a paid client with no activity lately.
 //!
-//! Reproduces `coaching@0.1`'s `paid_session_gap`: the gap clock is the
-//! later of the client's last consuming entry and their latest opener, the
-//! window edge is inclusive, a client with no remaining units and no
-//! pay-per-session history is not a paid client at all, and a spent
-//! package does not warn once it no longer counts as paid.
+//! The gap clock is the later of the client's last consuming entry and their
+//! latest opener, the window edge is inclusive, a client with no remaining
+//! units and no pay-per-session history is not a paid client at all, and a
+//! spent package does not warn once it no longer counts as paid.
 //!
 //! The per-person arithmetic (remaining units, the `pps` lookback) is
 //! [`super::ledger`]'s, driven by the `ledger-balance` rule that owns
@@ -187,7 +186,7 @@ impl RuleKind for ActivityGapKind {
                 continue;
             }
             // The gap clock uses the activity and start verbs. When they
-            // are the balance rule's own verbs (the coaching case, #449),
+            // are the balance rule's own verbs (the common case, #449),
             // use the shared fold's already-proven helpers; only a pack
             // that sets different verbs needs the vault scan, which walks
             // the canonical person's merge group.

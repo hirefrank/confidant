@@ -1236,7 +1236,7 @@ class QmdPreflightTest(unittest.TestCase):
         # mode (fix round: default-query runs never write one).
         report = self._run_main(vault, stub, self._closed_port_url(),
                                 extra=("--persist", "--query",
-                                       "coaching"))
+                                       "notes"))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertTrue(report["offline_recommended"])
         self.assertTrue(report["hybrid_cache_complete"])
@@ -1498,7 +1498,7 @@ class QmdPreflightTest(unittest.TestCase):
         stub = self._stub("stub-hits-explicit.py",
                           [{"path": "x.md", "score": 1.0}])
         report = self._run_main(vault, stub, self._closed_port_url(),
-                                extra=("--persist", "--query", "coaching"))
+                                extra=("--persist", "--query", "notes"))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         text = cfg.read_text(encoding="utf-8")
@@ -1629,7 +1629,7 @@ class QmdPreflightTest(unittest.TestCase):
                           [{"path": "x.md", "score": 1.0}])
         report = self._run_main(vault, stub, self._closed_port_url(),
                                 extra=("--persist", "--query",
-                                       "coaching"))
+                                       "notes"))
         self.assertEqual(report["recommended_mode"], "hybrid")
         self.assertEqual(report["persisted"]["default_mode"], "hybrid")
         self.assertTrue(report["persisted"]["offline"])
@@ -1716,7 +1716,7 @@ class QmdPreflightTest(unittest.TestCase):
         bindir = self._fake_qmd_on_path()
         argv = ["--vault", str(vault),
                 "--query-script", str(stub),
-                "--query", "coaching",
+                "--query", "notes",
                 "--hub-url", self._closed_port_url(), "--json", "--persist"]
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.dict(os.environ, {
