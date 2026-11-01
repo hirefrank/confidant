@@ -76,6 +76,132 @@ impl Vault {
     }
 }
 
+/// The placeholder a freshly initialized `keys/` tree may hold. Alone it
+/// is not key material.
+const KEYS_PLACEHOLDER: &str = ".gitkeep";
+
+/// How much of a candidate file the legacy sniff reads. Enough for any
+/// front-matter envelope header, and bounded so `doctor` never slurps a
+/// large ledger.
+const LEGACY_SNIFF_BYTES: u64 = 16 * 1024;
+
+/// Whether `root` looks like a vault written by the encrypted Confidant
+/// (≤0.7), which this plaintext-only CLI cannot read (#809).
+///
+/// Two strong, cheap signals, both read-only:
+///
+/// - a `keys/` tree holding anything besides [`KEYS_PLACEHOLDER`] (key
+///   material, even a half-initialized tree);
+/// - an `enc:` envelope header in a record file's front matter, or an
+///   `enc:`-prefixed line in a ledger file.
+///
+/// A plaintext vault never produces either. The sniff never decrypts,
+/// never reads a note body, and never returns names or paths; unreadable
+/// entries are skipped (a broken vault is `check`'s problem).
+pub fn is_legacy_encrypted_vault(root: &Path) -> bool {
+    has_legacy_key_material(&root.join("keys"))
+        || COLLECTIONS
+            .iter()
+            .any(|collection| has_envelope_in(&root.join(collection)))
+        || has_ledger_envelope(&root.join("ledger"))
+}
+
+fn has_legacy_key_material(keys_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(keys_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy() != KEYS_PLACEHOLDER)
+}
+
+fn has_envelope_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if has_envelope_in(&path) {
+                return true;
+            }
+        } else if file_type.is_file() && has_envelope_frontmatter(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Front matter opens with `---` and carries an `enc:` header line before
+/// the closing `---`. That is the shell the encrypted CLI wrote; a body
+/// line that happens to mention `enc:` never matches.
+fn has_envelope_frontmatter(path: &Path) -> bool {
+    let head = read_legacy_head(path);
+    let Ok(text) = std::str::from_utf8(&head) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return false;
+    }
+    for line in lines {
+        if line == "---" {
+            // The front matter closed without an envelope header.
+            return false;
+        }
+        if line.split_once(':').map(|(key, _)| key.trim()) == Some("enc") {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_ledger_envelope(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if has_ledger_envelope(&path) {
+                return true;
+            }
+        } else if file_type.is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("cfd")
+        {
+            let head = read_legacy_head(&path);
+            let Ok(text) = std::str::from_utf8(&head) else {
+                continue;
+            };
+            if text
+                .lines()
+                .any(|line| line.trim_start().starts_with("enc:"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn read_legacy_head(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::with_capacity(4096);
+    if file.take(LEGACY_SNIFF_BYTES).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
 pub fn load_vault(root: &Path) -> Result<Vault, crate::error::DomainError> {
     let root = root
         .canonicalize()
@@ -1501,7 +1627,10 @@ fn is_month_cfd(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::Prefix;
-    use super::{is_month_cfd, is_trusted_component, redacted_filename, COLLECTIONS};
+    use super::{
+        is_legacy_encrypted_vault, is_month_cfd, is_trusted_component, redacted_filename,
+        COLLECTIONS,
+    };
     use std::path::Path;
 
     #[test]
@@ -1606,5 +1735,81 @@ mod tests {
                 "main filename not trusted: {filename}"
             );
         }
+    }
+
+    // #809: the legacy encrypted-vault sniff. Fake key material and a
+    // fake envelope header only; the sniff never decrypts.
+
+    #[test]
+    fn legacy_sniff_detects_key_material() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys/shared")).unwrap();
+        std::fs::write(dir.path().join("keys/operator.toml"), "fake operator\n").unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_bare_keys_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+        std::fs::write(dir.path().join("keys/.gitkeep"), "").unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_detects_an_envelope_frontmatter_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\nenc: xchacha20poly1305\nkey_id: p-01M3TC5H00MPJG000000000101/e0\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\n\nAQID\n",
+        )
+        .unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_body_line_that_mentions_enc() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\n---\n\nA note that mentions enc: in prose, not a header.\n",
+        )
+        .unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_detects_an_enc_ledger_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            "enc: xchacha20poly1305\n",
+        )
+        .unwrap();
+        assert!(is_legacy_encrypted_vault(dir.path()));
+    }
+
+    #[test]
+    fn legacy_sniff_ignores_a_plaintext_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let person = dir.path().join("people/p-01M3TC5H00MPJG000000000101");
+        std::fs::create_dir_all(&person).unwrap();
+        std::fs::write(
+            person.join("profile.md"),
+            "---\nid: p-01M3TC5H00MPJG000000000101\ntype: person\nname: Robin Example\n---\n\nFake person.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("ledger/2026")).unwrap();
+        std::fs::write(
+            dir.path().join("ledger/2026/10.cfd"),
+            "2026-10-01 touch p-01M3TC5H00MPJG000000000101 call\n",
+        )
+        .unwrap();
+        assert!(!is_legacy_encrypted_vault(dir.path()));
     }
 }
