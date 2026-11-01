@@ -156,11 +156,11 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "context",
-            "Context bundle for one person. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
+            "Context bundle for one person or org. Honors no-ai; private data is stripped by default. Honors the connection's pack scope; an optional packs list can only narrow it.",
             obj(
                 &["person"],
                 json!({
-                    "person": str_prop("Opaque person id (p-…)."),
+                    "person": str_prop("Opaque person or org id (p-… or o-…)."),
                     "exclude_private": {"type": "boolean", "description": "Strip name, profile, and bodies. Default true: private data is stripped unless explicitly set to false."},
                     "packs": {"type": "array", "items": {"type": "string"}, "description": "Pack scope for this call (subset of the connection's scope). Unset = the connection's scope."},
                 }),
@@ -804,6 +804,27 @@ mod tests {
         // Non-boolean values fail closed toward stripping.
         assert!(context_strips_private(&json!({"exclude_private": "yes"})));
         assert!(context_strips_private(&json!({"exclude_private": 1})));
+    }
+
+    /// #813: the existing `person` parameter carries an org id unchanged;
+    /// no second tool or parameter is needed.
+    #[test]
+    fn context_argv_accepts_an_org_id() {
+        let org = "o-01M3TC5H00MPJG000000000901";
+        let argv = build_argv(
+            "context",
+            &json!({"person": org, "exclude_private": true}),
+            Path::new("/tmp/vault"),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(argv.first().map(String::as_str), Some("--json"));
+        assert!(argv.iter().any(|arg| arg == org), "{argv:?}");
+        assert!(
+            argv.iter().any(|arg| arg == "--exclude-private"),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|arg| arg == "--for-operator"), "{argv:?}");
     }
 
     #[test]

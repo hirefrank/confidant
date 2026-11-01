@@ -5377,10 +5377,10 @@ fn plaintext_vault_notes_mode_hides_unflagged_notes_and_interactions_from_find_a
     // context: person name and profile are shown; only the explicit-false note is included.
     let ada_id = confidant_core::id::RecordId::parse(ADA).unwrap();
     let ctx = build_context(&vault, &ada_id, true, &PackScope::All, false).unwrap();
-    assert_eq!(ctx.person.name.as_deref(), Some("Ada Example"));
-    assert!(!ctx.person.no_ai);
-    assert!(ctx
-        .person
+    let ctx_person = ctx.person.as_ref().unwrap();
+    assert_eq!(ctx_person.name.as_deref(), Some("Ada Example"));
+    assert!(!ctx_person.no_ai);
+    assert!(ctx_person
         .profile
         .as_deref()
         .unwrap_or("")
@@ -7763,7 +7763,41 @@ fn personal_view_0_2(root: &Path, person: &str, as_of: &str) -> Value {
     let vault = load_vault(root).unwrap();
     let id = confidant_core::id::RecordId::parse(person).unwrap();
     let as_of = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").unwrap();
-    build_personal_view(&vault, &id, &id, as_of, &fields_0_2()).expect("view serializes")
+    build_personal_view(
+        &vault,
+        &id,
+        &id,
+        as_of,
+        &fields_0_2(),
+        &["touch", "session"],
+    )
+    .expect("view serializes")
+}
+
+/// #799 step 1: the personal view's contact classification is the pack's
+/// declared `event_verbs`, not a core `touch || session` literal. A verb
+/// outside the declared list does not move `last_touch`.
+#[test]
+fn personal_view_contact_verbs_are_pack_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "confidant.toml", PERSONAL_TOML);
+    person(dir.path(), ADA, "Ada Example");
+    write(
+        dir.path(),
+        "ledger/2026/10.cfd",
+        &format!("2026-10-01 touch {ADA} call\n2026-10-05 session {ADA} 60m paid\n"),
+    );
+    let vault = load_vault(dir.path()).unwrap();
+    let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
+    let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
+    let fields = fields_0_2();
+
+    let touch_only = build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch"]).unwrap();
+    assert_eq!(touch_only["last_touch"], "2026-10-01");
+
+    let both =
+        build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch", "session"]).unwrap();
+    assert_eq!(both["last_touch"], "2026-10-05");
 }
 
 /// A person carrying the whole 0.2 field set (fake data). `no_ai` adds
@@ -7975,7 +8009,8 @@ fn context_view_merged_person_uses_canonical() {
     let bea = confidant_core::id::RecordId::parse(BEA).unwrap();
     let as_of = chrono::NaiveDate::parse_from_str("2026-10-08", "%Y-%m-%d").unwrap();
     let fields = fields_0_2();
-    let view = build_personal_view(&vault, &ada, &ada, as_of, &fields).unwrap();
+    let view =
+        build_personal_view(&vault, &ada, &ada, as_of, &fields, &["touch", "session"]).unwrap();
 
     // Ada's own relationship wins over Bea's.
     assert_eq!(view["relationship"], "friend", "{view}");
@@ -7986,7 +8021,8 @@ fn context_view_merged_person_uses_canonical() {
     assert_eq!(view["last_touch"], "2026-10-05", "{view}");
 
     // Asking for the merged-away id serves the same canonical view.
-    let folded = build_personal_view(&vault, &bea, &ada, as_of, &fields).unwrap();
+    let folded =
+        build_personal_view(&vault, &bea, &ada, as_of, &fields, &["touch", "session"]).unwrap();
     assert_eq!(folded, view);
 }
 
@@ -8119,8 +8155,9 @@ fn context_view_cleared_person_hides_touch_content() {
     let vault = load_vault(dir.path()).unwrap();
     let ada = confidant_core::id::RecordId::parse(ADA).unwrap();
     let bundle = build_context(&vault, &ada, true, &PackScope::All, false).unwrap();
-    assert!(bundle.person.name.is_none());
-    assert!(bundle.person.profile.is_none());
+    let bundle_person = bundle.person.as_ref().unwrap();
+    assert!(bundle_person.name.is_none());
+    assert!(bundle_person.profile.is_none());
     assert!(bundle.interactions.is_empty(), "{:?}", bundle.interactions);
     let dumped = serde_json::to_string(&bundle).unwrap();
     for leak in ["AI_HIDDEN_PROFILE", "AI_HIDDEN_IXN", "AI_HIDDEN_BODY"] {

@@ -503,6 +503,218 @@ fn context_scoped_to_example_pack_filters_notes() {
 
 const BEA: &str = "p-01M3TC5H00MPJG000H24000001";
 const EDGE_FRIEND: &str = "e-01M3TC5H00MPJG00E100000000";
+const CLI_ORG: &str = "o-01M3TC5H00MPJG000000000901";
+const CLI_WORKS: &str = "e-01M3TC5H00MPJG00E200000000";
+
+/// A 0.2 vault with two people and one org, plus a person→org `works_at`
+/// edge. Fake data only.
+fn entity_vault() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("confidant.toml"),
+        "spec = \"0.2\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n\n[checks]\nas_of = \"2026-10-08\"\n",
+    )
+    .unwrap();
+    for (id, name) in [(ADA, "Ada Example"), (BEA, "Bea Demo")] {
+        let d = root.join(format!("people/{id}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("profile.md"),
+            format!("---\nid: {id}\ntype: person\nname: {name}\n---\n\nFake person.\n"),
+        )
+        .unwrap();
+    }
+    let org_dir = root.join(format!("orgs/{CLI_ORG}"));
+    std::fs::create_dir_all(&org_dir).unwrap();
+    std::fs::write(
+        org_dir.join("org.md"),
+        format!("---\nid: {CLI_ORG}\ntype: org\nname: Example Studio\n---\n\nFake org body.\n"),
+    )
+    .unwrap();
+    let edge_dir = root.join(format!("edges/{CLI_WORKS}"));
+    std::fs::create_dir_all(&edge_dir).unwrap();
+    std::fs::write(
+        edge_dir.join("edge.md"),
+        format!(
+            "---\nid: {CLI_WORKS}\ntype: edge\na: {ADA}\nb: {CLI_ORG}\nkind: works_at\nsince: 2024-01-01\n---\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn context_org_json_shape() {
+    let dir = entity_vault();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["entity"]["id"], CLI_ORG);
+    assert_eq!(v["entity"]["kind"], "org");
+    assert_eq!(v["entity"]["name"], "Example Studio");
+    assert!(v.get("person").is_none(), "org bundle has no person alias");
+    assert!(v["packs"].as_object().unwrap().is_empty());
+    assert!(v["touchpoints"].as_array().unwrap().is_empty());
+    assert!(v["aliases"].as_array().unwrap().is_empty());
+
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["id"], CLI_WORKS);
+    assert_eq!(edges[0]["kind"], "works_at");
+    assert_eq!(edges[0]["direction"], "in");
+    assert_eq!(edges[0]["other"]["id"], ADA);
+    assert_eq!(edges[0]["other"]["kind"], "person");
+    assert_eq!(edges[0]["other"]["name"], "Ada Example");
+    assert_eq!(edges[0]["since"], "2024-01-01");
+    assert!(edges[0]["until"].is_null());
+}
+
+#[test]
+fn context_person_json_keeps_person_and_adds_entity_and_edges() {
+    let dir = entity_vault();
+    let v = run_json(&["context", ADA], dir.path());
+    assert_eq!(v["person"]["id"], ADA);
+    assert_eq!(v["person"]["name"], "Ada Example");
+    assert_eq!(v["entity"]["kind"], "person");
+    assert_eq!(v["entity"]["name"], "Ada Example");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["direction"], "out");
+    assert_eq!(edges[0]["other"]["id"], CLI_ORG);
+    assert_eq!(edges[0]["other"]["kind"], "org");
+}
+
+#[test]
+fn context_org_omits_edge_to_a_hidden_person() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join(format!("people/{ADA}/profile.md")),
+        format!(
+            "---\nid: {ADA}\ntype: person\nname: Ada Example\nno-ai: true\n---\n\nFake person.\n"
+        ),
+    )
+    .unwrap();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert!(v["edges"].as_array().unwrap().is_empty(), "{v}");
+    let dumped = v.to_string();
+    assert!(!dumped.contains(ADA), "{dumped}");
+    assert!(!dumped.contains("Ada Example"), "{dumped}");
+}
+
+#[test]
+fn context_org_exclude_private_strips_names_and_bodies() {
+    let dir = entity_vault();
+    let v = run_json(&["context", CLI_ORG, "--exclude-private"], dir.path());
+    assert!(v["entity"]["name"].is_null(), "{v}");
+    assert!(v["entity"]["profile"].is_null(), "{v}");
+    let edge = &v["edges"][0];
+    assert_eq!(edge["id"], CLI_WORKS);
+    assert_eq!(edge["kind"], "works_at");
+    assert_eq!(edge["since"], "2024-01-01");
+    assert!(edge["other"]["id"] == ADA);
+    assert!(edge["other"]["name"].is_null(), "{v}");
+}
+
+#[test]
+fn context_deal_is_not_found() {
+    let dir = entity_vault();
+    let deal = "d-01M3TC5H00MPJG00248G000004";
+    let d = dir.path().join(format!("deals/{deal}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("deal.md"),
+        format!("---\nid: {deal}\ntype: deal\nname: Fake Deal\n---\n"),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["context", deal, "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no person or org"),
+        "{v}"
+    );
+}
+
+#[test]
+fn context_unsupported_spec_fails() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"9.9\"\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n",
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args(["context", CLI_ORG, "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_SPEC_UNSUPPORTED");
+}
+
+#[test]
+fn context_org_by_name_is_not_resolved_in_phase_one() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", "Example Studio", "--json", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "E_NOT_FOUND");
+}
+
+#[test]
+fn context_org_bundle_in_zero_one_has_no_edges() {
+    let dir = entity_vault();
+    std::fs::write(
+        dir.path().join("confidant.toml"),
+        "spec = \"0.1\"\npacks = []\nvault_id = \"01M3TC5H00MPJG005VQC00000B\"\n",
+    )
+    .unwrap();
+    let v = run_json(&["context", CLI_ORG], dir.path());
+    assert_eq!(v["entity"]["kind"], "org");
+    assert!(v["edges"].as_array().unwrap().is_empty(), "{v}");
+}
+
+#[test]
+fn context_org_text_output_names_the_kind_and_counts_edges() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", CLI_ORG, "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Example Studio (org)"), "{text}");
+    assert!(text.contains("edges: 1"), "{text}");
+    assert!(!text.contains("[no-ai]"), "{text}");
+}
+
+#[test]
+fn context_operator_does_not_badge_a_visible_person() {
+    let dir = entity_vault();
+    let out = Command::new(bin())
+        .args(["context", ADA, "--for-operator", "--no-input", "--vault"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Ada Example"), "{text}");
+    assert!(!text.contains("[no-ai]"), "{text}");
+}
 
 /// A vault with personal-owned data — a personal field (`relationship`), a
 /// personal edge kind (`friend`), and a `touch` ledger line — next to a

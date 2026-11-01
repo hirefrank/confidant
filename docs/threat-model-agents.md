@@ -23,6 +23,9 @@ but narrower than it sounds.
   allowlist, or the search corpus — in either the CLI or MCP (though
   `context` still serves the person's derived ledger metadata; see
   `docs/privacy.md`).
+- An edge appears in a context bundle only when both endpoints are cleared.
+  A `no-ai: true` endpoint drops the edge from every bundle, including the
+  other endpoint's; it is not counted or anonymized (#813).
 - `no-ai` does not hide a record from the vault's owner.
 - `check` blocks a commit on errors, never on warnings, and verifies
   coherence, not truthfulness.
@@ -39,7 +42,7 @@ server configured) works through one fixed tool list.
 | Can | Cannot | Enforced by |
 |---|---|---|
 | Call 10 tools: `check`, `find`, `context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`, `doctor`, `pack_skill` | Call any other tool, or grant itself a new capability | `tools()` in `crates/confidant-cli/src/mcp.rs` — the list is a literal in the binary |
-| Read a person's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
+| Read a person's or org's context bundle, with private data stripped by default | Read private data silently — it must pass `exclude_private: false`, which is visible in its own tool call | `context_strips_private()` in `crates/confidant-cli/src/mcp.rs` |
 | Append a session or touchpoint line, bulk-append ledger lines, or add a note — one commit each, gated by `check` | Write without `check`, or skip the commit | `crates/confidant-core/src/write.rs` — change → `check` → one `git add` + `git commit`; a failing check rolls the files back |
 | Pass `exclude_private: false` and read private data | Be stopped from doing so by any vault setting — no vault config removes the opt-out | Current behavior; see Known gaps |
 
