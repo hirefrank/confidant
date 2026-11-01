@@ -1,8 +1,8 @@
 //! #665: `confidant sync`, the explicit vault sync boundary.
 //!
 //! Read-only by default (fetch + report), `--pull`/`--push` explicit and
-//! confirmed, and a plaintext vault is refused before any network access.
-//! Every remote here is a local `file://` bare repository; all data is fake.
+//! confirmed. Every remote here is a local `file://` bare repository; all
+//! data is fake.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
