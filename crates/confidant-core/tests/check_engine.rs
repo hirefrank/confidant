@@ -657,6 +657,46 @@ fn unsupported_spec_stops_after_spec_findings() {
     assert!(!c.contains(&"E_PARSE".into()), "{c:?}");
 }
 
+/// #821: a ≤0.7 encrypted vault is one clear finding, not a stream of parse
+/// errors, and the finding carries no file path, id, or record content.
+#[test]
+fn legacy_encrypted_vault_is_one_clear_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "confidant.toml",
+        "spec = \"0.1\"\nvault_id = \"test-vault\"\n",
+    );
+    write(
+        dir.path(),
+        &format!("people/{ADA}/profile.md"),
+        &format!(
+            "---\nid: {ADA}\ntype: person\nname: Robin Example\nenc: xchacha20poly1305\nkey_id: {ADA}/e0\nnonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n---\n\nAQID\n"
+        ),
+    );
+    std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+    std::fs::write(dir.path().join("keys/operator.toml"), "fake operator\n").unwrap();
+    write(dir.path(), "ledger/2026/10.cfd", "enc: xchacha20poly1305\n");
+
+    let vault = load_vault(dir.path()).unwrap();
+    let report = check_vault(&vault, &CheckOptions::default());
+    assert!(!report.ok);
+    assert_eq!(report.summary.errors, 1);
+    assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+    let finding = &report.findings[0];
+    assert_eq!(finding.code, FindingCode::VaultLegacyEncrypted);
+    assert_eq!(finding.code.as_str(), "E_VAULT_LEGACY_ENCRYPTED");
+    assert!(finding.file.is_none());
+    assert!(finding.line.is_none());
+    assert!(finding.id.is_none());
+    assert!(finding.message.contains("encrypted Confidant ≤0.7"));
+    assert!(finding.message.contains("confidant init"));
+    let dumped = serde_json::to_string(&report).unwrap();
+    assert!(!dumped.contains("people/"), "{dumped}");
+    assert!(!dumped.contains("Robin Example"), "{dumped}");
+    assert!(!dumped.contains("E_PARSE"), "{dumped}");
+}
+
 /// #497: an unsupported spec skips external-pack resolution entirely, so a
 /// listed external must not surface as `E_PACK_UNKNOWN` (or as any other
 /// pack finding) — the spec finding already fails `check`. Even a fully

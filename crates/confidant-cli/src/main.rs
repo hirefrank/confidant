@@ -850,6 +850,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(v) => v,
                 Err(code) => return Ok(code),
             };
+            if let Err(err) = legacy_vault_gate(&vault.root) {
+                print_error(json, Some(&vault.root.display().to_string()), &err)?;
+                return Ok(ExitCode::from(err.exit_code() as u8));
+            }
             if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
                 print_error(
                     json,
@@ -1170,6 +1174,21 @@ fn load_vault_for_reads(
             let _ = print_error(json, Some(&root.display().to_string()), &err);
             Err(ExitCode::from(err.exit_code() as u8))
         }
+    }
+}
+
+/// Refuse a vault written by the encrypted Confidant (≤0.7) (#821).
+///
+/// The sniff is read-only and returns only a boolean; the command error
+/// carries the same message as the `check` finding and the `doctor` check.
+/// Every agent-facing read calls this after loading and before reading
+/// content, so a legacy vault fails closed instead of returning an empty or
+/// partial result.
+fn legacy_vault_gate(root: &Path) -> Result<(), DomainError> {
+    if confidant_core::vault::is_legacy_encrypted_vault(root) {
+        Err(DomainError::vault_legacy_encrypted())
+    } else {
+        Ok(())
     }
 }
 
@@ -2664,6 +2683,10 @@ fn cmd_find(
         Err(code) => return Ok(code),
     };
     let vault_path = vault.root.display().to_string();
+    if let Err(err) = legacy_vault_gate(&vault.root) {
+        print_error(json, Some(&vault_path), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
         print_error(
             json,
@@ -4980,6 +5003,10 @@ fn cmd_context(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    if let Err(err) = legacy_vault_gate(&vault.root) {
+        print_error(cli.json, Some(&vault.root.display().to_string()), &err)?;
+        return Ok(ExitCode::from(err.exit_code() as u8));
+    }
     // The bundle now parses edges, whose kind list depends on the vault
     // spec. Fail closed on a spec this binary does not implement instead of
     // rendering a partial bundle.
@@ -5077,6 +5104,7 @@ fn cmd_resolve(cli: &Cli, root: &Path, query: &str) -> anyhow::Result<ExitCode> 
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    legacy_vault_gate(&vault.root).map_err(anyhow::Error::new)?;
     let matched = match confidant_core::resolve::resolve_person(&vault, query) {
         Ok(m) => m,
         Err(err) => return Err(person_resolve_error(query, err)),
@@ -5141,6 +5169,7 @@ fn cmd_alias_resolve(cli: &Cli, root: &Path, kind: &str, value: &str) -> anyhow:
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    legacy_vault_gate(&vault.root).map_err(anyhow::Error::new)?;
     let id = match confidant_core::resolve::resolve_alias(&vault, kind, value) {
         Ok(m) => m.id,
         Err(err) => return Err(person_resolve_error(value, err)),
@@ -5188,9 +5217,7 @@ fn legacy_encrypted_vault_check() -> DoctorCheck {
     DoctorCheck {
         id: "legacy-encrypted-vault",
         status: "error",
-        message: "this vault was written by an encrypted Confidant ≤0.7; \
-                  re-create it with `confidant init`."
-            .to_owned(),
+        message: confidant_core::error::LEGACY_ENCRYPTED_VAULT_MESSAGE.to_owned(),
         fix: None,
     }
 }

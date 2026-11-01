@@ -25,6 +25,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 ### Changed
 - The personal context view's contact classification now comes from the pack's declared `cadence-overdue` `event_verbs`, not a core `touch || session` literal (#799 step 1). `log session` and its fate are unchanged.
 
+### Fixed
+- A vault written by the encrypted Confidant (≤0.7) now fails closed on every read path: `check` reports one `E_VAULT_LEGACY_ENCRYPTED` finding instead of a parse-error stream, and `find`, `context`, `allowlist`, `resolve`, and `alias resolve` return the same code instead of an empty or partial result (#821).
+
 ## [0.7.2] - 2026-10-30
 
 ### Added
