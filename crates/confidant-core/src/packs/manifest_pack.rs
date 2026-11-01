@@ -17,7 +17,7 @@ use crate::context::ledger_sessions::LedgerSessionsParams;
 use crate::id::{Prefix, RecordId};
 use crate::ledger::LedgerEntry;
 use crate::packs::groups::MergeGroups;
-use crate::packs::manifest::{PackManifest, PackOrigin};
+use crate::packs::manifest::{entity_prefix, PackManifest, PackOrigin};
 use crate::packs::rules::ledger::{self, LedgerFacts};
 use crate::packs::{EdgeKind, Pack, PackState};
 use crate::vault::{SourcedEntry, Vault};
@@ -109,12 +109,31 @@ pub(crate) fn build_manifest_pack(
         .filter_map(|r| r.params.get("open_verb").and_then(|v| v.as_str()))
         .map(|v| leak_str(v.to_owned()))
         .collect();
+    // `validate_edge_endpoints` already refused unknown types, so the
+    // conversion below cannot see one. Absent declarations keep the
+    // historical person↔person rule.
+    let endpoint_slice = |names: &[String]| -> &'static [Prefix] {
+        let prefixes: Vec<Prefix> = names
+            .iter()
+            .map(|name| entity_prefix(name).expect("edge endpoint type validated at manifest load"))
+            .collect();
+        Box::leak(prefixes.into_boxed_slice())
+    };
+    let person_only: &'static [Prefix] = crate::packs::PERSON_ENDPOINT;
     let edge_kinds: Vec<EdgeKind> = manifest
         .edge_kinds
         .iter()
-        .map(|e| EdgeKind {
-            name: leak_str(e.name.clone()),
-            symmetric: e.symmetric,
+        .map(|e| {
+            let (from, to) = match (&e.from, &e.to) {
+                (Some(from), Some(to)) => (endpoint_slice(from), endpoint_slice(to)),
+                _ => (person_only, person_only),
+            };
+            EdgeKind {
+                name: leak_str(e.name.clone()),
+                symmetric: e.symmetric,
+                from,
+                to,
+            }
         })
         .collect();
     let finding_codes: Vec<&'static str> = manifest

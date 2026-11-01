@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::check::{sort_findings, Finding, FindingCode, Severity};
+use crate::config::SpecVersion;
 use crate::error::DomainError;
 use crate::id::{
     add_bare_ulid_windows, person_id_from_path, scan_ids, scan_prefixed_line, IdToken, Prefix,
@@ -92,6 +93,8 @@ struct Allowlist<'a> {
     enabled: Vec<&'a dyn crate::packs::Pack>,
     /// Note id → packs owning a ledger line that references it.
     linkage: HashMap<RecordId, BTreeSet<OwnerKey>>,
+    /// Vault spec; core edge-kind ownership depends on it (#813).
+    spec: SpecVersion,
 }
 
 /// Unicode case-insensitive substring scan. Hits are ordered by path, then line.
@@ -240,7 +243,7 @@ pub fn cleared_record_owners(vault: &Vault) -> BTreeMap<String, BTreeSet<OwnerKe
         if allow.cleared.contains(&rec.id) {
             out.insert(
                 rec.path.clone(),
-                record_owners(rec, &allow.linkage, &allow.enabled),
+                record_owners(rec, &allow.linkage, &allow.enabled, allow.spec),
             );
         }
     }
@@ -397,6 +400,7 @@ impl<'a> Allowlist<'a> {
             no_ai_hidden: HashSet::new(),
             enabled,
             linkage,
+            spec: vault.spec_version().unwrap_or(SpecVersion::V01),
         };
         allow.cleared = compute_cleared(&allow);
         // Operator mode only (#593): the agent's ledger allowlist, from the
@@ -1084,9 +1088,12 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
                 return false;
             }
             let rec = &allow.vault.records[id];
-            return allow
-                .scope
-                .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
+            return allow.scope.allows(&record_owners(
+                rec,
+                &allow.linkage,
+                &allow.enabled,
+                allow.spec,
+            ));
         }
         return false;
     }
@@ -1094,9 +1101,12 @@ fn finding_kept_verbatim(finding: &Finding, allow: &Allowlist<'_>) -> bool {
         if let Ok(id) = RecordId::parse(raw) {
             if let Some(rec) = allow.vault.records.get(&id) {
                 return allow.cleared.contains(&id)
-                    && allow
-                        .scope
-                        .allows(&record_owners(rec, &allow.linkage, &allow.enabled));
+                    && allow.scope.allows(&record_owners(
+                        rec,
+                        &allow.linkage,
+                        &allow.enabled,
+                        allow.spec,
+                    ));
             }
         }
     }
@@ -1130,7 +1140,7 @@ fn scan_record(
     };
     // Body lines share the record's owners; front-matter lines filter
     // per-field (#178). Computed once: the body owner set.
-    let body_owners = record_owners(rec, &allow.linkage, &allow.enabled);
+    let body_owners = record_owners(rec, &allow.linkage, &allow.enabled, allow.spec);
     let body_visible = allow.scope.allows(&body_owners);
     // #178 fix round (Silas review on #246): notes and interactions are
     // visible as whole records only. Per-field front-matter filtering

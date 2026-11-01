@@ -13,6 +13,9 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Removed commands: `confidant keys`, `recover`, `reset`, `inbox`, and `reindex`; `alias add` is gone, and `alias resolve` now matches the plain front-matter contact fields (`emails`/`phones`/`links`/`handles`) and names. `E_PLAINTEXT_REMOTE` is gone, so `sync --push` works against any git remote.
 - A vault written by an encrypted Confidant (0.7.x and earlier) must be re-created with `confidant init`; there is no migration. The now-unknown `[crypto]` table is ignored, and the retired finding codes (`E_KEY_COMMITMENT`, `E_ENVELOPE`, `E_REINDEX_REFUSED`, `E_PLAINTEXT_REMOTE`, `E_INBOX_*`, `E_ALIAS_PLAINTEXT`, `E_ALIAS_COLLISION`, `W_SKIPPED_ENCRYPTED`, `W_PARTIAL_RESULTS`) are reserved and must not be reused by packs.
 
+### Added
+- Entity edge endpoints (spec 0.2, #813): an edge's `a` / `b` may now be person or org IDs, constrained by the edge kind. 0.2 core kinds add `works_at`, `founder_of`, `investor_in`, and `advisor_to` (directed person→org); pack `[[edge_kinds]]` gain optional `from` / `to` type arrays (absent means the historical person↔person rule, and symmetric kinds must declare equal sets). 0.1 vaults are unchanged and still readable; `confidant init` now writes `spec = "0.2"`, and an existing vault opts in by changing that one line. In 0.2, `check` canonicalizes merge mappings for `E_SELF_EDGE` / `E_DUPLICATE_EDGE`; 0.1 keeps the raw comparison. A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, or a 0.1 vault rejects it with `E_PACK_VERSION`.
+
 ## [0.7.2] - 2026-10-30
 
 ### Added

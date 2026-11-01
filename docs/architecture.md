@@ -405,9 +405,29 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Consequences.** Nothing here needs to defend against a co-tenant. Anything two operators must not see together belongs in two vaults. Revisit this ADR before adding any multi-user feature.
 
+### ADR-17. Edges connect entities, not just people (spec 0.2).
+
+**Door:** One-way (once a vault holds an org edge, the format is fixed).
+
+**Context.** Edges were person↔person only: `check` rejected any other ID prefix, and the core kinds were `married`, `introduced`, and `colleague`. Orgs were therefore unlinkable islands. The pilot vault (#752) made the cost concrete: the only person↔org connection was a free-text `company` field, so two people at the same org did not resolve together and role history had nowhere to live. #796 decided the domain model should generalize in two phases; this ADR records phase 1, entity endpoints (#813). Phase 2, pack-definable record types, is separate.
+
+**Decision.**
+
+- Phase 1 declares **person and org** as edge endpoint entities. Deals, notes, interactions, edges, and packages are not endpoints; a place/thing type arrives with phase 2.
+- The edge record does **not** change: `a`, `b`, `kind`, `since`, `until`, no body, no `no-ai`. The kind declares which endpoint types each side allows.
+- Core ships four directed person→org kinds in 0.2: `works_at`, `founder_of`, `investor_in`, `advisor_to`. The 0.1 kind list is frozen.
+- Pack kinds declare optional `from`/`to` type sets. Absent means person↔person, so every existing pack keeps its meaning.
+- Spec 0.2 keeps every 0.1 rule. A vault opts in with a one-line `spec` change; `init` writes 0.2. No `migrate` command.
+- Merges redirect at read time. 0.2 `check` canonicalizes self-edges and duplicate relations; 0.1 keeps the raw comparison. No edge file is rewritten.
+- Privacy is unchanged: an edge is agent-visible only when both endpoints are cleared. Edges stay `no-ai`-free and orgs stay `no-ai`-free; hiding a single relation or an org is a separate privacy review.
+
+**Alternatives considered.** (a) Keep edges person-only: fails #752 and blocks the relationship graph. (b) Make record types pack-definable first: larger and slower; edges are the smaller unlock. (c) Store `a_type`/`b_type` on the edge: duplicates the kind's declaration and can disagree with it. (d) Rewrite edge files on merge: history churn for a problem read-time resolution already solves.
+
+**Consequences.** The spec gets a second frozen document (`spec/0.2.md`). A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, and a 0.1 vault rejects it with `E_PACK_VERSION` rather than guessing. Org context, roster visibility, and the demo follow in later #813 phases. A per-edge or per-org `no-ai` mode remains an open privacy question.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.

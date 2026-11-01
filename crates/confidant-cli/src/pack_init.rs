@@ -306,7 +306,7 @@ version = "@VERSION@"
 # The skill served to agents from this pack directory.
 skill = "SKILL.md"
 # Exact vault spec versions this pack supports.
-requires_spec = ["0.1"]
+requires_spec = ["0.1", "0.2"]
 
 # Finding message templates, one table per code ([messages."<CODE>"]). The
 # empty table is required even while no code is declared; see the example
@@ -333,6 +333,15 @@ requires_spec = ["0.1"]
 # [[verbs]]
 # name = "greet"
 # id_type = "person"
+
+# An edge kind this pack introduces. Core kinds (married, introduced,
+# colleague, works_at, founder_of, investor_in, advisor_to) are refused.
+# `from` / `to` are optional endpoint type lists; absent means person↔person.
+# [[edge_kinds]]
+# name = "backs"
+# symmetric = false
+# from = ["org"]
+# to = ["person"]
 
 # A severity key the operator can tune in confidant.toml. Keys are
 # namespaced to this pack; the default is error, warning, or off.
@@ -526,7 +535,10 @@ mod tests {
         assert_eq!(manifest.pack.name, "example-pack");
         assert_eq!(manifest.pack.version, "0.1");
         assert_eq!(manifest.pack.skill, "SKILL.md");
-        assert_eq!(manifest.pack.requires_spec, vec!["0.1".to_owned()]);
+        assert_eq!(
+            manifest.pack.requires_spec,
+            vec!["0.1".to_owned(), "0.2".to_owned()]
+        );
         assert!(manifest.record_types.is_empty());
         assert!(manifest.balance_metrics.is_empty());
         assert!(manifest.finding_codes.is_empty());
@@ -695,6 +707,9 @@ mod tests {
             "name =",
             "grammar =",
             "id_type =",
+            "symmetric =",
+            "from =",
+            "to =",
             "key =",
             "default =",
             "id =",

@@ -28,6 +28,7 @@ use std::collections::HashSet;
 use serde::{Serialize, Serializer};
 
 use crate::check::{canonical_on, check_aliases_and_merges, pack_snapshots, resolve_as_of_date};
+use crate::config::SpecVersion;
 use crate::id::RecordId;
 use crate::record::RecordKind;
 use crate::scope::{
@@ -185,6 +186,7 @@ pub fn build_context(
     let show_pii = include_private && cleared.contains(person);
 
     let as_of = resolve_as_of_date(vault);
+    let spec = vault.spec_version().unwrap_or(SpecVersion::V01);
     // Merge canonicalization is pack-independent: it walks the core merge
     // map, the same map the pack folds received.
     let known_ids: std::collections::HashSet<RecordId> = vault.records.keys().cloned().collect();
@@ -235,7 +237,7 @@ pub fn build_context(
             r.kind == RecordKind::Note
                 && cleared.contains(&r.id)
                 && (r.path.starts_with(&person_dir) || r.person().as_ref() == Some(&canonical))
-                && scope.allows(&record_owners(r, &linkage, &enabled))
+                && scope.allows(&record_owners(r, &linkage, &enabled, spec))
         })
         .map(|r| NoteView {
             id: r.id.to_string(),
@@ -253,7 +255,7 @@ pub fn build_context(
             r.kind == RecordKind::Interaction
                 && cleared.contains(&r.id)
                 && r.person().as_ref() == Some(&canonical)
-                && scope.allows(&record_owners(r, &linkage, &enabled))
+                && scope.allows(&record_owners(r, &linkage, &enabled, spec))
         })
         .map(|r| InteractionView {
             id: r.id.to_string(),

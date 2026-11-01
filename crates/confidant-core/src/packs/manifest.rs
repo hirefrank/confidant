@@ -121,6 +121,21 @@ const KNOWN_ID_TYPES: &[(&str, Prefix)] = &[
     ("package", Prefix::Package),
 ];
 
+/// Record types an edge endpoint may name in phase 1 (#813). Phase 2's
+/// pack-definable types extend this registry; until then a manifest that
+/// names anything else is `E_PACK_INVALID`.
+pub(crate) const ENTITY_ID_TYPES: &[(&str, Prefix)] =
+    &[("person", Prefix::Person), ("org", Prefix::Org)];
+
+/// Resolve an edge endpoint type name to its prefix. `None` for a type
+/// this spec does not declare as an entity.
+pub(crate) fn entity_prefix(name: &str) -> Option<Prefix> {
+    ENTITY_ID_TYPES
+        .iter()
+        .find(|(declared, _)| *declared == name)
+        .map(|(_, prefix)| *prefix)
+}
+
 /// Severity values a `[checks]` severity default may take.
 const KNOWN_SEVERITIES: &[&str] = &["error", "warning", "off"];
 
@@ -190,12 +205,21 @@ pub struct FieldDecl {
     pub grammar: String,
 }
 
-/// One `[[edge_kinds]]` entry: an edge kind the pack introduces.
+/// One `[[edge_kinds]]` entry: an edge kind the pack introduces (#813).
+///
+/// `from`/`to` name the endpoint record types for `a`/`b`. Both are
+/// optional; when absent the kind keeps the historical person↔person
+/// rule. When present they must appear together, be non-empty, and (for a
+/// symmetric kind) name the same set on both sides.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeKindDecl {
     pub name: String,
     pub symmetric: bool,
+    #[serde(default)]
+    pub from: Option<Vec<String>>,
+    #[serde(default)]
+    pub to: Option<Vec<String>>,
 }
 
 /// The optional `[context]` table (v2, spec §13.9): an opt-in naming a
@@ -367,6 +391,69 @@ fn check_unique(names: &[String], what: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// Validate one `[[edge_kinds]]` endpoint declaration (#813).
+///
+/// Absent `from`/`to` means the historical person↔person rule. Present
+/// declarations must be symmetric with the pair (both or neither),
+/// non-empty, duplicate-free, and name only declared entity types. A
+/// symmetric kind must allow the same set on both ends.
+fn validate_edge_endpoints(kind: &EdgeKindDecl) -> Result<(), DomainError> {
+    let (from, to) = match (&kind.from, &kind.to) {
+        (None, None) => return Ok(()),
+        (Some(from), Some(to)) => (from, to),
+        _ => {
+            return Err(manifest_err(format!(
+                "edge kind '{}' must declare from and to together",
+                kind.name
+            ))
+            .with_fix("Add both endpoint arrays, or neither for person↔person"));
+        }
+    };
+
+    for (label, endpoints) in [("from", from), ("to", to)] {
+        if endpoints.is_empty() {
+            return Err(manifest_err(format!(
+                "edge kind '{}' has an empty {label} endpoint list",
+                kind.name
+            ))
+            .with_fix("Name at least one endpoint type, e.g. from = [\"person\"]"));
+        }
+        let mut seen = BTreeSet::new();
+        for name in endpoints {
+            if !seen.insert(name.as_str()) {
+                return Err(manifest_err(format!(
+                    "edge kind '{}' repeats endpoint type '{name}' in {label}",
+                    kind.name
+                ))
+                .with_fix("List each endpoint type once"));
+            }
+            if entity_prefix(name).is_none() {
+                let accepted: Vec<&str> = ENTITY_ID_TYPES.iter().map(|(n, _)| *n).collect();
+                return Err(manifest_err(format!(
+                    "edge kind '{}' names unknown {label} endpoint type '{name}'; expected one of: {}",
+                    kind.name,
+                    accepted.join(", ")
+                ))
+                .with_fix("Use a declared entity type; phase 1 allows person and org"));
+            }
+        }
+    }
+
+    if kind.symmetric {
+        let from_set: BTreeSet<&str> = from.iter().map(String::as_str).collect();
+        let to_set: BTreeSet<&str> = to.iter().map(String::as_str).collect();
+        if from_set != to_set {
+            return Err(manifest_err(format!(
+                "symmetric edge kind '{}' must allow the same endpoint types on both ends",
+                kind.name
+            ))
+            .with_fix("Make from and to list the same types, or set symmetric = false"));
+        }
+    }
+
+    Ok(())
+}
+
 impl PackManifest {
     fn validate(&self) -> Result<(), DomainError> {
         if self.manifest_version != MANIFEST_VERSION {
@@ -511,10 +598,7 @@ impl PackManifest {
             }
 
             for edge_kind in &self.edge_kinds {
-                if crate::packs::CORE_EDGE_KINDS
-                    .iter()
-                    .any(|k| k.name == edge_kind.name)
-                {
+                if crate::packs::is_core_edge_kind(&edge_kind.name) {
                     return Err(manifest_err(format!(
                         "edge kind '{}' is a core edge kind and cannot be claimed by an external pack",
                         edge_kind.name
@@ -701,6 +785,9 @@ impl PackManifest {
         }
         let edge_names: Vec<String> = self.edge_kinds.iter().map(|e| e.name.clone()).collect();
         check_unique(&edge_names, "edge kind")?;
+        for edge_kind in &self.edge_kinds {
+            validate_edge_endpoints(edge_kind)?;
+        }
 
         // [checks] keys are namespaced <pack-name>.<rule>; a pack may only
         // declare keys under its own name. `as_of` stays core-owned.
@@ -1046,6 +1133,88 @@ default = "x"
         assert!(err.to_string().contains("duplicate edge kind"), "{err:?}");
     }
 
+    /// #813: a kind may declare its endpoint types; absent means the
+    /// historical person↔person default.
+    #[test]
+    fn edge_endpoints_parse_and_default() {
+        let text = valid_v2_toml()
+            + "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\n\
+               from = [\"org\"]\nto = [\"person\"]\n";
+        let m = parse_manifest_external(&text).unwrap();
+        assert_eq!(m.edge_kinds[0].name, "backs");
+        assert_eq!(
+            m.edge_kinds[0].from.as_deref(),
+            Some(&["org".to_string()][..])
+        );
+        assert_eq!(
+            m.edge_kinds[0].to.as_deref(),
+            Some(&["person".to_string()][..])
+        );
+
+        // Existing v1 manifests keep the no-declaration default.
+        let m = parse_manifest(&valid_toml()).unwrap();
+        assert!(m.edge_kinds[0].from.is_none());
+        assert!(m.edge_kinds[0].to.is_none());
+    }
+
+    /// #813: phase 1 declares person and org; anything else is a manifest
+    /// error, not a silently ignored value.
+    #[test]
+    fn edge_endpoints_reject_unknown_type() {
+        for bad in ["place", "deal", "note", "package"] {
+            let text = valid_v2_toml()
+                + &format!(
+                    "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\n\
+                     from = [\"person\"]\nto = [\"{bad}\"]\n"
+                );
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown to endpoint type"),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_endpoints_require_both_sides() {
+        for text in [
+            valid_v2_toml()
+                + "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\nfrom = [\"org\"]\n",
+            valid_v2_toml()
+                + "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\nto = [\"person\"]\n",
+        ] {
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(err.to_string().contains("from and to together"), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn edge_endpoints_reject_empty_and_duplicate() {
+        let empty = valid_v2_toml()
+            + "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\n\
+               from = []\nto = [\"person\"]\n";
+        let err = parse_manifest_external(&empty).unwrap_err();
+        assert!(err.to_string().contains("empty from endpoint"), "{err:?}");
+
+        let duplicate = valid_v2_toml()
+            + "\n[[edge_kinds]]\nname = \"backs\"\nsymmetric = false\n\
+               from = [\"person\", \"person\"]\nto = [\"person\"]\n";
+        let err = parse_manifest_external(&duplicate).unwrap_err();
+        assert!(err.to_string().contains("repeats endpoint type"), "{err:?}");
+    }
+
+    #[test]
+    fn symmetric_edge_kind_requires_equal_endpoint_sets() {
+        let text = valid_v2_toml()
+            + "\n[[edge_kinds]]\nname = \"peers\"\nsymmetric = true\n\
+               from = [\"person\"]\nto = [\"person\", \"org\"]\n";
+        let err = parse_manifest_external(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("same endpoint types on both ends"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn rejects_duplicate_finding_codes() {
         let text = valid_toml().replace(
@@ -1385,9 +1554,16 @@ default_fix = "{fix}"
 
     #[test]
     fn external_rejects_core_edge_kind() {
-        let text = valid_v2_toml() + "\n[[edge_kinds]]\nname = \"married\"\nsymmetric = true\n";
-        let err = parse_manifest_external(&text).unwrap_err();
-        assert!(err.to_string().contains("core edge kind"), "{err:?}");
+        // Both the 0.1 kinds and the 0.2-only person→org kinds are core.
+        for kind in ["married", "works_at"] {
+            let text = valid_v2_toml()
+                + &format!("\n[[edge_kinds]]\nname = \"{kind}\"\nsymmetric = true\n");
+            let err = parse_manifest_external(&text).unwrap_err();
+            assert!(
+                err.to_string().contains("core edge kind"),
+                "{kind}: {err:?}"
+            );
+        }
     }
 
     #[test]

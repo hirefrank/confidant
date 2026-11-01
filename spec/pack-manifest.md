@@ -20,7 +20,7 @@ trait — they are exactly the part the two packs do not share.
 - record types
 - front-matter fields and their grammars (named, from a fixed list)
 - balance metrics
-- edge kinds and symmetry
+- edge kinds, endpoint types, and symmetry
 - finding codes
 - verb-to-ID type
 - `[checks]` keys and defaults
@@ -115,7 +115,8 @@ id_type = "person"          # optional
 name = "birthday"
 grammar = "recurring-date"
 
-# Edge kinds this pack introduces, with symmetry.
+# Edge kinds this pack introduces. `symmetric` is required; the optional
+# `from` / `to` type arrays declare endpoint types (absent = person↔person).
 [[edge_kinds]]
 name = "friend"
 symmetric = true
@@ -148,6 +149,37 @@ none_fix = "Log a touchpoint with `confidant log touch {id} <kind>` or widen cad
 
 `id_type` names one of the record ID prefixes: `person`, `org`, `deal`,
 `interaction`, `note`, `edge`, `package`. (Today's `Prefix` enum.)
+
+### Edge kinds
+
+`[[edge_kinds]]` declares one relation kind. `name` and `symmetric` are
+required. `from` / `to` are optional arrays of record-type names for the
+`a` / `b` endpoints (#813):
+
+```toml
+[[edge_kinds]]
+name = "works_at"
+symmetric = false
+from = ["person"]
+to = ["org"]
+```
+
+- Absent `from` and `to` mean `["person"]` / `["person"]`, the historical
+  person↔person rule. Every 0.1-era pack kind keeps that meaning.
+- Both must appear together. Each list must be non-empty and contain no
+  duplicates.
+- In a 0.2 vault the names are the declared entity types (`person`,
+  `org`); any other name is `E_PACK_INVALID` at load, in every spec
+  version. A 0.1 vault validates the declaration but enforces only the
+  person-only edge rule (it treats every kind as person↔person).
+- A `symmetric = true` kind must declare equal sets: the relation reads
+  the same in both directions, so it cannot allow an asymmetric pair.
+- A manifest that declares a non-person endpoint must list `"0.2"` in
+  `requires_spec`. A 0.1 vault then fails closed with `E_PACK_VERSION`
+  before the endpoint declaration matters.
+- Core edge kinds are reserved in every spec version; an external pack
+  may not claim `married`, `introduced`, `colleague`, `works_at`,
+  `founder_of`, `investor_in`, or `advisor_to`.
 
 ### `[checks]` key namespacing
 
@@ -387,10 +419,9 @@ Notes on the example:
 - `E_TOUCH_MALFORMED` is intentionally absent: it is a core code
   emitted by `check`, not by the pack (cf. the comment on
   `finding_codes()` in `personal.rs`).
-- The edge kinds and finding codes above were checked by hand
-  (2026-10-15) against `PERSONAL_EDGE_KINDS` and `finding_codes()` in
-  `crates/confidant-core/src/packs/personal.rs` and match exactly.
-  Step 4's parity test must prove the same mechanically.
+- The edge kinds and finding codes above match
+  `packs/personal/manifest.toml` and the embedded copy it is vendored
+  from; the drift test pins the bytes.
 - `E_FRONTMATTER`'s `{problem}`/`{fix}` placeholders are filled by Rust
   at the call site (per-field text from `push_field_error`); the
   manifest holds only the template shell and never enumerates the
@@ -445,7 +476,9 @@ requires_spec = ["0.1"]
 ```
 
 - `[pack].requires_spec`: required in v2, absent in v1. Non-empty list
-  of exact spec version strings.
+  of exact spec version strings. A pack that declares `from` / `to` on an
+  edge kind must include `"0.2"`; a pack that only needs the historical
+  person↔person rule may list `"0.1"` alone.
 - `[[rules]]`: the declarative checks (§13.2). Absent in v1.
 - `[context]`: the opt-in `context` view (§13.9). Absent in v1.
 - Everything else (§4) is unchanged: `record_types`, `balance_metrics`,

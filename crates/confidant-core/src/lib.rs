@@ -1,6 +1,7 @@
 //! Parse, model, derived values, and the check engine for Confidant vaults.
 //!
-//! The file format is specified independently in `spec/0.1.md` (ADR-1).
+//! The file format is specified independently in `spec/0.1.md` (frozen) and
+//! `spec/0.2.md` (current) (ADR-1).
 
 // Unsafe is denied crate-wide. The Unix `openat` / `O_NOFOLLOW` walk in
 // `paths` is the only exception, matching cr (ADR-13).
@@ -34,7 +35,7 @@ pub use check::{
     run as check_vault, CheckOptions, CheckReport, Finding, FindingCode, Severity,
     JSON_SCHEMA_VERSION,
 };
-pub use config::{VaultConfig, SPEC_VERSION};
+pub use config::{SpecVersion, VaultConfig, SPEC_VERSION};
 pub use discover::{resolve as resolve_vault, Discovery};
 pub use error::DomainError;
 pub use id::RecordId;
