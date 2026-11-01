@@ -211,6 +211,14 @@ enum Command {
     },
     /// Vault health checks.
     Doctor,
+    /// One-screen readiness rollup and the completion brief for this install.
+    ///
+    /// Reports CLI/TUI versions, vault discovery and writability, skill
+    /// links, system-of-record instructions, git sync state, QMD corpus
+    /// state, and binary staleness. Optional layers report `absent`, never
+    /// a false `ok` (#709, #716, #733). Exits 1 when a required check is
+    /// not `ok`; warnings on optional layers do not fail it.
+    Status,
     /// Show how the vault compares with its git upstream (fetch, report).
     ///
     /// Read-only by default: fetch the upstream remote, report ahead/behind
@@ -283,6 +291,9 @@ enum Command {
         /// Copy skills instead of symlinking.
         #[arg(long, default_value_t = false)]
         copy: bool,
+        /// Do not write the system-of-record rule into agent instruction files.
+        #[arg(long, default_value_t = false)]
+        no_instructions: bool,
         /// Show every path as it is created/linked.
         #[arg(long, short = 'v', default_value_t = false)]
         verbose: bool,
@@ -724,6 +735,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             | Command::Agents { .. }
             | Command::Which { .. }
             | Command::Routing
+            | Command::Status
             | Command::Tui { .. }
             | Command::BenchGen { .. }
             | Command::Pack { .. }
@@ -1063,6 +1075,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let root = vault_root.unwrap();
             cmd_doctor(&cli, &root)
         }
+        Command::Status => cmd_status(&cli, vault_root.as_deref()),
         Command::Sync { pull, push, yes } => {
             let root = vault_root.unwrap();
             cmd_sync(&cli, &root, *pull, *push, *yes)
@@ -1077,8 +1090,17 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             agent,
             force,
             copy,
+            no_instructions,
             verbose,
-        } => cmd_setup(&cli, agent, *force, *copy, *verbose),
+        } => cmd_setup(
+            &cli,
+            agent,
+            *force,
+            *copy,
+            *no_instructions,
+            *verbose,
+            vault_root.as_deref(),
+        ),
         Command::Update {
             agent,
             force,
@@ -1086,7 +1108,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } => cmd_update(&cli, agent, *force, *verbose),
         Command::Agents { verbose } => cmd_agents(&cli, *verbose),
         Command::Which { skills_dir } => cmd_which(&cli, *skills_dir),
-        Command::Routing => cmd_routing(&cli),
+        Command::Routing => cmd_routing(&cli, vault_root.as_deref()),
         Command::Tui { args } => cmd_tui(&cli, args),
         Command::Mcp => {
             let root = vault_root.unwrap();
@@ -6314,7 +6336,7 @@ fn confirm_sync_write(cli: &Cli, yes: bool, question: &str) -> anyhow::Result<bo
 /// `unknown` is a stable fourth value, alongside the existing three.
 const DOCTOR_STATUS_UNKNOWN: &str = "unknown";
 
-fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
+fn collect_doctor_checks(cli: &Cli, root: &Path) -> Vec<DoctorCheck> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
 
     checks.push(DoctorCheck {
@@ -6323,6 +6345,7 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         message: format!("vault resolved to {}", root.display()),
         fix: None,
     });
+    checks.push(vault_access_check(root));
 
     // #809: detect the encrypted ≤0.7 vault shape before loading it. One
     // clear error beats a stream of parse and check findings, and the
@@ -6454,6 +6477,9 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         let latest = if offline { None } else { latest_release_tag() };
         checks.push(cli_staleness_check(latest, offline));
         checks.push(skills_links_check());
+        // #727: skill links only reach sessions that load a skill; the
+        // system-of-record rule belongs in the agent's always-on file.
+        checks.push(system_of_record_check(Some(root)));
         // #659: the optional TUI must match the CLI's agent contract.
         checks.push(tui_version_check());
         // #386/#657: qmd search availability. Missing qmd is `ok`; an
@@ -6461,7 +6487,36 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
         checks.push(qmd_search_check(root));
     }
 
+    checks
+}
+
+/// Count the doctor statuses without letting an unknown status silently
+/// disappear from the summary.
+fn doctor_status_counts(checks: &[DoctorCheck]) -> [(&'static str, usize); 4] {
+    [
+        ("ok", checks.iter().filter(|c| c.status == "ok").count()),
+        (
+            "warning",
+            checks.iter().filter(|c| c.status == "warning").count(),
+        ),
+        (
+            "error",
+            checks.iter().filter(|c| c.status == "error").count(),
+        ),
+        (
+            "unknown",
+            checks
+                .iter()
+                .filter(|c| c.status == DOCTOR_STATUS_UNKNOWN)
+                .count(),
+        ),
+    ]
+}
+
+fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
+    let checks = collect_doctor_checks(cli, root);
     let ok = !checks.iter().any(|c| c.status == "error");
+    let counts = doctor_status_counts(&checks);
     if cli.json {
         let items: Vec<serde_json::Value> = checks
             .iter()
@@ -6481,6 +6536,15 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
             .collect();
         let mut extra = serde_json::Map::new();
         extra.insert("checks".to_owned(), serde_json::Value::Array(items));
+        extra.insert(
+            "summary".to_owned(),
+            serde_json::json!({
+                "ok": counts[0].1,
+                "warning": counts[1].1,
+                "error": counts[2].1,
+                "unknown": counts[3].1,
+            }),
+        );
         let mut envelope = ok_envelope(Some(root), serde_json::Value::Object(extra));
         envelope["ok"] = serde_json::Value::Bool(ok);
         print_json(&envelope)?;
@@ -6491,12 +6555,871 @@ fn cmd_doctor(cli: &Cli, root: &Path) -> anyhow::Result<ExitCode> {
                 println!("        fix: {fix}");
             }
         }
+        println!();
+        println!(
+            "Summary: {} ok, {} warning, {} error, {} unknown",
+            counts[0].1, counts[1].1, counts[2].1, counts[3].1
+        );
+        println!("Full readiness rollup: confidant status");
     }
     if ok {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+/// `vault-access` reports what the permission bits say without attempting a
+/// write (`status` and `doctor` are read-only). A false `ok` would be worse
+/// than the honest caveat in the message.
+fn vault_access_check(root: &Path) -> DoctorCheck {
+    const ID: &str = "vault-access";
+    match std::fs::metadata(root) {
+        Ok(meta) if !meta.is_dir() => DoctorCheck {
+            id: ID,
+            status: "error",
+            message: "vault path is not a directory".to_owned(),
+            fix: None,
+        },
+        Ok(meta) if meta.permissions().readonly() => DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: "vault directory has no write permission; reads work, writes will fail"
+                .to_owned(),
+            fix: Some("Make the vault directory writable by this user".to_owned()),
+        },
+        Ok(_) => DoctorCheck {
+            id: ID,
+            status: "ok",
+            message:
+                "vault directory is readable and writable (permission bits; no write was attempted)"
+                    .to_owned(),
+            fix: None,
+        },
+        Err(err) => DoctorCheck {
+            id: ID,
+            status: "error",
+            message: format!("cannot inspect the vault directory: {err}"),
+            fix: None,
+        },
+    }
+}
+
+/// #727: is the system-of-record rule present in every detected agent's
+/// always-on file, and does it point at this vault? Missing or stale is a
+/// warning (setup fixes it); never an error, because a hand-written vault
+/// and a host with no agent are both valid.
+fn system_of_record_check(root: Option<&Path>) -> DoctorCheck {
+    const ID: &str = "system-of-record";
+    let home = match setup::home_dir() {
+        Ok(home) => home,
+        Err(err) => {
+            return DoctorCheck {
+                id: ID,
+                status: "warning",
+                message: format!("cannot determine home directory: {err:#}"),
+                fix: None,
+            };
+        }
+    };
+    let health = setup::system_of_record_health(&home, root);
+    if health.is_empty() {
+        return DoctorCheck {
+            id: ID,
+            status: "ok",
+            message: "no agents detected; run `confidant setup --agent auto` when one is installed"
+                .to_owned(),
+            fix: None,
+        };
+    }
+    let fix = root
+        .map(|root| {
+            format!(
+                "Run `confidant setup --agent auto --vault {}` to install or refresh the rule",
+                root.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            "Run `confidant setup --agent auto --vault <path>` to install or refresh the rule"
+                .to_owned()
+        });
+    let missing: Vec<&setup::InstructionHealth> = health.iter().filter(|h| !h.installed).collect();
+    if !missing.is_empty() {
+        let paths: Vec<String> = missing
+            .iter()
+            .map(|h| format!("{} ({})", h.agent, h.path.display()))
+            .collect();
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!("system-of-record rule missing for {}", paths.join(", ")),
+            fix: Some(fix),
+        };
+    }
+    let stale: Vec<&setup::InstructionHealth> = health
+        .iter()
+        .filter(|h| h.installed && !h.matches_vault)
+        .collect();
+    if !stale.is_empty() {
+        let paths: Vec<String> = stale
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} ({}, points at {})",
+                    h.agent,
+                    h.path.display(),
+                    h.pointer.as_deref().unwrap_or("no vault")
+                )
+            })
+            .collect();
+        return DoctorCheck {
+            id: ID,
+            status: "warning",
+            message: format!(
+                "system-of-record rule points at another vault for {}",
+                paths.join(", ")
+            ),
+            fix: Some(fix),
+        };
+    }
+    DoctorCheck {
+        id: ID,
+        status: "ok",
+        message: format!(
+            "system-of-record rule installed for {}",
+            health
+                .iter()
+                .map(|h| h.agent.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        fix: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `confidant status` (#716) and the completion brief (#733).
+// ---------------------------------------------------------------------------
+
+/// One line in the readiness rollup. `absent` is a fifth status for an
+/// optional layer that is not installed: it is never `ok`, and it does not
+/// fail readiness unless the check is required.
+#[derive(Debug, Clone)]
+struct ReadinessCheck {
+    id: &'static str,
+    status: &'static str,
+    message: String,
+    fix: Option<String>,
+    required: bool,
+}
+
+impl ReadinessCheck {
+    fn from_doctor(check: DoctorCheck, required: bool) -> Self {
+        ReadinessCheck {
+            id: check.id,
+            status: check.status,
+            message: check.message,
+            fix: check.fix,
+            required,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut item = serde_json::json!({
+            "id": self.id,
+            "status": self.status,
+            "message": self.message,
+            "required": self.required,
+        });
+        if let Some(fix) = &self.fix {
+            item["fix"] = Value::String(fix.clone());
+        }
+        item
+    }
+}
+
+/// Which doctor checks must be `ok` for setup to count as complete. Optional
+/// layers (TUI, QMD, remote, ahead/behind) may be absent or warning without
+/// blocking readiness; they are still reported.
+fn readiness_required(id: &str) -> bool {
+    matches!(
+        id,
+        "cli-staleness"
+            | "vault-discovery"
+            | "vault-access"
+            | "vault-load"
+            | "git-repo"
+            | "git-identity"
+            | "git-remote"
+            | "spec"
+            | "skills-links"
+            | "system-of-record"
+    )
+}
+
+fn readiness_checks(cli: &Cli, vault: Option<&Path>) -> Vec<ReadinessCheck> {
+    let mut checks: Vec<ReadinessCheck> = match vault {
+        Some(root) => collect_doctor_checks(cli, root)
+            .into_iter()
+            .map(|check| {
+                let required = readiness_required(check.id);
+                ReadinessCheck::from_doctor(check, required)
+            })
+            .collect(),
+        None => {
+            let offline = staleness_offline();
+            let latest = if offline { None } else { latest_release_tag() };
+            vec![
+                ReadinessCheck::from_doctor(cli_staleness_check(latest, offline), true),
+                ReadinessCheck::from_doctor(tui_version_check(), false),
+                ReadinessCheck {
+                    id: "vault-discovery",
+                    status: "absent",
+                    message: "no vault resolved; pass --vault, set CONFIDANT_VAULT, or run inside a vault"
+                        .to_owned(),
+                    fix: Some(
+                        "Pass `--vault <path>`, set `CONFIDANT_VAULT`, or run `confidant init --create`"
+                            .to_owned(),
+                    ),
+                    required: true,
+                },
+                ReadinessCheck::from_doctor(skills_links_check(), true),
+                ReadinessCheck::from_doctor(system_of_record_check(None), true),
+                ReadinessCheck {
+                    id: "qmd-search",
+                    status: "absent",
+                    message: "no vault to inspect for a search corpus; search is unavailable until a vault is set"
+                        .to_owned(),
+                    fix: None,
+                    required: false,
+                },
+            ]
+        }
+    };
+
+    // An optional layer that is not installed is `absent`, never a false
+    // `ok`. The doctor checks keep their historical `ok` for compatibility.
+    if find_on_path("confidant-tui").is_none() {
+        for check in &mut checks {
+            if check.id == "tui-version" {
+                check.status = "absent";
+            }
+        }
+    }
+    if vault.is_some() && find_on_path("qmd").is_none() {
+        for check in &mut checks {
+            if check.id == "qmd-search" {
+                check.status = "absent";
+            }
+        }
+    }
+
+    // A host with no agent has nothing to link or instruct; that is absent,
+    // not a failure of the install. A host that has agents but was never
+    // targeted is not set up: keep those checks required and non-ok.
+    let home = setup::home_dir().ok();
+    let agent_health = home
+        .as_deref()
+        .map(setup::agents_health)
+        .unwrap_or_default();
+    let detected = agent_health.iter().any(|agent| agent.detected);
+    let targeted = agent_health
+        .iter()
+        .any(|agent| agent.detected && agent.targeted);
+    if home.is_none() {
+        // `skills-links` already warns that home could not be determined;
+        // do not overwrite that with an optional "no agents" line.
+    } else if !detected {
+        for check in &mut checks {
+            if check.id == "skills-links" || check.id == "system-of-record" {
+                check.status = "absent";
+                check.required = false;
+                check.message =
+                    "no agents detected; install one, then run `confidant setup --agent auto`"
+                        .to_owned();
+                check.fix = None;
+            }
+        }
+    } else if !targeted {
+        for check in &mut checks {
+            if check.id == "skills-links" || check.id == "system-of-record" {
+                check.status = "absent";
+                check.message =
+                    "agents detected but setup has not linked them; run `confidant setup --agent auto`"
+                        .to_owned();
+            }
+        }
+    }
+    checks
+}
+
+fn readiness_summary(checks: &[ReadinessCheck]) -> Value {
+    let count = |status: &str| checks.iter().filter(|c| c.status == status).count();
+    // Any error blocks readiness, even from a check that is advisory for
+    // setup (a vault check error means writes are blocked). Optional
+    // warnings do not block; a warning on a required check does.
+    let ready = checks
+        .iter()
+        .all(|check| !check.required || check.status == "ok")
+        && !checks.iter().any(|check| check.status == "error");
+    serde_json::json!({
+        "ready": ready,
+        "ok": count("ok"),
+        "warning": count("warning"),
+        "absent": count("absent"),
+        "unknown": count(DOCTOR_STATUS_UNKNOWN),
+        "error": count("error"),
+    })
+}
+
+fn cmd_status(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let checks = readiness_checks(cli, vault);
+    let summary = readiness_summary(&checks);
+    let ready = summary["ready"].as_bool().unwrap_or(false);
+    let brief = completion_brief(cli, vault);
+    if cli.json {
+        let items: Vec<Value> = checks.iter().map(ReadinessCheck::to_json).collect();
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "readiness".to_owned(),
+            serde_json::json!({
+                "summary": summary,
+                "checks": items,
+            }),
+        );
+        extra.insert("brief".to_owned(), brief.to_json());
+        let mut envelope = ok_envelope(vault, Value::Object(extra));
+        envelope["ok"] = Value::Bool(ready);
+        print_json(&envelope)?;
+    } else {
+        println!("Confidant readiness");
+        for check in &checks {
+            let marker = if check.required { "" } else { " (optional)" };
+            println!(
+                "{:8} {:<18} {}{}",
+                check.status, check.id, check.message, marker
+            );
+            if let Some(fix) = &check.fix {
+                println!("         fix: {fix}");
+            }
+        }
+        println!();
+        let not_ready: Vec<&str> = checks
+            .iter()
+            .filter(|check| (check.required && check.status != "ok") || check.status == "error")
+            .map(|check| check.id)
+            .collect();
+        if ready {
+            println!("Ready: every required check is ok.");
+        } else {
+            println!("Not ready: {}.", not_ready.join(", "));
+        }
+        println!(
+            "          {} ok, {} warning, {} absent, {} unknown, {} error",
+            summary["ok"],
+            summary["warning"],
+            summary["absent"],
+            summary["unknown"],
+            summary["error"]
+        );
+        println!();
+        print_completion_brief(cli, vault);
+    }
+    Ok(if ready {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+struct BriefSection {
+    key: &'static str,
+    title: &'static str,
+    lines: Vec<String>,
+}
+
+struct CompletionBrief {
+    sections: Vec<BriefSection>,
+    routines: Vec<String>,
+}
+
+impl CompletionBrief {
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "sections": self.sections.iter().map(|section| serde_json::json!({
+                "key": section.key,
+                "title": section.title,
+                "lines": section.lines,
+            })).collect::<Vec<_>>(),
+            "routines": self.routines,
+        })
+    }
+}
+
+fn completion_brief_json(cli: &Cli, vault: Option<&Path>) -> Value {
+    completion_brief(cli, vault).to_json()
+}
+
+fn print_completion_brief(cli: &Cli, vault: Option<&Path>) {
+    let brief = completion_brief(cli, vault);
+    println!("Completion brief");
+    for section in &brief.sections {
+        println!();
+        println!("{}", section.title);
+        for line in &section.lines {
+            println!("  {line}");
+        }
+    }
+    println!();
+    println!("Jumping-off routines");
+    for (index, routine) in brief.routines.iter().enumerate() {
+        println!("  {}. {routine}", index + 1);
+    }
+}
+
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .filter(|name| !name.trim().is_empty())
+        })
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "this machine".to_owned())
+}
+
+fn format_system_time(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time)
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string()
+}
+
+fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
+    let loaded = vault.and_then(|root| load_vault(root).ok());
+    let counts = loaded
+        .as_ref()
+        .map(|vault| {
+            let count = |kind: RecordKind| {
+                vault
+                    .records
+                    .values()
+                    .filter(|record| record.kind == kind)
+                    .count()
+            };
+            (
+                count(RecordKind::Person),
+                count(RecordKind::Org),
+                count(RecordKind::Deal),
+                count(RecordKind::Interaction),
+                count(RecordKind::Note),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0));
+    let (people, orgs, deals, interactions, notes) = counts;
+    let cadence_warnings = loaded
+        .as_ref()
+        .map(|vault| {
+            check_vault(vault, &CheckOptions::default())
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.code == confidant_core::check::FindingCode::CadenceOverdue
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    // Only infer branch/remote/fleet from the vault's own repository, never
+    // from a parent checkout that happens to contain it.
+    let has_git = vault.is_some_and(|root| root.join(".git").exists());
+    let branch = vault
+        .filter(|_| has_git)
+        .and_then(|root| current_branch(root, cli.no_input));
+
+    let mut sections = Vec::new();
+
+    // 1. The vault.
+    let mut vault_lines = Vec::new();
+    match (vault, loaded.as_ref()) {
+        (Some(root), Some(loaded)) => {
+            vault_lines.push(format!("Name: {}", loaded.config.vault_id));
+            vault_lines.push(format!("Location: {}", root.display()));
+            vault_lines.push(format!(
+                "Branch: {}",
+                branch
+                    .as_deref()
+                    .unwrap_or("unknown (git did not report a branch)")
+            ));
+            vault_lines.push(format!(
+                "Records: {people} people, {orgs} orgs, {deals} deals, \
+                 {interactions} interactions, {notes} notes."
+            ));
+        }
+        (Some(root), None) => {
+            vault_lines.push(format!("Location: {}", root.display()));
+            vault_lines.push(
+                "The vault could not be loaded. Run `confidant check` and fix the error before relying on it."
+                    .to_owned(),
+            );
+        }
+        (None, _) => {
+            vault_lines.push("No vault is configured on this machine.".to_owned());
+            vault_lines.push("New vault: `confidant init --create --no-input`.".to_owned());
+            vault_lines.push(
+                "Existing vault: set `CONFIDANT_VAULT` or pass `--vault <path>`, then re-run `confidant setup` so agent instructions get the pointer."
+                    .to_owned(),
+            );
+        }
+    }
+    sections.push(BriefSection {
+        key: "vault",
+        title: "The vault",
+        lines: vault_lines,
+    });
+
+    // 2. This machine.
+    let writable = vault
+        .and_then(|root| std::fs::metadata(root).ok())
+        .map(|meta| !meta.permissions().readonly())
+        .unwrap_or(false);
+    let mut machine_lines = vec![format!("Machine: {}", machine_name())];
+    if vault.is_some() {
+        machine_lines.push(format!(
+            "Can read this vault: {}",
+            if loaded.is_some() { "yes" } else { "no" }
+        ));
+        machine_lines.push(format!(
+            "Can write this vault: {} (permission bits; no write was attempted)",
+            if writable { "yes" } else { "no" }
+        ));
+    } else {
+        machine_lines
+            .push("No vault is configured, so there is nothing to read or write yet.".to_owned());
+    }
+    sections.push(BriefSection {
+        key: "machine",
+        title: "This machine",
+        lines: machine_lines,
+    });
+
+    // 3. The fleet, inferred from the remote and recent commits.
+    let mut fleet_lines = Vec::new();
+    let mut remote: Option<(String, String)> = None;
+    let mut upstream: Option<(String, String)> = None;
+    let mut authors: Vec<String> = Vec::new();
+    if let (Some(root), true) = (vault, has_git) {
+        if let Ok(output) = confidant_core::write::git(root, &["remote", "-v"], cli.no_input) {
+            let entries = parse_git_remote_urls(&output);
+            remote = entries
+                .iter()
+                .find(|(name, _)| name == "origin")
+                .or_else(|| entries.first())
+                .map(|(name, url)| (name.clone(), url.clone()));
+        }
+        upstream = git_upstream(root, cli.no_input);
+        if let Ok(output) =
+            confidant_core::write::git(root, &["log", "-n", "50", "--format=%an"], cli.no_input)
+        {
+            for name in output
+                .lines()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                if !authors.iter().any(|seen| seen == name) {
+                    authors.push(name.to_owned());
+                }
+            }
+        }
+        fleet_lines.push(format!("This clone: {}", root.display()));
+    }
+    match &remote {
+        Some((name, url)) => fleet_lines.push(format!(
+            "Remote: {name} {}",
+            display_remote_url(url)
+        )),
+        None if vault.is_some() && !has_git => fleet_lines.push(
+            "This vault is not a git repository, so there is no remote. Writes need git; run `confidant doctor`."
+                .to_owned(),
+        ),
+        None => fleet_lines.push(
+            "No git remote. This vault lives on one machine; a lost disk has no copy.".to_owned(),
+        ),
+    }
+    if !authors.is_empty() {
+        fleet_lines.push(format!(
+            "Recent commits (last 50) show {} author {}: {}. Confidant cannot see how many machines clone this repo.",
+            authors.len(),
+            if authors.len() == 1 { "identity" } else { "identities" },
+            authors.join(", ")
+        ));
+    } else if vault.is_some() {
+        fleet_lines.push(
+            "No commits yet, so there is no recent-author evidence about other machines."
+                .to_owned(),
+        );
+    }
+    sections.push(BriefSection {
+        key: "fleet",
+        title: "The fleet",
+        lines: fleet_lines,
+    });
+
+    // 4. The remote and the perimeter, stated plainly.
+    let mut perimeter_lines = vec!["Records are plaintext on disk and in git history.".to_owned()];
+    if remote.is_some() {
+        perimeter_lines.push(
+            "The remote must be private: anyone with access can read every record, history included. Confidant cannot verify the host's visibility setting."
+                .to_owned(),
+        );
+        perimeter_lines.push(
+            "There is no application-level encryption. The perimeter is the private remote plus full-disk encryption (LUKS, FileVault) on every machine."
+                .to_owned(),
+        );
+    } else {
+        perimeter_lines.push(
+            "There is no remote. The perimeter is this machine and any backup copy you keep."
+                .to_owned(),
+        );
+        perimeter_lines.push(
+            "There is no application-level encryption. Keep the disk and every backup under full-disk encryption (LUKS, FileVault)."
+                .to_owned(),
+        );
+    }
+    perimeter_lines.push(
+        "Full-disk encryption is an OS setting. Confidant does not verify it, and no check was run."
+            .to_owned(),
+    );
+    sections.push(BriefSection {
+        key: "perimeter",
+        title: "The remote and the perimeter",
+        lines: perimeter_lines,
+    });
+
+    // 5. Sync posture, with the reason.
+    let mut sync_lines = Vec::new();
+    match &upstream {
+        Some((branch, upstream)) => {
+            sync_lines.push(format!("This clone tracks {upstream} on branch {branch}."));
+            sync_lines.push(
+                "Commits stay local until you run `confidant sync --push`; that is an explicit, confirmed network write."
+                    .to_owned(),
+            );
+        }
+        None if remote.is_some() => {
+            sync_lines.push(format!(
+                "A remote is configured, but branch {} has no upstream yet.",
+                branch.as_deref().unwrap_or("main")
+            ));
+            sync_lines.push(format!(
+                "Set one with `git push -u {} {}` before using `confidant sync`.",
+                remote
+                    .as_ref()
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("origin"),
+                branch.as_deref().unwrap_or("main")
+            ));
+        }
+        None => {
+            sync_lines.push(
+                "Local-only: no remote, so nothing syncs. Back up the disk another way.".to_owned(),
+            );
+        }
+    }
+    sync_lines.push(
+        "Nothing pushes or pulls as a side effect of a write. `confidant sync` reports ahead/behind from the last fetch."
+            .to_owned(),
+    );
+    sync_lines.push(
+        "If the branch has diverged, `confidant sync` reports it and refuses to fast-forward; reconcile explicitly."
+            .to_owned(),
+    );
+    if remote.is_some() {
+        sync_lines.push(
+            "Who can write: this machine can change its local clone; any machine with push access to the remote can change the shared copy. Confidant does not probe credentials."
+                .to_owned(),
+        );
+    } else {
+        sync_lines
+            .push("Who can write: this machine only; there is no remote to push to.".to_owned());
+    }
+    sections.push(BriefSection {
+        key: "sync",
+        title: "Sync posture",
+        lines: sync_lines,
+    });
+
+    // 6. Search state and its upkeep truth.
+    let qmd_available = find_on_path("qmd").is_some();
+    let corpus_path = vault.map(|root| root.join(QMD_CORPUS_REL));
+    let corpus = corpus_path
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .map(std::path::Path::to_path_buf);
+    let mut search_lines = Vec::new();
+    if vault.is_none() {
+        search_lines.push(
+            "No vault, so there is no corpus. `confidant find` becomes available once a vault is configured."
+                .to_owned(),
+        );
+    } else if !qmd_available {
+        search_lines.push(
+            "QMD is not installed; semantic search is off. `confidant find` reads the live vault."
+                .to_owned(),
+        );
+    } else if let Some(path) = &corpus {
+        let modified = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map(format_system_time)
+            .unwrap_or_else(|_| "unknown".to_owned());
+        search_lines.push(format!(
+            "QMD corpus: {}; last modified {modified}.",
+            path.display()
+        ));
+        search_lines.push(
+            "Search results are a snapshot from that time. Refresh the corpus after changes; exact lookups (`resolve`, `context`, `find`) read the live vault."
+                .to_owned(),
+        );
+    } else {
+        search_lines.push(
+            "QMD is installed but this vault has no corpus. Keyword search falls back to `confidant find`; build the corpus with the qmd-search skill."
+                .to_owned(),
+        );
+    }
+    search_lines.push(
+        "QMD is optional: embeddings can download multi-GB models and use disk under `.confidant/` (gitignored)."
+            .to_owned(),
+    );
+    sections.push(BriefSection {
+        key: "search",
+        title: "Search",
+        lines: search_lines,
+    });
+
+    // 7. The standing orders, and where they live.
+    let mut standing_lines = Vec::new();
+    match setup::home_dir() {
+        Ok(home) => {
+            let health = setup::system_of_record_health(&home, vault);
+            if health.is_empty() {
+                standing_lines.push(
+                    "No agent detected; no standing orders were installed. Run `confidant setup --agent auto` after installing one."
+                        .to_owned(),
+                );
+            } else {
+                for entry in health {
+                    let state = if !entry.installed {
+                        "missing"
+                    } else if vault.is_some() && !entry.matches_vault {
+                        "installed, but points at another vault"
+                    } else {
+                        "installed"
+                    };
+                    standing_lines.push(format!(
+                        "{} -> {} ({state})",
+                        entry.agent,
+                        entry.path.display()
+                    ));
+                }
+            }
+        }
+        Err(err) => standing_lines.push(format!("Cannot determine home directory: {err:#}")),
+    }
+    standing_lines.push("Re-print the exact rule with `confidant routing`.".to_owned());
+    sections.push(BriefSection {
+        key: "standing-orders",
+        title: "Standing orders",
+        lines: standing_lines,
+    });
+
+    // 8. The work discipline in force.
+    sections.push(BriefSection {
+        key: "discipline",
+        title: "Work discipline",
+        lines: vec![
+            "Writes are propose (`--dry-run`) → operator confirms → apply.".to_owned(),
+            "Each write runs `check` and commits once; a failing check blocks the write."
+                .to_owned(),
+            "Nothing pushes, publishes, or spends as a side effect.".to_owned(),
+            "`sync --pull` and `sync --push` are explicit, confirmed network writes.".to_owned(),
+            "`no-ai: true` records, and the notes of `no-ai: notes` people, never enter agent output.".to_owned(),
+        ],
+    });
+
+    // 9. 3–5 jumping-off routines, grounded in this vault's contents.
+    let mut routines = Vec::new();
+    if let Some(root) = vault {
+        if loaded.is_none() {
+            routines.push(format!(
+                "Inspect the vault: `confidant check --vault {}` and fix the error it reports.",
+                root.display()
+            ));
+            routines.push(format!(
+                "Load it in the agent: `confidant resolve <name> --vault {}` once `check` is clean.",
+                root.display()
+            ));
+            routines.push(format!(
+                "Re-run setup after fixing it: `confidant setup --vault {}`.",
+                root.display()
+            ));
+            routines.push("Check readiness: `confidant status`.".to_owned());
+        } else if people > 0 {
+            routines.push(
+                "Before a conversation: `confidant resolve <name>` then `confidant context <id>`."
+                    .to_owned(),
+            );
+            routines.push(
+                "After a conversation: `confidant log session <person> 45m --note \"what happened\" --dry-run`, review it, then rerun without `--dry-run`."
+                    .to_owned(),
+            );
+            if cadence_warnings > 0 {
+                routines.push(format!(
+                    "Keep in touch: `confidant check` lists {cadence_warnings} cadence warning(s); log a touch with `confidant log touch <person> meal` after contact."
+                ));
+            }
+        } else {
+            routines.push(
+                "Add the first person: `confidant record add --file <person.md>` (see `confidant help record add`)."
+                    .to_owned(),
+            );
+        }
+        routines.push(
+            "Search: `confidant find <query>` reads the live vault; use the qmd-search skill for fuzzy questions when enabled."
+                .to_owned(),
+        );
+        if interactions + notes > 0 && routines.len() < 5 {
+            routines.push(format!(
+                "Review context: `confidant context <id>` includes {interactions} interaction(s) and {notes} note(s)."
+            ));
+        }
+        if routines.len() < 5 {
+            routines.push(
+                "Check the vault: `confidant check` (read-only; finding codes are stable)."
+                    .to_owned(),
+            );
+        }
+    } else {
+        routines.push("Create a vault: `confidant init --create --no-input`.".to_owned());
+        routines.push(
+            "Point this machine at an existing vault: set `CONFIDANT_VAULT` or pass `--vault <path>`."
+                .to_owned(),
+        );
+        routines.push(
+            "Re-run `confidant setup --vault <path>` so the pointer is in agent instructions."
+                .to_owned(),
+        );
+        routines.push("Check readiness: `confidant status`.".to_owned());
+    }
+
+    CompletionBrief { sections, routines }
 }
 
 fn bootstrap_target(cli: &Cli) -> PathBuf {
@@ -7181,7 +8104,12 @@ fn cmd_schema(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn setup_result_json(result: &setup::SetupResult) -> Value {
+fn setup_result_json(
+    result: &setup::SetupResult,
+    instructions: Option<&[setup::InstructionInstall]>,
+    instruction_text: &str,
+    instructions_skipped: bool,
+) -> Value {
     let agents: Vec<Value> = result
         .agents
         .iter()
@@ -7199,7 +8127,7 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "skills_dir": result.skills_dir.display().to_string(),
         "home": result.home.display().to_string(),
         "version": result.version,
@@ -7213,7 +8141,19 @@ fn setup_result_json(result: &setup::SetupResult) -> Value {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
         "dry_run": result.dry_run,
-    })
+    });
+    if let Some(instructions) = instructions {
+        value["instructions"] = serde_json::json!({
+            "skipped": instructions_skipped,
+            "text": instruction_text,
+            "targets": instructions.iter().map(|i| serde_json::json!({
+                "agent": i.agent,
+                "path": i.path.display().to_string(),
+                "outcome": i.outcome.as_str(),
+            })).collect::<Vec<_>>(),
+        });
+    }
+    value
 }
 
 fn cmd_setup(
@@ -7221,8 +8161,11 @@ fn cmd_setup(
     agent: &str,
     force: bool,
     copy: bool,
+    no_instructions: bool,
     verbose: bool,
+    vault: Option<&Path>,
 ) -> anyhow::Result<ExitCode> {
+    let vault = vault.or(cli.vault.as_deref());
     match setup::run_setup(agent, force, copy, cli.dry_run) {
         Ok(result) => {
             // #653c: `--agent auto` falls back to claude-code when nothing is
@@ -7230,10 +8173,29 @@ fn cmd_setup(
             if let Some(note) = &result.fallback_note {
                 eprintln!("warning: {note}");
             }
+            // #727: install the system-of-record rule in each agent's
+            // always-on instruction file, not only in the skill dirs.
+            let instruction_text = setup::system_of_record_text(vault);
+            let instructions = if no_instructions {
+                Vec::new()
+            } else {
+                setup::install_instructions(
+                    &result.resolved_agents,
+                    &result.home,
+                    vault,
+                    cli.dry_run,
+                )?
+            };
             if cli.json {
-                let mut value = setup_result_json(&result);
+                let mut value = setup_result_json(
+                    &result,
+                    Some(&instructions),
+                    &instruction_text,
+                    no_instructions,
+                );
                 if let Value::Object(ref mut obj) = value {
                     obj.insert("next_steps".to_owned(), setup_next_steps_json(cli));
+                    obj.insert("brief".to_owned(), completion_brief_json(cli, vault));
                 }
                 print_json(&ok_envelope(None, value))?;
             } else {
@@ -7277,11 +8239,51 @@ fn cmd_setup(
                         result.removed_stale.len()
                     );
                 }
+                if no_instructions {
+                    println!();
+                    println!("System-of-record rule skipped (--no-instructions).");
+                } else if instructions.is_empty() {
+                    println!();
+                    println!(
+                        "System-of-record rule not installed: no agent instruction file was selected."
+                    );
+                } else {
+                    println!();
+                    println!(
+                        "System-of-record rule {}:",
+                        if result.dry_run {
+                            "planned (nothing written)"
+                        } else {
+                            "installed"
+                        }
+                    );
+                    for install in &instructions {
+                        println!(
+                            "  {:<12} {}",
+                            install.outcome.as_str(),
+                            install.path.display()
+                        );
+                    }
+                    println!();
+                    println!(
+                        "Text {}:",
+                        if result.dry_run {
+                            "that would be written"
+                        } else {
+                            "written"
+                        }
+                    );
+                    for line in instruction_text.lines() {
+                        println!("  {line}");
+                    }
+                }
                 if result.dry_run {
                     println!("  re-run without --dry-run to apply");
                 } else {
                     println!();
                     setup_next_steps(cli, verbose)?;
+                    println!();
+                    print_completion_brief(cli, vault);
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -7420,7 +8422,7 @@ fn cmd_update(cli: &Cli, agent: &str, force: bool, verbose: bool) -> anyhow::Res
             return Ok(ExitCode::SUCCESS);
         }
         let result = setup::run_setup(agent, force, false, cli.dry_run)?;
-        let mut value = setup_result_json(&result);
+        let mut value = setup_result_json(&result, None, "", false);
         if let Value::Object(ref mut obj) = value {
             obj.insert("update".to_owned(), update_info);
         }
@@ -7595,14 +8597,12 @@ fn cmd_which(cli: &Cli, skills_dir_only: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_routing(cli: &Cli) -> anyhow::Result<ExitCode> {
+fn cmd_routing(cli: &Cli, vault: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let text = setup::system_of_record_text(vault.or(cli.vault.as_deref()));
     if cli.json {
-        print_json(&ok_envelope(
-            None,
-            serde_json::json!({"snippet": setup::ROUTING_SNIPPET}),
-        ))?;
+        print_json(&ok_envelope(vault, serde_json::json!({"snippet": text})))?;
     } else {
-        print!("{}", setup::ROUTING_SNIPPET);
+        print!("{text}");
     }
     Ok(ExitCode::SUCCESS)
 }

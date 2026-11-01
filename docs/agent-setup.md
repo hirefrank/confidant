@@ -243,13 +243,14 @@ last-fetched copy.
 
 | Command | What |
 |---|---|
-| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [-v]` | Materialize embedded skills, link into agent skill dirs |
+| `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [--no-instructions] [-v]` | Materialize embedded skills, link into agent skill dirs, install the system-of-record rule, print the completion brief |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
-| `confidant doctor` | Vault health + CLI staleness + skills link health + `git-remote` + `local-commits` |
+| `confidant doctor` | Vault health + CLI staleness + skills link health + system-of-record rule + `git-remote` + `local-commits`, with a summary |
+| `confidant status` | One-screen readiness rollup and the completion brief; exits 1 when a required check is not `ok` |
 | `confidant sync [--dry-run] [--pull\|--push] [--yes]` | Fetch and report ahead/behind; `--pull`/`--push` are confirmed network writes |
 | `confidant agents` | List supported agents and detection status |
 | `confidant which [--skills-dir]` | Print installed skills location |
-| `confidant routing` | Print the optional routing snippet |
+| `confidant routing` | Print the system-of-record rule (the text setup installs) |
 
 `--agent auto` (default) links into every detected agent, falling back to
 `claude-code` when none is detected. `--agent all` targets all nine supported
@@ -259,6 +260,59 @@ warning. `--force` replaces existing non-symlink skill dirs (older installs);
 `setup` after every CLI upgrade to refresh them); `-v` prints every path and
 adds the optional qmd note ([below](#optional-search-backend-qmd)).
 Every command takes `--json` and `--no-input` per the agent contract.
+
+## System of record and the completion brief
+
+Linking skills is not enough. A session that never loads a skill still
+answers from whatever memory the host gave it, so `confidant setup` also
+writes a system-of-record declaration into each selected agent's always-on
+instructions. The declaration says the vault is where relationship memory
+lives, gives the vault path and CLI access path, routes reads through
+`resolve`/`context`, `find`, or QMD, routes writes through the CLI
+(dry-run → confirm → apply), states the `no-ai` boundary, and says to admit
+when the vault is unreachable instead of answering from agent memory.
+
+| Agent | Instruction file (relative to `$HOME`) |
+|---|---|
+| `claude-code` | `.claude/CLAUDE.md` |
+| `cursor` | `.cursor/rules/confidant.mdc` |
+| `codex` | `.codex/AGENTS.md` |
+| `opencode` | `.config/opencode/AGENTS.md` |
+| `pi` | `.pi/agent/AGENTS.md` |
+| `gemini-cli` | `.gemini/GEMINI.md` |
+| `hermes-agent` | `.hermes/AGENTS.md` |
+| `muse`, `agents` | `.agents/AGENTS.md` |
+
+Setup owns only the block between `<!-- confidant:system-of-record:begin -->`
+and `<!-- confidant:system-of-record:end -->`; text outside it is preserved,
+and a re-run updates the block in place. An existing block is left alone
+when setup has no vault to point at, so running `confidant setup` from
+`$HOME` cannot erase a pointer installed earlier. `--dry-run` reports the
+planned outcome and writes nothing. `--no-instructions` skips the files
+entirely for operators who manage their own memory. Setup prints every path
+and the exact text it wrote; `confidant routing` reprints the text.
+
+Setup ends with a completion brief for this install: the vault name, path,
+branch, and record counts; the machine and whether it can read and write
+the vault; the remote and recent commit authors (Confidant cannot count
+other machines); the perimeter in plain language (plaintext on disk and in
+git history, a private remote, full-disk encryption as an OS setting that
+Confidant does not verify, and no application-level encryption); the sync
+posture; search state and the corpus snapshot time; where the standing
+orders live; the work discipline; and 3–5 routines grounded in the vault's
+actual contents. `confidant status` reprints that brief with the readiness
+rollup.
+
+The rollup covers CLI/TUI versions, vault discovery and writability, skill
+links, the system-of-record rule, git repository/identity/remote/ahead-
+behind state, the QMD corpus, and binary staleness. Every line is `ok`,
+`warning`, `absent`, `unknown`, or `error`; an optional layer that is not
+installed is `absent`, never a false `ok`. Required checks are the CLI
+version, vault discovery and access, the git repository and identity, the
+vault spec, skill links, and the system-of-record rule. Absent optional
+layers (TUI, QMD) and optional warnings (remote advice, ahead/behind) do
+not block readiness. `confidant status --json` returns the same data under
+`readiness` and `brief`.
 
 ## Local packs
 
@@ -374,8 +428,9 @@ this loop:
   (https://github.com/hirefrank/confidant/releases), or run
   `confidant update` to be told. If behind, re-run the installer or
   `cargo install confidant-cli confidant-tui`, then `confidant setup` to
-  re-point the skill links at the new version dir. Upgrading only one of
-  the two is what trips the version warning.
+  re-point the skill links at the new version dir and refresh the
+  system-of-record rule. Upgrading only one of the two is what trips the
+  version warning.
 - **Skills:** they re-link from the new binary — no separate step, no tag
   to pin. `doctor` warns (`skills-links`) when a detected agent is missing
   links; fix with `confidant setup --agent auto`.
