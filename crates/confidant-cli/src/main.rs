@@ -507,11 +507,13 @@ enum RecordAction {
         #[arg(long)]
         file: PathBuf,
     },
-    /// List the vault's records of one kind, one entry each.
+    /// List the vault's records, one entry each.
     ///
-    /// Operator-only. This command is never exposed over MCP (`mcp.rs` maps
-    /// a fixed tool whitelist), and without `--for-operator` it lists only
-    /// the §12 cleared set, so `no-ai: true` records are absent. With
+    /// Defaults to every identity kind (`person`, `org`, `deal`), so orgs
+    /// are visible without already knowing to ask for them. Operator-only:
+    /// this command is never exposed over MCP (`mcp.rs` maps a fixed tool
+    /// whitelist), and without `--for-operator` it lists only the §12
+    /// cleared set, so `no-ai: true` records are absent. With
     /// `--for-operator` an operator may see them, with a tri-state
     /// `no_ai` (`"true"`, `"notes"`, `"false"`). The resolved vault path
     /// stays in the JSON envelope (ADR-7).
@@ -520,8 +522,8 @@ enum RecordAction {
         /// mechanism as `record show --for-edit`).
         #[arg(long)]
         for_operator: bool,
-        /// Record kind to list.
-        #[arg(long, value_enum, default_value_t = RosterKind::Person)]
+        /// Record kind to list: all (default), person, org, or deal.
+        #[arg(long, value_enum, default_value_t = RosterKind::All)]
         kind: RosterKind,
     },
     /// Print one record's text, to prepare an edit.
@@ -582,21 +584,25 @@ impl Side {
     }
 }
 
-/// Record kinds `record list --kind` accepts (#558).
+/// Record kinds `record list --kind` accepts (#558, #813).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub(crate) enum RosterKind {
+    /// Every identity kind: person, org, and deal (the default).
+    All,
     Person,
     Org,
     Deal,
 }
 
 impl RosterKind {
-    /// The core record kind this filter names.
-    pub(crate) fn record_kind(self) -> RecordKind {
+    /// The core record kind this filter names; `None` means every identity
+    /// kind.
+    pub(crate) fn record_kind(self) -> Option<RecordKind> {
         match self {
-            RosterKind::Person => RecordKind::Person,
-            RosterKind::Org => RecordKind::Org,
-            RosterKind::Deal => RecordKind::Deal,
+            RosterKind::All => None,
+            RosterKind::Person => Some(RecordKind::Person),
+            RosterKind::Org => Some(RecordKind::Org),
+            RosterKind::Deal => Some(RecordKind::Deal),
         }
     }
 }
@@ -4248,7 +4254,7 @@ pub(crate) fn reject_unsupported_prefix(id: &RecordId) -> anyhow::Result<()> {
 fn cmd_record_list(
     cli: &Cli,
     root: &Path,
-    kind: RecordKind,
+    kind: Option<RecordKind>,
     for_operator: bool,
 ) -> anyhow::Result<ExitCode> {
     let vault = match load_vault_for_reads(root, cli.json, for_operator) {
@@ -4300,7 +4306,7 @@ fn cmd_record_list(
                 confidant_core::packs::untrusted::escape_line(&entry.name)
             )?;
         }
-        let noun = if kind == RecordKind::Person {
+        let noun = if kind == Some(RecordKind::Person) {
             "people"
         } else {
             "records"
@@ -4309,7 +4315,7 @@ fn cmd_record_list(
             io::stdout(),
             "{} {noun} ({})",
             roster.records.len(),
-            kind.as_str()
+            roster.kind
         )?;
         // A scoped call names the scope that applied (like `context`).
         if matches!(scope, PackScope::Only(_)) && !scope_names.is_empty() {

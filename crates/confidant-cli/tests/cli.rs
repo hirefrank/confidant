@@ -89,7 +89,7 @@ fn check_demo_json_ok() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["schema_version"], "1");
-    assert_eq!(v["spec"], "0.1");
+    assert_eq!(v["spec"], "0.2");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     // Personal-first teaching content: two warnings, no errors. The default
     // `--fail-on error` keeps the CI step exiting 0.
@@ -124,6 +124,31 @@ fn find_demo_hits_fake_name() {
         .unwrap()
         .iter()
         .any(|m| { m["excerpt"].as_str().unwrap().contains("Dana Example") }));
+}
+
+#[test]
+fn demo_context_org_shows_the_works_at_edge() {
+    let v = run_json(&["context", CLI_ORG], &demo());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["entity"]["kind"], "org");
+    assert_eq!(v["entity"]["name"], "Example Studio");
+    assert!(v.get("person").is_none(), "{v}");
+    let edges = v["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1, "{v}");
+    assert_eq!(edges[0]["kind"], "works_at");
+    assert_eq!(edges[0]["direction"], "in");
+    assert_eq!(edges[0]["other"]["id"], "p-01M3TC5H00MPJG000000000101");
+    assert_eq!(edges[0]["other"]["name"], "Dana Example");
+}
+
+#[test]
+fn demo_find_returns_the_org() {
+    let v = run_json(&["find", "Example Studio"], &demo());
+    assert!(v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == CLI_ORG && m["path"] == "orgs/o-01M3TC5H00MPJG000000000901/org.md"));
 }
 
 #[test]
@@ -4030,12 +4055,13 @@ fn roster_names(v: &serde_json::Value) -> Vec<&str> {
 
 #[test]
 fn record_list_demo_is_the_cleared_set_in_name_order() {
-    let v = demo_roster(&[]);
+    let v = demo_roster(&["--kind", "person"]);
     // ADR-7 envelope: resolved vault path, ok, schema version.
     assert_eq!(v["ok"], true);
     assert_eq!(v["schema_version"], "1");
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     assert_eq!(v["kind"], "person");
+    assert_eq!(v["kinds"], serde_json::json!(["person"]));
     assert_eq!(v["for_operator"], false);
     // Deterministic: display name, case-insensitive.
     assert_eq!(
@@ -4049,9 +4075,34 @@ fn record_list_demo_is_the_cleared_set_in_name_order() {
     }
 }
 
+/// #813: the default roster is every identity kind, so the demo org is
+/// visible without knowing to pass `--kind org`.
+#[test]
+fn record_list_defaults_to_all_identity_kinds() {
+    let v = demo_roster(&[]);
+    assert_eq!(v["kind"], "all");
+    assert_eq!(v["kinds"], serde_json::json!(["person", "org", "deal"]));
+    let names = roster_names(&v);
+    for expected in ["Dana Example", "Eli Sample", "Example Studio"] {
+        assert!(names.contains(&expected), "{expected} missing: {v}");
+    }
+    let org = v["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "org")
+        .expect("demo org in the default roster");
+    assert_eq!(org["name"], "Example Studio");
+
+    // The explicit spelling is the same call.
+    let explicit = demo_roster(&["--kind", "all"]);
+    assert_eq!(explicit["kind"], "all");
+    assert_eq!(roster_names(&explicit), roster_names(&v));
+}
+
 #[test]
 fn record_list_demo_for_operator_adds_no_ai_with_tri_state() {
-    let v = demo_roster(&["--for-operator"]);
+    let v = demo_roster(&["--kind", "person", "--for-operator"]);
     assert_eq!(v["for_operator"], true);
     assert_eq!(
         roster_names(&v),
@@ -4084,9 +4135,17 @@ fn record_list_kind_filters() {
 
     let orgs = run_json(&["record", "list", "--kind", "org"], dir.path());
     assert_eq!(orgs["kind"], "org");
+    assert_eq!(orgs["kinds"], serde_json::json!(["org"]));
     assert_eq!(roster_names(&orgs), vec!["Example Org"]);
     let deals = run_json(&["record", "list", "--kind", "deal"], dir.path());
+    assert_eq!(deals["kind"], "deal");
     assert_eq!(roster_names(&deals), vec!["Example Deal"]);
+
+    // `all` is explicit too, and lists both identity kinds in name order.
+    let all = run_json(&["record", "list", "--kind", "all"], dir.path());
+    assert_eq!(all["kind"], "all");
+    assert_eq!(all["kinds"], serde_json::json!(["person", "org", "deal"]));
+    assert_eq!(roster_names(&all), vec!["Example Deal", "Example Org"]);
 }
 
 #[test]
@@ -4094,7 +4153,7 @@ fn record_list_packs_scope_is_reported_and_fails_closed() {
     // The scope is echoed and validated, like `find` / `context`. Roster
     // entries are core-owned identity records, so a narrower scope does not
     // remove them today.
-    let v = demo_roster(&["--packs", "personal@0.2"]);
+    let v = demo_roster(&["--kind", "person", "--packs", "personal@0.2"]);
     assert_eq!(v["scope"], serde_json::json!(["personal@0.2"]));
     assert_eq!(
         roster_names(&v),
@@ -4178,6 +4237,28 @@ fn record_list_text_output_lists_one_entry_per_line() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("Dana Example"), "{text}");
     assert!(text.contains("Eli Sample"), "{text}");
+    assert!(text.contains("Example Studio"), "{text}");
+    assert!(text.contains("5 records (all)"), "{text}");
+}
+
+#[test]
+fn record_list_text_output_names_a_person_filter() {
+    let out = Command::new(bin())
+        .args([
+            "record",
+            "list",
+            "--kind",
+            "person",
+            "--no-input",
+            "--vault",
+        ])
+        .arg(demo())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Dana Example"), "{text}");
+    assert!(!text.contains("Example Studio"), "{text}");
     assert!(text.contains("4 people (person)"), "{text}");
 }
 
