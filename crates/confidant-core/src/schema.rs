@@ -297,7 +297,7 @@ pub fn contract_schema() -> Value {
                     },
                     "packs": {
                         "type": "object",
-                        "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape. Empty for an org target."
+                        "description": "Pack state grouped by pack name (the built-in personal pack is \"personal@0.2\"; an enabled external pack may add its own view). Each pack decides its own view shape. Empty for an org target."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
