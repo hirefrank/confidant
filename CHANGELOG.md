@@ -13,6 +13,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 - Removed commands: `confidant keys`, `recover`, `reset`, `inbox`, and `reindex`; `alias add` is gone, and `alias resolve` now matches the plain front-matter contact fields (`emails`/`phones`/`links`/`handles`) and names. `E_PLAINTEXT_REMOTE` is gone, so `sync --push` works against any git remote.
 - A vault written by an encrypted Confidant (0.7.x and earlier) must be re-created with `confidant init`; there is no migration. The now-unknown `[crypto]` table is ignored, and the retired finding codes (`E_KEY_COMMITMENT`, `E_ENVELOPE`, `E_REINDEX_REFUSED`, `E_PLAINTEXT_REMOTE`, `E_INBOX_*`, `E_ALIAS_PLAINTEXT`, `E_ALIAS_COLLISION`, `W_SKIPPED_ENCRYPTED`, `W_PARTIAL_RESULTS`) are reserved and must not be reused by packs.
 
+### Added
+- `confidant setup` installs a system-of-record declaration into each detected agent's always-on instruction file (`.claude/CLAUDE.md`, `.codex/AGENTS.md`, `~/.cursor/rules/confidant.mdc`, and the equivalents for the other supported agents), reports every path and the exact text, and preserves text outside its marked block. The declaration covers the claim, vault and CLI access path, read routing through `resolve`/`context`, `find`, and QMD, write routing through the CLI (dry-run → confirm → apply), the `no-ai` boundary, and failure honesty; `confidant routing` prints the same text (#727). `--no-instructions` skips the files and `--dry-run` writes nothing.
+- `confidant status` is a one-screen readiness rollup covering CLI/TUI versions, vault discovery and writability, skill links, the system-of-record rule, git state, QMD corpus state, and binary staleness, plus the completion brief for the install (vault, machine, fleet, perimeter, sync posture, search, standing orders, work discipline, and 3–5 routines). Optional layers report `absent`, never a false `ok`; it exits 1 when a required check is not ok (#716, #733).
+- `doctor` gains a summary count and a `system-of-record` check; `vault-access` reports the permission-bit answer without attempting a write (#716).
+
 ## [0.7.2] - 2026-10-30
 
 ### Added
