@@ -8,6 +8,8 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-01
+
 ### Breaking
 - Confidant is plaintext-only. `crates/confidant-crypt`, the encrypted vault format (spec §14), OS keychain storage, HMAC alias hashing, recovery keys, the encrypted `inbox` queue and its `[trust]` signers, and the `reindex` decryption pipeline are removed. Records are plaintext on disk and in git history; the privacy boundary is the operator's encrypted disk, a private remote, and `no-ai` on agent-readable output (#795).
 - Removed commands: `confidant keys`, `recover`, `reset`, `inbox`, and `reindex`; `alias add` is gone, and `alias resolve` now matches the plain front-matter contact fields (`emails`/`phones`/`links`/`handles`) and names. `E_PLAINTEXT_REMOTE` is gone, so `sync --push` works against any git remote.
@@ -748,7 +750,8 @@ other people's client data in a vault until the audit lands.
 - `confidant allowlist` (the §12 cleared set for index-time exclusion),
   `doctor` health checks, the MCP server, and the coaching schema pack.
 
-[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/hirefrank/confidant/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hirefrank/confidant/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/hirefrank/confidant/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/hirefrank/confidant/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/hirefrank/confidant/compare/v0.6.2...v0.7.0
