@@ -60,6 +60,48 @@ pub fn contract_schema() -> Value {
                     }
                 }
             },
+            "entityView": {
+                "title": "context entity",
+                "description": "The context target: a person or an org (#813). `no_ai` is a boolean on the agent path; the operator-only path reports the tri-state string instead.",
+                "type": "object",
+                "required": ["id", "kind", "no_ai"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["person", "org"]},
+                    "name": {"type": ["string", "null"]},
+                    "no_ai": {
+                        "type": ["boolean", "string"],
+                        "description": "Agent path: boolean. Operator path: the tri-state string (`true`, `notes`, or `false`)."
+                    },
+                    "profile": {"type": ["string", "null"]}
+                }
+            },
+            "edgeView": {
+                "title": "context edge",
+                "description": "One edge from the target's point of view (#813). Opaque ids, kind, and dates are kept under --exclude-private; endpoint names are stripped. An edge appears only when both endpoints are in the section-12 cleared set.",
+                "type": "object",
+                "required": ["id", "kind", "direction", "other"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["out", "in", "none"]},
+                    "other": {
+                        "type": "object",
+                        "required": ["id", "kind"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["person", "org"]},
+                            "name": {"type": ["string", "null"]},
+                            "no_ai": {
+                                "type": ["string", "boolean"],
+                                "description": "Operator path only: the other endpoint's tri-state no-ai badge."
+                            }
+                        }
+                    },
+                    "since": {"type": ["string", "null"]},
+                    "until": {"type": ["string", "null"]}
+                }
+            },
             "checkReport": {
                 "title": "check --json",
                 "type": "object",
@@ -201,20 +243,25 @@ pub fn contract_schema() -> Value {
             },
             "contextBundle": {
                 "title": "context --json",
-                "description": "Everything the vault knows about one person. PII fields (name/profile/bodies) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions are omitted entirely, never nulled. --exclude-private strips PII regardless; ledger facts are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain.",
+                "description": "Everything the vault knows about one entity: a person or an org (#813). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared, so a no-ai endpoint omits the edge from the other endpoint's bundle with no count or hint. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. An org bundle has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:`.",
                 "type": "object",
-                "required": ["ok", "schema_version", "vault", "person", "notes", "interactions", "packs", "aliases"],
+                "required": ["ok", "schema_version", "vault", "entity", "notes", "interactions", "edges", "packs", "aliases"],
                 "properties": {
                     "ok": {"type": "boolean", "const": true},
                     "schema_version": {"type": "string"},
                     "vault": {"type": "string"},
+                    "entity": {"$ref": "#/$defs/entityView"},
                     "person": {
                         "type": "object",
+                        "description": "Deprecated person-only alias, present only for a person target. New readers use `entity`.",
                         "required": ["id", "no_ai"],
                         "properties": {
                             "id": {"type": "string"},
                             "name": {"type": ["string", "null"]},
-                            "no_ai": {"type": "boolean"},
+                            "no_ai": {
+                                "type": ["boolean", "string"],
+                                "description": "Agent path: boolean. Operator path: the tri-state string (`true`, `notes`, or `false`)."
+                            },
                             "profile": {"type": ["string", "null"]}
                         }
                     },
@@ -243,9 +290,14 @@ pub fn contract_schema() -> Value {
                             }
                         }
                     },
+                    "edges": {
+                        "type": "array",
+                        "description": "Edges whose endpoint is this entity, cleared-set-gated and merge-canonicalized (#813). Empty when the target has none or either endpoint is not cleared.",
+                        "items": {"$ref": "#/$defs/edgeView"}
+                    },
                     "packs": {
                         "type": "object",
-                        "description": "Pack state grouped by pack name (the shipped external pack is \"coaching@0.1\"). Each pack decides its own view shape."
+                        "description": "Pack state grouped by pack name (the built-in personal pack is \"personal@0.2\"; an enabled external pack may add its own view). Each pack decides its own view shape. Empty for an org target."
                     },
                     "scope": {"type": "array", "description": "Resolved pack scope that filtered the bundle (issue #178); all enabled packs when unscoped.", "items": {"type": "string"}},
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
@@ -334,6 +386,35 @@ pub fn contract_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #813: the context shape is an entity bundle with edges; `person` is
+    /// the deprecated person-only alias and is no longer required.
+    #[test]
+    fn context_schema_has_entity_and_edges() {
+        let s = contract_schema();
+        let context = &s["$defs"]["contextBundle"];
+        let required: Vec<&str> = context["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"entity"), "{required:?}");
+        assert!(required.contains(&"edges"), "{required:?}");
+        assert!(!required.contains(&"person"), "{required:?}");
+        assert!(context["properties"]["person"].is_object());
+        assert_eq!(
+            context["properties"]["entity"]["$ref"],
+            "#/$defs/entityView"
+        );
+        assert_eq!(
+            context["properties"]["edges"]["items"]["$ref"],
+            "#/$defs/edgeView"
+        );
+        assert!(s["$defs"]["entityView"]["properties"]["kind"]["enum"].is_array());
+        assert!(s["$defs"]["edgeView"]["properties"]["direction"]["enum"].is_array());
+        assert_eq!(s["properties"]["schema_version"]["const"], "1");
+    }
 
     #[test]
     fn schema_is_well_formed() {

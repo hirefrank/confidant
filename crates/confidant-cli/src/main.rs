@@ -191,17 +191,19 @@ enum Command {
         #[command(subcommand)]
         action: PackAction,
     },
-    /// Context bundle for one person (honors no-ai).
+    /// Context bundle for one person or org (honors no-ai).
     ///
     /// Operator-only flag: `--for-operator` includes `no-ai` records the
     /// default (agent) allowlist hides. It is never passed by MCP.
     Context {
-        /// Opaque person id (p-…) or an exact display name (cleared people
-        /// only; see `confidant resolve`).
+        /// Opaque person or org id (p-… / o-…) or an exact person display
+        /// name (cleared people only; see `confidant resolve`). Org names are
+        /// not resolved by name in phase 1; use `find` for the o- id.
+        #[arg(value_name = "ENTITY")]
         person: String,
-        /// Strip private data: name, profile, bodies, and the personal pack's
-        /// PII fields (`birthday`, `dates`, `relationship`, `location`,
-        /// `emails`, `phones`, `links`, `tags`).
+        /// Strip private data: name, profile, bodies, edge endpoint names,
+        /// and the personal pack's PII fields (`birthday`, `dates`,
+        /// `relationship`, `location`, `emails`, `phones`, `links`, `tags`).
         #[arg(long)]
         exclude_private: bool,
         /// Include `no-ai` records, read through the operator path (the same
@@ -4972,13 +4974,25 @@ fn cmd_context(
         Ok(v) => v,
         Err(code) => return Ok(code),
     };
+    // The bundle now parses edges, whose kind list depends on the vault
+    // spec. Fail closed on a spec this binary does not implement instead of
+    // rendering a partial bundle.
+    if !confidant_core::SpecVersion::is_supported(&vault.config.spec) {
+        print_error(
+            cli.json,
+            Some(&vault.root.display().to_string()),
+            &DomainError::spec_unsupported(&vault.config.spec),
+        )?;
+        return Ok(ExitCode::from(1));
+    }
     // #537: a `p-<ULID>` keeps its exact previous behaviour (unsupported id
     // shapes still fall through to the cannot-search / ⚠2b / not-found
     // branches below); a non-id argument is an exact display name resolved
     // against the cleared set and canonicalized. Id args are not
     // canonicalized here — `context` already folds merge groups when it
-    // builds the bundle.
-    let person = match RecordId::parse(person_raw) {
+    // builds the bundle. #813: an `o-<ULID>` is an org target; an org name
+    // is not resolved by name in phase 1.
+    let target = match RecordId::parse(person_raw) {
         Ok(id) => id,
         Err(_) => match confidant_core::resolve::resolve_person(&vault, person_raw) {
             Ok(m) => m.id,
@@ -4992,11 +5006,11 @@ fn cmd_context(
             return Ok(ExitCode::from(err.exit_code() as u8));
         }
     };
-    let bundle = match build_context(&vault, &person, include_private, &scope, for_operator) {
+    let bundle = match build_context(&vault, &target, include_private, &scope, for_operator) {
         Some(b) => b,
         None => {
             return Err(anyhow::Error::new(DomainError::not_found(format!(
-                "no person with id {person_raw}"
+                "no person or org with id {person_raw}"
             )))
             .context("use `confidant find <name>` to look up the id"));
         }
@@ -5008,30 +5022,34 @@ fn cmd_context(
         if for_operator {
             println!("{OPERATOR_MODE_BANNER}");
         }
-        let p = &bundle.person;
+        let e = &bundle.entity;
         // Operator mode carries the tri-state; the agent path still only
-        // knows the boolean.
-        let badge = match p.no_ai_mode {
+        // knows the boolean. `"false"` is an explicit visible record, not a
+        // hidden one, so it gets no badge.
+        let badge = match e.no_ai_mode {
             Some("notes") => " [no-ai: notes]",
-            Some(_) => " [no-ai]",
-            None if p.no_ai => " [no-ai]",
+            Some("true") => " [no-ai]",
+            Some(_) => "",
+            None if e.no_ai => " [no-ai]",
             None => "",
         };
-        println!(
-            "{} {}{badge}",
-            p.id,
-            p.name.as_deref().unwrap_or("(name withheld)"),
-        );
+        let name = e.name.as_deref().unwrap_or("(name withheld)");
+        if e.kind == "person" {
+            println!("{} {name}{badge}", e.id);
+        } else {
+            println!("{} {name} ({}){badge}", e.id, e.kind);
+        }
         // #178: show the scope that applied, so a scoped bundle is never
         // mistaken for the whole record.
         if !bundle.scope.is_empty() && matches!(scope, PackScope::Only(_)) {
             println!("scope: {}", bundle.scope.join(", "));
         }
         println!(
-            "notes: {}, interactions: {}, touchpoints: {}",
+            "notes: {}, interactions: {}, touchpoints: {}, edges: {}",
             bundle.notes.len(),
             bundle.interactions.len(),
-            bundle.touchpoints.len()
+            bundle.touchpoints.len(),
+            bundle.edges.len()
         );
         if !bundle.aliases.is_empty() {
             println!("aliases: {}", bundle.aliases.join(", "));

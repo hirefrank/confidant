@@ -66,6 +66,21 @@ children are treated as `no-ai: true`. Because the flag itself is readable,
 anyone who can read the file learns that a record is marked — but the read
 surfaces still withhold its content from agents.
 
+## Edges and orgs (#813)
+
+`context <id>` accepts a person or an org. An edge is in the bundle only when
+**both** endpoints are cleared: `a` and `b` are front-matter IDs, so a
+`no-ai: true` endpoint drops the whole edge from `find`, the allowlist, and
+every context bundle, including the other endpoint's. The bundle carries no
+count and no anonymized hint; omitted means indistinguishable from absent.
+`--exclude-private` keeps the edge's opaque id, kind, and dates but nulls
+the other endpoint's name, along with the target's name and profile.
+
+Orgs cannot be `no-ai` in phase 1, and edges carry no `no-ai`; hiding a
+single relation or a whole org is a later privacy decision (#820). An org
+bundle also selects notes and interactions attached by `org:`, under the
+same cleared-set and pack-scope rules as a person bundle.
+
 ## Ledger lines
 
 Ledger lines are searchable only when every ID on the line is cleared. A note,

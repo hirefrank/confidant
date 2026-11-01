@@ -102,7 +102,17 @@ impl Record {
         }
     }
 
-    /// One end of an edge (`a` / `b`): a person ID parsed with the same
+    /// The `org:` reference, parsed with the same tolerance as `person:`.
+    /// Used by the org context bundle (#813) to find notes and interactions
+    /// attached to an org.
+    pub fn org(&self) -> Option<RecordId> {
+        match parse_ref_id(self.ref_field("org")?) {
+            FrontmatterRef::Id(id) => Some(id),
+            FrontmatterRef::Absent | FrontmatterRef::Invalid => None,
+        }
+    }
+
+    /// One end of an edge (`a` / `b`): an entity ID parsed with the same
     /// wikilink / quote / comment tolerance as `person` / `org` / `deal`.
     /// `None` when the key is absent, empty, or malformed — `check`
     /// distinguishes those cases.

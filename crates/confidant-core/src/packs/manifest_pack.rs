@@ -337,12 +337,28 @@ impl Pack for ManifestPack {
         as_of: NaiveDate,
     ) -> Option<serde_json::Value> {
         if self.serves_core_personal_view() {
+            // #799: contact verbs are the pack's declaration, not a literal
+            // `touch`/`session` pair in core. The loader requires a
+            // `cadence-overdue` rule with non-empty `event_verbs` for the
+            // personal manifest, so this list is non-empty in practice; an
+            // empty fallback keeps the view valid if a future manifest
+            // shape ever reaches here without one.
+            let event_verbs: Vec<&str> = self
+                .manifest
+                .rules
+                .iter()
+                .find(|rule| rule.kind == "cadence-overdue")
+                .and_then(|rule| rule.params.get("event_verbs"))
+                .and_then(|value| value.as_array())
+                .map(|verbs| verbs.iter().filter_map(|value| value.as_str()).collect())
+                .unwrap_or_default();
             return crate::context::personal::build_personal_view(
                 vault,
                 person,
                 canonical,
                 as_of,
                 &self.manifest.fields,
+                &event_verbs,
             );
         }
         let params = self.context_params.as_ref()?;
