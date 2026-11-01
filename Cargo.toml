@@ -15,7 +15,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -28,7 +28,7 @@ description = "Relationship memory you own: plain-text records in a git repo, fo
 anyhow = "1.0"
 chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-confidant-core = { path = "crates/confidant-core", version = "0.7.2" }
+confidant-core = { path = "crates/confidant-core", version = "0.8.0" }
 crossterm = "0.29"
 include_dir = "0.7"
 ratatui = "0.30"

@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "confidant-tui"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
