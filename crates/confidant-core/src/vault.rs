@@ -96,8 +96,9 @@ const LEGACY_SNIFF_BYTES: u64 = 16 * 1024;
 ///   `enc:`-prefixed line in a ledger file.
 ///
 /// A plaintext vault never produces either. The sniff never decrypts,
-/// never reads a note body, and never returns names or paths; unreadable
-/// entries are skipped (a broken vault is `check`'s problem).
+/// reads at most [`LEGACY_SNIFF_BYTES`] from a candidate file, and never
+/// returns content, names, or paths; unreadable entries are skipped (a
+/// broken vault is `check`'s problem).
 pub fn is_legacy_encrypted_vault(root: &Path) -> bool {
     has_legacy_key_material(&root.join("keys"))
         || COLLECTIONS
