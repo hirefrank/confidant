@@ -225,8 +225,9 @@ Details:
 
 ## First five minutes: the people in your life
 
-The demo vault is fake data: a friend, a sibling, a partner, and a mentor.
-Copy it out so writes commit to a scratch repo:
+The demo vault is fake data: a friend, a sibling, a partner, a mentor, and
+one organization (Example Studio) that Dana Example works at. Copy it out so
+writes commit to a scratch repo:
 
 ```sh
 git clone --depth 1 https://github.com/hirefrank/confidant
@@ -240,8 +241,11 @@ explicitly instead of relying on an exported variable — and never
 `source ~/.bashrc` to set it: an interactive guard skips the export, and a
 stale `CONFIDANT_VAULT` can make `check` inspect the wrong vault.
 
-`confidant record list` prints the visible people; the one marked
-`no-ai: true` is absent. `confidant check` lists what needs attention:
+`confidant record list` prints the cleared roster and defaults to every
+identity kind — people, orgs, and deals — so Example Studio appears without
+knowing to pass `--kind org`. Use `--kind person` for the people-only view.
+Records marked `no-ai: true` are absent. `confidant check` lists what needs
+attention:
 
 ```text
 warning  W_CADENCE_OVERDUE  people/p-01M3TC5H00MPJG000000000101/profile.md  p-01M3TC5H00MPJG000000000101
@@ -293,6 +297,31 @@ The demo is fake data. For your own vault, `confidant init --create
 plaintext in the repo, so keep it private and on a full-disk-encrypted
 machine ([Privacy](#privacy)).
 
+### Link a person to an org
+
+Edges are records under `edges/e-…/edge.md` with `a`, `b`, `kind`, and
+optional `since` / `until`. Core ships person↔person kinds (`married`,
+`introduced`, `colleague`) and directed person→org kinds (`works_at`,
+`founder_of`, `investor_in`, `advisor_to`). The demo's Dana Example already
+has a `works_at` edge to Example Studio:
+
+```sh
+confidant context o-01M3TC5H00MPJG000000000901
+```
+
+`context` accepts a person or org ID. The bundle's `entity` is the target;
+`person` remains a deprecated alias for person targets. `edges` lists the
+relationships visible from that entity, with `direction` (`out` when the
+target is `a`, `in` when it is `b`, `none` for a symmetric kind) and the
+`other` endpoint. An org bundle also includes notes and interactions linked
+by `org:`.
+
+An edge is agent-visible only when both endpoints are cleared; a
+`no-ai: true` endpoint removes the whole edge, with no count or hint.
+`--exclude-private` strips names but keeps opaque IDs, kinds, and dates.
+Orgs and edges do not take `no-ai` in this version. Pack kinds can declare
+their own endpoint types with `from` / `to` in the pack manifest.
+
 ## How your agents use it
 
 `confidant setup --agent auto` links the embedded skills. Agents use the
@@ -313,9 +342,11 @@ not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
 
 `no-ai` keeps a record out of agent output; `--for-operator` on `find`,
 `context`, and `record list` is the operator-only escape hatch, and MCP
-never passes it. `--person` (on `log session`, `log touch`, `note add`,
-`context`) takes a `p-<ULID>` or an **exact display name**; `find` stays
-fuzzy and `no-ai: true` people are ID-only.
+never passes it. `--person` (on `log session`, `log touch`, `note add`)
+takes a `p-<ULID>` or an **exact display name**. `context` takes a person
+or org ID, or an exact person display name; org names are not resolved, so
+use `find` for the `o-` ID. `find` stays fuzzy and `no-ai: true` people are
+ID-only.
 
 | Area | Commands |
 |---|---|
@@ -359,8 +390,9 @@ contract.
 **`personal@0.2` is built in and always on.** It supplies the relationships
 schema this README describes: birthdays (full dates or year-less `--MM-DD`),
 recurring dates, `relationship`, `cadence` with `snooze_until`, contact
-fields, relationship edges, the `touch` verb, and two warning-level rules
-(`W_CADENCE_OVERDUE`, `W_DATE_UPCOMING`) that never block a write. Contract:
+fields, relationship edges (person↔person; core adds the person→org kinds),
+the `touch` verb, and two warning-level rules (`W_CADENCE_OVERDUE`,
+`W_DATE_UPCOMING`) that never block a write. Contract:
 [`packs/personal/0.2.md`](packs/personal/0.2.md). A vault needs no other pack
 to be useful, and a `personal@…` entry in `packs` is a no-op.
 

@@ -423,7 +423,7 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Alternatives considered.** (a) Keep edges person-only: fails #752 and blocks the relationship graph. (b) Make record types pack-definable first: larger and slower; edges are the smaller unlock. (c) Store `a_type`/`b_type` on the edge: duplicates the kind's declaration and can disagree with it. (d) Rewrite edge files on merge: history churn for a problem read-time resolution already solves.
 
-**Consequences.** The spec gets a second frozen document (`spec/0.2.md`). A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, and a 0.1 vault rejects it with `E_PACK_VERSION` rather than guessing. Org context, roster visibility, and the demo follow in later #813 phases. A per-edge or per-org `no-ai` mode remains an open privacy question.
+**Consequences.** The spec gets a second frozen document (`spec/0.2.md`). A pack that declares a non-person endpoint must add `"0.2"` to `requires_spec`, and a 0.1 vault rejects it with `E_PACK_VERSION` rather than guessing. Org context and the default all-kinds roster followed in #813 phases 2 and 3. A per-edge or per-org `no-ai` mode remains an open privacy question.
 
 ## 8. v0 scope and milestones
 

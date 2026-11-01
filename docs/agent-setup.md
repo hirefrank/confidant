@@ -87,9 +87,10 @@ URL is known instead. This is the long form of step 3 of the install prompt in
 ## What a vault is on disk
 
 A vault is a directory of plain text: `confidant.toml`, `ledger/`, and one
-Markdown record per person, org, deal, interaction, and note. There is one
-kind of vault, and no mode to choose. `examples/demo-vault` is the same kind
-of vault filled with fake people.
+Markdown record per person, org, deal, interaction, note, and edge. There is
+one kind of vault, and no mode to choose. `examples/demo-vault` is the same
+kind of vault, filled with fake people, an org, and the relationships
+between them.
 
 The privacy perimeter is the operator's own machines and a **private** git
 remote, with full-disk encryption on (LUKS, FileVault): see
@@ -320,9 +321,10 @@ The `pack-author` skill walks an agent through the decision: a pack for new
 declarative claims or checks, a skill-only workflow when existing records
 and notes suffice, and a core change when new Rust logic is needed.
 
-A pack is data plus agent text. It can declare fields, verbs, edge kinds,
-finding codes, check keys, and parameters for existing rule kinds; it cannot
-run code or define a new kind. Keep the source outside the vault:
+A pack is data plus agent text. It can declare fields, verbs, edge kinds
+(with optional `from` / `to` endpoint types), finding codes, check keys, and
+parameters for existing rule kinds; it cannot run code or define a new kind.
+Keep the source outside the vault:
 
 ```sh
 confidant pack init ~/confidant-packs/<name>

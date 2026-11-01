@@ -165,7 +165,9 @@ fn init_without_create_fills_in_a_hand_written_vault() {
     std::fs::create_dir_all(&home).unwrap();
     let vault = tmp.path().join("vault");
     common::copy_dir(&demo(), &vault);
-    for dir in ["orgs", "deals", "interactions"] {
+    // The demo now carries an org (spec 0.2), so only these collections are
+    // absent from the hand-written copy.
+    for dir in ["deals", "interactions"] {
         assert!(!vault.join(dir).exists());
     }
     git(&vault, &["init", "-q"]);

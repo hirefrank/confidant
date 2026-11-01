@@ -41,8 +41,12 @@ pub struct RosterEntry {
 /// The whole roster plus the envelope-level context a reader needs.
 #[derive(Clone, Debug, Serialize)]
 pub struct Roster {
-    /// The requested record kind (`"person"`, `"org"`, `"deal"`).
+    /// The requested filter: `"all"`, `"person"`, `"org"`, or `"deal"`.
+    /// `"all"` is the default and covers the three identity kinds.
     pub kind: &'static str,
+    /// The record kinds included by this call. One entry for a filtered
+    /// call, three for `"all"`.
+    pub kinds: Vec<&'static str>,
     /// Whether the operator-only visibility flag was set.
     pub for_operator: bool,
     pub records: Vec<RosterEntry>,
@@ -53,7 +57,11 @@ pub struct Roster {
     pub scope: Vec<String>,
 }
 
-/// Build the roster for `kind`.
+/// The identity kinds `--kind all` lists (#813). Notes, interactions, and
+/// edges are not roster kinds; deals are listable but never edge endpoints.
+const ALL_KINDS: &[RecordKind] = &[RecordKind::Person, RecordKind::Org, RecordKind::Deal];
+
+/// Build the roster for `kind`, or for every identity kind when `None`.
 ///
 /// A record is listed when it is in the §12 cleared set, or — with
 /// `for_operator` — when its own mode is `no-ai: true` (the only reason a
@@ -66,17 +74,25 @@ pub struct Roster {
 /// the §12 allowlist does not expose as a single check.
 pub fn build_roster(
     vault: &Vault,
-    kind: RecordKind,
+    kind: Option<RecordKind>,
     scope: &PackScope,
     for_operator: bool,
 ) -> Roster {
     let cleared = cleared_record_ids(vault);
     let (enabled, _) = vault.pack_registry().resolve_enabled(&vault.config.packs);
     let scope_names = scope.names(&enabled);
+    let is_included = |record_kind: RecordKind| match kind {
+        Some(kind) => record_kind == kind,
+        None => ALL_KINDS.contains(&record_kind),
+    };
+    let kinds: Vec<&'static str> = match kind {
+        Some(kind) => vec![kind.as_str()],
+        None => ALL_KINDS.iter().map(|kind| kind.as_str()).collect(),
+    };
 
     let mut sortable: Vec<(String, RecordId, RosterEntry)> = Vec::new();
     for rec in vault.records.values() {
-        if rec.kind != kind {
+        if !is_included(rec.kind) {
             continue;
         }
         if !cleared.contains(&rec.id) && !(for_operator && rec.no_ai()) {
@@ -98,7 +114,8 @@ pub fn build_roster(
     sortable.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     Roster {
-        kind: kind.as_str(),
+        kind: kind.map_or("all", |kind| kind.as_str()),
+        kinds,
         for_operator,
         records: sortable.into_iter().map(|(_, _, entry)| entry).collect(),
         scope: scope_names,
@@ -118,7 +135,7 @@ mod tests {
     #[test]
     fn roster_without_flag_is_the_cleared_set() {
         let vault = demo_vault();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some(RecordKind::Person), &PackScope::All, false);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -126,6 +143,7 @@ mod tests {
         );
         assert!(roster.records.iter().all(|r| r.no_ai == "false"));
         assert_eq!(roster.kind, "person");
+        assert_eq!(roster.kinds, vec!["person"]);
         assert!(!roster.for_operator);
         assert!(roster.scope.contains(&"personal@0.2".to_string()));
     }
@@ -133,7 +151,7 @@ mod tests {
     #[test]
     fn operator_roster_lists_the_demo_people_with_tri_state() {
         let vault = demo_vault();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, true);
+        let roster = build_roster(&vault, Some(RecordKind::Person), &PackScope::All, true);
         let names: Vec<&str> = roster.records.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
@@ -166,7 +184,7 @@ mod tests {
             .unwrap();
         }
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some(RecordKind::Person), &PackScope::All, false);
         let ids: Vec<&str> = roster.records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -191,7 +209,7 @@ mod tests {
         std::fs::create_dir_all(d.parent().unwrap()).unwrap();
         std::fs::write(&d, format!("---\nid: {id}\ntype: person\n---\n\n")).unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some(RecordKind::Person), &PackScope::All, false);
         assert_eq!(roster.records.len(), 1);
         assert_eq!(roster.records[0].name, id);
     }
@@ -215,7 +233,7 @@ mod tests {
         )
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let roster = build_roster(&vault, RecordKind::Person, &PackScope::All, false);
+        let roster = build_roster(&vault, Some(RecordKind::Person), &PackScope::All, false);
         assert_eq!(roster.records.len(), 1);
         assert_eq!(roster.records[0].no_ai, "notes");
     }
@@ -243,14 +261,84 @@ mod tests {
         )
         .unwrap();
         let vault = crate::vault::load_vault(dir.path()).unwrap();
-        let orgs = build_roster(&vault, RecordKind::Org, &PackScope::All, false);
+        let orgs = build_roster(&vault, Some(RecordKind::Org), &PackScope::All, false);
         assert_eq!(orgs.records.len(), 1);
         assert_eq!(orgs.records[0].name, "Example Org");
         assert_eq!(orgs.records[0].kind, "org");
         assert_eq!(orgs.records[0].no_ai, "false");
-        let deals = build_roster(&vault, RecordKind::Deal, &PackScope::All, false);
+        assert_eq!(orgs.kinds, vec!["org"]);
+        let deals = build_roster(&vault, Some(RecordKind::Deal), &PackScope::All, false);
         assert_eq!(deals.records.len(), 1);
         assert_eq!(deals.records[0].name, "Example Deal");
         assert_eq!(deals.records[0].kind, "deal");
+        assert_eq!(deals.kinds, vec!["deal"]);
+    }
+
+    /// #813: the default roster is the three identity kinds. Notes,
+    /// interactions, and edges are not roster kinds; deals are listable but
+    /// never edge endpoints.
+    #[test]
+    fn roster_all_lists_only_identity_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.2\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let person = "p-01J9Z3K4QF0000000000000001";
+        let other = "p-01J9Z3K4QF0000000000000002";
+        let org = "o-01J9Z3K4QF0000000000000003";
+        let deal = "d-01J9Z3K4QF0000000000000004";
+        let note = "n-01J9Z3K4QF0000000000000005";
+        for (rel, body) in [
+            (
+                format!("people/{person}/profile.md"),
+                format!("---\nid: {person}\ntype: person\nname: Ada Example\n---\n"),
+            ),
+            (
+                format!("people/{other}/profile.md"),
+                format!("---\nid: {other}\ntype: person\nname: Bea Example\n---\n"),
+            ),
+            (
+                format!("orgs/{org}/org.md"),
+                format!("---\nid: {org}\ntype: org\nname: Example Org\n---\n"),
+            ),
+            (
+                format!("deals/{deal}/deal.md"),
+                format!("---\nid: {deal}\ntype: deal\nname: Example Deal\n---\n"),
+            ),
+            (
+                format!("notes/{note}/note.md"),
+                format!("---\nid: {note}\ntype: note\nperson: {person}\ndate: 2026-10-01\n---\n"),
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let roster = build_roster(&vault, None, &PackScope::All, false);
+        assert_eq!(roster.kind, "all");
+        assert_eq!(roster.kinds, vec!["person", "org", "deal"]);
+        assert_eq!(
+            roster
+                .records
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Ada Example", "Bea Example", "Example Deal", "Example Org"]
+        );
+        assert_eq!(
+            roster
+                .records
+                .iter()
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+            vec!["person", "person", "deal", "org"]
+        );
+        assert!(
+            roster.records.iter().all(|entry| entry.id != note),
+            "notes are not roster kinds"
+        );
     }
 }

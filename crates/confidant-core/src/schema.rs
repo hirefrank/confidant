@@ -20,7 +20,7 @@ pub fn contract_schema() -> Value {
             "schema_version": {"type": "string", "const": "1"},
             "shapes": {
                 "type": "object",
-                "required": ["error", "check", "find", "allowlist", "write", "context", "doctor", "sync", "help"],
+                "required": ["error", "check", "find", "allowlist", "write", "context", "roster", "doctor", "sync", "help"],
                 "properties": {
                     "error": {"$ref": "#/$defs/error"},
                     "check": {"$ref": "#/$defs/checkReport"},
@@ -28,6 +28,7 @@ pub fn contract_schema() -> Value {
                     "allowlist": {"$ref": "#/$defs/allowlistResponse"},
                     "write": {"$ref": "#/$defs/writeResponse"},
                     "context": {"$ref": "#/$defs/contextBundle"},
+                    "roster": {"$ref": "#/$defs/rosterResponse"},
                     "doctor": {"$ref": "#/$defs/doctorReport"},
                     "sync": {"$ref": "#/$defs/syncReport"},
                     "help": {"$ref": "#/$defs/helpJson"}
@@ -303,6 +304,39 @@ pub fn contract_schema() -> Value {
                     "aliases": {"type": "array", "items": {"type": "string"}, "description": "Contact values from the person's front-matter emails, phones, and handles (empty under --exclude-private and for uncleared records)."}
                 }
             },
+            "rosterResponse": {
+                "title": "record list --json",
+                "description": "Operator-only roster (#558, #813). `record list` is never exposed over MCP. `kind` is the requested filter; the default is `all`, which covers the three identity kinds person, org, and deal (deals are listable but never edge endpoints). `kinds` lists the kinds included by this call. Without --for-operator entries are the section-12 cleared set; with it, records hidden only by their own no-ai are added and every entry carries the tri-state no_ai string the #559 ruling specifies.",
+                "type": "object",
+                "required": ["ok", "schema_version", "vault", "kind", "kinds", "for_operator", "records", "scope"],
+                "properties": {
+                    "ok": {"type": "boolean", "const": true},
+                    "schema_version": {"type": "string"},
+                    "vault": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["all", "person", "org", "deal"]},
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["person", "org", "deal"]}
+                    },
+                    "for_operator": {"type": "boolean"},
+                    "records": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/rosterEntry"}
+                    },
+                    "scope": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "rosterEntry": {
+                "title": "record list entry",
+                "type": "object",
+                "required": ["id", "name", "no_ai", "kind"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string", "description": "Display name, falling back to the opaque id."},
+                    "no_ai": {"type": "string", "enum": ["true", "notes", "false"]},
+                    "kind": {"type": "string", "enum": ["person", "org", "deal"]}
+                }
+            },
             "doctorReport": {
                 "title": "doctor --json",
                 "type": "object",
@@ -416,6 +450,37 @@ mod tests {
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
     }
 
+    /// #813: the roster shape documents the `all` default and the three
+    /// identity kinds; `record list` stays an operator-only command.
+    #[test]
+    fn roster_schema_has_all_default_and_identity_kinds() {
+        let s = contract_schema();
+        assert_eq!(
+            s["properties"]["shapes"]["properties"]["roster"]["$ref"],
+            "#/$defs/rosterResponse"
+        );
+        let roster = &s["$defs"]["rosterResponse"];
+        let required: Vec<&str> = roster["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        for field in ["kind", "kinds", "records", "for_operator"] {
+            assert!(required.contains(&field), "{field}: {required:?}");
+        }
+        assert!(roster["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "all"));
+        assert_eq!(
+            s["$defs"]["rosterEntry"]["properties"]["kind"]["enum"],
+            serde_json::json!(["person", "org", "deal"])
+        );
+        assert_eq!(s["properties"]["schema_version"]["const"], "1");
+    }
+
     #[test]
     fn schema_is_well_formed() {
         let s = contract_schema();
@@ -427,6 +492,7 @@ mod tests {
             "allowlist",
             "write",
             "context",
+            "roster",
             "doctor",
             "sync",
             "help",
@@ -449,6 +515,7 @@ mod tests {
             "allowlist" => "allowlistResponse",
             "write" => "writeResponse",
             "context" => "contextBundle",
+            "roster" => "rosterResponse",
             "doctor" => "doctorReport",
             "sync" => "syncReport",
             "help" => "helpJson",
