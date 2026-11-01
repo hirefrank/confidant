@@ -105,33 +105,6 @@ fn render_to_string_at<R: Runner>(app: &App<R>, width: u16, height: u16) -> Stri
     lines.join("\n") + "\n"
 }
 
-/// Flatten only the Search view's Status block from a rendering, so a
-/// warning assertion cannot pass on a `reindex` mention in another
-/// block. The block starts at the row whose border carries the
-/// ` Status ` title and ends at its bottom border (or the next
-/// block's title row); border characters are stripped row by row
-/// before joining, so a phrase wrapped across rows is reconstructed.
-/// Panics if no Status block is found, so a layout change fails
-/// loudly instead of silently asserting on an empty string.
-fn status_block_flat(rendered: &str) -> String {
-    let lines: Vec<&str> = rendered.lines().collect();
-    let start = lines
-        .iter()
-        .position(|row| row.contains("Status"))
-        .expect("Status block title must render");
-    let mut rows: Vec<&str> = Vec::new();
-    for row in &lines[start + 1..] {
-        if row.starts_with('└') || row.starts_with('╰') || row.contains("Matches") {
-            break;
-        }
-        rows.push(row);
-    }
-    rows.iter()
-        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn assert_snapshot(name: &str, actual: &str) {
     let path = snapshot_path(name);
     if std::env::var("UPDATE_SNAPSHOTS").is_ok() {
@@ -212,8 +185,6 @@ fn search_context_and_doctor_views_snapshot() {
             }
         ],
         "findings": [],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0,
         "scope": ["personal@0.2"]
     }"#;
     let context_json = r#"{
@@ -248,9 +219,7 @@ fn search_context_and_doctor_views_snapshot() {
             }
         ],
         "packs": {},
-        "aliases": ["hmac:0123456789abcdef0123456789abcdef"],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0,
+        "aliases": ["ada@example.test"],
         "scope": ["personal@0.2"]
     }"#;
     let doctor_json = r#"{
@@ -338,7 +307,7 @@ fn search_exact_toggle_reruns_query() {
     let find_json = r#"{
         "ok": true, "schema_version": "1", "vault": "/fake/v",
         "query": "ada", "matches": [], "findings": [],
-        "skipped_encrypted": 0, "refused_envelopes": 0, "scope": []
+        "scope": []
     }"#;
     let fake = FakeRunner::new().with_response("find", 0, find_json);
     let mut app = App::new(fake);
@@ -367,148 +336,6 @@ fn search_exact_toggle_reruns_query() {
     // The `via` label reflects the engine that answered.
     let rendered = render_to_string(&app);
     assert!(rendered.contains("find-exact"), "{rendered}");
-}
-
-/// #718 fix wave: a zero-match exact search over skipped encrypted
-/// records must render the in-band warning in the Search status block,
-/// not just a bare "0 matches" — the TUI case the PR body claimed but
-/// the view did not actually render.
-#[test]
-fn search_exact_zero_matches_with_skips_renders_warning() {
-    let find_json = r#"{
-        "ok": true, "schema_version": "1", "vault": "/fake/v",
-        "query": "sourdough", "matches": [],
-        "findings": [{"code": "W_SKIPPED_ENCRYPTED", "severity": "warning",
-          "message": "2 encrypted records were not searched; this result does not establish absence — try `resolve`/`context`, or build the search corpus with `reindex`."}],
-        "skipped_encrypted": 2, "refused_envelopes": 0, "scope": []
-    }"#;
-    let fake = FakeRunner::new().with_response("find", 0, find_json);
-    let mut app = App::new(fake);
-    app.active_view = ActiveView::Search;
-    app.search.exact = true;
-    app.run_search("sourdough");
-
-    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
-    let res = app.search.result.as_ref().expect("search result populated");
-    assert!(res.kept.is_empty(), "zero matches expected");
-    assert_eq!(res.result.skipped_encrypted, 2);
-    assert!(
-        res.result
-            .findings
-            .iter()
-            .any(|f| f.code == "W_SKIPPED_ENCRYPTED"),
-        "warning finding must carry through"
-    );
-
-    // #790 blocker 1: render at an ordinary 80-column width. The
-    // warning wraps inside the status block, so the full message —
-    // including the remedy at its end — must still render.
-    let rendered = render_to_string_at(&app, 80, 24);
-    assert!(rendered.contains("0 matches"), "{rendered}");
-    assert!(
-        rendered.contains("W_SKIPPED_ENCRYPTED"),
-        "warning code must render in the status block:\n{rendered}"
-    );
-    // The wrapped message spans rows, so assert its phrases on the
-    // newline-flattened rendering; the code assertion above already
-    // proves the warning is in the status block.
-    // Strip the block borders row by row before flattening: a wrapped
-    // phrase is split across rows with a `│` border between the words.
-    let flat: String = rendered
-        .lines()
-        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        flat.contains("does not establish absence"),
-        "warning message must render:\n{rendered}"
-    );
-    assert!(
-        flat.contains("reindex"),
-        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
-    );
-    // #790 fix round 2: scope the remedy assertion to the Status
-    // block and assert the warning's last phrase verbatim, so a
-    // `reindex` mention elsewhere on screen cannot mask a clipped
-    // warning.
-    let status = status_block_flat(&rendered);
-    assert!(
-        status.contains("search corpus with `reindex`"),
-        "warning's last phrase must render inside the Status block:\n{rendered}"
-    );
-}
-
-/// #769: a non-empty exact search over skipped encrypted records must
-/// render the partial-results warning in the Search status block, not
-/// just the match list — the TUI half of the #718 warning's complement.
-#[test]
-fn search_exact_nonempty_with_skips_renders_partial_warning() {
-    let find_json = r#"{
-        "ok": true, "schema_version": "1", "vault": "/fake/v",
-        "query": "plaintextmarker", "matches": [
-            {"id": "p-01J9Z3K4QH0000000000000000", "path": "people/p-01J9Z3K4QH0000000000000000/profile.md", "line": 3, "excerpt": "Bio with plaintextmarker."}
-        ],
-        "findings": [{"code": "W_PARTIAL_RESULTS", "severity": "warning",
-          "message": "2 encrypted records were not searched; these matches may be incomplete — try `resolve`/`context`, or build the search corpus with `reindex`."}],
-        "skipped_encrypted": 2, "refused_envelopes": 0, "scope": []
-    }"#;
-    let fake = FakeRunner::new().with_response("find", 0, find_json);
-    let mut app = App::new(fake);
-    app.active_view = ActiveView::Search;
-    app.search.exact = true;
-    app.run_search("plaintextmarker");
-
-    assert!(app.alert.is_none(), "unexpected alert: {:?}", app.alert);
-    let res = app.search.result.as_ref().expect("search result populated");
-    assert!(!res.kept.is_empty(), "non-empty matches expected");
-    assert_eq!(res.result.skipped_encrypted, 2);
-    assert!(
-        res.result
-            .findings
-            .iter()
-            .any(|f| f.code == "W_PARTIAL_RESULTS"),
-        "partial warning finding must carry through"
-    );
-    assert!(
-        !res.result
-            .findings
-            .iter()
-            .any(|f| f.code == "W_SKIPPED_ENCRYPTED"),
-        "non-empty result must not carry the absence warning"
-    );
-
-    // #790 blocker 1: render at an ordinary 80-column width. The
-    // warning wraps inside the status block, so the full message —
-    // including the remedy at its end — must still render.
-    let rendered = render_to_string_at(&app, 80, 24);
-    assert!(
-        rendered.contains("W_PARTIAL_RESULTS"),
-        "warning code must render in the status block:\n{rendered}"
-    );
-    // Strip the block borders row by row before flattening: a wrapped
-    // phrase is split across rows with a `│` border between the words.
-    let flat: String = rendered
-        .lines()
-        .map(|row| row.trim_matches(|c| c == '│' || c == ' '))
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(
-        flat.contains("may be incomplete"),
-        "warning message must render:\n{rendered}"
-    );
-    assert!(
-        flat.contains("reindex"),
-        "warning remedy (last word) must not be clipped at 80 columns:\n{rendered}"
-    );
-    // #790 fix round 2: scope the remedy assertion to the Status
-    // block and assert the warning's last phrase verbatim, so a
-    // `reindex` mention elsewhere on screen cannot mask a clipped
-    // warning.
-    let status = status_block_flat(&rendered);
-    assert!(
-        status.contains("search corpus with `reindex`"),
-        "warning's last phrase must render inside the Status block:\n{rendered}"
-    );
 }
 
 #[test]
@@ -784,7 +611,7 @@ fn proposals_temp_dir(name: &str) -> PathBuf {
 /// truncated from the left when it is too wide. `std::env::temp_dir()` is
 /// `/var/folders/...` on macOS, so the snapshot test pins its vault to the
 /// short `/tmp/...` form that renders identically on Linux and macOS, the same
-/// way the conflict and inbox snapshots already use literal `/tmp/` paths.
+/// way the conflict snapshots already use literal `/tmp/` paths.
 /// Every other proposals test keeps the platform temp dir.
 fn proposals_temp_dir_at(root: &Path, name: &str) -> PathBuf {
     let dir = root.join(name);
@@ -1113,241 +940,6 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn inbox_dry_run_json() -> &'static str {
-    r#"{
-        "ok": true,
-        "schema_version": "1",
-        "vault": "/tmp/fake-vault",
-        "branch": "main",
-        "dry_run": true,
-        "empty": false,
-        "merged": 2,
-        "cleared": 2,
-        "items": [
-            {"name": "01JAAA", "kind": "ledger", "target": "ledger/*", "action": "merge"},
-            {"name": "01JAAB", "kind": "record", "target": "people/p-01/record.md", "action": "skip"}
-        ],
-        "skipped": [
-            {"name": "01JAAC", "kind": "ledger", "target": "ledger/*"}
-        ],
-        "warnings": ["item 01JAAB already present: idempotent no-op"]
-    }"#
-}
-
-fn inbox_empty_json() -> &'static str {
-    r#"{
-        "ok": true,
-        "schema_version": "1",
-        "vault": "/tmp/fake-vault",
-        "branch": "main",
-        "dry_run": true,
-        "empty": true,
-        "merged": 0,
-        "cleared": 0,
-        "items": [],
-        "skipped": [],
-        "warnings": []
-    }"#
-}
-
-#[test]
-fn inbox_dry_run_renders_items_warnings_and_skipped() {
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    assert_eq!(app.active_view, ActiveView::Inbox);
-    let rendered = render_to_string(&app);
-    assert!(rendered.contains("01JAAA"), "item name shown:\n{rendered}");
-    assert!(rendered.contains("ledger/*"), "target shown:\n{rendered}");
-    assert!(rendered.contains("(merge)"), "action shown:\n{rendered}");
-    assert!(
-        rendered.contains("Deferred (1)"),
-        "skipped section:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("already present"),
-        "warnings shown:\n{rendered}"
-    );
-    assert_snapshot("inbox_dry_run.txt", &rendered);
-}
-
-#[test]
-fn inbox_empty_renders_nothing_to_do() {
-    let fake = FakeRunner::from_json(0, inbox_empty_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    let rendered = render_to_string(&app);
-    assert!(
-        rendered.contains("nothing to do"),
-        "empty state:\n{rendered}"
-    );
-}
-
-#[test]
-fn inbox_apply_confirm_runs_real_inbox_then_reloads() {
-    let fake = FakeRunner::new();
-    // Dry run, then the real apply, then the post-apply dry run (empty).
-    fake.push_response(0, inbox_dry_run_json().as_bytes().to_vec());
-    fake.push_response(
-        0,
-        r#"{"ok": true, "schema_version": "1", "dry_run": false, "empty": false,
-            "merged": 2, "cleared": 2, "items": [], "skipped": [], "warnings": []}"#,
-    );
-    fake.push_response(0, inbox_empty_json().as_bytes().to_vec());
-
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    // Begin apply: confirm modal opens.
-    app.handle_key(key(KeyCode::Char('a')));
-    assert!(app.inbox.confirming, "confirm modal open");
-    let rendered = render_to_string(&app);
-    assert!(
-        rendered.contains("Confirm: apply inbox"),
-        "modal shown:\n{rendered}"
-    );
-    // Confirm with y: runs the real inbox, then reloads the dry run.
-    app.handle_key(key(KeyCode::Char('y')));
-    assert!(!app.inbox.confirming, "modal closed");
-
-    let calls = app.runner.recorded_calls();
-    assert!(
-        calls
-            .iter()
-            .any(|c| c == &vec!["inbox".to_owned(), "--dry-run".to_owned()]),
-        "dry run issued: {calls:?}"
-    );
-    assert!(
-        calls.iter().any(|c| c == &vec!["inbox".to_owned()]),
-        "real inbox issued without --dry-run: {calls:?}"
-    );
-    assert!(
-        app.inbox
-            .last_apply
-            .as_deref()
-            .unwrap_or("")
-            .contains("merged 2"),
-        "apply result recorded"
-    );
-}
-
-#[test]
-fn inbox_apply_cancel_does_not_run_real_inbox() {
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    app.handle_key(key(KeyCode::Char('a')));
-    assert!(app.inbox.confirming);
-    // Any key other than y cancels.
-    app.handle_key(key(KeyCode::Char('n')));
-    assert!(!app.inbox.confirming, "modal closed");
-    let calls = app.runner.recorded_calls();
-    assert!(
-        !calls.iter().any(|c| c == &vec!["inbox".to_owned()]),
-        "no real inbox run: {calls:?}"
-    );
-}
-
-#[test]
-fn inbox_apply_with_no_items_does_not_open_confirm() {
-    let fake = FakeRunner::from_json(0, inbox_empty_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    app.handle_key(key(KeyCode::Char('a')));
-    assert!(!app.inbox.confirming, "no confirm when nothing to apply");
-}
-
-#[test]
-fn inbox_tab_falls_through_to_shared_navigation() {
-    // Tab from Inbox advances within the Review workspace.
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    assert_eq!(app.active_view, ActiveView::Inbox);
-    app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.active_view, ActiveView::Conflicts);
-
-    // Tab from Conflicts wraps around to Proposals.
-    app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.active_view, ActiveView::Proposals);
-
-    // `o` from Inbox switches to Proposals.
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    app.handle_key(key(KeyCode::Char('o')));
-    assert_eq!(app.active_view, ActiveView::Proposals);
-
-    // Shift-Tab from Inbox steps back to Proposals in the Review cycle.
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    app.handle_key(key(KeyCode::BackTab));
-    assert_eq!(app.active_view, ActiveView::Proposals);
-
-    // Esc with no alert quits.
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    app.handle_key(key(KeyCode::Esc));
-    assert!(app.should_quit, "Esc quits from the inbox tab");
-}
-
-#[test]
-fn inbox_q_quits() {
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-    app.handle_key(key(KeyCode::Char('i')));
-    assert_eq!(app.active_view, ActiveView::Inbox);
-    app.handle_key(key(KeyCode::Char('q')));
-    assert!(app.should_quit, "q quits from the inbox tab");
-}
-
-/// Live dry run against a throwaway git vault with no inbox branch,
-/// reusing the `crates/confidant-cli/tests/inbox.rs` fixture shape.
-#[test]
-fn inbox_live_dry_run_empty_vault() {
-    let dir = tempfile::TempDir::new().expect("tempdir");
-    let root = dir.path();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?} failed");
-    };
-    git(&["init", "-b", "main", "-q"]);
-    fs::write(
-        root.join("confidant.toml"),
-        "spec = \"0.1\"\nvault_id = \"tui-inbox-test\"\n",
-    )
-    .unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
-
-    let bin = confidant_bin();
-    let home = tempfile::TempDir::new().expect("temp home");
-    let runner = ProcessRunner::new(bin, Some(root.to_path_buf()))
-        .with_env("CONFIDANT_KEYCHAIN", "off")
-        .with_env("HOME", home.path().to_string_lossy().to_string());
-    let mut app = App::new(runner);
-    app.handle_key(key(KeyCode::Char('i')));
-    let report = app.inbox.report.as_ref().expect("report loaded");
-    assert!(report.empty, "no inbox branch -> empty");
-    assert!(report.dry_run);
-    let rendered = render_to_string(&app);
-    assert!(
-        rendered.contains("nothing to do"),
-        "live empty state:\n{rendered}"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // QMD search view (Phase 3a, #212)
 // ---------------------------------------------------------------------------
@@ -1371,7 +963,7 @@ fn which_json(skills_dir: &Path) -> String {
     serde_json::json!({
         "schema_version": "1",
         "ok": true,
-        "skills_dir": skills_dir.to_string_lossy(),
+        "skills_dir": skills_dir.to_string_lossy()
     })
     .to_string()
 }
@@ -1609,12 +1201,12 @@ fn conflict_check_json() -> &'static str {
             {"code": "E_MERGE_CONFLICT", "severity": "error",
              "file": "people/p-01FAKE000000000000000001/record.md",
              "id": "p-01FAKE000000000000000001",
-             "message": "encrypted record has two versions after a merge conflict",
+             "message": "record has two versions after a merge conflict",
              "fix": "Run `confidant record resolve p-01FAKE000000000000000001 --show` to compare the two versions"},
             {"code": "E_MERGE_CONFLICT", "severity": "error",
              "file": "people/p-01FAKE000000000000000002/record.md",
              "id": "p-01FAKE000000000000000002",
-             "message": "encrypted record has two versions after a merge conflict",
+             "message": "record has two versions after a merge conflict",
              "fix": "Run `confidant record resolve p-01FAKE000000000000000002 --show` to compare the two versions"},
             {"code": "E_MERGE_CONFLICT", "severity": "error",
              "file": "ledger/2026-10-17.md",
@@ -1656,7 +1248,7 @@ fn conflict_cli_error_json() -> &'static str {
         "ok": false,
         "schema_version": "1",
         "vault": "/tmp/fake-vault",
-        "error": {"code": "E_UNREADABLE", "message": "cannot decrypt theirs side of p-01FAKE000000000000000001", "fix": "check device keys"}
+        "error": {"code": "E_UNREADABLE", "message": "cannot read theirs side of p-01FAKE000000000000000001", "fix": "restore the record from git history"}
     }"#
 }
 
@@ -1823,7 +1415,7 @@ fn conflict_cli_error_shows_alert() {
     assert!(app.conflict.detail.is_none(), "no detail on CLI error");
     let rendered = render_to_string(&app);
     assert!(
-        rendered.contains("cannot decrypt theirs side"),
+        rendered.contains("cannot read theirs side"),
         "CD7 message shown:\n{rendered}"
     );
 }
@@ -1948,13 +1540,13 @@ fn conflict_tab_navigation() {
     app.handle_key(key(KeyCode::Char('c')));
     assert_eq!(app.active_view, ActiveView::Conflicts);
     // Tab wraps within Review: Conflicts -> Proposals; Shift-Tab steps
-    // back to Inbox.
+    // back to Conflicts.
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.active_view, ActiveView::Proposals);
     app.handle_key(key(KeyCode::Char('c')));
     assert_eq!(app.active_view, ActiveView::Conflicts);
     app.handle_key(key(KeyCode::BackTab));
-    assert_eq!(app.active_view, ActiveView::Inbox);
+    assert_eq!(app.active_view, ActiveView::Proposals);
     // `q` quits from the conflicts tab.
     app.handle_key(key(KeyCode::Char('c')));
     app.handle_key(key(KeyCode::Char('q')));
@@ -1992,9 +1584,7 @@ fn people_roster_json() -> String {
             {"id": ADA, "name": "Ada Example", "no_ai": "false", "kind": "person"},
             {"id": BEA, "name": "Bea Demo", "no_ai": "false", "kind": "person"}
         ],
-        "scope": ["personal@0.2"],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0
+        "scope": ["personal@0.2"]
     })
     .to_string()
 }
@@ -2015,9 +1605,7 @@ fn people_context_json(id: &str, name: &str, profile: &str) -> String {
         ],
         "touchpoints": [{"date": "2026-10-05", "kind": "call"}],
         "packs": {},
-        "aliases": ["hmac:0123456789abcdef0123456789abcdef"],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0,
+        "aliases": ["ada@example.test"],
         "scope": ["personal@0.2"]
     })
     .to_string()
@@ -2226,9 +1814,9 @@ fn status_pills_use_cached_results_and_do_not_call_the_cli_per_key() {
 }
 
 #[test]
-fn workspace_shortcuts_keep_proposals_inbox_conflicts_and_check_reachable() {
+fn workspace_shortcuts_keep_proposals_conflicts_and_check_reachable() {
     let vault = tempfile::tempdir().expect("temp vault");
-    let fake = people_runner().with_response("inbox", 0, inbox_empty_json());
+    let fake = people_runner();
     let mut app = App::new(fake);
     app.set_vault_root(vault.path().to_path_buf());
 
@@ -2239,8 +1827,6 @@ fn workspace_shortcuts_keep_proposals_inbox_conflicts_and_check_reachable() {
         confidant_tui::app::Workspace::Review
     );
 
-    app.handle_key(key(KeyCode::Tab));
-    assert_eq!(app.active_view, ActiveView::Inbox);
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.active_view, ActiveView::Conflicts);
 
@@ -2512,9 +2098,7 @@ fn operator_roster_json() -> String {
             {"id": CAM, "name": "Cam Sample", "no_ai": "true", "kind": "person"},
             {"id": NIA, "name": "Nia Notes", "no_ai": "notes", "kind": "person"}
         ],
-        "scope": ["personal@0.2"],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0
+        "scope": ["personal@0.2"]
     })
     .to_string()
 }
@@ -2537,8 +2121,6 @@ fn operator_context_json(person_mode: &str, note_mode: &str) -> String {
         "touchpoints": [],
         "packs": {},
         "aliases": [],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0,
         "scope": ["personal@0.2"]
     })
     .to_string()
@@ -3961,26 +3543,20 @@ fn review_queue_badge_counts_sources_and_is_visible_from_people() {
             &["context", "--", ADA],
             0,
             people_context_json(ADA, "Ada Example", "Fake contact."),
-        )
-        .with_argv_response(&["inbox", "--dry-run"], 0, inbox_dry_run_json());
+        );
     let mut app = App::new(runner);
     app.load_check();
     app.load_roster();
-    app.load_inbox();
     app.proposals.entries.push(ProposalListEntry {
         name: "example-1".to_owned(),
         ..ProposalListEntry::default()
     });
 
-    assert_eq!(
-        app.review_pending(),
-        1 + 2 + 2,
-        "proposals + inbox + conflicts"
-    );
+    assert_eq!(app.review_pending(), 1 + 2, "proposals + conflicts");
     // Workspace 1 (People) still shows the Review Queue badge.
     assert_eq!(app.active_view, ActiveView::People);
     let rendered = render_to_string(&app);
-    assert!(rendered.contains("2 Review Queue (5)"), "{rendered}");
+    assert!(rendered.contains("2 Review Queue (3)"), "{rendered}");
 
     // With nothing pending the badge is absent (unchanged header).
     let clean = FakeRunner::new()
@@ -4227,8 +3803,6 @@ fn capture_targets_the_person_open_in_context_not_the_people_cursor() {
             "excerpt": "name: Bea Demo"
         }],
         "findings": [],
-        "skipped_encrypted": 0,
-        "refused_envelopes": 0,
         "scope": ["personal@0.2"]
     })
     .to_string();
@@ -4299,43 +3873,6 @@ fn load_conflicts_resets_the_check_cursor() {
     assert_eq!(
         app.check.selected, 0,
         "the Check list must not open on a stale row"
-    );
-}
-
-#[test]
-fn prime_review_queue_keeps_the_first_startup_alert() {
-    // check and roster fail first; the inbox dry run fails with a different
-    // error. The first failure is the one the operator should see.
-    let inbox_error = serde_json::json!({
-        "ok": false,
-        "schema_version": "1",
-        "vault": "/fake/demo-vault",
-        "error": {
-            "code": "E_INBOX_CRYPTO",
-            "message": "inbox dry run failed",
-            "fix": "queue the item again"
-        }
-    })
-    .to_string();
-    let fake = FakeRunner::new()
-        .with_argv_response(&["check"], 1, check_cli_error_json())
-        .with_argv_response(&["record", "list"], 1, check_cli_error_json())
-        .with_argv_response(&["inbox", "--dry-run"], 1, inbox_error);
-    let mut app = App::new(fake);
-    app.load_check();
-    app.load_roster();
-    let first = app
-        .alert
-        .as_ref()
-        .map(|alert| alert.message.clone())
-        .expect("startup alert");
-
-    app.prime_review_queue();
-
-    assert_eq!(
-        app.alert.as_ref().map(|alert| alert.message.clone()),
-        Some(first),
-        "the inbox failure must not replace the earlier startup alert"
     );
 }
 
@@ -4581,116 +4118,6 @@ fn home_esc_does_not_quit_and_still_clears_the_filter() {
 }
 
 #[test]
-fn command_palette_inbox_apply_dry_runs_then_asks_for_y() {
-    let fake = FakeRunner::from_json(0, inbox_dry_run_json());
-    let mut app = App::new(fake);
-
-    app.handle_key(key(KeyCode::Char(':')));
-    type_text(&mut app, "apply inbox");
-    assert_eq!(
-        app.palette
-            .as_ref()
-            .and_then(|state| state.selected_entry())
-            .map(|entry| entry.id),
-        Some("inbox.apply")
-    );
-    let before = app.runner.recorded_calls().len();
-    app.handle_key(key(KeyCode::Enter));
-
-    assert_eq!(app.active_view, ActiveView::Inbox);
-    assert!(app.inbox.confirming, "the normal apply confirm is open");
-    let calls = app.runner.recorded_calls();
-    let issued = &calls[before..];
-    assert_eq!(
-        issued,
-        &[vec!["inbox".to_owned(), "--dry-run".to_owned()]],
-        "exactly one dry run, no write: {issued:?}"
-    );
-
-    // Esc cancels the confirm; the real (non-dry-run) inbox is never issued.
-    app.handle_key(key(KeyCode::Esc));
-    assert!(!app.inbox.confirming);
-    assert!(
-        !app.runner
-            .recorded_calls()
-            .iter()
-            .any(|call| call == &vec!["inbox".to_owned()]),
-        "cancelling writes nothing"
-    );
-}
-
-#[test]
-fn command_palette_inbox_apply_failure_keeps_the_confirm_closed() {
-    // Prime the view with a successful dry run, then make the palette's own
-    // fresh dry run fail. The loaded report is now stale, so the confirm must
-    // stay closed: otherwise `y` would run the real inbox behind a preview the
-    // TUI just failed to refresh (the entry's fail-closed contract).
-    let fake = FakeRunner::new();
-    fake.push_response(0, inbox_dry_run_json());
-    fake.push_response(
-        1,
-        r#"{
-            "ok": false,
-            "schema_version": "1",
-            "vault": "/tmp/fake-vault",
-            "error": {
-                "code": "E_INBOX_CRYPTO",
-                "message": "inbox dry run failed",
-                "fix": "queue the item again"
-            }
-        }"#,
-    );
-    let mut app = App::new(fake);
-
-    app.load_inbox();
-    assert!(
-        app.inbox
-            .report
-            .as_ref()
-            .is_some_and(|r| !r.empty && !r.items.is_empty()),
-        "the first dry run primed an applicable preview"
-    );
-
-    app.handle_key(key(KeyCode::Char(':')));
-    type_text(&mut app, "apply inbox");
-    assert_eq!(
-        app.palette
-            .as_ref()
-            .and_then(|state| state.selected_entry())
-            .map(|entry| entry.id),
-        Some("inbox.apply")
-    );
-    let before = app.runner.recorded_calls().len();
-    app.handle_key(key(KeyCode::Enter));
-
-    assert_eq!(app.active_view, ActiveView::Inbox);
-    assert!(
-        !app.inbox.confirming,
-        "a failed fresh dry run must not open the apply confirm"
-    );
-    assert!(
-        app.alert.is_some(),
-        "the dry-run failure is surfaced to the operator"
-    );
-    let issued = &app.runner.recorded_calls()[before..];
-    assert_eq!(
-        issued,
-        &[vec!["inbox".to_owned(), "--dry-run".to_owned()]],
-        "the palette still issues exactly one fresh dry run: {issued:?}"
-    );
-
-    // With no confirm open, `y` is an ordinary key: the real inbox never runs.
-    app.handle_key(key(KeyCode::Char('y')));
-    assert!(
-        !app.runner
-            .recorded_calls()
-            .iter()
-            .any(|call| call == &vec!["inbox".to_owned()]),
-        "the real inbox must not run behind the stale preview"
-    );
-}
-
-#[test]
 fn palette_record_edit_is_refused_outside_people_and_context() {
     // `e` edits the loaded context pane, which only People and the Context
     // view show. Launched from another view, the palette entry must refuse
@@ -4735,7 +4162,6 @@ fn sync_json(ahead: u64, behind: u64) -> String {
         "upstream": "origin/main",
         "ahead": ahead,
         "behind": behind,
-        "crypto_mode": "encrypted",
         "fetched": false,
         "dry_run": true,
         "action": "none",
@@ -4755,7 +4181,6 @@ fn sync_pill_shows_unpushed_commits_and_quit_pushes_only_on_confirm() {
         "upstream": "origin/main",
         "ahead": 0,
         "behind": 0,
-        "crypto_mode": "encrypted",
         "fetched": true,
         "dry_run": false,
         "action": "push",

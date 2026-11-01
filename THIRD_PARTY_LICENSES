@@ -26,11 +26,6 @@ Adapted files:
   O_NOFOLLOW walk from cr. The portable symlink_metadata fallback is compiled
   only for non-Unix targets.
 
-- crates/confidant-crypt/src/aead.rs
-  XChaCha20-Poly1305 AEAD with length-prefixed associated data. Confidant
-  re-keys to per-client data keys and binds vault_id, record ULID, client
-  id, path, purpose, epoch, and the outer header in the AAD (ADR-13).
-
 Re-implemented patterns (no cr source copied; credited per ADR-13):
 
 - Collect findings instead of aborting on the first damaged file.
@@ -39,8 +34,8 @@ Re-implemented patterns (no cr source copied; credited per ADR-13):
 - Classify errors by typed downcast, never by message text.
 
 The following cr pieces are deliberately not used: the linear audit chain,
-database.rs, schema-driven field encryption, sync.rs, and anything server or
-UI related. Encryption code is out of scope for milestone 1 (section 9b).
+database.rs, its schema-driven field-level secrecy layer, sync.rs, and
+anything server or UI related.
 
 ---------------------------------------------------------------------------
 

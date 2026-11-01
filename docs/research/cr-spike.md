@@ -1,11 +1,20 @@
 # cr spike: contribute, fork, or build? (2026-10-07)
 
+> **Historical record.** This is the one-day prior-art spike that informed
+> ADR-13, kept as written on 2026-10-07. Its analysis of cr's source is still
+> accurate about cr; its recommendations about *our* key and secrecy design
+> are superseded by [#795](https://github.com/hirefrank/confidant/issues/795)
+> and [`docs/architecture.md`](../architecture.md) ADR-4: Confidant is
+> plaintext on disk in a private repo, with `no-ai` as the agent boundary.
+> Read it for the build-vs-fork reasoning and the borrowing list, not as a
+> description of the current design.
+
 **Summary**
-- **Verdict: build our own and borrow patterns.** cr's encryption and storage layers are **not** separable. Across 56.7k lines of `src/` there are **zero traits**. Encryption is one concrete `EncryptionPolicy` with a single global keyring read from env vars inside `protect()`. Its envelope semantics are woven into audit replay. Storage is one 8.2k-line concrete `Database` built on YAML front matter as the source of truth.
-- None of our one-way doors slots in. Per-client age DEKs need new key plumbing through ~10 call sites in encryption.rs, database.rs, audit.rs and sync.rs. A strict ledger is a different data model from front matter. cr explicitly **refuses encryption for folder ("bundle") records**, which is exactly our `people/p-…/profile.md + notes/` layout. ~40% of `src/` (22.6k lines) is the server, web UI and RBAC we don't want.
+- **Verdict: build our own and borrow patterns.** cr's secrecy and storage layers are **not** separable. Across 56.7k lines of `src/` there are **zero traits**. Its policy is one concrete `EncryptionPolicy` with a single global keyring read from env vars inside `protect()`. Its envelope semantics are woven into audit replay. Storage is one 8.2k-line concrete `Database` built on YAML front matter as the source of truth.
+- None of our one-way doors slots in. Per-client keys would need new key plumbing through ~10 call sites in encryption.rs, database.rs, audit.rs and sync.rs. A strict ledger is a different data model from front matter. cr explicitly **refuses folding** for folder ("bundle") records, which is exactly our `people/p-…/profile.md + notes/` layout. ~40% of `src/` (22.6k lines) is the server, web UI and RBAC we don't want.
 - Contributing upstream is unrealistic. It's a one-person project, 9 weeks old, and recent work all goes into `serve` and the UI. Forking means deleting 40% and rewriting the core semantics of the rest.
-- **Worth borrowing (MIT, with attribution):** the AEAD-with-AAD record binding (~150 lines), the HMAC-keyed idempotency digests (~60 lines), the `DomainError` taxonomy and `check` Finding types (~450 lines), the agent attribution model (attribution.rs), the safe path walker (paths.rs), and the pending-write crash recovery pattern.
-- **ADR changes:** ADR-4 should wrap keys with age and encrypt content with XChaCha20-Poly1305 plus AAD, because age has no associated data. It should also authenticate recipient-list changes against a trust anchor outside the vault, keep unchanged ciphertext as-is, and import encrypted from the first write. ADR-7 should keep commit messages, reasons and intent free of plaintext PII, and scope `--request-id` and store it hashed. ADR-10 should pin trusted signers outside the vault. ADR-2 and Open Q2 should not leave alias emails as plaintext ledger arguments. The prior-art appendix needs correcting.
+- **Worth borrowing (MIT, with attribution):** the `DomainError` taxonomy and `check` Finding types (~450 lines), the agent attribution model (attribution.rs), the safe path walker (paths.rs), and the pending-write crash recovery pattern.
+- **ADR changes at the time:** ADR-4 chose per-record content protection with associated data, authenticated recipient-list changes against a trust anchor outside the vault, unchanged bytes kept as-is, protected from the first write. ADR-7 kept commit messages, reasons and intent free of plaintext PII, and scoped `--request-id` and stored it hashed. ADR-10 pinned trusted signers outside the vault. ADR-2 and Open Q2 kept alias emails out of plaintext ledger arguments. The ADR-4 and ADR-2 items were later reversed by #795.
 - **Don't adopt cr's linear audit hash chain.** Every write touches the same segment and anchor files, so two devices writing at once guarantees a git conflict. That defeats ADR-3. Use git history plus signed commits as the audit trail instead.
 
 ---

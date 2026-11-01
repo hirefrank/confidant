@@ -1,6 +1,6 @@
 //! Operator record/note editing (#556 phase 2).
 //!
-//! `e` in the context pane fetches the decrypted text through the CLI's
+//! `e` in the context pane fetches the record text through the CLI's
 //! operator-only `record show --for-edit` / `note show --for-edit` reads,
 //! stages it in a 0600 scratch file under `.confidant/conflicts/<id>/`, hands
 //! the file to the operator's `$EDITOR` while the TUI is suspended, and —
@@ -8,7 +8,7 @@
 //! `record edit --file` / `note edit --file`.
 //!
 //! This module holds the pure state plus the scratch-file plumbing. It never
-//! links `confidant-core`: the decrypted text crosses the process boundary as
+//! links `confidant-core`: the record text crosses the process boundary as
 //! JSON, and the only files touched here are this crate's own gitignored
 //! scratch (the same 0600 convention and stale-scratch sweep the CLI's
 //! conflict hand-merge uses, #455). Nothing here logs the text.
@@ -101,7 +101,7 @@ pub enum EditPhase {
 
 /// The in-flight edit.
 ///
-/// `original`/`edited` hold decrypted plaintext, so the manual
+/// `original`/`edited` hold record text, so the manual
 /// [`std::fmt::Debug`] impl redacts them: nothing here may reach logs or a
 /// panic message.
 #[derive(Clone, Default, PartialEq)]

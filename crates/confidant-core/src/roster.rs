@@ -11,8 +11,8 @@
 //! The flag is operator-only by construction, the same mechanism as
 //! `record show --for-edit`: `crates/confidant-cli/src/mcp.rs` maps a fixed
 //! tool whitelist to argv and `record list` is not in it, so no agent
-//! connection can reach the command, and the `--for-operator` decrypt path
-//! (`RecordDecryptor::for_edit`) is never selected by an agent-facing read.
+//! connection can reach the command, and the `--for-operator` read path
+//! is never selected by an agent-facing read.
 
 use serde::Serialize;
 
@@ -51,10 +51,6 @@ pub struct Roster {
     /// scope does not remove them today; it is reported for contract
     /// consistency with `find` / `context` and validates `--packs`.
     pub scope: Vec<String>,
-    /// Envelopes skipped as unreadable by the content hook (spec 4, ⚠2).
-    pub skipped_encrypted: u32,
-    /// Envelopes refused as tampered/corrupt (spec 4, ⚠2c).
-    pub refused_envelopes: u32,
 }
 
 /// Build the roster for `kind`.
@@ -106,8 +102,6 @@ pub fn build_roster(
         for_operator,
         records: sortable.into_iter().map(|(_, _, entry)| entry).collect(),
         scope: scope_names,
-        skipped_encrypted: vault.skipped_encrypted,
-        refused_envelopes: vault.refused_envelopes,
     }
 }
 

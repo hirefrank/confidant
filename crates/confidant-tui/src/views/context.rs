@@ -217,14 +217,6 @@ fn context_lines(ctx: &Context, edit_index: usize) -> Vec<Line<'static>> {
             theme::pill(&ctx.scope.join(", ")),
         ]));
     }
-    if ctx.skipped_encrypted > 0 || ctx.refused_envelopes > 0 {
-        lines.push(Line::from(vec![
-            theme::label("skipped_encrypted "),
-            Span::raw(ctx.skipped_encrypted.to_string()),
-            theme::label("  refused_envelopes "),
-            Span::raw(ctx.refused_envelopes.to_string()),
-        ]));
-    }
     lines.push(row(
         "profile ",
         Span::raw(first_line(p.profile.as_deref()).to_owned()),

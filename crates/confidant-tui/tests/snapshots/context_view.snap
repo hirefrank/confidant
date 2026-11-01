@@ -12,7 +12,7 @@ vault  /fake/demo-vault   scope  personal@0.2   doctor  not run
 │     Fake intro call transcript.                                                                  │
 │ touchpoints (1)                                                                                  │
 │    2026-10-05  call                                                                              │
-│ aliases (1) hmac:0123456789abcdef0123456789abcdef                                                │
+│ aliases (1) ada@example.test                                                                     │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

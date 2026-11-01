@@ -91,8 +91,6 @@ fn run_doctor(path: &str, extra_env: &[(&str, &str)]) -> Value {
         .env("CONFIDANT_OFFLINE", "1")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
         .env_remove("CONFIDANT_SKILLS_DIR")
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off")
         .env("HOME", tmp_home.path());
     for (k, v) in extra_env {
         cmd.env(k, v);

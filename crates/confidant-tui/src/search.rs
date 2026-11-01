@@ -77,8 +77,6 @@ pub fn find_result_to_search(result: FindResult) -> SearchResult {
             .collect(),
         findings: result.findings,
         dropped_uncleared: 0,
-        skipped_encrypted: result.skipped_encrypted,
-        refused_envelopes: result.refused_envelopes,
     }
 }
 

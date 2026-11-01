@@ -8,6 +8,11 @@ Pre-1.0: breaking changes bump the minor, fixes bump the patch.
 
 ## [Unreleased]
 
+### Breaking
+- Confidant is plaintext-only. `crates/confidant-crypt`, the encrypted vault format (spec §14), OS keychain storage, HMAC alias hashing, recovery keys, the encrypted `inbox` queue and its `[trust]` signers, and the `reindex` decryption pipeline are removed. Records are plaintext on disk and in git history; the privacy boundary is the operator's encrypted disk, a private remote, and `no-ai` on agent-readable output (#795).
+- Removed commands: `confidant keys`, `recover`, `reset`, `inbox`, and `reindex`; `alias add` is gone, and `alias resolve` now matches the plain front-matter contact fields (`emails`/`phones`/`links`/`handles`) and names. `E_PLAINTEXT_REMOTE` is gone, so `sync --push` works against any git remote.
+- A vault written by an encrypted Confidant (0.7.x and earlier) must be re-created with `confidant init`; there is no migration. The now-unknown `[crypto]` table is ignored, and the retired finding codes (`E_KEY_COMMITMENT`, `E_ENVELOPE`, `E_REINDEX_REFUSED`, `E_PLAINTEXT_REMOTE`, `E_INBOX_*`, `E_ALIAS_PLAINTEXT`, `E_ALIAS_COLLISION`, `W_SKIPPED_ENCRYPTED`, `W_PARTIAL_RESULTS`) are reserved and must not be reused by packs.
+
 ## [0.7.2] - 2026-10-30
 
 ### Added

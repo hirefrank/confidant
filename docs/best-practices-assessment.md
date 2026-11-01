@@ -15,10 +15,18 @@ prepared to fill in the questionnaire for [issue #237](https://github.com/hirefr
 
 | Status | Count |
 |---|---|
-| Met | 63 |
-| N/A | 4 (each with a justification below) |
+| Met | 56 |
+| N/A | 11 (each with a justification below) |
 | Unmet | 0 |
 | **Total** | **67** |
+
+Seven of the N/A items are the `crypto_*` criteria (#46–#51 and #54; #52 and
+#53 were already N/A): Confidant performs no cryptographic operations.
+Records are plaintext on disk in a private git repo on a
+full-disk-encrypted machine, and the privacy boundary is `no-ai` on
+agent-facing reads (`docs/architecture.md` ADR-4, §3). That is a deliberate
+architectural decision, not an unfinished feature, so those criteria are marked
+N/A rather than Met.
 
 All four previously-flagged gaps are now closed and **Met**: branch protection
 ([#234](https://github.com/hirefrank/confidant/issues/234), ruleset `Protect main` is active),
@@ -94,9 +102,9 @@ they are the ones to double-check wording on before submitting.
 | 36 | `test_most` — suite covers most branches/inputs/functionality | SUGGESTED | Met (weak) | Extensive unit + contract tests plus golden `check --json` fixtures (`crates/*/tests`, `testdata/golden/`). **No coverage instrumentation** exists (no `cargo-llvm-cov`/Codecov), so "most branches" is asserted not measured. Optional hardening: add coverage to CI. |
 | 37 | `test_continuous_integration` — CI runs tests frequently | SUGGESTED | Met | `ci.yml` on every push/PR to `main`, plus a nightly cron; runs fmt, clippy, full test suite, demo-vault `check`. |
 | 38 | `test_policy` — policy that new functionality gets tests | MUST | Met | `AGENTS.md` code conventions ("add or update tests for every behaviour change"); `CONTRIBUTING.md` "Tests". |
-| 39 | `tests_are_added` — policy followed in recent major changes | MUST | Met | Recent PRs ship tests: fuzz targets (#235), crypto rewrite/AAD, check-engine golden tests, `no-ai` leakage tests (#270), TUI tests. |
+| 39 | `tests_are_added` — policy followed in recent major changes | MUST | Met | Recent PRs ship tests: fuzz targets (#235), check-engine golden tests, `no-ai` leakage tests (#270), allowlist/pack-scope tests (#178), TUI tests. |
 | 40 | `tests_documented_added` — test policy documented in change instructions | SUGGESTED | Met | `CONTRIBUTING.md` "Tests" section + PR-body template in `AGENTS.md`. |
-| 41 | `warnings` — compiler warnings / safe mode / linter enabled | MUST | Met | `cargo clippy --workspace --all-targets --all-features -- -D warnings` in CI; `#![deny(unsafe_code)]` / `#![forbid(unsafe_code)]` in crates. |
+| 41 | `warnings` — compiler warnings / safe mode / linter enabled | MUST | Met | `cargo clippy --workspace --all-targets --all-features -- -D warnings` in CI; `#![deny(unsafe_code)]` in `confidant-core`. |
 | 42 | `warnings_fixed` — warnings addressed | MUST | Met | `RUSTFLAGS="-D warnings"` + clippy `-D warnings` in `ci.yml`; any warning fails the build. |
 | 43 | `warnings_strict` — maximally strict with warnings | SUGGESTED | Met | All-targets, all-features, deny-warnings; fmt checked. |
 
@@ -104,22 +112,22 @@ they are the ones to double-check wording on before submitting.
 
 | # | Criterion | Level | Status | Evidence |
 |---|---|---|---|---|
-| 44 | `know_secure_design` — primary dev knows secure design | MUST | Met | Questionnaire answer. Supporting evidence: `docs/crypto-design.md` (key hierarchy, AAD, threat model), `docs/threat-model-agents.md`, ADR process in `docs/architecture.md`. |
+| 44 | `know_secure_design` — primary dev knows secure design | MUST | Met | Questionnaire answer. Supporting evidence: `docs/architecture.md` §3–§4 (privacy and threat model, ADR process), `docs/threat-model-agents.md`, and the `no-ai` allowlist design in `docs/privacy.md`. |
 | 45 | `know_common_errors` — knows common vuln classes and mitigations | MUST | Met | Questionnaire answer. Evidence: threat models; privacy rules and `no-ai` allowlist (`AGENTS.md` hard rule 3, `docs/privacy.md`, `spec` §12); tests that prove `no-ai` content is excluded. |
-| 46 | `crypto_published` — only reviewed, published crypto | MUST | Met | X25519 (`x25519-dalek`/`age`), XChaCha20-Poly1305 (`chacha20poly1305`), Ed25519 (`ed25519-dalek`), HKDF/HMAC-SHA-256 (`hkdf`/`hmac`/`sha2`), BIP-39 (`bip39`) — all public standards/audited crates (`crates/confidant-crypt/Cargo.toml`). |
-| 47 | `crypto_call` — calls dedicated crypto software, doesn't roll its own | SHOULD | Met | `confidant-crypt` composes `age` + RustCrypto crates; no primitive is hand-implemented. |
-| 48 | `crypto_floss` — crypto functionality implementable with FLOSS | MUST | Met | All crypto deps are FLOSS (age, RustCrypto, `getrandom`, `zeroize`). |
-| 49 | `crypto_keylength` — ≥ NIST minimums through 2030, no smaller keys | MUST | Met | 256-bit ECC (X25519/Ed25519) and 256-bit AEAD keys; ≥ the 112-bit security floor NIST requires through 2030; no configuration permits shorter keys. |
-| 50 | `crypto_working` — no broken algorithms/modes by default | MUST | Met | AEAD only (XChaCha20-Poly1305); no MD4/MD5/DES/RC4/Dual_EC_DRBG. |
-| 51 | `crypto_weaknesses` — avoid algorithms with serious weaknesses | SHOULD | Met | No SHA-1/MD5 for security, no CBC/SSH-style modes; SHA-256/HKDF-HMAC used for derivation/addressing. |
-| 52 | `crypto_pfs` — forward secrecy for key agreement | SHOULD | **N/A** | There is no interactive session/key-agreement protocol. X25519 + age is used for **one-shot key wrapping** of per-client data keys; content is protected by XChaCha20-Poly1305. Long-term-key compromise is explicitly in scope and documented in `docs/crypto-design.md` §11. Mark N/A with this reasoning. |
-| 53 | `crypto_password_storage` — passwords stored as salted KDF hashes | MUST | **N/A** | The software stores no user passwords for external-user authentication; operator/device keys live in the OS keychain or on disk (`docs/crypto-design.md` §4). |
-| 54 | `crypto_random` — keys/nonces from a CSPRNG | MUST | Met | `getrandom`/`rand` `OsRng`; `zeroize` for secret hygiene; no non-crypto RNG for key material. |
+| 46 | `crypto_published` — only reviewed, published crypto | MUST | **N/A** | Confidant performs no cryptographic operations. Records are plaintext on disk (ADR-4); confidentiality is full-disk encryption plus a private repo, both outside the application. |
+| 47 | `crypto_call` — calls dedicated crypto software, doesn't roll its own | SHOULD | **N/A** | No crypto is called; there is no secrecy layer to delegate. |
+| 48 | `crypto_floss` — crypto functionality implementable with FLOSS | MUST | **N/A** | Nothing to implement; see #46. |
+| 49 | `crypto_keylength` — ≥ NIST minimums through 2030, no smaller keys | MUST | **N/A** | The application holds no keys. Git credentials and SSH keys are the operator's own and are not part of Confidant. |
+| 50 | `crypto_working` — no broken algorithms/modes by default | MUST | **N/A** | No algorithms are implemented or selected by the software. |
+| 51 | `crypto_weaknesses` — avoid algorithms with serious weaknesses | SHOULD | **N/A** | See #50. Content hashing for `--request-id` idempotency uses a domain-separated digest for identity, not for secrecy (ADR-7). |
+| 52 | `crypto_pfs` — forward secrecy for key agreement | SHOULD | **N/A** | There is no session or key-agreement protocol. |
+| 53 | `crypto_password_storage` — passwords stored as salted KDF hashes | MUST | **N/A** | The software stores no user passwords and has no login system; there is nothing to authenticate against (ADR-10). |
+| 54 | `crypto_random` — keys/nonces from a CSPRNG | MUST | **N/A** | No key material or nonces. Record IDs are random ULIDs, which is an identifier requirement, not a secrecy one. |
 | 55 | `delivery_mitm` — delivery counters MITM | MUST | Met | HTTPS/TLS for repo, crates.io, and the `curl --proto '=https' --tlsv1.2` installer; per-artifact `.sha256` files; build-provenance attestations via `actions/attest-build-provenance` (`release.yml`). |
 | 56 | `delivery_unsigned` — no unsigned hash fetched over http | MUST | Met | All checksums are served over HTTPS (GitHub Releases) and published alongside artifacts; no http hash retrieval. |
 | 57 | `vulnerabilities_fixed_60_days` — no unpatched medium+ vuln older than 60 days | MUST | Met | `cargo audit` runs in CI (daily cron) and Dependabot security updates are enabled; Scorecard `Vulnerabilities` = 10 (0 known). No known unpatched medium+ issues. |
 | 58 | `vulnerabilities_critical_fixed` — criticals fixed rapidly | SHOULD | Met | `SECURITY.md` "What to expect": critical issues fixed ASAP within the 90-day coordinated-disclosure window. No criticals reported to date. |
-| 59 | `no_leaked_credentials` — no valid private credential in public repos | MUST | Met | No secrets in repo (fake-data rule, `AGENTS.md` hard rule 4); repo settings show secret scanning **enabled** and push protection **enabled**. |
+| 59 | `no_leaked_credentials` — no valid private credential in public repos | MUST | Met | No secrets in repo (fake-data rule, `AGENTS.md` hard rule 1); repo settings show secret scanning **enabled** and push protection **enabled**. |
 
 ## Analysis
 
@@ -129,7 +137,7 @@ they are the ones to double-check wording on before submitting.
 | 61 | `static_analysis_common_vulnerabilities` — rules for common vulns | SUGGESTED | Met (weak) | Satisfied by clippy's correctness/security-relevant lints, `unsafe` bans, and overflow checks; **no dedicated vulnerability SAST** (CodeQL/Semgrep). Scorecard `SAST` = 0 for that reason. Consider adding CodeQL as optional hardening. |
 | 62 | `static_analysis_fixed` — medium+ SAST findings fixed timely | MUST | Met | No confirmed medium+ exploitable findings to date (vacuously satisfied); CI fails on any new lint/deny/audit finding. |
 | 63 | `static_analysis_often` — SAST on every commit or daily | SUGGESTED | Met | clippy runs on every push/PR; the CI workflow also runs on a nightly cron. |
-| 64 | `dynamic_analysis` — dynamic tool used before major release | SUGGESTED | Met | `fuzz/` cargo-fuzz targets (`ledger_line`, `envelope_decode`), documented run commands in `CONTRIBUTING.md`; nightly CI exercises the binaries. (Harnesses run manually, not in CI — see notes.) |
+| 64 | `dynamic_analysis` — dynamic tool used before major release | SUGGESTED | Met | `fuzz/` cargo-fuzz target (`ledger_line`), documented run commands in `CONTRIBUTING.md`; nightly CI exercises the binaries. (Harnesses run manually, not in CI — see notes.) |
 | 65 | `dynamic_analysis_unsafe` — memory-safety dynamic tooling | SUGGESTED | **N/A** | Confidant is written in Rust and the crates use `#![deny(unsafe_code)]`/`#![forbid(unsafe_code)]`; no memory-unsafe language is used. |
 | 66 | `dynamic_analysis_enable_assertions` — assertions enabled in some dynamic config | SUGGESTED | Met | Rust's test/debug profile enables `debug_assertions` (and overflow checks); tests run in CI with them on, while `release`/`dist` builds have them off. |
 | 67 | `dynamic_analysis_fixed` — medium+ dynamic findings fixed timely | MUST | Met | No confirmed medium+ dynamic findings to date; fuzz crashes are treated as bugs and fixed before release (see #235/#269). |
@@ -159,7 +167,7 @@ Issue #237 anticipated these gaps. All three are closed and the criteria are Met
 | Gap | Issue | Status | Evidence |
 |---|---|---|---|
 | Branch protection | [#234](https://github.com/hirefrank/confidant/issues/234) — closed | Met | Ruleset `Protect main` (id 25103877), *active*: requires a PR, blocks deletion and non-fast-forward. `gh api repos/hirefrank/confidant/rules/branches/main` lists `pull_request`, `deletion`, `non_fast_forward`. |
-| Fuzzing | [#235](https://github.com/hirefrank/confidant/issues/235) — closed | Met | `fuzz/fuzz_targets/ledger_line.rs`, `fuzz/fuzz_targets/envelope_decode.rs`, corpus generator, run docs in `CONTRIBUTING.md`. Scorecard `Fuzzing` = 10. |
+| Fuzzing | [#235](https://github.com/hirefrank/confidant/issues/235) — closed | Met | `fuzz/fuzz_targets/ledger_line.rs`, corpus generator, run docs in `CONTRIBUTING.md`. Scorecard `Fuzzing` = 10. |
 | Scorecard | [#236](https://github.com/hirefrank/confidant/issues/236) — closed | Met | `.github/workflows/scorecard.yml` (weekly + on push), README badge; latest published score 6.4 at 2026-10-14. |
 | Dependency updates | `.github/dependabot.yml` | Met | Weekly Cargo + monthly GitHub Actions updates; Dependabot security updates enabled in repo settings. |
 
@@ -187,6 +195,6 @@ Recorded so they are not confused with criteria, and because a reviewer will see
 1. Sign in at https://www.bestpractices.dev with the GitHub account that owns `hirefrank/confidant`.
 2. Create the project page (https://www.bestpractices.dev/en/projects/new), pointing at
    `https://github.com/hirefrank/confidant`.
-3. Walk the questionnaire using this table; mark N/A for #22, #52, #53, #65 with the justifications above.
+3. Walk the questionnaire using this table; mark N/A for #22, #46–#54, and #65 with the justifications above.
 4. Add the resulting badge to `README.md` (next to the Scorecard badge) and close
    [#237](https://github.com/hirefrank/confidant/issues/237) with the badge URL.

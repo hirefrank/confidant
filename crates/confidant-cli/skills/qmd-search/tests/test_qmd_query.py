@@ -60,7 +60,7 @@ SHORT_NOTE = f"people/{PERSON}/notes/{SHORT_ID}.md"
 CJK_BODY = "山田さんと面談。日本語だけのメモ。"
 SHORT_BODY = "OK? #12 — done."
 LEDGER_REL = "ledger/2026/11.cfd"
-# A small file: reindex writes the cleared line at the same position.
+# A small file: qmd-index.py stages the cleared line at the same position.
 LEDGER_CORPUS_LINE = 1
 LEDGER_VAULT_LINE = 1
 
@@ -126,6 +126,11 @@ def hit(rel, line, snippet, score=1.0):
             "score": score, "snippet": snippet}
 
 
+def stage_cleared_corpus(cli, vault):
+    """Stage the cleared set with the skill's own staging code (spec §12)."""
+    return load_index_module().stage_cleared_corpus(str(vault), str(cli))
+
+
 class QmdQueryTest(unittest.TestCase):
     maxDiff = None
 
@@ -134,7 +139,7 @@ class QmdQueryTest(unittest.TestCase):
         if not QUERY.is_file():
             raise unittest.SkipTest(f"skill script not found: {QUERY}")
         if shutil.which("git") is None:
-            raise unittest.SkipTest("git is required (reindex probes the gitignore)")
+            raise unittest.SkipTest("git is required (the corpus stages from the vault)")
         cls.cli = resolve_cli()
         if not cls.cli.is_file():
             raise unittest.SkipTest(
@@ -156,14 +161,9 @@ class QmdQueryTest(unittest.TestCase):
         )
         (cls.vault / ".gitignore").write_text(".confidant/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=cls.vault, check=True)
-        # Build the real corpus: the ledger alignment reads the file reindex
-        # writes, so the test exercises the shipped corpus layout.
-        r = subprocess.run(
-            [str(cls.cli), "reindex", "--json", "--no-input",
-             "--vault", str(cls.vault)],
-            capture_output=True, text=True)
-        if r.returncode != 0:
-            raise AssertionError(f"reindex failed: {r.stdout}{r.stderr}")
+        # Stage the corpus from the `allowlist --json` cleared set: the
+        # ledger alignment reads the same layout a real index build uses.
+        stage_cleared_corpus(cls.cli, cls.vault)
 
         cls.bin = cls.root / "bin"
         cls.bin.mkdir()
@@ -282,83 +282,22 @@ def load_index_module():
     return module
 
 
-class QmdIndexEncryptedDiskTest(unittest.TestCase):
-    """#540: the encrypted-disk gate honours a persisted confirmation.
-
-    The gate is device policy, so the tests drive
-    `encrypted_disk_confirmation` with detection patched instead of building
-    a corpus: the env var and the user-config key both satisfy it, neither
-    (with no detection) refuses, and detection is reported ahead of any
-    operator assertion.
-    """
-
-    home_keys = ("CONFIDANT_ASSUME_ENCRYPTED_DISK", "HOME")
+class QmdIndexSetupTest(unittest.TestCase):
+    """Setup-time behaviours of bin/qmd-index.py that need no QMD install."""
 
     def setUp(self):
         self.index = load_index_module()
-        self._saved = {k: os.environ.get(k) for k in self.home_keys}
-        self._detected = self.index.encrypted_disk_detected
-        os.environ.pop("CONFIDANT_ASSUME_ENCRYPTED_DISK", None)
-        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-540-")
+        self._saved_home = os.environ.get("HOME")
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-setup-")
         self.home = Path(self.tmp.name)
         os.environ["HOME"] = str(self.home)
 
     def tearDown(self):
-        self.index.encrypted_disk_detected = self._detected
-        for key, value in self._saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        if self._saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._saved_home
         self.tmp.cleanup()
-
-    def detect(self, value):
-        self.index.encrypted_disk_detected = lambda vault: value
-
-    def write_user_config(self, text):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        (cfg / "config.toml").write_text(text, encoding="utf-8")
-
-    def test_env_confirmation_satisfies_gate(self):
-        self.detect(None)  # no detection possible (cloud VM / container)
-        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "1"
-        self.assertEqual(
-            self.index.encrypted_disk_confirmation("/vault", False),
-            "asserted via CONFIDANT_ASSUME_ENCRYPTED_DISK")
-
-    def test_user_config_confirmation_satisfies_gate(self):
-        self.detect(None)
-        self.write_user_config("[qmd]\nassume_encrypted_disk = true\n")
-        mechanism = self.index.encrypted_disk_confirmation("/vault", False)
-        self.assertIn("config.toml", mechanism)
-        self.assertIn("assume_encrypted_disk", mechanism)
-
-    def test_without_confirmation_it_refuses(self):
-        self.detect(False)  # definitively not detected, no assertion
-        with self.assertRaises(SystemExit):
-            self.index.ensure_encrypted_disk("/vault", False)
-
-    def test_detection_preferred_over_assertions(self):
-        self.detect(True)
-        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "1"
-        self.write_user_config("[qmd]\nassume_encrypted_disk = true\n")
-        self.assertEqual(
-            self.index.encrypted_disk_confirmation("/vault", True),
-            "detected (FileVault/dm-crypt)")
-
-    def test_mechanism_is_printed_to_stderr(self):
-        self.detect(None)
-        os.environ["CONFIDANT_ASSUME_ENCRYPTED_DISK"] = "true"
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("CONFIDANT_ASSUME_ENCRYPTED_DISK", err.getvalue())
-
-    def test_flag_alone_still_satisfies_gate(self):
-        self.detect(None)
-        self.assertEqual(
-            self.index.encrypted_disk_confirmation("/vault", True),
-            "asserted via --i-confirm-encrypted-disk")
 
     def test_setup_preflight_passes_persist(self):
         # Round-2 N2: setup's automatic preflight run must record the
@@ -378,6 +317,128 @@ class QmdIndexEncryptedDiskTest(unittest.TestCase):
         self.assertIn("--persist", argv)
         self.assertIn("--chained", argv)
         self.assertEqual(argv[argv.index("--vault") + 1], "/vault")
+
+
+class QmdIndexStagingTest(unittest.TestCase):
+    """#795: the corpus is staged from `allowlist --json`, not `reindex`.
+
+    The skill writes the corpus itself now that the vault is plaintext, so
+    these tests drive the real stage_cleared_corpus() against a throwaway
+    vault and assert the §12 boundary survives: no `no-ai` content, only
+    cleared ledger lines, and the QMD-visible `.cfd.md` mirror suffix.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not INDEX.is_file():
+            raise unittest.SkipTest(f"skill script not found: {INDEX}")
+        if shutil.which("git") is None:
+            raise unittest.SkipTest("git is required (the corpus checks it)")
+        cls.cli = resolve_cli()
+        if not cls.cli.is_file():
+            raise unittest.SkipTest(
+                f"no built confidant at {cls.cli}; build it or pass --cli PATH")
+
+    def setUp(self):
+        self.index = load_index_module()
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-795-")
+        self.vault = Path(self.tmp.name) / "vault"
+        shutil.copytree(DEMO, self.vault)
+        add_person(self.vault, NO_AI_PERSON, "Cam Sample", "no-ai: true\n")
+        add_note(self.vault, "n-01M3TC5H000068T0000000000C",
+                 "Cam asked that notes never go to a model provider.",
+                 person=NO_AI_PERSON)
+        add_note(self.vault, "n-01M3TC5H00MPJG002NAM000005",
+                 "Kickofftoken. Dana wants a vault that agents can write.")
+        (self.vault / "ledger/2026/11.cfd").write_text(
+            f"2026-11-01 touch {PERSON} meeting "
+            "note:n-01M3TC5H00MPJG002NAM000005\n",
+            encoding="utf-8",
+        )
+        (self.vault / ".gitignore").write_text(".confidant/\n",
+                                               encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=self.vault, check=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_stages_only_cleared_content(self):
+        corpus, files, lines = self.index.stage_cleared_corpus(
+            str(self.vault), str(self.cli))
+        corpus = Path(corpus)
+        self.assertGreater(files, 0)
+        self.assertFalse((corpus / NO_AI_NOTE).exists(),
+                         "a no-ai note entered the corpus")
+        ledger = corpus / (LEDGER_REL + ".md")
+        self.assertTrue(ledger.is_file(), "ledger mirror missing")
+        self.assertEqual(ledger.read_text(encoding="utf-8").strip(),
+                         f"2026-11-01 touch {PERSON} "
+                         "meeting note:n-01M3TC5H00MPJG002NAM000005")
+        # Every staged byte is cleared content: the record file is a copy.
+        staged = next(corpus.rglob("profile.md"))
+        self.assertEqual(staged.read_text(encoding="utf-8"),
+                         (self.vault / staged.relative_to(corpus))
+                         .read_text(encoding="utf-8"))
+        if os.name == "posix":
+            self.assertEqual(corpus.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(ledger.stat().st_mode & 0o777, 0o600)
+
+    def test_rebuild_drops_stale_corpus_files(self):
+        corpus, _files, _lines = self.index.stage_cleared_corpus(
+            str(self.vault), str(self.cli))
+        stale = Path(corpus) / "stale.md"
+        stale.write_text("gone after the rebuild\n", encoding="utf-8")
+        self.index.stage_cleared_corpus(str(self.vault), str(self.cli))
+        self.assertFalse(stale.exists(), "a rebuild must wipe the old corpus")
+
+    def test_refuses_when_confidant_is_not_gitignored(self):
+        (self.vault / ".gitignore").write_text("", encoding="utf-8")
+        with self.assertRaises(SystemExit) as caught:
+            self.index.stage_cleared_corpus(str(self.vault), str(self.cli))
+        self.assertIn(".confidant/", str(caught.exception.code))
+        self.assertFalse((self.vault / ".confidant" / "qmd-corpus").exists())
+
+
+class CorpusLineIndexTest(unittest.TestCase):
+    """#795: one edited ledger line must not drop every later mapping."""
+
+    def setUp(self):
+        self.query = load_module("qmd_query", QUERY)
+        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-line-map-795-")
+        self.root = Path(self.tmp.name)
+        self.vault = self.root / "vault"
+        self.corpus = self.root / "corpus"
+        self.vault.mkdir()
+        self.corpus.mkdir()
+        self.rel = LEDGER_REL
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mapping(self, vault_lines, corpus_lines):
+        src = self.vault / self.rel
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("\n".join(vault_lines) + "\n", encoding="utf-8")
+        dest = self.corpus / (self.rel + ".md")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("\n".join(corpus_lines) + "\n", encoding="utf-8")
+        mapping, _lines = self.query.corpus_line_index(
+            str(self.vault), str(self.corpus), self.rel, {})
+        return mapping
+
+    def test_edited_line_costs_only_that_line(self):
+        # The old forward scan ran off the end on "b" and returned {1: 1}.
+        mapping = self.mapping(["a", "b edited", "c", "d"],
+                               ["a", "b", "c", "d"])
+        self.assertEqual(mapping, {1: 1, 3: 3, 4: 4})
+
+    def test_duplicate_lines_map_to_successive_occurrences(self):
+        self.assertEqual(self.mapping(["x", "y", "x"], ["x", "x"]),
+                         {1: 1, 2: 3})
+
+    def test_out_of_order_line_falls_back_to_exact_match(self):
+        self.assertEqual(self.mapping(["a", "b"], ["b", "a"]),
+                         {1: 2, 2: 1})
 
 
 def load_module(name, path):
@@ -655,14 +716,14 @@ class QmdPreflightTest(unittest.TestCase):
         cfg = self.root / ".config" / "confidant"
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "config.toml").write_text(
-            "# Operator election (see issue #723).\n"
-            "[qmd]\nassume_encrypted_disk = true\n",
+            "# Operator election.\n"
+            "[qmd]\nlegacy_choice = true\n",
             encoding="utf-8")
         self.preflight.set_qmd_config_value(str(self.root), "default_mode",
                                             '"vector"')
         self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
         text = (cfg / "config.toml").read_text(encoding="utf-8")
-        self.assertIn("assume_encrypted_disk = true", text)
+        self.assertIn("legacy_choice = true", text)
         self.assertIn("# Operator election", text)
         self.assertIn('default_mode = "vector"', text)
         self.assertIn("offline = true", text)
@@ -675,6 +736,34 @@ class QmdPreflightTest(unittest.TestCase):
         self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
         config = self.preflight.read_qmd_config(str(self.root))
         self.assertTrue(self.preflight._truthy(config.get("offline", "")))
+
+    def test_config_write_is_atomic_and_leaves_no_temp_file(self):
+        # #795: config writes go through a sibling temp file + os.replace,
+        # so a reader never sees a truncated file and no temp is left behind.
+        cfg = self.root / ".config" / "confidant"
+        self.preflight.set_qmd_config_value(str(self.root), "offline", "true")
+        leftovers = [p.name for p in cfg.iterdir()
+                     if p.name.startswith(".qmd-config-")]
+        self.assertEqual(leftovers, [])
+        self.assertIn("offline = true",
+                      (cfg / "config.toml").read_text(encoding="utf-8"))
+
+    def test_failed_config_replace_keeps_the_original(self):
+        cfg = self.root / ".config" / "confidant"
+        cfg.mkdir(parents=True, exist_ok=True)
+        path = cfg / "config.toml"
+        original = "[qmd]\noffline = true\n"
+        path.write_text(original, encoding="utf-8")
+        with unittest.mock.patch.object(
+                self.preflight.os, "replace",
+                side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.preflight.set_qmd_config_value(
+                    str(self.root), "offline", "false")
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
+        leftovers = [p.name for p in cfg.iterdir()
+                     if p.name.startswith(".qmd-config-")]
+        self.assertEqual(leftovers, [], "a failed write must clean its temp")
 
     def test_recommendation_prefers_hybrid_within_budget(self):
         results = {
@@ -1211,14 +1300,14 @@ class QmdPreflightTest(unittest.TestCase):
         cfg = vault / ".confidant" / "qmd-preflight.toml"
         cfg.write_text(
             "# Operator note.\n"
-            "[qmd]\nassume_encrypted_disk = true\n",
+            "[qmd]\nlegacy_choice = true\n",
             encoding="utf-8")
         self.preflight.set_vault_qmd_config_value(
             str(vault), "default_mode", '"vector"')
         self.preflight.set_vault_qmd_config_value(
             str(vault), "offline", "true")
         text = cfg.read_text(encoding="utf-8")
-        self.assertIn("assume_encrypted_disk = true", text)
+        self.assertIn("legacy_choice = true", text)
         self.assertIn("# Operator note", text)
         self.assertIn('default_mode = "vector"', text)
         self.assertIn("offline = true", text)
@@ -1643,321 +1732,6 @@ class QmdPreflightTest(unittest.TestCase):
         text = (vault / ".confidant" / "qmd-preflight.toml") \
             .read_text(encoding="utf-8")
         self.assertIn('default_mode = "hybrid"', text)
-
-
-class FakeTtyStdin(io.StringIO):
-    """stdin with isatty() True, so the #723 election prompt runs."""
-
-    def isatty(self):
-        return True
-
-
-class FakePipeStdin(io.StringIO):
-    """stdin with isatty() False, so the #723 election never prompts."""
-
-    def isatty(self):
-        return False
-
-
-class QmdIndexDiskElectionTest(unittest.TestCase):
-    """#723: the disk election happens once, at setup, and persists.
-
-    No new key is invented: the election writes the existing #540
-    `[qmd] assume_encrypted_disk` key. The interactive prompt runs only
-    on a TTY; anything else keeps the old refusal.
-    """
-
-    def setUp(self):
-        self.index = load_index_module()
-        self._saved_home = os.environ.get("HOME")
-        self._saved_stdin = sys.stdin
-        self._detected = self.index.encrypted_disk_detected
-        os.environ.pop("CONFIDANT_ASSUME_ENCRYPTED_DISK", None)
-        self.tmp = tempfile.TemporaryDirectory(prefix="qmd-index-723-")
-        self.home = Path(self.tmp.name)
-        os.environ["HOME"] = str(self.home)
-
-    def tearDown(self):
-        self.index.encrypted_disk_detected = self._detected
-        sys.stdin = self._saved_stdin
-        if self._saved_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._saved_home
-        self.tmp.cleanup()
-
-    def user_config(self):
-        cfg = self.home / ".config" / "confidant" / "config.toml"
-        return cfg.read_text(encoding="utf-8") if cfg.is_file() else None
-
-    def test_persist_preserves_other_keys_and_comments(self):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        (cfg / "config.toml").write_text(
-            "# Preflight choice (issue #722).\n"
-            "[qmd]\noffline = true\n",
-            encoding="utf-8")
-        self.index.persist_encrypted_disk_assumption()
-        text = self.user_config()
-        self.assertIn("offline = true", text)
-        self.assertIn("# Preflight choice", text)
-        self.assertIn("assume_encrypted_disk = true", text)
-        # Idempotent: a second persist replaces, never duplicates.
-        self.index.persist_encrypted_disk_assumption()
-        self.assertEqual(self.user_config().count("assume_encrypted_disk"), 1)
-
-    def test_persist_creates_qmd_section(self):
-        self.index.persist_encrypted_disk_assumption()
-        self.assertEqual(
-            self.index.assume_from_user_config(), True)
-
-    def test_election_assert_persists_and_proceeds(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("a\n")
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("asserted by operator at setup", err.getvalue())
-        self.assertIn("assume_encrypted_disk = true", self.user_config())
-
-    def test_election_decline_keeps_qmd_off(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("d\n")
-        with self.assertRaises(SystemExit) as caught:
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("stays off", str(caught.exception.code))
-        self.assertIsNone(self.user_config())
-
-    def test_election_eof_refuses_without_assuming(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("")
-        with self.assertRaises(SystemExit):
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIsNone(self.user_config())
-
-    def test_election_reprompts_then_asserts(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("maybe\na\n")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("assume_encrypted_disk = true", self.user_config())
-
-    def test_non_tty_keeps_the_old_refusal(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakePipeStdin("")
-        with self.assertRaises(SystemExit) as caught:
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("could not confirm", str(caught.exception.code))
-        self.assertIsNone(self.user_config())
-
-    def test_persist_overwrites_false_with_true(self):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        (cfg / "config.toml").write_text(
-            "[qmd]\nassume_encrypted_disk = false\n", encoding="utf-8")
-        self.index.persist_encrypted_disk_assumption()
-        self.assertEqual(self.user_config().count("assume_encrypted_disk"), 1)
-        self.assertEqual(self.index.assume_from_user_config(), True)
-
-    def test_persist_inline_table_does_not_duplicate_qmd(self):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        (cfg / "config.toml").write_text(
-            'qmd = { offline = true }\n', encoding="utf-8")
-        self.index.persist_encrypted_disk_assumption()
-        text = self.user_config()
-        self.assertEqual(text.count("qmd"), 1)
-        self.assertNotIn("[qmd]", text)
-        self.assertEqual(self.index.assume_from_user_config(), True)
-
-    def test_persist_inline_table_replaces_existing_key(self):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        (cfg / "config.toml").write_text(
-            'qmd = { assume_encrypted_disk = false }\n', encoding="utf-8")
-        self.index.persist_encrypted_disk_assumption()
-        self.assertEqual(self.user_config().count("assume_encrypted_disk"), 1)
-        self.assertEqual(self.index.assume_from_user_config(), True)
-
-    def test_persist_invalid_toml_refuses_without_writing(self):
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        bad = "[qmd\nassume_encrypted_disk = false\n"
-        (cfg / "config.toml").write_text(bad, encoding="utf-8")
-        with self.assertRaises(OSError):
-            self.index.persist_encrypted_disk_assumption()
-        self.assertEqual(self.user_config(), bad)
-
-    def test_election_unrecordable_config_refuses_cleanly(self):
-        # #723 review SF1: an invalid pre-existing config must turn
-        # the election into a clean refusal, never a traceback and
-        # never a build proceeding on an unrecorded assertion.
-        cfg = self.home / ".config" / "confidant"
-        cfg.mkdir(parents=True, exist_ok=True)
-        bad = "[qmd\nassume_encrypted_disk = false\n"
-        (cfg / "config.toml").write_text(bad, encoding="utf-8")
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("a\n")
-        with self.assertRaises(SystemExit) as caught:
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("could not record", str(caught.exception.code))
-        self.assertEqual(self.user_config(), bad)
-
-    def test_persist_without_toml_parser_refuses_without_claiming(self):
-        # #723 review SF1, strict read-back: with no TOML parser the
-        # gate could never read the recording back, so persist must
-        # refuse (and write nothing) rather than report success on a
-        # textual check alone.
-        saved_parser = self.index._toml_parser
-        try:
-            self.index._toml_parser = lambda: None
-            with self.assertRaises(OSError):
-                self.index.persist_encrypted_disk_assumption()
-        finally:
-            self.index._toml_parser = saved_parser
-        self.assertIsNone(self.user_config())
-
-    def test_persist_userprofile_fallback_matches_doctor(self):
-        # #723 review SF5: with HOME unset, the election must look where
-        # Rust setup::home_dir() looks (USERPROFILE), not raise.
-        saved_home = os.environ.pop("HOME", None)
-        saved_profile = os.environ.pop("USERPROFILE", None)
-        try:
-            profile = self.home / "profile-home"
-            profile.mkdir(parents=True, exist_ok=True)
-            os.environ["USERPROFILE"] = str(profile)
-            path = self.index.persist_encrypted_disk_assumption()
-            self.assertTrue(str(path).startswith(str(profile)))
-            self.assertEqual(
-                self.index.assume_from_user_config(home=str(profile)), True)
-        finally:
-            if saved_home is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = saved_home
-            if saved_profile is None:
-                os.environ.pop("USERPROFILE", None)
-            else:
-                os.environ["USERPROFILE"] = saved_profile
-
-    def test_second_run_passes_via_config_without_prompting(self):
-        # The "never asks again" property itself: after an election, a
-        # second gate call on a non-TTY stdin passes by config read-back.
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("a\n")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.index.ensure_encrypted_disk("/vault", False)
-        sys.stdin = FakePipeStdin("")
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("config.toml", err.getvalue())
-
-    def test_election_false_detection_says_negative(self):
-        # #723 review SF2: a walked-and-negative detection is reported
-        # as a negative finding, distinct from the unknown case.
-        self.index.encrypted_disk_detected = lambda vault: False
-        sys.stdin = FakeTtyStdin("d\n")
-        with self.assertRaises(SystemExit):
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("no encrypted disk was found", err.getvalue())
-
-    def test_election_unknown_detection_says_could_not_be_checked(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("d\n")
-        with self.assertRaises(SystemExit):
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("could not be checked", err.getvalue())
-        self.assertNotIn("no encrypted disk was found", err.getvalue())
-
-    def test_election_revoke_hint_is_shown(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("d\n")
-        with self.assertRaises(SystemExit):
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("setting it to false", err.getvalue())
-
-    def test_election_garbage_three_times_refuses(self):
-        self.index.encrypted_disk_detected = lambda vault: None
-        sys.stdin = FakeTtyStdin("maybe\nnope\nwat\n")
-        with self.assertRaises(SystemExit) as caught:
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.index.ensure_encrypted_disk("/vault", False)
-        self.assertIn("3 attempts", str(caught.exception.code))
-        self.assertIsNone(self.user_config())
-
-    def test_detector_unmapped_device_is_unknown_not_negative(self):
-        # #723 review SF2, at the detector: a vault device absent from
-        # the lsblk table returns None (unknown), while a listed device
-        # with no crypt ancestor returns False.
-        import stat as stat_mod
-        st = os.stat(self.home)
-        majmin = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
-        script_dir = self.home / "bin"
-        script_dir.mkdir(parents=True, exist_ok=True)
-        lsblk = script_dir / "lsblk"
-        lsblk.write_text(
-            "#!/bin/sh\n"
-            f"printf 'sda disk 8:0 \\n'\n"
-            f"printf 'sda1 part {majmin} sda\\n'",
-            encoding="utf-8")
-        lsblk.chmod(0o755)
-        saved_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = f"{script_dir}{os.pathsep}{saved_path}"
-        try:
-            self.assertEqual(
-                self.index.encrypted_disk_detected(str(self.home)), False)
-            lsblk.write_text(
-                "#!/bin/sh\nprintf 'sda disk 253:99 \\n'\n",
-                encoding="utf-8")
-            lsblk.chmod(0o755)
-            self.assertIsNone(
-                self.index.encrypted_disk_detected(str(self.home)))
-        finally:
-            os.environ["PATH"] = saved_path
-
-    def test_scripted_flag_logs_its_own_mechanism_and_path(self):
-        # #723 review SF3/SF4(a): --assert-and-persist through main()
-        # persists, satisfies the gate, and logs a mechanism distinct
-        # from the per-run flag, with the path written.
-        self.index.encrypted_disk_detected = lambda vault: None
-        vault = self.home / "vault"
-        vault.mkdir(parents=True, exist_ok=True)
-        (vault / "confidant.toml").write_text("", encoding="utf-8")
-        saved = {}
-        for name in ("run_reindex", "run_qmd", "ensure_store_dirs",
-                     "migrate_default_store", "exclude_from_backups"):
-            saved[name] = getattr(self.index, name)
-        saved_argv = sys.argv
-        saved_stdin = sys.stdin
-        try:
-            self.index.run_reindex = lambda vault_arg, cli: str(vault)
-            self.index.run_qmd = lambda args, env, check=True: type(
-                "QmdOut", (), {"stdout": ""})()
-            self.index.ensure_store_dirs = lambda vault_arg: None
-            self.index.migrate_default_store = lambda: None
-            self.index.exclude_from_backups = lambda vault_arg: None
-            sys.stdin = FakePipeStdin("")
-            sys.argv = ["qmd-index.py", "--vault", str(vault),
-                        "--assert-and-persist-encrypted-disk"]
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.index.main()
-            self.assertEqual(self.index.assume_from_user_config(), True)
-            self.assertIn("--assert-and-persist-encrypted-disk",
-                          err.getvalue())
-            self.assertIn("config.toml", err.getvalue())
-            self.assertNotIn("--i-confirm-encrypted-disk", err.getvalue())
-        finally:
-            for name, value in saved.items():
-                setattr(self.index, name, value)
-            sys.argv = saved_argv
-            sys.stdin = saved_stdin
 
 
 if __name__ == "__main__":

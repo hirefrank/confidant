@@ -3825,8 +3825,6 @@ fn record_list_demo_is_the_cleared_set_in_name_order() {
     assert!(v["vault"].as_str().unwrap().contains("demo-vault"));
     assert_eq!(v["kind"], "person");
     assert_eq!(v["for_operator"], false);
-    assert_eq!(v["skipped_encrypted"], 0);
-    assert_eq!(v["refused_envelopes"], 0);
     // Deterministic: display name, case-insensitive.
     assert_eq!(
         roster_names(&v),
@@ -4142,7 +4140,7 @@ fn find_for_operator_marks_operator_only_ledger_hits() {
     assert!(visible.iter().all(|m| m.get("operator_only").is_none()));
 }
 
-/// #572: `context --for-operator` decrypts a `no-ai` person and their
+/// #572: `context --for-operator` includes a `no-ai` person and their
 /// notes, with the tri-state `no_ai` and `for_operator: true`. Without the
 /// flag the output is unchanged: name withheld, notes absent, boolean flag.
 #[test]

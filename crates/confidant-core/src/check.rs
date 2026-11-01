@@ -96,8 +96,6 @@ pub enum FindingCode {
     LedgerPath,
     LedgerDate,
     BalanceMismatch,
-    AliasPlaintext,
-    AliasCollision,
     UnresolvedMerge,
     SelfMerge,
     MergeCycle,
@@ -115,17 +113,12 @@ pub enum FindingCode {
     DuplicateSrc,
     SessionUntagged,
     SessionTags,
-    InboxKeyMismatch,
     SelfEdge,
     DuplicateEdge,
     UnknownEdgeKind,
     TouchMalformed,
     CadenceOverdue,
     DateUpcoming,
-    SkippedEncrypted,
-    /// #769: non-empty `find` over skipped encrypted records — the matches
-    /// shown may be incomplete. Find-only; `check` does not emit it.
-    PartialResults,
     DuplicateTouch,
     DuplicateSession,
     Pack(&'static str),
@@ -156,8 +149,6 @@ impl FindingCode {
             Self::LedgerPath => "E_LEDGER_PATH",
             Self::LedgerDate => "E_LEDGER_DATE",
             Self::BalanceMismatch => "E_BALANCE_MISMATCH",
-            Self::AliasPlaintext => "E_ALIAS_PLAINTEXT",
-            Self::AliasCollision => "E_ALIAS_COLLISION",
             Self::UnresolvedMerge => "E_UNRESOLVED_MERGE",
             Self::SelfMerge => "E_SELF_MERGE",
             Self::MergeCycle => "E_MERGE_CYCLE",
@@ -175,15 +166,12 @@ impl FindingCode {
             Self::DuplicateSrc => "E_DUPLICATE_SRC",
             Self::SessionUntagged => "W_SESSION_UNTAGGED",
             Self::SessionTags => "E_SESSION_TAGS",
-            Self::InboxKeyMismatch => "E_INBOX_KEY_MISMATCH",
             Self::SelfEdge => "E_SELF_EDGE",
             Self::DuplicateEdge => "E_DUPLICATE_EDGE",
             Self::UnknownEdgeKind => "E_UNKNOWN_EDGE_KIND",
             Self::TouchMalformed => "E_TOUCH_MALFORMED",
             Self::CadenceOverdue => "W_CADENCE_OVERDUE",
             Self::DateUpcoming => "W_DATE_UPCOMING",
-            Self::SkippedEncrypted => "W_SKIPPED_ENCRYPTED",
-            Self::PartialResults => "W_PARTIAL_RESULTS",
             Self::DuplicateTouch => "W_DUPLICATE_TOUCH",
             Self::DuplicateSession => "W_DUPLICATE_SESSION",
             Self::Pack(code) => code,
@@ -247,10 +235,12 @@ impl FindingCode {
         "W_DUPLICATE_SESSION",
     ];
 
-    /// Codes retired by the #449 cutover (`spec/findings.md`): reserved
-    /// builtin names that nothing emits in 0.1 and that no pack may reuse
-    /// for a new meaning. They stay in [`Self::ALL_BUILTIN_STRS`] so a
-    /// pack-declared code cannot shadow them.
+    /// Codes retired by the #449 cutover and the #795 crypto removal
+    /// (`spec/findings.md`): reserved builtin names that nothing emits and
+    /// that no pack may reuse for a new meaning. They stay in
+    /// [`Self::ALL_BUILTIN_STRS`] so a pack-declared code cannot shadow
+    /// them; the crypto-era variants were deleted outright, and the older
+    /// retired names keep their (unconstructed) variants.
     pub const RETIRED_CODES: &[&str] = &[
         "E_BALANCE_MISMATCH",
         "E_NEGATIVE_BALANCE",
@@ -260,6 +250,11 @@ impl FindingCode {
         "W_SESSION_UNTAGGED",
         "E_SESSION_WITHOUT_NOTES",
         "E_PAID_SESSION_GAP",
+        "E_ALIAS_PLAINTEXT",
+        "E_ALIAS_COLLISION",
+        "E_INBOX_KEY_MISMATCH",
+        "W_SKIPPED_ENCRYPTED",
+        "W_PARTIAL_RESULTS",
     ];
 
     /// Whether `s` is the string of a builtin enum variant (not a `Pack` code).
@@ -344,8 +339,6 @@ impl FindingCode {
             "E_LEDGER_PATH" => Self::LedgerPath,
             "E_LEDGER_DATE" => Self::LedgerDate,
             "E_BALANCE_MISMATCH" => Self::BalanceMismatch,
-            "E_ALIAS_PLAINTEXT" => Self::AliasPlaintext,
-            "E_ALIAS_COLLISION" => Self::AliasCollision,
             "E_UNRESOLVED_MERGE" => Self::UnresolvedMerge,
             "E_SELF_MERGE" => Self::SelfMerge,
             "E_MERGE_CYCLE" => Self::MergeCycle,
@@ -363,15 +356,12 @@ impl FindingCode {
             "E_DUPLICATE_SRC" => Self::DuplicateSrc,
             "W_SESSION_UNTAGGED" => Self::SessionUntagged,
             "E_SESSION_TAGS" => Self::SessionTags,
-            "E_INBOX_KEY_MISMATCH" => Self::InboxKeyMismatch,
             "E_SELF_EDGE" => Self::SelfEdge,
             "E_DUPLICATE_EDGE" => Self::DuplicateEdge,
             "E_UNKNOWN_EDGE_KIND" => Self::UnknownEdgeKind,
             "E_TOUCH_MALFORMED" => Self::TouchMalformed,
             "W_CADENCE_OVERDUE" => Self::CadenceOverdue,
             "W_DATE_UPCOMING" => Self::DateUpcoming,
-            "W_SKIPPED_ENCRYPTED" => Self::SkippedEncrypted,
-            "W_PARTIAL_RESULTS" => Self::PartialResults,
             "W_DUPLICATE_TOUCH" => Self::DuplicateTouch,
             "W_DUPLICATE_SESSION" => Self::DuplicateSession,
             _ => return None,
@@ -493,10 +483,6 @@ pub struct CheckReport {
 pub struct CheckOptions {
     pub as_of: Option<NaiveDate>,
     pub fail_on: Option<Severity>,
-    /// The operator's out-of-band pin of the vault's inbox public key. When
-    /// set and the vault's `[inbox].pubkey` differs, an error finding is
-    /// reported (possible key substitution; see `docs/inbox.md`).
-    pub pinned_inbox_pubkey: Option<String>,
 }
 
 /// Run every check against `vault`, collecting rather than propagating.
@@ -513,58 +499,6 @@ pub fn run(vault: &Vault, options: &CheckOptions) -> CheckReport {
             .at_file("confidant.toml")
             .with_fix("Use spec = \"0.1\" or upgrade the CLI"),
         );
-    }
-
-    // Spec 3 (§2.2): a `mode = "plaintext"` declaration combined with a
-    // structurally encrypted vault (any `enc:` envelope or any `keys/`
-    // tree) is E_CONFIG — the declaration can never downgrade an
-    // encrypted vault.
-    if vault.config.crypto.mode.as_deref() == Some("plaintext")
-        && crate::crypto_mode::is_structurally_encrypted(&vault.root)
-    {
-        findings.push(
-            Finding::new(
-                FindingCode::Config,
-                Severity::Error,
-                "confidant.toml declares [crypto] mode = \"plaintext\" but the vault \
-                 is structurally encrypted (it has an `enc:` envelope or a `keys/` tree); \
-                 the declaration cannot downgrade an encrypted vault",
-            )
-            .at_file("confidant.toml")
-            .with_fix("Remove the `[crypto] mode = \"plaintext\"` line"),
-        );
-    }
-
-    // Key-substitution defense: the vault's advertised inbox key must match
-    // the operator's out-of-band pin. Anyone with git write access can change
-    // confidant.toml; only the local pin is trustworthy.
-    if let Some(pinned) = options
-        .pinned_inbox_pubkey
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match vault
-            .config
-            .inbox
-            .pubkey
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(vault_key) if vault_key != pinned => {
-                findings.push(
-                    Finding::new(
-                        FindingCode::InboxKeyMismatch,
-                        Severity::Error,
-                        "vault [inbox].pubkey does not match the pinned key in user config; possible key substitution",
-                    )
-                    .at_file("confidant.toml")
-                    .with_fix("Restore the pinned public key, or update the pin in ~/.config/confidant/config.toml after verifying the key out of band"),
-                );
-            }
-            _ => {}
-        }
     }
 
     let spec_ok = vault.config.spec == SPEC_VERSION;
@@ -1086,7 +1020,7 @@ pub(crate) type MergeMap = HashMap<RecordId, (RecordId, NaiveDate)>;
 pub(crate) fn check_aliases_and_merges(
     vault: &Vault,
     known_ids: &HashSet<RecordId>,
-    as_of: NaiveDate,
+    _as_of: NaiveDate,
     findings: &mut Vec<Finding>,
 ) -> MergeMap {
     let mut parent: MergeMap = HashMap::new();
@@ -1211,43 +1145,6 @@ pub(crate) fn check_aliases_and_merges(
         findings.push(finding);
     }
 
-    let mut seen_alias: BTreeMap<(String, String), RecordId> = BTreeMap::new();
-    for sourced in &vault.entries {
-        if sourced.entry.verb != "alias" {
-            continue;
-        }
-        let e = &sourced.entry;
-        match parse_alias(e) {
-            Err(msg) => findings.push(
-                Finding::new(FindingCode::AliasPlaintext, Severity::Error, msg)
-                    .at_file(&sourced.file)
-                    .at_line(sourced.line)
-                    .for_id(&e.id)
-                    .with_fix("Store HMAC(vault lookup key, normalized value) as hmac:<hex>"),
-            ),
-            Ok((kind, hmac)) => {
-                let canon = canonical_on(&e.id, &parent, as_of);
-                let key = (kind.clone(), hmac);
-                if let Some(existing) = seen_alias.get(&key) {
-                    if existing != &canon {
-                        findings.push(
-                            Finding::new(
-                                FindingCode::AliasCollision,
-                                Severity::Warning,
-                                format!("alias {kind} hmac is shared by {existing} and {canon}"),
-                            )
-                            .at_file(&sourced.file)
-                            .at_line(sourced.line)
-                            .for_id(&canon)
-                            .with_fix("Merge the duplicate records or drop one alias"),
-                        );
-                    }
-                } else {
-                    seen_alias.insert(key, canon);
-                }
-            }
-        }
-    }
     parent
 }
 
@@ -1274,32 +1171,6 @@ pub(crate) fn parse_merge(entry: &LedgerEntry) -> MergeParse {
         },
         Err(_) => MergeParse::InvalidTo,
     }
-}
-
-const ALIAS_HMAC_MIN_HEX: usize = 32;
-
-pub(crate) fn parse_alias(entry: &LedgerEntry) -> Result<(String, String), String> {
-    if entry.args.len() != 2 {
-        return Err("alias line must be exactly KIND hmac:HEX".to_owned());
-    }
-    let kind = entry.args[0]
-        .as_token()
-        .ok_or_else(|| "alias kind must be a token (email, phone, handle, or name)".to_owned())?;
-    if !matches!(kind, "email" | "phone" | "handle" | "name") {
-        return Err("alias kind must be email, phone, handle, or name".to_owned());
-    }
-    let hmac = match &entry.args[1] {
-        Arg::Token(s) if s.starts_with("hmac:") => s.clone(),
-        Arg::Pair { key, value } if key == "hmac" => format!("hmac:{value}"),
-        _ => return Err("alias value is not hmac:<hex>".to_owned()),
-    };
-    let hex = hmac.strip_prefix("hmac:").unwrap_or("");
-    if hex.len() < ALIAS_HMAC_MIN_HEX || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "alias HMAC must be hmac: plus at least {ALIAS_HMAC_MIN_HEX} hex characters"
-        ));
-    }
-    Ok((kind.to_owned(), hex.to_ascii_lowercase()))
 }
 
 pub(crate) fn canonical_on(id: &RecordId, parent: &MergeMap, on: NaiveDate) -> RecordId {
@@ -1534,9 +1405,9 @@ fn check_dangling_refs(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &
     }
 }
 
-/// Edge rules (#179). Runs on records `check` can read: in an encrypted
-/// vault an edge is an envelope, so these rules do not run there — the
-/// same visibility limit as every other record rule. Kind symmetry is
+/// Edge rules (#179). Runs on every edge record: with plaintext records the
+/// `a` / `b` / `kind` fields are always readable.
+/// Kind symmetry is
 /// looked up over enabled packs, core, and all registered packs (a kind
 /// owned by a disabled pack is still a known kind for duplicate
 /// detection; the edge itself warns as `W_PACK_ORPHAN`).
@@ -1569,13 +1440,6 @@ fn check_edges(
         HashMap::new();
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Edge {
-            continue;
-        }
-        // Envelope shells (`enc:` present) carry no inner fields
-        // keylessly: `a` / `b` / `kind` sit inside the ciphertext, so
-        // the missing-field rules would false-positive on every edge
-        // envelope. Edge rules run on visible records only.
-        if rec.field("enc").is_some() {
             continue;
         }
         let mut ends: Vec<RecordId> = Vec::new();
@@ -1762,10 +1626,8 @@ fn check_edges(
     }
 }
 
-/// `with:` rules (#179) on interactions. Existence is a keyed check: it
-/// runs on records `check` can read. In an encrypted vault the interaction
-/// is an envelope with `with:` inside the ciphertext, so these rules do
-/// not run there.
+/// `with:` rules (#179) on interactions. Existence is a keyed check on the
+/// interaction's plaintext `with:` front matter.
 fn check_with_lists(vault: &Vault, known_ids: &HashSet<RecordId>, findings: &mut Vec<Finding>) {
     for rec in vault.records.values() {
         if rec.kind != RecordKind::Interaction {
@@ -1963,7 +1825,7 @@ pub(crate) fn duration_of(entry: &LedgerEntry) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_alias, parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
+    use super::{parse_fail_on, CheckSummary, Finding, FindingCode, Severity};
 
     #[test]
     fn fail_on_and_summary() {
@@ -1978,35 +1840,6 @@ mod tests {
         };
         assert!(!s.fails(Severity::Error));
         assert!(s.fails(Severity::Warning));
-    }
-
-    /// #748: `name` is a valid alias kind (former/married name, nickname,
-    /// preferred name); an unknown kind is still refused by the parser.
-    #[test]
-    fn parse_alias_accepts_name_kind() {
-        use crate::id::RecordId;
-        use crate::ledger::{Arg, LedgerEntry};
-        use chrono::NaiveDate;
-        let entry = |kind: &str| LedgerEntry {
-            date: NaiveDate::from_ymd_opt(2026, 10, 24).unwrap(),
-            verb: "alias".to_owned(),
-            id: RecordId::parse("p-01M3TC5H00MPJG000000000000").unwrap(),
-            args: vec![
-                Arg::Token(kind.to_owned()),
-                Arg::Token(
-                    "hmac:6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
-                        .to_owned(),
-                ),
-            ],
-            comment: None,
-        };
-        let (kind, hex) = parse_alias(&entry("name")).unwrap();
-        assert_eq!(kind, "name");
-        assert_eq!(
-            hex,
-            "6f2c9a1d8b7e4f30112233445566778899aabbccddeeff0011223344556677"
-        );
-        assert!(parse_alias(&entry("twitter")).is_err());
     }
 
     /// #732 fix wave: the orphan branch of the shared verb-set helper.
@@ -2212,8 +2045,6 @@ mod tests {
             FindingCode::LedgerPath,
             FindingCode::LedgerDate,
             FindingCode::BalanceMismatch,
-            FindingCode::AliasPlaintext,
-            FindingCode::AliasCollision,
             FindingCode::UnresolvedMerge,
             FindingCode::SelfMerge,
             FindingCode::MergeCycle,
@@ -2231,15 +2062,12 @@ mod tests {
             FindingCode::DuplicateSrc,
             FindingCode::SessionUntagged,
             FindingCode::SessionTags,
-            FindingCode::InboxKeyMismatch,
             FindingCode::SelfEdge,
             FindingCode::DuplicateEdge,
             FindingCode::UnknownEdgeKind,
             FindingCode::TouchMalformed,
             FindingCode::CadenceOverdue,
             FindingCode::DateUpcoming,
-            FindingCode::SkippedEncrypted,
-            FindingCode::PartialResults,
             FindingCode::DuplicateTouch,
             FindingCode::DuplicateSession,
         ];
@@ -2267,8 +2095,6 @@ mod tests {
                 | FindingCode::LedgerPath
                 | FindingCode::LedgerDate
                 | FindingCode::BalanceMismatch
-                | FindingCode::AliasPlaintext
-                | FindingCode::AliasCollision
                 | FindingCode::UnresolvedMerge
                 | FindingCode::SelfMerge
                 | FindingCode::MergeCycle
@@ -2286,30 +2112,45 @@ mod tests {
                 | FindingCode::DuplicateSrc
                 | FindingCode::SessionUntagged
                 | FindingCode::SessionTags
-                | FindingCode::InboxKeyMismatch
                 | FindingCode::SelfEdge
                 | FindingCode::DuplicateEdge
                 | FindingCode::UnknownEdgeKind
                 | FindingCode::TouchMalformed
                 | FindingCode::CadenceOverdue
                 | FindingCode::DateUpcoming
-                | FindingCode::SkippedEncrypted
-                | FindingCode::PartialResults => {}
-                FindingCode::DuplicateTouch => {}
+                | FindingCode::DuplicateTouch => {}
                 FindingCode::DuplicateSession => {}
                 FindingCode::Pack(_) => panic!("Pack is not a builtin variant"),
             }
         }
-        // The str→builtin mapping covers every builtin, both ways (#441).
+        // The str→builtin mapping covers every builtin that still has a
+        // variant (#441); a retired code whose variant was deleted has no
+        // mapping but stays reserved in ALL_BUILTIN_STRS.
         for s in FindingCode::ALL_BUILTIN_STRS {
-            let code = FindingCode::builtin_from_str(s)
-                .unwrap_or_else(|| panic!("builtin_from_str misses {s}"));
-            assert_eq!(code.as_str(), *s, "builtin_from_str roundtrip: {s}");
+            match FindingCode::builtin_from_str(s) {
+                Some(code) => assert_eq!(code.as_str(), *s, "builtin_from_str roundtrip: {s}"),
+                None => assert!(
+                    FindingCode::is_retired_code(s),
+                    "{s} has no variant and is not retired"
+                ),
+            }
         }
+        // Every non-retired builtin appears as a variant, in declaration
+        // order. Retired codes keep their slot in ALL_BUILTIN_STRS even when
+        // their variant was deleted.
+        let variants: Vec<&str> = variants
+            .iter()
+            .map(|c| c.as_str())
+            .filter(|s| !FindingCode::is_retired_code(s))
+            .collect();
+        let builtins: Vec<&str> = FindingCode::ALL_BUILTIN_STRS
+            .iter()
+            .copied()
+            .filter(|s| !FindingCode::is_retired_code(s))
+            .collect();
         assert_eq!(
-            variants.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            FindingCode::ALL_BUILTIN_STRS.to_vec(),
-            "ALL_BUILTIN_STRS must list every builtin variant, in declaration order"
+            variants, builtins,
+            "ALL_BUILTIN_STRS must list every live builtin variant, in declaration order"
         );
     }
 }

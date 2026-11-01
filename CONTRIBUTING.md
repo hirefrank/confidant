@@ -33,7 +33,6 @@ Fuzz the untrusted-input parsers manually (not in CI; needs a nightly toolchain)
 
 ```sh
 cd fuzz && cargo +nightly fuzz run ledger_line -- -max_len=4096 -rss_limit_mb=1024 -max_total_time=300
-cd fuzz && cargo +nightly fuzz run envelope_decode -- -max_len=65536 -rss_limit_mb=2048 -max_total_time=300
 ```
 
 Regenerate golden check JSON after an intentional finding-message change:
@@ -62,12 +61,13 @@ never symlinks (`cargo publish` tarballs and `include_dir!` break).
 | `packs/personal/` | Built-in personal pack contract |
 | `crates/confidant-core` | Parser, model, derived values, check engine |
 | `crates/confidant-cli` | `confidant` binary |
-| `crates/confidant-crypt` | Encryption (milestone 2) |
+| `crates/confidant-tui` | Terminal UI over the CLI contract |
 | `examples/demo-vault/` | Fake data only |
 | `docs/borrowing.md` | What we took from cr, and what we did not |
 
-Do not add encryption, key wrapping, or real client data. Section 9b of the
-architecture requires an independent crypto design review before milestone 2.
+Never add real client data. Records are plaintext on disk by design
+(`docs/architecture.md` ADR-4); a change to the vault format or the privacy
+model needs a review issue first (repo hard rule 7).
 
 ## Agent contract
 

@@ -10,12 +10,12 @@ vault  /fake/demo-vault   scope  personal@0.2   doctor  not run
 │   People (2)│   Review Queue workspace  Go                                         │             │
 │ › Ada Exampl│   Check workspace  Go                                                │H0000008     │
 │   Bea Demo  │   Proposals  Go                                                      │             │
-│             │   Inbox  Go                                                          │             │
 │             │   Conflicts  Go                                                      │             │
-│             │   Doctor  Go                                                         │def          │
+│             │   Doctor  Go                                                         │             │
 │             │   Filter people  People                                              │             │
 │             │   Search (type a query)  People                                      │             │
 │             │   Search (open the tab)  People                                      │             │
+│             │   New person  Write                                                  │             │
 │             ╰ Enter run   Up/Down select   Esc close ──────────────────────────────╯             │
 │                                    ││                                                            │
 │                                    ││                                                            │

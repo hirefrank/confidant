@@ -1,9 +1,0 @@
----
-id: p-01ABC
-type: note
-no-ai: maybe
-enc: xchacha20poly1305
-key_id: p-01ABC/e1
-nonce: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
----
-AAAA

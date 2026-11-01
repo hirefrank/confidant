@@ -101,6 +101,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -384,12 +385,45 @@ def read_qmd_config(home=None):
     return dict(qmd) if isinstance(qmd, dict) else {}
 
 
+def write_config_atomic(path, text):
+    """Replace `path` with `text` atomically.
+
+    The query wrapper reads this file on every run, so a crash, a full disk,
+    or an interrupt mid-write must not leave it truncated or half-written
+    (#795 review). Write a sibling temp file in the same directory (so
+    `os.replace` stays on one filesystem and is atomic), fsync it, then
+    rename over the target; on any failure the temp file is removed and the
+    original config is untouched. Returns the path written.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=parent, prefix=".qmd-config-",
+                suffix=".tmp", delete=False) as f:
+            tmp = f.name
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return path
+
+
 def set_qmd_config_value(home, key, value_repr):
     """Set one key in the [qmd] table, preserving everything else.
 
     Text edit, not a TOML round-trip: comments and unrelated keys (e.g.
-    the #723 disk-election key) survive byte-for-byte. Creates the
-    [qmd] section when absent. Returns the config path written.
+    the #722 preflight keys an older run wrote) survive byte-for-byte.
+    Creates the [qmd] section when absent, and writes atomically through
+    write_config_atomic. Returns the config path written.
     """
     home = home or os.environ.get("HOME")
     if not home:
@@ -424,8 +458,7 @@ def set_qmd_config_value(home, key, value_repr):
             lines[key_at] = f"{key} = {value_repr}"
         else:
             lines.insert(section_at + 1, f"{key} = {value_repr}")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    write_config_atomic(path, "\n".join(lines) + "\n")
     return path
 
 
@@ -463,8 +496,7 @@ def remove_qmd_config_value(home, key):
     if key_at is None:
         return False
     del lines[key_at]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    write_config_atomic(path, "\n".join(lines) + "\n")
     return True
 
 
@@ -557,8 +589,7 @@ def set_vault_qmd_config_value(vault, key, value_repr):
             lines[key_at] = f"{key} = {value_repr}"
         else:
             lines.insert(section_at + 1, f"{key} = {value_repr}")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    write_config_atomic(path, "\n".join(lines) + "\n")
     # Verify the write round-trips (#773 S3): a text edit can "succeed"
     # while leaving the file unparseable (a garbage line elsewhere), so
     # the value would silently never take effect. Re-read and confirm the
@@ -602,8 +633,7 @@ def remove_vault_qmd_config_value(vault, key):
     if key_at is None:
         return False
     del lines[key_at]
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    write_config_atomic(path, "\n".join(lines) + "\n")
     return True
 
 

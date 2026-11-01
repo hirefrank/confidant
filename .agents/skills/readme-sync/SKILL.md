@@ -45,8 +45,8 @@ Compare against the table in the README's "What's in the box today" section.
 For each command in the code but not in the table, propose a row. For each
 row in the table whose command no longer exists, flag it for removal.
 
-Also check: does the README mention `confidant mcp`? `confidant reindex`?
-`confidant allowlist`? `confidant doctor`? These are easy to forget.
+Also check: does the README mention `confidant mcp`? `confidant allowlist`?
+`confidant doctor`? `confidant sync`? These are easy to forget.
 
 ### 2. Packs
 
@@ -73,20 +73,23 @@ The README's Search section should accurately describe:
 If the search implementation has changed (e.g. QMD becomes a dependency, or
 `find` gains a flag), update this section.
 
-### 4. Encryption and privacy
+### 4. Privacy
 
-Check `docs/crypto-design.md` and the current state of `confidant-crypt`.
-The README's "Encryption and privacy" section should reflect:
+Check `docs/architecture.md` ADR-4 and §3–§4, and `docs/privacy.md`. The
+README's "Privacy" section should reflect:
 
-- What is encrypted (record content via §14 envelopes).
-- What stays plaintext by design (ledger, `import`, `confidant.toml`).
-- The `[crypto] mode = "plaintext"` opt-out and its limits.
-- The `no-ai` flag and what it guarantees.
-- The outside audit status — link to #138 and state plainly whether it has
-  landed or not.
+- That records are plaintext on disk, in a private repo, on a
+  machine with full-disk encryption enabled (the perimeter).
+- That there is no application-level secrecy layer, and no key material in a
+  vault.
+- The `no-ai` flag and what it guarantees (and that it is an exposure
+  control, not access control).
+- The pack-scope caveat: a read-time policy filter, not an access boundary.
+- What reaches a hosted model provider.
 
-If #138 has closed, update the Status section to say the audit landed and
-what it found.
+If the storage or privacy model changes (for example a future design that
+adds a hiding layer), that needs a review issue first, and this section
+should be updated only with the decision.
 
 ### 5. Roadmap
 
@@ -102,18 +105,18 @@ Read the open issues and group them by theme. Compare against the README's
 The roadmap section should be a curated view of the issues, not a dump. Aim
 for 5–7 themes, each with a one-line description and a link.
 
-### 6. Status section
+### 6. Security status section
 
-The "Status: one thing is not ready for other people's data" section is the
-safety disclosure. It should:
+The "Security status" section is the safety disclosure. It should:
 
-- State plainly what the current limitation is (today: no outside crypto
-  audit, #138).
-- Link to the tracking issue.
-- Say what *is* safe to use today (check, find, context, the allowlist).
+- State the operational rules that do the work (full-disk encryption, a
+  private remote).
+- Name the engineering controls that are in place (`check`, the allowlist,
+  `no-ai`, CI audits, fuzzing, attested releases).
 - Be honest but not alarmist. The goal is informed consent, not fear.
 
-If the limitation has been resolved, say so and remove or update the section.
+If a limitation is resolved (or a new one appears), say so and update the
+section.
 
 ### 7. Install and quickstart
 

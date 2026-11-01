@@ -107,12 +107,11 @@ merge canonicalization). Optional `src:PROVENANCE` dedupes re-imported lines.
 ### `confidant log touch`
 
 ```
-confidant log touch <person> <kind> [--note <text>] [--date YYYY-MM-DD] [--src <token>] [--fallback-inbox]
+confidant log touch <person> <kind> [--note <text>] [--date YYYY-MM-DD] [--src <token>]
 ```
 
 Writes one `touch` ledger line in one commit. `--note <text>` creates and
-links an encrypted note; `--fallback-inbox` queues that note to the `inbox`
-branch when the keychain fails, instead of failing closed (#213). Every
+links a plaintext note record under that person, in the same commit. Every
 command takes `--json` and `--no-input` (ADR-7); branch on the error `code`,
 never on message text.
 
@@ -170,8 +169,8 @@ overrides both ways.
 - `personal.date_upcoming_days`: look-ahead window in days, default `7`,
   cap `3650`.
 
-Both rules are warnings by default and never block writes, commits, or inbox
-merges. `--as-of YYYY-MM-DD` overrides `[checks].as_of`; with neither, the
+Both rules are warnings by default and never block writes or commits.
+`--as-of YYYY-MM-DD` overrides `[checks].as_of`; with neither, the
 rules use today's UTC date.
 
 ## Findings
@@ -255,17 +254,19 @@ can act on it. This is a nudge, not a task, and it never blocks a write.
   text — and `find` returns none of it. `context` still serves their
   derived, ledger-based metadata: `cadence_days`, `cadence_never`,
   `last_touch`, `days_since_touch`, `overdue`, `recent_touches`, the
-  declared `snooze_until`, the `touchpoints` list, and opaque `hmac:`
-  alias hashes (spec §12). `no-ai: notes` keeps the person visible while
-  their notes and interactions default to hidden (spec §13). An explicit
-  `no-ai: false` on a child overrides the inherited default.
+  declared `snooze_until`, and the `touchpoints` list (spec §12). Contact
+  aliases (`emails`, `phones`, `handles`) follow the same PII gate as the
+  rest of the profile, so they are empty for an uncleared person.
+  `no-ai: notes` keeps the person visible while their notes and
+  interactions default to hidden (spec §13). An explicit `no-ai: false` on
+  a child overrides the inherited default.
 - **Scope pack reads.** `--packs personal@0.2` limits reads to core and
   personal-owned items. Personal fields, `touch` lines, and personal edge
   kinds appear only when the pack is in scope (#178).
 - **The ledger line is plaintext.** A `touch` line carries only the date, the
   verb, the person's own ID, and a kind from the closed list — no other
-  participant, no prose. Sensitive detail goes in an encrypted note via
-  `--note`.
+  participant, no prose. Detail that does not fit the line goes in a note
+  via `--note`; every record, notes included, is plaintext on disk.
 - **Fake data only.** Never place real names, emails, phone numbers, or notes
   in tests, fixtures, docs, or examples. Use `Ada Example`, `Bea Demo`, and
   fake ULIDs.

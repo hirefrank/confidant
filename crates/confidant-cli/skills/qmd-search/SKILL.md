@@ -13,83 +13,38 @@ truth for the search allowlist.
 
 ## Trust and safety (read first)
 
-- **Trusted devices with encrypted disks only.** The index holds plaintext
-  chunks and embeddings. The corpus lives under `<vault>/.confidant/qmd-corpus/`
-  and QMD's own index under `<vault>/.confidant/qmd/` (both gitignored, never
-  committed, never synced, directories `0700`; on macOS both are excluded from
+- **Trusted devices only.** The index holds plaintext chunks and embeddings.
+  The corpus lives under `<vault>/.confidant/qmd-corpus/` and QMD's own index
+  under `<vault>/.confidant/qmd/` (both gitignored, never committed, never
+  synced, directories `0700`, files `0600`; on macOS both are excluded from
   Time Machine). Treat them as sensitive, exactly like `.confidant/`.
-- **`confidant reindex` builds the corpus and enforces its guardrails**
-  (issue #37, ADR-6). The CLI owns content, the §12 cleared set,
-  decryption, and permissions; this skill only registers/embeds on top.
-  The CLI refuses rather than build a partial corpus:
+- **`qmd-index` stages the corpus and enforces its guardrails** (issue #795,
+  ADR-6). The vault is plaintext on disk, so staging is a copy, not a
+  decryption: `confidant allowlist --json` is the single source of truth for
+  §12 clearance, and the script copies the cleared record files and the
+  cleared ledger lines into the corpus. It keeps two guardrails:
   1. it refuses unless `.confidant/` is git-ignored in the vault's repo
      (fix: `echo '.confidant/' >> .gitignore` in the vault);
-  2. it refuses — writing nothing — when an encrypted record on the vault
-     could not be decrypted (no device key / key absent) or was refused as
-     tampered, naming the counts and pointing at `confidant init` /
-     `confidant recover`. A corpus that silently omits records is worse
-     than no corpus;
-  3. it writes dirs `0700` and files `0600`.
-- **`qmd-index` keeps the encrypted-disk assertion** (architecture §9b
-  item 4, device policy, not a per-command check): it refuses unless the
-  disk is encrypted — auto-detected (FileVault on macOS, dm-crypt ancestor
-  in `lsblk` on Linux) or asserted by the operator. Detection is preferred
-  and reported when it succeeds; otherwise the assertion can be per run
-  (`--i-confirm-encrypted-disk`) or persisted for automated runs on hosts
-  where detection is impossible — a cloud VM or container with no local
-  `dm-crypt` ancestor (#540) — with `CONFIDANT_ASSUME_ENCRYPTED_DISK=1`
-  or `[qmd] assume_encrypted_disk = true` in
-  `~/.config/confidant/config.toml`. The persisted forms are a
-  device-policy statement by the operator, **not a check**: the script
-  prints which mechanism satisfied the gate on stderr, so an assumption
-  never masquerades as detection. QMD's index DB and collection registry
-  are moved under the vault via `INDEX_PATH`/`QMD_CONFIG_DIR` (never
-  `~/.cache`), and any `confidant` collection left in qmd's default store
-  is removed on first run.
-- **The disk election happens once, at setup (#723).** When the gate
-  fails and the operator is present (stdin is a TTY), `qmd-index`
-  explains in plain language what the index is (a readable copy of the
-  cleared records), why the disk question matters, and what is
-  known/unknown about this host — then asks: assert and record, or
-  decline. Asserting writes the existing `[qmd] assume_encrypted_disk`
-  key (no new key) to the user config, preserving every other key; the
-  next run under the same home directory — or the next agent — never
-  asks again, because the write is re-parsed and verified before the
-  build proceeds (a config that cannot be recorded cleanly refuses
-  instead of proceeding on an unrecorded assertion). The election is
-  scoped to the home directory, not to a host or a disk: a shared or
-  restored `$HOME` carries the assertion to a different disk, and
-  `doctor` cannot distinguish that from a local election — revoke it
-  by deleting the key or setting it to `false`. Declining means QMD
-  stays off and `confidant find` remains the search path. There is no
-  third, silent outcome, and a non-TTY run keeps the old refusal rather
-  than prompting. Scripted setup uses
-  `--assert-and-persist-encrypted-disk` (the non-interactive form of
-  answering "assert"). `confidant doctor` reports the persisted
-  election forever after as a `qmd-disk` check — "asserted by operator
-  (…; an assertion, not a detection)" — per #709, so an assumption
-  never renders as detected.
+  2. it writes dirs `0700` and files `0600`.
+  QMD's index DB and collection registry are moved under the vault via
+  `INDEX_PATH`/`QMD_CONFIG_DIR` (never `~/.cache`), and any `confidant`
+  collection left in qmd's default store is removed on first run.
 - **The §12 allowlist is enforced at query time, and uncleared records are
-  also excluded at index time.** `confidant reindex` copies only the exact
-  cleared set computed by the CLI (cleared record files and cleared ledger
-  lines) into the corpus, so a query-path bug degrades to missing results
-  rather than risking a leak — this is #38's index-time exclusion, now
-  enforced inside the CLI. `bin/qmd-query` still verifies every hit against
-  the live cleared set *before* returning anything, in one
+  also excluded at index time.** `qmd-index` copies only the exact cleared
+  set computed by the CLI (cleared record files and cleared ledger lines)
+  into the corpus, so a query-path bug degrades to missing results rather
+  than risking a leak — this is #38's index-time exclusion, done by the skill
+  from `confidant allowlist --json`. `bin/qmd-query` still verifies every hit
+  against the live cleared set *before* returning anything, in one
   `confidant allowlist --json` call per query (#538): record hits by path
   (`cleared_files`), ledger hits by `(file, line)` (`cleared_ledger_lines`) —
   the corpus mixes people and can be stale after a `no-ai` change, so the
   file alone is not enough. The CLI stays the single source of truth, so
   allowlist logic can never drift between the index and the CLI. A hit that
   cannot be verified as cleared is dropped (fail closed).
-- **`no-ai` records are never decrypted into the corpus.** The build goes
-  through the CLI's `for_agent` read path, which never decrypts a `no-ai`
-  envelope; `no-ai` is excluded by construction, not just by the
-  query-time filter.
-- **Encrypted envelopes are decrypted through the CLI.** The old script
-  skipped `enc:` files and warned; now the CLI decrypts cleared envelopes
-  through the read path and refuses (rather than skipping) when a key is
-  missing, so the corpus is either complete for this device or not built.
+- **`no-ai` records never enter the corpus.** The CLI does not list them as
+  cleared, so they are excluded by construction, not just by the query-time
+  filter.
 
 ## Setup
 
@@ -98,7 +53,7 @@ truth for the search allowlist.
 npm install -g @tobilu/qmd        # or: bun install -g @tobilu/qmd
 
 # per vault: build the corpus + collection (needs --vault or CONFIDANT_VAULT)
-# (the corpus itself is built by `confidant reindex`, which the script runs first)
+# (the corpus is staged by this script from `confidant allowlist --json`)
 "$(confidant which --skills-dir)"/qmd-search/bin/qmd-index.py --vault /path/to/vault
 
 # optional: embeddings for hybrid/vector search (downloads GGUF models on first run)
@@ -149,10 +104,10 @@ return a **stale snippet of a still-cleared record**: the excerpt comes from
 the corpus copy, so a note edited in the vault keeps returning its old text
 until `qmd-index` reruns. That is not a §12 leak (the record is still
 cleared and the corpus already holds that text), but the text can be out of
-date. For a ledger file, one edited or removed vault line makes the
-corpus-to-vault line alignment run off the end and drop every later corpus
-line in that file until the next reindex; it fails closed (a dropped line is
-never returned), and a rerun clears it.
+date. For a ledger file, an edited or removed vault line costs only the
+corpus lines that no longer align: the corpus-to-vault map is built from a
+text index, so every other line in that file still resolves. It fails closed
+per line (a dropped line is never returned), and a rerun clears it.
 
 ## Querying
 
@@ -223,21 +178,18 @@ value once its own preflight persists a per-vault value.
 
 ## Tooling
 
-- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--i-confirm-encrypted-disk] [--skip-preflight] [--assert-and-persist-encrypted-disk]` — runs
-  `confidant reindex` to (re)build `<vault>/.confidant/qmd-corpus/` (a full
-  rebuild: the CLI wipes the old corpus), then registers it as the `confidant`
-  QMD collection (removing any previous one first). It never walks the vault
-  itself. It keeps one guardrail: it refuses unless the disk is encrypted
-  (auto-detected, or asserted with `--i-confirm-encrypted-disk` /
-  `CONFIDANT_ASSUME_ENCRYPTED_DISK=1` / `[qmd]
-  assume_encrypted_disk = true`; detection is preferred and the mechanism
-  used is printed on stderr); the gitignore refusal and
-  the `0700`/`0600` permissions live in `confidant reindex`. Puts QMD's own
-  store under `<vault>/.confidant/qmd/`. `--cli` points at the confidant
-  binary (default `confidant` on PATH). Each kept `ledger/*.cfd` is written by
-  the CLI with a sibling `.cfd.md` so QMD's `**/*.md` collection pattern
-  covers ledger facts too (hits map back to the real `.cfd` path). `--embed`
-  runs `qmd embed` afterwards. Setup ends with an automatic
+- `bin/qmd-index.py [--vault PATH] [--cli PATH] [--embed] [--skip-preflight]`
+  — (re)builds `<vault>/.confidant/qmd-corpus/` from the CLI's cleared set
+  (`confidant allowlist --json`), wiping the old corpus first: cleared
+  record files are copied whole, and each cleared `ledger/*.cfd` gets a
+  sibling `.cfd.md` holding only its cleared lines (so QMD's `**/*.md`
+  collection pattern covers ledger facts too; hits map back to the real
+  `.cfd` path). It refuses unless `.confidant/` is git-ignored, then writes
+  the corpus `0700`/`0600`. It registers the corpus as the `confidant` QMD
+  collection (removing any previous one first) and puts QMD's own store
+  under `<vault>/.confidant/qmd/`. `--cli` points at the confidant binary
+  (default `confidant` on PATH) whose allowlist defines the cleared set.
+  `--embed` runs `qmd embed` afterwards. Setup ends with an automatic
   `qmd-preflight.py --persist` run (issue #722) unless `--skip-preflight`
   is given: preflight is part of setup, so a cold-start or
   unreachable-hub problem surfaces here, not on the first real query,
@@ -282,15 +234,14 @@ value once its own preflight persists a per-vault value.
   explicit --query probe yields no hit-bearing mode — an empty
   probe is not evidence against it (#778). It never
   touches the global user config: values an old `--persist` wrote
-  there (including the #723 disk-election key) stay honored as
-  fallback for vaults with no per-vault file. Exit 0 whenever the
-  report completes, even with no mode recommended — read the report,
-  do not gate on the exit code.
+  there stay honored as fallback for vaults with no per-vault file.
+  Exit 0 whenever the report completes, even with no mode
+  recommended — read the report, do not gate on the exit code.
 - `bin/qmd-query.py [--vault PATH] [--mode hybrid|bm25|vector] [-n N] [--packs LIST] QUERY`
   — queries QMD, verifies every hit against `confidant allowlist --json`
   (one call per query; #538), and emits the JSON above. A ledger hit is kept
-  only when its (corpus) line resolves to a cleared vault line: `reindex`
-  writes only cleared ledger lines into the corpus, in order, so
+  only when its (corpus) line resolves to a cleared vault line: `qmd-index`
+  stages only cleared ledger lines into the corpus, in order, so
   `qmd-query` aligns corpus and vault lines by text to report real vault
   line numbers. `--packs` scopes the allowlist call, so a scoped agent
   never sees hits owned by another pack (issue #178). Falls back to plain

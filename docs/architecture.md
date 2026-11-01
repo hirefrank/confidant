@@ -12,13 +12,19 @@ It is modeled on beancount and beancount-io: plain text in git, a CLI with a `--
 
 **Not goals.** Teams, shared pipelines, permissions UIs, live collaboration, a web app, a hosted service in v0, and a general integration plugin system in v0.
 
-**Later, out of scope here.** A hosted or paid version, probably an agent for non-technical users. Cloudflare Artifacts (git-compatible storage in open beta; one repo per user at scale; short-lived per-repo read/write tokens; events on push; US/EU data location) is the likely base. The hosted side must only ever hold ciphertext. v0 works with any git remote.
+**Later, out of scope here.** A hosted or paid version, probably an agent for
+non-technical users. That needs a second person using Confidant and an answer
+to how two operators' vaults relate; the expected shape is separate
+interoperating vaults, not one shared vault. v0 works with any git remote.
 
 **What it is and what it isn't.** `confidant` is the operator's private record of relationships: people, organizations, deals, interactions and notes, plus the judgment about them. It is **not** a system that faces customers. Booking, payments, invoicing, client logins, scheduling and anything a customer touches stay in the tools built for that (a booking portal, a payment processor, a calendar). `confidant` reads from those systems: an agent or script *pulls* their events into the vault, so nothing ever pushes into `confidant`, and nothing private flows back out to them.
 
 ## 2. Why not a typical client/server web app
 
-A server-side CRM must hold plaintext to search, display and summarize notes. That is how every hosted CRM works (HubSpot, Attio and the rest), and it is what the privacy rule below forbids.
+A server-side CRM holds the operator's notes in the clear, on someone else's
+machine, because that is how it searches, displays and summarizes them. Every
+hosted CRM works that way (HubSpot, Attio and the rest), and it is what the
+privacy model below rules out.
 
 What a web app does better, and why it doesn't matter here:
 
@@ -28,35 +34,54 @@ What a web app does better, and why it doesn't matter here:
 | Non-technical users | The later hosted *agent* serves that market. |
 | Always-on capture (email, calendar sync) | The agent does capture on a schedule, through the CLI. |
 
-**Main alternative weighed: local-first SQLite app with encrypted change sync.** Better at concurrent edits (CRDT or op-log merges instead of git merges). It loses plain files you can read and diff, free history and blame from git, and agent fluency: agents already know how to read files, grep, and use git. With one operator and a few devices, concurrent edits are rare, and the file layout (ADR-3) keeps conflicts small. Rejected for v0.
+**Main alternative weighed: local-first SQLite app with an op-log sync layer.** Better at concurrent edits (CRDT or op-log merges instead of git merges). It loses plain files you can read and diff, free history and blame from git, and agent fluency: agents already know how to read files, grep, and use git. With one operator and a few devices, concurrent edits are rare, and the file layout (ADR-3) keeps conflicts small. Rejected for v0.
 
 ## 3. Privacy model
 
-**Trusted device:** any device or agent computer acting on behalf of the owner, including a cloud machine running the owner's agent. A shared application server holding customer data is **not** a trusted device.
+**Trusted device:** any device or agent computer acting on behalf of the
+owner, including a cloud machine running the owner's agent. A shared
+application server holding customer data is **not** a trusted device.
 
 **Rule:**
 
-1. Plaintext only on trusted devices (laptop, agent computer).
-2. Only ciphertext in any git remote or backup.
+1. Record bodies are plaintext on a trusted device, inside a private git repo,
+   on a disk the operator encrypts (LUKS, FileVault). Disk encryption is an
+   operating-system setting, not something Confidant manages.
+2. Only a **private** git remote or backup receives the vault. Confidentiality
+   there rests on the host's access control and the repo being private, which
+   is why the remote must be private by choice, not by accident.
 3. Nothing private leaves the trusted devices for an outside tool, ever.
 
-**Accepted exception:** when an agent reads notes, that content is sent to a hosted model provider for processing. This is explicit and accepted. The design does not claim the provider stores nothing; that depends on the provider's terms.
+**Scope:** one operator, one vault. Multi-user is deferred until there is a
+second human; the expected resolution is separate interoperating vaults, not
+a shared one. That deferral is what makes plaintext-on-disk acceptable: there
+is no second person to isolate notes from.
 
-Client notes and PII are encrypted in git by default (ADR-4).
+**The operator↔agent boundary is `no-ai`.** Records (or just their notes) can
+be marked `no-ai`, which keeps their content out of `find`, `context`, the
+allowlist, and the search corpus that agents read. It is an exposure control
+for agent-facing output, not access control: the operator can always read the
+files, and an agent with a shell on the same machine can too. Pack scoping
+(`--packs`) is a second policy filter on the same read paths.
+
+**Accepted exception:** when an agent reads notes, that content is sent to a hosted model provider for processing. This is explicit and accepted. The design does not claim the provider stores nothing; that depends on the provider's terms.
 
 ## 4. Threat model
 
 | Protects against | Does not protect against |
 |---|---|
-| A leaked or breached git remote | A compromised trusted device (malware, stolen unlocked laptop) |
-| A stolen backup | A model provider seeing what agents send it |
-| A curious host (remote provider, later hosted service) | Metadata: commit timing, commit counts, file counts and sizes, which opaque IDs change together |
-| Filenames revealing who is a client (opaque IDs in paths) | Plaintext ledger fields, if left unencrypted (Open question 2) |
-| A revoked device reading *future* writes | A revoked device reading what it already copied (ADR-5) |
+| A leaked laptop or backup, if the disk is encrypted and locked (the OS setting the design assumes) | A compromised trusted device (malware, stolen unlocked laptop, or a disk left unlocked) |
+| Filenames revealing who is a client (opaque IDs in paths) | A public repo, or a repo shared with the wrong account: the remote must be private |
+| An agent reading `no-ai` content through the CLI, MCP, or the search corpus | Anyone with access to the private repo: records are readable there |
+| A malformed or incoherent vault reaching a commit (the `check` gate) | Record bodies, ledger fields and commit messages, which carry whatever the operator and agents put in them |
+|  | A model provider seeing what agents send it |
+|  | Metadata a git host still sees: commit timing, commit counts, file counts and sizes |
 
-Local indexes and caches (`.confidant/`, any search index) contain plaintext and embeddings. They are sensitive, gitignored, and stay on trusted devices.
+Local indexes and caches (`.confidant/`, any search index) hold plaintext and
+embeddings. They are sensitive, gitignored, and stay on trusted devices.
 
-Agent-focused threat model — what an MCP-connected agent can and cannot do, and exactly what `no-ai`, the `check` gate, and the inbox guarantee: [`docs/threat-model-agents.md`](threat-model-agents.md).
+Agent-focused threat model — what an MCP-connected agent can and cannot do, and exactly what `no-ai` and the `check` gate guarantee:
+[`docs/threat-model-agents.md`](threat-model-agents.md).
 
 ## 5. Layouts
 
@@ -64,10 +89,9 @@ Agent-focused threat model — what an MCP-connected agent can and cannot do, an
 
 ```
 vault/
-├── confidant.toml              # vault config: spec version, packs, key recipients, random vault id
-├── keys/                 # wrapped per-client data keys (age)
+├── confidant.toml              # vault config: spec version, packs, random vault id
 ├── ledger/2026/10.cfd    # dated one-line entries, one file per month
-├── people/p-01J9…/       # profile.md + notes/*.md (encrypted)
+├── people/p-01J9…/       # profile.md + notes/*.md
 ├── orgs/o-01J9…/org.md
 ├── deals/d-01J9…/deal.md
 └── .confidant/                 # local index/cache, gitignored, rebuildable
@@ -79,7 +103,6 @@ vault/
 confidant/
 ├── spec/                 # versioned file-format spec (the contract)
 ├── crates/confidant-core/      # parse, model, derived values, check engine
-├── crates/confidant-crypt/     # age key wrapping, record-bound XChaCha20-Poly1305 content encryption
 ├── crates/confidant-cli/       # CLI + agent contract + thin MCP server
 │   └── skills/           # agent skills, embedded in the binary by `setup`
 ├── packs/                # built-in and vendored schema packs
@@ -95,7 +118,6 @@ Structured facts are one-line ledger entries. Prose is Markdown.
 ```
 ; ledger/2026/10.cfd
 2026-10-01 touch    p-01J9Z3K4QF  call
-2026-10-03 alias    p-01J9Z3K4QF  email hmac:3f9c…  ; keyed HMAC; real value in encrypted profile
 2026-10-08 touch    p-01J9Z3K4QF  meet note:n-01JA02
 2026-10-08 balance  p-01J9Z3K4QF  unknown_metric 4
 2026-10-09 stage    d-01J9ZB7W1M  proposal
@@ -103,7 +125,7 @@ Structured facts are one-line ledger entries. Prose is Markdown.
 ```
 
 ```markdown
-<!-- people/p-01J9Z3K4QF/profile.md (encrypted at rest) -->
+<!-- people/p-01J9Z3K4QF/profile.md -->
 ---
 id: p-01J9Z3K4QF
 type: person
@@ -136,7 +158,7 @@ Each ADR is flagged **One-way door** (hard to change once vaults exist) or **Rev
 
 **Decision.** Facts are one-line entries, `DATE VERB ID ARGS…`, beancount style, e.g. `2026-10-01 touch p-01J9… call`. Prose lives in Markdown. Derived values are computed, never stored as truth. `balance` entries are assertions that `confidant check` verifies against the computed value. YAML frontmatter holds only identity and display fields (id, type, name), not facts.
 
-Ledger arguments never carry plaintext PII. Alias values (emails, phones, handles) are stored either as `HMAC(vault lookup key, normalized value)` for matching, with the real value in the encrypted profile, or as an encrypted payload (Open question 2). A plain hash isn't enough because it can be dictionary-attacked. The lookup key is wrapped to devices like a data key. The ledger is the only source of truth for facts; there is no separate audit journal (ADR-6).
+Ledger arguments carry identifiers and structured values, never prose: a `touch` line is a date, an opaque id and a kind. Contact values (emails, phones, handles) live in person front matter, declared by the personal pack, and are looked up there directly (ADR-9). The ledger is the only source of truth for facts; there is no separate audit journal (ADR-6).
 
 **Alternatives considered.** (a) YAML frontmatter as source of truth: familiar, but edits overwrite state in place, history is lost inside a field, two devices editing one file conflict, and there are no assertions. (b) JSON/JSONL: strict, but noisy for humans to read and diff. (c) SQLite: see Section 2.
 
@@ -146,7 +168,7 @@ Ledger arguments never carry plaintext PII. Alias values (emails, phones, handle
 
 **Door:** One-way.
 
-**Context.** Laptop and agent computer may write at the same time. Sequential IDs (e.g. `s03`) collide. Merge conflicts in encrypted files can't be resolved by reading the diff.
+**Context.** Laptop and agent computer may write at the same time. Sequential IDs (e.g. `s03`) collide. Two devices editing one file at once conflicts.
 
 **Decision.** ULID-style IDs with type prefixes: `p-` person, `o-` org, `d-` deal (others defined in the spec). One directory or file per record. Writes are mostly appends. Ledger files are split by month to stay small. IDs appear in paths; names never do. The CLI generates ULIDs, and `confidant check` rejects non-conforming IDs and non-ID filenames as errors rather than skipping them.
 
@@ -154,44 +176,35 @@ Ledger arguments never carry plaintext PII. Alias values (emails, phones, handle
 
 **Consequences.** IDs are not human-friendly; the CLI resolves names and aliases to IDs (`confidant find`). Most concurrent writes touch different files or append to different lines. A git merge driver for `.cfd` ledgers (union of sorted lines) is worth shipping.
 
-### ADR-4. Encryption built into the CLI: `age` wraps per-client keys, record-bound AEAD encrypts content.
+### ADR-4. Plaintext records on disk; the perimeter is full-disk encryption plus a private repo.
 
-**Door:** One-way.
+**Door:** One-way (once history is plaintext, it stays plaintext).
 
-**Context.** Notes and PII must be ciphertext in any remote or backup. Frank also needs to delete a client completely, revoke a lost device, and give some agents less access than others. Ciphertext should be bound to its record so it can't be swapped into another record or vault, but the age format has no associated data. Anyone with git write access (Lock 1, ADR-10) can edit `confidant.toml` and `keys/`.
+**Context.** Notes and PII are the operator's private memory, and a vault's git history is permanent. Something has to define who can read a record. The candidates were application-level secrecy inside the CLI, or trusting the host: the operator's own machines, their disk encryption, and a private remote.
 
 **Decision.**
 
-- **Key wrapping (age only).** Each client gets its own data key. It is age-encrypted to every authorized device or agent recipient and stored in `keys/`.
-- **Content encryption.** Content files are encrypted with XChaCha20-Poly1305 under the client's data key, with a fresh nonce per write and a key id in the envelope. The associated data is a length-prefixed encoding of vault id ‖ ULID ‖ relative path ‖ purpose ‖ key epoch, so a file moved to another record, path or vault fails to decrypt.
-- **Vault id.** `confidant.toml` holds a random, non-secret vault id, bound into every associated data.
-- **Signed recipient changes.** Changes to the recipient set must be in commits signed by an already-trusted key. `confidant` verifies them against a trust anchor kept outside the vault (`~/.config/confidant/`, or a pinned first-commit fingerprint) before wrapping anything. Without this, anyone with git write access could add their own recipient and receive future keys, and revocation by re-wrap has the same hole.
-- **Never commit plaintext.** A vault never contains a plaintext commit of a protected file. Content is encrypted before its first commit. Existing plaintext is never encrypted in place, because git history would keep it.
-- **Keep unchanged ciphertext.** If a file's plaintext hasn't changed, its existing ciphertext is kept byte for byte, so rewrites don't create diffs, conflicts or false "changed" signals (ADR-3).
+- **Records are plaintext.** A record is YAML front matter plus a Markdown body on disk: readable, greppable, diffable, and mergeable by git. `record add`, `note add`, and `log session --note` write those bytes straight through an atomic temp-file + rename.
+- **The perimeter is the machine and the repo.** The operator runs Confidant on trusted devices (§3) with full-disk encryption enabled, and syncs to a **private** git remote. `confidant doctor`'s `git-remote` check refuses cleartext transports (`http://`, `git://`) and warns on transports it cannot verify; it does not police whether the host is private.
+- **`no-ai` is the agent boundary.** It is enforced at read time in the allowlist (§12), not by the storage layer, and it applies to `find`, `context`, `allowlist`, MCP, and the QMD corpus.
+- **No second secrecy layer.** There is no key material in a vault, so a vault is self-contained: clone it and read it. That removes key handling from the failure surface — no key to lose, rotate, or fail to unwrap — and it makes every record reviewable with `git diff`.
+- **Opaque paths still matter.** Names never appear in paths (ADR-3), so a directory listing does not reveal who is a client even though bodies are readable.
 
-This enables:
+**Alternatives considered.** (a) Per-record application-level encryption (envelopes, per-client keys, recovery phrases): designed and shipped, then removed in #795. It cost key management, recovery, and unusable diffs, and its per-client shredding could never reach bytes already in git history, so it promised deletion it could not deliver. (b) git-crypt or similar: encrypts contents but not paths, deterministic, and no revocation. (c) Full-disk encryption only, with no `no-ai`: leaves agents free to read everything the operator can. (d) A hosted service that does the encryption for you: that is the client/server design §2 rejects.
 
-- **Crypto-shredding:** delete a client's wrapped keys and the data is unreadable everywhere, including git history and backups.
-- **Device revocation:** re-wrap keys without the revoked recipient (see ADR-5 for limits).
-- **Scoped agent keys:** e.g. a pipeline-only key that can read deals and ledger but not notes.
+**Consequences.** A vault copied to an unencrypted disk, a public repo, or a shared backup is exposed. `no-ai` protects agent-facing output, not the files. Anything that must never be readable by whoever holds the repo does not belong in a Confidant vault; use the tool built for that. The trade is deliberate: one operator, their own machines, a private repo, and a plain format that agents handle well.
 
-Encryption is optional for generic open-source users and the default for notes and PII. Paths use opaque IDs so filenames never reveal clients. git-crypt is optionally supported for compatibility, with its limits documented: it encrypts contents but not paths, its encryption is deterministic, and its docs say it can't revoke access.
+### ADR-5. Deleting is not erasing.
 
-**Alternatives considered.** (a) git-crypt only: easy, but the limits above rule it out as the default. (b) One vault-wide key: simpler, but no shredding per client and no scoped agents. (c) Full-disk or remote-side encryption only: does not keep plaintext off the remote. (d) age for content, with `{vault, id, path}` embedded in the plaintext and checked after decryption: weaker and easy to forget.
+**Door:** One-way (it's a property of git plus backups, stated so nobody expects otherwise).
 
-**Consequences.** Key management is real work: `confidant keys add|revoke|rotate|shred`. Each device needs a trust anchor outside the vault. The AEAD layer is adapted from cr (ADR-13). Encrypted files diff and merge poorly, which ADR-3 and keeping unchanged ciphertext mitigate. A lost private key with no other recipient means lost data; `confidant doctor` should warn when a client key has a single recipient.
+**Context.** The operator will want to remove a person: an ex-client, a mistaken record, someone who asked to be forgotten. Deleting the file removes it from the working tree. It does not remove it from git history, from clones, or from backups.
 
-### ADR-5. Revocation protects only future writes.
+**Decision.** Docs and command output say this plainly rather than implying a wipe. Deleting a record removes it from the live vault (so `find`, `context`, and agents stop seeing it) and leaves history intact. To make deletion stick, the operator rewrites or discards history deliberately, knowing that every clone and backup must be handled too. Confidant never rewrites history on its own.
 
-**Door:** One-way (it's a property of the design, stated so nobody expects otherwise).
+**Alternatives considered.** (a) Rewriting history automatically on delete: a destructive, hard-to-undo operation that breaks every other device and clone, surprising for a command named `record delete`. (b) A tombstone that hides the record everywhere: keeps the bytes and only changes the view, which overstates what it does.
 
-**Context.** Re-wrapping keys stops a revoked device from decrypting new data. It cannot reach into a copy already on that device.
-
-**Decision.** Docs and `confidant keys revoke` output say plainly: a revoked device keeps whatever it already copied. Revocation re-wraps all data keys, and optionally rotates data keys for affected clients so future content uses new keys.
-
-**Alternatives considered.** Claiming remote wipe or DRM-style control: not possible with files on a device the user doesn't control.
-
-**Consequences.** Honest expectations. Rotation issues a new epoch key; old-epoch ciphertext stays readable by still-authorized parties (the AAD binds the key epoch, ADR-4), so rotation is cheap and creates small commits.
+**Consequences.** Honest expectations, and a reason to keep the vault's history and remotes private (ADR-4). `merge` keeps a merged-away id resolvable on purpose; that is curation, not erasure.
 
 ### ADR-6. Files are the only source of truth; indexes and caches are throwaway.
 
@@ -199,11 +212,11 @@ Encryption is optional for generic open-source users and the default for notes a
 
 **Context.** Search and fast lookups need indexes, and they hold plaintext.
 
-**Decision.** Indexes, caches and any search index live in `.confidant/` (or similar), are gitignored, stay on trusted devices, and rebuild with one command (`confidant reindex`). QMD (tobi/qmd: local BM25, vector and rerank search, Node-based) is **not** a dependency of the Rust CLI. It is integrated through a skill or script (ADR-8). The QMD index holds plaintext chunks and embeddings and is treated as sensitive.
+**Decision.** Indexes, caches and any search index live in `.confidant/` (or similar), are gitignored, stay on trusted devices, and are rebuilt from the vault at any time. QMD (tobi/qmd: local BM25, vector and rerank search, Node-based) is **not** a dependency of the Rust CLI. It is integrated through a skill or script (ADR-8). The QMD index holds plaintext chunks and embeddings and is treated as sensitive.
 
 There is no separate audit journal. The audit trail is the ledger plus git history plus signed commits (ADR-10). If more tamper evidence is needed later, sign or anchor commits rather than keep a second chain.
 
-**Alternatives considered.** (a) Committing an index: faster cold start, but leaks plaintext or needs encryption and creates conflicts. (b) Bundling vector search in Rust core: no Node, but a large dependency for a feature not every user needs. (c) A hash-chained audit journal like cr's: rejected. It is one linear chain with a global sequence and an anchor file that every write rewrites, so two devices writing at once always conflict (breaking ADR-3). It is also a second source of truth to reconcile, and it keeps plaintext metadata forever.
+**Alternatives considered.** (a) Committing an index: faster cold start, but publishes plaintext and creates conflicts. (b) Bundling vector search in Rust core: no Node, but a large dependency for a feature not every user needs. (c) A hash-chained audit journal like cr's: rejected. It is one linear chain with a global sequence and an anchor file that every write rewrites, so two devices writing at once always conflict (breaking ADR-3). It is also a second source of truth to reconcile, and it keeps plaintext metadata forever.
 
 **Consequences.** First search on a new device is slower. No index ever needs migrating; delete and rebuild.
 
@@ -217,10 +230,10 @@ There is no separate audit journal. The audit trail is the ledger plus git histo
 
 - `--json` on every command; every JSON response includes the resolved vault path.
 - `--no-input`: never prompt; fail with an error code instead.
-- `--file` to pass structured input; `--dry-run` on every write. Dry runs and confirm-before-write skills show and bind to the logical change (ledger lines, plaintext diff), never to ciphertext bytes, because nonces are fresh on every write.
+- `--file` to pass structured input; `--dry-run` on every write. Dry runs and confirm-before-write skills show and bind to the logical change (ledger lines, the plaintext diff) that will be written.
 - Stable exit codes and error codes. Errors name the file and line and suggest a fix; paths are opaque IDs, so this leaks nothing. Errors are classified by type, never by message text. `internal_error` is reserved for unclassified failures, and usage errors exit with code 2.
-- Optional `--request-id` so a retried write does not apply twice. It is scoped per write command (imports are multi-record). Only hashes are stored, in a commit trailer: a domain-separated hash of the id and an HMAC keyed by the raw id over the canonical request. Reusing an id with different content is an error (`E_IDEMPOTENCY_CONFLICT`). ADR-8's `src:` provenance stays the content-level dedupe.
-- One commit per write, attributed to the human or agent. Commit messages and trailers are plaintext that crypto-shredding can't reach, so they carry only opaque IDs, verbs, agent identity and request-id hashes. Free-text reasons and intent are stored encrypted under the client's data key, or omitted. When an agent performs a write, set `CONFIDANT_AGENT_ID` to an opaque identifier (no free-text names); the write pipeline adds an `Agent:` commit trailer carrying that value.
+- Optional `--request-id` so a retried write does not apply twice. It is scoped per write command (imports are multi-record). Only hashes are stored, in a commit trailer: a domain-separated hash of the id and of the canonical request. Reusing an id with different content is an error (`E_IDEMPOTENCY_CONFLICT`). ADR-8's `src:` provenance stays the content-level dedupe.
+- One commit per write, attributed to the human or agent. Commit messages and trailers are readable by anyone with the repo, so they carry only opaque IDs, verbs, agent identity and request-id hashes. Free-text reasons and intent go in a record body when they are worth keeping, or are omitted. When an agent performs a write, set `CONFIDANT_AGENT_ID` to an opaque identifier (no free-text names); the write pipeline adds an `Agent:` commit trailer carrying that value.
 - `confidant check` runs before every commit; a failing check blocks the write.
 - `confidant schema` (JSON Schema), `confidant help --json`, `confidant doctor`.
 - `confidant context <person>`: a context bundle, with flags to include or exclude private data.
@@ -253,7 +266,7 @@ confidant check --json
 
 **Consequences.** Every command needs JSON output and error codes from day one. The contract is versioned and tested against the demo vault.
 
-### ADR-8. Extensibility in v0: check rules, schema packs, and local decrypted operations. No integration plugin system.
+### ADR-8. Extensibility in v0: check rules, schema packs, and local operations. No integration plugin system.
 
 **Door:** Reversible.
 
@@ -263,7 +276,7 @@ confidant check --json
 
 1. **Check rules / validators.** Run on every write and in `confidant check`, regardless of who writes (human, agent, script). Example: a rule that rejects a package `open` line with no unit count.
 2. **Schema packs.** Define record types, ledger verbs and derived values, declared in `confidant.toml`. The built-in personal pack is the reference; external packs add domain schemas (a clinic's appointments, a team's projects).
-3. **Local decrypted operations (possible).** Operations that need plaintext, such as building a search index, run inside or under the CLI so plaintext doesn't have to leave it through a general export. Scope to be decided (Open question 4).
+3. **Local operations at the vault (possible).** Operations such as building a search index run locally and stage only the cleared set through `confidant allowlist --json`, so no general export has to exist. Scope to be decided (Open question 4).
 
 ```toml
 # confidant.toml
@@ -282,7 +295,7 @@ Integrations are idempotent and record provenance on each entry (`src:<source>/<
 confidant import --file events.jsonl --request-id import-2026-10-07 --json --no-input
 ```
 
-**Alternatives considered.** Git-style subprocess plugins: `confidant-<name>` on PATH, a JSON stdin/stdout protocol, and a capability manifest declaring whether the plugin needs the private (decrypted) tier. Clean, and a likely later addition, but in v0 it is a framework to design, version and secure before there is a second user who needs it. Agents plus the CLI contract cover the same integrations today.
+**Alternatives considered.** Git-style subprocess plugins: `confidant-<name>` on PATH, a JSON stdin/stdout protocol, and a capability manifest declaring whether the plugin needs the operator-only (uncleared) tier. Clean, and a likely later addition, but in v0 it is a framework to design, version and secure before there is a second user who needs it. Agents plus the CLI contract cover the same integrations today.
 
 **Consequences.** Less to build and secure in v0. Integration code lives as skills/scripts that may duplicate small helpers. How packs are expressed (declarative TOML/spec files vs compiled Rust) needs a design pass; external packs are declarative, while the built-in personal pack stays compiled behind the same pack interface.
 
@@ -299,23 +312,23 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Context.** People have several emails and handles, and an outside system can hold the same person under two accounts.
 
-**Decision.** `alias` entries attach emails, phones and handles to an ID, stored as a keyed HMAC or encrypted, never as plaintext (ADR-2). A `merge` entry folds one ID into another; the old ID stays resolvable and its history is kept. `confidant check` warns on two IDs sharing an alias.
+**Decision.** Contact values (emails, phones, handles) are front-matter fields on the person, declared by the personal pack, and `confidant alias resolve` matches them directly — trimmed, Unicode case-insensitive, whole-string — canonicalizing through merges. A legacy `DATE alias …` ledger line is accepted and ignored so older vaults keep passing `check`; nothing generates it. A `merge` entry folds one ID into another; the old ID stays resolvable and its history is kept. `confidant check` warns on two IDs sharing a contact value.
 
-**Alternatives considered.** Deleting the duplicate and rewriting references: loses history and touches many encrypted files.
+**Alternatives considered.** Deleting the duplicate and rewriting references: loses history and touches many records. Hashing contact values so the ledger never holds them (the pre-#795 design): it needed a key, broke direct lookup, and was protecting strings that sit in readable front matter anyway.
 
-**Consequences.** Every reader resolves merges. Importers match on aliases first, by the HMAC of the normalized value.
+**Consequences.** Every reader resolves merges. Importers match on contact fields first, then on name. Two cleared people sharing a value is `E_AMBIGUOUS_PERSON`, not a silent pick.
 
-### ADR-10. Auth without a login system: two locks plus signed commits.
+### ADR-10. Auth without a login system: a private repo plus git's own attribution.
 
 **Door:** Reversible.
 
-**Context.** No server, so no accounts.
+**Context.** No server, so no accounts. There is exactly one operator, and the machine already has a git identity.
 
-**Decision.** Lock 1: git remote access decides who can sync ciphertext. Lock 2: keys decide who can read it. Git access is all-or-nothing, so scoping comes from keys (ADR-4). Attribution comes from signed commits, because git author names can be spoofed; `confidant check` can require signatures from known keys. The trusted-signers list lives outside the vault (`~/.config/confidant/`, a flag or an env var), never inside it, since anyone with write access could replace an in-vault list. It is the same trust anchor that authorizes recipient changes (ADR-4). Signed commits plus git history are the audit trail (ADR-6).
+**Decision.** Access is git access: whoever can read the private repo can read the vault, and whoever can push can write it. There is no second lock inside the vault, because there is nothing inside it that could hold one (ADR-4). Attribution comes from git: one commit per write, author and committer set to the operator, and an `Agent:` trailer when a write came from an agent (`CONFIDANT_AGENT_ID`). Signed commits (SSH or GPG) are supported as an option and give tamper-evident attribution, but they are the operator's git configuration, not a Confidant feature: nothing in the CLI verifies a signature today, and git author names can be spoofed without them. Signed commits plus git history are the audit trail (ADR-6).
 
-**Alternatives considered.** A custom auth service: contradicts having no server.
+**Alternatives considered.** (a) A custom auth service: contradicts having no server. (b) A signed allowlist of trusted committers stored inside the vault: anyone with push access could replace the list, so it would authenticate nothing. (c) A second key-based lock per device: see ADR-4's alternatives; removed in #795.
 
-**Consequences.** Setup requires a signing key per device/agent and a trust anchor outside the vault on each device. There is no login system to build.
+**Consequences.** Keep the remote private and the machine's disk encrypted; that is the whole access model. Turning on commit signing is a per-device git setting and does not change any Confidant command. Adding a second human means separate vaults, not a shared one (§3).
 
 ### ADR-11. Vault discovery order.
 
@@ -331,7 +344,7 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Door:** Mostly one-way once outside contributions arrive.
 
-**Context.** beancount-io is MIT. A later hosted offering would be an encrypted sync service that never sees plaintext.
+**Context.** beancount-io is MIT. A later hosted offering would have to decide what it holds and where; nothing hosted is planned (§1).
 
 **Recommendation.** Apache-2.0, for its explicit patent grant. MIT remains acceptable. Decision deferred to Frank.
 
@@ -341,60 +354,65 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Door:** Reversible.
 
-**Context.** The prior-art sweep found [cr](https://github.com/AnandChowdhary/cr) closest to this design. A one-day spike read its source at commit `f29f8d4` (v0.2.75) without building it; report: `/workspace/research/cr-spike-2026-10-07.md`. Its encryption and storage layers are not separable: no traits in ~56.7k lines, one database-wide keyring read from env vars inside `protect()`, field-level encryption only, an explicit refusal to encrypt folder-style records (our `people/p-…/` layout), and an 8.2k-line `Database` with YAML front matter as the source of truth.
+**Context.** The prior-art sweep found [cr](https://github.com/AnandChowdhary/cr) closest to this design. A one-day spike read its source at commit `f29f8d4` (v0.2.75) without building it; report: [`docs/research/cr-spike.md`](research/cr-spike.md). Its secrecy and storage layers are not separable: no traits in ~56.7k lines, one database-wide keyring read from env vars inside `protect()`, field-level secrecy only, an explicit refusal to apply it to folder-style records (our `people/p-…/` layout), and an 8.2k-line `Database` with YAML front matter as the source of truth.
 
 **Decision.** Build our own. Borrow these MIT-licensed pieces, with a header on each adapted file and the full MIT text in `THIRD_PARTY_LICENSES`:
 
-- Record-bound AEAD (~200 lines), re-keyed to per-client data keys and our associated-data fields (ADR-4).
-- Keeping existing ciphertext when a value is unchanged, at file level (ADR-4).
-- HMAC idempotency digests and their rules (ADR-7), taking the rules, not cr's verification code.
 - `DomainError` and JSON error output, plus `file`, `line` and `fix` fields (ADR-7).
 - `check.rs` report types (severity, finding kinds with stable codes, summary, `--fail-on`), not its scanner.
 - `attribution.rs`, turned into commit trailers with free text kept out (ADR-7).
 - `paths.rs`: refuses symlinks, writes atomically. Close to drop-in.
 - The crash-safe write pattern, re-implemented for ledger append + file write + commit.
 
-**Alternatives considered.** (a) Contribute per-device keys and the ledger upstream: needs a key-resolver abstraction through its encryption, storage and audit replay, lifting the folder refusal, a second storage model and multi-device audit changes. It is a one-person, 9-week-old project whose roadmap heads toward server and UI. (b) Fork: delete ~40% (22.6k lines of server, web UI and access control), then replace the source of truth, key model, encryption unit and audit chain, and inherit its v1–v4 audit compatibility code.
+**Alternatives considered.** (a) Contribute per-device keys and the ledger upstream: needs a key-resolver abstraction through its secrecy, storage and audit replay, lifting the folder refusal, a second storage model and multi-device audit changes. It is a one-person, 9-week-old project whose roadmap heads toward server and UI. (b) Fork: delete ~40% (22.6k lines of server, web UI and access control), then replace the source of truth, key model, content unit and audit chain, and inherit its v1–v4 audit compatibility code.
 
-**Consequences.** We write the ledger, per-client keys and storage ourselves. We don't take cr's audit chain, `database.rs`, schema-driven field encryption, `sync.rs`, or anything server-side. Re-implemented patterns get credit in `docs/`. If cr later ships per-record keys, re-check it as a reference; the ledger and multi-device git mismatches remain either way.
+**Consequences.** We write the ledger, records and storage ourselves. We don't take cr's audit chain, `database.rs`, schema-driven field handling, `sync.rs`, or anything server-side. Re-implemented patterns get credit in `docs/`. The ledger and multi-device git mismatches are ours either way.
 
 ### ADR-14. CI and releases.
 
 **Door:** Reversible.
 
-**Context.** Confidant is a binary that people trust with client secrets. Every change needs to be tested, and every release needs to be verifiable. Building a release on every commit would create noise and make no version meaningful.
+**Context.** Confidant is a binary that people trust with their private records. Every change needs to be tested, and every release needs to be verifiable. Building a release on every commit would create noise and make no version meaningful.
 
 **Decision.** Run checks on every push, and release only when a version tag is pushed.
 
-- **Every push and pull request:** `cargo fmt --check`, `clippy` with warnings treated as errors, and the tests. Also `confidant check` on the demo vault, an encrypt-then-decrypt round-trip test, format-spec compatibility tests against fixture vaults, and dependency audits (`cargo deny`, `cargo audit`). Runs on Linux and macOS.
+- **Every push and pull request:** `cargo fmt --check`, `clippy` with warnings treated as errors, and the tests. Also `confidant check` on the demo vault, format-spec compatibility tests against fixture vaults, `no-ai` exclusion tests, and dependency audits (`cargo deny`, `cargo audit`). Runs on Linux and macOS.
 - **Version tag (for example `v0.1.0`):** cargo-dist builds binaries for macOS (Apple Silicon and Intel) and Linux (x86_64). It publishes a GitHub Release with SHA-256 checksums, a Homebrew formula and shell installers, and also publishes to crates.io. Builds carry build-provenance attestations so users can check that a binary came from this repo's CI. macOS notarization is added once there are outside users. Windows is supported via WSL2; no native Windows binaries are built.
 - **Main is protected:** merges need CI to pass, and release tags come only from main.
-- **CI never holds vault keys.** Tests use the demo vault and throwaway keys generated during the run.
+- **CI never holds vault data or credentials.** Tests use the demo vault and throwaway vaults created during the run.
 
 **Alternatives considered.** (a) Release on every merge to main: too many versions, and none of them means anything. (b) Hand-written release workflows: more to maintain than cargo-dist, for no gain in v0.
 
 **Consequences.** Cutting a release is a single step: push a tag. The format spec version and the CLI version are separate (ADR-1), so CI checks that a new CLI still reads vaults written in older format versions.
 
-### ADR-15. Recovery key.
+### ADR-15. (Withdrawn) Recovery key.
 
-**Door:** One-way (a vault created without one can add one later, but data lost before that can't be recovered).
+**Door:** Withdrawn 2026-10-31.
 
-**Context.** No server holds any copy of the keys. If every device key is lost, every client's notes are gone for good. 2FA recovery codes don't fit, because they only prove identity to a service that still has the data. Here nobody else has it.
+**Context.** This ADR specified an offline recovery key, because losing a device's key material meant permanently lost notes.
 
-**Decision.** `confidant init` creates a recovery key: an extra age key that every client data key is also wrapped to. It's shown once as a printable phrase, and the operator stores it offline (on paper or in a password manager such as 1Password), never on a device that syncs the vault. Recovery: clone the repo, run `confidant recover` with the phrase, add a new device key, then rotate to a fresh recovery key and revoke the old one. `confidant doctor` warns if any client key isn't wrapped to the recovery key, and the trust anchor for signed recipient changes includes it.
+**Decision.** Withdrawn with the removal of the application-level secrecy layer (#795, ADR-4). A vault now holds no key material, so there is nothing to recover: a clone of the repo *is* the vault, and recovery is "clone it on the new machine". The number is left in place rather than reused, because old issues and PRs cite it. What replaces it is backup discipline: push to the private remote (or back up the repo some other way), because a vault that was never pushed and never backed up is still gone if the disk dies (ADR-5).
 
-**Alternatives considered.** (a) No recovery: too easy to lose everything. (b) Split the key across several people (Shamir secret sharing): stronger, but too much for one operator in v0. It could be an option later. (c) Escrow with a hosted service: breaks the privacy rule.
+### ADR-16. Single operator; multi-user is deferred.
 
-**Consequences.** Anyone who has the phrase can read the whole vault, so it's as sensitive as every device key combined. Rotation re-wraps every client key but doesn't re-encrypt content, so it's cheap.
+**Door:** Reversible until a second person needs access.
+
+**Context.** Every design decision above assumes one operator: the disk is theirs, the repo is theirs, `no-ai` is the only boundary inside the data, and there is no second set of eyes to isolate. A household, a team, or peers running their own agents would break that assumption.
+
+**Decision.** Confidant is single-operator. Records for other people are *data about* them, not *access for* them. When a second human needs their own vault, the expected shape is separate interoperating vaults (each with its own repo and `no-ai` policy), not one shared vault with per-person isolation. That work is unscheduled, and the per-record secrecy layer that once looked like the answer to it is not coming back by default (ADR-4).
+
+**Alternatives considered.** (a) One shared vault with per-record access control: that is a permissions system, and it needs the auth/login model §2 rejects. (b) Per-record ciphers with per-person keys: the pre-#795 design; it promised isolation over git history that it could not deliver.
+
+**Consequences.** Nothing here needs to defend against a co-tenant. Anything two operators must not see together belongs in two vaults. Revisit this ADR before adding any multi-user feature.
 
 ## 8. v0 scope and milestones
 
 1. **Spec + core + check.** Format spec 0.1, parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
-2. **Crypt.** age key wrapping, record-bound content encryption, signed recipient changes, recovery key (ADR-15), `confidant keys`, scoped keys, shredding, git-crypt compatibility notes. Done when a recovery drill passes: clone the demo vault onto a clean machine, recover with only the phrase, rotate to a new phrase, and confirm the old one no longer works. Store the phrase in 1Password plus a printed copy kept somewhere physical; `confidant doctor` gives a yearly reminder to check the paper copy.
+2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.
-5. **QMD search (right after v0).** On trusted devices with encrypted disks only, and the index never goes in git (section 9b).
-6. **Terminal UI (`crates/confidant-tui`, after v0).** Reference second consumer of the ADR-7 CLI contract: invokes `confidant <subcommand> --json --no-input` as a child process without linking `confidant-core`, keeping plaintext on the alternate screen only (#205, #210).
+5. **QMD search (right after v0).** On trusted devices only, and the index never goes in git (section 9b).
+6. **Terminal UI (`crates/confidant-tui`, after v0).** Reference second consumer of the ADR-7 CLI contract: invokes `confidant <subcommand> --json --no-input` as a child process without linking `confidant-core`, keeping content on the alternate screen only (#205, #210).
 
 Out of v0: hosted version, integration plugin system, GUI.
 
@@ -407,92 +425,84 @@ slice ships, and the CHANGELOG is the record. Keep a release to 5-8
 issues; if a milestone needs more, it is a theme, not a slice.
 
 Pre-1.0 with one supported user, optimize for learning speed on the UX,
-the schema, and the command surface. Keep the review gates for crypto,
-the vault format, and the privacy model: those mistakes are expensive to
-reverse even when nobody else is using the vault.
+the schema, and the command surface. Keep the review gates for the vault
+format and the privacy model: those mistakes are expensive to reverse even
+when nobody else is using the vault.
 
 **The 1.0 bar.** 1.0 is a stability claim, not a feature checklist. It
-ships only when (a) the delegated-writer auth model and headless custody
-have shipped and been dogfooded on the operator's own vault for at least
-one full minor cycle, (b) no known data-loss, key-loss, or privacy-model
-bugs are open, (c) a fresh clone can install, init, recover, upgrade, and
-sync from the README alone, and (d) the outside audit in #138 is complete
-or the release still carries the unaudited disclosure. If any of those is
-false, the next release is 0.x.
+ships only when (a) the agent contract and the write path have been
+dogfooded on the operator's own vault for at least one full minor cycle,
+(b) no known data-loss or privacy-model bugs are open, (c) a fresh clone can
+install, init, upgrade, and sync from the README alone, and (d) the security
+review in #138 is complete. If any of those is false, the next release is
+0.x.
 
-## 8b. Worked example: encrypted intake (the inbox pattern)
+## 8b. Worked example: a private vault on two machines
 
-An outside tool can hand material to the vault without a server and without
-being able to read the vault. This flow exercises the architecture without a
-Confidant server or a plugin system.
-
-**Who sees what.** The outside tool already holds whatever the customer
-typed there; private notes stay in the vault. The only thing that crosses
-from the vault to a server is text the customer sees anyway.
+The everyday architecture exercise is backup and a second device, with no
+server and no plugin system.
 
 **Flow.**
 
-1. **Prepare locally.** On a trusted device, the agent runs
-   `confidant context <person>` and drafts the payload from recent
-   interactions, open commitments and themes.
-2. **Approve, then send.** By default the operator approves anything derived
-   from private notes before it leaves the trusted device.
-3. **Deliver.** The agent pushes only the intended text to the delivery
-   channel. The channel does not matter to Confidant.
-4. **Capture answers encrypted.** The outside tool encrypts each item to the
-   vault's public inbox key and stores only ciphertext.
-5. **Import through the inbox.** The agent picks up encrypted items dropped
-   into an `inbox/` branch or folder, runs `confidant inbox` to validate and
-   merge them, and writes encrypted interaction entries with provenance
-   (`src:<source>/<id>`). Importing twice adds nothing.
+1. **Capture locally.** On the laptop, the agent runs `confidant log touch`
+   or `confidant note add`. One commit lands in the vault's own repo;
+   nothing touches the network.
+2. **Check, then push.** `confidant doctor` shows unpushed commits and any
+   remote-transport warning. `confidant sync --push` fetches, confirms, and
+   pushes to the private `origin`, or `contrib/`'s opt-in timer does it on a
+   schedule.
+3. **Read on the other machine.** On the desktop, `confidant sync --pull`
+   fast-forwards. A clone is the whole setup step: there is no enrollment,
+   no key handoff, and no anchor to copy.
+4. **Keep the perimeter.** The remote is private, the disks are encrypted,
+   and `no-ai` keeps marked records out of what agents read on either
+   machine.
 
-**Inbox pattern (general).** Any outside tool can drop content for the vault
-without a server and without being able to read the vault: it encrypts each
-item to the vault's public key and pushes it to `inbox/`. `confidant inbox`
-decrypts, runs `check`, merges into the vault and clears the inbox. GitHub
-webhooks are not used for intake. They only notify a server you would have to
-run, and a GitHub Action must never hold decryption keys.
-
-**Intended pattern.** The operator deletes answers from the outside tool
-after a verified import; browser-side encryption is the stronger option.
-The inbox is a separate `inbox` branch, with main protected so only trusted
-signers can write to it. This is the intended pattern, not a v0 enforcement
-claim (see section 9).
+**Intended pattern.** Anything an outside tool hands back (a form, a
+transcript, a phone shortcut) reaches the vault as a file the operator or
+agent places there and imports through the CLI with `src:` provenance.
+Confidant has no intake channel of its own and no daemon: nothing pushes into
+a vault from outside, and no GitHub Action holds vault access. That is the
+intended pattern, not a v0 enforcement claim.
 
 ## 9. Open questions (resolved)
 
 1. **Name.** Resolved: Confidant (CLI `confidant`), chosen 2026-10-07 after an availability check.
-2. **Ledger privacy.** Resolved 2026-10-07: amounts and dates stay plain metadata, tied only to opaque IDs, so `check`, balances and merges work without a key. Names, notes and alias values stay encrypted. Alias lookup uses a keyed HMAC, with the real values encrypted (ADR-2).
-3. **Transcripts.** Resolved: source-agnostic. Confidant doesn't care which tool records or stores transcripts. An import skill reads them from wherever they live and writes encrypted interaction entries with provenance (`src:<source>/<id>`) and duration, which pack metrics can use. Copies left in a hosted store are outside Confidant's privacy guarantee; deleting them after import is the operator's call.
-4. **Local decrypted operations.** Resolved: not in v0. Agents use `confidant context` and `--json` output for now.
+2. **Ledger privacy.** Resolved 2026-10-31: amounts, dates and opaque IDs stay in the ledger, whose arguments are never prose. Contact values live in readable front matter (ADR-9), on the same perimeter as the rest of the vault (ADR-4).
+3. **Transcripts.** Resolved: source-agnostic. Confidant doesn't care which tool records or stores transcripts. An import skill reads them from wherever they live and writes interaction records with provenance (`src:<source>/<id>`) and duration, which pack metrics can use. Copies left in a hosted store are outside Confidant's privacy guarantee; deleting them after import is the operator's call.
+4. **Local operations at the vault.** Resolved: no general export in v0. Search indexes stage the cleared set via `confidant allowlist --json`; everything else uses `confidant context` and `--json` output.
 5. **First integration skill.** Resolved: an import from the outside tool that feeds records and ledger entries into the vault.
-6. **Inbox location.** Resolved: a separate `inbox` branch, with main protected so only trusted signers can write to it.
 
 ## 9b. Risks and how we handle them (decided 2026-10-07)
 
-1. **Conflicting edits to an encrypted file.** Git can't merge ciphertext. When two devices change the same record, the CLI keeps both versions side by side, `confidant check` flags the conflict, and the agent or the operator picks which one to keep. Nothing is silently dropped. Conflicts should be rare, because records are one file each and writes are mostly append-only.
+1. **Conflicting edits to one record.** When two devices change the same record, git must merge two plaintext files; for a body that changed in both, the CLI keeps both versions side by side, `confidant check` flags the conflict, and the agent or the operator picks which one to keep. Nothing is silently dropped. Conflicts should be rare, because records are one file each and writes are mostly append-only.
 2. **The model provider sees plaintext.** Agents send what they read to a hosted model provider. The README and privacy model say so plainly and don't claim the provider stores nothing. A per-client `no-ai` flag keeps that client's notes and PII out of `confidant context` and `--json` output used by agents, so the operator can keep sensitive people away from models entirely.
 3. **Capture going stale.** Confidant only knows what agents write into it. A `confidant check` rule flags gaps, such as a record with no follow-up note, or a contact with no touchpoint within a set window. The agent sends the operator a weekly summary of these gaps.
-4. **Search.** v0 searches by decrypting and scanning, which should be fast enough for a few hundred people (milestone 1 measures it). Right after v0, QMD becomes the search: it runs only on trusted devices with encrypted disks, and its index stays out of git and is never synced anywhere.
-5. Changed 2026-10-08 by Frank: Silas's security review of the crypto design (PR A) clears milestone 2 code for the operator's own use. One outside human reviews the design and a full code audit happens before the README invites anyone else to trust Confidant with client data.
+4. **Search.** v0 searches by scanning the vault directly, which stays fast for a few hundred people (milestone 1 measures it). Right after v0, QMD becomes the search: it runs on trusted devices, stages only the cleared set, and its index stays out of git and is never synced anywhere.
+5. **The public repo is not the vault.** Confidant's own source is public; a vault is not, and must not be. The ways a vault gets exposed are a public remote, a share link, an unencrypted disk, or a paste into a chat. ADR-4 covers the perimeter and `confidant doctor` covers the transport.
 
-   Changed 2026-10-12 by Frank: the crates.io release is **not** treated as the invitation. Publishing (needed for `cargo install confidant-cli` to resolve its dependencies) goes ahead with an explicit disclosure that the crypto is unaudited and the CLI write path still produces plaintext; a disclosure that withholds the invitation satisfies this item as written. The outside review and code audit are still required before any surface invites trust with client data, and remain tracked in issue #138. If the audit finds a defect, the fix ships as a new version; published versions are yanked, not deleted.
+   Changed 2026-10-31 by Frank: the application-level secrecy layer was
+   removed (#795, ADR-4). The audit item in #138 no longer gates launch on a
+   secrecy design; the remaining review surface is the `no-ai` allowlist, the
+   write path, and the git/sync boundary. If a future design reintroduces a
+   hiding layer, it needs a new `<topic>-review` issue first (repo hard rule
+   7).
 
 ## Appendix: Prior art (sweep 2026-10-07)
 
-No existing project combines all of these: a git vault, a beancount-style ledger, age keys per device, per-client keys that allow crypto-shredding, an agent-first contract and schema packs. The individual parts do exist.
+No existing project combines all of these: a git vault, a beancount-style ledger, an agent-first contract and schema packs. The individual parts do exist.
 
 | Project | Lang / license | Closeness | Take |
 |---|---|---|---|
-| [cr](https://github.com/AnandChowdhary/cr) | Rust, MIT | High | Markdown records with YAML front matter as the source of truth, JSON Schema validation, `cr check`, a tamper-evident audit log (actor, agent, approval, reason), idempotency keys. Real differences: caller-chosen name slugs as IDs (examples like `priya-shah.md` leak names) versus our opaque ULIDs; it doesn't store its data through git; one database-wide keyring; it encrypts only fields and bodies inside a file; it refuses encryption for folder-style records; its audit chain is single-writer; and ~40% of the source is server, web UI and access control. **Spiked: build and borrow (ADR-13).** |
-| [AgentCRM](https://github.com/AgentPal/AgentCRM) | Go, MIT | Medium | Markdown per contact and deal, monthly interaction logs, an approval queue for agent writes, and a SQLite index that can be rebuilt. No encryption. |
+| [cr](https://github.com/AnandChowdhary/cr) | Rust, MIT | High | Markdown records with YAML front matter as the source of truth, JSON Schema validation, `cr check`, a tamper-evident audit log (actor, agent, approval, reason), idempotency keys. Real differences: caller-chosen name slugs as IDs (examples like `priya-shah.md` leak names) versus our opaque ULIDs; it doesn't store its data through git; one database-wide keyring; it protects fields and bodies inside a file rather than whole records; it refuses folder-style records; its audit chain is single-writer; and ~40% of the source is server, web UI and access control. **Spiked: build and borrow (ADR-13).** |
+| [AgentCRM](https://github.com/AgentPal/AgentCRM) | Go, MIT | Medium | Markdown per contact and deal, monthly interaction logs, an approval queue for agent writes, and a SQLite index that can be rebuilt. |
 | [frm](https://github.com/justinabrahms/frm) | Go, MIT | Medium | Agent contract: `check`, `context <person>`, `--json`, `--dry-run`, SKILL.md. |
 | [crm.cli](https://github.com/dzhng/crm.cli) | TS, MIT | Low–Medium | Same vault-discovery order as ADR-11; duplicate merge re-points links. |
 | [people-context](https://github.com/JinyangWang27/people-context) | Python, MIT | Low–Medium | Published threat model, a `forget` that actually deletes, alias resolution. |
 | [friends](https://github.com/JacobEvelyn/friends) | Ruby, MIT | Prior art | A dated one-line activity ledger about people (last updated 2021). |
 
-**Building blocks:** `age` from [rage](https://github.com/str4d/rage), [gix](https://github.com/GitoxideLabs/gitoxide) or [git2](https://github.com/rust-lang/git2-rs), [ulid-rs](https://github.com/dylanhart/ulid-rs), [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark), and [beancount-parser](https://github.com/jcornaz/beancount-parser) as a parser reference. None of the encrypt-in-git tools ([sops](https://github.com/getsops/sops), [git-agecrypt](https://github.com/bartei/git-agecrypt), [transcrypt](https://github.com/elasticdog/transcrypt), [git-crypt](https://github.com/AGWA/git-crypt)) does per-client keys, so ADR-4 needs custom code.
+**Building blocks:** [gix](https://github.com/GitoxideLabs/gitoxide) or [git2](https://github.com/rust-lang/git2-rs), [ulid-rs](https://github.com/dylanhart/ulid-rs), [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark), and [beancount-parser](https://github.com/jcornaz/beancount-parser) as a parser reference.
 
-**Ideas to adopt:** bind each ciphertext to its vault, record ID and path through AEAD associated data (cr, ADR-4); agent writes wait as pending proposals until a human approves them (AgentCRM, wend-core); merges re-point every link (crm.cli); a published threat model and a real `forget` (people-context).
+**Ideas to adopt:** agent writes wait as pending proposals until a human approves them (AgentCRM, wend-core); merges re-point every link (crm.cli); a published threat model and a real `forget` (people-context).
 
-**cr spike (done 2026-10-07):** build our own and borrow patterns; see ADR-13 and `/workspace/research/cr-spike-2026-10-07.md`.
+**cr spike:** [`docs/research/cr-spike.md`](research/cr-spike.md) (2026-10-07, historical) — build our own and borrow patterns; see ADR-13.

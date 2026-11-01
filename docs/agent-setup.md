@@ -5,7 +5,7 @@ The one-prompt install is canonical in
 installs the CLI and TUI, links the embedded skills, asks where the vault
 is, and verifies the result.
 
-This page is the long tail: the encrypted-vs-plaintext decision, the
+This page is the long tail: what a vault looks like on disk, the
 setup/update commands, environment variables, headless hosts, and staying
 current.
 
@@ -51,10 +51,9 @@ URL is known instead. This is the long form of step 3 of the install prompt in
    If the version is below 2.34.0, upgrade (strongly recommended):
    macOS `brew upgrade git`, Linux `apt upgrade git`, `dnf upgrade git`,
    or `pacman -Syu git` (inside WSL2 for Windows). Below the floor is
-   not a hard block on a fresh install: `confidant doctor` reports it as
-   a warning unless SSH signers are configured, when it is an error —
-   SSH signature verification needs git >= 2.34, so upgrade before
-   configuring signers.
+   not a hard block on a fresh install: `confidant doctor` reports it as a
+   warning, since older git is still usable for the commands Confidant
+   runs. Upgrade when you can.
 2. **Git identity.** `init` commits, so it needs one. Check first with
    `git config --global user.name` and `git config --global user.email`,
    and set only values that are unset — do not overwrite an existing
@@ -85,14 +84,26 @@ URL is known instead. This is the long form of step 3 of the install prompt in
    remote auth is not — do not conflate the two: a missing credential is
    not a blocker for a local-only vault.
 
-## Encrypted vault vs. plaintext
+## What a vault is on disk
 
-Choose the vault's crypto mode up front (see [`spec/0.1.md`](../spec/0.1.md) §2.2 and §14):
+A vault is a directory of plain text: `confidant.toml`, `ledger/`, and one
+Markdown record per person, org, deal, interaction, and note. There is one
+kind of vault, and no mode to choose. `examples/demo-vault` is the same kind
+of vault filled with fake people.
 
-| Mode | Use for | Consequences | Agent behavior |
-|---|---|---|---|
-| **Encrypted** (default) | Real relationship data | `confidant init` generates keys and writes a 24-word recovery phrase once (`--phrase-out <path>` is the agent-safe form; see [Recovery phrase](#recovery-phrase-save-it-then-verify-it)). Record bodies are encrypted in git; ledger lines (`ledger/`), `confidant.toml`, and `import` stay structural plaintext. | For a **new** vault, run `confidant init --create --phrase-out <path>` (optional `--remote <url>`). For an existing directory that is not yet initialized, ensure `mode` is not `"plaintext"` (never silently copy demo `mode = "plaintext"` into a real vault) and `git status` is clean, then run `confidant init`. To put an already-initialized vault on another device, clone it and run `keys device-add` — not `init`. Store the recovery phrase offline. |
-| **Plaintext** | Vaults where unencrypted record bodies are acceptable (`examples/demo-vault` is one) | `[crypto] mode = "plaintext"` in `confidant.toml` (valid only while the vault is structurally plaintext — no `keys/` or `enc:` envelopes; cannot downgrade an encrypted vault). Every record body, history included, is readable by anyone with the repo or a clone, and a remote on such a vault is reported as a `git-remote` warning. | Set or keep `[crypto] mode = "plaintext"`, do **not** run `confidant init`, explain the exposure, and let the operator choose. |
+The privacy perimeter is the operator's own machines and a **private** git
+remote, with full-disk encryption on (LUKS, FileVault): see
+[`docs/architecture.md`](architecture.md) §3–§4. So:
+
+- Record bodies, names, and ledger lines are readable by anyone who can read
+  the repo. Keep the repo private, and do not put anything in a vault that
+  the repo's readers must not see.
+- `confidant doctor`'s `git-remote` check refuses `http://` and `git://`
+  remotes and warns on transports it cannot verify, so the vault does not
+  cross the network readable.
+- `no-ai` is the only in-data boundary: it keeps marked records out of
+  `find`, `context`, `allowlist`, MCP, and the search corpus. It is an
+  exposure control, not access control (`docs/privacy.md`).
 
 ## Create a vault
 
@@ -108,9 +119,9 @@ Then create the vault. `--remote <url>` is optional and only sets `origin`
 
 ```sh
 export CONFIDANT_VAULT="$HOME/vault"     # this process only
-confidant init --create --no-input --phrase-out "$HOME/confidant-recovery.txt"
+confidant init --create --no-input
 # or, if you already have a remote URL:
-# confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-recovery.txt"
+# confidant init --create --remote <url> --no-input
 ```
 
 For an interactive shell you can add the export to your shell rc, but in a
@@ -121,10 +132,9 @@ non-interactive or agent session export it directly and/or pass `--vault
 The command creates the directory and runs `git init` with branch `main`
 (no manual `master` → `main` rename), reports the branch it created, writes
 `.gitignore` (`.confidant/`) and a minimal `confidant.toml` with a fresh
-`vault_id` and `packs = []`, commits the skeleton, then creates the vault
-lookup key, the `vault:shared` client, the signed operator certificate, and
-the trust anchor. It does **not** create an inbox key. Without `--remote` it
-adds no git remote. It never pushes.
+`vault_id` and `packs = []`, creates the collection directories, and commits
+the skeleton. There is no secret to store and no enrollment step. Without
+`--remote` it adds no git remote. It never pushes.
 
 Packs are optional. `packs = []` is clean: `personal@0.2` is built in and
 implicit, so `check` starts with birthdays, cadence, and the `touch` verb.
@@ -146,17 +156,17 @@ Local-only is a valid setup. A remote is what makes backup and putting the
 vault on another device possible:
 
 - **Local-only:** the vault lives on one disk. Back it up some other way —
-  a second device cannot clone what was never pushed, and `confidant recover`
-  cannot help if the repository is gone.
-- **Remote:** backups and second-device enrollment. The remote holds
-  ciphertext only for an encrypted vault. On another device, clone it and
-  run `confidant keys device-add` (not `init`, and not `recover` unless
-  every enrolled device is lost). See [New device, existing vault](#new-device-existing-vault).
+  a second device cannot clone what was never pushed, and a lost disk with
+  no copy and no remote is gone.
+- **Remote:** backups and a second device. Keep the remote **private**: it
+  holds the vault as plaintext files. On another device, clone it and start
+  reading; there is no enrollment step. See
+  [New device, existing vault](#new-device-existing-vault).
 
 To set origin at init time (still no push):
 
 ```sh
-confidant init --create --remote <url> --no-input --phrase-out "$HOME/confidant-recovery.txt"
+confidant init --create --remote <url> --no-input
 git push -u origin main    # you run this; credentials and host keys stay yours
 ```
 
@@ -177,8 +187,8 @@ route). After a non-interactive `gh auth login --with-token`, run
 `gh auth setup-git` separately — that login alone does not register the
 helper. If the operator chose SSH during login, the helper claim does
 not apply at all. Alternatives: an SSH key, where SSH to the host
-actually works, or a PAT stored via the git credential helper / OS
-keychain — never pasted into a repo config, never committed, and never
+actually works, or a PAT stored via the git credential helper or the OS
+credential store — never pasted into a repo config, never committed, and never
 an account password (GitHub rejects passwords for git operations). A
 token that only exists somewhere else (for example one an agent can
 only use through an API) does not count: if it cannot be handed to git,
@@ -197,127 +207,37 @@ adds `origin`; it never pushes. After the first `git push -u origin main`,
 use `confidant sync` to see ahead/behind and `confidant sync --push` /
 `--pull` for explicit, confirmed transfers. Nothing pushes or pulls as a
 side effect of a write. `confidant doctor` reports a `git-remote` check
-(local-only is fine; an encrypted vault with a remote is fine; a remote on
-a `[crypto] mode = "plaintext"` vault is a **warning**) and a
-`local-commits` check with ahead/behind from the last fetch. See
-[`docs/sync.md`](sync.md).
+(local-only is fine; a private remote over `https://` or `ssh://` is fine;
+a cleartext or unverifiable transport warns) and a `local-commits` check with
+ahead/behind from the last fetch. See [`docs/sync.md`](sync.md).
 
-**A plaintext-mode vault on a remote is a deliberate exposure.** Every record
-body, history included, is readable by anyone with access to the repository,
-and `confidant doctor` reports it as a `git-remote` warning. If that is not
-the tradeoff you want, remove the remote; anything already pushed stays
-readable in its history.
+**The remote must be private.** Every record body, history included, is
+readable by anyone with access to the repository. Confidant cannot see
+whether a host's repository is private, so that is the operator's setting to
+get right. If it is not the tradeoff you want, remove the remote; anything
+already pushed stays readable in its history (ADR-5).
 
 ## New device, existing vault
 
-`confidant init` always creates a **new** vault (new `vault_id`, new keys,
-new recovery phrase). Running it on a second machine does not attach that
-machine to the vault you already have.
-
-| Situation | What to run |
-|---|---|
-| New vault on this machine | `confidant init --create` (optional `--remote <url>`) |
-| This vault on another device, and an enrolled device still works | Clone the repo, then `confidant keys device-add` (`--initiate` on the new device, `--from-request` on an enrolled one) |
-| Every enrolled device is lost | Clone the repo, then `confidant recover` (this rotates and revokes the current recovery phrase) |
-
-Typical second-device flow (confirm `git ls-remote <url>` succeeds before
-the clone — see [Connect a git remote](#connect-a-git-remote-optional) for
-the probe, including its non-interactive form and failure modes):
+`confidant init` always creates a **new** vault. To use the vault you already
+have on another machine, clone it:
 
 ```sh
 git clone <url> ~/vault
 export CONFIDANT_VAULT="$HOME/vault"
-# on the new device:
-confidant keys device-add --initiate --label "laptop-2" --output ~/device-add-request.toml
-# copy the request to an enrolled device, confirm the fingerprint out of band, then:
-confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml
-# copy the anchor file back to the new device, pull, then finish enrollment there:
-git -C ~/vault pull
-confidant keys device-add --complete --anchor-file ~/device-add-anchor.toml
-# --complete verifies the anchor against the pulled vault (operator
-# certificate, lookup key, every client key) before installing it. Without
-# this step the new device holds wrapped keys but cannot decrypt: `doctor`
-# reports the missing anchor as an error. Never copy another vault's anchor.
-# Re-running --complete with an already-installed anchor re-verifies the
-# same three checks and is a no-op.
-# --from-request without --anchor-out still enrolls, but warns loudly and
-# reports anchor_out: null in JSON: the new device cannot decrypt until
-# --complete installs an anchor. Get one afterwards with --re-emit-anchor
-# (below) instead of re-enrolling.
-# A device enrolled before --anchor-out existed (wrapped keys, no anchor)
-# cannot be re-enrolled — re-running --from-request refuses it. Re-emit
-# just the anchor instead (no new enrollment, no commit):
-confidant keys device-add --from-request ~/device-add-request.toml --anchor-out ~/device-add-anchor.toml --re-emit-anchor
-# then --complete on the new device as above. Copying an enrolled device's
-# trust.toml works as a fallback, but it is unverified — prefer --anchor-out.
-# --complete verifies EVERY client key, not just one: a device missing some
-# clients' wrappings (partial enrollment) fails --complete naming the
-# missing clients, and a plain --from-request re-run or --re-emit-anchor
-# for such a device fails the same way. There is no top-up: re-enrollment
-# refuses any keypair already enrolled anywhere, so generate a fresh
-# device keypair (--initiate) and enroll that request instead. The
-# --from-request enrollment probe is side-effect-free: it never touches
-# the operator's seq tracker, even when the re-run then fails fast.
+confidant check --json --no-input
 ```
 
-Two things the commands above don't make obvious:
+That is the whole flow — there is no enrollment, key handoff, or trust anchor
+to copy, because the vault holds no key material. Confirm
+`git ls-remote <url>` succeeds before the clone (see
+[Connect a git remote](#connect-a-git-remote-optional) for the probe,
+including its non-interactive form and failure modes).
 
-- **`keys anchor export`** — `confidant keys anchor export --out <file>`
-  writes this device's `trust.toml` for transfer, with no enrollment, no
-  commit, and no device key. It is the standalone form of
-  `--from-request --anchor-out`, for when the new device's request file is
-  no longer at hand. It copies the installed anchor verbatim (public-key
-  material only) and does not verify it against the vault — the new
-  device's `--complete` is what verifies. Prefer it over hand-copying
-  `trust.toml`, which is an unverified fallback.
-
-- **Pre-certificate vaults.** On a vault that predates operator
-  certificates (no `keys/operator.toml`), `--complete` has no out-of-band
-  operator binding to check, so it proceeds on manifest-signature and
-  commitment-checked unwrap verification alone; the trust root is then the
-  anchor file's transfer channel plus the git remote. There is no post-hoc
-  command that adds a certificate (only `init`, `recover`, and shred
-  mutation write `operator.toml`), so such a vault keeps this weaker
-  binding until it is recovered. Make sure the anchor file came from a
-  device you trust.
-
-Headless hosts without an OS keychain: the **new** device needs only
-`CONFIDANT_DEVICE_KEY` for `keys device-add --initiate`. The already-enrolled
-device that runs `--from-request` is the one that needs
-`CONFIDANT_OPERATOR_KEY` (see
-[Headless hosts and agents](#headless-hosts-and-agents)). Enrollment of a
-second headless device is `keys device-add`, not `init`.
-
-## Recovery phrase: save it, then verify it
-
-Encrypted `init` creates a 24-word recovery phrase — the only way back if
-every device is lost. In an agent session, never let it reach the
-transcript or a log. Use:
-
-```sh
-confidant init --create --no-input --phrase-out <path>
-```
-
-`--phrase-out` writes the phrase to a **new** file (mode `0600`), prints only
-the path, and refuses to overwrite an existing file. Never tell an agent to
-echo, copy, or read the phrase into chat.
-
-After `init`:
-
-1. Verify the file before it leaves the machine — the human-only,
-   read-only check:
-
-   ```sh
-   confidant keys verify-recovery --phrase-file <path>
-   ```
-
-   It writes nothing and enrolls nothing, and never prints the phrase.
-2. Move the file offline (paper, password manager, or offline media) and
-   delete the local copy.
-3. After `recover` or a `keys shred` rotation, run the check again against
-   the saved copy to confirm it still matches the vault.
-
-Agents must not handle or pipe the phrase.
+Do not run `init` on the second machine: it scaffolds a different vault, with
+a different `vault_id`, next to the clone. Keep the two copies in step with
+`confidant sync`; a machine that has not pulled still reads its own
+last-fetched copy.
 
 ## Commands
 
@@ -325,9 +245,8 @@ Agents must not handle or pipe the phrase.
 |---|---|
 | `confidant setup [--agent auto\|all\|a,b] [--force] [--copy] [-v]` | Materialize embedded skills, link into agent skill dirs |
 | `confidant update [--agent …] [--force] [-v]` | Report latest release, re-link skills from this binary |
-| `confidant doctor` | Vault health + CLI staleness + keychain/device-enrollment state + skills link health + `git-remote` + `local-commits` |
+| `confidant doctor` | Vault health + CLI staleness + skills link health + `git-remote` + `local-commits` |
 | `confidant sync [--dry-run] [--pull\|--push] [--yes]` | Fetch and report ahead/behind; `--pull`/`--push` are confirmed network writes |
-| `confidant keys verify-recovery [--phrase-file <path>]` | Read-only recovery-phrase check; human-only — never ask an agent to read or pipe the phrase |
 | `confidant agents` | List supported agents and detection status |
 | `confidant which [--skills-dir]` | Print installed skills location |
 | `confidant routing` | Print the optional routing snippet |
@@ -413,93 +332,26 @@ resolved `vault` path, so a script can confirm which vault it read.
 
 ## Headless hosts and agents
 
-On a desktop, keys live in the OS keychain (Secret Service on Linux, the
-macOS keychain) and that is the default. On a headless host — a Linux
-container, cloud VM, or agent sandbox with no D-Bus session bus — Confidant
-fails closed: loading the device or inbox key errors out instead of falling
-back to anything on disk. Keys never live in files: there is no file-backed
-keystore, and no `CONFIDANT_KEYCHAIN`-style switch can point at one (see
-[`docs/crypto-design.md`](crypto-design.md) §2).
+A headless host needs nothing extra. There is no OS credential store to
+reach, no secret to inject, and no per-device state to enroll: a vault is
+plain files (see [What a vault is on disk](#what-a-vault-is-on-disk)).
+`init`, `check`, `find`, and the write path are ordinary file operations, so
+a container, cloud VM, or agent sandbox behaves the same as a laptop.
 
-The supported headless path is to supply the keys in the process
-environment **before** `confidant init`. Generate them once, store them in
-the host's secret store, and re-inject them into each session:
+What a headless host does need is the same care as any other machine:
 
-```sh
-# Device identity (age). age-keygen also prints comment/public-key text
-# (`# created:`, `# public key:`); only the AGE-SECRET-KEY-1... line is the
-# identity. The CLI rejects a value that combines lines.
-export CONFIDANT_DEVICE_KEY="$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')"
+- The disk holding the vault must be full-disk encrypted, because that is
+  the perimeter (ADR-4). A cloud VM's volume encryption is the provider's
+  setting; check it, or keep the only copy on a machine you control.
+- Any copy of the vault on that host is readable by whoever administers it.
+  `no-ai` shapes what agents read through Confidant; it does not make the
+  files secret from root on the box.
+- A host that runs an agent needs git and a git credential for the private
+  remote, exactly like a desktop. Keep those credentials out of the vault
+  and out of the agent's prompt (see `docs/sync.md`).
 
-# Operator Ed25519 seed: 32 random bytes, 64 hex chars.
-export CONFIDANT_OPERATOR_KEY="$(openssl rand -hex 32)"
-
-export CONFIDANT_VAULT="$HOME/vault"
-confidant init --create --no-input --phrase-out "$HOME/confidant-recovery.txt"
-```
-
-`age-keygen` (from `age`) or an equivalent existing tool is fine for the
-device identity; `openssl rand -hex 32` is just a CSPRNG for the operator
-seed. Keep only the `AGE-SECRET-KEY-1…` line: `age-keygen` prints
-`# created:` and `# public key:` lines too, and a value that contains them
-is not an identity and is rejected. The variables are **per-process
-secrets**, not a file fallback: the CLI reads them from the environment of
-the process that runs it, so export them in that process or have the host's
-secret store inject them. Do not write them into the vault, a git file, or
-a shell history line. Generate each value **once** and retrieve the stored
-copy later; re-running `age-keygen` or `openssl rand` would create a new
-identity that no longer opens the vault.
-
-To enroll a **second** headless device into an existing vault, generate a
-**new** identity for that host (do not copy another device's
-`CONFIDANT_DEVICE_KEY`), export it, clone the vault, then run
-`keys device-add --initiate`. The command uses the env identity and does
-not write a keychain. Approve the request from an enrolled device with
-`--from-request`. Do not run `init` on the second device, and do not run
-`recover` unless every enrolled device is lost. There is no `--key-out`;
-keys never live in files.
-
-```sh
-export CONFIDANT_DEVICE_KEY="$(age-keygen 2>/dev/null | grep '^AGE-SECRET-KEY-')"
-git clone <url> ~/vault
-export CONFIDANT_VAULT="$HOME/vault"
-confidant keys device-add --initiate --label "headless-2" --output ~/device-add-request.toml
-# copy the request to an enrolled device, confirm the fingerprint, then:
-# confidant keys device-add --from-request ~/device-add-request.toml
-```
-
-On a desktop the keychain is still the default; an env var wins over it
-for the same key and holds the value the keychain would (an age identity
-for the device or inbox key, a hex seed for the operator key), so injecting
-one cannot silently change which key a command uses.
-
-Additional variables for later commands:
-
-| Variable | What |
-|---|---|
-| `CONFIDANT_DEVICE_KEY` | This device's age identity (`AGE-SECRET-KEY-1…`) |
-| `CONFIDANT_OPERATOR_KEY` | Operator Ed25519 seed (64 hex chars), operator-only commands |
-| `CONFIDANT_INBOX_KEY` | The vault inbox keypair's private half (`AGE-SECRET-KEY-1…`) |
-| `CONFIDANT_INBOX_KEY_PREVIOUS` | The rotation-window slot (only during `inbox rotate`) |
-
-`confidant doctor` reports the device key as one `device-key` check, with the
-same data in human and `--json` output:
-
-| Check message | Meaning |
-|---|---|
-| `device key comes from CONFIDANT_DEVICE_KEY` | Env-provided; the normal headless state (ok) |
-| `device key is in the OS keychain` | Keychain reachable and enrolled (ok) |
-| `not enrolled (the OS keychain holds no device key)` | Reachable but empty: run `confidant init` (new vault), clone and `confidant keys device-add` (existing vault), or `confidant recover` only if every enrolled device is lost; on a headless host inject `CONFIDANT_DEVICE_KEY` (warning) |
-| `the OS keychain is unreachable (...)` | Headless host or locked keychain; the `fix` field names `CONFIDANT_DEVICE_KEY` and `CONFIDANT_OPERATOR_KEY` (warning) |
-
-Before init on a headless host, doctor's hint names both variables to set —
-that is the pre-init path above, not a fallback to a key file. After init,
-an inbox workflow also needs `CONFIDANT_INBOX_KEY`.
-
-In `--json`, each check is `{id, status, message}` plus `fix` when there is
-something to do. A missing key is a warning, not an error: a plaintext demo
-vault needs no keys, and a report that still lists every other check is
-more useful than a hard failure.
+In `--json`, each `doctor` check is `{id, status, message}` plus `fix` when
+there is something to do.
 
 ## TUI versions
 

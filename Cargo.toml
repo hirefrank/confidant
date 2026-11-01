@@ -6,13 +6,11 @@ exclude = ["fuzz"]
 members = [
     "crates/confidant-core",
     "crates/confidant-cli",
-    "crates/confidant-crypt",
     "crates/confidant-tui",
 ]
 default-members = [
     "crates/confidant-core",
     "crates/confidant-cli",
-    "crates/confidant-crypt",
     "crates/confidant-tui",
 ]
 
@@ -28,38 +26,16 @@ description = "Relationship memory you own: plain-text records in a git repo, fo
 
 [workspace.dependencies]
 anyhow = "1.0"
-base64 = "0.23"
-bech32 = "0.12"
-bip39 = { version = "3.0", default-features = false, features = ["std", "rand", "zeroize"] }
-chacha20poly1305 = "0.10"
 chrono = { version = "0.4.38", default-features = false, features = ["alloc", "std", "clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 confidant-core = { path = "crates/confidant-core", version = "0.7.2" }
-confidant-crypt = { path = "crates/confidant-crypt", version = "0.7.2" }
 crossterm = "0.29"
-age = { version = "0.12", default-features = false, features = ["armor"] }
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-getrandom = "0.4"
-hkdf = "0.13"
-hmac = "0.13"
-hex = "0.4"
 include_dir = "0.7"
-# OS keychain backends (keyring 3.6 has no default features — without these
-# it falls back to an in-memory mock). `dep:`-gated per platform, so all
-# are safe to enable unconditionally: macOS → Keychain Services,
-# Linux → Secret Service. The async backend is pure-Rust zbus exposed
-# through a blocking wrapper (no system libdbus needed); crypto-rust
-# avoids an OpenSSL dep. `async-io` is enabled explicitly (not left to
-# transitive resolution) because keyring's docs require picking a runtime
-# when `async-secret-service` is used.
-keyring = { version = "3.6", features = ["apple-native", "async-io", "async-secret-service", "crypto-rust"] }
-rand = "0.8"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 tempfile = "3.13"
-thiserror = "2.0"
 toml = "1.1.8"
 toml_edit = "0.25"
 # Sync HTTP client for the `doctor` staleness check (#165). No async
@@ -67,9 +43,6 @@ toml_edit = "0.25"
 # the tree stays small (GitHub's API returns identity when not asked for
 # compression). MSRV 1.88, matching the workspace.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
-unicode-normalization = "0.1"
-x25519-dalek = { version = "3.0", features = ["static_secrets"] }
-zeroize = { version = "1.8", features = ["derive"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

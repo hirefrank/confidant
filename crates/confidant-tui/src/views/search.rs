@@ -3,11 +3,6 @@
 //! Renders the fail-closed [`FilteredSearchResult`]: only `via == "qmd"` or
 //! `via == "find"` matches are shown, the fallback banner appears when the
 //! skill fell back to `confidant find`, and drop counts are always visible.
-//! A `W_SKIPPED_ENCRYPTED` warning finding (#718) renders in the status
-//! block, so a zero-match exact search over skipped records does not read
-//! as absence in the TUI either, and a `W_PARTIAL_RESULTS` finding (#769)
-//! renders the same way, so a non-empty exact search over skipped records
-//! does not read as the complete answer.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -168,24 +163,6 @@ fn status_lines(result: Option<&FilteredSearchResult>) -> Vec<Line<'static>> {
         count_spans.push(theme::label(")"));
     }
     lines.push(Line::from(count_spans));
-    // #718/#769: the in-band warning from `confidant find` (carried
-    // through `find_result_to_search`) renders here, not just in the
-    // counts: a bare "0 matches" over skipped records must not read as
-    // absence, and a non-empty match list over skipped records must not
-    // read as the complete answer. Only the two warning codes render —
-    // other findings keep their existing (non-)rendering, and the
-    // message itself carries only the count.
-    for finding in &res.result.findings {
-        if finding.code == "W_SKIPPED_ENCRYPTED" || finding.code == "W_PARTIAL_RESULTS" {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{}: ", finding.code),
-                    Style::default().fg(palette::WARNING).bold(),
-                ),
-                Span::styled(finding.message.clone(), palette::TEXT),
-            ]));
-        }
-    }
     lines
 }
 

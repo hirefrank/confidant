@@ -1,11 +1,11 @@
 //! `doctor` qmd-search check (#386, #657).
 //!
 //! A missing qmd is `ok`: qmd is optional. An installed qmd without a
-//! corpus is a `warning` (#657) because `confidant reindex` is needed to
-//! enable semantic search. Tests cover `qmd` absent from PATH, present
-//! without a corpus, and present with a corpus, plus the embeddings
-//! probe. No test touches the network (`CONFIDANT_OFFLINE=1`) and all
-//! data is fake.
+//! corpus is a `warning` (#657) because the qmd-search skill must stage
+//! the corpus to enable semantic search. Tests cover `qmd` absent from
+//! PATH, present without a corpus, and present with a corpus, plus the
+//! embeddings probe. No test touches the network (`CONFIDANT_OFFLINE=1`)
+//! and all data is fake.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,7 +45,7 @@ fn give_child_git_identity(cmd: &mut Command) {
 /// (no network).
 fn run_doctor(vault: &Path, path: &std::ffi::OsStr, extra_env: &[(&str, &str)]) -> Value {
     // A hermetic HOME: Windows CI runners don't set HOME, and without it
-    // the crypto-manifests check errors (config dir unknown).
+    // the config-dir checks error.
     let tmp_home = tempfile::tempdir().unwrap();
     run_doctor_home(vault, path, extra_env, tmp_home.path())
 }
@@ -64,10 +64,7 @@ fn run_doctor_home(
         .env("PATH", path)
         .env("CONFIDANT_OFFLINE", "1")
         .env_remove("CONFIDANT_TEST_RELEASES_URL")
-        .env_remove("CONFIDANT_SKILLS_DIR")
-        // #541: keep the device-key probe off the real OS keychain.
-        .env_remove("CONFIDANT_DEVICE_KEY")
-        .env("CONFIDANT_KEYCHAIN", "off");
+        .env_remove("CONFIDANT_SKILLS_DIR");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -130,7 +127,7 @@ fn path_with_fake_qmd(dir: &Path) -> std::ffi::OsString {
 
 #[cfg(unix)]
 #[test]
-fn doctor_qmd_present_without_corpus_points_at_reindex() {
+fn doctor_qmd_present_without_corpus_points_at_the_skill() {
     let dir = tempfile::tempdir().unwrap();
     write_fake_qmd(dir.path());
     // Throwaway vault copy with no `.confidant/qmd-corpus/`.
@@ -145,10 +142,10 @@ fn doctor_qmd_present_without_corpus_points_at_reindex() {
     assert_eq!(c["status"], "warning", "{v}");
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("corpus is missing"), "{msg}");
-    assert!(msg.contains("confidant reindex"), "{msg}");
+    assert!(msg.contains("qmd-search"), "{msg}");
     assert!(msg.contains("confidant find"), "{msg}");
     let fix = c["fix"].as_str().expect("fix field missing");
-    assert!(fix.contains("confidant reindex"), "{fix}");
+    assert!(fix.contains("confidant setup"), "{fix}");
 }
 
 #[cfg(unix)]
@@ -240,78 +237,4 @@ fn doctor_qmd_status_failure_does_not_point_at_embed() {
     let msg = c["message"].as_str().unwrap();
     assert!(msg.contains("qmd status"), "{msg}");
     assert!(!msg.contains("qmd embed"), "{msg}");
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_reported_when_persisted() {
-    // #723: a persisted operator assertion is reported forever after —
-    // as an assertion, never as detection (#709).
-    let home = tempfile::tempdir().unwrap();
-    let conf_dir = home.path().join(".config/confidant");
-    std::fs::create_dir_all(&conf_dir).unwrap();
-    std::fs::write(
-        conf_dir.join("config.toml"),
-        "[qmd]\nassume_encrypted_disk = true\n",
-    )
-    .unwrap();
-    let empty = tempfile::tempdir().unwrap();
-    let v = run_doctor_home(&demo(), empty.path().as_os_str(), &[], home.path());
-    let c = check(&v, "qmd-disk").expect("qmd-disk check missing");
-    assert_eq!(c["status"], "ok", "{v}");
-    let msg = c["message"].as_str().unwrap();
-    assert!(msg.contains("asserted by operator"), "{msg}");
-    assert!(msg.contains("not a detection"), "{msg}");
-    assert!(!msg.contains("detected"), "{msg}");
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_absent_without_key() {
-    let empty = tempfile::tempdir().unwrap();
-    let v = run_doctor(&demo(), empty.path().as_os_str(), &[]);
-    assert!(check(&v, "qmd-disk").is_none(), "{v}");
-}
-
-fn doctor_qmd_disk_with_config(text: &str) -> Value {
-    let home = tempfile::tempdir().unwrap();
-    let conf_dir = home.path().join(".config/confidant");
-    std::fs::create_dir_all(&conf_dir).unwrap();
-    std::fs::write(conf_dir.join("config.toml"), text).unwrap();
-    let empty = tempfile::tempdir().unwrap();
-    // Keep the tempdirs alive until doctor has run: the home path is
-    // only borrowed by run_doctor_home, so hold both guards here.
-    let v = run_doctor_home(&demo(), empty.path().as_os_str(), &[], home.path());
-    drop(empty);
-    drop(home);
-    v
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_absent_when_false() {
-    // #723 review SF4(d): an explicit false is a declined election,
-    // not an assertion to report.
-    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = false\n");
-    assert!(check(&v, "qmd-disk").is_none(), "{v}");
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_absent_for_bogus_value() {
-    // A hand-edited value outside the truthy set is not an assertion.
-    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = \"maybe\"\n");
-    assert!(check(&v, "qmd-disk").is_none(), "{v}");
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_absent_for_malformed_config() {
-    // Unparsable TOML is not an assertion (fail closed, no check).
-    let v = doctor_qmd_disk_with_config("[qmd\nassume_encrypted_disk = true\n");
-    assert!(check(&v, "qmd-disk").is_none(), "{v}");
-}
-
-#[test]
-fn doctor_qmd_disk_assertion_reported_for_integer_one() {
-    // Parser alignment with the Python gate's TRUTHY set: an integer 1
-    // hand-edit counts, just as it satisfies qmd-index.py.
-    let v = doctor_qmd_disk_with_config("[qmd]\nassume_encrypted_disk = 1\n");
-    let c = check(&v, "qmd-disk").expect("qmd-disk check missing");
-    assert_eq!(c["status"], "ok", "{v}");
 }

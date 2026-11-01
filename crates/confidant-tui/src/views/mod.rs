@@ -11,7 +11,6 @@ pub mod context;
 pub mod diff;
 pub mod doctor;
 pub mod help;
-pub mod inbox;
 pub mod info;
 pub mod palette;
 pub mod people;
