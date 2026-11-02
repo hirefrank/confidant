@@ -88,7 +88,7 @@ impl CaptureKind {
                 toggle(FieldId::NoAi, "no-ai", "space toggles (hide from agents)"),
             ],
             // The pack's optional person front-matter fields the CLI accepts
-            // (personal@0.2) plus the profile body. `aliases` is *not* a
+            // (the active personal pack, 0.2 or 0.3) plus the profile body. `aliases` is *not* a
             // front-matter field — aliases are ledger lines managed by
             // `confidant alias` — so it is deliberately absent here.
             Self::NewPerson => vec![

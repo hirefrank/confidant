@@ -52,6 +52,12 @@ and `context` returns no bundle for it. The TUI only renders what the CLI's
 effective view returns: superseded ledger lines are already gone from
 `context` touchpoints and pack state, and the TUI never re-adds one.
 
+Places and things are not in the People workspace yet: the TUI stays
+person-only, and `entity.fields` is additive CLI JSON it ignores. Use
+`confidant record list --kind place|thing` (operator path) and
+`confidant context pl-…|th-…` from the CLI until a dedicated place/thing
+view exists.
+
 ## Editing
 
 Editing is always operator-only, independent of operator mode: from the

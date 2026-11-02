@@ -156,8 +156,9 @@ at all, `init` sets a repo-local fallback so the commit works. The command:
 3. adds `origin` only if `--remote <url>` was passed, and never pushes.
 
 There is no key, phrase, or enrollment step, and it installs no pack. A
-new vault starts with `packs = []`, which is fine: `personal@0.2` is implicit
-and already enabled (§3.1), and `check` is clean without packs. Install a
+new vault starts with `packs = []`, which is fine: the active personal pack
+is implicit and already enabled (§3.1) — `personal@0.3` on a 0.4 vault,
+`personal@0.2` on 0.1–0.3 — and `check` is clean without packs. Install a
 pack later with `confidant pack add <https-url> --yes`.
 
 ### 2.5 A second device needs no ceremony
@@ -180,12 +181,15 @@ that is behind on a pull will still read its last-fetched copy.
 
 ### 3.1 Start with the personal pack (nothing to install)
 
-`personal@0.2` is built into the binary and **implicit**: every vault has it,
-whether or not `packs` lists it. `packs = []` still enables it, and a
-`personal@…` entry is a no-op.
+The personal pack is built into the binary and **implicit**: every vault has
+it, whether or not `packs` lists it. `packs = []` still enables it, and a
+`personal@…` entry is a no-op. The vault `spec` selects the version:
+`personal@0.3` on 0.4, the frozen `personal@0.2` on 0.1–0.3.
 
-That gives you birthdays, relationship edges, keep-in-touch cadence, upcoming
-dates, and the `touch` ledger verb:
+On 0.4 that gives you the person schema — birthdays, relationship edges,
+keep-in-touch cadence, upcoming dates, and the `touch` ledger verb — plus
+`place` and `thing` records with `kind`, `address`, `tags`, `links`, and
+the `visited` / `lives_at` / `owns` / `located_at` edges:
 
 ```sh
 confidant record add --file robin.md --no-input
@@ -194,7 +198,9 @@ confidant context "Robin Example"
 ```
 
 Quote display names with spaces. A `no-ai: true` person is addressed by
-`p-<ULID>` only.
+`p-<ULID>` only. A place or thing is addressed by its opaque id too; add one
+from a file with `confidant record add --file place.md`, and attach a dated
+note with `confidant note add --entity pl-<ULID> --body-file note.md`.
 
 ### 3.2 Add a pack later
 
@@ -222,21 +228,24 @@ Installing a pack:
 
 It does **not** touch records. `check` starts applying the pack's rules, its
 verbs become valid, and on a spec 0.3 or 0.4 vault its declared record types
-become writable and readable (for example a `place` or `thing` collection). A pack
+become writable and readable (for example a `project` collection). A pack
 that declares record types must list `"0.3"` in `requires_spec`; a 0.2 vault
 rejects it with `E_PACK_VERSION`. Existing personal records stay where they
 are; there is no migration.
 
-Spec 0.4 is current. The built-in `personal@0.2` pack remains **person-only**
-in 0.3 and 0.4 and declares no record types; places/things and other domain
-entities come from external packs. See `spec/0.4.md`,
-`spec/0.3.md`, and `spec/pack-manifest.md` for the type declaration and
-two-letter prefix rules.
+Spec 0.4 is current. The built-in `personal@0.3` already declares `place`
+and `thing`, so a 0.4 vault does not need an external pack for those.
+Vaults on 0.1–0.3 keep `personal@0.2`, which is **person-only** and declares
+no record types; places, things, and other domain entities there come from
+external packs. Note that an external pack used in a 0.4 vault cannot claim
+`place`/`thing` (or their prefixes/collections) because the built-in already
+owns those names. See `spec/0.4.md`, `spec/0.3.md`, and
+`spec/pack-manifest.md` for the type declaration and two-letter prefix rules.
 
 Do not try to seed a pack at `init` time with `--packs <name>@<version>`.
-`init` only seeds packs built into the binary (today the implicit
-`personal@0.2`); naming any other pack is a usage error (exit 2) with a fix
-telling you to install it after init
+`init` only seeds packs built into the binary (the active implicit personal
+pack; `personal@0.2` is also accepted as a no-op); naming any other pack is
+a usage error (exit 2) with a fix telling you to install it after init
 ([#639](https://github.com/hirefrank/confidant/issues/639)). Init with no
 packs, then `pack add`.
 
