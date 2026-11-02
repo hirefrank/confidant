@@ -23,7 +23,9 @@ mismatch or duplicate on a person's profile unclears that whole person.
 ## Finer `no-ai` granularity (issue #181)
 
 `no-ai` has three values: `true`, `false`, and `notes` (person records
-only). There are no field-level flags — the record is the unit.
+only). There are no field-level flags — the record is the unit. An edge is
+the exception: it accepts only `true` / `false`, and `true` hides the
+relation while both endpoints stay visible (see “Edges and orgs”).
 
 - **`no-ai: true`** hides the person's (or record's) content from agents —
   names, bodies, profile fields, notes, and free text — the all-or-nothing
@@ -69,17 +71,22 @@ surfaces still withhold its content from agents.
 ## Edges and orgs (#813)
 
 `context <id>` accepts a person or an org. An edge is in the bundle only when
-**both** endpoints are cleared: `a` and `b` are front-matter IDs, so a
-`no-ai: true` endpoint drops the whole edge from `find`, the allowlist, and
-every context bundle, including the other endpoint's. The bundle carries no
-count and no anonymized hint; omitted means indistinguishable from absent.
-`--exclude-private` keeps the edge's opaque id, kind, and dates but nulls
-the other endpoint's name, along with the target's name and profile.
+**both** endpoints are cleared **and** the edge itself is not `no-ai: true`:
+`a` and `b` are front-matter IDs, so a `no-ai: true` endpoint drops the whole
+edge from `find`, the allowlist, and every context bundle, including the
+other endpoint's. A `no-ai: true` edge is hidden the same way while both
+endpoints stay visible; the relation is not counted, summarized, or
+anonymized. The bundle carries no count and no anonymized hint; omitted means
+indistinguishable from absent. The operator path still sees a hidden edge and
+badges it with `no_ai: "true"`; `--exclude-private` keeps the edge's opaque
+id, kind, and dates but nulls the other endpoint's name, along with the
+target's name and profile.
 
-Orgs cannot be `no-ai` in phase 1, and edges carry no `no-ai`; hiding a
-single relation or a whole org is a later privacy decision (#820). An org
-bundle also selects notes and interactions attached by `org:`, under the
-same cleared-set and pack-scope rules as a person bundle.
+Orgs cannot be `no-ai` (org-level hiding remains a later privacy decision,
+#820). Edges accept `no-ai: true` / `false` only: there is no `notes` mode and
+no inheritance in either direction. An org bundle also selects notes and
+interactions attached by `org:`, under the same cleared-set and pack-scope
+rules as a person bundle.
 
 ## Ledger lines
 
@@ -208,10 +215,12 @@ Rules:
 
 ## Edges (issue #179)
 
-An edge record carries only ids, kind, and dates — no body, no note.
-Sensitive context belongs in a note on one of the edge's people, where the
-`no-ai` rules above decide who may read it. Because an edge holds no prose,
-it can be visible while the interesting detail stays hidden.
+An edge record carries only ids, kind, dates, and (in 0.3) `no-ai` — no body,
+no note. Sensitive context belongs in a note on one of the edge's entities,
+where the `no-ai` rules above decide who may read it. Because an edge holds
+no prose, it can be visible while the interesting detail stays hidden; a
+`no-ai: true` edge instead hides the relation while both endpoints stay
+visible.
 
 A person's own touchpoints stay in the ledger as opaque-id lines. A `touch`
 line carries a date, one opaque id, and a kind: no other participant, no

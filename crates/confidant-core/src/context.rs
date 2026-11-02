@@ -8,8 +8,10 @@
 //! every member of its merge group is cleared (fixpoint invariant in
 //! `search.rs`), so merge-folded and duplicate-tainted records can never
 //! leak through `context`. An edge is visible only when both endpoints are
-//! cleared, so a `no-ai: true` endpoint omits it from the other endpoint's
-//! bundle entirely. `--exclude-private` strips PII regardless.
+//! cleared and the edge itself is not `no-ai: true`, so a hidden endpoint or
+//! a hidden edge is omitted from the other endpoint's bundle entirely. The
+//! operator path sees the edge and carries its `no_ai` badge in
+//! [`EdgeView::no_ai`]. `--exclude-private` strips PII regardless.
 //! Ledger-derived facts (sessions remaining, ICF hours) are metadata, not
 //! content, and are kept.
 //! [`PersonView::no_ai`] always tells the caller which mode applied. With
@@ -139,6 +141,10 @@ pub struct EdgeView {
     pub other: OtherEntityView,
     pub since: Option<String>,
     pub until: Option<String>,
+    /// Operator path only: the edge's own tri-state `no-ai` badge. Absent on
+    /// the agent path, where a hidden edge is omitted entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_ai: Option<&'static str>,
 }
 
 /// One note under `people/<id>/notes/`, or one attached to an org (#813).
@@ -552,6 +558,7 @@ pub fn build_context(
             },
             since: rec.field("since").map(str::to_owned),
             until: rec.field("until").map(str::to_owned),
+            no_ai: for_operator.then(|| operator_no_ai_badge(rec, &hidden_by_no_ai)),
         });
     }
     edges.sort_by(|left, right| {

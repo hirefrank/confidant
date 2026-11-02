@@ -439,15 +439,33 @@ registry, no signing in v1. External packs affect `check` only.
 - A pack's `[[verbs]].id_type` and edge endpoints may name core types or its own types. Cross-pack type references are refused; core is the shared vocabulary.
 - Agent reads fail closed on a disabled, retired, or undeclared type. `check` reports `W_PACK_ORPHAN`; the operator path still sees the record. `[[retired_types]]` in `confidant.toml` keeps a removed pack's records parseable.
 - `entity:` is a generic front-matter reference key, so notes and interactions can attach to any declared entity. `person:`/`org:`/`deal:` stay.
-- Edge-level `no-ai` is the companion privacy change to the same format version; core orgs remain `no-ai`-free.
+- Edge-level `no-ai` is the companion privacy change to the same format version (ADR-19); core orgs remain `no-ai`-free.
 
 **Alternatives considered.** (a) Move `deal`/`interaction` to the personal pack now: their one-letter prefixes and core verbs (`stage`) are frozen, and a format migration buys no user-visible gain. (b) Arbitrary prefix strings with a registry-aware scanner: more parser coupling and no orphan parsing after removal. (c) One core `thing`/`place`: repeats the database-diagram problem and makes the personal default a different product. (d) Reuse `person` for domains: fields can express a client, but the type identity, roster, and edges cannot.
 
 **Consequences.** Spec 0.3 is the current document; 0.1/0.2 stay frozen. `init` writes 0.3. A 0.2 vault opts in with one `spec` change and no record rewrite. A pack that declares types must list `"0.3"` in `requires_spec`; a 0.2 vault rejects it with `E_PACK_VERSION`. The built-in personal pack stays `personal@0.2` and declares no types in this slice. Pack removal tombstones ship with the removal workflow (#699); this ADR defines the read behavior.
 
+### ADR-19. Edge-level `no-ai` (spec 0.3).
+
+**Door:** One-way (a vault that hides an edge has committed to the 0.3 edge key set).
+
+**Context.** ADR-17 kept edges `no-ai`-free and gated them only on endpoint visibility. #820 found the gap: a cleared person's structured relationships can be sensitive even when both people are visible (for example an `investor_in` relation). The review deferred org-level hiding but approved edge-level `no-ai` as the smaller first step, shipped with the next format version alongside pack-declared types.
+
+**Decision.**
+
+- A 0.3 edge may carry `no-ai: true` or `no-ai: false`. `notes` is invalid; there is no inheritance in either direction.
+- `true` hides the relation from every agent-facing read while **both endpoints stay visible**. The relation is not counted, summarized, or anonymized.
+- The operator path (`find --for-operator`, `context --for-operator`, `record show --for-edit`) still sees the edge; `context` badges it with its tri-state `no_ai`.
+- `check` still validates the edge. A finding on a hidden edge may carry its opaque `e-…` id and file, but never its kind or either endpoint id.
+- 0.2 remains frozen: `no-ai` on an edge is `E_FRONTMATTER` there. Org-level `no-ai` remains deferred.
+
+**Alternatives considered.** (a) Keep endpoint-only gating and document the limit: fails the sensitive-relation case. (b) Hide the whole relation by hiding an endpoint: also hides that person's other relationships and changes person-level visibility. (c) Allow `no-ai: notes` on an edge: edges have no prose or children, so there is nothing for `notes` to hide. (d) Add org hiding at the same time: needs its own inheritance, findings, and search design; deferred by #820.
+
+**Consequences.** The edge format gains one key in 0.3. The allowlist's existing own-flag rule hides the edge; `context` filters it out and the operator bundle carries the badge. `find`/`allowlist`/QMD never see it. Edge tests cover agent vs operator, a note naming a hidden edge, both endpoints staying visible, and 0.2 rejection.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17) and 0.3 pack-declared types (ADR-18); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18), and edge-level `no-ai` (ADR-19); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.
