@@ -23,9 +23,11 @@ but narrower than it sounds.
   allowlist, or the search corpus — in either the CLI or MCP (though
   `context` still serves the person's derived ledger metadata; see
   `docs/privacy.md`).
-- An edge appears in a context bundle only when both endpoints are cleared.
-  A `no-ai: true` endpoint drops the edge from every bundle, including the
-  other endpoint's; it is not counted or anonymized (#813).
+- An edge appears in a context bundle only when both endpoints are cleared
+  **and** the edge is not `no-ai: true`. A `no-ai: true` endpoint or edge
+  drops the relation from every bundle, including the other endpoint's; it is
+  not counted or anonymized (#813, #820). Both endpoints stay visible when
+  only the edge is hidden.
 - `no-ai` does not hide a record from the vault's owner.
 - `check` blocks a commit on errors, never on warnings, and verifies
   coherence, not truthfulness.
@@ -108,9 +110,11 @@ trusted devices.
 ### `no-ai`: an exposure control, not access control
 
 `no-ai` is a per-record flag in the record's YAML front matter
-(`no-ai: true`, or `no-ai: notes` on a person), read by
-`crates/confidant-core/src/search.rs`. A record's effective flag is its own
-flag **or** its person's flag — "any `true` wins".
+(`no-ai: true`, or `no-ai: notes` on a person; an edge accepts only
+`true` / `false`), read by `crates/confidant-core/src/search.rs`. A record's
+effective flag is its own flag **or** its person's flag — "any `true` wins".
+An edge has only its own flag: hiding it does not hide either endpoint, and a
+hidden endpoint still hides every edge touching it.
 
 What it does: a `no-ai` record's content never appears in `find` (filter in
 `crates/confidant-core/src/search.rs`), in `context` (which shows a `no-ai`

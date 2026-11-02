@@ -35,7 +35,7 @@ present, for CI users who want the stricter gate.
 | `E_WRONG_ID_TYPE` | error | | `stage`, `open`, or `session` names the wrong record type, a `merge` folds one record type into another, an `entity:` value names a non-entity type, or an edge end is not a declared entity type (0.2: person or org; 0.3 also a pack type with `entity = true`) or does not match its kind's `from` / `to` endpoint declaration. |
 | `E_DUPLICATE_ID` | error | | The same ID appears in two files. |
 | `E_DUPLICATE_ULID` | error | | The same ULID is used under two prefixes. |
-| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a record type that does not allow it — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; note `date` / `session` that is not YYYY-MM-DD; and a missing field a pack type declares as required). Messages never echo a raw front-matter value. They name the key when it is a known spec key or a field the record type declares; otherwise they give the line number only. |
+| `E_FRONTMATTER` | error | | Required front matter keys are missing, duplicated, or malformed (including `no-ai` that is not `true`/`false` — or `notes` on a record type that does not allow it, including an `edge` — or is set on a record type that does not allow it; a key the record type does not allow at all, such as `name` on an `edge`; a key that, after stripping surrounding quotes, case-folding, and removing every non-alphanumeric character, equals `noai` other than exact `no-ai`; note `date` / `session` that is not YYYY-MM-DD; and a missing field a pack type declares as required). Messages never echo a raw front-matter value. They name the key when it is a known spec key or a field the record type declares; otherwise they give the line number only. |
 | `E_UNKNOWN_VERB` | error | | A ledger verb is not core, not in an enabled pack, and not owned by a disabled pack (those are `W_PACK_ORPHAN`). The message does not echo the verb. |
 | `E_UNKNOWN_RECORD` | error | | A ledger ID has no record file. A pack's `note:` miss is that pack's own finding. |
 | `E_UNKNOWN_RECORD_TYPE` | error | | A record's `type` is neither a core type nor a type declared by an enabled/registered pack. An undeclared two-letter pack prefix is `W_PACK_ORPHAN` instead (removed pack); a type declared by a disabled or retired pack is also `W_PACK_ORPHAN`. The message names the `type` key, never its value. |
@@ -82,7 +82,9 @@ verbatim only when it has no file and no ID, or when it resolves to a
 cleared record or a cleared ledger line. Everything else is reduced to
 its code and the count of affected items — never a path, file name, ID,
 key, or line text. Front-matter `E_INVALID_ID` on an uncleared record
-is code and count only. Name-only mentions with no ID are not detected
+is code and count only. A finding on a `no-ai: true` edge is code and count
+only in `find`; `check` may carry the opaque `e-…` id and file but never the
+edge kind or either endpoint id. Name-only mentions with no ID are not detected
 in body prose and comments; a `person` / `org` / `deal` value (including
 case variants) that is
 not a record ID (including a bare `p-A|Name` pipe alias) is `E_INVALID_ID`

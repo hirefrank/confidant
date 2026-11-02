@@ -79,7 +79,7 @@ pub fn contract_schema() -> Value {
             },
             "edgeView": {
                 "title": "context edge",
-                "description": "One edge from the target's point of view (#813). Opaque ids, kind, and dates are kept under --exclude-private; endpoint names are stripped. An edge appears only when both endpoints are in the section-12 cleared set.",
+                "description": "One edge from the target's point of view (#813). Opaque ids, kind, and dates are kept under --exclude-private; endpoint names are stripped. An edge appears only when both endpoints are in the section-12 cleared set and the edge itself is not no-ai: true. The operator path also carries the edge's own no_ai badge.",
                 "type": "object",
                 "required": ["id", "kind", "direction", "other"],
                 "properties": {
@@ -100,7 +100,12 @@ pub fn contract_schema() -> Value {
                         }
                     },
                     "since": {"type": ["string", "null"]},
-                    "until": {"type": ["string", "null"]}
+                    "until": {"type": ["string", "null"]},
+                    "no_ai": {
+                        "type": "string",
+                        "enum": ["true", "false"],
+                        "description": "Operator path only: the edge's own no-ai badge. Edges have no notes mode."
+                    }
                 }
             },
             "checkReport": {
@@ -244,7 +249,7 @@ pub fn contract_schema() -> Value {
             },
             "contextBundle": {
                 "title": "context --json",
-                "description": "Everything the vault knows about one entity: a person or an org (#813). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared, so a no-ai endpoint omits the edge from the other endpoint's bundle with no count or hint. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. An org bundle has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:`.",
+                "description": "Everything the vault knows about one entity: a person or an org (#813). `entity` is the canonical target view; `person` is a deprecated person-only alias, present only when the target is a person. PII fields (name/profile/bodies/edge endpoint names) are shown only for records in the section-12 cleared set — exactly like find; uncleared notes/interactions/edges are omitted entirely, never nulled. An edge is visible only when both endpoints are cleared and the edge itself is not no-ai: true, so a no-ai endpoint or no-ai edge omits the edge from the other endpoint's bundle with no count or hint; an operator bundle badges it instead. --exclude-private strips PII regardless; ledger facts and opaque edge ids/kinds/dates are kept. The `packs[\"personal@0.2\"]` entry (core: context::personal) carries the personal pack's declared fields (birthday, dates, relationship, location, emails, phones, links, tags, …) plus cadence_days, cadence_never, snooze_until, last_touch, days_since_touch, overdue and recent_touches. cadence_never is true only when the declared cadence is the literal `never` (and is omitted otherwise), so it distinguishes a deliberate never-nudge from no cadence set: both omit cadence_days. --exclude-private removes the PII fields by name; title, company, cadence_days and snooze_until stay. For a person outside the cleared set (no-ai) the declared fields are denied by default: only snooze_until and the derived cadence/touch metadata (cadence_days, cadence_never, last_touch, days_since_touch, overdue, recent_touches) remain. An org bundle has empty `touchpoints`, `aliases`, and `packs`; its notes/interactions are those linked by `org:`.",
                 "type": "object",
                 "required": ["ok", "schema_version", "vault", "entity", "notes", "interactions", "edges", "packs", "aliases"],
                 "properties": {
@@ -447,6 +452,7 @@ mod tests {
         );
         assert!(s["$defs"]["entityView"]["properties"]["kind"]["enum"].is_array());
         assert!(s["$defs"]["edgeView"]["properties"]["direction"]["enum"].is_array());
+        assert!(s["$defs"]["edgeView"]["properties"]["no_ai"].is_object());
         assert_eq!(s["properties"]["schema_version"]["const"], "1");
     }
 

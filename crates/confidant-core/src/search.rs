@@ -1655,4 +1655,43 @@ mod tests {
         assert!(!visible.is_empty());
         assert!(visible.iter().all(|h| h.operator_only.is_none()));
     }
+    #[test]
+    fn hidden_edge_is_not_cleared_for_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("confidant.toml"),
+            "spec = \"0.3\"\nvault_id = \"01J9Z3K4QF0000000000000000\"\n",
+        )
+        .unwrap();
+        let person = "p-01M3TC5H00MPJG000000000000";
+        let org = "o-01M3TC5H00MPJG000000000001";
+        let edge = "e-01M3TC5H00MPJG000000000002";
+        for (rel, body) in [
+            (
+                format!("people/{person}/profile.md"),
+                format!("---\nid: {person}\ntype: person\nname: Dana Example\n---\n"),
+            ),
+            (
+                format!("orgs/{org}/org.md"),
+                format!("---\nid: {org}\ntype: org\nname: Example Studio\n---\n"),
+            ),
+            (
+                format!("edges/{edge}/edge.md"),
+                format!(
+                    "---\nid: {edge}\ntype: edge\na: {person}\nb: {org}\nkind: works_at\nno-ai: true\n---\n"
+                ),
+            ),
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let vault = crate::vault::load_vault(dir.path()).unwrap();
+        let id = super::RecordId::parse(edge).unwrap();
+        assert!(!super::cleared_record_ids(&vault).contains(&id));
+        assert!(super::cleared_record_ids_for_operator(&vault).contains(&id));
+        assert!(!super::cleared_record_paths(&vault)
+            .iter()
+            .any(|path| path == &format!("edges/{edge}/edge.md")));
+    }
 }

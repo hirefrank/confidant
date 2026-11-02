@@ -69,9 +69,8 @@ impl RecordKind {
     pub fn allows_no_ai(self) -> bool {
         match self {
             Self::Person | Self::Note | Self::Deal | Self::Interaction => true,
-            // Org has no no-ai; an edge is ids + kind + dates only, and
-            // its content is never agent-facing prose, so no-ai is
-            // meaningless on it too. Edge-level no-ai is a later format.
+            // Org has no no-ai. Edge-level no-ai is spec-dependent (0.3+);
+            // `parse_record` applies `RecordSchema.spec`.
             Self::Org | Self::Edge => false,
             // A pack declaration decides; `parse_record` checks the schema.
             Self::Pack { .. } => false,
@@ -716,16 +715,18 @@ pub fn parse_record_with_schema(
         // fails closed.
         RecordKind::pack(intern_type_name(type_raw), id.prefix())
     };
-    // #390: an edge carries only ids, kind, and dates, so a front-matter key
-    // outside that set is rejected rather than ignored like unknown keys
-    // elsewhere (spec §4). Edge-level `no-ai` is not part of 0.3's
-    // record-type core; it remains disallowed until the privacy change.
+    // #390: an edge carries only ids, kind, dates, and (in 0.3) `no-ai`, so
+    // a front-matter key outside that set is rejected rather than ignored
+    // like unknown keys elsewhere (spec §4).
     if fields.contains_key("no-ai") {
         let line = line_of("no-ai").unwrap_or(1);
         let policy = match kind {
             RecordKind::Person => Some(NoAiPolicy::Notes),
             RecordKind::Note | RecordKind::Deal | RecordKind::Interaction => Some(NoAiPolicy::Full),
-            RecordKind::Org | RecordKind::Edge => None,
+            RecordKind::Org => None,
+            // Edge-level `no-ai` ships with spec 0.3 (#820): it hides the
+            // relation, not either endpoint, and has no `notes` mode.
+            RecordKind::Edge => (schema.spec >= SpecVersion::V03).then_some(NoAiPolicy::Full),
             // An orphaned pack type has no declaration to consult; accept
             // the full tri-state so the file still loads for `check` and
             // the operator. The type gate fails it closed for agents.
@@ -780,17 +781,29 @@ pub fn parse_record_with_schema(
             }
         }
     }
-    // #390: an edge carries only ids, kind, and dates. An extra key has no
-    // home, so it is rejected rather than silently stored.
+    // #390: an edge carries only ids, kind, dates, and (in 0.3) `no-ai`.
+    // An extra key has no home, so it is rejected rather than silently
+    // stored.
     if kind == RecordKind::Edge {
-        const ALLOWED: [&str; 7] = ["id", "type", "a", "b", "kind", "since", "until"];
-        let disallowed = fields.keys().find(|k| !ALLOWED.contains(&k.as_str()));
+        const ALLOWED: [&str; 8] = ["id", "type", "a", "b", "kind", "since", "until", "no-ai"];
+        let allowed: &[&str] = if schema.spec >= SpecVersion::V03 {
+            &ALLOWED
+        } else {
+            &ALLOWED[..7]
+        };
+        let disallowed = fields.keys().find(|k| !allowed.contains(&k.as_str()));
         if let Some(key) = disallowed {
             let line = line_of(key).unwrap_or(1);
+            let fix = if schema.spec >= SpecVersion::V03 {
+                "Edge records allow only id, type, a, b, kind, since, until, and no-ai; \
+                 move the context into a note on one of the edge's entities"
+            } else {
+                "Edge records allow only id, type, a, b, kind, since, and until; \
+                 move the context into a note on one of the edge's entities"
+            };
             return Err(FrontmatterError::new(
                 "edge record has a front matter key that is not allowed",
-                "Edge records allow only id, type, a, b, kind, since, and until; \
-                 move the context into a note on one of the edge's people",
+                fix,
             )
             .at_line(line));
         }
@@ -1288,5 +1301,28 @@ mod tests {
             super::frontmatter_line_spec_key("client: p-01M3TC5H00MPJG00"),
             None
         );
+    }
+    #[test]
+    fn edge_no_ai_is_spec_gated_and_has_no_notes_mode() {
+        use crate::config::SpecVersion;
+        use crate::record_type::RecordSchema;
+
+        let edge = |mode: &str| {
+            format!(
+                "---\nid: e-01M3TC5H00MPJG000000000000\ntype: edge\na: p-01M3TC5H00MPJG000000000000\nb: p-01M3TC5H00MPJG000H24000001\nkind: married\nno-ai: {mode}\n---\n"
+            )
+        };
+        let v03 = RecordSchema {
+            spec: SpecVersion::V03,
+            types: None,
+            require_declared: false,
+        };
+        for mode in ["true", "false"] {
+            let rec = super::parse_record_with_schema(&edge(mode), "x.md", &v03).unwrap();
+            assert_eq!(rec.no_ai(), mode == "true");
+        }
+        assert!(super::parse_record_with_schema(&edge("notes"), "x.md", &v03).is_err());
+        let v02 = RecordSchema::core(SpecVersion::V02);
+        assert!(super::parse_record_with_schema(&edge("true"), "x.md", &v02).is_err());
     }
 }
