@@ -1446,7 +1446,7 @@ fn help_examples_cover_each_journey() {
     let help = String::from_utf8_lossy(&out.stdout);
     for example in [
         "Start here:        confidant setup --agent auto",
-        "Everyday:          confidant log session p-01H… 60m paid --json --no-input",
+        "Everyday:          confidant log touch p-01H… meal --json --no-input",
         "Integrations:      confidant mcp",
         "Advanced / rare:   confidant schema --json",
         "Demo vault:        confidant check --vault ./examples/demo-vault",

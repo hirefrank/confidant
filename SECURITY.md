@@ -39,7 +39,7 @@ In scope:
 - The privacy allowlist (`no-ai`, the §12 cleared set): any path that lets
   an agent-facing surface (`find`, `context`, `allowlist`, MCP, the QMD
   corpus) return content it should withhold.
-- The write path (`record add`, `note add`, `log session`, `log touch`,
+- The write path (`record add`, `note add`, `log touch`,
   `import`) and the `check`-before-commit gate, including anything that
   corrupts a vault, drops data, or commits without the gate passing.
 - Git and sync behaviour: transport checks, `confidant sync` refusals, and

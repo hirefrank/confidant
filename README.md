@@ -391,8 +391,8 @@ relationship facts live and that they go through the CLI. Every command
 takes `--json` and `--no-input`; usage errors exit 2; branch on `code`,
 never message text.
 
-`confidant mcp` exposes ten fixed tools (`check`, `doctor`, `find`,
-`context`, `log_session`, `log_touch`, `import_ledger`, `note_add`, `schema`,
+`confidant mcp` exposes nine fixed tools (`check`, `doctor`, `find`,
+`context`, `log_touch`, `import_ledger`, `note_add`, `schema`,
 `pack_skill`); no tool can widen that list. A write runs `check` and commits once. `--packs` scopes
 reads (on `mcp` it is the instance ceiling) as a read-time policy filter,
 not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
@@ -400,15 +400,15 @@ not access control ([`docs/privacy.md`](docs/privacy.md#pack-scoping-issue-178),
 
 `no-ai` keeps a record out of agent output; `--for-operator` on `find`,
 `context`, and `record list` is the operator-only escape hatch, and MCP
-never passes it. `--person` (on `log session`, `log touch`, `note add`)
-takes a `p-<ULID>` or an **exact display name**. `context` takes a person
+never passes it. `--person` (on `log touch`, `note add`) takes a
+`p-<ULID>` or an **exact display name**. `context` takes a person
 or org ID, or an exact person display name; org names are not resolved, so
 use `find` for the `o-` ID. `find` stays fuzzy and `no-ai: true` people are
 ID-only.
 
 | Area | Commands |
 |---|---|
-| Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log session`, `log touch`, `alias add`, `import` |
+| Write | `record add`, `record edit`, `record resolve`, `note add`, `note edit`, `log touch`, `alias add`, `import` |
 | Read | `find`, `context`, `resolve`, `alias resolve`, `record list`, `record show`, `note show`, `allowlist`, `schema`, `help` |
 | Check | `check` (read-only; stable codes in [`spec/findings.md`](spec/findings.md)) |
 | Packs | `pack init`, `pack add`, `pack list`, `pack verify`, `pack update`, `pack remove` |
@@ -435,8 +435,8 @@ confidant-tui` — then run `confidant tui --vault examples/demo-vault`.
 differ; upgrade both together.
 
 Operator mode (`!`) is off by default; `e` edits through the operator-only
-path, `s` / `t` / `n` capture a session, touch, or note, and `2` opens the
-review queue. Tabs and phase history: [`docs/tui.md`](docs/tui.md).
+path, `t` / `n` capture a touch or note, and `2` opens the review queue.
+Tabs and phase history: [`docs/tui.md`](docs/tui.md).
 
 ## Packs
 
@@ -538,7 +538,7 @@ query-path bug degrades to missing results; without QMD it falls back to
 ## Privacy
 
 **Records are plaintext on disk.** A vault is Markdown and `.cfd` files in a
-git repo; `record add`, `note add`, and `log session --note` write those
+git repo; `record add`, `note add`, and `log touch --note` write those
 bytes directly. There is no second secrecy layer and no key material, so a
 clone is the whole vault.
 

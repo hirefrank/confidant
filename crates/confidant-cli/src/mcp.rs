@@ -167,24 +167,6 @@ fn tools() -> Vec<Value> {
             ),
         ),
         tool(
-            "log_session",
-            "Append a session ledger line. One commit; check-gated.",
-            obj(
-                &["person", "duration"],
-                json!({
-                    "person": str_prop("Opaque person id (p-…)."),
-                    "duration": str_prop("Like 60m or 1h30m."),
-                    "tag": str_prop("Billing tag: paid, pps, or comp."),
-                    "date": str_prop("YYYY-MM-DD; default today."),
-                    "note": str_prop("Session note text; creates a note record."),
-                    "src": str_prop("Source token."),
-                    "request_id": str_prop("Idempotency key."),
-                    "dry_run": {"type": "boolean", "description": "Show the logical change only."},
-                    "force": {"type": "boolean", "description": "Log even when an identical session is already in the ledger; use only for a genuinely separate session the same day."},
-                }),
-            ),
-        ),
-        tool(
             "log_touch",
             "Append a personal touchpoint ledger line (call, text, email, meet, meal, event, gift, video, or other). One commit; check-gated.",
             obj(
@@ -344,28 +326,6 @@ fn build_argv(
             }
             cli.push("--".to_owned());
             cli.push(get_str(args, "person")?);
-        }
-        "log_session" => {
-            cli.push("log".to_owned());
-            cli.push("session".to_owned());
-            cli.push(get_str(args, "person")?);
-            cli.push(get_str(args, "duration")?);
-            if let Some(t) = opt_str(args, "tag") {
-                cli.push(t);
-            }
-            for (flag, key) in [("--date", "date"), ("--note", "note"), ("--src", "src")] {
-                if let Some(v) = opt_str(args, key) {
-                    cli.push(flag.to_owned());
-                    cli.push(v);
-                }
-            }
-            // #747 review: MCP is the agent surface, so it needs the
-            // same escape hatch the CLI has — otherwise a legitimate
-            // same-day repeat is loggable from the CLI and impossible
-            // from MCP.
-            if get_bool(args, "force") {
-                cli.push("--force".to_owned());
-            }
         }
         "log_touch" => {
             cli.push("log".to_owned());
@@ -705,45 +665,36 @@ mod tests {
         }
     }
 
-    /// #747 review: both log tools carry the `--force` escape hatch the
-    /// CLI has — MCP is the agent surface, so a legitimate same-day
-    /// repeat must be loggable from it, and the flag must be absent
-    /// unless the caller explicitly sets it.
+    /// #747 review: `log_touch` carries the `--force` escape hatch the CLI
+    /// has — MCP is the agent surface, so a legitimate same-day repeat must
+    /// be loggable from it, and the flag must be absent unless the caller
+    /// explicitly sets it.
     #[test]
-    fn mcp_passes_force_to_log_tools_only_when_set() {
+    fn mcp_passes_force_to_log_touch_only_when_set() {
         let vault = Path::new("/tmp/vault");
-        for (name, args) in [
-            (
-                "log_session",
-                json!({"person": "p-01ABC", "duration": "60m", "force": true}),
-            ),
-            (
-                "log_touch",
-                json!({"person": "p-01ABC", "kind": "meal", "force": true}),
-            ),
-        ] {
-            let argv = build_argv(name, &args, vault, &None).unwrap();
-            assert!(
-                argv.iter().any(|a| a == "--force"),
-                "{name} dropped force: {argv:?}"
-            );
-        }
-        for (name, args) in [
-            (
-                "log_session",
-                json!({"person": "p-01ABC", "duration": "60m"}),
-            ),
-            (
-                "log_touch",
-                json!({"person": "p-01ABC", "kind": "meal", "force": false}),
-            ),
-        ] {
-            let argv = build_argv(name, &args, vault, &None).unwrap();
-            assert!(
-                !argv.iter().any(|a| a == "--force"),
-                "{name} passed force unasked: {argv:?}"
-            );
-        }
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal", "force": true}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(
+            argv.iter().any(|a| a == "--force"),
+            "log_touch dropped force: {argv:?}"
+        );
+
+        let argv = build_argv(
+            "log_touch",
+            &json!({"person": "p-01ABC", "kind": "meal", "force": false}),
+            vault,
+            &None,
+        )
+        .unwrap();
+        assert!(
+            !argv.iter().any(|a| a == "--force"),
+            "log_touch passed force unasked: {argv:?}"
+        );
     }
 
     #[test]
@@ -764,7 +715,6 @@ mod tests {
             "check",
             "find",
             "context",
-            "log_session",
             "log_touch",
             "import_ledger",
             "note_add",
@@ -774,6 +724,10 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
+        assert!(
+            !names.contains(&"log_session"),
+            "log_session must not be exposed: {names:?}"
+        );
     }
 
     #[test]

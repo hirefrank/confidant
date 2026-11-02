@@ -1,7 +1,7 @@
 //! `confidant` — local-first, git-backed, plaintext relationship memory.
 //!
 //! Read commands (`check`, `find`, `context`, `doctor`, `schema`, `help`)
-//! never mutate the vault. Write commands (`log session`, `import`,
+//! never mutate the vault. Write commands (`log touch`, `import`,
 //! `note add`) funnel through the [`write`] pipeline: one commit per write,
 //! `check` runs before every commit and a failing check blocks the write.
 //! `mcp` is a thin stdio JSON-RPC wrapper around this binary — never a
@@ -30,7 +30,7 @@ use confidant_core::context::build_context;
 use confidant_core::discover::{load_user_config, resolve, Discovery};
 use confidant_core::error::DomainError;
 use confidant_core::id::{Prefix, RecordId};
-use confidant_core::ledger::{parse_duration_minutes, parse_strict_date};
+use confidant_core::ledger::parse_strict_date;
 use confidant_core::packs::dir::read_pack_dir;
 use confidant_core::packs::lock::read_lockfile;
 use confidant_core::record::{main_record_path_with, Record, RecordKind};
@@ -73,7 +73,7 @@ impl FixExt for anyhow::Error {
     about = "Relationship memory you own: plain-text records in a git repo.",
     after_help = "Examples:\n  \
         Start here:        confidant setup --agent auto\n  \
-        Everyday:          confidant log session p-01H… 60m paid --json --no-input\n  \
+        Everyday:          confidant log touch p-01H… meal --json --no-input\n  \
         Integrations:      confidant mcp\n  \
         Advanced / rare:   confidant schema --json\n  \
         Demo vault:        confidant check --vault ./examples/demo-vault"
@@ -364,29 +364,6 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum LogAction {
-    /// Append a session ledger line, e.g. `log session p-… 60m paid`.
-    Session {
-        /// Opaque person id (p-…) or an exact display name (cleared people
-        /// only; see `confidant resolve`).
-        person: String,
-        /// Duration like 60m or 1h30m.
-        duration: String,
-        /// Billing tag (paid, pps, comp).
-        tag: Option<String>,
-        /// Session date YYYY-MM-DD (default today).
-        #[arg(long)]
-        date: Option<String>,
-        /// Session note text (creates a note record).
-        #[arg(long)]
-        note: Option<String>,
-        /// Source token, stored as src:<value>.
-        #[arg(long)]
-        src: Option<String>,
-        /// Log even when an identical session (same person, date,
-        /// duration, tag) is already in the ledger (#747).
-        #[arg(long)]
-        force: bool,
-    },
     /// Append a personal touchpoint ledger line, e.g. `log touch p-… meal`.
     Touch {
         /// Opaque person id (p-…) or an exact display name (cleared people
@@ -946,25 +923,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Log { action } => {
             let root = vault_root.unwrap();
             match action {
-                LogAction::Session {
-                    person,
-                    duration,
-                    tag,
-                    date,
-                    note,
-                    src,
-                    force,
-                } => cmd_log_session(
-                    &cli,
-                    &root,
-                    person,
-                    duration,
-                    tag.clone(),
-                    date.clone(),
-                    note.clone(),
-                    src.clone(),
-                    *force,
-                ),
                 LogAction::Touch {
                     person,
                     kind,
@@ -3152,11 +3110,11 @@ fn require_log_verb(vault: &confidant_core::vault::Vault, verb: &str) -> anyhow:
     Err(refuse_unknown_verb(verb))
 }
 
-/// #747: semantic idempotency for `log touch` / `log session`. Returns
-/// the existing line's vault-relative file and line number when an
-/// identical line is already in the ledger, so the refusal can point at
-/// it. The caller runs this after building the canonical request but
-/// before applying anything, so a refusal writes nothing.
+/// #747: semantic idempotency for `log touch`. Returns the existing
+/// line's vault-relative file and line number when an identical line is
+/// already in the ledger, so the refusal can point at it. The caller runs
+/// this after building the canonical request but before applying anything,
+/// so a refusal writes nothing.
 /// `note:` and `src:` never make a line distinct — a
 /// backfill that re-adds the same contact with a fresh note or
 /// provenance is still the same touchpoint.
@@ -3169,24 +3127,6 @@ fn find_duplicate_touch(
     vault.entries.iter().find_map(|sourced| {
         let (id, d, k) = confidant_core::touch::touch_identity(&sourced.entry)?;
         (id == *person && d == *date && k == kind).then_some((sourced.file.clone(), sourced.line))
-    })
-}
-
-fn find_duplicate_session(
-    vault: &confidant_core::Vault,
-    person: &RecordId,
-    date: &chrono::NaiveDate,
-    duration: &str,
-    tag: Option<&str>,
-) -> Option<(String, u32)> {
-    let minutes = parse_duration_minutes(duration)?;
-    // Tags compare lowercased, matching `session_identity`, so a
-    // historical `Paid` line matches a `paid` re-log.
-    let tag = tag.unwrap_or("").to_ascii_lowercase();
-    vault.entries.iter().find_map(|sourced| {
-        let (id, d, m, t) = confidant_core::ledger::session_identity(&sourced.entry)?;
-        (id == *person && d == *date && m == minutes && t == tag)
-            .then_some((sourced.file.clone(), sourced.line))
     })
 }
 
@@ -3205,156 +3145,6 @@ fn defer_to_write_path(root: &Path, cli: &Cli, canonical: &str) -> anyhow::Resul
     }
     let (id_hash, _) = confidant_core::write::idempotency_digests(rid, canonical);
     Ok(confidant_core::write::find_request_commit(root, &id_hash, cli.no_input)?.is_some())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_log_session(
-    cli: &Cli,
-    root: &Path,
-    person_raw: &str,
-    duration: &str,
-    tag: Option<String>,
-    date_raw: Option<String>,
-    note: Option<String>,
-    src: Option<String>,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
-    let vault = vault_or!(root, cli.json);
-    require_log_verb(&vault, "session")?;
-    let person = resolve_person_arg(root, &vault, person_raw)?;
-    announce_resolved_person(cli, &person);
-    let Some(minutes) = parse_duration_minutes(duration) else {
-        return Err(anyhow::Error::new(DomainError::usage(format!(
-            "bad duration '{duration}'; use like 60m or 1h30m"
-        ))));
-    };
-    // #747 review: the billing tag is a closed vocabulary — a
-    // free-form token would silently count as untagged in balance
-    // math, and `Paid` would be a distinct session from `paid`.
-    // Validate before the refusal, like touch kinds are validated
-    // before comparison, so the refusal never compares raw tags.
-    // #747 round 3: the vocabulary is the union of the enabled packs'
-    // `session-checks` billing tags for verb `session`, falling back
-    // to the core default (`paid`, `pps`, `comp`) when no enabled pack
-    // declares any — so a pack that bills under different tags is no
-    // longer overruled at log time. Fail-closed enforcement is
-    // unchanged: an unlisted tag still fails, in any case.
-    if let Some(t) = &tag {
-        let tags = confidant_core::packs::session_billing_tags_for_vault(&vault);
-        if !tags.iter().any(|valid| valid == t) {
-            return Err(anyhow::Error::new(DomainError::usage(format!(
-                "bad session tag '{t}'; use one of: {}",
-                tags.join(", ")
-            ))));
-        }
-    }
-    let date = parse_date_arg(&date_raw)?;
-
-    // An inline --note becomes its own note record, referenced from the line.
-    let mut changes = Vec::new();
-    let mut note_arg: Option<String> = None;
-    let mut note_body: Option<String> = None;
-    if let Some(text) = note {
-        let nid = RecordId::new(Prefix::Note, confidant_core::write::new_ulid())
-            .map_err(|e| anyhow::anyhow!("generated bad note id: {e}"))?;
-        let rel = PathBuf::from(format!("people/{}/notes/{nid}.md", person.id));
-        let rec = Record {
-            id: nid.clone(),
-            kind: RecordKind::Note,
-            path: rel.display().to_string(),
-            name: None,
-            fields: BTreeMap::from([
-                ("person".to_owned(), person.id.to_string()),
-                ("date".to_owned(), date.to_string()),
-            ]),
-            body: text.clone(),
-            source: String::new(),
-            body_start_line: 0,
-            field_lines: BTreeMap::new(),
-        };
-        let contents = confidant_core::format_record(&rec);
-        changes.push(FileChange::WriteFile {
-            path: rel,
-            contents,
-        });
-        note_arg = Some(format!("note:{nid}"));
-        note_body = Some(text);
-    }
-
-    let mut parts = vec![
-        date.to_string(),
-        "session".to_owned(),
-        person.id.to_string(),
-        duration.to_owned(),
-    ];
-    if let Some(t) = &tag {
-        parts.push(t.clone());
-    }
-    if let Some(n) = &note_arg {
-        parts.push(n.clone());
-    }
-    if let Some(s) = &src {
-        parts.push(format!("src:{s}"));
-    }
-    let line = parts.join(" ");
-    changes.push(FileChange::AppendLines {
-        path: month_path(&date),
-        lines: vec![line.clone()],
-    });
-
-    let canonical = format!(
-        "log-session/v1\nperson={}\ndate={date}\nduration={duration}\ntag={}\nnote={}\nsrc={}\n",
-        person.id,
-        tag.as_deref().unwrap_or(""),
-        note_body.as_deref().unwrap_or(""),
-        src.as_deref().unwrap_or(""),
-    );
-    let summary = format!(
-        "session {} {duration}{}",
-        person.id,
-        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default()
-    );
-    // #747: refuse an identical session before applying or queueing
-    // anything, unless --force or the write path owns the decision
-    // (a known --request-id replays or conflicts there).
-    if !force {
-        if let Some((file, line)) =
-            find_duplicate_session(&vault, &person.id, &date, duration, tag.as_deref())
-        {
-            if !defer_to_write_path(root, cli, &canonical)? {
-                return Err(anyhow::Error::new(
-                    DomainError::already_exists(format!(
-                        // #747 review: name the normalized minutes, not
-                        // the raw typed duration — re-logging `1h`
-                        // against a stored `60m` line reports a `60m`
-                        // session, so the message points at the line
-                        // matched.
-                        "a {minutes}m{} session for {} on {date} is already in the ledger ({file}:{line})",
-                        tag.as_deref().map(|t| format!(" {t}")).unwrap_or_default(),
-                        person.id,
-                    ))
-                    .with_file(file)
-                    .with_line(line)
-                    .with_fix("Pass --force to log a genuinely separate session anyway"),
-                ));
-            }
-        }
-    }
-    let outcome = apply_record_write(
-        root,
-        &vault,
-        PendingWrite {
-            changes,
-            summary,
-            canonical_request: canonical,
-        },
-        &write_options(cli),
-    )?;
-    let mut extra = serde_json::json!({"lines": [line]});
-    if let Some(echo) = person.echo_json() {
-        extra["person"] = echo;
-    }
-    finish_write(cli, root, "log-session", outcome, extra)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7567,7 +7357,7 @@ fn completion_brief(cli: &Cli, vault: Option<&Path>) -> CompletionBrief {
                     .to_owned(),
             );
             routines.push(
-                "After a conversation: `confidant log session <person> 45m --note \"what happened\" --dry-run`, review it, then rerun without `--dry-run`."
+                "After a conversation: `confidant log touch <person> meet --note \"what happened\" --dry-run`, review it, then rerun without `--dry-run`."
                     .to_owned(),
             );
             if cadence_warnings > 0 {

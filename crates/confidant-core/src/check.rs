@@ -2056,11 +2056,11 @@ fn check_duplicate_src(vault: &Vault, findings: &mut Vec<Finding>) {
 /// date, and kind (see [`crate::touch::touch_identity`]). A warning, not
 /// an error: duplicates already in a vault are historical noise to clean
 /// up, and warnings never block writes — the write-time refusal lives in
-/// `log touch`/`log session`, not here. Kind-less mirrored lines carry no
-/// identity and are never flagged.
-/// #747 review: sessions get the same treatment (see
-/// [`check_duplicate_sessions`]) so a `--force` session repeat is not
-/// invisible while a `--force` touch repeat is flagged.
+/// `log touch`, not here. Kind-less mirrored lines carry no identity and
+/// are never flagged.
+/// Pack-written `session` lines get the same treatment (see
+/// [`check_duplicate_sessions`]) so a repeated session line is not
+/// invisible while a repeated touch is flagged.
 fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
     let mut seen: BTreeMap<(RecordId, NaiveDate, String), (String, u32)> = BTreeMap::new();
     for sourced in &vault.entries {
@@ -2088,8 +2088,7 @@ fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
 }
 
 /// #747 review: flag every `session` line after the first for the same
-/// person, date, duration, and billing tag (see
-/// [`crate::ledger::session_identity`]) — the session mirror of
+/// person, date, duration, and billing tag — the session mirror of
 /// [`check_duplicate_touches`], including its warning severity and its
 /// "warnings never block writes" rationale. Durations compare by
 /// minutes (`60m` and `1h` flag) and tags compare lowercased; lines
@@ -2097,9 +2096,25 @@ fn check_duplicate_touches(vault: &Vault, findings: &mut Vec<Finding>) {
 fn check_duplicate_sessions(vault: &Vault, findings: &mut Vec<Finding>) {
     let mut seen: BTreeMap<(RecordId, NaiveDate, u32, String), (String, u32)> = BTreeMap::new();
     for sourced in &vault.entries {
-        let Some(identity) = crate::ledger::session_identity(&sourced.entry) else {
+        let entry = &sourced.entry;
+        if entry.verb != "session" {
+            continue;
+        }
+        let Some(minutes) = entry
+            .args
+            .first()
+            .and_then(Arg::as_token)
+            .and_then(parse_duration_minutes)
+        else {
             continue;
         };
+        let tag = entry
+            .args
+            .get(1)
+            .and_then(Arg::as_token)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let identity = (entry.id.clone(), entry.date, minutes, tag);
         if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(identity) {
             slot.insert((sourced.file.clone(), sourced.line));
         } else {

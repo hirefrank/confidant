@@ -239,7 +239,7 @@ pub struct App<R: Runner> {
     /// The in-flight record/note edit (`e`). While `Some`, the confirm modal
     /// owns the keyboard and the scratch file is live on disk.
     pub edit_flow: Option<EditFlow>,
-    /// The in-flight quick capture (`s`/`t`/`n`) (#556 phase 3). While `Some`,
+    /// The in-flight quick capture (`t`/`n`) (#556 phase 3). While `Some`,
     /// the capture modal owns the keyboard; nothing is written until the
     /// operator confirms the `--dry-run` preview.
     pub capture: Option<Capture>,
@@ -1438,7 +1438,7 @@ impl<R: Runner> App<R> {
     /// Reload the views a write can change: the check report (a write can add
     /// findings), the roster (a name or `no-ai` mode may differ), and the
     /// selected person's context (the body/notes/interactions changed).
-    /// Shared by the `e` edit and the `s`/`t`/`n` captures.
+    /// Shared by the `e` edit and the `t`/`n` captures.
     fn reload_after_write(&mut self) {
         self.load_check();
         self.load_roster();
@@ -1478,7 +1478,7 @@ impl<R: Runner> App<R> {
         Some((id, name))
     }
 
-    /// `s`/`t`/`n`: open a quick-capture form pre-filled with the selected
+    /// `t`/`n`: open a quick-capture form pre-filled with the selected
     /// person. Writes nothing; the operator confirms the CLI's dry run first.
     pub fn begin_capture(&mut self, kind: CaptureKind) {
         if self.capture.is_some() {
@@ -1639,8 +1639,8 @@ impl<R: Runner> App<R> {
             capture.reviewed_hash = None;
         }
 
-        // Only the file-backed surfaces need a scratch; the inline surfaces
-        // (session/touch) pass their note as an argument.
+        // Only the file-backed surfaces need a scratch; the inline touch
+        // surface passes its note as an argument.
         let mut scratch_arg: Option<String> = None;
         if kind.stages_scratch() {
             let (person_id, staged) = {
@@ -2412,7 +2412,6 @@ impl<R: Runner> App<R> {
                     });
                 }
             }
-            "capture.session" => self.begin_capture(CaptureKind::Session),
             "capture.touch" => self.begin_capture(CaptureKind::Touch),
             "capture.note" => self.begin_capture(CaptureKind::Note),
             // `e` edits the loaded context pane, which only People and the
@@ -2466,10 +2465,6 @@ impl<R: Runner> App<R> {
                 true
             }
             // #556 phase 3: quick capture, pre-filled with the selected person.
-            KeyCode::Char('s') => {
-                self.begin_capture(CaptureKind::Session);
-                true
-            }
             KeyCode::Char('t') => {
                 self.begin_capture(CaptureKind::Touch);
                 true
@@ -2479,7 +2474,7 @@ impl<R: Runner> App<R> {
                 true
             }
             // #621: compose a new person from People or the full-screen
-            // Context view. Unlike `s`/`t`/`n` it needs no selected row.
+            // Context view. Unlike `t`/`n` it needs no selected row.
             KeyCode::Char('a')
                 if matches!(self.active_view, ActiveView::People | ActiveView::Context) =>
             {

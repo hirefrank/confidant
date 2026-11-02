@@ -215,7 +215,7 @@ This is not documentation polishing; it is the format/privacy change hard rules 
 
 **Root `AGENTS.md`:** rewrite hard rules 4 ("never log secrets", crypto half), 6 ("crypto changes need review", obsolete once removed), and the intro line "Client content is meant to be encrypted at rest once milestone 2 lands". Update the repo map's `confidant-crypt` row (delete it), the `crypto-design.md` references, and the "Crypto changes need review first" workflow.
 
-**Agent contract — fold in #797 (legacy `coaching` key).** The legacy top-level `coaching` key in `context`/`resolve` (`main.rs:7511` `bundle.coaching`, `schema.rs:206` `required` key, spec §8 sentence) is removed as part of this same ADR-7 contract bump — it is the same "clean up the agent contract" work and edits the same `schema.rs`. Tracked in #797. The *functional* `session`-verb / `log session` remnants are tracked separately in #799 (their final shape depends on #796).
+**Agent contract — fold in #797 (legacy `coaching` key).** The legacy top-level `coaching` key in `context`/`resolve` (`main.rs:7511` `bundle.coaching`, `schema.rs:206` `required` key, spec §8 sentence) is removed as part of this same ADR-7 contract bump — it is the same "clean up the agent contract" work and edits the same `schema.rs`. Tracked in #797. The *functional* `session`-verb / `log session` remnants were removed in #799 step 2: the pack `session` verb and its rule kinds remain, and a pack logs it through `import --file`.
 
 **`contrib/sync/` templates:** drop `E_PLAINTEXT_REMOTE` and keychain-unlock caveats from `confidant-sync.service` and `com.kitchenrodeo.confidant.sync.plist`.
 

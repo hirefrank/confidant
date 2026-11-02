@@ -62,14 +62,14 @@ explicit `y` confirm. A no-op edit commits nothing.
 
 ## Quick capture
 
-Quick capture is `s` (session), `t` (touch), and `n` (note). Each opens a
+Quick capture is `t` (touch) and `n` (note). Each opens a
 form pre-filled with the selected person's id, so a ULID never has to be
 typed, and `Enter` runs the CLI's `--dry-run` preview; `y` writes it (one
 commit) and any other key cancels and writes nothing. A note body is staged
 in the same 0600 gitignored scratch as the editor flow and removed after the
 write.
 
-Search moved to `f` (it was `s`). The Review Queue workspace (`2`) carries a
+Search is `f`. The Review Queue workspace (`2`) carries a
 badge with its pending count — proposal manifests and unresolved conflicts —
 so a queued item is visible from every workspace.
 
