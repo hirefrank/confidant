@@ -302,9 +302,11 @@ cannot render a code it does not claim.
 The TOML below is the frozen `personal@0.1` claims that the compiled pack
 shipped with until the #551 cutover. That pack and its in-crate manifest
 (`crates/confidant-core/pack-manifests/personal-0.1/manifest.toml`) are
-deleted; the current built-in is `personal@0.2` at
-`packs/personal/manifest.toml` (§13.7). The example is kept because it is the
-clearest statement of the v1 manifest shape.
+deleted; the current built-in is the `personal` pack, with
+`personal@0.3` at `packs/personal/manifest.toml` for 0.4 and the frozen
+`personal@0.2` bytes in `crates/confidant-core/pack-manifests/personal-0.2/`
+(§13.7). The example is kept because it is the clearest statement of the v1
+manifest shape.
 
 ```toml
 manifest_version = 1
@@ -432,7 +434,7 @@ Notes on the example:
 
 ## 12. Non-goals
 
-- No new pack is added by this spec; the two compiled packs keep
+- No new pack is added by this spec; the compiled packs keep
   working exactly as today.
 - No change to the `Pack` trait's compiled methods.
 - No grammar language, no expression language, no WASM (per the
@@ -1001,7 +1003,8 @@ only event is a grant on `2026-01-01` emits `none`.
 - `personal` is reserved: no external pack may use it. `personal@…` names
   the implicit built-in personal pack: the listing is a no-op at any
   version, and any vendored directory or lockfile pin for it is
-  `E_PACK_INVALID` (§13.7).
+  `E_PACK_INVALID` (§13.7). The active built-in version is selected by the
+  vault's `spec`, not by the listing (§13.7).
 - Rule `id`s match `^[a-z][a-z0-9_]*$` and are unique within the pack.
 - Finding codes declared by an external pack must match
   `^[EW]_[A-Z0-9_]{2,40}$` (PD13), must not equal any existing core or
@@ -1090,12 +1093,18 @@ issue turns the v2 example into a test.
 
 ### 13.7. Compiled-in built-ins (#550)
 
-A **built-in** pack (today `personal@0.2`) is a v2 manifest whose bytes
-are compiled into the binary and loaded through the same loader and rule
-kinds as an external pack. A built-in is **implicit**: it is enabled in
-every vault, a `packs = []` vault included, and a `personal@…` listing is a
-no-op. The manifest's **origin** is what differs, and only the loader sets
-it (a manifest file cannot claim it):
+A **built-in** pack (today the `personal` pack) is a v2 or v3 manifest
+whose bytes are compiled into the binary and loaded through the same loader
+and rule kinds as an external pack. A built-in is **implicit**: it is
+enabled in every vault, a `packs = []` vault included, and a `personal@…`
+listing is a no-op. A binary may compile more than one version of the same
+built-in; exactly one version is active per vault, selected by the vault's
+`spec`, never by the `packs` list. The active version must list that spec in
+`requires_spec`; the inactive versions are inert. For the personal pack,
+specs 0.1–0.3 select `personal@0.2` (v2) and spec 0.4 selects
+`personal@0.3` (v3). A `personal@…` listing still does not choose a version.
+The manifest's **origin** is what differs, and only the loader sets it (a
+manifest file cannot claim it):
 
 - origin `external` (the default): the bytes came from the vault's
   `packs/<name>@<version>/`; the PD8 capability limits and the
@@ -1112,8 +1121,8 @@ The allowance is keyed on the origin, **never on the pack name**. A
 vault directory `packs/personal@<version>/` still resolves through the
 external path and is `E_PACK_INVALID` (a built-in is never installed
 from the vault: any lockfile pin or vendored directory for its name
-fails closed). The v2 schema itself — rule ids, kinds, declared codes,
-message tables — applies in full.
+fails closed). The manifest schema itself — v2 rules and declared codes, plus v3
+`[[record_types]]` when the active built-in is v3 — applies in full.
 
 ### 13.8. Moving a compiled pack to an external pack
 
@@ -1122,8 +1131,8 @@ pack without a format change. The external pack carries its manifest and
 skill text, is vendored under `packs/<name>@<version>/`, and is pinned in
 `confidant.lock`; the binary stops registering the compiled path. Its
 finding codes stay pack-owned, and a vault that lists the pack resolves it
-like any other external pack. The built-in `personal@0.2` is the only
-compiled pack.
+like any other external pack. The built-in `personal` pack is the only
+compiled pack; a binary may carry more than one of its versions (§13.7).
 
 The legacy top-level `coaching` field in `context` survives (ADR-7): it is
 the entry of the pack named `coaching` that serves the `ledger-sessions`

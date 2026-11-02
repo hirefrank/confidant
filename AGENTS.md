@@ -31,17 +31,20 @@ Read before changing behaviour:
   implements it. The spec version and the CLI version are independent (ADR-1).
 - [`spec/findings.md`](spec/findings.md): stable `check` finding codes.
 - [`docs/architecture.md`](docs/architecture.md): privacy and threat model,
-  ADR-1 to ADR-20, milestones (section 8), and risk decisions (section 9b,
+  ADR-1 to ADR-21, milestones (section 8), and risk decisions (section 9b,
   binding).
 - [`testdata/packs/example-pack/`](testdata/packs/example-pack/): the neutral external-pack fixture used by tests, the QA smoke, and the benchmark generator.
 - [`testdata/packs/place-pack/`](testdata/packs/place-pack/) and
   [`testdata/vaults/place-0.3/`](testdata/vaults/place-0.3/): the spec 0.3
   record-type fixture, its vendored pack pin, and its `check --json` golden.
   Fake data only; keep the demo vault on 0.2.
-- [`packs/personal/0.2.md`](packs/personal/0.2.md): the personal
-  relationships pack (implicit built-in).
+- [`packs/personal/0.2.md`](packs/personal/0.2.md): the frozen personal
+  relationships pack for 0.1–0.3. A 0.4 vault selects `personal@0.3`,
+  which adds places and things (ADR-21); the 0.3 pack source lands with
+  #745 PR 1.
 - [`spec/pack-manifest.md`](spec/pack-manifest.md): the pack manifest
-  format. The manifest (`packs/<name>/manifest.toml`) is the single
+  format, including spec-selected built-in versions (§13.7). The manifest
+  (`packs/<name>/manifest.toml`) is the single
   source of truth for a pack's claims (record types, verbs, fields, edge
   kinds, finding codes, `[checks]` keys, message templates); the folds and
   findings logic stay in Rust.

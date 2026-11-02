@@ -443,7 +443,7 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Alternatives considered.** (a) Move `deal`/`interaction` to the personal pack now: their one-letter prefixes and core verbs (`stage`) are frozen, and a format migration buys no user-visible gain. (b) Arbitrary prefix strings with a registry-aware scanner: more parser coupling and no orphan parsing after removal. (c) One core `thing`/`place`: repeats the database-diagram problem and makes the personal default a different product. (d) Reuse `person` for domains: fields can express a client, but the type identity, roster, and edges cannot.
 
-**Consequences.** Spec 0.3 is the current document; 0.1/0.2 stay frozen. `init` writes 0.3. A 0.2 vault opts in with one `spec` change and no record rewrite. A pack that declares types must list `"0.3"` in `requires_spec`; a 0.2 vault rejects it with `E_PACK_VERSION`. The built-in personal pack stays `personal@0.2` and declares no types in this slice. The demo vault stays on 0.2; [`testdata/vaults/place-0.3/`](../testdata/vaults/place-0.3/) is the checked-in 0.3 fixture with a place pack, an `entity:` note, a visible edge, and a hidden edge. Pack removal tombstones ship with the removal workflow (#699); this ADR defines the read behavior.
+**Consequences.** Spec 0.3 is the current document; 0.1/0.2 stay frozen. `init` writes 0.3. A 0.2 vault opts in with one `spec` change and no record rewrite. A pack that declares types must list `"0.3"` in `requires_spec`; a 0.2 vault rejects it with `E_PACK_VERSION`. The built-in personal pack stays `personal@0.2` and declares no types in this slice; ADR-21 later adds `personal@0.3` for 0.4. The demo vault stays on 0.2; [`testdata/vaults/place-0.3/`](../testdata/vaults/place-0.3/) is the checked-in 0.3 fixture with a place pack, an `entity:` note, a visible edge, and a hidden edge. Pack removal tombstones ship with the removal workflow (#699); this ADR defines the read behavior.
 
 ### ADR-19. Edge-level `no-ai` (spec 0.3).
 
@@ -485,9 +485,72 @@ registry, no signing in v1. External packs affect `check` only.
 
 **Follow-up (unresolved).** `record retire` is a normal check-gated write, not a repairing write: it does not suppress record-level findings. A record that itself causes a `check` error must be fixed before it can be retired, so retirement is a remedy for a valid-but-unwanted record, not for a malformed one. Whether retirement should become a repairing write (and which findings it may suppress) is left open for the #746 correction review.
 
+### ADR-21. The 0.4 default personal pack adds places and things (`personal@0.3`).
+
+**Door:** One-way (a vault that writes a place or thing commits to their
+two-letter prefixes and collections).
+
+**Context.** The personal default schema was person-only: `personal@0.2`
+declares no record types. #745 found that places and things have nowhere to
+live, so operators overload notes or install an external pack. #839 approved
+the default schema change for 0.4. Spec 0.3 is frozen; changing its default
+would alter the `context.packs` key, the `place-0.3` fixture, and TUI
+snapshots.
+
+**Decision.**
+
+- The binary compiles `personal@0.2` and `personal@0.3`. A 0.1–0.3 vault
+  selects 0.2; a 0.4 vault selects 0.3. The vault `spec` selects the active
+  built-in version; a `personal@…` listing remains a no-op
+  (`spec/pack-manifest.md` §13.7).
+- `personal@0.3` is a v3 manifest and keeps every 0.2 claim. It adds
+  `place` (`pl`, `places/`; required `name`, `kind`; optional `address`,
+  `tags`, `links`) and `thing` (`th`, `things/`; required `name`, `kind`;
+  optional `tags`, `links`). Both are entities, not person-like,
+  `no_ai = "full"`, and roster-visible.
+- `kind` is required, non-empty, and an open vocabulary. The pack-field
+  claim gives core spec keys precedence in `scope::owner_of_field`, so a
+  personal `kind` field does not hide a core edge's `kind:` line.
+- The pack adds `visited` (person→place), `lives_at` (person→place), `owns`
+  (person→thing), and `located_at` (thing→place). `visited` is a durable
+  "has been to" relation; individual visits are interactions or notes, not
+  repeated edges.
+- `context.entity.fields` exposes a non-person-like pack entity's declared
+  fields. `--exclude-private` strips `address`, `tags`, and `links`; an
+  uncleared place or thing returns no agent bundle at all.
+- `context.packs` follows the active version (`personal@0.3` in 0.4);
+  `--packs personal@0.2` remains a no-op alias. `org` and `deal` stay core;
+  `thing.kind` excludes `organization`.
+- The demo vault stays on 0.2; `testdata/vaults/personal-0.4/` is the new
+  fixture. Root `packs/personal/` becomes the 0.3 source; frozen 0.2 bytes
+  stay in `crates/confidant-core/pack-manifests/personal-0.2/`.
+- No new verbs, finding codes, metrics, or `[checks]` keys. No TUI
+  place/thing UI, no name resolution for them, and no per-visit event verb
+  in this lane.
+
+**Alternatives considered.** (a) One `personal@0.3` in every spec: changes
+frozen 0.3 behavior and cannot honestly list 0.1/0.2. (b) Core
+`place`/`thing`: repeats the database-diagram problem and reverses ADR-18.
+(c) Namespaced types (`personal_place`): avoids external claims but leaks
+implementation into IDs and the operator vocabulary. (d) `category` instead
+of `kind`: avoids the precedence fix but loses the natural noun. (e) An
+optional `kind`: lets junk-drawer records in. (f) Move the demo to 0.4:
+churns every snapshot and loses old-format coverage. (g) Fold `org` into
+`thing` or retire `deal`: a format migration beyond this lane.
+
+**Consequences.** 0.4 is the first spec whose default personal schema has
+places and things; 0.1–0.3 remain byte-compatible. A 0.4-compatible external
+pack cannot claim `place`/`pl`/`places` or `thing`/`th`/`things`; it must
+rename or drop the claim. Callers that hardcode
+`context.packs["personal@0.2"]` on 0.4 must read the active key. An
+uncleared place or thing yields no agent bundle, and `address` is stripped
+from private context. The new fixture and golden cover the types, edges,
+fields, and privacy. TUI work, name resolution, per-visit history, the
+org/deal migration, and cross-pack type references remain follow-ups.
+
 ## 8. v0 scope and milestones
 
-1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), and 0.4 corrections and record retirement (ADR-20); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
+1. **Spec + core + check.** Format spec 0.1, extended by 0.2 entity endpoints (ADR-17), 0.3 pack-declared types (ADR-18) and edge-level `no-ai` (ADR-19), 0.4 corrections and record retirement (ADR-20), and 0.4's `personal@0.3` default with places and things (ADR-21); parser, generic records, derived values, balance assertions, check engine, built-in personal pack, external packs, demo vault.
 2. **Vault safety and sync.** `confidant doctor` (git repo and identity, transport, spec, `check`, staleness, skills links), `confidant sync` as the explicit git boundary, and the §12 `no-ai` allowlist. Done when a fresh clone on a clean machine reads and writes the vault with no extra setup.
 3. **CLI writes + agent contract.** Write commands, `--json`/`--no-input`/`--dry-run`/`--request-id`, commit-per-write, `schema`, `help --json`, `context`, `doctor`, thin MCP server.
 4. **Import skills.** Agent skills that pull events and transcripts from outside systems into the vault, with dry runs and safe retries.
